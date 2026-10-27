@@ -1,0 +1,47 @@
+== sync-1-before 10:26:51.823 /home/developer/imagedb/build/tmp/commit_lat-before sync /home/developer/imagedb/build/tmp/pm/sync-b1 8000 1
+   end 10:27:22.275
+== sync-1-after 10:27:27.282 /home/developer/imagedb/.work/prealloc/build/commit_lat sync /home/developer/imagedb/build/tmp/pm/sync-a1 8000 1
+   end 10:27:42.499
+== sync-2-after 10:27:47.506 /home/developer/imagedb/.work/prealloc/build/commit_lat sync /home/developer/imagedb/build/tmp/pm/sync-a2 8000 1
+   end 10:28:02.493
+== sync-2-before 10:28:07.501 /home/developer/imagedb/build/tmp/commit_lat-before sync /home/developer/imagedb/build/tmp/pm/sync-b2 8000 1
+   end 10:28:38.197
+== strict-1-before 10:28:43.203 /home/developer/imagedb/build/tmp/commit_lat-before durable-ack /home/developer/imagedb/build/tmp/pm/strict-b1 2000 1
+   end 10:28:58.564
+== strict-1-after 10:29:03.572 /home/developer/imagedb/.work/prealloc/build/commit_lat durable-ack /home/developer/imagedb/build/tmp/pm/strict-a1 2000 1
+   end 10:29:14.665
+== strict-2-after 10:29:19.674 /home/developer/imagedb/.work/prealloc/build/commit_lat durable-ack /home/developer/imagedb/build/tmp/pm/strict-a2 2000 1
+   end 10:29:30.927
+== strict-2-before 10:29:35.933 /home/developer/imagedb/build/tmp/commit_lat-before durable-ack /home/developer/imagedb/build/tmp/pm/strict-b2 2000 1
+   end 10:29:51.121
+== sync1k-1-before 10:29:56.129 /home/developer/imagedb/build/tmp/commit_lat-before sync /home/developer/imagedb/build/tmp/pm/sync1k-b1 200000 1000
+   end 10:29:57.961
+== sync1k-1-after 10:30:02.968 /home/developer/imagedb/.work/prealloc/build/commit_lat sync /home/developer/imagedb/build/tmp/pm/sync1k-a1 200000 1000
+   end 10:30:04.567
+== sync1k-2-after 10:30:09.576 /home/developer/imagedb/.work/prealloc/build/commit_lat sync /home/developer/imagedb/build/tmp/pm/sync1k-a2 200000 1000
+   end 10:30:11.169
+== sync1k-2-before 10:30:16.177 /home/developer/imagedb/build/tmp/commit_lat-before sync /home/developer/imagedb/build/tmp/pm/sync1k-b2 200000 1000
+   end 10:30:18.037
+== sync10k-1-before 10:30:23.044 /home/developer/imagedb/build/tmp/commit_lat-before sync /home/developer/imagedb/build/tmp/pm/sync10k-b1 200000 10000
+   end 10:30:24.109
+== sync10k-1-after 10:30:29.117 /home/developer/imagedb/.work/prealloc/build/commit_lat sync /home/developer/imagedb/build/tmp/pm/sync10k-a1 200000 10000
+   end 10:30:30.232
+== sync10k-2-after 10:30:35.238 /home/developer/imagedb/.work/prealloc/build/commit_lat sync /home/developer/imagedb/build/tmp/pm/sync10k-a2 200000 10000
+   end 10:30:36.368
+== sync10k-2-before 10:30:41.374 /home/developer/imagedb/build/tmp/commit_lat-before sync /home/developer/imagedb/build/tmp/pm/sync10k-b2 200000 10000
+   end 10:30:42.434
+== nosync-1-before 10:30:47.442 /home/developer/imagedb/build/tmp/commit_lat-before nosync /home/developer/imagedb/build/tmp/pm/nosync-b1 200000 1000
+   end 10:30:48.443
+== nosync-1-after 10:30:53.449 /home/developer/imagedb/.work/prealloc/build/commit_lat nosync /home/developer/imagedb/build/tmp/pm/nosync-a1 200000 1000
+   end 10:30:54.641
+== nosync-2-after 10:30:59.647 /home/developer/imagedb/.work/prealloc/build/commit_lat nosync /home/developer/imagedb/build/tmp/pm/nosync-a2 200000 1000
+   end 10:31:00.831
+== nosync-2-before 10:31:05.837 /home/developer/imagedb/build/tmp/commit_lat-before nosync /home/developer/imagedb/build/tmp/pm/nosync-b2 200000 1000
+   end 10:31:06.845
+== group-probe 10:31:11.853 /home/developer/imagedb/.work/prealloc/build/group_probe /home/developer/imagedb/build/tmp/pm 200 330
+   end 10:31:17.190
+done 10:31:17
+== nosync1-1-before 10:32:49
+== nosync1-1-after 10:32:55
+== nosync1-2-after 10:33:01
+== nosync1-2-before 10:33:07

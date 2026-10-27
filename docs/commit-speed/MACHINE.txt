@@ -1,0 +1,47 @@
+Option 2's first step measured, 2026-10-26 (docs/commit-speed.md, "Measured: step 1"); raw output in this directory
+runs: alg-run{1..4}-*.txt 12:21:32-12:22:08 PKT (bench-alg.sh: build/bench, IMDB_DIGEST_ALG 1, 2, 1, 2);
+  step1-run{1..6}-*.txt 12:25:41-12:26:33 (bench-step1.sh: build/bench of main before the merge, then main after it
+  under alg 1 and alg 2, rotated twice); step1-sql-runs.txt 12:28:09-12:28:36 (bench-step1-sql.sh: the same three
+  through SQL). Each in one window.sh (the scripts here are the ones run, from .work/, with their paths as they were:
+  they expect the pre-merge tree's binaries in build/tmp/pre-e3a/build/).
+cpu: Intel(R) Core(TM) i7-8550U CPU @ 1.80GHz, 8 CPUs; for each window the power profile (power-profiles-daemon) and
+  the CPU governor set to performance, and power-saver and powersave (all 8) read back after each (the user's yes:
+  "You can switch to Performance briefly for your runs"); cpu0 3,700-3,991 MHz as each bench run started, but for
+  one reading of 400 MHz (step1-run3: an idle core at that instant; its numbers equal run 6's)
+memory: 15.8 GB; 13.0 GB or more available throughout (.work/ramwatch.sh, every 30 s), no swap used
+kernel: 6.8.0-138-generic; disk: ext4 on /dev/sda2 (the bench and the SQL runs are sync=0 / --nosync: CPU, not flushes)
+toolchain: gcc 11.4.0 (-O2, the Makefile's hardened flags), NASM 2.15.05
+imagedb: main after the digest_alg 2 merge (12:07, proved equal to the copy that passed the matrix and the alg 1 pass),
+  rebuilt after make clean and checked (lint, make unit 231/231 with the auditor, fuzz and ct built, 12:09-12:20);
+  "old" is main before the merge (.work/pre-e3a-merge-20261026-1207.tgz), built the same way
+other load: none of another session's jobs; load 0.7-1.4 (falling from the builds just before), 97% idle before
+heat: not recorded
+
+The alg 2 key redefinition measured, 2026-10-26 evening (docs/commit-speed.md, "Measured: the redefinition"):
+runs: redef-alg-run{1..4}-*.txt 18:52:55-18:53:29 PKT (bench-alg.sh on main, IMDB_DIGEST_ALG 1, 2, 1, 2);
+  redef-run{1..6}-*.txt 18:53:31-18:54:20 (bench-redef.sh: old2 = main before the merge under alg 2, then main under
+  alg 1 and alg 2, rotated twice); redef-sql-runs.txt after 18:54:20, done 18:54:48 (bench-redef-sql.sh, two
+  rotations: set aside, see the doc); redef-sql4-runs.txt 18:56:55-18:57:44 (bench-redef-sql4.sh, four rotations).
+  Each in one window.sh, power-saver and powersave (all 8) read back after each.
+cpu, memory, kernel, disk, toolchain: as above. The mean clock over the 8 CPUs (idle ones included) was 2,096-3,865
+  MHz as each bench run started; the first SQL window 3,300-3,500 MHz, the second 3,500-3,852. 12.7 GB or more
+  available throughout (ramwatch), no swap used.
+imagedb: main after the alg 2 key redefinition merge (18:45, proved equal to the copy that passed the matrix, plus
+  run.sh's in_sync fix and its targeted re-run), rebuilt after make clean and checked (lint, make unit 232/232 with
+  the auditor, fuzz and ct built, 18:46-18:50, 0 warnings). "old2" is main before the merge
+  (.work/pre-e3b-merge-20261026-1845.tgz, without the two tarballs), built the same way by build-pre-e3b.sh
+  18:51:26-18:51:52. Its guard checks that the element expands a hashed key: the first definition.
+other load: none of another session's jobs. At 18:52, 93.6% idle, load 1.14 falling from the builds; the desktop
+  (Xorg, a terminal, remmina) used a few percent.
+heat: not recorded. The machine had run the matrix (17:04-18:34) and the builds before.
+
+2026-10-27, preallocation (P) against the tree before it (prealloc-20261027/):
+- commit_lat and group_probe in .work/window.sh windows: 10:26:45-10:31:17 (performance governor and profile,
+  load 0.32, mean clock 3,324 MHz), one-row --nosync 10:3x (3,780 MHz), the torn tails after; power-saver
+  read back after each. bench/devstall on sda beside them: no pause, no slow flush.
+- bench/whole.sh (its own window), imagedb and the private PostgreSQL, from main then from P, 10:32-10:52:
+  imagedb started at 45 C both times (mean clock 2,973 and 2,138 MHz at the start, 3,764 and 3,774 MHz at its
+  end); devstall: one 2.5 s flush in the first run (it is W6 update's stall), one 2.7 s in the second (no
+  timed sample flagged).
+- "before" is main as merged at 09:58 on 2026-10-27 (the 10-26 review's fixes in), "after" the preallocation
+  copy (.work/prealloc) as its stage check passed (make test, 10:06-10:11).

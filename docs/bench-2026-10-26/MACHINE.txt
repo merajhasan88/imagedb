@@ -1,0 +1,20 @@
+The head-to-head with joins and the new indexes, 2026-10-26 (bench/whole.sh, bench/whole.c; raw output in run1.txt, run2.txt)
+run 1: 06:23:07-06:31:05 PKT (load 0.50 at the start); run 2: 06:31:05-06:39:04 PKT (load 0.56), back to back
+cpu: Intel(R) Core(TM) i7-8550U CPU @ 1.80GHz, 8 CPUs; for each run the power profile (power-profiles-daemon) and the
+  CPU governor set to performance, power-saver and powersave (all 8) restored after and checked (the user's yes: "You
+  can switch to Performance briefly for your runs"); the desktop's profile is power-saver
+disk: CT500BX100SSD1 (SATA SSD), ext4 (rw,relatime) on /dev/sda2, data in /var/tmp (no leftovers after)
+memory: 15.8 GB; 13.8 GB available before, lowest 13.0 GB during (.work/ramwatch.sh, every 30 s), no swap used
+kernel: 6.8.0-138-generic
+sqlite: 3.37.2-2ubuntu0.8 (WAL, synchronous=FULL)
+postgres: 14.24-0ubuntu0.22.04.1 (private instance, fsync=on, synchronous_commit=on, defaults otherwise: its parallel
+  workers too, which W7d's plan uses)
+imagedb: main after E2 stage 4 (plan C) merged at 06:13 and checked (make lint, the unit suite 223/223 at 06:19:57; the
+  same tree passed make test, make san, make tsan, fuzz-run and make faults in its copy, 04:10-06:13); build/whole of
+  06:20, build/fsync_probe rebuilt 06:23 from its unchanged source; sync=1
+other load: none of another session's jobs during the runs
+heat: the package at 40-44 C before each engine (after its minute's idle) and 59-74 C after, in both runs, much cooler
+  than 2026-10-24's 86-97 C; the lines are in the raw output
+raw output: stdout is block-buffered and stderr is not, so the expected refusal of W8b's duplicate (on stderr) can
+  split a stdout line: in both runs PostgreSQL's "w8_two_column_count p50" line is split by it ("postgres w8_two_col"
+  ... "umn_count p50 42.4 us" in run 1, 23.2 us in run 2); the values are intact

@@ -1,0 +1,8 @@
+    37.49%  [.] visible_q                       -      -            
+    31.91%  [.] seg_get                         -      -            
+    16.02%  [.] imdb_oidx_range                 -      -            
+     2.35%  [.] preds_ok                        -      -            
+     1.79%  [.] ord_fetch                       -      -            
+     1.64%  [.] sink_row.part.0                 -      -            
+     1.49%  [.] imdb_seg_values                 -      -            
+     1.18%  [.] join_emit                       -      -            

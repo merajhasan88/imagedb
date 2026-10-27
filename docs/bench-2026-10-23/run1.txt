@@ -1,0 +1,216 @@
+imagedb before (after 60 s idle): package 48 C, mean clock 3025 MHz
+imagedb single_row_commit commits_per_s 271 /s
+imagedb single_row_commit p50 3390.8 us
+imagedb single_row_commit p95 5069.5 us
+imagedb single_row_commit p99 5336.0 us
+imagedb batch_insert_100 rows_per_s 20550 /s
+imagedb batch_insert_100 p50 4932.7 us
+imagedb batch_insert_100 p95 6178.0 us
+imagedb batch_insert_100 p99 6560.7 us
+imagedb after_load memory 35.6 MB
+imagedb after_load written 20.9 MB
+imagedb after_load cpu 0.97 s
+imagedb batch_insert_10000 rows_per_s 162512 /s
+imagedb batch_insert_10000 p50 56928.7 us
+imagedb batch_insert_10000 p95 69806.5 us
+imagedb batch_insert_10000 p99 69806.5 us
+imagedb pk_lookup p50 3.1 us
+imagedb pk_lookup p95 3.3 us
+imagedb pk_lookup p99 4.0 us
+imagedb range_sum_1000 p50 15542.6 us
+imagedb range_sum_1000 p95 16692.2 us
+imagedb range_sum_1000 p99 17037.8 us
+imagedb subject_count p50 215.8 us
+imagedb subject_count p95 242.6 us
+imagedb subject_count p99 295.3 us
+imagedb checkpoint_after_load seconds 0.233 s
+imagedb after_checkpoint memory 71.8 MB
+imagedb pk_lookup_after_checkpoint p50 2.9 us
+imagedb pk_lookup_after_checkpoint p95 3.1 us
+imagedb pk_lookup_after_checkpoint p99 3.3 us
+imagedb range_sum_1000_after_checkpoint p50 213.3 us
+imagedb range_sum_1000_after_checkpoint p95 251.8 us
+imagedb range_sum_1000_after_checkpoint p99 292.9 us
+imagedb subject_count_after_checkpoint p50 81.6 us
+imagedb subject_count_after_checkpoint p95 90.5 us
+imagedb subject_count_after_checkpoint p99 124.3 us
+imagedb churn_update_1000 rows_per_s 44424 /s
+imagedb churn_update_1000 p50 22261.7 us
+imagedb churn_update_1000 p95 25032.7 us
+imagedb churn_update_1000 p99 31307.8 us
+imagedb after_churn memory 246.6 MB
+imagedb churn written 152.2 MB
+imagedb delete_reinsert_1000 rows_per_s 67987 /s
+imagedb delete_reinsert_1000 p50 29290.0 us
+imagedb delete_reinsert_1000 p95 31783.7 us
+imagedb delete_reinsert_1000 p99 32048.6 us
+imagedb after_deletes memory 246.6 MB
+imagedb total cpu 31.10 s (churn phase ended at 29.74)
+imagedb reopen_load_state seconds 1.530 s (the log since the load's checkpoint: 600 commits)
+imagedb checkpoint_after_churn seconds 0.451 s
+imagedb reopen_after_checkpoint seconds 1.328 s
+imagedb after: package 71 C, mean clock 3827 MHz
+imagedb storage size 225.9 MB
+imagedb-durable-ack before (after 60 s idle): package 46 C, mean clock 2121 MHz
+imagedb-durable-ack single_row_commit commits_per_s 132 /s
+imagedb-durable-ack single_row_commit p50 7811.2 us
+imagedb-durable-ack single_row_commit p95 9958.8 us
+imagedb-durable-ack single_row_commit p99 10372.6 us
+imagedb-durable-ack batch_insert_100 rows_per_s 11565 /s
+imagedb-durable-ack batch_insert_100 p50 8083.1 us
+imagedb-durable-ack batch_insert_100 p95 11000.7 us
+imagedb-durable-ack batch_insert_100 p99 11538.0 us
+imagedb-durable-ack after_load memory 35.6 MB
+imagedb-durable-ack after_load written 27.1 MB
+imagedb-durable-ack after_load cpu 1.06 s
+imagedb-durable-ack batch_insert_10000 rows_per_s 147490 /s
+imagedb-durable-ack batch_insert_10000 p50 63107.4 us
+imagedb-durable-ack batch_insert_10000 p95 76700.0 us
+imagedb-durable-ack batch_insert_10000 p99 76700.0 us
+imagedb-durable-ack pk_lookup p50 3.2 us
+imagedb-durable-ack pk_lookup p95 3.5 us
+imagedb-durable-ack pk_lookup p99 3.7 us
+imagedb-durable-ack range_sum_1000 p50 15566.9 us
+imagedb-durable-ack range_sum_1000 p95 16110.4 us
+imagedb-durable-ack range_sum_1000 p99 16484.5 us
+imagedb-durable-ack subject_count p50 215.3 us
+imagedb-durable-ack subject_count p95 250.6 us
+imagedb-durable-ack subject_count p99 284.7 us
+imagedb-durable-ack checkpoint_after_load seconds 0.223 s
+imagedb-durable-ack after_checkpoint memory 71.7 MB
+imagedb-durable-ack pk_lookup_after_checkpoint p50 3.1 us
+imagedb-durable-ack pk_lookup_after_checkpoint p95 3.3 us
+imagedb-durable-ack pk_lookup_after_checkpoint p99 3.5 us
+imagedb-durable-ack range_sum_1000_after_checkpoint p50 233.3 us
+imagedb-durable-ack range_sum_1000_after_checkpoint p95 262.7 us
+imagedb-durable-ack range_sum_1000_after_checkpoint p99 308.5 us
+imagedb-durable-ack subject_count_after_checkpoint p50 79.4 us
+imagedb-durable-ack subject_count_after_checkpoint p95 91.6 us
+imagedb-durable-ack subject_count_after_checkpoint p99 123.7 us
+imagedb-durable-ack churn_update_1000 rows_per_s 38129 /s
+imagedb-durable-ack churn_update_1000 p50 25614.5 us
+imagedb-durable-ack churn_update_1000 p95 29380.9 us
+imagedb-durable-ack churn_update_1000 p99 36002.7 us
+imagedb-durable-ack after_churn memory 246.6 MB
+imagedb-durable-ack churn written 154.3 MB
+imagedb-durable-ack delete_reinsert_1000 rows_per_s 53601 /s
+imagedb-durable-ack delete_reinsert_1000 p50 37767.3 us
+imagedb-durable-ack delete_reinsert_1000 p95 41969.1 us
+imagedb-durable-ack delete_reinsert_1000 p99 42323.7 us
+imagedb-durable-ack after_deletes memory 246.6 MB
+imagedb-durable-ack total cpu 31.17 s (churn phase ended at 29.79)
+imagedb-durable-ack reopen_load_state seconds 1.523 s (the log since the load's checkpoint: 600 commits)
+imagedb-durable-ack checkpoint_after_churn seconds 0.443 s
+imagedb-durable-ack reopen_after_checkpoint seconds 1.329 s
+imagedb-durable-ack after: package 70 C, mean clock 3746 MHz
+imagedb-durable-ack storage size 225.9 MB
+sqlite before (after 60 s idle): package 47 C, mean clock 2103 MHz
+sqlite single_row_commit commits_per_s 263 /s
+sqlite single_row_commit p50 3519.2 us
+sqlite single_row_commit p95 5039.6 us
+sqlite single_row_commit p99 5270.9 us
+sqlite batch_insert_100 rows_per_s 20278 /s
+sqlite batch_insert_100 p50 4345.3 us
+sqlite batch_insert_100 p95 11774.3 us
+sqlite batch_insert_100 p99 14488.5 us
+sqlite after_load memory 4.2 MB
+sqlite after_load written 431.4 MB
+sqlite after_load cpu 0.86 s
+sqlite batch_insert_10000 rows_per_s 304268 /s
+sqlite batch_insert_10000 p50 29628.7 us
+sqlite batch_insert_10000 p95 43217.1 us
+sqlite batch_insert_10000 p99 43217.1 us
+sqlite pk_lookup p50 3.5 us
+sqlite pk_lookup p95 3.9 us
+sqlite pk_lookup p99 4.2 us
+sqlite range_sum_1000 p50 65.1 us
+sqlite range_sum_1000 p95 69.5 us
+sqlite range_sum_1000 p99 91.0 us
+sqlite subject_count p50 45.4 us
+sqlite subject_count p95 52.1 us
+sqlite subject_count p99 61.3 us
+sqlite checkpoint_after_load seconds 0.015 s
+sqlite after_checkpoint memory 4.4 MB
+sqlite pk_lookup_after_checkpoint p50 3.5 us
+sqlite pk_lookup_after_checkpoint p95 3.9 us
+sqlite pk_lookup_after_checkpoint p99 4.3 us
+sqlite range_sum_1000_after_checkpoint p50 64.5 us
+sqlite range_sum_1000_after_checkpoint p95 67.4 us
+sqlite range_sum_1000_after_checkpoint p99 91.6 us
+sqlite subject_count_after_checkpoint p50 45.4 us
+sqlite subject_count_after_checkpoint p95 55.0 us
+sqlite subject_count_after_checkpoint p99 80.0 us
+sqlite churn_update_1000 rows_per_s 331137 /s
+sqlite churn_update_1000 p50 2764.4 us
+sqlite churn_update_1000 p95 5136.2 us
+sqlite churn_update_1000 p99 19662.6 us
+sqlite after_churn memory 4.5 MB
+sqlite churn written 105.1 MB
+sqlite delete_reinsert_1000 rows_per_s 142178 /s
+sqlite delete_reinsert_1000 p50 11869.1 us
+sqlite delete_reinsert_1000 p95 23115.5 us
+sqlite delete_reinsert_1000 p99 32078.6 us
+sqlite after_deletes memory 4.5 MB
+sqlite total cpu 1.78 s (churn phase ended at 1.58)
+sqlite checkpoint_after_churn seconds 0.010 s
+sqlite reopen_connection seconds 0.001 s
+sqlite after: package 55 C, mean clock 3044 MHz
+sqlite storage size 11.4 MB
+could not change directory to "/home/developer/imagedb": Permission denied
+initdb: could not find suitable text search configuration for locale "ur_PK.UTF-8"
+could not change directory to "/home/developer/imagedb": Permission denied
+postgres before (after 60 s idle): package 48 C, mean clock 3762 MHz
+postgres single_row_commit commits_per_s 506 /s
+postgres single_row_commit p50 2036.2 us
+postgres single_row_commit p95 2644.1 us
+postgres single_row_commit p99 2775.9 us
+postgres batch_insert_100 rows_per_s 21319 /s
+postgres batch_insert_100 p50 4532.6 us
+postgres batch_insert_100 p95 6116.0 us
+postgres batch_insert_100 p99 6916.5 us
+postgres after_load memory 41.0 MB
+postgres after_load written 90.6 MB
+postgres after_load cpu 2.28 s
+postgres batch_insert_10000 rows_per_s 40925 /s
+postgres batch_insert_10000 p50 243008.2 us
+postgres batch_insert_10000 p95 266754.2 us
+postgres batch_insert_10000 p99 266754.2 us
+postgres pk_lookup p50 21.2 us
+postgres pk_lookup p95 35.3 us
+postgres pk_lookup p99 52.4 us
+postgres range_sum_1000 p50 141.8 us
+postgres range_sum_1000 p95 267.2 us
+postgres range_sum_1000 p99 350.0 us
+postgres subject_count p50 1111.1 us
+postgres subject_count p95 1317.3 us
+postgres subject_count p99 1569.0 us
+postgres checkpoint_after_load seconds 0.105 s
+postgres after_checkpoint memory 49.0 MB
+postgres pk_lookup_after_checkpoint p50 21.0 us
+postgres pk_lookup_after_checkpoint p95 37.1 us
+postgres pk_lookup_after_checkpoint p99 51.9 us
+postgres range_sum_1000_after_checkpoint p50 180.8 us
+postgres range_sum_1000_after_checkpoint p95 271.2 us
+postgres range_sum_1000_after_checkpoint p99 333.7 us
+postgres subject_count_after_checkpoint p50 1110.4 us
+postgres subject_count_after_checkpoint p95 1383.6 us
+postgres subject_count_after_checkpoint p99 1688.4 us
+postgres churn_update_1000 rows_per_s 101579 /s
+postgres churn_update_1000 p50 7947.6 us
+postgres churn_update_1000 p95 15400.5 us
+postgres churn_update_1000 p99 62883.6 us
+postgres after_churn memory 103.4 MB
+postgres churn written 388.5 MB
+postgres delete_reinsert_1000 rows_per_s 57023 /s
+postgres delete_reinsert_1000 p50 32251.5 us
+postgres delete_reinsert_1000 p95 47284.9 us
+postgres delete_reinsert_1000 p99 88841.4 us
+postgres after_deletes memory 109.7 MB
+postgres total cpu 10.35 s (churn phase ended at 9.20)
+postgres checkpoint_after_churn seconds 0.229 s
+postgres after: package 59 C, mean clock 3875 MHz
+postgres storage size 272.3 MB (beyond a fresh cluster)
+could not change directory to "/home/developer/imagedb": Permission denied
+could not change directory to "/home/developer/imagedb": Permission denied
+postgres server_restart seconds 0.237 s
+exit 0

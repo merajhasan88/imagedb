@@ -1,0 +1,5 @@
+imagedb: warning: torn tail (torn tail: tagged segment 1, commit 201 incomplete); last good commit 200; tail truncated
+ count 
+--------
+ 199000
+(1 row)  [scan]  at commit 200

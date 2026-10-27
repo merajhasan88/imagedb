@@ -1,0 +1,15 @@
+window: profile performance, governor performance, load 1.48, mean clock 3776 MHz
+rows: 150500 versions, no checkpoint
+range SUM, no index      p50   15866.7 us, p95   16912.9, p99   20459.2, mean   16066.4; path scan (index(ordered) 0 of 1000)
+CREATE INDEX t_id: 9.3 ms; memory: indexes 12.09 -> 14.50 MB, total 59.03 -> 61.44 MB (+16.0 bytes per row)
+range SUM, index on id   p50     114.7 us, p95     126.8, p99     159.4, mean     116.8; path index(ordered) (index(ordered) 1000 of 1000)
+the 1,000 answers agree, and each is 1000 * lo + 499500
+in memory, 100k ids, auto  p50   11540.2 us; path index(ordered)
+in memory, 100k ids, scan  p50   16478.9 us; path scan
+open with the index (log replay + build), median of 5: 307.2 ms
+open without it (log replay), median of 5:          294.7 ms
+checkpointed, no index   p50     205.2 us, p95     252.0, p99     311.5, mean     214.0; path scan (index(ordered) 0 of 1000)
+checkpointed, index on id p50      36.2 us, p95      38.9, p99      60.1, mean      37.2; path index(ordered) (index(ordered) 1000 of 1000)
+checkpointed, index, scan p50     204.7 us, p95     243.7, p99     297.0, mean     209.8; path scan (index(ordered) 0 of 1000)
+checkpointed, 100k ids, scan p50     227.4 us; path scan
+checkpointed, 100k ids, auto p50     229.3 us; path scan

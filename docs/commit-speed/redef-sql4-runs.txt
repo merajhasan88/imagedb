@@ -1,0 +1,12 @@
+run 1 old2 alg 2: insert 200000 rows 633 ms, update 200000 rows 1123 ms; updated rows 200000; clock 3793 MHz
+run 2 new1 alg 1: insert 200000 rows 735 ms, update 200000 rows 1384 ms; updated rows 200000; clock 3823 MHz
+run 3 new2 alg 2: insert 200000 rows 613 ms, update 200000 rows 1051 ms; updated rows 200000; clock 3852 MHz
+run 4 old2 alg 2: insert 200000 rows 631 ms, update 200000 rows 1106 ms; updated rows 200000; clock 3775 MHz
+run 5 new1 alg 1: insert 200000 rows 736 ms, update 200000 rows 1417 ms; updated rows 200000; clock 3760 MHz
+run 6 new2 alg 2: insert 200000 rows 621 ms, update 200000 rows 1054 ms; updated rows 200000; clock 3850 MHz
+run 7 old2 alg 2: insert 200000 rows 639 ms, update 200000 rows 1104 ms; updated rows 200000; clock 3800 MHz
+run 8 new1 alg 1: insert 200000 rows 745 ms, update 200000 rows 1415 ms; updated rows 200000; clock 3838 MHz
+run 9 new2 alg 2: insert 200000 rows 630 ms, update 200000 rows 3504 ms; updated rows 200000; clock 3778 MHz
+run 10 old2 alg 2: insert 200000 rows 643 ms, update 200000 rows 1109 ms; updated rows 200000; clock 3829 MHz
+run 11 new1 alg 1: insert 200000 rows 731 ms, update 200000 rows 1406 ms; updated rows 200000; clock 3501 MHz
+run 12 new2 alg 2: insert 200000 rows 644 ms, update 200000 rows 1116 ms; updated rows 200000; clock 3600 MHz

@@ -1,0 +1,15 @@
+The head-to-head after CREATE INDEX, 2026-10-24 (bench/whole.sh, bench/whole.c; raw output in run1.txt, run2.txt)
+run 1: 22:09:52-22:17:23 PKT (load 1.09 at the start); run 2: 22:17:23-22:24:55 PKT (load 1.06), back to back
+cpu: Intel(R) Core(TM) i7-8550U CPU @ 1.80GHz, 8 CPUs; for each run the power profile (power-profiles-daemon) and the
+  CPU governor set to performance, power-saver and powersave restored after (the user's yes: "You can switch to
+  Performance briefly for your runs"); the desktop's profile is power-saver, which holds the cores at 800 MHz
+disk: CT500BX100SSD1 (SATA SSD), ext4 (rw,relatime) on /dev/sda2, data in /var/tmp
+memory: 15.8 GB; 12.9 GB available before and after, no swap used, no OOM, memory pressure 0
+kernel: 6.8.0-138-generic
+sqlite: 3.37.2-2ubuntu0.8 (WAL, synchronous=FULL)
+postgres: 14.24-0ubuntu0.22.04.1 (private instance, fsync=on, synchronous_commit=on, defaults otherwise)
+imagedb: build/libimagedb.a of 2026-10-24 21:03 (the tree make test and make san passed at 21:24 and 22:07: the
+  planner's cost rule included; index-only scans not yet), build/whole of 22:08, sync=1
+other load: another Claude session's test jobs on the machine earlier in the evening, none running during the runs
+heat: the package reached 86-97 C in places; run 2's imagedb started at 97 C after run 1's PostgreSQL (its reads
+  are 15-35% slower than run 1's): the heat lines are in the raw output

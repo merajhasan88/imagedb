@@ -1,0 +1,5 @@
+19:28:37.509 23415 1789956 1 7 0
+19:28:37.576 23482 1789956 0 7 1 | 1789956 rq_qos_wait: rq_qos_wait; wbt_wait; __rq_qos_throttle; blk_mq_submit_bio; __submit_bio
+19:28:38.492 24398 1789956 0 7 1 | 1789956 folio_wait_bit_common: folio_wait_bit_common; folio_wait_bit; folio_wait_writeback; __filemap_fdatawait_range; file_write_and_wait_range
+19:28:38.829 24734 1789956 0 7 1 | 1789956 jbd2_log_wait_commit: jbd2_log_wait_commit; jbd2_complete_transaction; ext4_fc_commit; ext4_sync_file; __x64_sys_fdatasync
+19:28:39.698 25604 1789974 5 3 0

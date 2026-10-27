@@ -1,0 +1,1 @@
+window: profile performance, governor performance, load 1.92, mean clock 2568 MHz

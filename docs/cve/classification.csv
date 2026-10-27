@@ -1,0 +1,77 @@
+cve,cve_year,first_fix,component,cvss,class,secondary,title
+CVE-2021-20229,2021,2021-02-11,core server,3.1,H,,Single-column SELECT privilege enables reading all columns
+CVE-2021-3393,2021,2021-02-11,core server,3.1,H,,Partition constraint violation errors leak values of denied columns
+CVE-2021-32027,2021,2021-05-13,core server,6.5,A,,Buffer overrun from integer overflow in array subscripting calculations
+CVE-2021-32028,2021,2021-05-13,core server,6.5,B,,Memory disclosure in INSERT ... ON CONFLICT ... DO UPDATE
+CVE-2021-32029,2021,2021-05-13,core server,6.5,B,,Memory disclosure in partitioned-table UPDATE ... RETURNING
+CVE-2021-3677,2021,2021-08-12,core server,6.5,B,,Memory disclosure in certain queries
+CVE-2021-23214,2021,2021-11-11,core server,8.1,I,,Server processes unencrypted bytes from man-in-the-middle
+CVE-2021-23222,2021,2021-11-11,client,3.7,I,,libpq processes unencrypted bytes from man-in-the-middle
+CVE-2022-1552,2022,2022-05-12,core server,8.8,F,,"Autovacuum, REINDEX, and others omit ""security restricted operation"" sandbox"
+CVE-2022-2625,2022,2022-08-11,core server,7.1,F,,Extension scripts replace objects not belonging to the extension
+CVE-2022-41862,2022,2023-02-09,client,3.7,B,,"Client memory disclosure when connecting, with Kerberos, to modified server"
+CVE-2023-2454,2023,2023-05-11,core server,7.2,F,,CREATE SCHEMA ... schema_element defeats protective search_path changes
+CVE-2023-2455,2023,2023-05-11,core server,4.2,G,,Row security policies disregard user ID changes after inlining
+CVE-2023-39417,2023,2023-08-10,core server,7.5,E,,Extension script @substitutions@ within quoting allow SQL injection
+CVE-2023-39418,2023,2023-08-10,core server,3.1,G,,MERGE fails to enforce UPDATE or SELECT row security policies
+CVE-2023-5868,2023,2023-11-09,core server,4.3,B,,Memory disclosure in aggregate function calls
+CVE-2023-5869,2023,2023-11-09,core server,8.8,A,,Buffer overrun from integer overflow in array modification
+CVE-2023-5870,2023,2023-11-09,core server,2.2,H,,"Role ""pg_signal_backend"" can signal certain superuser processes"
+CVE-2024-0985,2024,2024-02-08,core server,8.0,F,,PostgreSQL non-owner REFRESH MATERIALIZED VIEW CONCURRENTLY executes arbitrary SQL
+CVE-2024-4317,2024,2024-05-09,core server,3.1,H,,"Restrict visibility of ""pg_stats_ext"" and ""pg_stats_ext_exprs"" entries to the table owner"
+CVE-2024-7348,2024,2024-08-08,core server,8.8,F,TOCTOU,PostgreSQL relation replacement during pg_dump executes arbitrary SQL
+CVE-2024-10976,2024,2024-11-14,core server,4.2,G,,PostgreSQL row security below e.g. subqueries disregards user ID changes
+CVE-2024-10977,2024,2024-11-14,client,3.1,I,,PostgreSQL libpq retains an error message from man-in-the-middle
+CVE-2024-10978,2024,2024-11-14,core server,4.2,F,,"PostgreSQL SET ROLE, SET SESSION AUTHORIZATION reset to wrong user ID"
+CVE-2024-10979,2024,2024-11-14,core server,8.8,F,,PostgreSQL PL/Perl environment variable changes execute arbitrary code
+CVE-2025-1094,2025,2025-02-13,core server,8.1,E,C,PostgreSQL quoting APIs miss neutralizing quoting syntax in text that fails encoding validation
+CVE-2025-4207,2025,2025-05-08,core server,5.9,C,,PostgreSQL GB18030 encoding validation can read one byte past end of allocation for text that fails validation
+CVE-2025-8713,2025,2025-08-14,core server,3.1,H,,"PostgreSQL optimizer statistics can expose sampled data within a view, partition, or child table"
+CVE-2025-8714,2025,2025-08-14,core server,8.8,E,,PostgreSQL pg_dump lets superuser of origin server execute arbitrary code in psql client
+CVE-2025-8715,2025,2025-08-14,core server,8.8,E,,PostgreSQL pg_dump newline in object name executes arbitrary code in psql client and in restore target server
+CVE-2025-12817,2025,2025-11-13,core server,3.1,H,,PostgreSQL CREATE STATISTICS does not check for schema CREATE privilege
+CVE-2025-12818,2025,2025-11-13,core server,5.9,A,,"PostgreSQL libpq undersizes allocations, via integer wraparound"
+CVE-2026-2003,2026,2026-02-12,core server,4.3,B,,PostgreSQL oidvector discloses a few bytes of memory
+CVE-2026-2004,2026,2026-02-12,contrib module,8.8,D,,PostgreSQL intarray missing validation of type of input to selectivity estimator executes arbitrary code
+CVE-2026-2005,2026,2026-02-12,contrib module,8.8,B,,PostgreSQL pgcrypto heap buffer overflow executes arbitrary code
+CVE-2026-2006,2026,2026-02-12,core server,8.8,C,,PostgreSQL missing validation of multibyte character length executes arbitrary code
+CVE-2026-2007,2026,2026-02-12,contrib module,8.2,B,,PostgreSQL pg_trgm heap buffer overflow writes pattern onto server memory
+CVE-2026-6472,2026,2026-05-14,core server,5.4,F,,PostgreSQL CREATE TYPE does not check multirange schema CREATE privilege
+CVE-2026-6473,2026,2026-05-14,core server,8.8,A,,"PostgreSQL server undersizes allocations, via integer wraparound"
+CVE-2026-6474,2026,2026-05-14,core server,4.3,B,format string,PostgreSQL timeofday() can disclose portions of server memory
+CVE-2026-6475,2026,2026-05-14,client,8.8,J,,PostgreSQL pg_basebackup and pg_rewind can overwrite unrelated files of origin superuser choice
+CVE-2026-6476,2026,2026-05-14,client,7.2,E,,PostgreSQL pg_createsubscriber allows SQL injection via subscription name
+CVE-2026-6477,2026,2026-05-14,client,8.8,B,,PostgreSQL libpq lo_* functions let server superuser overwrite client stack memory
+CVE-2026-6478,2026,2026-05-14,core server,6.5,I,,PostgreSQL discloses MD5-hashed passwords via covert timing channel
+CVE-2026-6479,2026,2026-05-14,core server,7.5,I,recursion,"PostgreSQL SSL/GSS init causes denial of service, via uncontrolled recursion"
+CVE-2026-6575,2026,2026-05-14,core server,4.3,B,,PostgreSQL pg_restore_attribute_stats accepts values that cause query planning to read past end of stats array
+CVE-2026-6637,2026,2026-05-14,contrib module,8.8,B,E,PostgreSQL refint allows stack buffer overflow and SQL injection
+CVE-2026-6638,2026,2026-05-14,core server,3.7,E,,PostgreSQL REFRESH PUBLICATION allows SQL injection via table name
+CVE-2026-14662,2026,2026-08-13,core server,8.8,A,,"PostgreSQL tsvector and tsquery undersize allocations, via integer wraparound"
+CVE-2026-14663,2026,2026-08-13,contrib module,6.5,I,,"PostgreSQL pgcrypto, for OpenSSL-disabled ciphers, silently encrypts to and decrypts from cleartext"
+CVE-2026-14664,2026,2026-08-13,core server,8.8,C,B,PostgreSQL regexp heap buffer overflow executes arbitrary code
+CVE-2026-14666,2026,2026-08-13,core server,4.2,G,,PostgreSQL row security caching disregards role modifications
+CVE-2026-14668,2026,2026-08-13,core server,8.1,D,,PostgreSQL ctid type confusion in selectivity estimator discloses derivative of arbitrary read
+CVE-2026-14669,2026,2026-08-13,core server,8.8,B,,PostgreSQL to_char heap buffer overflow executes arbitrary code
+CVE-2026-14670,2026,2026-08-13,core server,8.8,B,,PostgreSQL plperl tied object heap buffer overflow executes arbitrary code
+CVE-2026-14671,2026,2026-08-13,contrib module,8.8,D,,PostgreSQL refint plan cache type confusion executes arbitrary code
+CVE-2026-14672,2026,2026-08-13,core server,5.3,I,,PostgreSQL observable response discrepancy with non-default scram_iterations provides user existence oracle
+CVE-2026-14673,2026,2026-08-13,contrib module,3.8,F,,PostgreSQL amcheck does not clear untrusted search path
+CVE-2026-14676,2026,2026-08-13,contrib module,8.8,B,,PostgreSQL pg_stat_statements heap buffer overflow executes arbitrary code
+CVE-2026-14677,2026,2026-08-13,core server,8.8,A,,"PostgreSQL 32-bit pltcl and plperl undersize allocations, via integer wraparound"
+CVE-2026-14678,2026,2026-08-13,contrib module,4.3,B,,PostgreSQL pg_trgm picksplit reads past end of buffer
+CVE-2026-14679,2026,2026-08-13,core server,8.2,B,,PostgreSQL stack buffer overflow in argument match writes 0x0 and 0x1 to server memory
+CVE-2026-14680,2026,2026-08-13,core server,8.8,D,,"PostgreSQL type confusion via ""internal"" arguments"
+CVE-2026-14681,2026,2026-08-13,core server,4.2,I,,PostgreSQL improper enforcement of GSSAPI encryption when coupled with SSL
+CVE-2026-15741,2026,2026-08-13,core server,8.8,E,,PostgreSQL expression deparse allows SQL injection via EXTRACT argument
+CVE-2026-15742,2026,2026-08-13,contrib module,8.8,A,,"PostgreSQL fuzzystrmatch writes effectively-arbitrary addresses, via integer wraparound"
+CVE-2026-16238,2026,2026-08-13,core server,8.8,D,,PostgreSQL type confusion in pg_restore_attribute_stats() executes arbitrary code
+CVE-2026-16239,2026,2026-08-13,core server,8.8,D,,PostgreSQL type confusion in cursor CLOSE + DECLARE executes arbitrary code
+CVE-2026-16241,2026,2026-08-13,client,3.8,A,,PostgreSQL ECPG integer underflow can crash the client
+CVE-2026-18024,2026,2026-08-13,core server,4.3,C,,PostgreSQL ascii() function reads past end of buffer
+CVE-2026-18408,2026,2026-08-13,client,8.8,E,,PostgreSQL psql \unrestrict lets superuser of pg_dump origin server execute arbitrary code in psql client
+CVE-2026-19385,2026,2026-08-13,client,8.8,B,,PostgreSQL pg_dump heap buffer overflow executes arbitrary code
+CVE-2026-6464,2026,2026-08-13,client,8.1,E,,PostgreSQL psql COPY FROM STDIN early failure processes data lines as psql commands
+CVE-2026-6469,2026,2026-08-13,core server,3.8,H,,PostgreSQL ALTER TABLE ALTER TYPE resets extended statistics ownership
+CVE-2026-6470,2026,2026-08-13,core server,4.3,H,,PostgreSQL fails to check type USAGE privilege
+CVE-2026-6471,2026,2026-08-13,core server,7.2,F,,PostgreSQL logical decoding can dlopen arbitrary file

@@ -1,0 +1,34 @@
+== run 4: IMDB_DIGEST_ALG=2, 12:22:00, load 1.02, mean clock 3279 MHz
+imagedb bench  (sse4.2=1 avx2=1)
+cpu0 governor performance, 3828 MHz now
+kernels:
+  crc32c          C table    0.44 GB/s   asm-sse42         9.75 GB/s
+  lthash add      C         561.9 ns/op   asm-avx2          26.6 ns/op (2 KiB vector)
+  range filter    C          1156 Mrow/s  asm-avx2          2011 Mrow/s
+  exact sum       C int128    685 Mrow/s  asm-avx2-split    1248 Mrow/s
+  utf8 ascii run  C          2.36 GB/s   asm-avx2         18.67 GB/s
+  digest element  C          21.1 us/row  avx2-sha256x8      3.4 us/row (64 x SHA-256)
+  element         alg 1       3.3 us/row  alg 2 (avx2-chacha20x8)     1.2 us/row
+  state digest    alg 1      10.6 us      alg 2 (avx2)     4.5 us (the tree)
+  ed25519 sign    Monocypher   53.3 us     fast   20.1 us  (2.7x)
+  ed25519 verify  Monocypher  145.6 us     fast   50.4 us  (2.9x; 800/800 valid)
+  ed25519 batch   scalar field   14.4 us per signature, four-way field   11.7 us
+  ed25519 batch     11.7 us per signature in groups of 64 (4.3x the single fast check; 40/40 groups valid)
+engine (200000 rows):
+  bulk insert       303154 rows/s   (200000 rows, LtHash digest included, parallel)
+  single-row txn      31.4 us/commit (sync=0, so no fdatasync: not durable latency; chain hash, Ed25519 signature,
+                                   digest and the DURABLE watermark write included)
+  checkpoint          0.29 s        (segments + manifest for 202000 rows)
+  pk lookup           0.23 us        (engine API)
+  user query           0.00 ms/query  index path
+  range aggregate      0.32 ms/query  SIMD scan
+                   =      631 Mrow/s
+  range aggregate      5.52 ms/query  store (row at a time)
+                   =       37 Mrow/s
+  VERIFY              0.66 s        (read 0.01, parallel 0.18, ordered 0.02, engine 0.07, lake 0.37; 8 threads)
+  replica apply     203218 rows/s   (2006 commits, every check incl. lake rebuild + state recompute)
+  reopen              0.32 s        (from the lake snapshot at commit 2006, tail replayed)
+  reopen (full)       0.46 s        (every commit replayed and re-verified)
+  kept            build/tmp/bench-primary, build/tmp/bench-replica
+algorithm  digest_alg 2 (LtHash16 by ChaCha20, the digest a tree of SHA-256)
+algorithm  digest_alg 2 (LtHash16 by ChaCha20, the digest a tree of SHA-256)

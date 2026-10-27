@@ -1,0 +1,17 @@
+    40.97%  imagedb               [.] chacha20_x8.constprop.0                     -      -            
+    22.41%  imagedb               [.] imdb_sha256_compress                        -      -            
+     2.22%  imagedb               [.] find                                        -      -            
+     2.20%  imagedb               [.] imdb_row_decode                             -      -            
+     2.15%  [kernel.kallsyms]     [k] __irqentry_text_end                         -      -            
+     1.89%  libc.so.6             [.] __memmove_avx_unaligned_erms                -      -            
+     1.51%  libc.so.6             [.] __memset_avx2_unaligned_erms                -      -            
+     1.32%  imagedb               [.] imdb_siphash24                              -      -            
+     1.14%  [kernel.kallsyms]     [k] error_entry                                 -      -            
+     0.87%  [kernel.kallsyms]     [k] clear_page_erms                             -      -            
+     0.79%  imagedb               [.] imdb_lthash_add_avx2.loop                   -      -            
+     0.61%  imagedb               [.] imdb_sha256_update                          -      -            
+     0.61%  [kernel.kallsyms]     [k] native_irq_return_iret                      -      -            
+     0.60%  imagedb               [.] imdb_row_get                                -      -            
+     0.60%  imagedb               [.] imdb_commit                                 -      -            
+     0.59%  imagedb               [.] imdb_value_check                            -      -            
+     0.55%  imagedb               [.] imdb_sha256_final                           -      -            

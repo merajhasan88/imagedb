@@ -1,0 +1,60 @@
+    23.19%  imagedb  imagedb      
+            |          
+            |--10.58%--0xffffffffffffffff
+            |          main
+            |          cmd_sql (inlined)
+            |          run_text (inlined)
+            |          imdb_split_statements
+            |          run_stmt
+            |          imdb_exec_one
+            |          |          
+            |          |--6.63%--exec_update (inlined)
+            |          |          imdb_update_salt
+            |          |          imdb_update_salt
+            |          |          imdb_update_row (inlined)
+            |          |          imdb_update_row (inlined)
+            |          |          add_version (inlined)
+            |          |          add_version (inlined)
+            |          |          imdb_row_commit
+            |          |          |          
+            |          |          |--3.62%--imdb_sha256_update
+            |          |          |          imdb_sha256_compress
+            |          |          |          
+            |          |           --3.00%--imdb_sha256_final
+            |          |                     imdb_sha256_update
+            |          |                     imdb_sha256_compress
+            |          |          
+            |           --3.96%--imdb_commit
+            |                     imdb_commit_hash
+            |                     imdb_sha256_update
+            |                     imdb_sha256_compress
+            |          
+            |--9.64%--__clone3 (inlined)
+            |          start_thread
+            |          worker
+            |          run_items (inlined)
+            |          rpre_frame
+            |          |          
+            |          |--7.10%--imdb_row_commit
+            |          |          |          
+            |          |          |--3.69%--imdb_sha256_update
+            |          |          |          imdb_sha256_compress
+            |          |          |          
+            |          |           --3.41%--imdb_sha256_final
+            |          |                     imdb_sha256_update
+            |          |                     imdb_sha256_compress
+            |          |          
+            |           --2.54%--imdb_frame_decode_body
+            |                     imdb_commit_decode_header
+            |                     imdb_commit_hash (inlined)
+            |                     imdb_sha256_update
+            |                     imdb_sha256_compress
+            |          
+             --2.89%--_start
+                       __libc_start_main_impl (inlined)
+                       __libc_start_call_main
+                       main
+                       cmd_sql (inlined)
+                       open_anchored
+                       imdb_open
+                       imdb_replay

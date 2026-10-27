@@ -1,0 +1,3 @@
+run 1 CPU ms: insert 812; open after it 827; update statement process 2024; so the update itself 1197 ms, 5985 ns per row
+run 2 CPU ms: insert 821; open after it 786; update statement process 2054; so the update itself 1268 ms, 6340 ns per row
+run 3 CPU ms: insert 822; open after it 835; update statement process 2042; so the update itself 1207 ms, 6035 ns per row

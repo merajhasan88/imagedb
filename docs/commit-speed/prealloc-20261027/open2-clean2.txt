@@ -1,0 +1,4 @@
+ count 
+--------
+ 200000
+(1 row)  [scan]  at commit 201

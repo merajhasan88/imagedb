@@ -1,0 +1,32 @@
+imagedb   single_row_commit commits_per_s    before 258        after 562
+postgres  single_row_commit commits_per_s    before 496        after 492
+imagedb   single_row_commit p50              before 3808.6     after 1774.4
+postgres  single_row_commit p50              before 2015.0     after 1981.9
+imagedb   single_row_commit p95              before 5119.3     after 2469.0
+postgres  single_row_commit p95              before 2707.2     after 2759.8
+imagedb   single_row_commit p99              before 5333.4     after 2560.9
+postgres  single_row_commit p99              before 2821.5     after 2872.4
+imagedb   batch_insert_100 rows_per_s        before 21636      after 38953
+postgres  batch_insert_100 rows_per_s        before 22424      after 22025
+imagedb   batch_insert_10000 rows_per_s      before 160191     after 150220
+postgres  batch_insert_10000 rows_per_s      before 41954      after 37604
+imagedb   churn_update_1000 rows_per_s       before 101591     after 112276
+postgres  churn_update_1000 rows_per_s       before 103278     after 103162
+imagedb   delete_reinsert_1000 rows_per_s    before 132351     after 162549
+postgres  delete_reinsert_1000 rows_per_s    before 63499      after 59224
+imagedb   reopen_load_state seconds          before 1.401      after 1.407
+postgres  reopen_load_state seconds          before -          after -
+imagedb   w6_load_1000 rows_per_s            before 98837      after 124152
+postgres  w6_load_1000 rows_per_s            before 37953      after 41379
+imagedb   w6_update_1000 rows_per_s          before 30208      after 143013
+postgres  w6_update_1000 rows_per_s          before 125899     after 122610
+imagedb   w7_load_1000 rows_per_s            before 102809     after 120200
+postgres  w7_load_1000 rows_per_s            before 38220      after 39755
+imagedb   w8_unique_insert_100 rows_per_s    before 20214      after 46135
+postgres  w8_unique_insert_100 rows_per_s    before 24536      after 20835
+imagedb   storage size                       before 299.1      after 303.5
+postgres  storage size                       before 303.5      after 303.5
+device sda: 1 pauses or slow flushes (bench/devstall: 200 ms or more with requests in flight and none completing, a lower bound, or 200 ms of flushes completed in 0.1 s)
+devstall flush 10:36:45.647 2.502 s
+device sda: 1 pauses or slow flushes (bench/devstall: 200 ms or more with requests in flight and none completing, a lower bound, or 200 ms of flushes completed in 0.1 s)
+devstall flush 10:39:58.917 2.700 s

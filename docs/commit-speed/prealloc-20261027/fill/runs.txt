@@ -1,0 +1,61 @@
+== nosync-1-before 11:13:27.107 /home/developer/imagedb/build/tmp/commit_lat-before nosync /home/developer/imagedb/build/tmp/pm3/nosync-1-before 200000 1000
+   end 11:13:28.123
+== nosync-1-p1 11:13:33.132 /home/developer/imagedb/build/tmp/commit_lat-p1 nosync /home/developer/imagedb/build/tmp/pm3/nosync-1-p1 200000 1000
+   end 11:13:34.322
+== nosync-1-p2 11:13:39.330 /home/developer/imagedb/build/tmp/commit_lat-p2 nosync /home/developer/imagedb/build/tmp/pm3/nosync-1-p2 200000 1000
+   end 11:13:40.350
+== nosync-2-p2 11:13:45.356 /home/developer/imagedb/build/tmp/commit_lat-p2 nosync /home/developer/imagedb/build/tmp/pm3/nosync-2-p2 200000 1000
+   end 11:13:46.373
+== nosync-2-p1 11:13:51.379 /home/developer/imagedb/build/tmp/commit_lat-p1 nosync /home/developer/imagedb/build/tmp/pm3/nosync-2-p1 200000 1000
+   end 11:13:52.565
+== nosync-2-before 11:13:57.572 /home/developer/imagedb/build/tmp/commit_lat-before nosync /home/developer/imagedb/build/tmp/pm3/nosync-2-before 200000 1000
+   end 11:13:58.584
+== nosync1-1-before 11:14:03.590 /home/developer/imagedb/build/tmp/commit_lat-before nosync /home/developer/imagedb/build/tmp/pm3/nosync1-1-before 20000 1
+   end 11:14:04.421
+== nosync1-1-p1 11:14:09.429 /home/developer/imagedb/build/tmp/commit_lat-p1 nosync /home/developer/imagedb/build/tmp/pm3/nosync1-1-p1 20000 1
+   end 11:14:10.321
+== nosync1-1-p2 11:14:15.328 /home/developer/imagedb/build/tmp/commit_lat-p2 nosync /home/developer/imagedb/build/tmp/pm3/nosync1-1-p2 20000 1
+   end 11:14:16.173
+== nosync1-2-p2 11:14:21.181 /home/developer/imagedb/build/tmp/commit_lat-p2 nosync /home/developer/imagedb/build/tmp/pm3/nosync1-2-p2 20000 1
+   end 11:14:22.022
+== nosync1-2-p1 11:14:27.029 /home/developer/imagedb/build/tmp/commit_lat-p1 nosync /home/developer/imagedb/build/tmp/pm3/nosync1-2-p1 20000 1
+   end 11:14:27.922
+== nosync1-2-before 11:14:32.928 /home/developer/imagedb/build/tmp/commit_lat-before nosync /home/developer/imagedb/build/tmp/pm3/nosync1-2-before 20000 1
+   end 11:14:33.758
+== sync10k-1-before 11:14:38.766 /home/developer/imagedb/build/tmp/commit_lat-before sync /home/developer/imagedb/build/tmp/pm3/sync10k-1-before 200000 10000
+   end 11:14:39.831
+== sync10k-1-p1 11:14:44.839 /home/developer/imagedb/build/tmp/commit_lat-p1 sync /home/developer/imagedb/build/tmp/pm3/sync10k-1-p1 200000 10000
+   end 11:14:45.976
+== sync10k-1-p2 11:14:50.982 /home/developer/imagedb/build/tmp/commit_lat-p2 sync /home/developer/imagedb/build/tmp/pm3/sync10k-1-p2 200000 10000
+   end 11:14:52.066
+== sync10k-2-p2 11:14:57.072 /home/developer/imagedb/build/tmp/commit_lat-p2 sync /home/developer/imagedb/build/tmp/pm3/sync10k-2-p2 200000 10000
+   end 11:15:00.605
+== sync10k-2-p1 11:15:05.611 /home/developer/imagedb/build/tmp/commit_lat-p1 sync /home/developer/imagedb/build/tmp/pm3/sync10k-2-p1 200000 10000
+   end 11:15:06.753
+== sync10k-2-before 11:15:11.761 /home/developer/imagedb/build/tmp/commit_lat-before sync /home/developer/imagedb/build/tmp/pm3/sync10k-2-before 200000 10000
+   end 11:15:12.839
+== sync1k-1-before 11:15:17.846 /home/developer/imagedb/build/tmp/commit_lat-before sync /home/developer/imagedb/build/tmp/pm3/sync1k-1-before 200000 1000
+   end 11:15:19.714
+== sync1k-1-p1 11:15:24.720 /home/developer/imagedb/build/tmp/commit_lat-p1 sync /home/developer/imagedb/build/tmp/pm3/sync1k-1-p1 200000 1000
+   end 11:15:26.320
+== sync1k-1-p2 11:15:31.326 /home/developer/imagedb/build/tmp/commit_lat-p2 sync /home/developer/imagedb/build/tmp/pm3/sync1k-1-p2 200000 1000
+   end 11:15:32.918
+== sync1k-2-p2 11:15:37.925 /home/developer/imagedb/build/tmp/commit_lat-p2 sync /home/developer/imagedb/build/tmp/pm3/sync1k-2-p2 200000 1000
+   end 11:15:39.528
+== sync1k-2-p1 11:15:44.533 /home/developer/imagedb/build/tmp/commit_lat-p1 sync /home/developer/imagedb/build/tmp/pm3/sync1k-2-p1 200000 1000
+   end 11:15:46.146
+== sync1k-2-before 11:15:51.154 /home/developer/imagedb/build/tmp/commit_lat-before sync /home/developer/imagedb/build/tmp/pm3/sync1k-2-before 200000 1000
+   end 11:15:53.000
+== sync-1-before 11:15:58.006 /home/developer/imagedb/build/tmp/commit_lat-before sync /home/developer/imagedb/build/tmp/pm3/sync-1-before 8000 1
+   end 11:16:28.569
+== sync-1-p1 11:16:33.578 /home/developer/imagedb/build/tmp/commit_lat-p1 sync /home/developer/imagedb/build/tmp/pm3/sync-1-p1 8000 1
+   end 11:16:48.508
+== sync-1-p2 11:16:53.515 /home/developer/imagedb/build/tmp/commit_lat-p2 sync /home/developer/imagedb/build/tmp/pm3/sync-1-p2 8000 1
+   end 11:17:08.598
+== sync-2-p2 11:17:13.609 /home/developer/imagedb/build/tmp/commit_lat-p2 sync /home/developer/imagedb/build/tmp/pm3/sync-2-p2 8000 1
+   end 11:17:28.771
+== sync-2-p1 11:17:33.778 /home/developer/imagedb/build/tmp/commit_lat-p1 sync /home/developer/imagedb/build/tmp/pm3/sync-2-p1 8000 1
+   end 11:17:48.984
+== sync-2-before 11:17:53.991 /home/developer/imagedb/build/tmp/commit_lat-before sync /home/developer/imagedb/build/tmp/pm3/sync-2-before 8000 1
+   end 11:18:24.945
+done 11:18:24

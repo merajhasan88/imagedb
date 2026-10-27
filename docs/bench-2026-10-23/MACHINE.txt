@@ -1,0 +1,16 @@
+R8 whole-engine benchmarks, 2026-10-23 (bench/whole.sh, bench/whole.c; raw output in run1.txt, run2.txt)
+run 1: 02:03-02:09 PKT; run 2: 02:11-02:17 PKT (run 2 added initdb --locale=C and cd / before su; no text is compared)
+cpu: Intel(R) Core(TM) i7-8550U CPU @ 1.80GHz, 8 CPUs, performance governor during each run (powersave restored after)
+disk: CT500BX100SSD1 (SATA SSD), ext4 (rw,relatime) on /dev/sda2, data in /var/tmp
+kernel: 6.8.0-138-generic
+sqlite: 3.37.2-2ubuntu0.8 (WAL, synchronous=FULL)
+postgres: 14.24 (private instance, fsync=on, synchronous_commit=on, defaults otherwise)
+imagedb: build/libimagedb.a of 2026-10-23 00:00 (the tree the R3+R4 matrix tested), sync=1
+run 3: 20:32-20:39 PKT (after a reboot at 12:36; load 0.86 at the start; another Claude session's
+  processes on the machine, its Python job not running then): adds per-phase CPU, peak RSS (VmHWM)
+  and bench/fsync_probe.c; its imagedb throughputs within ~3% of runs 1-2, SQLite's 8-18% higher,
+  PostgreSQL's per-statement latencies 20-50% higher, so only its CPU split, ratios within it and
+  the probe are used, not its timings
+run 4 (run4-imagedb.txt): 20:43, imagedb alone (build/whole imagedb, the performance governor set
+  by hand and restored): commits per phase (one automatic CHECKPOINT in the churn: 501 commits for
+  500 transactions) and the log tail at reopen (235 commits)

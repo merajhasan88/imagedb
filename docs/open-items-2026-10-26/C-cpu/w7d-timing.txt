@@ -1,0 +1,9 @@
+W7d before checkpoint, run 1: open 338 ms; open + 20 W7d 1467 ms; so 56 ms a query
+W7d before checkpoint, run 2: open 334 ms; open + 20 W7d 1463 ms; so 56 ms a query
+W7d before checkpoint, run 3: open 320 ms; open + 20 W7d 1423 ms; so 55 ms a query
+W7d after checkpoint, run 1: open 356 ms; open + 20 W7d 1242 ms; so 44 ms a query
+W7d after checkpoint, run 2: open 345 ms; open + 20 W7d 1242 ms; so 44 ms a query
+W7d after checkpoint, run 3: open 356 ms; open + 20 W7d 1275 ms; so 45 ms a query
+== plans
+(100 rows)  [join(index 1)]  at commit 226
+(100 rows)  [join(index 1)]  at commit 227

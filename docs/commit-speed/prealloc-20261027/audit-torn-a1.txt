@@ -1,0 +1,1 @@
+imagedb-audit: FAILED: log damaged: commit 201 was acknowledged as durable, but segment 00000000000000000001.ilg ends with a damaged or incomplete frame after commit 200

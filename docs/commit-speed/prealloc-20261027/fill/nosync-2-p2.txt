@@ -1,0 +1,6 @@
+commit_lat nosync rows_per_s 306862 rows/s
+commit_lat nosync close 64.8 ms
+commit_lat nosync log_bytes 21581312 bytes
+commit_lat nosync log_segments 1
+commit_lat nosync reopen 256.3 ms
+rc 0

@@ -1,0 +1,31 @@
+== run 1: old (build/tmp/pre-e3a/build/bench, IMDB_DIGEST_ALG=1), 12:25:41, load 1.34, mean clock 3771 MHz
+imagedb bench  (sse4.2=1 avx2=1)
+cpu0 governor performance, 3979 MHz now
+kernels:
+  crc32c          C table    0.48 GB/s   asm-sse42         9.65 GB/s
+  lthash add      C         525.4 ns/op   asm-avx2          25.8 ns/op (2 KiB vector)
+  range filter    C          1143 Mrow/s  asm-avx2          2007 Mrow/s
+  exact sum       C int128    756 Mrow/s  asm-avx2-split    1817 Mrow/s
+  utf8 ascii run  C          2.67 GB/s   asm-avx2         25.20 GB/s
+  digest element  C          18.2 us/row  avx2-sha256x8      3.1 us/row (64 x SHA-256)
+  ed25519 sign    Monocypher   49.1 us     fast   19.9 us  (2.5x)
+  ed25519 verify  Monocypher  140.5 us     fast   53.4 us  (2.6x; 800/800 valid)
+  ed25519 batch   scalar field   13.4 us per signature, four-way field   10.1 us
+  ed25519 batch     10.1 us per signature in groups of 64 (5.3x the single fast check; 40/40 groups valid)
+engine (200000 rows):
+  bulk insert       274434 rows/s   (200000 rows, LtHash digest included, parallel)
+  single-row txn      39.5 us/commit (sync=0, so no fdatasync: not durable latency; chain hash, Ed25519 signature,
+                                   digest and the DURABLE watermark write included)
+  checkpoint          0.28 s        (segments + manifest for 202000 rows)
+  pk lookup           0.21 us        (engine API)
+  user query           0.00 ms/query  index path
+  range aggregate      0.32 ms/query  SIMD scan
+                   =      637 Mrow/s
+  range aggregate      5.47 ms/query  store (row at a time)
+                   =       37 Mrow/s
+  VERIFY              0.82 s        (read 0.01, parallel 0.25, ordered 0.02, engine 0.16, lake 0.36; 8 threads)
+  replica apply     169869 rows/s   (2006 commits, every check incl. lake rebuild + state recompute)
+  reopen              0.32 s        (from the lake snapshot at commit 2006, tail replayed)
+  reopen (full)       0.55 s        (every commit replayed and re-verified)
+  kept            build/tmp/bench-primary, build/tmp/bench-replica
+algorithm  digest_alg 1 (LtHash16 by MGF1-SHA256, the digest SHA-256)

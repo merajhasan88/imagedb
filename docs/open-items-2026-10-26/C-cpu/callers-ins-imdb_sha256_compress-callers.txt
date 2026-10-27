@@ -1,0 +1,30 @@
+    19.70%  imagedb  imagedb      
+            |
+            ---0xffffffffffffffff
+               main
+               cmd_sql (inlined)
+               run_text (inlined)
+               imdb_split_statements
+               run_stmt
+               imdb_exec_one
+               |          
+               |--14.77%--exec_insert (inlined)
+               |          imdb_insert_salt
+               |          imdb_insert_salt
+               |          imdb_insert_row (inlined)
+               |          imdb_insert_row (inlined)
+               |          add_version (inlined)
+               |          add_version (inlined)
+               |          imdb_row_commit
+               |          |          
+               |          |--7.82%--imdb_sha256_update
+               |          |          imdb_sha256_compress
+               |          |          
+               |           --6.96%--imdb_sha256_final
+               |                     imdb_sha256_update
+               |                     imdb_sha256_compress
+               |          
+                --4.93%--imdb_commit
+                          imdb_commit_hash
+                          imdb_sha256_update
+                          imdb_sha256_compress

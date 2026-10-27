@@ -1,0 +1,1772 @@
+[
+ {
+  "cve": "CVE-2004-0977",
+  "affected": "7.4, 7.3",
+  "fixed": "7.4.6, 7.3.8",
+  "component": "client contrib module",
+  "score": "Legacy:",
+  "vector": "",
+  "desc": "Contrib script make_oidjoins_check uses unsafe temporary files. This script is not a user-facing script.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2005-0227",
+  "affected": "8.0, 7.4, 7.3",
+  "fixed": "8.0.1, 7.4.7, 7.3.9",
+  "component": "core server",
+  "score": "Legacy: C",
+  "vector": "",
+  "desc": "Any database user is permitted to load arbitrary shared libraries using the LOAD command. A valid login is required to exploit this vulnerability.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2005-0244",
+  "affected": "8.0, 7.4, 7.3",
+  "fixed": "8.0.1, 7.4.7, 7.3.9",
+  "component": "core server",
+  "score": "Legacy: C",
+  "vector": "",
+  "desc": "EXECUTE permissions are not properly checked when creating aggregates. A valid login is required to exploit this vulnerability.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2005-0245",
+  "affected": "8.0, 7.4, 7.3",
+  "fixed": "8.0.1, 7.4.7, 7.3.10",
+  "component": "core server",
+  "score": "Legacy: C",
+  "vector": "",
+  "desc": "Multiple buffer overflows in the PL/PGSQL parser may allow attackers to execute arbitrary code. A valid login is required to exploit this vulnerability.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2005-0246",
+  "affected": "8.0, 7.4, 7.3",
+  "fixed": "8.0.1, 7.4.7, 7.3.9",
+  "component": "contrib module",
+  "score": "Legacy: D",
+  "vector": "",
+  "desc": "The intagg contrib module allows attackers to cause a denial of service. A valid login is required to exploit this vulnerability.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2005-0247",
+  "affected": "8.0, 7.4",
+  "fixed": "8.0.2, 7.4.8",
+  "component": "core server",
+  "score": "Legacy: C",
+  "vector": "",
+  "desc": "Multiple buffer overflows in the PL/PGSQL parser may allow attackers to execute arbitrary code. A valid login is required to exploit this vulnerability.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2005-1409",
+  "affected": "8.0, 7.4, 7.3",
+  "fixed": "8.0.3, 7.4.8, 7.3.10",
+  "component": "core server",
+  "score": "Legacy: D",
+  "vector": "",
+  "desc": "Public EXECUTE access is given to certain character conversion functions that are not designed to be safe against malicious arguments. This can cause at least a denial of service. A valid login is required to exploit this vulnerability.Note! See the announcement for special upgrade instructions.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2005-1410",
+  "affected": "8.0, 7.4",
+  "fixed": "8.0.3, 7.4.8",
+  "component": "contrib module",
+  "score": "Legacy: D",
+  "vector": "",
+  "desc": "The tsearch2 contrib module declares several functions as internal even though they don't take an internal argument. This allows attackers to cause a denial of service and may possibly have other impacts. A valid login is required to exploit this vulnerability.Note! See the announcement for special upgrade instructions.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2006-0105",
+  "affected": "8.1, 8.0",
+  "fixed": "8.1.2, 8.0.6",
+  "component": "core server",
+  "score": "Legacy: B",
+  "vector": "",
+  "desc": "On Windows only, the postmaster will exit if too many connection requests arrive simultaneously. This does not affect existing database connections, but will prevent new connections from being established until the postmaster is manually restarted.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2006-0553",
+  "affected": "8.1",
+  "fixed": "8.1.3",
+  "component": "core server",
+  "score": "Legacy: C",
+  "vector": "",
+  "desc": "A bug in the handling of SET ROLE allows escalation of privileges to any other database user, including superuser. A valid login is required to exploit this vulnerability.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2006-0678",
+  "affected": "8.0, 7.4, 7.3",
+  "fixed": "8.0.7, 7.4.12, 7.3.14",
+  "component": "core server",
+  "score": "Legacy: D",
+  "vector": "",
+  "desc": "A bug in the handling of SET SESSION AUTHORIZATION can cause a backend crash in Assert enabled builds. This will cause the postmaster to restart all backend, resulting in a denial of service. A valid login is required to exploit this vulnerability.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2006-2313",
+  "affected": "8.1, 8.0, 7.4, 7.3",
+  "fixed": "8.1.4, 8.0.8, 7.4.13, 7.3.15",
+  "component": "core server",
+  "score": "Legacy: A",
+  "vector": "",
+  "desc": "An attacker able to submit crafted strings to an application that will embed those strings in SQL commands can use invalidly-encoded multibyte characters to bypass standard string-escaping methods, resulting in possible SQL injection.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2006-2314",
+  "affected": "8.1, 8.0, 7.4, 7.3",
+  "fixed": "8.1.4, 8.0.8, 7.4.13, 7.3.15",
+  "component": "core server",
+  "score": "Legacy: A",
+  "vector": "",
+  "desc": "The widely-used practice of escaping ASCII single quote \"'\" by turning it into \"\\'\" is unsafe when operating in multibyte encodings that allow 0x5c (ASCII code for backslash) as the trailing byte of a multibyte character.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2006-5540",
+  "affected": "8.1",
+  "fixed": "8.1.5",
+  "component": "core server",
+  "score": "Legacy: D",
+  "vector": "",
+  "desc": "A bug in the handling of aggregates in UPDATE can cause a denial of service. A valid login is required to exploit this vulnerability.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2006-5541",
+  "affected": "8.1, 8.0, 7.4",
+  "fixed": "8.1.5, 8.0.9, 7.4.14",
+  "component": "core server",
+  "score": "Legacy: D",
+  "vector": "",
+  "desc": "A bug in the coercion of unknown literals to ANYARRAY can cause a denial of service. A valid login is required to exploit this vulnerability.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2006-5542",
+  "affected": "8.1",
+  "fixed": "8.1.5",
+  "component": "core server",
+  "score": "Legacy: D",
+  "vector": "",
+  "desc": "A bug in the logging of V3 protocol messages can cause a denial of service. A valid login is required to exploit this vulnerability.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2007-0555",
+  "affected": "8.2, 8.1, 8.0, 7.4, 7.3",
+  "fixed": "8.2.2, 8.1.7, 8.0.11, 7.4.16, 7.3.13",
+  "component": "core server",
+  "score": "Legacy: C",
+  "vector": "",
+  "desc": "A vulnerability allows suppressing the normal checks that a SQL function returns the data type it's declared to do. These errors can easily be exploited to cause a backend crash, and in principle might be used to read database content that the user should not be able to access.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2007-0556",
+  "affected": "8.2, 8.1, 8.0",
+  "fixed": "8.2.2, 8.1.7, 8.0.11",
+  "component": "core server",
+  "score": "Legacy: C",
+  "vector": "",
+  "desc": "A vulnerability involving changing the data type of a table column can easily be exploited to cause a backend crash, and in principle might be used to read database content that the user should not be able to access.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2007-2138",
+  "affected": "8.2, 8.1, 8.0, 7.4, 7.3",
+  "fixed": "8.2.4, 8.1.9, 8.0.13, 7.4.17, 7.3.19",
+  "component": "core server",
+  "score": "Legacy: C",
+  "vector": "",
+  "desc": "A vulnerability involving insecure search_path settings allows unprivileged users to gain the SQL privileges of the owner of any SECURITY DEFINER function they are allowed to call. Securing such a function requires both a software update and changes to the function definition.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2007-4769",
+  "affected": "8.2, 8.1, 8.0, 7.4",
+  "fixed": "8.2.6, 8.1.11, 8.0.15, 7.4.19",
+  "component": "core server",
+  "score": "Legacy: B",
+  "vector": "",
+  "desc": "Three vulnearbilities in the regular expression handling libraries can be exploited to cause a backend crash, infinite loops or memory exhaustion. This vulnearbility can be exploited through frontend applications that allow unfiltered regular expressions to be passed in queries.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2007-6600",
+  "affected": "8.2, 8.1, 8.0, 7.4, 7.3",
+  "fixed": "8.2.6, 8.1.11, 8.0.15, 7.4.19, 7.3.21",
+  "component": "core server",
+  "score": "Legacy: C",
+  "vector": "",
+  "desc": "Two vulnerabilities in how ANALYZE executes user defined functions that are part of expression indexes allows users to gain superuser privileges. A valid login that has permissions to create functions and tables is required to exploit this vulnearbility.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2007-6601",
+  "affected": "8.2, 8.1, 8.0, 7.4, 7.3",
+  "fixed": "8.2.6, 8.1.11, 8.0.15, 7.4.19, 7.3.21",
+  "component": "contrib module",
+  "score": "Legacy: C",
+  "vector": "",
+  "desc": "DBLink functions combined with local trust or ident access control could be used by a malicious user togain superuser privileges. A valid login is required to exploit this vulnerability.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2009-0922",
+  "affected": "8.3, 8.2, 8.1, 8.0, 7.4",
+  "fixed": "8.3.7, 8.2.13, 8.1.17, 8.0.21, 7.4.25",
+  "component": "core server",
+  "score": "Legacy: D",
+  "vector": "",
+  "desc": "It is possible to cause a momentary denial of service when there is a failure to convert a localized error message to the client-specified encoding. A valid login is required to exploit this vulnerability.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2009-3229",
+  "affected": "8.4, 8.3, 8.2",
+  "fixed": "8.4.1, 8.3.8, 8.2.14",
+  "component": "core server",
+  "score": "Legacy: D",
+  "vector": "",
+  "desc": "Authenticated non-superusers can shut down the backend server by re-LOAD-ing libraries in $libdir/plugins, if any libraries are present there.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2009-3230",
+  "affected": "8.4, 8.3, 8.2, 8.1, 8.0, 7.4",
+  "fixed": "8.4.1, 8.3.8, 8.2.14, 8.1.18, 8.0.22, 7.4.26",
+  "component": "core server",
+  "score": "Legacy: C",
+  "vector": "",
+  "desc": "The fix for issue CVE-2007-6600 (below) failed to include protection against misuse of RESET SESSION AUTHORIZATION.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2009-3231",
+  "affected": "8.3, 8.2",
+  "fixed": "8.3.8, 8.2.14",
+  "component": "core server",
+  "score": "Legacy: A",
+  "vector": "",
+  "desc": "If PostgreSQL is configured with LDAP authentication, and your LDAP configuration allows anonymous binds, it is possible for a user to authenticate themselves with an empty password.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2009-4034",
+  "affected": "8.4, 8.3, 8.2, 8.1, 8.0, 7.4",
+  "fixed": "8.4.2, 8.3.9, 8.2.15, 8.1.19, 8.0.23, 7.4.27",
+  "component": "core server",
+  "score": "Legacy: A",
+  "vector": "",
+  "desc": "NULL Bytes in SSL Certificates can be used to falsify client or server authentication. This only affects users who have SSL enabled, perform certificate name validation or client certificate authentication, and where the Certificate Authority (CA) has been tricked into issuing invalid certificates. The use of a CA that can be trusted to always issue valid certificates is recommended to ensure you are not vulnerable to this issue.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2009-4136",
+  "affected": "8.4, 8.3, 8.2, 8.1, 8.0, 7.4",
+  "fixed": "8.4.2, 8.3.9, 8.2.15, 8.1.19, 8.0.23, 7.4.27",
+  "component": "core server",
+  "score": "Legacy: C",
+  "vector": "",
+  "desc": "Privilege escalation via changing session state in an index function. This closes a corner case related to vulnerabilities CVE-2009-3230 and CVE-2007-6600 (below).",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2010-1169",
+  "affected": "8.4, 8.3, 8.2, 8.1, 8.0, 7.4",
+  "fixed": "8.4.4, 8.3.11, 8.2.17, 8.1.21, 8.0.25, 7.4.29",
+  "component": "core server",
+  "score": "Legacy: C",
+  "vector": "",
+  "desc": "A vulnerability in Safe.pm and PL/Perl can allow an authenticated user to run arbitrary Perl code on the database",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2010-1170",
+  "affected": "8.4, 8.3, 8.2, 8.1, 8.0, 7.4",
+  "fixed": "8.4.4, 8.3.11, 8.2.17, 8.1.21, 8.0.25, 7.4.29",
+  "component": "core server",
+  "score": "Legacy: C",
+  "vector": "",
+  "desc": "Insecure permissions on the pltcl_modules table could allow an authenticated user to run arbitrary Tcl code on the",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2010-1975",
+  "affected": "8.4, 8.3, 8.2, 8.1, 8.0, 7.4",
+  "fixed": "8.4.4, 8.3.11, 8.2.17, 8.1.21, 8.0.25, 7.4.29",
+  "component": "core server",
+  "score": "Legacy: C",
+  "vector": "",
+  "desc": "An unprivileged database user can remove superuser-only",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2010-3433",
+  "affected": "9.0, 8.4, 8.3, 8.2, 8.1, 8.0, 7.4",
+  "fixed": "9.0.1, 8.4.5, 8.3.12, 8.2.18, 8.1.22, 8.0.26, 7.4.30",
+  "component": "core server",
+  "score": "Legacy: C",
+  "vector": "",
+  "desc": "An authenticated database user can manipulate modules and tied variables in some external procedural languages to execute code with enhanced privileges.Details",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2010-4015",
+  "affected": "9.0, 8.4, 8.3, 8.2",
+  "fixed": "9.0.3, 8.4.7, 8.3.14, 8.2.20",
+  "component": "contrib module",
+  "score": "Legacy: C",
+  "vector": "",
+  "desc": "An authenticated database user can cause a buffer overrun by calling functions from the intarray optional module with certain parameters.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2012-0866",
+  "affected": "9.1, 9.0, 8.4, 8.3",
+  "fixed": "9.1.3, 9.0.7, 8.4.11, 8.3.18",
+  "component": "core server",
+  "score": "Legacy: C",
+  "vector": "",
+  "desc": "Permissions on a function called by a trigger are not properly checked.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2012-0867",
+  "affected": "9.1, 9.0, 8.4",
+  "fixed": "9.1.3, 9.0.7, 8.4.11",
+  "component": "core server",
+  "score": "Legacy: A",
+  "vector": "",
+  "desc": "SSL certificate name checks are truncated to 32 characters, allowing connection spoofing under some circumstances when using third party certificate authorities.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2012-0868",
+  "affected": "9.1, 9.0, 8.4, 8.3",
+  "fixed": "9.1.3, 9.0.7, 8.4.11, 8.3.18",
+  "component": "core server",
+  "score": "Legacy: C",
+  "vector": "",
+  "desc": "Line breaks in object names can be exploited to execute arbitrary SQL when reloading a pg_dump file.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2012-2143",
+  "affected": "9.1, 9.0, 8.4, 8.3",
+  "fixed": "9.1.4, 9.0.8, 8.4.12, 8.3.19",
+  "component": "contrib module",
+  "score": "Legacy: C",
+  "vector": "",
+  "desc": "Passwords containing the byte 0x80 passed to the crypt() function in pgcrypto are incorrectly truncated if DES encryption was used",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2012-2655",
+  "affected": "9.1, 9.0, 8.4, 8.3",
+  "fixed": "9.1.4, 9.0.8, 8.4.12, 8.3.19",
+  "component": "core server",
+  "score": "Legacy: D",
+  "vector": "",
+  "desc": "SECURITY DEFINER and SET attributes on procedural call handlers are not ignored and can be used to crash the server",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2012-3488",
+  "affected": "9.1, 9.0, 8.4, 8.3",
+  "fixed": "9.1.5, 9.0.9, 8.4.13, 8.3.20",
+  "component": "contrib module",
+  "score": "Legacy: C",
+  "vector": "",
+  "desc": "contrib/xml2's xslt_process() can be used to read and write arbitrary files",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2012-3489",
+  "affected": "9.1, 9.0, 8.4, 8.3",
+  "fixed": "9.1.5, 9.0.9, 8.4.13, 8.3.20",
+  "component": "core server",
+  "score": "Legacy: C",
+  "vector": "",
+  "desc": "xml_parse() DTD validation can be used to read arbitrary files",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2013-0255",
+  "affected": "9.2, 9.1, 9.0, 8.4, 8.3",
+  "fixed": "9.2.3, 9.1.8, 9.0.12, 8.4.16, 8.3.23",
+  "component": "core server",
+  "score": "Legacy: D",
+  "vector": "",
+  "desc": "executing enum_recv() with wrong parameters crashes server",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2013-1899",
+  "affected": "9.2, 9.1, 9.0",
+  "fixed": "9.2.4, 9.1.9, 9.0.13",
+  "component": "core server",
+  "score": "Legacy: A",
+  "vector": "",
+  "desc": "A connection request containing a database name that begins with \"-\" may be crafted to damage or destroy files within a server's data directory",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2013-1900",
+  "affected": "9.2, 9.1, 9.0, 8.4",
+  "fixed": "9.2.4, 9.1.9, 9.0.13, 8.4.17",
+  "component": "contrib module",
+  "score": "Legacy: C",
+  "vector": "",
+  "desc": "Random numbers generated by contrib/pgcrypto functions may be easy for another database user to guess",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2013-1901",
+  "affected": "9.2, 9.1",
+  "fixed": "9.2.4, 9.1.9",
+  "component": "core server",
+  "score": "Legacy: D",
+  "vector": "",
+  "desc": "An unprivileged user can run commands that could interfere with in-progress backups.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2014-0060",
+  "affected": "9.3, 9.2, 9.1, 9.0, 8.4",
+  "fixed": "9.3.3, 9.2.7, 9.1.12, 9.0.16, 8.4.20",
+  "component": "core server",
+  "score": "3.1",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:N/I:N/A:L",
+  "desc": "SET ROLE bypasses lack of ADMIN OPTION.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2014-0061",
+  "affected": "9.3, 9.2, 9.1, 9.0, 8.4",
+  "fixed": "9.3.3, 9.2.7, 9.1.12, 9.0.16, 8.4.20",
+  "component": "core server",
+  "score": "7.5",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "Privilege escalation via calls to validator functions.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2014-0062",
+  "affected": "9.3, 9.2, 9.1, 9.0, 8.4",
+  "fixed": "9.3.3, 9.2.7, 9.1.12, 9.0.16, 8.4.20",
+  "component": "core server",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "Race condition in CREATE INDEX allows for privilege escalation.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2014-0063",
+  "affected": "9.3, 9.2, 9.1, 9.0, 8.4",
+  "fixed": "9.3.3, 9.2.7, 9.1.12, 9.0.16, 8.4.20",
+  "component": "core server",
+  "score": "4.3",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:L/A:N",
+  "desc": "Potential buffer overruns in datetime input/output.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2014-0064",
+  "affected": "9.3, 9.2, 9.1, 9.0, 8.4",
+  "fixed": "9.3.3, 9.2.7, 9.1.12, 9.0.16, 8.4.20",
+  "component": "core server",
+  "score": "6.5",
+  "vector": "AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:L/A:H",
+  "desc": "Potential buffer overruns due to integer overflow in size calculations.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2014-0065",
+  "affected": "9.3, 9.2, 9.1, 9.0, 8.4",
+  "fixed": "9.3.3, 9.2.7, 9.1.12, 9.0.16, 8.4.20",
+  "component": "core server",
+  "score": "0.0",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:N/I:N/A:N",
+  "desc": "Potential buffer overruns of fixed-size buffers.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2014-0066",
+  "affected": "9.3, 9.2, 9.1, 9.0, 8.4",
+  "fixed": "9.3.3, 9.2.7, 9.1.12, 9.0.16, 8.4.20",
+  "component": "contrib module",
+  "score": "0.0",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:N/I:N/A:N",
+  "desc": "Potential null pointer dereference crash when crypt(3) returns NULL.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2014-0067",
+  "affected": "9.4, 9.3, 9.2, 9.1, 9.0",
+  "fixed": "9.4.1, 9.3.6, 9.2.10, 9.1.15, 9.0.19",
+  "component": "other",
+  "score": "7.0",
+  "vector": "AV:L/AC:H/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "Unauthenticated users may gain access to the database server during \"make check\"..",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2014-8161",
+  "affected": "9.4, 9.3, 9.2, 9.1, 9.0",
+  "fixed": "9.4.1, 9.3.6, 9.2.10, 9.1.15, 9.0.19",
+  "component": "core server",
+  "score": "3.1",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:L/I:N/A:N",
+  "desc": "Constraint violation errors can cause display of values in columns which the user would not normally have rights to see.",
+  "first_fix": ""
+ },
+ {
+  "cve": "CVE-2015-0241",
+  "affected": "9.4, 9.3, 9.2, 9.1, 9.0",
+  "fixed": "9.4.1, 9.3.6, 9.2.10, 9.1.15, 9.0.19",
+  "component": "core server",
+  "score": "4.2",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:L/I:L/A:N",
+  "desc": "Buffer overruns in \"to_char\" functions.",
+  "first_fix": "2015-02-05"
+ },
+ {
+  "cve": "CVE-2015-0242",
+  "affected": "9.4, 9.3, 9.2, 9.1, 9.0",
+  "fixed": "9.4.1, 9.3.6, 9.2.10, 9.1.15, 9.0.19",
+  "component": "core server",
+  "score": "4.2",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:L/I:L/A:N",
+  "desc": "Buffer overrun in replacement printf family of functions.",
+  "first_fix": "2015-02-05"
+ },
+ {
+  "cve": "CVE-2015-0243",
+  "affected": "9.4, 9.3, 9.2, 9.1, 9.0",
+  "fixed": "9.4.1, 9.3.6, 9.2.10, 9.1.15, 9.0.19",
+  "component": "contrib module",
+  "score": "6.5",
+  "vector": "AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:L/A:H",
+  "desc": "Memory errors in functions in the pgcrypto extension.",
+  "first_fix": "2015-02-05"
+ },
+ {
+  "cve": "CVE-2015-0244",
+  "affected": "9.4, 9.3, 9.2, 9.1, 9.0",
+  "fixed": "9.4.1, 9.3.6, 9.2.10, 9.1.15, 9.0.19",
+  "component": "core server",
+  "score": "8.1",
+  "vector": "AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "An error in extended protocol message reading.",
+  "first_fix": "2015-02-05"
+ },
+ {
+  "cve": "CVE-2015-3165",
+  "affected": "9.4, 9.3, 9.2, 9.1, 9.0",
+  "fixed": "9.4.2, 9.3.7, 9.2.11, 9.1.16, 9.0.20",
+  "component": "core server",
+  "score": "7.5",
+  "vector": "AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+  "desc": "Double \"free\" after authentication timeout",
+  "first_fix": "2015-05-22"
+ },
+ {
+  "cve": "CVE-2015-3166",
+  "affected": "9.4, 9.3, 9.2, 9.1, 9.0",
+  "fixed": "9.4.2, 9.3.7, 9.2.11, 9.1.16, 9.0.20",
+  "component": "core server",
+  "score": "5.6",
+  "vector": "AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:L/A:L",
+  "desc": "Unanticipated errors from the standard library.",
+  "first_fix": "2015-05-22"
+ },
+ {
+  "cve": "CVE-2015-3167",
+  "affected": "9.4, 9.3, 9.2, 9.1, 9.0",
+  "fixed": "9.4.2, 9.3.7, 9.2.11, 9.1.16, 9.0.20",
+  "component": "contrib module",
+  "score": "3.7",
+  "vector": "AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:N/A:N",
+  "desc": "pgcrypto has multiple error messages for decryption with an incorrect key.",
+  "first_fix": "2015-05-22"
+ },
+ {
+  "cve": "CVE-2015-5288",
+  "affected": "9.4, 9.3, 9.2, 9.1, 9.0",
+  "fixed": "9.4.5, 9.3.10, 9.2.14, 9.1.19, 9.0.23",
+  "component": "contrib module",
+  "score": "3.1",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:L/I:N/A:N",
+  "desc": "Memory leak in crypt() function.",
+  "first_fix": "2015-10-08"
+ },
+ {
+  "cve": "CVE-2015-5289",
+  "affected": "9.4, 9.3",
+  "fixed": "9.4.5, 9.3.10",
+  "component": "core server",
+  "score": "5.9",
+  "vector": "AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:N/A:H",
+  "desc": "Unchecked JSON input can crash the server",
+  "first_fix": "2015-10-08"
+ },
+ {
+  "cve": "CVE-2016-0773",
+  "affected": "9.5, 9.4, 9.3, 9.2, 9.1",
+  "fixed": "9.5.1, 9.4.6, 9.3.11, 9.2.15, 9.1.20",
+  "component": "core server",
+  "score": "6.5",
+  "vector": "AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:L/A:H",
+  "desc": "Unchecked regex can crash the server",
+  "first_fix": "2016-02-11"
+ },
+ {
+  "cve": "CVE-2016-2193",
+  "affected": "9.5",
+  "fixed": "9.5.2",
+  "component": "core server",
+  "score": "4.2",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:L/I:L/A:N",
+  "desc": "Plan cache might use wrong role context for RLS policy",
+  "first_fix": "2016-03-31"
+ },
+ {
+  "cve": "CVE-2016-3065",
+  "affected": "9.5",
+  "fixed": "9.5.2",
+  "component": "contrib module",
+  "score": "3.1",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:L/I:N/A:N",
+  "desc": "pageinspect does not check permissions for BRIN indexes",
+  "first_fix": "2016-03-31"
+ },
+ {
+  "cve": "CVE-2016-5423",
+  "affected": "9.5, 9.4, 9.3, 9.2, 9.1",
+  "fixed": "9.5.4, 9.4.9, 9.3.14, 9.2.18, 9.1.23",
+  "component": "core server",
+  "score": "4.3",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:N/A:N",
+  "desc": "Certain nested CASE/WHEN expressions can crash server",
+  "first_fix": "2016-08-11"
+ },
+ {
+  "cve": "CVE-2016-5424",
+  "affected": "9.5, 9.4, 9.3, 9.2, 9.1",
+  "fixed": "9.5.4, 9.4.9, 9.3.14, 9.2.18, 9.1.23",
+  "component": "client",
+  "score": "8.5",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:C/C:H/I:H/A:H",
+  "desc": "Exceptional database and role names could enable escalation to superuser",
+  "first_fix": "2016-08-11"
+ },
+ {
+  "cve": "CVE-2016-7048",
+  "affected": "9.5, 9.4, 9.3, 9.2, 9.1",
+  "fixed": "9.5.5, 9.4.10, 9.3.15, 9.2.19, 9.1.24",
+  "component": "packaging",
+  "score": "7.5",
+  "vector": "AV:N/AC:H/PR:N/UI:R/S:U/C:H/I:H/A:H",
+  "desc": "Interactive installer downloads software over plain HTTP, then executes it",
+  "first_fix": "2016-10-27"
+ },
+ {
+  "cve": "CVE-2017-12172",
+  "affected": "10, 9.6, 9.5, 9.4, 9.3, 9.2",
+  "fixed": "10.1, 9.6.6, 9.5.10, 9.4.15, 9.3.20, 9.2.24",
+  "component": "contrib module",
+  "score": "8.4",
+  "vector": "AV:N/AC:L/PR:H/UI:R/S:C/C:H/I:H/A:H",
+  "desc": "Start scripts permit database administrator to modify root-owned files",
+  "first_fix": "2017-11-09"
+ },
+ {
+  "cve": "CVE-2017-15098",
+  "affected": "10, 9.6, 9.5, 9.4, 9.3",
+  "fixed": "10.1, 9.6.6, 9.5.10, 9.4.15, 9.3.20",
+  "component": "core server",
+  "score": "4.3",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:N/A:N",
+  "desc": "Memory disclosure in JSON functions",
+  "first_fix": "2017-11-09"
+ },
+ {
+  "cve": "CVE-2017-15099",
+  "affected": "10, 9.6, 9.5",
+  "fixed": "10.1, 9.6.6, 9.5.10",
+  "component": "core server",
+  "score": "3.1",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:L/I:N/A:N",
+  "desc": "INSERT ... ON CONFLICT DO UPDATE fails to enforce SELECT privileges",
+  "first_fix": "2017-11-09"
+ },
+ {
+  "cve": "CVE-2017-7484",
+  "affected": "9.6, 9.5, 9.4, 9.3, 9.2",
+  "fixed": "9.6.3, 9.5.7, 9.4.12, 9.3.17, 9.2.21",
+  "component": "core server",
+  "score": "4.3",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:N/A:N",
+  "desc": "selectivity estimators bypass SELECT privilege checks",
+  "first_fix": "2017-05-11"
+ },
+ {
+  "cve": "CVE-2017-7485",
+  "affected": "9.6, 9.5, 9.4, 9.3",
+  "fixed": "9.6.3, 9.5.7, 9.4.12, 9.3.17",
+  "component": "client",
+  "score": "8.1",
+  "vector": "AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "libpq ignores PGREQUIRESSL environment variable",
+  "first_fix": "2017-05-11"
+ },
+ {
+  "cve": "CVE-2017-7486",
+  "affected": "9.6, 9.5, 9.4, 9.3, 9.2",
+  "fixed": "9.6.3, 9.5.7, 9.4.12, 9.3.17, 9.2.21",
+  "component": "core server",
+  "score": "8.5",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:C/C:H/I:H/A:H",
+  "desc": "pg_user_mappings view discloses foreign server passwords",
+  "first_fix": "2017-05-11"
+ },
+ {
+  "cve": "CVE-2017-7546",
+  "affected": "9.6, 9.5, 9.4, 9.3, 9.2",
+  "fixed": "9.6.4, 9.5.8, 9.4.13, 9.3.18, 9.2.22",
+  "component": "core server",
+  "score": "8.1",
+  "vector": "AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "empty password accepted in some authentication methods",
+  "first_fix": "2017-08-10"
+ },
+ {
+  "cve": "CVE-2017-7547",
+  "affected": "9.6, 9.5, 9.4, 9.3, 9.2",
+  "fixed": "9.6.4, 9.5.8, 9.4.13, 9.3.18, 9.2.22",
+  "component": "core server",
+  "score": "8.5",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:C/C:H/I:H/A:H",
+  "desc": "pg_user_mappings view discloses passwords to users lacking server privileges",
+  "first_fix": "2017-08-10"
+ },
+ {
+  "cve": "CVE-2017-7548",
+  "affected": "9.6, 9.5, 9.4",
+  "fixed": "9.6.4, 9.5.8, 9.4.13",
+  "component": "core server",
+  "score": "3.1",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:N/I:L/A:N",
+  "desc": "lo_put() function ignores ACLs",
+  "first_fix": "2017-11-09"
+ },
+ {
+  "cve": "CVE-2018-1052",
+  "affected": "10",
+  "fixed": "10.2",
+  "component": "core server",
+  "score": "6.5",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N",
+  "desc": "Memory disclosure in table partitioning",
+  "first_fix": "2018-02-08"
+ },
+ {
+  "cve": "CVE-2018-1053",
+  "affected": "10, 9.6, 9.5, 9.4, 9.3",
+  "fixed": "10.2, 9.6.7, 9.5.11, 9.4.16, 9.3.21",
+  "component": "client",
+  "score": "6.7",
+  "vector": "AV:L/AC:H/PR:L/UI:R/S:U/C:H/I:H/A:H",
+  "desc": "pg_upgrade creates file of sensitive metadata under prevailing umask",
+  "first_fix": "2018-02-08"
+ },
+ {
+  "cve": "CVE-2018-1058",
+  "affected": "10, 9.6, 9.5, 9.4, 9.3",
+  "fixed": "10.3, 9.6.8, 9.5.12, 9.4.17, 9.3.22",
+  "component": "client",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "Uncontrolled search path element in pg_dump and other client applications",
+  "first_fix": "2018-03-01"
+ },
+ {
+  "cve": "CVE-2018-10915",
+  "affected": "10, 9.6, 9.5, 9.4, 9.3",
+  "fixed": "10.5, 9.6.10, 9.5.14, 9.4.19, 9.3.24",
+  "component": "client",
+  "score": "8.5",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:C/C:H/I:H/A:H",
+  "desc": "Certain host connection parameters defeat client-side security defenses",
+  "first_fix": "2018-08-09"
+ },
+ {
+  "cve": "CVE-2018-10925",
+  "affected": "10, 9.6, 9.5",
+  "fixed": "10.5, 9.6.10, 9.5.14",
+  "component": "core server",
+  "score": "7.1",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:L/A:N",
+  "desc": "Memory disclosure and missing authorization in INSERT ... ON CONFLICT DO UPDATE.",
+  "first_fix": "2018-08-09"
+ },
+ {
+  "cve": "CVE-2018-1115",
+  "affected": "10, 9.6",
+  "fixed": "10.4, 9.6.9",
+  "component": "contrib module",
+  "score": "3.1",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:N/I:L/A:N",
+  "desc": "Too-permissive access control list on function pg_logfile_rotate()",
+  "first_fix": "2018-05-10"
+ },
+ {
+  "cve": "CVE-2018-16850",
+  "affected": "11, 10",
+  "fixed": "11.1, 10.6",
+  "component": "core server",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "SQL injection in pg_upgrade and pg_dump, via CREATE TRIGGER ... REFERENCING.",
+  "first_fix": "2018-11-08"
+ },
+ {
+  "cve": "CVE-2019-10127",
+  "affected": "11, 10, 9.6, 9.5, 9.4",
+  "fixed": "11.3, 10.8, 9.6.13, 9.5.17, 9.4.22",
+  "component": "packaging",
+  "score": "7.0",
+  "vector": "AV:L/AC:H/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "BigSQL Windows installer does not clear permissive ACL entries.",
+  "first_fix": "2019-05-09"
+ },
+ {
+  "cve": "CVE-2019-10128",
+  "affected": "11, 10, 9.6, 9.5, 9.4",
+  "fixed": "11.3, 10.8, 9.6.13, 9.5.17, 9.4.22",
+  "component": "packaging",
+  "score": "7.0",
+  "vector": "AV:L/AC:H/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "EnterpriseDB Windows installer does not clear permissive ACL entries",
+  "first_fix": "2019-05-09"
+ },
+ {
+  "cve": "CVE-2019-10129",
+  "affected": "11",
+  "fixed": "11.3",
+  "component": "core server",
+  "score": "6.5",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N",
+  "desc": "Memory disclosure in partition routing",
+  "first_fix": "2019-05-09"
+ },
+ {
+  "cve": "CVE-2019-10130",
+  "affected": "11, 10, 9.6, 9.5",
+  "fixed": "11.3, 10.8, 9.6.13, 9.5.17",
+  "component": "core server",
+  "score": "3.1",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:L/I:N/A:N",
+  "desc": "Selectivity estimators bypass row security policies",
+  "first_fix": "2019-05-09"
+ },
+ {
+  "cve": "CVE-2019-10164",
+  "affected": "11, 10",
+  "fixed": "11.4, 10.9",
+  "component": "core server",
+  "score": "7.5",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "Stack-based buffer overflow via setting a password",
+  "first_fix": "2019-06-20"
+ },
+ {
+  "cve": "CVE-2019-10208",
+  "affected": "11, 10, 9.6, 9.5, 9.4",
+  "fixed": "11.5, 10.10, 9.6.15, 9.5.19, 9.4.24",
+  "component": "core server",
+  "score": "7.5",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "TYPE in pg_temp executes arbitrary SQL during SECURITY DEFINER execution",
+  "first_fix": "2019-08-08"
+ },
+ {
+  "cve": "CVE-2019-10209",
+  "affected": "11",
+  "fixed": "11.5",
+  "component": "core server",
+  "score": "3.1",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:L/I:N/A:N",
+  "desc": "Memory disclosure in cross-type comparison for hashed subplan",
+  "first_fix": "2019-08-08"
+ },
+ {
+  "cve": "CVE-2019-10210",
+  "affected": "11, 10, 9.6, 9.5, 9.4",
+  "fixed": "11.5, 10.10, 9.6.15, 9.5.19, 9.4.24",
+  "component": "packaging",
+  "score": "6.7",
+  "vector": "AV:L/AC:H/PR:L/UI:R/S:U/C:H/I:H/A:H",
+  "desc": "Windows installer writes superuser password to unprotected temporary file",
+  "first_fix": "2019-08-08"
+ },
+ {
+  "cve": "CVE-2019-10211",
+  "affected": "11, 10, 9.6, 9.5, 9.4",
+  "fixed": "11.5, 10.10, 9.6.15, 9.5.19, 9.4.24",
+  "component": "packaging",
+  "score": "7.8",
+  "vector": "AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "Windows installer bundled OpenSSL executes code from unprotected directory",
+  "first_fix": "2019-08-08"
+ },
+ {
+  "cve": "CVE-2019-3466",
+  "affected": "12, 11, 10, 9.6, 9.5, 9.4",
+  "fixed": "12.1, 11.6, 10.11, 9.6.16, 9.5.20, 9.4.25",
+  "component": "packaging",
+  "score": "8.4",
+  "vector": "AV:N/AC:L/PR:H/UI:R/S:C/C:H/I:H/A:H",
+  "desc": "pg_ctlcluster script in postgresql-common does not drop privileges when creating socket/statistics temporary directories",
+  "first_fix": "2019-11-14"
+ },
+ {
+  "cve": "CVE-2020-10733",
+  "affected": "12, 11, 10, 9.6, 9.5",
+  "fixed": "12.3, 11.8, 10.13, 9.6.18, 9.5.22",
+  "component": "packaging",
+  "score": "6.7",
+  "vector": "AV:L/AC:H/PR:L/UI:R/S:U/C:H/I:H/A:H",
+  "desc": "Windows installer runs executables from uncontrolled directories",
+  "first_fix": "2020-05-14"
+ },
+ {
+  "cve": "CVE-2020-14349",
+  "affected": "12, 11, 10",
+  "fixed": "12.4, 11.9, 10.14",
+  "component": "core server",
+  "score": "7.5",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "Uncontrolled search path element in logical replication",
+  "first_fix": "2020-08-13"
+ },
+ {
+  "cve": "CVE-2020-14350",
+  "affected": "12, 11, 10, 9.6, 9.5",
+  "fixed": "12.4, 11.9, 10.14, 9.6.19, 9.5.23",
+  "component": "core server",
+  "score": "7.1",
+  "vector": "AV:N/AC:H/PR:L/UI:R/S:U/C:H/I:H/A:H",
+  "desc": "Uncontrolled search path element in CREATE EXTENSION",
+  "first_fix": "2020-08-13"
+ },
+ {
+  "cve": "CVE-2020-1720",
+  "affected": "12, 11, 10, 9.6",
+  "fixed": "12.2, 11.7, 10.12, 9.6.17",
+  "component": "core server",
+  "score": "3.1",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:N/I:L/A:N",
+  "desc": "ALTER ... DEPENDS ON EXTENSION is missing authorization checks.",
+  "first_fix": "2020-02-13"
+ },
+ {
+  "cve": "CVE-2020-25694",
+  "affected": "13, 12, 11, 10, 9.6, 9.5",
+  "fixed": "13.1, 12.5, 11.10, 10.15, 9.6.20, 9.5.24",
+  "component": "client",
+  "score": "8.1",
+  "vector": "AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "Reconnection can downgrade connection security settings",
+  "first_fix": "2020-11-12"
+ },
+ {
+  "cve": "CVE-2020-25695",
+  "affected": "13, 12, 11, 10, 9.6, 9.5",
+  "fixed": "13.1, 12.5, 11.10, 10.15, 9.6.20, 9.5.24",
+  "component": "core server",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "Multiple features escape \"security restricted operation\" sandbox",
+  "first_fix": "2020-11-12"
+ },
+ {
+  "cve": "CVE-2020-25696",
+  "affected": "13, 12, 11, 10, 9.6, 9.5",
+  "fixed": "13.1, 12.5, 11.10, 10.15, 9.6.20, 9.5.24",
+  "component": "client",
+  "score": "7.5",
+  "vector": "AV:N/AC:H/PR:N/UI:R/S:U/C:H/I:H/A:H",
+  "desc": "psql's \\gset allows overwriting specially treated variables",
+  "first_fix": "2020-11-12"
+ },
+ {
+  "cve": "CVE-2021-20229",
+  "affected": "13",
+  "fixed": "13.2",
+  "component": "core server",
+  "score": "3.1",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:L/I:N/A:N",
+  "desc": "Single-column SELECT privilege enables reading all columns",
+  "first_fix": "2021-02-11"
+ },
+ {
+  "cve": "CVE-2021-23214",
+  "affected": "14, 13, 12, 11, 10, 9.6",
+  "fixed": "14.1, 13.5, 12.9, 11.14, 10.19, 9.6.24",
+  "component": "core server",
+  "score": "8.1",
+  "vector": "AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "Server processes unencrypted bytes from man-in-the-middle",
+  "first_fix": "2021-11-11"
+ },
+ {
+  "cve": "CVE-2021-23222",
+  "affected": "14, 13, 12, 11, 10, 9.6",
+  "fixed": "14.1, 13.5, 12.9, 11.14, 10.19, 9.6.24",
+  "component": "client",
+  "score": "3.7",
+  "vector": "AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:N/A:N",
+  "desc": "libpq processes unencrypted bytes from man-in-the-middle",
+  "first_fix": "2021-11-11"
+ },
+ {
+  "cve": "CVE-2021-32027",
+  "affected": "13, 12, 11, 10, 9.6",
+  "fixed": "13.3, 12.7, 11.12, 10.17, 9.6.22",
+  "component": "core server",
+  "score": "6.5",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:H/A:N",
+  "desc": "Buffer overrun from integer overflow in array subscripting calculations",
+  "first_fix": "2021-05-13"
+ },
+ {
+  "cve": "CVE-2021-32028",
+  "affected": "13, 12, 11, 10, 9.6",
+  "fixed": "13.3, 12.7, 11.12, 10.17, 9.6.22",
+  "component": "core server",
+  "score": "6.5",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N",
+  "desc": "Memory disclosure in INSERT ... ON CONFLICT ... DO UPDATE",
+  "first_fix": "2021-05-13"
+ },
+ {
+  "cve": "CVE-2021-32029",
+  "affected": "13, 12, 11",
+  "fixed": "13.3, 12.7, 11.12",
+  "component": "core server",
+  "score": "6.5",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N",
+  "desc": "Memory disclosure in partitioned-table UPDATE ... RETURNING",
+  "first_fix": "2021-05-13"
+ },
+ {
+  "cve": "CVE-2021-3393",
+  "affected": "13, 12, 11",
+  "fixed": "13.2, 12.6, 11.11",
+  "component": "core server",
+  "score": "3.1",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:L/I:N/A:N",
+  "desc": "Partition constraint violation errors leak values of denied columns",
+  "first_fix": "2021-02-11"
+ },
+ {
+  "cve": "CVE-2021-3677",
+  "affected": "13, 12, 11",
+  "fixed": "13.4, 12.8, 11.13",
+  "component": "core server",
+  "score": "6.5",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N",
+  "desc": "Memory disclosure in certain queries",
+  "first_fix": "2021-08-12"
+ },
+ {
+  "cve": "CVE-2022-1552",
+  "affected": "14, 13, 12, 11, 10",
+  "fixed": "14.3, 13.7, 12.11, 11.16, 10.21",
+  "component": "core server",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "Autovacuum, REINDEX, and others omit \"security restricted operation\" sandbox",
+  "first_fix": "2022-05-12"
+ },
+ {
+  "cve": "CVE-2022-2625",
+  "affected": "14, 13, 12, 11, 10",
+  "fixed": "14.5, 13.8, 12.12, 11.17, 10.22",
+  "component": "core server",
+  "score": "7.1",
+  "vector": "AV:N/AC:H/PR:L/UI:R/S:U/C:H/I:H/A:H",
+  "desc": "Extension scripts replace objects not belonging to the extension",
+  "first_fix": "2022-08-11"
+ },
+ {
+  "cve": "CVE-2022-41862",
+  "affected": "15, 14, 13, 12",
+  "fixed": "15.2, 14.7, 13.10, 12.14",
+  "component": "client",
+  "score": "3.7",
+  "vector": "AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:N/A:N",
+  "desc": "Client memory disclosure when connecting, with Kerberos, to modified server",
+  "first_fix": "2023-02-09"
+ },
+ {
+  "cve": "CVE-2023-2454",
+  "affected": "15, 14, 13, 12, 11",
+  "fixed": "15.3, 14.8, 13.11, 12.15, 11.20",
+  "component": "core server",
+  "score": "7.2",
+  "vector": "AV:N/AC:L/PR:H/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "CREATE SCHEMA ... schema_element defeats protective search_path changes",
+  "first_fix": "2023-05-11"
+ },
+ {
+  "cve": "CVE-2023-2455",
+  "affected": "15, 14, 13, 12, 11",
+  "fixed": "15.3, 14.8, 13.11, 12.15, 11.20",
+  "component": "core server",
+  "score": "4.2",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:L/I:L/A:N",
+  "desc": "Row security policies disregard user ID changes after inlining",
+  "first_fix": "2023-05-11"
+ },
+ {
+  "cve": "CVE-2023-39417",
+  "affected": "15, 14, 13, 12, 11",
+  "fixed": "15.4, 14.9, 13.12, 12.16, 11.21",
+  "component": "core server",
+  "score": "7.5",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "Extension script @substitutions@ within quoting allow SQL injection",
+  "first_fix": "2023-08-10"
+ },
+ {
+  "cve": "CVE-2023-39418",
+  "affected": "15",
+  "fixed": "15.4",
+  "component": "core server",
+  "score": "3.1",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:N/I:L/A:N",
+  "desc": "MERGE fails to enforce UPDATE or SELECT row security policies",
+  "first_fix": "2023-08-10"
+ },
+ {
+  "cve": "CVE-2023-5868",
+  "affected": "16, 15, 14, 13, 12, 11",
+  "fixed": "16.1, 15.5, 14.10, 13.13, 12.17, 11.22",
+  "component": "core server",
+  "score": "4.3",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:N/A:N",
+  "desc": "Memory disclosure in aggregate function calls",
+  "first_fix": "2023-11-09"
+ },
+ {
+  "cve": "CVE-2023-5869",
+  "affected": "16, 15, 14, 13, 12, 11",
+  "fixed": "16.1, 15.5, 14.10, 13.13, 12.17, 11.22",
+  "component": "core server",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "Buffer overrun from integer overflow in array modification",
+  "first_fix": "2023-11-09"
+ },
+ {
+  "cve": "CVE-2023-5870",
+  "affected": "16, 15, 14, 13, 12, 11",
+  "fixed": "16.1, 15.5, 14.10, 13.13, 12.17, 11.22",
+  "component": "core server",
+  "score": "2.2",
+  "vector": "AV:N/AC:H/PR:H/UI:N/S:U/C:N/I:N/A:L",
+  "desc": "Role \"pg_signal_backend\" can signal certain superuser processes",
+  "first_fix": "2023-11-09"
+ },
+ {
+  "cve": "CVE-2024-0985",
+  "affected": "16, 15, 14, 13, 12",
+  "fixed": "16.2, 15.6, 14.11, 13.14, 12.18",
+  "component": "core server",
+  "score": "8.0",
+  "vector": "AV:N/AC:L/PR:L/UI:R/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL non-owner REFRESH MATERIALIZED VIEW CONCURRENTLY executes arbitrary SQL",
+  "first_fix": "2024-02-08"
+ },
+ {
+  "cve": "CVE-2024-10976",
+  "affected": "17, 16, 15, 14, 13, 12",
+  "fixed": "17.1, 16.5, 15.9, 14.14, 13.17, 12.21",
+  "component": "core server",
+  "score": "4.2",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:L/I:L/A:N",
+  "desc": "PostgreSQL row security below e.g. subqueries disregards user ID changes",
+  "first_fix": "2024-11-14"
+ },
+ {
+  "cve": "CVE-2024-10977",
+  "affected": "17, 16, 15, 14, 13, 12",
+  "fixed": "17.1, 16.5, 15.9, 14.14, 13.17, 12.21",
+  "component": "client",
+  "score": "3.1",
+  "vector": "AV:N/AC:H/PR:N/UI:R/S:U/C:N/I:L/A:N",
+  "desc": "PostgreSQL libpq retains an error message from man-in-the-middle",
+  "first_fix": "2024-11-14"
+ },
+ {
+  "cve": "CVE-2024-10978",
+  "affected": "17, 16, 15, 14, 13, 12",
+  "fixed": "17.1, 16.5, 15.9, 14.14, 13.17, 12.21",
+  "component": "core server",
+  "score": "4.2",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:L/I:L/A:N",
+  "desc": "PostgreSQL SET ROLE, SET SESSION AUTHORIZATION reset to wrong user ID",
+  "first_fix": "2024-11-14"
+ },
+ {
+  "cve": "CVE-2024-10979",
+  "affected": "17, 16, 15, 14, 13, 12",
+  "fixed": "17.1, 16.5, 15.9, 14.14, 13.17, 12.21",
+  "component": "core server",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL PL/Perl environment variable changes execute arbitrary code",
+  "first_fix": "2024-11-14"
+ },
+ {
+  "cve": "CVE-2024-4317",
+  "affected": "16, 15, 14",
+  "fixed": "16.3, 15.7, 14.12",
+  "component": "core server",
+  "score": "3.1",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:L/I:N/A:N",
+  "desc": "Restrict visibility of \"pg_stats_ext\" and \"pg_stats_ext_exprs\" entries to the table owner",
+  "first_fix": "2024-05-09"
+ },
+ {
+  "cve": "CVE-2024-7348",
+  "affected": "16, 15, 14, 13, 12",
+  "fixed": "16.4, 15.8, 14.13, 13.16, 12.20",
+  "component": "core server",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL relation replacement during pg_dump executes arbitrary SQL",
+  "first_fix": "2024-08-08"
+ },
+ {
+  "cve": "CVE-2025-1094",
+  "affected": "17, 16, 15, 14, 13",
+  "fixed": "17.3, 16.7, 15.11, 14.16, 13.19",
+  "component": "core server",
+  "score": "8.1",
+  "vector": "AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL quoting APIs miss neutralizing quoting syntax in text that fails encoding validation",
+  "first_fix": "2025-02-13"
+ },
+ {
+  "cve": "CVE-2025-12817",
+  "affected": "18, 17, 16, 15, 14, 13",
+  "fixed": "18.1, 17.7, 16.11, 15.15, 14.20, 13.23",
+  "component": "core server",
+  "score": "3.1",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:N/I:N/A:L",
+  "desc": "PostgreSQL CREATE STATISTICS does not check for schema CREATE privilege",
+  "first_fix": "2025-11-13"
+ },
+ {
+  "cve": "CVE-2025-12818",
+  "affected": "18, 17, 16, 15, 14, 13",
+  "fixed": "18.1, 17.7, 16.11, 15.15, 14.20, 13.23",
+  "component": "core server",
+  "score": "5.9",
+  "vector": "AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:N/A:H",
+  "desc": "PostgreSQL libpq undersizes allocations, via integer wraparound",
+  "first_fix": "2025-11-13"
+ },
+ {
+  "cve": "CVE-2025-4207",
+  "affected": "17, 16, 15, 14, 13",
+  "fixed": "17.5, 16.9, 15.13, 14.18, 13.21",
+  "component": "core server",
+  "score": "5.9",
+  "vector": "AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:N/A:H",
+  "desc": "PostgreSQL GB18030 encoding validation can read one byte past end of allocation for text that fails validation",
+  "first_fix": "2025-05-08"
+ },
+ {
+  "cve": "CVE-2025-8713",
+  "affected": "17, 16, 15, 14, 13",
+  "fixed": "17.6, 16.10, 15.14, 14.19, 13.22",
+  "component": "core server",
+  "score": "3.1",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:L/I:N/A:N",
+  "desc": "PostgreSQL optimizer statistics can expose sampled data within a view, partition, or child table",
+  "first_fix": "2025-08-14"
+ },
+ {
+  "cve": "CVE-2025-8714",
+  "affected": "17, 16, 15, 14, 13",
+  "fixed": "17.6, 16.10, 15.14, 14.19, 13.22",
+  "component": "core server",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL pg_dump lets superuser of origin server execute arbitrary code in psql client",
+  "first_fix": "2025-08-14"
+ },
+ {
+  "cve": "CVE-2025-8715",
+  "affected": "17, 16, 15, 14, 13",
+  "fixed": "17.6, 16.10, 15.14, 14.19, 13.22",
+  "component": "core server",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL pg_dump newline in object name executes arbitrary code in psql client and in restore target server",
+  "first_fix": "2025-08-14"
+ },
+ {
+  "cve": "CVE-2026-14662",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.6, 17.11, 16.15, 15.19, 14.24",
+  "component": "core server",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL tsvector and tsquery undersize allocations, via integer wraparound",
+  "first_fix": "2026-08-13"
+ },
+ {
+  "cve": "CVE-2026-14663",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.6, 17.11, 16.15, 15.19, 14.24",
+  "component": "contrib module",
+  "score": "6.5",
+  "vector": "AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:N",
+  "desc": "PostgreSQL pgcrypto, for OpenSSL-disabled ciphers, silently encrypts to and decrypts from cleartext",
+  "first_fix": "2026-08-13"
+ },
+ {
+  "cve": "CVE-2026-14664",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.6, 17.11, 16.15, 15.19, 14.24",
+  "component": "core server",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL regexp heap buffer overflow executes arbitrary code",
+  "first_fix": "2026-08-13"
+ },
+ {
+  "cve": "CVE-2026-14666",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.6, 17.11, 16.15, 15.19, 14.24",
+  "component": "core server",
+  "score": "4.2",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:L/I:L/A:N",
+  "desc": "PostgreSQL row security caching disregards role modifications",
+  "first_fix": "2026-08-13"
+ },
+ {
+  "cve": "CVE-2026-14668",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.6, 17.11, 16.15, 15.19, 14.24",
+  "component": "core server",
+  "score": "8.1",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:H",
+  "desc": "PostgreSQL ctid type confusion in selectivity estimator discloses derivative of arbitrary read",
+  "first_fix": "2026-08-13"
+ },
+ {
+  "cve": "CVE-2026-14669",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.6, 17.11, 16.15, 15.19, 14.24",
+  "component": "core server",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL to_char heap buffer overflow executes arbitrary code",
+  "first_fix": "2026-08-13"
+ },
+ {
+  "cve": "CVE-2026-14670",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.6, 17.11, 16.15, 15.19, 14.24",
+  "component": "core server",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL plperl tied object heap buffer overflow executes arbitrary code",
+  "first_fix": "2026-08-13"
+ },
+ {
+  "cve": "CVE-2026-14671",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.6, 17.11, 16.15, 15.19, 14.24",
+  "component": "contrib module",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL refint plan cache type confusion executes arbitrary code",
+  "first_fix": "2026-08-13"
+ },
+ {
+  "cve": "CVE-2026-14672",
+  "affected": "18, 17, 16",
+  "fixed": "18.6, 17.11, 16.15",
+  "component": "core server",
+  "score": "5.3",
+  "vector": "AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+  "desc": "PostgreSQL observable response discrepancy with non-default scram_iterations provides user existence oracle",
+  "first_fix": "2026-08-13"
+ },
+ {
+  "cve": "CVE-2026-14673",
+  "affected": "18, 16, 15, 14",
+  "fixed": "18.6, 16.15, 15.19, 14.24",
+  "component": "contrib module",
+  "score": "3.8",
+  "vector": "AV:N/AC:L/PR:H/UI:N/S:U/C:L/I:L/A:N",
+  "desc": "PostgreSQL amcheck does not clear untrusted search path",
+  "first_fix": "2026-08-13"
+ },
+ {
+  "cve": "CVE-2026-14676",
+  "affected": "18",
+  "fixed": "18.6",
+  "component": "contrib module",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL pg_stat_statements heap buffer overflow executes arbitrary code",
+  "first_fix": "2026-08-13"
+ },
+ {
+  "cve": "CVE-2026-14677",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.6, 17.11, 16.15, 15.19, 14.24",
+  "component": "core server",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL 32-bit pltcl and plperl undersize allocations, via integer wraparound",
+  "first_fix": "2026-08-13"
+ },
+ {
+  "cve": "CVE-2026-14678",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.6, 17.11, 16.15, 15.19, 14.24",
+  "component": "contrib module",
+  "score": "4.3",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:N/A:N",
+  "desc": "PostgreSQL pg_trgm picksplit reads past end of buffer",
+  "first_fix": "2026-08-13"
+ },
+ {
+  "cve": "CVE-2026-14679",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.6, 17.11, 16.15, 15.19, 14.24",
+  "component": "core server",
+  "score": "8.2",
+  "vector": "AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:L/A:H",
+  "desc": "PostgreSQL stack buffer overflow in argument match writes 0x0 and 0x1 to server memory",
+  "first_fix": "2026-08-13"
+ },
+ {
+  "cve": "CVE-2026-14680",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.6, 17.11, 16.15, 15.19, 14.24",
+  "component": "core server",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL type confusion via \"internal\" arguments",
+  "first_fix": "2026-08-13"
+ },
+ {
+  "cve": "CVE-2026-14681",
+  "affected": "18, 17",
+  "fixed": "18.6, 17.11",
+  "component": "core server",
+  "score": "4.2",
+  "vector": "AV:N/AC:H/PR:L/UI:N/S:U/C:L/I:L/A:N",
+  "desc": "PostgreSQL improper enforcement of GSSAPI encryption when coupled with SSL",
+  "first_fix": "2026-08-13"
+ },
+ {
+  "cve": "CVE-2026-15741",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.6, 17.11, 16.15, 15.19, 14.24",
+  "component": "core server",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL expression deparse allows SQL injection via EXTRACT argument",
+  "first_fix": "2026-08-13"
+ },
+ {
+  "cve": "CVE-2026-15742",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.6, 17.11, 16.15, 15.19, 14.24",
+  "component": "contrib module",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL fuzzystrmatch writes effectively-arbitrary addresses, via integer wraparound",
+  "first_fix": "2026-08-13"
+ },
+ {
+  "cve": "CVE-2026-16238",
+  "affected": "18",
+  "fixed": "18.6",
+  "component": "core server",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL type confusion in pg_restore_attribute_stats() executes arbitrary code",
+  "first_fix": "2026-08-13"
+ },
+ {
+  "cve": "CVE-2026-16239",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.6, 17.11, 16.15, 15.19, 14.24",
+  "component": "core server",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL type confusion in cursor CLOSE + DECLARE executes arbitrary code",
+  "first_fix": "2026-08-13"
+ },
+ {
+  "cve": "CVE-2026-16241",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.6, 17.11, 16.15, 15.19, 14.24",
+  "component": "client",
+  "score": "3.8",
+  "vector": "AV:N/AC:L/PR:H/UI:N/S:U/C:N/I:L/A:L",
+  "desc": "PostgreSQL ECPG integer underflow can crash the client",
+  "first_fix": "2026-08-13"
+ },
+ {
+  "cve": "CVE-2026-18024",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.6, 17.11, 16.15, 15.19, 14.24",
+  "component": "core server",
+  "score": "4.3",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:N/A:N",
+  "desc": "PostgreSQL ascii() function reads past end of buffer",
+  "first_fix": "2026-08-13"
+ },
+ {
+  "cve": "CVE-2026-18408",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.6, 17.11, 16.15, 15.19, 14.24",
+  "component": "client",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL psql \\unrestrict lets superuser of pg_dump origin server execute arbitrary code in psql client",
+  "first_fix": "2026-08-13"
+ },
+ {
+  "cve": "CVE-2026-19385",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.6, 17.11, 16.15, 15.19, 14.24",
+  "component": "client",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL pg_dump heap buffer overflow executes arbitrary code",
+  "first_fix": "2026-08-13"
+ },
+ {
+  "cve": "CVE-2026-2003",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.2, 17.8, 16.12, 15.16, 14.21",
+  "component": "core server",
+  "score": "4.3",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:N/A:N",
+  "desc": "PostgreSQL oidvector discloses a few bytes of memory",
+  "first_fix": "2026-02-12"
+ },
+ {
+  "cve": "CVE-2026-2004",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.2, 17.8, 16.12, 15.16, 14.21",
+  "component": "contrib module",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL intarray missing validation of type of input to selectivity estimator executes arbitrary code",
+  "first_fix": "2026-02-12"
+ },
+ {
+  "cve": "CVE-2026-2005",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.2, 17.8, 16.12, 15.16, 14.21",
+  "component": "contrib module",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL pgcrypto heap buffer overflow executes arbitrary code",
+  "first_fix": "2026-02-12"
+ },
+ {
+  "cve": "CVE-2026-2006",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.2, 17.8, 16.12, 15.16, 14.21",
+  "component": "core server",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL missing validation of multibyte character length executes arbitrary code",
+  "first_fix": "2026-02-12"
+ },
+ {
+  "cve": "CVE-2026-2007",
+  "affected": "18",
+  "fixed": "18.2",
+  "component": "contrib module",
+  "score": "8.2",
+  "vector": "AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:L/A:H",
+  "desc": "PostgreSQL pg_trgm heap buffer overflow writes pattern onto server memory",
+  "first_fix": "2026-02-12"
+ },
+ {
+  "cve": "CVE-2026-6464",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.6, 17.11, 16.15, 15.19, 14.24",
+  "component": "client",
+  "score": "8.1",
+  "vector": "AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL psql COPY FROM STDIN early failure processes data lines as psql commands",
+  "first_fix": "2026-08-13"
+ },
+ {
+  "cve": "CVE-2026-6469",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.6, 17.11, 16.15, 15.19, 14.24",
+  "component": "core server",
+  "score": "3.8",
+  "vector": "AV:N/AC:L/PR:H/UI:N/S:U/C:N/I:L/A:L",
+  "desc": "PostgreSQL ALTER TABLE ALTER TYPE resets extended statistics ownership",
+  "first_fix": "2026-08-13"
+ },
+ {
+  "cve": "CVE-2026-6470",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.6, 17.11, 16.15, 15.19, 14.24",
+  "component": "core server",
+  "score": "4.3",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:L",
+  "desc": "PostgreSQL fails to check type USAGE privilege",
+  "first_fix": "2026-08-13"
+ },
+ {
+  "cve": "CVE-2026-6471",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.6, 17.11, 16.15, 15.19, 14.24",
+  "component": "core server",
+  "score": "7.2",
+  "vector": "AV:N/AC:L/PR:H/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL logical decoding can dlopen arbitrary file",
+  "first_fix": "2026-08-13"
+ },
+ {
+  "cve": "CVE-2026-6472",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.4, 17.10, 16.14, 15.18, 14.23",
+  "component": "core server",
+  "score": "5.4",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:L/A:N",
+  "desc": "PostgreSQL CREATE TYPE does not check multirange schema CREATE privilege",
+  "first_fix": "2026-05-14"
+ },
+ {
+  "cve": "CVE-2026-6473",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.4, 17.10, 16.14, 15.18, 14.23",
+  "component": "core server",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL server undersizes allocations, via integer wraparound",
+  "first_fix": "2026-05-14"
+ },
+ {
+  "cve": "CVE-2026-6474",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.4, 17.10, 16.14, 15.18, 14.23",
+  "component": "core server",
+  "score": "4.3",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:N/A:N",
+  "desc": "PostgreSQL timeofday() can disclose portions of server memory",
+  "first_fix": "2026-05-14"
+ },
+ {
+  "cve": "CVE-2026-6475",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.4, 17.10, 16.14, 15.18, 14.23",
+  "component": "client",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL pg_basebackup and pg_rewind can overwrite unrelated files of origin superuser choice",
+  "first_fix": "2026-05-14"
+ },
+ {
+  "cve": "CVE-2026-6476",
+  "affected": "18, 17",
+  "fixed": "18.4, 17.10",
+  "component": "client",
+  "score": "7.2",
+  "vector": "AV:N/AC:L/PR:H/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL pg_createsubscriber allows SQL injection via subscription name",
+  "first_fix": "2026-05-14"
+ },
+ {
+  "cve": "CVE-2026-6477",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.4, 17.10, 16.14, 15.18, 14.23",
+  "component": "client",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL libpq lo_* functions let server superuser overwrite client stack memory",
+  "first_fix": "2026-05-14"
+ },
+ {
+  "cve": "CVE-2026-6478",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.4, 17.10, 16.14, 15.18, 14.23",
+  "component": "core server",
+  "score": "6.5",
+  "vector": "AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:N",
+  "desc": "PostgreSQL discloses MD5-hashed passwords via covert timing channel",
+  "first_fix": "2026-05-14"
+ },
+ {
+  "cve": "CVE-2026-6479",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.4, 17.10, 16.14, 15.18, 14.23",
+  "component": "core server",
+  "score": "7.5",
+  "vector": "AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+  "desc": "PostgreSQL SSL/GSS init causes denial of service, via uncontrolled recursion",
+  "first_fix": "2026-05-14"
+ },
+ {
+  "cve": "CVE-2026-6575",
+  "affected": "18",
+  "fixed": "18.4",
+  "component": "core server",
+  "score": "4.3",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:N/A:N",
+  "desc": "PostgreSQL pg_restore_attribute_stats accepts values that cause query planning to read past end of stats array",
+  "first_fix": "2026-05-14"
+ },
+ {
+  "cve": "CVE-2026-6637",
+  "affected": "18, 17, 16, 15, 14",
+  "fixed": "18.4, 17.10, 16.14, 15.18, 14.23",
+  "component": "contrib module",
+  "score": "8.8",
+  "vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+  "desc": "PostgreSQL refint allows stack buffer overflow and SQL injection",
+  "first_fix": "2026-05-14"
+ },
+ {
+  "cve": "CVE-2026-6638",
+  "affected": "18, 17, 16",
+  "fixed": "18.4, 17.10, 16.14",
+  "component": "core server",
+  "score": "3.7",
+  "vector": "AV:N/AC:H/PR:L/UI:R/S:U/C:L/I:L/A:N",
+  "desc": "PostgreSQL REFRESH PUBLICATION allows SQL injection via table name",
+  "first_fix": "2026-05-14"
+ }
+]

@@ -1,0 +1,18 @@
+commit_lat durable-ack rows_per_s 181 rows/s
+commit_lat durable-ack close 0.2 ms
+commit_lat durable-ack after_rotation 20047 us
+commit_lat durable-ack checkpoint 21.4 ms
+commit_lat durable-ack commits 2000
+commit_lat durable-ack mean 5501 us
+commit_lat durable-ack p50 5127 us
+commit_lat durable-ack p90 7153 us
+commit_lat durable-ack p99 7775 us
+commit_lat durable-ack p99.9 12051 us
+commit_lat durable-ack max 20047 us
+commit_lat durable-ack worst_at 10:29:09.184
+commit_lat durable-ack over_5ms 1045
+commit_lat durable-ack over_10ms 2
+commit_lat durable-ack log_bytes 1562624 bytes
+commit_lat durable-ack log_segments 2
+commit_lat durable-ack reopen 23.8 ms
+rc 0

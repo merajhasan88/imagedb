@@ -1,0 +1,16 @@
+commit_lat sync rows_per_s 131646 rows/s
+commit_lat sync close 8.9 ms
+commit_lat sync commits 200
+commit_lat sync mean 7596 us
+commit_lat sync p50 7061 us
+commit_lat sync p90 8591 us
+commit_lat sync p99 21018 us
+commit_lat sync p99.9 23247 us
+commit_lat sync max 23247 us
+commit_lat sync worst_at 10:29:57.666
+commit_lat sync over_5ms 200
+commit_lat sync over_10ms 8
+commit_lat sync log_bytes 21243270 bytes
+commit_lat sync log_segments 1
+commit_lat sync reopen 252.1 ms
+rc 0

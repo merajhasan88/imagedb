@@ -1,0 +1,39 @@
+    40.40%  imagedb  imagedb      
+            |          
+            |--35.14%--__clone3 (inlined)
+            |          start_thread
+            |          worker
+            |          run_items (inlined)
+            |          |          
+            |          |--23.43%--dd_run
+            |          |          imdb_lthash_expand2_avx2
+            |          |          chacha20_x8 (inlined)
+            |          |          |          
+            |          |          |--5.97%--_mm256_add_epi32 (inlined)
+            |          |          |          
+            |          |          |--5.81%--rotl (inlined)
+            |          |          |          |          
+            |          |          |           --2.58%--_mm256_srli_epi32 (inlined)
+            |          |          |          
+            |          |           --5.50%--_mm256_xor_si256 (inlined)
+            |          |          
+            |           --11.71%--rpre_chunk
+            |                     imdb_lthash_expand2_avx2
+            |                     chacha20_x8 (inlined)
+            |                     |          
+            |                     |--3.05%--_mm256_add_epi32 (inlined)
+            |                     |          
+            |                     |--2.91%--_mm256_xor_si256 (inlined)
+            |                     |          
+            |                      --2.53%--rotl (inlined)
+            |          
+             --3.39%--0xffffffffffffffff
+                       run_stmt
+                       imdb_exec_one
+                       imdb_commit
+                       imdb_digest_delta
+                       imdb_par_for
+                       run_items (inlined)
+                       dd_run
+                       imdb_lthash_expand2_avx2
+                       chacha20_x8 (inlined)

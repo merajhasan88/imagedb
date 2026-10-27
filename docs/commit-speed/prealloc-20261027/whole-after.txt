@@ -1,0 +1,393 @@
+probe append_fdatasync p50 4004.3 us
+probe append_fdatasync p99 5259.0 us
+probe overwrite_fdatasync p50 1867.2 us
+probe overwrite_fdatasync p99 2628.0 us
+probe fallocated_fdatasync p50 3686.6 us
+probe fallocated_fdatasync p99 5272.1 us
+probe direct_dsync_overwrite p50 1709.9 us
+probe direct_dsync_overwrite p99 2622.3 us
+imagedb before (after 60 s idle): package 45 C, mean clock 2138 MHz
+imagedb before: synced, dirty 0.1 MB, writeback 0.0 MB
+imagedb single_row_commit commits_per_s 562 /s
+imagedb single_row_commit p50 1774.4 us
+imagedb single_row_commit p95 2469.0 us
+imagedb single_row_commit p99 2560.9 us
+imagedb single_row_commit cpu 0.06 s
+imagedb batch_insert_100 rows_per_s 38953 /s
+imagedb batch_insert_100 p50 2317.6 us
+imagedb batch_insert_100 p95 3240.1 us
+imagedb batch_insert_100 p99 9851.3 us
+imagedb batch_insert_100 cpu 0.73 s
+imagedb after_load memory 39.3 MB
+imagedb after_load written 35.2 MB
+imagedb after_load cumulative_cpu 0.80 s
+imagedb batch_insert_10000 rows_per_s 150220 /s
+imagedb batch_insert_10000 p50 63107.2 us
+imagedb batch_insert_10000 p95 76848.0 us
+imagedb batch_insert_10000 p99 76848.0 us
+imagedb batch_insert_10000 cpu 0.35 s
+imagedb pk_lookup p50 3.3 us
+imagedb pk_lookup p95 3.6 us
+imagedb pk_lookup p99 5.6 us
+imagedb pk_lookup cpu 0.07 s
+imagedb range_sum_1000 p50 116.3 us
+imagedb range_sum_1000 p95 126.4 us
+imagedb range_sum_1000 p99 180.5 us
+imagedb range_sum_1000 cpu 0.12 s
+imagedb subject_count p50 214.1 us
+imagedb subject_count p95 268.9 us
+imagedb subject_count p99 350.2 us
+imagedb subject_count cpu 0.22 s
+imagedb range_sum_all p50 11797.4 us
+imagedb range_sum_all p95 18530.9 us
+imagedb range_sum_all p99 18530.9 us
+imagedb range_sum_all cpu 0.25 s
+imagedb checkpoint_after_load seconds 0.231 s
+imagedb checkpoint_after_load cpu 0.16 s
+imagedb after_checkpoint memory 78.6 MB
+imagedb pk_lookup_after_checkpoint p50 3.1 us
+imagedb pk_lookup_after_checkpoint p95 3.3 us
+imagedb pk_lookup_after_checkpoint p99 3.8 us
+imagedb pk_lookup_after_checkpoint cpu 0.07 s
+imagedb range_sum_1000_after_checkpoint p50 35.8 us
+imagedb range_sum_1000_after_checkpoint p95 37.8 us
+imagedb range_sum_1000_after_checkpoint p99 51.3 us
+imagedb range_sum_1000_after_checkpoint cpu 0.04 s
+imagedb subject_count_after_checkpoint p50 81.2 us
+imagedb subject_count_after_checkpoint p95 94.0 us
+imagedb subject_count_after_checkpoint p99 123.4 us
+imagedb subject_count_after_checkpoint cpu 0.08 s
+imagedb range_sum_all_after_checkpoint p50 234.1 us
+imagedb range_sum_all_after_checkpoint p95 389.3 us
+imagedb range_sum_all_after_checkpoint p99 389.3 us
+imagedb range_sum_all_after_checkpoint cpu 0.00 s
+imagedb churn_update_1000 rows_per_s 112276 /s
+imagedb churn_update_1000 p50 6302.5 us
+imagedb churn_update_1000 p95 13819.4 us
+imagedb churn_update_1000 p99 21881.4 us
+imagedb churn_update_1000 stall 0.641 s at 10:39:42.539
+imagedb churn_update_1000 cpu 3.35 s
+imagedb churn_update_1000 commits 501 (500 transactions; the rest are automatic CHECKPOINTs)
+imagedb after_churn memory 257.8 MB
+imagedb churn written 249.6 MB
+imagedb delete_reinsert_1000 rows_per_s 162549 /s
+imagedb delete_reinsert_1000 p50 11783.7 us
+imagedb delete_reinsert_1000 p95 18883.7 us
+imagedb delete_reinsert_1000 p99 19069.9 us
+imagedb delete_reinsert_1000 cpu 0.47 s
+imagedb delete_reinsert_1000 commits 100 (100 transactions; the rest are automatic CHECKPOINTs)
+imagedb after_deletes memory 257.8 MB
+imagedb cumulative cpu 5.97 s (every phase so far; the phases print their own)
+imagedb reopen_load_state seconds 1.407 s (the log after the last checkpoint: 235 commits)
+imagedb reopen_load_state cpu 2.27 s
+imagedb checkpoint_after_churn seconds 0.456 s
+imagedb checkpoint_after_churn cpu 0.34 s
+imagedb reopen_after_checkpoint seconds 1.396 s
+imagedb reopen_after_checkpoint cpu 1.38 s
+imagedb peak_rss memory 410.2 MB
+imagedb w6_load_1000 rows_per_s 124152 /s
+imagedb w6_load_1000 p50 7676.6 us
+imagedb w6_load_1000 p95 14459.8 us
+imagedb w6_load_1000 p99 15501.2 us
+imagedb w6_load_1000 cpu 0.65 s
+imagedb w6_create_index seconds 0.013 s
+imagedb w6_create_index cpu 0.02 s
+imagedb w6_range_sum_1000 p50 125.6 us
+imagedb w6_range_sum_1000 p95 222.3 us
+imagedb w6_range_sum_1000 p99 253.9 us
+imagedb w6_range_sum_1000 cpu 0.02 s
+imagedb w6_range_sum_all p50 13104.1 us
+imagedb w6_range_sum_all p95 31031.6 us
+imagedb w6_range_sum_all p99 31031.6 us
+imagedb w6_range_sum_all cpu 0.28 s
+imagedb w6_update_1000 p50 6201.4 us
+imagedb w6_update_1000 p95 13091.5 us
+imagedb w6_update_1000 p99 22705.4 us
+imagedb w6_update_1000 cpu 0.56 s
+imagedb w6_update_1000 rows_per_s 143013 /s (99998 rows)
+imagedb w6_checkpoint seconds 0.389 s
+imagedb w6_checkpoint cpu 0.31 s
+imagedb w6_range_sum_1000_after_checkpoint p50 76.0 us
+imagedb w6_range_sum_1000_after_checkpoint p95 148.1 us
+imagedb w6_range_sum_1000_after_checkpoint p99 179.5 us
+imagedb w6_range_sum_1000_after_checkpoint cpu 0.01 s
+imagedb w6_range_sum_all_after_checkpoint p50 328.4 us
+imagedb w6_range_sum_all_after_checkpoint p95 511.6 us
+imagedb w6_range_sum_all_after_checkpoint p99 511.6 us
+imagedb w6_range_sum_all_after_checkpoint cpu 0.00 s
+imagedb after_w6 memory 385.9 MB (W6 added 71.3 MB)
+imagedb w6 written 64.7 MB
+imagedb w7_load_1000 rows_per_s 120200 /s
+imagedb w7_load_1000 p50 7796.2 us
+imagedb w7_load_1000 p95 14438.4 us
+imagedb w7_load_1000 p99 15564.1 us
+imagedb w7_load_1000 cpu 1.49 s
+imagedb w7_point_join p50 6.9 us
+imagedb w7_point_join p95 7.4 us
+imagedb w7_point_join p99 9.6 us
+imagedb w7_point_join cpu 0.09 s
+imagedb w7_point_join plan join(index 2)
+imagedb w7_customer_orders p50 9.7 us
+imagedb w7_customer_orders p95 10.4 us
+imagedb w7_customer_orders p99 12.6 us
+imagedb w7_customer_orders cpu 0.10 s
+imagedb w7_customer_orders plan join(index 2)
+imagedb w7_anti_join p50 547.8 us
+imagedb w7_anti_join p95 634.3 us
+imagedb w7_anti_join p99 761.5 us
+imagedb w7_anti_join cpu 0.06 s
+imagedb w7_anti_join plan join(index 2)
+imagedb w7_join_by_region p50 56691.9 us
+imagedb w7_join_by_region p95 59650.2 us
+imagedb w7_join_by_region p99 59650.2 us
+imagedb w7_join_by_region cpu 0.56 s
+imagedb w7_join_by_region plan join(index 1)
+imagedb w7_join_by_region_forced_hash p50 45908.4 us
+imagedb w7_join_by_region_forced_hash p95 49802.8 us
+imagedb w7_join_by_region_forced_hash p99 49802.8 us
+imagedb w7_join_by_region_forced_hash cpu 0.48 s
+imagedb w7_join_by_region_forced_hash plan join(build 2)
+imagedb w7_checkpoint seconds 0.397 s
+imagedb w7_checkpoint cpu 0.33 s
+imagedb w7_point_join_after_checkpoint p50 6.8 us
+imagedb w7_point_join_after_checkpoint p95 10.9 us
+imagedb w7_point_join_after_checkpoint p99 16.5 us
+imagedb w7_point_join_after_checkpoint cpu 0.09 s
+imagedb w7_point_join_after_checkpoint plan join(index 2)
+imagedb w7_customer_orders_after_checkpoint p50 9.0 us
+imagedb w7_customer_orders_after_checkpoint p95 9.8 us
+imagedb w7_customer_orders_after_checkpoint p99 18.6 us
+imagedb w7_customer_orders_after_checkpoint cpu 0.09 s
+imagedb w7_customer_orders_after_checkpoint plan join(index 2)
+imagedb w7_anti_join_after_checkpoint p50 455.1 us
+imagedb w7_anti_join_after_checkpoint p95 540.6 us
+imagedb w7_anti_join_after_checkpoint p99 654.7 us
+imagedb w7_anti_join_after_checkpoint cpu 0.05 s
+imagedb w7_anti_join_after_checkpoint plan join(index 2)
+imagedb w7_join_by_region_after_checkpoint p50 45443.6 us
+imagedb w7_join_by_region_after_checkpoint p95 46243.1 us
+imagedb w7_join_by_region_after_checkpoint p99 46243.1 us
+imagedb w7_join_by_region_after_checkpoint cpu 0.45 s
+imagedb w7_join_by_region_after_checkpoint plan join(index 1)
+imagedb w7_join_by_region_forced_hash_after_checkpoint p50 36476.3 us
+imagedb w7_join_by_region_forced_hash_after_checkpoint p95 41025.8 us
+imagedb w7_join_by_region_forced_hash_after_checkpoint p99 41025.8 us
+imagedb w7_join_by_region_forced_hash_after_checkpoint cpu 0.37 s
+imagedb w7_join_by_region_forced_hash_after_checkpoint plan join(build 2)
+imagedb after_w7 memory 466.6 MB (W7 added 78.7 MB)
+imagedb w7 written 60.6 MB
+imagedb w8_create_index_2col seconds 0.041 s
+imagedb w8_create_index_2col cpu 0.04 s
+imagedb w8_two_column_count p50 3.8 us
+imagedb w8_two_column_count p95 5.3 us
+imagedb w8_two_column_count p99 7.0 us
+imagedb w8_two_column_count cpu 0.04 s
+imagedb w8_two_column_count plan index(ordered, only)
+imagedb w8_create_unique_index seconds 0.005 s
+imagedb w8_create_unique_index cpu 0.01 s
+imagedb w8_unique_lookup p50 3.5 us
+imagedb w8_unique_lookup p95 3.9 us
+imagedb w8_unique_lookup p99 4.1 us
+imagedb w8_unique_lookup cpu 0.04 s
+imagedb w8_unique_lookup plan index(ordered)
+imagedb w8_unique_insert_100 rows_per_s 46135 /s
+imagedb w8_unique_insert_100 p50 2241.3 us
+imagedb w8_unique_insert_100 p95 2401.6 us
+imagedb w8_unique_insert_100 p99 2401.6 us
+imagedb w8_unique_insert_100 cpu 0.02 s
+whole: imagedb: W8b inserts a duplicate name, which must be refused:
+whole: imagedb: INSERT INTO c VALUES ($1, $2, $3): row 1: duplicate key in unique index c_name (table c)
+imagedb w8_duplicate_name refused
+imagedb peak_rss_after_w8 memory 519.1 MB
+imagedb after: package 63 C, mean clock 3774 MHz
+imagedb storage size 303.5 MB
+postgres before (after 60 s idle): package 44 C, mean clock 2151 MHz
+postgres before: synced, dirty 0.2 MB, writeback 0.0 MB
+postgres setting server_version 14.24 (Ubuntu 14.24-0ubuntu0.22.04.1)
+postgres setting fsync on
+postgres setting synchronous_commit on
+postgres setting wal_sync_method fdatasync
+postgres setting full_page_writes on
+postgres setting shared_buffers 128MB
+postgres setting max_parallel_workers_per_gather 2
+postgres single_row_commit commits_per_s 492 /s
+postgres single_row_commit p50 1981.9 us
+postgres single_row_commit p95 2759.8 us
+postgres single_row_commit p99 2872.4 us
+postgres single_row_commit cpu 0.07 s
+postgres batch_insert_100 rows_per_s 22025 /s
+postgres batch_insert_100 p50 4428.7 us
+postgres batch_insert_100 p95 5888.1 us
+postgres batch_insert_100 p99 6190.3 us
+postgres batch_insert_100 cpu 2.19 s
+postgres after_load memory 40.9 MB
+postgres after_load written 90.6 MB
+postgres after_load cumulative_cpu 2.27 s
+postgres batch_insert_10000 rows_per_s 37604 /s
+postgres batch_insert_10000 p50 253487.0 us
+postgres batch_insert_10000 p95 299104.5 us
+postgres batch_insert_10000 p99 299104.5 us
+postgres batch_insert_10000 cpu 1.01 s
+postgres pk_lookup p50 21.1 us
+postgres pk_lookup p95 37.0 us
+postgres pk_lookup p99 45.8 us
+postgres pk_lookup cpu 0.37 s
+postgres range_sum_1000 p50 179.1 us
+postgres range_sum_1000 p95 314.5 us
+postgres range_sum_1000 p99 355.6 us
+postgres range_sum_1000 cpu 0.16 s
+postgres subject_count p50 1081.6 us
+postgres subject_count p95 1167.5 us
+postgres subject_count p99 1281.2 us
+postgres subject_count cpu 1.06 s
+postgres range_sum_all p50 12354.3 us
+postgres range_sum_all p95 13119.4 us
+postgres range_sum_all p99 13119.4 us
+postgres range_sum_all cpu 0.25 s
+postgres checkpoint_after_load seconds 0.108 s
+postgres checkpoint_after_load cpu 0.01 s
+postgres after_checkpoint memory 49.0 MB
+postgres pk_lookup_after_checkpoint p50 20.8 us
+postgres pk_lookup_after_checkpoint p95 31.1 us
+postgres pk_lookup_after_checkpoint p99 45.9 us
+postgres pk_lookup_after_checkpoint cpu 0.35 s
+postgres range_sum_1000_after_checkpoint p50 154.0 us
+postgres range_sum_1000_after_checkpoint p95 314.6 us
+postgres range_sum_1000_after_checkpoint p99 331.6 us
+postgres range_sum_1000_after_checkpoint cpu 0.17 s
+postgres subject_count_after_checkpoint p50 1089.2 us
+postgres subject_count_after_checkpoint p95 1190.0 us
+postgres subject_count_after_checkpoint p99 1464.5 us
+postgres subject_count_after_checkpoint cpu 1.05 s
+postgres range_sum_all_after_checkpoint p50 12206.2 us
+postgres range_sum_all_after_checkpoint p95 13123.6 us
+postgres range_sum_all_after_checkpoint p99 13123.6 us
+postgres range_sum_all_after_checkpoint cpu 0.24 s
+postgres churn_update_1000 rows_per_s 103162 /s
+postgres churn_update_1000 p50 7935.0 us
+postgres churn_update_1000 p95 15244.3 us
+postgres churn_update_1000 p99 60403.2 us
+postgres churn_update_1000 cpu 2.64 s
+postgres after_churn memory 103.3 MB
+postgres churn written 388.5 MB
+postgres delete_reinsert_1000 rows_per_s 59224 /s
+postgres delete_reinsert_1000 p50 30913.5 us
+postgres delete_reinsert_1000 p95 45326.4 us
+postgres delete_reinsert_1000 p99 82139.5 us
+postgres delete_reinsert_1000 cpu 1.14 s
+postgres after_deletes memory 109.6 MB
+postgres cumulative cpu 10.72 s (every phase so far; the phases print their own)
+postgres checkpoint_after_churn seconds 0.258 s
+postgres checkpoint_after_churn cpu 0.03 s
+postgres w6_load_1000 rows_per_s 41379 /s
+postgres w6_load_1000 p50 23283.0 us
+postgres w6_load_1000 p95 35007.7 us
+postgres w6_load_1000 p99 38044.7 us
+postgres w6_load_1000 cpu 1.70 s
+postgres w6_create_index seconds 0.060 s
+postgres w6_create_index cpu 0.03 s
+postgres w6_range_sum_1000 p50 567.6 us
+postgres w6_range_sum_1000 p95 699.6 us
+postgres w6_range_sum_1000 p99 1095.7 us
+postgres w6_range_sum_1000 cpu 0.06 s
+postgres w6_range_sum_all p50 11914.9 us
+postgres w6_range_sum_all p95 12747.8 us
+postgres w6_range_sum_all p99 12747.8 us
+postgres w6_range_sum_all cpu 0.23 s
+postgres w6_update_1000 p50 7742.0 us
+postgres w6_update_1000 p95 12492.8 us
+postgres w6_update_1000 p99 17207.3 us
+postgres w6_update_1000 cpu 0.54 s
+postgres w6_update_1000 rows_per_s 122610 /s (99998 rows)
+postgres w6_checkpoint seconds 0.069 s
+postgres w6_checkpoint cpu 0.02 s
+postgres w6_range_sum_1000_after_checkpoint p50 574.4 us
+postgres w6_range_sum_1000_after_checkpoint p95 867.4 us
+postgres w6_range_sum_1000_after_checkpoint p99 4779.6 us
+postgres w6_range_sum_1000_after_checkpoint cpu 0.06 s
+postgres w6_range_sum_all_after_checkpoint p50 13988.2 us
+postgres w6_range_sum_all_after_checkpoint p95 15475.9 us
+postgres w6_range_sum_all_after_checkpoint p99 15475.9 us
+postgres w6_range_sum_all_after_checkpoint cpu 0.28 s
+postgres after_w6 memory 121.2 MB (W6 added 11.5 MB)
+postgres w6 written 51.9 MB
+postgres w7_load_1000 rows_per_s 39755 /s
+postgres w7_load_1000 p50 24820.1 us
+postgres w7_load_1000 p95 27467.1 us
+postgres w7_load_1000 p99 33004.2 us
+postgres w7_load_1000 cpu 4.00 s
+postgres w7_analyze seconds 0.240 s
+postgres w7_analyze cpu 0.16 s
+postgres w7_point_join p50 24.9 us
+postgres w7_point_join p95 46.8 us
+postgres w7_point_join p99 61.9 us
+postgres w7_point_join cpu 0.25 s
+postgres w7_point_join plan Nested Loop; Index Scan using o_pkey on o; Index Cond: (id = $1); Index Scan using c_pkey on c; Index Cond: (id = o.cust)
+postgres w7_customer_orders p50 44.5 us
+postgres w7_customer_orders p95 67.0 us
+postgres w7_customer_orders p99 89.7 us
+postgres w7_customer_orders cpu 0.43 s
+postgres w7_customer_orders plan Aggregate; Nested Loop; Index Only Scan using c_pkey on c; Index Cond: (id = $1); Bitmap Heap Scan on o; Recheck Cond: (cust = $1); Bitmap Index Scan on o_cust; Index Cond: (cust = $1)
+postgres w7_anti_join p50 14426.1 us
+postgres w7_anti_join p95 15430.2 us
+postgres w7_anti_join p99 15660.2 us
+postgres w7_anti_join cpu 1.46 s
+postgres w7_anti_join plan Aggregate; Hash Right Join; Hash Cond: (o.cust = c.id); Filter: (o.id IS NULL); Seq Scan on o; Hash; Bitmap Heap Scan on c; Recheck Cond: (region = $1); Bitmap Index Scan on c_region; Index Cond: (region = $1)
+postgres w7_join_by_region p50 33028.0 us
+postgres w7_join_by_region p95 34588.0 us
+postgres w7_join_by_region p99 34588.0 us
+postgres w7_join_by_region cpu 0.63 s
+postgres w7_join_by_region plan Finalize GroupAggregate; Group Key: c.region; Gather Merge; Workers Planned: 1; Sort; Sort Key: c.region; Partial HashAggregate; Group Key: c.region; Hash Join; Hash Cond: (o.cust = c.id); Parallel Seq Scan on o; Hash; Seq Scan on c
+postgres w7_checkpoint seconds 0.148 s
+postgres w7_checkpoint cpu 0.03 s
+postgres w7_point_join_after_checkpoint p50 25.4 us
+postgres w7_point_join_after_checkpoint p95 45.1 us
+postgres w7_point_join_after_checkpoint p99 51.6 us
+postgres w7_point_join_after_checkpoint cpu 0.23 s
+postgres w7_point_join_after_checkpoint plan Nested Loop; Index Scan using o_pkey on o; Index Cond: (id = $1); Index Scan using c_pkey on c; Index Cond: (id = o.cust)
+postgres w7_customer_orders_after_checkpoint p50 40.6 us
+postgres w7_customer_orders_after_checkpoint p95 58.8 us
+postgres w7_customer_orders_after_checkpoint p99 69.0 us
+postgres w7_customer_orders_after_checkpoint cpu 0.37 s
+postgres w7_customer_orders_after_checkpoint plan Aggregate; Nested Loop; Index Only Scan using c_pkey on c; Index Cond: (id = $1); Bitmap Heap Scan on o; Recheck Cond: (cust = $1); Bitmap Index Scan on o_cust; Index Cond: (cust = $1)
+postgres w7_anti_join_after_checkpoint p50 14869.9 us
+postgres w7_anti_join_after_checkpoint p95 16256.3 us
+postgres w7_anti_join_after_checkpoint p99 19419.0 us
+postgres w7_anti_join_after_checkpoint cpu 1.51 s
+postgres w7_anti_join_after_checkpoint plan Aggregate; Hash Right Join; Hash Cond: (o.cust = c.id); Filter: (o.id IS NULL); Seq Scan on o; Hash; Bitmap Heap Scan on c; Recheck Cond: (region = $1); Bitmap Index Scan on c_region; Index Cond: (region = $1)
+postgres w7_join_by_region_after_checkpoint p50 33045.2 us
+postgres w7_join_by_region_after_checkpoint p95 33615.4 us
+postgres w7_join_by_region_after_checkpoint p99 33615.4 us
+postgres w7_join_by_region_after_checkpoint cpu 0.63 s
+postgres w7_join_by_region_after_checkpoint plan Finalize GroupAggregate; Group Key: c.region; Gather Merge; Workers Planned: 1; Sort; Sort Key: c.region; Partial HashAggregate; Group Key: c.region; Hash Join; Hash Cond: (o.cust = c.id); Parallel Seq Scan on o; Hash; Seq Scan on c
+postgres after_w7 memory 144.1 MB (W7 added 22.8 MB)
+postgres w7 written 93.4 MB
+postgres w8_create_index_2col seconds 0.089 s
+postgres w8_create_index_2col cpu 0.13 s
+postgres w8_two_column_count p50 23.3 us
+postgres w8_two_column_count p95 37.9 us
+postgres w8_two_column_count p99 49.8 us
+postgres w8_two_column_count cpu 0.20 s
+postgres w8_two_column_count plan Aggregate; Index Only Scan using o_ca on o; Index Cond: ((cust = $1) AND (amount >= $2) AND (amount <= $3))
+postgres w8_create_unique_index seconds 0.019 s
+postgres w8_create_unique_index cpu 0.01 s
+postgres w8_unique_lookup p50 20.8 us
+postgres w8_unique_lookup p95 34.8 us
+postgres w8_unique_lookup p99 45.1 us
+postgres w8_unique_lookup cpu 0.18 s
+postgres w8_unique_lookup plan Index Scan using c_name on c; Index Cond: (name = $1)
+postgres w8_unique_insert_100 rows_per_s 20835 /s
+postgres w8_unique_insert_100 p50 4406.6 us
+postgres w8_unique_insert_100 p95 7769.7 us
+postgres w8_unique_insert_100 p99 7769.7 us
+postgres w8_unique_insert_100 cpu 0.02 s
+whole: postgres: W8b inserts a duplicate name, which must be refused:
+whole: postgres: INSERT INTO c VALUES ($1, $2, $3): ERROR:  duplicate key value violates unique constraint "c_name"
+DETAIL:  Key (name)=(c1) already exists.
+
+postgres w8_duplicate_name refused
+postgres after: package 69 C, mean clock 2977 MHz
+postgres storage size 303.5 MB (beyond a fresh cluster)
+postgres server_restart seconds 0.237 s
+device sda: 1 pauses or slow flushes (bench/devstall: 200 ms or more with requests in flight and none completing, a lower bound, or 200 ms of flushes completed in 0.1 s)
+devstall flush 10:39:58.917 2.700 s

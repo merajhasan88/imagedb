@@ -1,0 +1,5 @@
+clean2: rc 0, 303 ms (torn2: sector 42159 zeroed, watermark rewound)
+torn2: rc 0, 301 ms (torn2: sector 42159 zeroed, watermark rewound)
+torn2: rc 0, 302 ms (torn2: sector 42159 zeroed, watermark rewound)
+verify rc 0
+audit rc 0

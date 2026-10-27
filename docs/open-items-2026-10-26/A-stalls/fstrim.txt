@@ -1,0 +1,1 @@
+fstrim -v / at 19:46:02-19:46:16: /: 22.7 GiB (24361836544 bytes) trimmed (the last, by the weekly timer, 00:49: 82.5 GiB)

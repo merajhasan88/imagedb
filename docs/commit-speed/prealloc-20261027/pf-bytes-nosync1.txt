@@ -1,0 +1,5 @@
+pf_bytes frames 20001
+pf_bytes untagged 6420270 bytes
+pf_bytes P 6525952 bytes (+1.6%)
+pf_bytes F 10241024 bytes (+59.5%)
+pf_bytes P_fill 814592 bytes

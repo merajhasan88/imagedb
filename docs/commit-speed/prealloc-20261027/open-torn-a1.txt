@@ -1,0 +1,1 @@
+imagedb: open: log damaged: commit 201 was acknowledged as durable, but the log ends with a damaged or incomplete frame after commit 200 (torn tail: tagged segment 1, commit 201 incomplete); restore the segment from a replica, or discard the acknowledged commits with im (corrupt)

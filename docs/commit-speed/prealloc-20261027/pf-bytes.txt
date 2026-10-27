@@ -1,0 +1,30 @@
+== sync-a1
+pf_bytes frames 8002
+pf_bytes untagged 2568518 bytes
+pf_bytes P 4098048 bytes (+59.5%)
+pf_bytes F 4098048 bytes (+59.5%)
+pf_bytes P_fill 1097728 bytes
+== strict-a1
+pf_bytes frames 2002
+pf_bytes untagged 642518 bytes
+pf_bytes P 1026048 bytes (+59.7%)
+pf_bytes F 1026048 bytes (+59.7%)
+pf_bytes P_fill 536576 bytes
+== sync1k-a1
+pf_bytes frames 201
+pf_bytes untagged 21243270 bytes
+pf_bytes P 21607424 bytes (+1.7%)
+pf_bytes F 21607424 bytes (+1.7%)
+pf_bytes P_fill 413184 bytes
+== sync10k-a1
+pf_bytes frames 21
+pf_bytes untagged 21204570 bytes
+pf_bytes P 21545984 bytes (+1.6%)
+pf_bytes F 21545984 bytes (+1.6%)
+pf_bytes P_fill 1048576 bytes
+== nosync-a1
+pf_bytes frames 201
+pf_bytes untagged 21243270 bytes
+pf_bytes P 21585920 bytes (+1.6%)
+pf_bytes F 21607424 bytes (+1.7%)
+pf_bytes P_fill 434688 bytes

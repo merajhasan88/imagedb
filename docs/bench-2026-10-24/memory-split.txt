@@ -1,0 +1,13 @@
+sizeof(imdb_version) = 96 B
+-- after the load: 150500 versions (150500 live), RSS 69.2 MB, imdb_mem total 61.4 MB = 408 B per version
+   versions    25.2 MB (  167 B/version)   rows    16.8 MB (  111)   indexes    14.5 MB (   96)
+   segments     0.0 MB (    0 B/version)   commits    0.1 MB (    1)   txns    4.8 MB
+-- after the checkpoint: 150500 versions (150500 live), RSS 73.8 MB, imdb_mem total 67.4 MB = 448 B per version
+   versions    25.2 MB (  167 B/version)   rows     0.0 MB (    0)   indexes    14.5 MB (   96)
+   segments    22.7 MB (  151 B/version)   commits    0.1 MB (    1)   txns    4.8 MB
+-- after the churn (500,000 updates): 650500 versions (150500 live), RSS 244.6 MB, imdb_mem total 227.6 MB = 350 B per version
+   versions   100.7 MB (  155 B/version)   rows    16.8 MB (   26)   indexes    27.3 MB (   42)
+   segments    77.9 MB (  120 B/version)   commits    0.1 MB (    0)   txns    4.8 MB
+-- after the delete churn: 700500 versions (150500 live), RSS 244.6 MB, imdb_mem total 228.6 MB = 326 B per version
+   versions   100.7 MB (  144 B/version)   rows    16.8 MB (   24)   indexes    28.1 MB (   40)
+   segments    77.9 MB (  111 B/version)   commits    0.3 MB (    0)   txns    4.8 MB

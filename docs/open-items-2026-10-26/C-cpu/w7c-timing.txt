@@ -1,0 +1,15 @@
+before checkpoint, run 1: open 322 ms; open + 1,000 W7c 846 ms; so 524 us a query
+before checkpoint, run 2: open 318 ms; open + 1,000 W7c 827 ms; so 509 us a query
+before checkpoint, run 3: open 318 ms; open + 1,000 W7c 827 ms; so 509 us a query
+after checkpoint, run 1: open 347 ms; open + 1,000 W7c 778 ms; so 431 us a query
+after checkpoint, run 2: open 345 ms; open + 1,000 W7c 768 ms; so 423 us a query
+after checkpoint, run 3: open 353 ms; open + 1,000 W7c 773 ms; so 420 us a query
+== answer before / after the checkpoint
+ count
+-------
+    40
+(1 row)  [join(index 2)]  at commit 226
+ count
+-------
+    40
+(1 row)  [join(index 2)]  at commit 227

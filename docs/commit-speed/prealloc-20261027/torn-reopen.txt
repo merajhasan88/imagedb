@@ -1,0 +1,5 @@
+clean-a1: rc 0, 301 ms (sector 42159 zeroed in torn-a1)
+torn-a1: rc 1, 276 ms (sector 42159 zeroed in torn-a1)
+torn-a1 again (repaired): rc 0, 274 ms
+verify rc 1
+audit rc 1

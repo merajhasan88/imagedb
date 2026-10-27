@@ -1,0 +1,24 @@
+build/
+build-san/
+build-fuzz/
+*.o
+.work/
+build-tsan/
+build-ct/
+
+# Kept on this machine, not published, and never to be deleted: results that include SQL Server, whose
+# licence (SQL Server 2025 Developer terms, section 5) requires Microsoft's prior written approval to
+# disclose benchmark results; and the working records (the session plan logs, the external reviews).
+/docs/bench-2026-10-26-ten.md
+/docs/bench-2026-10-26-ten/
+/docs/open-items-2026-10-26/B-swings/batch-10000.txt
+/docs/private/
+/docs/plan-round*.md
+/docs/imagedb-feedback-2026-10-21.md
+/docs/imagedb-feedback-2026-10-26.md
+
+# Markdown stays on this machine (the user, 2026-10-27): every .md file but README.md and Monocypher's
+# (src/vendor/monocypher), which stay tracked. A new one is published only with git add -f, on the
+# user's word.
+/progress_for_owner.md
+*.md

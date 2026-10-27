@@ -1,0 +1,13 @@
+    44.00%  [.] visible_q                         -      -            
+    13.03%  [.] imdb_oidx_range                   -      -            
+    12.43%  [.] seg_get                           -      -            
+     6.13%  [.] imdb_siphash24                    -      -            
+     4.69%  [.] sink_row.part.0                   -      -            
+     2.57%  [.] imdb_value_hash                   -      -            
+     2.56%  [.] imdb_version_values               -      -            
+     1.75%  [.] find                              -      -            
+     1.68%  [.] ord_fetch                         -      -            
+     1.67%  [.] join_emit                         -      -            
+     1.61%  [.] acc_add.part.0                    -      -            
+     1.41%  [.] imdb_seg_values                   -      -            
+     1.05%  [.] __memmove_avx_unaligned_erms      -      -            

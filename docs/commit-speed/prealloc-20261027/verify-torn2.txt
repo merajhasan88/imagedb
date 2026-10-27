@@ -1,0 +1,6 @@
+VERIFY ok
+  commits            200 (hash chain, 200 Ed25519 signatures)
+  payloads re-hashed 199000
+  versions           199000 (199000 live, 0 erased stubs)
+  lake               0 segments, 0 rows re-derived from files
+  digest             d3eb83d79469afb8a0dd606ff77860295f6b969625a8cb9c8cdbce7cc92b91c9

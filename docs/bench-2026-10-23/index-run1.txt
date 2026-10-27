@@ -1,0 +1,7 @@
+rows: 150500 versions, no checkpoint
+range SUM, no index      p50   17441.6 us, p95   19262.9, p99   21640.3, mean   17701.8; path scan (index(ordered) 0 of 1000)
+CREATE INDEX t_id: 10.6 ms; memory: indexes 12.09 -> 14.50 MB, total 59.03 -> 61.44 MB (+16.0 bytes per row)
+range SUM, index on id   p50     121.6 us, p95     184.5, p99     231.8, mean     131.0; path index(ordered) (index(ordered) 1000 of 1000)
+the 1,000 answers agree, and each is 1000 * lo + 499500
+open with the index (log replay + build): 351.5 ms
+open without it (log replay):             332.7 ms
