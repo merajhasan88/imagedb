@@ -50,7 +50,7 @@ TSRC    = $(wildcard tests/unit/*.c)
 TOBJ    = $(TSRC:tests/unit/%.c=$(BUILD)/tobj/%.o) $(BUILD)/tobj/acrypto.o $(BUILD)/tobj/afsum.o
 TBIN    = $(BUILD)/test_unit
 
-.PHONY: all lint test unit san tsan ct fuzz fuzz-run bench whole index-sum mem-split join-cost clean integration faults
+.PHONY: all lint test unit san tsan ct fuzz fuzz-run bench whole index-sum mem-split join-cost clean integration faults soak
 
 AUDIT   = $(BUILD)/imagedb-audit
 ASRC    = tools/audit/audit.c tools/audit/acrypto.c tools/audit/afsum.c
@@ -135,6 +135,14 @@ integration: $(BIN) $(AUDIT) $(FORGE)
 faults: $(TBIN) $(AUDIT)
 	mkdir -p $(BUILD)/tmp
 	IMDB_AUDIT_BIN=$(AUDIT) IMDB_FAULT_FULL=1 IMDB_FAULT_TMP=$(BUILD)/tmp $(TBIN) fault
+
+# Hours of churn over a fixed live set, the writer killed at random and restarted, memory and disk sampled
+# (tests/soak/soak.sh; deferred.md D8): not in the matrix. SOAK_MINUTES, SOAK_LIVE; IMDB_SOAK_* knobs in the script.
+SOAK_MINUTES ?= 120
+SOAK_LIVE ?= 100000
+soak: $(BIN) $(LIB) $(AUDIT)
+	mkdir -p $(BUILD)/tmp
+	IMDB_SOAK_TMP=$(BUILD)/tmp bash tests/soak/soak.sh $(BIN) $(SOAK_MINUTES) $(SOAK_LIVE)
 
 # Sanitizer runtimes of clang <= 16 / gcc 11 can fault-loop at startup when the
 # kernel uses 32 bits of mmap randomisation (Linux 6.x); run them without ASLR.
