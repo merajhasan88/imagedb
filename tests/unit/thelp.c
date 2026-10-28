@@ -96,7 +96,7 @@ uint64_t count_subject(imdb_db *db, int64_t user, uint64_t snap)
     imdb_value k = {.type = IMDB_T_INT64, .i = user};
     const imdb_vlist *l = imdb_subject_versions(t, &k);
     uint64_t n = 0;
-    for (uint32_t i = 0; l && i < l->n; i++) n += imdb_visible(&t->ver[l->v[i]], snap);
+    for (uint32_t i = 0; l && i < l->n; i++) n += imdb_visible(imdb_vh(t, l->v[i]), snap);
     return n;
 }
 

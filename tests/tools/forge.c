@@ -856,7 +856,7 @@ static void index_lie(const char *dir, const char *kind)
         int64_t maxpk = 0;
         for (uint64_t vid = 0; vid < t->nver; vid++) {
             imdb_value k;
-            if (t->ver[vid].end != IMDB_LIVE || imdb_version_key(t, vid, t->s.pk, &k) != IMDB_OK) continue;
+            if (imdb_vh(t, vid)->end != IMDB_LIVE || imdb_version_key(t, vid, t->s.pk, &k) != IMDB_OK) continue;
             if (src == IMDB_NONE) src = vid;
             if (k.i > maxpk) maxpk = k.i;
         }

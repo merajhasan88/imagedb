@@ -37,7 +37,7 @@ static void t_checkpoint_basic(void)
     imdb_state_digest(db, NULL, d1);
     CHECK(memcmp(d0, d1, 32) == 0); /* physical work never changes the logical digest */
     imdb_table *t = imdb_table_by_name(db, "txns");
-    CHECK(t->nseg == 1 && t->mem_first == t->nver && (t->ver[5].flags & IMDB_V_SEG));
+    CHECK(t->nseg == 1 && t->mem_first == t->nver && (imdb_vh(t, 5)->flags & IMDB_V_SEG));
     CHECK(lookup_cents(db, 42, db->seq) == 126);
     CHECK(count_subject(db, 3, db->seq) == 14);
     char *objs = path_join(dir, "objects");
@@ -621,10 +621,10 @@ static bool same_state(imdb_db *a, imdb_db *b, char *why, size_t wl)
             return false;
         }
         for (uint64_t vid = 0; vid < x->nver; vid++) {
-            const imdb_version *u = &x->ver[vid], *w = &y->ver[vid];
+            const imdb_version *u = imdb_vh(x, vid), *w = imdb_vh(y, vid);
             uint8_t fm = IMDB_V_STUB | IMDB_V_PURGED | IMDB_V_PENDING_AUTH;
             if (u->begin != w->begin || u->end != w->end || (u->flags & fm) != (w->flags & fm) ||
-                memcmp(u->commit, w->commit, 32) || memcmp(u->salt, w->salt, 16)) {
+                memcmp(imdb_vc(x, vid)->commit, imdb_vc(y, vid)->commit, 32) || memcmp(imdb_vc(x, vid)->salt, imdb_vc(y, vid)->salt, 16)) {
                 snprintf(why, wl, "table %s version %llu", x->s.name, (unsigned long long)vid);
                 return false;
             }

@@ -29,11 +29,11 @@ int imdb_erase_versions(imdb_db *db, imdb_erase_ent *ents, uint32_t n, imdb_eras
     for (uint32_t i = 0; i < n; i++) {
         imdb_table *t = imdb_table_by_id(db, ents[i].table);
         if (!t || ents[i].vid >= t->nver || (i && cmp_ent(&ents[i - 1], &ents[i]) == 0) ||
-            (t->ver[ents[i].vid].flags & IMDB_V_STUB)) {
+            (imdb_vh(t, ents[i].vid)->flags & IMDB_V_STUB)) {
             free(ents);
             return imdb_fail(e, IMDB_ERR_INVALID, "ERASE: invalid or duplicate version");
         }
-        memcpy(ents[i].commit, t->ver[ents[i].vid].commit, 32);
+        memcpy(ents[i].commit, imdb_vc(t, ents[i].vid)->commit, 32);
         if (ents[i].table != last_table) {
             rep->tables++;
             last_table = ents[i].table;
@@ -45,7 +45,7 @@ int imdb_erase_versions(imdb_db *db, imdb_erase_ent *ents, uint32_t n, imdb_eras
     }
     for (uint32_t i = 0; i < n; i++) {
         imdb_table *t = db->t[ents[i].table];
-        if (t->ver[ents[i].vid].end == IMDB_LIVE) {
+        if (imdb_vh(t, ents[i].vid)->end == IMDB_LIVE) {
             if (imdb_delete(db, t, ents[i].vid, e)) {
                 imdb_rollback(db);
                 free(ents);
@@ -82,7 +82,7 @@ int imdb_erase_subject(imdb_db *db, const imdb_value *subject, imdb_erase_report
         const imdb_vlist *l = imdb_subject_versions(t, subject);
         if (!l) continue;
         for (uint32_t i = 0; i < l->n; i++) {
-            if (t->ver[l->v[i]].flags & IMDB_V_STUB) continue;
+            if (imdb_vh(t, l->v[i])->flags & IMDB_V_STUB) continue;
             if (n == cap) {
                 size_t ncap = cap ? cap * 2 : 64;
                 if (ncap > IMDB_MAX_ERASE_ENTRIES) {

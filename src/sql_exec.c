@@ -493,7 +493,7 @@ static void sink_row(sink *k, uint64_t vid, const imdb_value *vals)
     case SINK_JOUTER: join_outer_row(k, vid, vals); return;
     case SINK_JINNER: join_inner_row(k, vid, vals); return;
     case SINK_DIGEST:
-        imdb_lthash_add_commit(k->x->db->meta.digest_alg, &k->digest, k->t->ver[vid].commit);
+        imdb_lthash_add_commit(k->x->db->meta.digest_alg, &k->digest, imdb_vc(k->t, vid)->commit);
         k->digest_rows++;
         return;
     case SINK_GROUP: {
@@ -586,7 +586,7 @@ static int path_store(xctx *x, const qspec *q, sink *k, imdb_err *e)
     imdb_table *t = q->t;
     imdb_value vals[IMDB_MAX_COLS];
     for (uint64_t vid = 0; vid < t->nver && !k->err; vid++) {
-        if (!visible_q(q, &t->ver[vid])) continue;
+        if (!visible_q(q, imdb_vh(t, vid))) continue;
         if (fetch_row(x, t, vid, vals, e)) return e->code;
         if (preds_ok(q, vals)) sink_row(k, vid, vals);
     }
@@ -608,7 +608,7 @@ static int path_index(xctx *x, const qspec *q, sink *k, imdb_err *e)
         const imdb_vlist *l = imdb_subject_versions(t, &q->p[q->subj_pred].a);
         for (uint32_t i = 0; l && i < l->n && !k->err; i++) {
             uint64_t vid = l->v[i];
-            if (!visible_q(q, &t->ver[vid])) continue;
+            if (!visible_q(q, imdb_vh(t, vid))) continue;
             if (fetch_row(x, t, vid, vals, e)) return e->code;
             if (preds_ok(q, vals)) sink_row(k, vid, vals);
         }
@@ -657,7 +657,7 @@ typedef struct octx {
 static int ord_fetch(octx *o, uint64_t vid)
 {
     imdb_table *t = o->q->t;
-    if (vid >= t->nver || !visible_q(o->q, &t->ver[vid])) return IMDB_OK;
+    if (vid >= t->nver || !visible_q(o->q, imdb_vh(t, vid))) return IMDB_OK;
     if (fetch_row(o->x, t, vid, o->vals, o->e)) return o->e->code;
     if (preds_ok(o->q, o->vals)) sink_row(o->k, vid, o->vals);
     return o->k->err;
@@ -675,7 +675,7 @@ static int ord_only_visit(void *ctx, const uint64_t *key, uint64_t vid)
 {
     octx *o = ctx;
     imdb_table *t = o->q->t;
-    if (vid >= t->nver || !visible_q(o->q, &t->ver[vid])) return IMDB_OK;
+    if (vid >= t->nver || !visible_q(o->q, imdb_vh(t, vid))) return IMDB_OK;
     const imdb_index *ix = o->q->ord_idx;
     for (uint8_t c = 0; c < ix->d.ncols; c++)
         if (t->s.cols[ix->d.cols[c]].type != IMDB_T_TEXT) o->vals[ix->d.cols[c]].i = (int64_t)(key[c] ^ (1ull << 63));
@@ -826,7 +826,7 @@ static int path_scan(xctx *x, const qspec *q, sink *k, imdb_err *e)
                         uint32_t r = (uint32_t)(w * 64 + (uint64_t)__builtin_ctzll(m));
                         m &= m - 1;
                         imdb_value v;
-                        imdb_seg_value(t, &t->ver[g->vid[r]], b->col, &v);
+                        imdb_seg_value(t, imdb_vh(t, g->vid[r]), b->col, &v);
                         if (!pred_ok(b, &v)) bits[w] &= ~(1ull << (r & 63));
                     }
                 }
@@ -874,7 +874,7 @@ static int path_scan(xctx *x, const qspec *q, sink *k, imdb_err *e)
     if (rc || k->err) return rc ? rc : k->err;
     /* memtable rows (not yet in a segment) */
     for (uint64_t vid = t->mem_first; vid < t->nver && !k->err; vid++) {
-        if (!visible_q(q, &t->ver[vid])) continue;
+        if (!visible_q(q, imdb_vh(t, vid))) continue;
         if (fetch_row(x, t, vid, vals, e)) return e->code;
         if (preds_ok(q, vals)) sink_row(k, vid, vals);
     }
@@ -2473,14 +2473,14 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
         for (int c = 0; c < t->s.ncols; c++) res_name(r, (uint16_t)(3 + c), t->s.cols[c].name);
         uint64_t *head = imdb_hmap_get(&t->pk, &key);
         uint64_t nch = 0;
-        for (uint64_t vid = head ? *head : IMDB_NONE; vid != IMDB_NONE; vid = t->ver[vid].pk_prev) nch++;
+        for (uint64_t vid = head ? *head : IMDB_NONE; vid != IMDB_NONE; vid = imdb_vh(t, vid)->pk_prev) nch++;
         uint64_t *chain = xalloc(x, nch * sizeof *chain, e);
         if (!chain) return e->code;
         nch = 0;
-        for (uint64_t vid = head ? *head : IMDB_NONE; vid != IMDB_NONE; vid = t->ver[vid].pk_prev) chain[nch++] = vid;
+        for (uint64_t vid = head ? *head : IMDB_NONE; vid != IMDB_NONE; vid = imdb_vh(t, vid)->pk_prev) chain[nch++] = vid;
         imdb_value vals[IMDB_MAX_COLS];
         for (uint64_t i = nch; i-- > 0;) { /* oldest first */
-            imdb_version *v = &t->ver[chain[i]];
+            imdb_version *v = imdb_vh(t, chain[i]);
             if (v->flags & IMDB_V_PURGED) continue;
             if (fetch_row(x, t, chain[i], vals, e)) return e->code;
             imdb_cell *row = res_row(r, e);

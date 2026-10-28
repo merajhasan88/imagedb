@@ -10,6 +10,14 @@ enum { UNDO_INSERT = 1, UNDO_END = 2, UNDO_CREATE = 3, UNDO_INDEX = 4, UNDO_UNIN
 int imdb_table_new(imdb_db *db, const imdb_schema *s, imdb_err *e);
 void imdb_table_free(imdb_table *t);
 int imdb_ver_push(imdb_table *t, imdb_err *e);
+/* An empty store with room for exactly n versions (chunk 0 sized to n when n fits one chunk), for an
+ * open that knows the count (the snapshot). */
+int imdb_ver_reserve(imdb_table *t, uint64_t n, imdb_err *e);
+/* What the store holds in memory, and what its next growth step adds (both parts and the directories). */
+uint64_t imdb_ver_bytes(const imdb_table *t);
+uint64_t imdb_ver_growth(const imdb_table *t);
+/* the capacity in versions after the next growth step */
+uint64_t imdb_ver_next_cap(const imdb_table *t);
 const uint8_t *imdb_mem_row(const imdb_table *t, const imdb_version *v);
 int imdb_version_key(imdb_table *t, uint64_t vid, int col, imdb_value *out);
 /* DML on canonical row bytes; salt is a replayed op's (its commitment stays the same) or NULL. */

@@ -52,7 +52,8 @@ int main(int argc, char **argv)
     imdb_db *db;
     if (imdb_open(argv[1], &o, &db, &e)) return 1;
     imdb_session_init(&s, db);
-    printf("sizeof(imdb_version) = %zu B\n", sizeof(imdb_version));
+    printf("sizeof(imdb_version) = %zu B (the hot part), sizeof(imdb_version_cold) = %zu B, chunks of %llu versions\n",
+           sizeof(imdb_version), sizeof(imdb_version_cold), (unsigned long long)IMDB_VCHUNK);
     ex("CREATE TABLE t (id INT64 PRIMARY KEY, user_id INT64 SUBJECT, amount INT64 NOT NULL, memo TEXT NOT NULL)", NULL, 0);
     ex("CREATE INDEX t_id ON t (id)", NULL, 0);
     for (int i = 0; i < 500; i++) ins(1000000 + i, i % 97, i);                         /* W1 */

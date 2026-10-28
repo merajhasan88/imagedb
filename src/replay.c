@@ -39,22 +39,22 @@ static int apply_insert(imdb_db *db, imdb_table *t, const imdb_op *op, uint64_t 
         if (imdb_row_decode(&t->s, op->row, op->row_len, vals, &e2))
             return imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: %s", (unsigned long long)seq, e2.msg);
         uint64_t *head = imdb_hmap_get(&t->pk, &vals[t->s.pk]);
-        if (head && t->ver[*head].end == IMDB_LIVE)
+        if (head && imdb_vh(t, *head)->end == IMDB_LIVE)
             return imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: duplicate live primary key in table %s",
                              (unsigned long long)seq, t->s.name);
         if (imdb_index_unique_replay(t, vals, seq, e)) return e->code; /* an UPDATE's old version ended already */
     }
     if (imdb_ver_push(t, e)) return e->code;
-    imdb_version *v = &t->ver[vid];
+    imdb_version *v = imdb_vh(t, vid);
     v->begin = seq;
-    memcpy(v->commit, commit, 32);
+    memcpy(imdb_vc(t, vid)->commit, commit, 32);
     t->live++;
     if (op->pkind == IMDB_PAYLOAD_REDACTED) {
         v->flags = IMDB_V_STUB | IMDB_V_PENDING_AUTH;
         db->pending_auth++;
         return IMDB_OK;
     }
-    memcpy(v->salt, op->salt, 16);
+    memcpy(imdb_vc(t, vid)->salt, op->salt, 16);
     v->row_off = t->arena.len;
     v->row_len = op->row_len;
     imdb_buf_put(&t->arena, op->row, op->row_len);
@@ -68,11 +68,11 @@ static int apply_end(imdb_table *t, uint64_t vid, const uint8_t commit[32], uint
 {
     if (vid >= t->nver)
         return imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: delete of unknown version", (unsigned long long)seq);
-    imdb_version *v = &t->ver[vid];
+    imdb_version *v = imdb_vh(t, vid);
     if (v->end != IMDB_LIVE)
         return imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: delete of a version that is not live (table %s)",
                          (unsigned long long)seq, t->s.name);
-    if (memcmp(v->commit, commit, 32) != 0)
+    if (memcmp(imdb_vc(t, vid)->commit, commit, 32) != 0)
         return imdb_fail(e, IMDB_ERR_VERIFY, "commit %llu: delete precondition failed: version commitment differs",
                          (unsigned long long)seq);
     v->end = seq;
@@ -211,8 +211,8 @@ int imdb_apply_commit(imdb_db *db, imdb_commit_rec *c, const imdb_commit_pre *pr
                     rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: ERASE names an unknown version", (unsigned long long)seq);
                     break;
                 }
-                imdb_version *v = &et->ver[en->vid];
-                if (memcmp(v->commit, en->commit, 32) != 0) {
+                imdb_version *v = imdb_vh(et, en->vid);
+                if (memcmp(imdb_vc(et, en->vid)->commit, en->commit, 32) != 0) {
                     rc = imdb_fail(e, IMDB_ERR_VERIFY, "commit %llu: ERASE commitment mismatch", (unsigned long long)seq);
                     break;
                 }
@@ -279,20 +279,20 @@ int imdb_apply_commit(imdb_db *db, imdb_commit_rec *c, const imdb_commit_pre *pr
         bool ok = true;
         switch (o->code) {
         case IMDB_OP_INSERT:
-            ok = t && o->vid < t->nver && t->ver[o->vid].begin == seq && !memcmp(t->ver[o->vid].commit, o->commit, 32) &&
-                 (t->ver[o->vid].end == IMDB_LIVE || t->ver[o->vid].end == seq);
+            ok = t && o->vid < t->nver && imdb_vh(t, o->vid)->begin == seq && !memcmp(imdb_vc(t, o->vid)->commit, o->commit, 32) &&
+                 (imdb_vh(t, o->vid)->end == IMDB_LIVE || imdb_vh(t, o->vid)->end == seq);
             break;
         case IMDB_OP_DELETE:
-            ok = t && o->vid < t->nver && t->ver[o->vid].end == seq;
+            ok = t && o->vid < t->nver && imdb_vh(t, o->vid)->end == seq;
             break;
         case IMDB_OP_UPDATE:
-            ok = t && o->new_vid < t->nver && t->ver[o->vid].end == seq && t->ver[o->new_vid].begin == seq &&
-                 !memcmp(t->ver[o->new_vid].commit, o->new_commit, 32);
+            ok = t && o->new_vid < t->nver && imdb_vh(t, o->vid)->end == seq && imdb_vh(t, o->new_vid)->begin == seq &&
+                 !memcmp(imdb_vc(t, o->new_vid)->commit, o->new_commit, 32);
             break;
         case IMDB_OP_ERASE:
             for (uint32_t k = 0; k < o->n_erase && ok; k++) {
                 imdb_table *et = imdb_table_by_id(db, o->erase[k].table);
-                ok = et && (et->ver[o->erase[k].vid].flags & IMDB_V_STUB);
+                ok = et && (imdb_vh(et, o->erase[k].vid)->flags & IMDB_V_STUB);
             }
             break;
         default:
@@ -822,7 +822,7 @@ static int redact_segment(imdb_db *db, size_t si, imdb_err *e)
             if (!imdb_op_has_payload(o->code) || o->pkind != IMDB_PAYLOAD_ROW) continue;
             imdb_table *t = imdb_table_by_id(db, o->table);
             uint64_t vid = o->code == IMDB_OP_INSERT ? o->vid : o->new_vid;
-            if (t && vid < t->nver && (t->ver[vid].flags & IMDB_V_STUB)) {
+            if (t && vid < t->nver && (imdb_vh(t, vid)->flags & IMDB_V_STUB)) {
                 o->pkind = IMDB_PAYLOAD_REDACTED;
                 changed = true;
             }

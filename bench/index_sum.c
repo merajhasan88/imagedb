@@ -36,7 +36,7 @@ static int cmp_d(const void *a, const void *b)
 static int sums(const char *label, int64_t *got)
 {
     static double lat[SUMS];
-    char path[64] = "";
+    char path[sizeof ((imdb_result *)0)->path] = ""; /* the whole access path: snprintf below copies r.path */
     int ordered = 0;
     double t0 = now();
     for (int i = 0; i < SUMS; i++) {
@@ -78,7 +78,7 @@ static double opens(const char *dir, const imdb_open_opts *o)
 static int wide(const char *label, int n)
 {
     double t[20];
-    char path[64] = "";
+    char path[sizeof ((imdb_result *)0)->path] = ""; /* the whole access path: snprintf below copies r.path */
     for (int i = 0; i < n; i++) {
         imdb_value p[2] = {{.type = IMDB_T_INT64, .i = 1}, {.type = IMDB_T_INT64, .i = 100000}};
         imdb_result r;

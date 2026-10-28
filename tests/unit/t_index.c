@@ -677,7 +677,7 @@ static void t_index_erase(void)
         g_nseen = 0;
         uint64_t lo[IMDB_MAX_INDEX_COLS] = {0}, hi[IMDB_MAX_INDEX_COLS] = {UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX};
         OK(imdb_oidx_range(t->idx[k].ox, lo, hi, collect, NULL));
-        for (size_t j = 0; j < g_nseen; j++) CHECK(!(t->ver[g_seen[j]].flags & IMDB_V_STUB));
+        for (size_t j = 0; j < g_nseen; j++) CHECK(!(imdb_vh(t, g_seen[j])->flags & IMDB_V_STUB));
         CHECK(g_nseen == 1); /* only row 2's version is left */
     }
     OK(ex(&s, "SELECT COUNT(*) FROM t WHERE v BETWEEN 700 AND 800"));

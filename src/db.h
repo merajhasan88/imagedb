@@ -33,6 +33,10 @@ enum {
     IMDB_V_SEG = 8,           /* row bytes live in a segment                              */
 };
 
+/* A version is stored in two parts, so that visibility checks, scans, joins and index maintenance
+ * walk only the hot one (48 bytes) and the commitment and salt, read for verification, erasure and
+ * the digest, stay in the cold one (48 bytes). Both live in the table's chunked store (imdb_vh,
+ * imdb_vc). */
 typedef struct imdb_version {
     uint64_t begin;           /* commit seq that created it                 */
     uint64_t end;             /* commit seq that deleted it, IMDB_LIVE      */
@@ -42,9 +46,18 @@ typedef struct imdb_version {
     uint32_t seg;             /* segment index (IMDB_V_SEG)                 */
     uint32_t seg_row;
     uint8_t flags;
+} imdb_version;
+
+typedef struct imdb_version_cold {
     uint8_t salt[16];
     uint8_t commit[32];
-} imdb_version;
+} imdb_version_cold;
+
+/* The version store's chunks: 2^16 entries each, so growth never copies more than chunk 0 (which
+ * grows from 64 entries to a whole chunk, keeping a small table small) and leaves at most one chunk
+ * part empty, where one doubling array copied itself at each step and kept up to half of it empty. */
+#define IMDB_VCHUNK_BITS 16
+#define IMDB_VCHUNK ((uint64_t)1 << IMDB_VCHUNK_BITS)
 
 typedef struct imdb_vlist {
     uint64_t *v;
@@ -72,8 +85,10 @@ typedef struct imdb_index {
 
 typedef struct imdb_table {
     imdb_schema s;
-    imdb_version *ver;
-    uint64_t nver, capver;
+    imdb_version **vh;        /* the version store: chunk k holds vids from k << IMDB_VCHUNK_BITS */
+    imdb_version_cold **vc;   /* the same vids' cold parts */
+    uint32_t nchunk, capchunk; /* chunks allocated, room in vh and vc */
+    uint64_t nver, capver;    /* versions; room for them in the chunks allocated */
     imdb_buf arena;           /* canonical bytes of memtable rows          */
     uint64_t mem_first;       /* first vid not yet flushed to a segment    */
     imdb_hmap pk;             /* key -> newest non-stub version            */
@@ -92,6 +107,17 @@ typedef struct imdb_table {
     uint64_t idx_upto;        /* versions below are in the indexes' structures; the rest are the */
                               /* active transaction's own (versions are only appended) */
 } imdb_table;
+
+/* A version's parts, vid < t->nver. A pointer into chunk 0 moves while chunk 0 grows (as any pointer
+ * into the store did before it was chunked): take it again after an append. */
+static inline imdb_version *imdb_vh(const imdb_table *t, uint64_t vid)
+{
+    return &t->vh[vid >> IMDB_VCHUNK_BITS][vid & (IMDB_VCHUNK - 1)];
+}
+static inline imdb_version_cold *imdb_vc(const imdb_table *t, uint64_t vid)
+{
+    return &t->vc[vid >> IMDB_VCHUNK_BITS][vid & (IMDB_VCHUNK - 1)];
+}
 
 typedef struct imdb_commit_info {
     uint64_t time_us;

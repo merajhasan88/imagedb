@@ -136,7 +136,7 @@ static bool locks_live(const imdb_db *db, const imdb_txn *x)
 {
     for (uint32_t i = 0; i < x->nlocks; i++) {
         const imdb_table *t = db->t[x->locks[i].table];
-        const imdb_version *v = &t->ver[x->locks[i].vid];
+        const imdb_version *v = imdb_vh(t, x->locks[i].vid);
         /* seq+1 is an uncommitted end, including our own UPDATE/DELETE.
          * Only a committed change can break an optimistic observation. */
         if (v->end <= db->seq || (v->flags & (IMDB_V_STUB | IMDB_V_PURGED))) return false;
@@ -280,7 +280,7 @@ int imdb_txn_lock_rows(imdb_db *db, imdb_txn *x, const imdb_table *t, const uint
     uint64_t na = 0;
     int rc = IMDB_OK;
     for (uint64_t i = 0; i < n && !rc; i++) {
-        const imdb_version *v = &t->ver[vids[i]];
+        const imdb_version *v = imdb_vh(t, vids[i]);
         imdb_txn_lock k = {t->s.id, vids[i]};
         if (v->begin == db->seq + 1) continue; /* its own pending row needs no lock */
         if (v->end <= db->seq || (v->flags & (IMDB_V_STUB | IMDB_V_PURGED)))

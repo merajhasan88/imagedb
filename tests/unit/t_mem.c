@@ -544,7 +544,203 @@ static void t_mem_retain_churn(void)
     CHECK(grew[1] * 10 <= grew[0] * 9); /* measured 239 against 283 bytes per update: the payloads */
 }
 
+/* ids from..from+n-1 into txns, 10,000 to a transaction */
+static int ins_range(imdb_db *db, int64_t from, int64_t n)
+{
+    imdb_table *t = imdb_table_by_name(db, "txns");
+    imdb_value v[4];
+    for (int64_t id = from; id < from + n; id += 10000) {
+        if (imdb_begin(db, E)) return E->code;
+        for (int64_t k = id; k < id + 10000 && k < from + n; k++) {
+            row_vals(v, k, k % 7, k, "chunked");
+            if (imdb_insert(db, t, v, E)) {
+                imdb_rollback(db);
+                return E->code;
+            }
+        }
+        if (imdb_commit(db, E)) return E->code;
+    }
+    return IMDB_OK;
+}
+
+static bool all_zero(const uint8_t *p, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+        if (p[i]) return false;
+    return true;
+}
+
+/* The version store in chunks (db.h): chunk 0 grows from 64 entries to a whole chunk, then whole
+ * chunks follow; the report counts exactly the room held (both parts and the directories); versions
+ * on both sides of a chunk boundary read back, VERIFY recomputes the digest across it, and a reopen
+ * from the snapshot sizes the store to its versions. */
+static void t_mem_vstore_chunks(void)
+{
+    const char *dir = test_tmpdir();
+    OK(imdb_init(dir, false, NULL, E));
+    imdb_open_opts o = {.sync = 0};
+    imdb_db *db = NULL;
+    OK(imdb_open(dir, &o, &db, E));
+    if (!db) return;
+    OK(make_table(db, E));
+    imdb_table *t = imdb_table_by_name(db, "txns");
+    const uint64_t per = sizeof(imdb_version) + sizeof(imdb_version_cold), slot = 2 * sizeof(void *);
+    CHECK(sizeof(imdb_version) == 48 && sizeof(imdb_version_cold) == 48);
+    CHECK(t->nver == 0 && t->nchunk == 0 && imdb_ver_bytes(t) == 0);
+    OK(ins_range(db, 1, 1));
+    CHECK(t->nchunk == 1 && t->capver == 64 && imdb_ver_bytes(t) == 64 * per + 4 * slot);
+    OK(ins_range(db, 2, (int64_t)IMDB_VCHUNK - 1)); /* chunk 0 whole, nothing past it */
+    CHECK(t->nver == IMDB_VCHUNK && t->nchunk == 1 && t->capver == IMDB_VCHUNK);
+    CHECK(imdb_ver_growth(t) == IMDB_VCHUNK * per); /* the next version takes a whole chunk */
+    OK(ins_range(db, (int64_t)IMDB_VCHUNK + 1, 2));
+    CHECK(t->nver == IMDB_VCHUNK + 2 && t->nchunk == 2 && t->capver == 2 * IMDB_VCHUNK);
+    CHECK(imdb_ver_bytes(t) == 2 * IMDB_VCHUNK * per + 4 * slot);
+    for (uint64_t vid = IMDB_VCHUNK - 2; vid < IMDB_VCHUNK + 2; vid++) { /* both sides of the boundary */
+        imdb_value k;
+        CHECK(imdb_vh(t, vid)->end == IMDB_LIVE && imdb_vh(t, vid)->begin);
+        CHECK(!all_zero(imdb_vc(t, vid)->commit, 32) && !all_zero(imdb_vc(t, vid)->salt, 16));
+        OK(imdb_version_key(t, vid, t->s.pk, &k));
+        CHECK(k.i == (int64_t)vid + 1);
+    }
+    imdb_mem_report m;
+    imdb_mem(db, &m);
+    CHECK(m.versions == imdb_ver_bytes(t));
+    OK(verify_db(db)); /* the digest recomputed over both chunks equals the incremental one */
+    imdb_session s;
+    imdb_session_init(&s, db);
+    imdb_result r;
+    OK(run(&s, "CHECKPOINT", &r));
+    imdb_result_free(&r);
+    imdb_session_close(&s);
+    uint64_t n = t->nver;
+    imdb_close(db);
+    db = NULL;
+    OK(imdb_open(dir, &o, &db, E)); /* from the snapshot: the store sized to its versions */
+    if (!db) return;
+    t = imdb_table_by_name(db, "txns");
+    CHECK(t->nver == n && t->nchunk == 2 && t->capver == 2 * IMDB_VCHUNK);
+    OK(verify_db(db));
+    imdb_close(db);
+}
+
+/* The budget charges the store's next step: a whole chunk once chunk 0 is full. An insert whose chunk
+ * would cross the budget is refused with nothing written, and goes through once the chunk fits. */
+static void t_mem_vstore_admission(void)
+{
+    const char *dir = test_tmpdir();
+    OK(imdb_init(dir, false, NULL, E));
+    imdb_open_opts o = {.sync = 0};
+    imdb_db *db = NULL;
+    OK(imdb_open(dir, &o, &db, E));
+    if (!db) return;
+    OK(make_table(db, E));
+    OK(ins_range(db, 1, (int64_t)IMDB_VCHUNK));
+    imdb_close(db);
+    db = open_budget(dir, 0); /* replayed one version at a time: chunk 0 exactly whole again */
+    CHECK(db);
+    if (!db) return;
+    imdb_table *t = imdb_table_by_name(db, "txns");
+    CHECK(t->nver == IMDB_VCHUNK && t->capver == IMDB_VCHUNK);
+    uint64_t step = imdb_ver_growth(t), base = held(db);
+    imdb_close(db);
+    db = open_budget(dir, base + step - 1);
+    CHECK(db);
+    if (!db) return;
+    uint64_t before = db->seq;
+    int rc = ins1(db, (int64_t)IMDB_VCHUNK + 1, 1, 1, "one more");
+    CHECK(rc == IMDB_ERR_LIMIT && strstr(g_e.msg, "growth step") && strstr(g_e.msg, "nothing was written"));
+    t = imdb_table_by_name(db, "txns");
+    CHECK(db->seq == before && t->nchunk == 1);
+    imdb_close(db);
+    db = open_budget(dir, base + step + (8u << 20)); /* the chunk and the other structures' steps fit */
+    CHECK(db);
+    if (!db) return;
+    OK(ins1(db, (int64_t)IMDB_VCHUNK + 1, 1, 1, "one more"));
+    t = imdb_table_by_name(db, "txns");
+    CHECK(t->nchunk == 2 && t->nver == IMDB_VCHUNK + 1);
+    OK(verify_db(db));
+    imdb_close(db);
+}
+
+/* The store's allocation failures that no fault scenario reaches (none grows a table past chunk 0):
+ * each allocation of a step refused in turn, on raw pushes into a table that is only freed afterwards.
+ * A refused step leaves the store as it was, the retry takes it, and nothing leaks (the SAN build). The
+ * hooks are on for the one call alone, and it runs no parallel loop. */
+static int g_refuse_at, g_allocs;
+
+static long refuse_nth_alloc(imdb_io_call *c, void *ctx)
+{
+    (void)ctx;
+    return c->op == IMDB_IO_ALLOC && ++g_allocs == g_refuse_at ? -1 : 0;
+}
+
+static const imdb_io_hooks g_refuse_hooks = {refuse_nth_alloc, NULL, NULL};
+
+/* one push (n = 0) or one reserve of n versions, its nth allocation refused (nth 0: none) */
+static int store_step_refusing(imdb_table *t, uint64_t n, int nth)
+{
+    imdb_err e = {0};
+    g_refuse_at = nth;
+    g_allocs = 0;
+    imdb_io_set_hooks(&g_refuse_hooks);
+    int rc = n ? imdb_ver_reserve(t, n, &e) : imdb_ver_push(t, &e);
+    imdb_io_set_hooks(NULL);
+    return rc;
+}
+
+static bool store_is(const imdb_table *t, uint64_t nver, uint32_t nchunk, uint32_t capchunk)
+{
+    return t->nver == nver && t->nchunk == nchunk && t->capchunk == capchunk && t->capver == nchunk * IMDB_VCHUNK;
+}
+
+static void t_mem_vstore_refused(void)
+{
+    const char *dir = test_tmpdir();
+    OK(imdb_init(dir, false, NULL, E));
+    imdb_open_opts o = {.sync = 0};
+    imdb_db *db = NULL;
+    OK(imdb_open(dir, &o, &db, E));
+    if (!db) return;
+    OK(make_table(db, E));
+    imdb_table *t = imdb_table_by_name(db, "txns");
+    int rc = IMDB_OK;
+    while (!rc && t->nver < IMDB_VCHUNK) rc = imdb_ver_push(t, E);
+    OK(rc);
+    /* chunk 1: its hot part refused, then its cold part (the hot one freed); there is no third allocation */
+    CHECK(store_step_refusing(t, 0, 1) == IMDB_ERR_NOMEM && store_is(t, IMDB_VCHUNK, 1, 4));
+    CHECK(store_step_refusing(t, 0, 2) == IMDB_ERR_NOMEM && store_is(t, IMDB_VCHUNK, 1, 4));
+    CHECK(store_step_refusing(t, 0, 3) == IMDB_OK && store_is(t, IMDB_VCHUNK + 1, 2, 4));
+    /* the directory full at four chunks: vh's room refused, then vc's (vh's new room is kept, the count is
+     * not), then the chunk once the directory has grown */
+    while (!rc && t->nver < 4 * IMDB_VCHUNK) rc = imdb_ver_push(t, E);
+    OK(rc);
+    CHECK(store_step_refusing(t, 0, 1) == IMDB_ERR_NOMEM && store_is(t, 4 * IMDB_VCHUNK, 4, 4));
+    CHECK(store_step_refusing(t, 0, 2) == IMDB_ERR_NOMEM && store_is(t, 4 * IMDB_VCHUNK, 4, 4));
+    CHECK(store_step_refusing(t, 0, 3) == IMDB_ERR_NOMEM && store_is(t, 4 * IMDB_VCHUNK, 4, 8));
+    CHECK(store_step_refusing(t, 0, 0) == IMDB_OK && store_is(t, 4 * IMDB_VCHUNK + 1, 5, 8));
+    /* a snapshot's reserve of three chunks, each on an empty store: the directory's two allocations, then
+     * each chunk's two, refused in turn (the open frees what a refused reserve made, then replays) */
+    for (int nth = 1; nth <= 9; nth++) {
+        imdb_schema s;
+        txn_schema(&s);
+        snprintf(s.name, sizeof s.name, "r%d", nth);
+        OK(imdb_begin(db, E));
+        OK(imdb_create_table(db, &s, E));
+        OK(imdb_commit(db, E));
+        imdb_table *r = imdb_table_by_name(db, s.name);
+        CHECK(r);
+        if (!r) break;
+        rc = store_step_refusing(r, 3 * IMDB_VCHUNK, nth);
+        uint32_t whole = nth <= 4 ? 0 : (uint32_t)(nth - 3) / 2; /* the chunks made before the refusal */
+        CHECK(rc == (nth <= 8 ? IMDB_ERR_NOMEM : IMDB_OK) && store_is(r, 0, whole, nth <= 2 ? 0 : 4));
+    }
+    imdb_close(db);
+}
+
 const test_case mem_tests[] = {
+    {"mem_vstore_chunks", t_mem_vstore_chunks},
+    {"mem_vstore_admission", t_mem_vstore_admission},
+    {"mem_vstore_refused", t_mem_vstore_refused},
     {"mem_admission", t_mem_admission},
     {"mem_result_cap", t_mem_result_cap},
     {"mem_replica", t_mem_replica},

@@ -320,13 +320,13 @@ static bool erased_has(const erased_set *es, uint32_t table, uint64_t vid)
 
 static bool row_is_stub(const imdb_table *t, uint64_t vid, const erased_set *es)
 {
-    return (t->ver[vid].flags & IMDB_V_STUB) || erased_has(es, t->s.id, vid);
+    return (imdb_vh(t, vid)->flags & IMDB_V_STUB) || erased_has(es, t->s.id, vid);
 }
 
 /* Value of column c of a (non-stub) version, wherever it lives. */
 static void ver_get(const imdb_table *t, uint64_t vid, uint32_t c, imdb_value *v)
 {
-    const imdb_version *ver = &t->ver[vid];
+    const imdb_version *ver = imdb_vh(t, vid);
     if (ver->flags & IMDB_V_SEG) seg_get(&t->s, t->seg[ver->seg], ver->seg_row, c, v);
     else imdb_row_get(&t->s, t->arena.p + ver->row_off, ver->row_len, (int)c, v);
 }
@@ -335,7 +335,7 @@ static void ver_get(const imdb_table *t, uint64_t vid, uint32_t c, imdb_value *v
  * by this ERASE, purged before or by this COMPACT ... PURGE. */
 static uint8_t row_flags(const imdb_table *t, uint64_t vid, const erased_set *es, uint64_t purge_before)
 {
-    const imdb_version *v = &t->ver[vid];
+    const imdb_version *v = imdb_vh(t, vid);
     uint8_t f = row_is_stub(t, vid, es) ? IMDB_SEG_STUB : 0;
     if ((v->flags & IMDB_V_PURGED) || (purge_before && v->end != IMDB_LIVE && v->end <= purge_before))
         f |= IMDB_SEG_PURGED;
@@ -401,12 +401,13 @@ static int seg_build(const imdb_table *t, const uint64_t *vids, uint32_t n, cons
         imdb_le64(de + 16, d[k].len);
     }
     for (uint32_t i = 0; i < n; i++) {
-        const imdb_version *v = &t->ver[vids[i]];
+        const imdb_version *v = imdb_vh(t, vids[i]);
         imdb_le64(b + off[0] + 8u * i, vids[i]);
         imdb_le64(b + off[1] + 8u * i, v->begin);
         b[off[2] + i] = fl[i];
-        if (!fl[i]) memcpy(b + off[3] + 16u * i, v->salt, 16);
-        memcpy(b + off[4] + 32u * i, v->commit, 32);
+        const imdb_version_cold *c = imdb_vc(t, vids[i]);
+        if (!fl[i]) memcpy(b + off[3] + 16u * i, c->salt, 16);
+        memcpy(b + off[4] + 32u * i, c->commit, 32);
     }
     uint32_t k = 5;
     uint8_t *zm = b + off[nsec - 1];
@@ -465,7 +466,7 @@ static int seg_build(const imdb_table *t, const uint64_t *vids, uint32_t n, cons
         free(b);
         return rc;
     }
-    for (uint32_t i = 0; i < n; i++) g->end[i] = t->ver[vids[i]].end;
+    for (uint32_t i = 0; i < n; i++) g->end[i] = imdb_vh(t, vids[i])->end;
     *out = g;
     return IMDB_OK;
 }
@@ -1050,7 +1051,7 @@ static int plan_install(imdb_db *db, imdb_lake_plan *p, imdb_err *e)
         for (uint32_t k = 0; pt->compacted && k < pt->nseg; k++) {
             const imdb_segment *g = pt->seg[k];
             for (uint32_t i = 0; i < g->nrows; i++) {
-                if (!(g->flags[i] & IMDB_SEG_PURGED) || (t->ver[g->vid[i]].flags & (IMDB_V_PURGED | IMDB_V_STUB))) continue;
+                if (!(g->flags[i] & IMDB_SEG_PURGED) || (imdb_vh(t, g->vid[i])->flags & (IMDB_V_PURGED | IMDB_V_STUB))) continue;
                 imdb_value key;
                 if (imdb_version_key(t, g->vid[i], t->s.pk, &key) == IMDB_OK) imdb_pk_unlink(t, g->vid[i], &key);
             }
@@ -1081,18 +1082,18 @@ static int plan_install(imdb_db *db, imdb_lake_plan *p, imdb_err *e)
             t->mem_first = t->nver;
         }
         /* map every version to its (possibly new) location */
-        for (uint64_t vid = 0; vid < t->nver; vid++) t->ver[vid].flags &= (uint8_t)~IMDB_V_SEG;
+        for (uint64_t vid = 0; vid < t->nver; vid++) imdb_vh(t, vid)->flags &= (uint8_t)~IMDB_V_SEG;
         for (uint32_t k = 0; k < t->nseg; k++) {
             imdb_segment *g = t->seg[k];
             for (uint32_t i = 0; i < g->nrows; i++) {
-                imdb_version *v = &t->ver[g->vid[i]];
+                imdb_version *v = imdb_vh(t, g->vid[i]);
                 v->flags |= IMDB_V_SEG;
                 v->seg = k;
                 v->seg_row = i;
                 if ((g->flags[i] & IMDB_SEG_PURGED) && !(v->flags & IMDB_V_PURGED)) {
                     /* purged now: its tombstone keeps vid, begin, commitment, subject */
                     v->flags |= IMDB_V_PURGED;
-                    imdb_wipe(v->salt, sizeof v->salt);
+                    imdb_wipe(imdb_vc(t, g->vid[i])->salt, sizeof imdb_vc(t, g->vid[i])->salt);
                     v->row_len = 0;
                 }
             }
@@ -1720,15 +1721,16 @@ static int load_table(imdb_db *db, int ofd, const imdb_manifest_tab *mt, uint32_
             memcpy(g->dv_hash, mt->seg[k].dv, 32);
         }
     }
-    /* every version of the table is in exactly one segment (tombstones included) */
-    if (mt->versions > IMDB_MAX_ALLOC / sizeof *t->ver) return imdb_fail(e, IMDB_ERR_LIMIT, "snapshot: too many versions");
-    t->ver = imdb_alloc_array(mt->versions ? mt->versions : 1, sizeof *t->ver, e);
-    uint8_t *seen = imdb_alloc(mt->versions / 8 + 1, e);
-    if (!t->ver || !seen) {
+    /* every version of the table is in exactly one segment (tombstones included), so the segments'
+     * rows bound the store the manifest asks for (allocation stays proportional to what was read) */
+    uint64_t held = 0;
+    for (uint32_t k = 0; k < t->nseg; k++) held += t->seg[k]->nrows;
+    if (mt->versions > held) return imdb_fail(e, IMDB_ERR_CORRUPT, "snapshot: more versions than its segments hold");
+    uint8_t *seen = NULL;
+    if (imdb_ver_reserve(t, mt->versions, e) || !(seen = imdb_alloc(mt->versions / 8 + 1, e))) {
         free(seen);
         return e->code;
     }
-    t->capver = mt->versions ? mt->versions : 1;
     t->nver = mt->versions;
     int rc = IMDB_OK;
     uint64_t live = 0;
@@ -1741,7 +1743,8 @@ static int load_table(imdb_db *db, int ofd, const imdb_manifest_tab *mt, uint32_
                 break;
             }
             seen[vid >> 3] |= (uint8_t)(1u << (vid & 7));
-            imdb_version *v = &t->ver[vid];
+            imdb_version *v = imdb_vh(t, vid);
+            imdb_version_cold *c = imdb_vc(t, vid);
             v->begin = g->begin[i];
             v->end = g->end[i];
             v->pk_prev = IMDB_NONE;
@@ -1749,8 +1752,8 @@ static int load_table(imdb_db *db, int ofd, const imdb_manifest_tab *mt, uint32_
             v->seg_row = i;
             v->flags = IMDB_V_SEG | ((g->flags[i] & IMDB_SEG_STUB) ? IMDB_V_STUB : 0) |
                        ((g->flags[i] & IMDB_SEG_PURGED) ? IMDB_V_PURGED : 0);
-            if (!g->flags[i]) memcpy(v->salt, g->salt + 16u * i, 16);
-            memcpy(v->commit, g->commit + 32u * i, 32);
+            if (!g->flags[i]) memcpy(c->salt, g->salt + 16u * i, 16);
+            memcpy(c->commit, g->commit + 32u * i, 32);
             live += v->end == IMDB_LIVE;
         }
     }
@@ -1764,7 +1767,7 @@ static int load_table(imdb_db *db, int ofd, const imdb_manifest_tab *mt, uint32_
     t->mem_first = t->nver;
     /* indexes in version order, as incremental insertion builds them */
     for (uint64_t vid = 0; vid < t->nver && !rc; vid++) {
-        const imdb_version *v = &t->ver[vid];
+        const imdb_version *v = imdb_vh(t, vid);
         if (!(v->flags & (IMDB_V_STUB | IMDB_V_PURGED))) {
             rc = imdb_index_version(t, vid, NULL, e);
         } else if (!(v->flags & IMDB_V_STUB) && t->s.subject >= 0) {

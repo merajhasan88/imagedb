@@ -1160,18 +1160,18 @@ static int verify_engine(imdb_db *db, const vctx *x, imdb_verify_report *rep, im
         if (memcmp(&re, &et->digest, sizeof re) != 0)
             return imdb_fail(e, IMDB_ERR_VERIFY, "verify: table %s incremental digest drifted", et->s.name);
         for (uint64_t vid = 0; vid < vt->n; vid++) {
-            const imdb_version *ev = &et->ver[vid];
+            const imdb_version *ev = imdb_vh(et, vid);
             const vver *v = &vt->v[vid];
             bool estub = (ev->flags & IMDB_V_STUB) != 0;
             bool purged = v->end != IMDB_LIVE && v->end <= vt->horizon;
             if (v->end != ev->end || v->begin != ev->begin || v->stub != (estub && !(ev->flags & IMDB_V_PENDING_AUTH)) ||
-                purged != ((ev->flags & IMDB_V_PURGED) != 0) || memcmp(v->commit, ev->commit, 32) != 0)
+                purged != ((ev->flags & IMDB_V_PURGED) != 0) || memcmp(v->commit, imdb_vc(et, vid)->commit, 32) != 0)
                 return imdb_fail(e, IMDB_ERR_VERIFY, "verify: table %s version %llu differs", et->s.name,
                                  (unsigned long long)vid);
             if (estub) {
                 /* an erased version must not keep any payload in memory */
-                for (size_t k = 0; k < sizeof ev->salt; k++)
-                    if (ev->salt[k]) return imdb_fail(e, IMDB_ERR_VERIFY, "verify: erased version still holds its salt");
+                for (size_t k = 0; k < sizeof imdb_vc(et, vid)->salt; k++)
+                    if (imdb_vc(et, vid)->salt[k]) return imdb_fail(e, IMDB_ERR_VERIFY, "verify: erased version still holds its salt");
                 if (!(ev->flags & IMDB_V_SEG) && ev->row_len) {
                     const uint8_t *p = imdb_mem_row(et, ev);
                     for (uint32_t k = 0; k < ev->row_len; k++)
