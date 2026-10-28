@@ -326,9 +326,9 @@ int imdb_apply_commit(imdb_db *db, imdb_commit_rec *c, const imdb_commit_pre *pr
     db->global = global;
     rc = imdb_ci_push(db, c->time_us, c->hash, c->digest, e);
 out:
-    free(post);
-    free(delta);
-    free(touched);
+    imdb_free(post);
+    imdb_free(delta);
+    imdb_free(touched);
     return rc;
 }
 
@@ -427,7 +427,7 @@ static imdb_lthash *rchunk_slot(rchunk *ch, uint32_t table)
         return NULL;
     }
     if (ch->nd) memcpy(nd, ch->delta, ch->nd * sizeof *nd);
-    free(ch->delta);
+    imdb_free(ch->delta);
     ch->delta = nd;
     ch->tab[ch->nd] = table;
     imdb_lthash_zero(&ch->delta[ch->nd]);
@@ -469,14 +469,14 @@ static void rbatch_free(rbatch *b)
 {
     for (size_t i = 0; i < b->nf; i++) {
         if (b->f[i].decoded) imdb_commit_free(&b->f[i].c);
-        free(b->f[i].tab);
-        free(b->f[i].delta);
+        imdb_free(b->f[i].tab);
+        imdb_free(b->f[i].delta);
     }
     for (size_t i = 0; i < b->nch; i++) {
-        free(b->ch[i].tab);
-        free(b->ch[i].delta);
+        imdb_free(b->ch[i].tab);
+        imdb_free(b->ch[i].delta);
     }
-    free(b->ch);
+    imdb_free(b->ch);
 }
 
 /* The pre-pass over frames f[0..nf). Only allocation failures are errors here;
@@ -639,8 +639,8 @@ static int replay_segment(imdb_db *db, size_t si, bool ro, imdb_err *e)
             }
         }
     }
-    free(fr);
-    free(states);
+    imdb_free(fr);
+    imdb_free(states);
     imdb_logseg_free(&seg);
     if (rc) return rc;
     if (!last && !ended)
@@ -687,7 +687,7 @@ static bool log_grew(imdb_db *db)
             grew = imdb_io_fstatat(db->logdirfd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 && (uint64_t)st.st_size > db->log_size;
         }
     }
-    free(segs);
+    imdb_free(segs);
     return grew;
 }
 
@@ -712,7 +712,7 @@ int imdb_replay(imdb_db *db, bool ro, imdb_err *e)
         }
         imdb_reset_state(db);
         if (moved && attempt < IMDB_PIN_RETRIES) { /* its generation went while it was read: as things are now */
-            free(db->segs);
+            imdb_free(db->segs);
             db->segs = NULL;
             db->nsegs = db->capsegs = 0;
             continue;
@@ -967,7 +967,7 @@ static int log_hash_at(ship_acks *a, uint64_t seq, uint8_t out[32])
     if (si < nsegs) {
         imdb_logseg seg;
         if (imdb_logseg_load(a->logfd, segs[si], &seg, e)) {
-            free(segs);
+            imdb_free(segs);
             return -1;
         }
         for (size_t off = 0, flen = 0; !found; off += flen) {
@@ -980,7 +980,7 @@ static int log_hash_at(ship_acks *a, uint64_t seq, uint8_t out[32])
         }
         imdb_logseg_free(&seg);
     }
-    free(segs);
+    imdb_free(segs);
     return found;
 }
 
@@ -1139,7 +1139,7 @@ int imdb_ship_ex(const char *path, uint64_t after_seq, int outfd, const imdb_shi
                 bool whole = true, reload = true;
                 while (!rc) {
                     if (reload) {
-                        free(buf);
+                        imdb_free(buf);
                         base = pos.sector;
                         uint64_t at = base * IMDB_TSEG_SECTOR, size = (uint64_t)st.st_size;
                         size_t n = size > at ? (size_t)(size - at < win ? size - at : win) : 0;
@@ -1207,7 +1207,7 @@ int imdb_ship_ex(const char *path, uint64_t after_seq, int outfd, const imdb_shi
                 cur_prev = prev;
                 cur_tagged = true;
                 if (buf) imdb_wipe(buf, got);
-                free(buf);
+                imdb_free(buf);
                 imdb_buf_wipe_free(&fb);
                 close(fd);
                 if (!whole) break;
@@ -1275,10 +1275,10 @@ int imdb_ship_ex(const char *path, uint64_t after_seq, int outfd, const imdb_shi
             cur_prev = prev;
             cur_tagged = false;
             if (buf) imdb_wipe(buf, got);
-            free(buf);
+            imdb_free(buf);
             if (!whole) break; /* later segments cannot exist past a partial or undurable frame */
         }
-        free(segs);
+        imdb_free(segs);
         if (!rc && acks) rc = acks_drain(acks, e);
         if (rc || !follow) break;
         if (!progressed || stalled) {
@@ -1291,8 +1291,8 @@ int imdb_ship_ex(const char *path, uint64_t after_seq, int outfd, const imdb_shi
             }
         }
     }
-    free(A.allow);
-    free(A.h);
+    imdb_free(A.allow);
+    imdb_free(A.h);
     close(logfd);
     close(dirfd);
     return rc;
@@ -1418,7 +1418,7 @@ int imdb_apply_stream_ex(imdb_db *db, int fd, uint64_t *applied, imdb_apply_opts
     }
     imdb_stream_free(&s);
     imdb_wipe(src, sizeof *src);
-    free(src);
+    imdb_free(src);
     return rc;
 }
 

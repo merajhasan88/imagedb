@@ -44,10 +44,10 @@ void imdb_hmap_free(imdb_hmap *m)
     for (size_t i = 0; i < m->cap; i++)
         if (m->slots[i].skey) {
             imdb_wipe(m->slots[i].skey, m->slots[i].slen);
-            free(m->slots[i].skey);
+            imdb_free(m->slots[i].skey);
         }
     imdb_wipe(m->slots, m->cap * sizeof *m->slots); /* INT64 keys live in the slots themselves */
-    free(m->slots);
+    imdb_free(m->slots);
     m->slots = NULL;
     m->cap = m->count = m->key_bytes = 0;
 }
@@ -82,7 +82,7 @@ static int grow(imdb_hmap *m, imdb_err *e)
         ns[j] = *s;
     }
     imdb_wipe(m->slots, m->cap * sizeof *m->slots); /* the old table holds copies of every key */
-    free(m->slots);
+    imdb_free(m->slots);
     m->slots = ns;
     m->cap = ncap;
     return IMDB_OK;
@@ -123,7 +123,7 @@ bool imdb_hmap_del(imdb_hmap *m, const imdb_value *k)
     size_t mask = m->cap - 1, i = (size_t)(s - m->slots);
     if (s->skey) {
         imdb_wipe(s->skey, s->slen);
-        free(s->skey);
+        imdb_free(s->skey);
         m->key_bytes -= s->slen ? s->slen : 1;
     }
     memset(s, 0, sizeof *s);

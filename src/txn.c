@@ -19,10 +19,10 @@ static void release_ops(imdb_txn *x)
 {
     for (uint32_t i = 0; i < x->nops; i++) {
         if (x->ops[i].row) imdb_wipe(x->ops[i].row, x->ops[i].row_len);
-        free(x->ops[i].row);
+        imdb_free(x->ops[i].row);
     }
     if (x->ops) imdb_wipe(x->ops, (size_t)x->capops * sizeof *x->ops);
-    free(x->ops);
+    imdb_free(x->ops);
     x->ops = NULL;
     x->nops = x->capops = 0;
 }
@@ -84,8 +84,8 @@ static int swap_out(imdb_db *db, imdb_err *e)
     uint64_t *pend = imdb_alloc_array(db->nt ? db->nt : 1, sizeof *pend, e);
     imdb_saved_op *ops = n ? imdb_alloc_array(n, sizeof *ops, e) : NULL;
     if (!pend || (n && !ops)) {
-        free(pend);
-        free(ops);
+        imdb_free(pend);
+        imdb_free(ops);
         return e->code;
     }
     for (uint32_t i = 0; i < n; i++) { /* pending versions per table: one per INSERT, one per UPDATE */
@@ -119,7 +119,7 @@ static int swap_out(imdb_db *db, imdb_err *e)
             memcpy(so->row, t->arena.p + db->tx_row_off[i], o->row_len);
         }
     }
-    free(pend);
+    imdb_free(pend);
     if (rc) {
         imdb_txn tmp = {.ops = ops, .nops = n, .capops = n};
         release_ops(&tmp);
@@ -168,7 +168,7 @@ static int swap_in(imdb_db *db, imdb_txn *x, imdb_err *e)
         default: rc = imdb_update_row(db, t, base, so->row, so->row_len, so->salt, &e2); break;
         }
     }
-    free(start);
+    imdb_free(start);
     if (!rc && !locks_live(db, x)) rc = imdb_fail(&e2, IMDB_ERR_CONFLICT, "a locked row changed");
     if (rc) {
         imdb_rollback(db);
@@ -210,10 +210,10 @@ int imdb_txn_enter(imdb_db *db, imdb_txn *x, int need, imdb_err *e)
 static void close_txn(imdb_db *db, imdb_txn *x)
 {
     release_ops(x);
-    free(x->locks);
+    imdb_free(x->locks);
     x->locks = NULL;
     x->nlocks = x->caplocks = 0;
-    free(x->sps);
+    imdb_free(x->sps);
     x->sps = NULL;
     x->nsps = x->capsps = 0;
     unlink_txn(db, x);
@@ -304,11 +304,11 @@ int imdb_txn_lock_rows(imdb_db *db, imdb_txn *x, const imdb_table *t, const uint
         uint64_t i = 0, j = 0, o = 0;
         while (i < x->nlocks || j < u)
             m[o++] = j == u || (i < x->nlocks && cmp_lock(&x->locks[i], &add[j]) < 0) ? x->locks[i++] : add[j++];
-        free(x->locks);
+        imdb_free(x->locks);
         x->locks = m;
         x->nlocks = x->caplocks = (uint32_t)o;
     }
-    free(add);
+    imdb_free(add);
     return rc;
 }
 
@@ -411,7 +411,7 @@ int imdb_txn_rollback_to(imdb_db *db, imdb_txn *x, const char *name, imdb_err *e
     } else {
         for (uint32_t i = pos; i < x->nops; i++) {
             if (x->ops[i].row) imdb_wipe(x->ops[i].row, x->ops[i].row_len);
-            free(x->ops[i].row);
+            imdb_free(x->ops[i].row);
             memset(&x->ops[i], 0, sizeof x->ops[i]);
         }
         if (pos < x->nops) x->nops = pos;

@@ -255,7 +255,7 @@ static void t_round3_revoked_replica_cache(void)
     memcpy(ack.head, db->head, 32);
     imdb_ack_sign(&ack, &next, raw);
     int nrc = imdb_ack_receive(db->dirfd, db->db_id, kNoNonce, &allow, &n, raw, same_head, db, NULL, E);
-    free(allow);
+    imdb_free(allow);
     imdb_signer_wipe(&old);
     imdb_signer_wipe(&next);
     imdb_close(db);
@@ -349,7 +349,7 @@ static void t_round3_incident_io_failure(void)
         int rc = imdb_ack_receive(db->dirfd, db->db_id, kNoNonce, &allow, &n, raw, same_head, db, NULL, E);
         imdb_io_set_hooks(NULL);
         refused &= f.fired && rc == IMDB_ERR_IO && file_size(ackpath) < 0;
-        free(allow);
+        imdb_free(allow);
         imdb_signer_wipe(&key);
         imdb_close(db);
     }

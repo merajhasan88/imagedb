@@ -100,8 +100,16 @@ int main(int argc, char **argv)
             g_errmsg[0] = 0;
             printf("[%s] %s\n", groups[g].name, tc->name);
             fflush(stdout);
+            uint64_t heap = imdb_heap_bytes();
             tc->fn();
             run++;
+            /* every block the test's engine calls took is freed by its end (util.h): more left is a leak,
+             * or a free that bypassed imdb_free; fewer, imdb_free given a block the helpers never charged */
+            uint64_t left = imdb_heap_bytes();
+            if (left != heap) {
+                fprintf(stderr, "    FAIL heap drift: %+lld bytes held after the test\n", (long long)(left - heap));
+                g_test_failed = 1;
+            }
             if (g_test_failed) failed++;
         }
     }

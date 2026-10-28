@@ -1777,7 +1777,7 @@ bool imdb_ed25519_verify_batch_z(size_t n, const uint8_t *const sigs[], const ui
             for (size_t i = at; i < at + k; i++) all = (ok[i] = imdb_ed25519_verify(sigs[i], pk, msgs[i], lens[i])) && all;
         }
     }
-    free(b);
+    imdb_free(b);
     return all;
 }
 

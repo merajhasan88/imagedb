@@ -337,7 +337,7 @@ int imdb_read_file_at(int dirfd, const char *name, uint8_t **out, size_t *len, s
     int rc = imdb_read_all(fd, buf, n, &got, e);
     close(fd);
     if (rc) {
-        free(buf);
+        imdb_free(buf);
         return rc;
     }
     *out = buf;

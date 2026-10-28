@@ -10,7 +10,7 @@
 
 void imdb_fsum_free(imdb_fsum *s)
 {
-    free(s->limb);
+    imdb_free(s->limb);
     memset(s, 0, sizeof *s);
 }
 
@@ -24,7 +24,7 @@ static int grow(imdb_fsum *s, int32_t clo, int32_t chi, imdb_err *e)
     int64_t *l = imdb_alloc_array((size_t)(nhi - nlo + 1), sizeof *l, e);
     if (!l) return e->code;
     if (s->n) memcpy(l + (s->lo - nlo), s->limb, s->n * sizeof *l);
-    free(s->limb);
+    imdb_free(s->limb);
     s->limb = l;
     s->lo = nlo;
     s->n = (uint32_t)(nhi - nlo + 1);

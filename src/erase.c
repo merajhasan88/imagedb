@@ -15,11 +15,11 @@ int imdb_erase_versions(imdb_db *db, imdb_erase_ent *ents, uint32_t n, imdb_eras
 {
     memset(rep, 0, sizeof *rep);
     if (db->in_txn) {
-        free(ents);
+        imdb_free(ents);
         return imdb_fail(e, IMDB_ERR_STATE, "ERASE must run outside an explicit transaction");
     }
     if (n == 0) {
-        free(ents);
+        imdb_free(ents);
         return IMDB_OK;
     }
     /* sorted, unique, existing, not yet erased: the log entry must be a pure
@@ -30,7 +30,7 @@ int imdb_erase_versions(imdb_db *db, imdb_erase_ent *ents, uint32_t n, imdb_eras
         imdb_table *t = imdb_table_by_id(db, ents[i].table);
         if (!t || ents[i].vid >= t->nver || (i && cmp_ent(&ents[i - 1], &ents[i]) == 0) ||
             (imdb_vh(t, ents[i].vid)->flags & IMDB_V_STUB)) {
-            free(ents);
+            imdb_free(ents);
             return imdb_fail(e, IMDB_ERR_INVALID, "ERASE: invalid or duplicate version");
         }
         memcpy(ents[i].commit, imdb_vc(t, ents[i].vid)->commit, 32);
@@ -40,7 +40,7 @@ int imdb_erase_versions(imdb_db *db, imdb_erase_ent *ents, uint32_t n, imdb_eras
         }
     }
     if (imdb_begin(db, e)) {
-        free(ents);
+        imdb_free(ents);
         return e->code;
     }
     for (uint32_t i = 0; i < n; i++) {
@@ -48,7 +48,7 @@ int imdb_erase_versions(imdb_db *db, imdb_erase_ent *ents, uint32_t n, imdb_eras
         if (imdb_vh(t, ents[i].vid)->end == IMDB_LIVE) {
             if (imdb_delete(db, t, ents[i].vid, e)) {
                 imdb_rollback(db);
-                free(ents);
+                imdb_free(ents);
                 return e->code;
             }
             rep->live_deleted++;
@@ -60,8 +60,8 @@ int imdb_erase_versions(imdb_db *db, imdb_erase_ent *ents, uint32_t n, imdb_eras
     if (imdb_lake_plan_erase(db, ents, n, &rw, &nrw, manifest, e) ||
         imdb_tx_add_erase(db, ents, n, rw, nrw, manifest, e)) {
         imdb_rollback(db);
-        free(ents);
-        free(rw);
+        imdb_free(ents);
+        imdb_free(rw);
         return e->code;
     }
     rep->versions = n;
@@ -86,12 +86,12 @@ int imdb_erase_subject(imdb_db *db, const imdb_value *subject, imdb_erase_report
             if (n == cap) {
                 size_t ncap = cap ? cap * 2 : 64;
                 if (ncap > IMDB_MAX_ERASE_ENTRIES) {
-                    free(ents);
+                    imdb_free(ents);
                     return imdb_fail(e, IMDB_ERR_LIMIT, "ERASE touches more than %u versions", IMDB_MAX_ERASE_ENTRIES);
                 }
                 imdb_erase_ent *ne = imdb_realloc_array(ents, cap, ncap, sizeof *ne, e);
                 if (!ne) {
-                    free(ents);
+                    imdb_free(ents);
                     return e->code;
                 }
                 ents = ne;

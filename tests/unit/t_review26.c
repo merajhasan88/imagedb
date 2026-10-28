@@ -211,7 +211,7 @@ static int ack_receive_at(ack_probe *p, uint64_t seq)
     size_t n = 0;
     imdb_err e = {0};
     int rc = imdb_ack_receive(p->db->dirfd, p->db->db_id, a.nonce, &allow, &n, raw, ack_hash, p->db, NULL, &e);
-    free(allow);
+    imdb_free(allow);
     return rc;
 }
 
@@ -260,7 +260,7 @@ static void t_review26_ack_serialization(void)
     bool monotonic = n == 1 && v[0].acked && v[0].ack.seq == 2 && !v[0].incident;
     fprintf(stderr, "    interleaved receipts: nested=%d stored=%llu\n", p.nested_rc,
             (unsigned long long)(n && v[0].acked ? v[0].ack.seq : 0));
-    free(v);
+    imdb_free(v);
     imdb_signer_wipe(&p.key);
     imdb_close(p.db);
     CHECK(monotonic);

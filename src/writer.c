@@ -35,7 +35,7 @@ static imdb_wep *wep_push(imdb_db *db, imdb_err *e)
 
 static void wep_drop_from(imdb_db *db, uint32_t from)
 {
-    for (uint32_t i = from; i < db->nwep; i++) free(db->wep[i].hdr);
+    for (uint32_t i = from; i < db->nwep; i++) imdb_free(db->wep[i].hdr);
     if (from < db->nwep) db->nwep = from;
     if (db->nwep) memcpy(db->writer_pk, db->wep[db->nwep - 1].k.pk, IMDB_PUBKEY_LEN);
 }
@@ -45,7 +45,7 @@ void imdb_writers_reset(imdb_db *db) { wep_drop_from(db, 1); }
 void imdb_writers_free(imdb_db *db)
 {
     wep_drop_from(db, 0);
-    free(db->wep);
+    imdb_free(db->wep);
     db->wep = NULL;
     db->nwep = db->capwep = 0;
 }
@@ -208,7 +208,7 @@ int imdb_writers_init(imdb_db *db, imdb_err *e)
     int rc = imdb_read_file_at(db->dirfd, IMDB_WRITERS_NAME, &p, &n, (size_t)IMDB_MAX_EPOCHS * 4096u, &ew);
     if (rc == IMDB_ERR_NOTFOUND) return IMDB_OK;
     if (!rc) rc = writers_load(db, p, n, &ew);
-    free(p);
+    imdb_free(p);
     if (rc) { /* proves nothing: a snapshot then fails to authenticate and the whole log is replayed */
         imdb_writers_reset(db);
         imdb_warn(db, "WRITERS ignored (%s)", ew.msg);
@@ -233,11 +233,11 @@ int imdb_writers_publish(imdb_db *db, imdb_err *e)
     imdb_err er = {0};
     if (!rc && imdb_read_file_at(db->dirfd, IMDB_WRITERS_NAME, &cur, &cn, b.len, &er) == IMDB_OK && cn == b.len &&
         memcmp(cur, b.p, cn) == 0) {
-        free(cur);
+        imdb_free(cur);
         imdb_buf_free(&b);
         return IMDB_OK;
     }
-    free(cur);
+    imdb_free(cur);
     if (!rc) rc = imdb_write_file_atomic(db->dirfd, IMDB_WRITERS_NAME, b.p, b.len, 0600, e);
     imdb_buf_free(&b);
     return rc;
@@ -421,7 +421,7 @@ static int ledger_check(int fd, const char *path, const uint8_t db_id[16], uint3
         }
         at = (size_t)(nl - (const char *)b) + 1;
     }
-    free(b);
+    imdb_free(b);
     return rc;
 }
 

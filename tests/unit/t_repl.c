@@ -82,7 +82,7 @@ static int receive(imdb_db *db, const imdb_ack *a, const imdb_signer *k, imdb_ha
     size_t n = 0;
     imdb_err_clear(E);
     int rc = imdb_ack_receive(db->dirfd, db->db_id, kNonce, &allow, &n, raw, fn, db, NULL, E);
-    free(allow);
+    imdb_free(allow);
     return rc;
 }
 
@@ -156,7 +156,7 @@ static void t_repl_allowlist(void)
     OK(imdb_allowlist_load(dfd, &l, &n, E));
     CHECK(n == 2 && strcmp(l[0].name, "r1") == 0 && strcmp(l[1].name, "r2") == 0 && memcmp(l[0].pub, a.pk, 32) == 0 &&
           memcmp(l[1].pub, b.pk, 32) == 0);
-    free(l);
+    imdb_free(l);
     char f[700];
     snprintf(f, sizeof f, "%s/replicas/r2.pub", p);
     spit(f, (const uint8_t *)"not a key\n", 10); /* refused, never skipped: a damaged allowlist is an error */
@@ -184,7 +184,7 @@ static void t_repl_receive(void)
     size_t n;
     imdb_replica_status *v = status_of(db, &n);
     CHECK(v && n == 1 && v[0].acked && v[0].ack.seq == db->seq && v[0].state == IMDB_REPL_SAME_HISTORY && !v[0].incident);
-    free(v);
+    imdb_free(v);
     /* refused, and nothing recorded: a key no one allowlisted, another database, an unseen commit */
     make_ack(&k, db, &b, db->seq, db->head);
     CHECK(receive(db, &k, &b, hash_from_db) == IMDB_ERR_AUTH);
@@ -204,13 +204,13 @@ static void t_repl_receive(void)
     CHECK(receive(db, &k, &a, hash_from_db) == IMDB_ERR_STATE && strstr(g_e.msg, "diverged"));
     v = status_of(db, &n);
     CHECK(v && n == 1 && v[0].incident && v[0].state == IMDB_REPL_DIVERGED && v[0].refused.seq == 2);
-    free(v);
+    imdb_free(v);
     /* the operator re-initialised it: a new key, a clean slate */
     OK(imdb_replica_add(p, "r1", c.pk, true, E));
     CHECK(!exists_in(p, "replicas", "r1.diverged") && !exists_in(p, "replicas", "r1.ack"));
     v = status_of(db, &n);
     CHECK(v && n == 1 && !v[0].acked && v[0].state == IMDB_REPL_NONE);
-    free(v);
+    imdb_free(v);
     make_ack(&k, db, &a, db->seq, db->head); /* the old key is gone with it */
     CHECK(receive(db, &k, &a, hash_from_db) == IMDB_ERR_AUTH);
     /* a replica holding commits beyond this log (lost here in a --nosync crash, or another primary) */
@@ -225,12 +225,12 @@ static void t_repl_receive(void)
     put_ack_file(p, "r1", raw, 1000);
     v = status_of(db, &n);
     CHECK(v && n == 1 && v[0].acked && v[0].state == IMDB_REPL_AHEAD && v[0].received_ms == 1000 && v[0].age_ms > 0);
-    free(v);
+    imdb_free(v);
     raw[100] ^= 1; /* a damaged record (its CRC recomputed) reads as no acknowledgement: its signature */
     put_ack_file(p, "r1", raw, 1000);
     v = status_of(db, &n);
     CHECK(v && n == 1 && !v[0].acked && v[0].state == IMDB_REPL_NONE);
-    free(v);
+    imdb_free(v);
     raw[100] ^= 1; /* a torn one: its CRC */
     put_ack_file(p, "r1", raw, 1000);
     char f[700];
@@ -245,7 +245,7 @@ static void t_repl_receive(void)
     }
     v = status_of(db, &n);
     CHECK(v && n == 1 && !v[0].acked);
-    free(v);
+    imdb_free(v);
     imdb_close(db);
 }
 
@@ -278,7 +278,7 @@ static void *ack_later(void *arg)
     size_t n = 0;
     imdb_err e = {0};
     l->rc = imdb_ack_receive(l->db->dirfd, l->db->db_id, kNonce, &allow, &n, raw, hash_fixed, l, NULL, &e);
-    free(allow);
+    imdb_free(allow);
     return NULL;
 }
 
@@ -583,7 +583,7 @@ static void t_repl_incarnation(void)
     imdb_replica_status *v = status_of(db, &n);
     CHECK(v && n == 1 && v[0].incident && v[0].why == IMDB_REFUSED_BACK && v[0].earlier == tip &&
           v[0].refused.seq == tip - 1 && v[0].state == IMDB_REPL_DIVERGED);
-    free(v);
+    imdb_free(v);
     make_ack(&k, db, &a, tip, db->head); /* refused from then on, at the tip too */
     CHECK(receive(db, &k, &a, hash_from_db) == IMDB_ERR_STATE && strstr(g_e.msg, "recorded incident"));
     OK(imdb_replica_add(p, "r1", c.pk, true, E)); /* re-enrolled: a new incarnation starts where it is */
@@ -603,7 +603,7 @@ static void t_repl_incarnation(void)
     put_ack_file(p, "r1", raw, 1000);
     v = status_of(db, &n);
     CHECK(v && n == 1 && v[0].acked && v[0].state == IMDB_REPL_DIVERGED);
-    free(v);
+    imdb_free(v);
     uint32_t got = 9;
     OK(imdb_replicas_wait(db, tip, 1, 50, &got, E));
     CHECK(got == 0);

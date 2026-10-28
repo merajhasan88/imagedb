@@ -112,7 +112,7 @@ static int read_meta(int dirfd, imdb_identity *id, bool *replica, imdb_err *e)
         if (!rc && v4 && meta_alg(&r, &left, &id->digest_alg, &ea)) rc = imdb_fail(e, ea.code, "META: %s", ea.msg);
         if (!rc && left) rc = imdb_fail(e, IMDB_ERR_CORRUPT, "META: trailing bytes");
     }
-    free(p);
+    imdb_free(p);
     return rc;
 }
 
@@ -338,7 +338,7 @@ int imdb_table_new(imdb_db *db, const imdb_schema *s, imdb_err *e)
     if (imdb_hmap_init(&t->pk, s->cols[s->pk].type, e) ||
         (s->subject >= 0 && imdb_hmap_init(&t->subj, s->cols[s->subject].type, e))) {
         imdb_hmap_free(&t->pk);
-        free(t);
+        imdb_free(t);
         return e->code;
     }
     imdb_lthash_zero(&t->digest);
@@ -356,20 +356,20 @@ void imdb_table_free(imdb_table *t)
     imdb_buf_wipe_free(&t->arena);
     imdb_hmap_free(&t->pk);
     imdb_hmap_free(&t->subj);
-    for (uint32_t i = 0; i < t->nsubj; i++) free(t->subj_lists[i].v);
-    free(t->subj_lists);
+    for (uint32_t i = 0; i < t->nsubj; i++) imdb_free(t->subj_lists[i].v);
+    imdb_free(t->subj_lists);
     for (uint32_t k = 0; k < t->nidx; k++) {
         if (t->idx[k].ox) {
             imdb_oidx_free(t->idx[k].ox);
-            free(t->idx[k].ox);
+            imdb_free(t->idx[k].ox);
         }
         if (t->idx[k].ux) {
             unique_free(t->idx[k].ux);
-            free(t->idx[k].ux);
+            imdb_free(t->idx[k].ux);
         }
     }
     ver_free(t);
-    free(t);
+    imdb_free(t);
 }
 
 /* ---- version store ---------------------------------------------------------- */
@@ -388,11 +388,11 @@ static void ver_free(imdb_table *t)
         uint64_t n = k < t->nchunk ? chunk_cap(t, k) : 0;
         if (t->vh[k]) imdb_wipe(t->vh[k], n * sizeof(imdb_version));
         if (t->vc[k]) imdb_wipe(t->vc[k], n * sizeof(imdb_version_cold));
-        free(t->vh[k]);
-        free(t->vc[k]);
+        imdb_free(t->vh[k]);
+        imdb_free(t->vc[k]);
     }
-    free(t->vh);
-    free(t->vc);
+    imdb_free(t->vh);
+    imdb_free(t->vc);
     t->vh = NULL;
     t->vc = NULL;
     t->nchunk = t->capchunk = 0;
@@ -457,7 +457,7 @@ static int chunk_add(imdb_table *t, imdb_err *e)
     imdb_version *h = imdb_realloc_array(NULL, 0, IMDB_VCHUNK, sizeof *h, e);
     imdb_version_cold *c = h ? imdb_realloc_array(NULL, 0, IMDB_VCHUNK, sizeof *c, e) : NULL;
     if (!c) {
-        free(h);
+        imdb_free(h);
         return e->code;
     }
     t->vh[t->nchunk] = h;
@@ -603,7 +603,7 @@ static void unindex_newest(imdb_table *t, uint64_t vid, const imdb_undo *u)
             imdb_value sv;
             if (imdb_version_key(t, vid, t->s.subject, &sv) == IMDB_OK) imdb_hmap_del(&t->subj, &sv);
             if (u->subj_list == t->nsubj - 1) {
-                free(l->v);
+                imdb_free(l->v);
                 memset(l, 0, sizeof *l);
                 t->nsubj--;
             }
@@ -656,7 +656,7 @@ static void subj_remove(imdb_table *t, const imdb_value *sv, uint64_t vid)
             break;
         }
     if (l->n == 0) {
-        free(l->v);
+        imdb_free(l->v);
         memset(l, 0, sizeof *l);
         imdb_hmap_del(&t->subj, sv); /* wipes the stored subject value */
     }
@@ -776,10 +776,10 @@ int imdb_digest_delta(uint8_t alg, const imdb_op *ops, uint32_t nops, uint32_t n
     }
     for (size_t w = 0; w < np; w++) {
         if (!parts[w].delta) continue;
-        for (uint32_t t = 0; t < nt; t++) free(parts[w].delta[t]);
-        free(parts[w].delta);
+        for (uint32_t t = 0; t < nt; t++) imdb_free(parts[w].delta[t]);
+        imdb_free(parts[w].delta);
     }
-    free(parts);
+    imdb_free(parts);
     return rc;
 }
 
@@ -863,7 +863,7 @@ int imdb_recompute_digest(imdb_db *db, imdb_table *t, uint64_t snap, imdb_lthash
     imdb_par_for(np, rc_run, parts);
     imdb_lthash_zero(out);
     for (size_t w = 0; w < np; w++) imdb_lthash_add(out, &parts[w].acc);
-    free(parts);
+    imdb_free(parts);
     return IMDB_OK;
 }
 
@@ -899,7 +899,7 @@ int imdb_lthash_sum_commits(uint8_t alg, const uint8_t *const *ptrs, size_t n, i
     }
     imdb_par_for(np, cs_run, parts);
     for (size_t w = 0; w < np; w++) imdb_lthash_add(out, &parts[w].acc);
-    free(parts);
+    imdb_free(parts);
     return IMDB_OK;
 }
 
@@ -1004,11 +1004,11 @@ int imdb_ci_load_all(imdb_db *db, imdb_err *e)
     if (!rc && got != want + 1) rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit index: the log lacks commits through %llu",
                                             (unsigned long long)db->ci_first);
     if (rc) {
-        free(v);
+        imdb_free(v);
         return rc;
     }
     if (db->nci) memcpy(v + want, db->ci, db->nci * sizeof *v);
-    free(db->ci);
+    imdb_free(db->ci);
     db->ci = v;
     db->nci += want;
     db->capci = db->nci;
@@ -1146,10 +1146,10 @@ static int tx_bytes_check(const imdb_db *db, size_t len, imdb_err *e)
 
 static void tx_op_free(imdb_op *o)
 {
-    free(o->schema);
-    free(o->erase);
-    free(o->rewrites);
-    free(o->iname);
+    imdb_free(o->schema);
+    imdb_free(o->erase);
+    imdb_free(o->rewrites);
+    imdb_free(o->iname);
     o->schema = NULL;
     o->erase = NULL;
     o->rewrites = NULL;
@@ -1307,7 +1307,7 @@ typedef struct imdb_uidx {
 static void unique_free(imdb_uidx *u)
 {
     imdb_hmap_free(&u->map); /* wipes the key copies: a key may be an erased value */
-    free(u->prev);
+    imdb_free(u->prev);
     memset(u, 0, sizeof *u);
 }
 
@@ -1316,11 +1316,11 @@ void imdb_index_remove(imdb_table *t, uint32_t pos)
     imdb_index *ix = &t->idx[pos];
     if (ix->ox) {
         imdb_oidx_free(ix->ox);
-        free(ix->ox);
+        imdb_free(ix->ox);
     }
     if (ix->ux) {
         unique_free(ix->ux);
-        free(ix->ux);
+        imdb_free(ix->ux);
     }
     memmove(&t->idx[pos], &t->idx[pos + 1], (t->nidx - pos - 1) * sizeof *t->idx);
     t->nidx--;
@@ -1558,7 +1558,7 @@ static int index_build(imdb_table *t, imdb_index *ix, imdb_err *e)
         if (imdb_index_version_key(t, vid, ix, all + n * w)) all[n++ * w + ix->d.ncols] = vid;
     if (!ix->ox) {
         if (!(ix->ox = imdb_alloc(sizeof *ix->ox, e))) {
-            free(all);
+            imdb_free(all);
             return e->code;
         }
         imdb_oidx_init(ix->ox, ix->d.ncols);
@@ -2373,7 +2373,7 @@ static int anchor_rewrite(imdb_db *db, const char *path, imdb_err *e)
 static int anchor_path_set(imdb_db *db, const char *path, imdb_err *e)
 {
     size_t pl = strlen(path) + 1;
-    free(db->anchor_path);
+    imdb_free(db->anchor_path);
     if (!(db->anchor_path = imdb_alloc(pl, e))) return e->code;
     memcpy(db->anchor_path, path, pl);
     return IMDB_OK;
@@ -2500,10 +2500,10 @@ static int log_put_tagged(imdb_db *db, const uint8_t *frame, size_t len, imdb_er
             back = imdb_pwrite_all(db->logfd, buf, k * IMDB_TSEG_SECTOR, (int64_t)((at + i) * IMDB_TSEG_SECTOR), &eb) == 0;
         }
         if (!back || (db->sync && imdb_io_fdatasync(db->logfd) != 0) || sync_failed) db->failed = true;
-        if (buf != small) free(buf);
+        if (buf != small) imdb_free(buf);
         return rc;
     }
-    if (buf != small) free(buf);
+    if (buf != small) imdb_free(buf);
     db->log_fill = extend ? fill + IMDB_LOG_FILL_CHUNK : fill;
     imdb_tgroup_advance(&g, frame, len);
     db->log_tg = g;
@@ -2784,8 +2784,8 @@ int imdb_commit(imdb_db *db, imdb_err *e)
 fail:
     imdb_rollback(db);
 out:
-    free(delta);
-    free(touched);
+    imdb_free(delta);
+    imdb_free(touched);
     imdb_buf_free(&hdr);
     imdb_buf_wipe_free(&pay);
     imdb_buf_wipe_free(&frame);
@@ -2825,12 +2825,12 @@ int imdb_close(imdb_db *db)
     if (db->in_txn) imdb_rollback(db);
     imdb_lake_db_free(db);
     for (uint32_t i = 0; i < db->nt; i++) imdb_table_free(db->t[i]);
-    free(db->t);
+    imdb_free(db->t);
     for (uint32_t i = 0; i < db->ntx; i++) tx_op_free(&db->tx[i]);
-    free(db->tx);
-    free(db->tx_row_off);
-    free(db->undo);
-    free(db->ci);
+    imdb_free(db->tx);
+    imdb_free(db->tx_row_off);
+    imdb_free(db->undo);
+    imdb_free(db->ci);
     imdb_signer_wipe(&db->signer);
     if (db->durfd >= 0) {
         /* a clean close makes --nosync commits durable, and then the watermark says so */
@@ -2846,17 +2846,17 @@ int imdb_close(imdb_db *db)
         if (imdb_io_fsync(db->anchorfd) != 0) rc = IMDB_ERR_IO;
         close(db->anchorfd);
     }
-    free(db->anchor_path);
+    imdb_free(db->anchor_path);
     if (db->logfd >= 0) close(db->logfd);
     if (db->logdirfd >= 0) close(db->logdirfd);
-    free(db->segs);
-    free(db->redact_seqs);
+    imdb_free(db->segs);
+    imdb_free(db->redact_seqs);
     imdb_writers_free(db); /* after the closing sync: the anchor still names its commit's epoch */
     if (db->lockfd >= 0) close(db->lockfd);
     if (db->anchor_lockfd >= 0) close(db->anchor_lockfd); /* the lease goes last */
     if (db->dirfd >= 0) close(db->dirfd);
-    free(db->path);
-    free(db);
+    imdb_free(db->path);
+    imdb_free(db);
     return rc;
 }
 
@@ -3019,7 +3019,7 @@ static int save_sectors(int logfd, uint64_t first, uint64_t from, uint64_t n, in
         from += k;
         n -= k;
     }
-    free(b);
+    imdb_free(b);
     close(sfd);
     return rc;
 }
@@ -3188,7 +3188,7 @@ int imdb_recover_tail(const char *path, bool apply, const char *save_path, imdb_
     r->applied = true;
 out:
     imdb_logseg_free(&seg);
-    free(segs);
+    imdb_free(segs);
     if (segfd >= 0) close(segfd);
     if (logfd >= 0) close(logfd);
     if (lockfd >= 0) close(lockfd);

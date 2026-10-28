@@ -109,6 +109,7 @@ unit: $(TBIN) $(AUDIT)
 # must not depend on the thread count.
 # Growth must wipe the block it leaves (util.c): no plain realloc in the engine.
 # File system calls go through fsio.c (imdb_io_*), where the tests inject faults.
+# Frees go through imdb_free (util.c), where the heap's counter credits them.
 IOCALLS = open|openat|read|pread|write|pwrite|fsync|fdatasync|ftruncate|renameat|rename|unlinkat|unlink|mkdir|mkdirat|fstat|fstatat|flock|fdopendir|opendir|readdir
 ALLOCS  = malloc|calloc|aligned_alloc|strdup|strndup|posix_memalign
 lint:
@@ -117,6 +118,8 @@ lint:
 	  { echo "raw file system call in src/: use the imdb_io_* wrappers (fsio.h)"; exit 1; }
 	@! grep -nE '(^|[^_a-zA-Z0-9.>"])($(ALLOCS))\(' $(filter-out src/util.c src/main.c,$(wildcard src/*.c)) || \
 	  { echo "raw allocation in src/: use the imdb_alloc* helpers (util.h; the tests fail them at will)"; exit 1; }
+	@! grep -nE '(^|[^_a-zA-Z0-9.>"])free\(' $(filter-out src/util.c src/main.c,$(wildcard src/*.c)) || \
+	  { echo "raw free in src/: use imdb_free (util.h: the heap's counter credits it)"; exit 1; }
 
 # The fault group (t_fault.c) runs in the first pass only: the second repeats the kernels in their
 # C references, which the fault handling does not depend on.

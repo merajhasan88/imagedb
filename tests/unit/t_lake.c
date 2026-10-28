@@ -384,7 +384,7 @@ static void t_segment_decoder_strict(void)
         imdb_segment *x;
         imdb_err e2 = {0};
         CHECK(imdb_segment_parse(&t->s, b, cut, &x, &e2) != 0);
-        free(b);
+        imdb_free(b);
     }
     for (size_t at = 0; at < n; at++) {
         uint8_t *b = imdb_alloc_aligned(1, n, E);
@@ -410,7 +410,7 @@ static void t_segment_decoder_strict(void)
             accepted_mut++;
             imdb_segment_free(x);
         } else {
-            free(b);
+            imdb_free(b);
         }
     }
     CHECK(accepted_mut > 0 && (size_t)accepted_mut < n);
@@ -453,7 +453,7 @@ static void t_dv_decoder_hostile(void)
     imdb_dv_ent *ents;
     uint32_t n;
     CHECK(imdb_dv_parse(b.p, b.len, got, &ents, &n, 10, &e) == 0 && n == 2 && ents[1].row == 4 && ents[1].end == 9);
-    free(ents);
+    imdb_free(ents);
     CHECK(memcmp(got, seg, 32) == 0);
     for (size_t cut = 0; cut < b.len; cut++) {
         imdb_err_clear(&e);
@@ -478,7 +478,7 @@ static void t_dv_decoder_hostile(void)
         int rc = imdb_dv_parse(m, b.len, got, &ents, &n, 10, &e);
         if (rc == 0) {
             fprintf(stderr, "    dv mutation %zu accepted\n", k);
-            free(ents);
+            imdb_free(ents);
         }
         CHECK(rc != 0);
         free(m);

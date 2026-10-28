@@ -173,7 +173,7 @@ static int run_text(runner *rn, const char *text, size_t len)
 static char *read_all(FILE *f, size_t *len)
 {
     size_t cap = 1 << 16, n = 0;
-    char *b = malloc(cap);
+    char *b = imdb_alloc(cap, &(imdb_err){0}); /* the helpers' throughout: imdb_realloc_array credits the old block */
     if (!b) return NULL;
     for (;;) {
         if (n == cap) {
@@ -181,7 +181,7 @@ static char *read_all(FILE *f, size_t *len)
             char *nb = imdb_realloc_array(b, cap, cap * 2, 1, &(imdb_err){0}); /* wipes the old block */
             if (!nb) {
                 imdb_wipe(b, cap);
-                free(b);
+                imdb_free(b);
                 return NULL;
             }
             cap *= 2;
@@ -296,7 +296,7 @@ static int cmd_sql(int argc, char **argv)
             }
             rc = run_text(&rn, text, len);
             imdb_wipe(text, len); /* SQL text carries row values */
-            free(text);
+            imdb_free(text);
             ran = true;
         }
     }
@@ -310,7 +310,7 @@ static int cmd_sql(int argc, char **argv)
                 rc = run_text(&rn, text, len);
                 imdb_wipe(text, len);
             }
-            free(text);
+            imdb_free(text);
         }
     }
     if (ss.txn.open) fprintf(stderr, "imagedb: open transaction rolled back at exit\n");

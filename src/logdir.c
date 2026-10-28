@@ -145,7 +145,7 @@ int imdb_logdir_list(int logfd, uint64_t **firsts, size_t *n, imdb_err *e)
     }
     closedir(d);
     if (rc) {
-        free(v);
+        imdb_free(v);
         return rc;
     }
     if (cnt) qsort(v, cnt, sizeof *v, cmp_u64);
@@ -200,7 +200,7 @@ void imdb_logseg_free(imdb_logseg *s)
 {
     if (s->buf) {
         imdb_wipe(s->buf, s->size);
-        free(s->buf);
+        imdb_free(s->buf);
     }
     s->buf = NULL;
 }

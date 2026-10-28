@@ -33,7 +33,7 @@ void imdb_result_init(imdb_result *r)
 void imdb_result_free(imdb_result *r)
 {
     if (r->cells) imdb_wipe(r->cells, (size_t)(r->caprows * r->ncols) * sizeof *r->cells); /* result values */
-    free(r->cells);
+    imdb_free(r->cells);
     imdb_buf_wipe_free(&r->text);
     memset(r, 0, sizeof *r);
 }
@@ -145,8 +145,8 @@ static void *xalloc(xctx *x, size_t n, imdb_err *e)
 
 static void xfree(xctx *x)
 {
-    for (uint32_t i = 0; i < x->nallocs; i++) free(x->allocs[i]);
-    free(x->allocs);
+    for (uint32_t i = 0; i < x->nallocs; i++) imdb_free(x->allocs[i]);
+    imdb_free(x->allocs);
     imdb_salts_wipe(&x->salts);
 }
 
@@ -562,9 +562,9 @@ static void sink_free(sink *k)
 {
     for (uint16_t i = 0; i < IMDB_MAX_COLS; i++) imdb_fsum_free(&k->acc[i].fsum);
     for (uint64_t i = 0; k->gacc && k->st && i < k->ngroups * k->st->nitems; i++) imdb_fsum_free(&k->gacc[i].fsum);
-    free(k->vids);
-    free(k->groups);
-    free(k->gacc);
+    imdb_free(k->vids);
+    imdb_free(k->groups);
+    imdb_free(k->gacc);
     if (k->gmap.slots) imdb_hmap_free(&k->gmap);
 }
 
@@ -782,8 +782,8 @@ static int path_scan(xctx *x, const qspec *q, sink *k, imdb_err *e)
         if (!q->all_versions && seg_skipped(q, g)) continue;
         size_t words = (n + 63) / 64;
         if (words > capw) {
-            free(bits);
-            free(tmp);
+            imdb_free(bits);
+            imdb_free(tmp);
             bits = imdb_alloc_array(words, sizeof *bits, e);
             tmp = imdb_alloc_array(words, sizeof *tmp, e);
             if (!bits || !tmp) {
@@ -869,8 +869,8 @@ static int path_scan(xctx *x, const qspec *q, sink *k, imdb_err *e)
             }
         }
     }
-    free(bits);
-    free(tmp);
+    imdb_free(bits);
+    imdb_free(tmp);
     if (rc || k->err) return rc ? rc : k->err;
     /* memtable rows (not yet in a segment) */
     for (uint64_t vid = t->mem_first; vid < t->nver && !k->err; vid++) {
@@ -1069,17 +1069,17 @@ static int materialize(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb
         imdb_value vals[IMDB_MAX_COLS];
         for (uint64_t i = 0; i < lim; i++) {
             if (fetch_row(x, t, kv[i].vid, vals, e)) {
-                free(kv);
+                imdb_free(kv);
                 return e->code;
             }
             imdb_cell *row = res_row(r, e);
             if (!row) {
-                free(kv);
+                imdb_free(kv);
                 return e->code;
             }
             for (uint16_t c = 0; c < nc; c++) res_put(r, &row[c], &vals[st->star ? c : k->item_col[c]]);
         }
-        free(kv);
+        imdb_free(kv);
         return res_finish(r, e);
     }
     res_cols(r, st->nitems);
@@ -1110,19 +1110,19 @@ static int materialize(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb
         uint64_t g = order[gi];
         imdb_cell *row = res_row(r, e);
         if (!row) {
-            free(order);
+            imdb_free(order);
             return e->code;
         }
         for (uint16_t i = 0; i < st->nitems; i++) {
             int c = k->item_col[i];
             if (st->items[i].agg == AGG_NONE) res_put(r, &row[i], &k->groups[g].key);
             else if (put_agg(r, &row[i], &k->gacc[g * st->nitems + i], st->items[i].agg, c >= 0 ? &t->s.cols[c] : &t->s.cols[0], e)) {
-                free(order);
+                imdb_free(order);
                 return e->code;
             }
         }
     }
-    free(order);
+    imdb_free(order);
     return res_finish(r, e);
 }
 
@@ -1279,18 +1279,18 @@ static int join_charge(jctx *j, uint64_t bytes, imdb_err *e)
 static void join_free(jctx *j)
 {
     if (j->map.slots) imdb_hmap_free(&j->map);
-    for (uint32_t i = 0; i < j->nlists; i++) free(j->lists[i].v);
-    free(j->lists);
-    free(j->ent);
-    free(j->matched);
-    free(j->pairs);
+    for (uint32_t i = 0; i < j->nlists; i++) imdb_free(j->lists[i].v);
+    imdb_free(j->lists);
+    imdb_free(j->ent);
+    imdb_free(j->matched);
+    imdb_free(j->pairs);
     if (j->kept) imdb_wipe(j->kept, (size_t)(j->capkept * j->nneed) * sizeof *j->kept); /* row values */
-    free(j->kept);
+    imdb_free(j->kept);
     for (uint32_t i = 0; i < j->nchunks; i++) {
         imdb_wipe(j->chunks[i], JOIN_CHUNK);
-        free(j->chunks[i]);
+        imdb_free(j->chunks[i]);
     }
-    free(j->chunks);
+    imdb_free(j->chunks);
     imdb_wipe(j->brow, sizeof j->brow);
     j->lists = NULL;
     j->ent = NULL;
@@ -1838,7 +1838,7 @@ static int join_materialize(xctx *x, const sql_stmt *st, jctx *j, sink *k, imdb_
         if (!rc && !row) rc = e->code;
         for (uint16_t c = 0; !rc && c < nc; c++) res_put(r, &row[c], &cv[st->star ? c : k->item_col[c]]);
     }
-    free(kv);
+    imdb_free(kv);
     return rc ? rc : res_finish(r, e);
 }
 
@@ -1880,7 +1880,7 @@ static int exec_join(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
     j->nc[1] = t[1]->s.ncols;
     j->left = st->join_left;
     if (!(j->ct = imdb_alloc(sizeof *j->ct, e))) {
-        free(j);
+        imdb_free(j);
         return e->code;
     }
     j->ct->s.ncols = (uint16_t)(j->nc[0] + j->nc[1]);
@@ -1967,8 +1967,8 @@ static int exec_join(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
         }
     }
     join_free(j);
-    free(j->ct);
-    free(j);
+    imdb_free(j->ct);
+    imdb_free(j);
     return rc;
 }
 
@@ -2143,7 +2143,7 @@ static int exec_update(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
         if (!rc && !(rc = imdb_salt_next(&x->salts, salt, e))) rc = imdb_update_salt(x->db, t, vids[i], vals, salt, e);
         imdb_wipe(salt, sizeof salt);
     }
-    free(vids);
+    imdb_free(vids);
     if (!rc) snprintf(r->status, sizeof r->status, "UPDATE %llu", (unsigned long long)n);
     return rc;
 }
@@ -2156,7 +2156,7 @@ static int exec_delete(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
     if (select_vids(x, st, t, false, &vids, &n, e)) return e->code;
     int rc = IMDB_OK;
     for (uint64_t i = 0; i < n && !rc; i++) rc = imdb_delete(x->db, t, vids[i], e);
-    free(vids);
+    imdb_free(vids);
     if (!rc) snprintf(r->status, sizeof r->status, "DELETE %llu", (unsigned long long)n);
     return rc;
 }
@@ -2312,7 +2312,7 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
         res_name(r, 3, "detail");
         imdb_cell *row = res_row(r, e);
         if (!row) {
-            free(v);
+            imdb_free(v);
             return e->code;
         }
         char d[256];
@@ -2330,7 +2330,7 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
         for (size_t i = 0; i < n; i++) {
             const imdb_replica_status *s = &v[i];
             if (!(row = res_row(r, e))) {
-                free(v);
+                imdb_free(v);
                 return e->code;
             }
             char sc[64], sess[17];
@@ -2353,7 +2353,7 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
             res_put_int(r, &row[2], usable ? (int64_t)s->ack.cleanup : -1);
             res_put_str(r, &row[3], d);
         }
-        free(v);
+        imdb_free(v);
         static const char *const out[][3] = {
             {"backups and copies", "not tracked", "copies made outside imagedb (backups, file system snapshots, a replica "
                                                   "restored from one) may hold the bytes"},
@@ -2385,7 +2385,7 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
         for (size_t i = 0; i < n; i++) {
             imdb_cell *row = res_row(r, e);
             if (!row) {
-                free(v);
+                imdb_free(v);
                 return e->code;
             }
             imdb_replica_status *s = &v[i];
@@ -2417,7 +2417,7 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
             res_put_str(r, &row[8], s->acked ? sess : "");
             res_put_str(r, &row[9], state);
         }
-        free(v);
+        imdb_free(v);
         snprintf(r->status, sizeof r->status, "%zu replicas allowlisted; this primary at commit %llu", n,
                  (unsigned long long)db->seq);
         return res_finish(r, e);
@@ -2621,12 +2621,12 @@ int imdb_exec_one(imdb_session *ss, const char *sql, size_t len, const imdb_valu
     if (!st) return e->code;
     int rc = imdb_sql_parse(sql, len, st, e);
     if (rc) {
-        free(st);
+        imdb_free(st);
         return rc;
     }
     if (nparams > IMDB_MAX_PARAMS) {
         imdb_sql_stmt_free(st);
-        free(st);
+        imdb_free(st);
         return imdb_fail(e, IMDB_ERR_LIMIT, "too many parameters");
     }
     xctx x = {.ss = ss, .db = ss->db, .sql = sql, .params = params, .nparams = nparams};
@@ -2635,12 +2635,12 @@ int imdb_exec_one(imdb_session *ss, const char *sql, size_t len, const imdb_valu
     if (db->failed) {
         /* in-memory state may be half-installed: no answers until reopen + replay */
         imdb_sql_stmt_free(st);
-        free(st);
+        imdb_free(st);
         return imdb_fail(e, IMDB_ERR_STATE, "database is in a failed state; reopen it to recover");
     }
     if ((db->pending_auth || db->lake_unverified) && st->kind != ST_VERIFY) {
         imdb_sql_stmt_free(st);
-        free(st);
+        imdb_free(st);
         return imdb_fail(e, IMDB_ERR_STATE,
                          "replica has unauthorised redactions or an unverified lake; resume apply before querying");
     }
@@ -2650,7 +2650,7 @@ int imdb_exec_one(imdb_session *ss, const char *sql, size_t len, const imdb_valu
         rc = imdb_fail(e, IMDB_ERR_STATE, "this database is at commit %llu; the session requires commit %llu (SET min_commit)",
                        (unsigned long long)db->seq, (unsigned long long)ss->min_commit);
         imdb_sql_stmt_free(st);
-        free(st);
+        imdb_free(st);
         return rc;
     }
     bool autocommit = false, txn = ss->txn.open;
@@ -2823,7 +2823,7 @@ int imdb_exec_one(imdb_session *ss, const char *sql, size_t len, const imdb_valu
         if ((rc = select_vids(&x, st, t, true, &vids, &n, e))) break;
         imdb_erase_ent *ents = n ? imdb_alloc_array(n, sizeof *ents, e) : NULL;
         if (n && !ents) {
-            free(vids);
+            imdb_free(vids);
             rc = e->code;
             break;
         }
@@ -2831,7 +2831,7 @@ int imdb_exec_one(imdb_session *ss, const char *sql, size_t len, const imdb_valu
             ents[i].table = t->s.id;
             ents[i].vid = vids[i];
         }
-        free(vids);
+        imdb_free(vids);
         imdb_erase_report er;
         rc = imdb_erase_versions(db, ents, (uint32_t)n, &er, e);
         if (!rc) erase_status(r, &er, db);
@@ -2939,7 +2939,7 @@ done:
     if (rc) imdb_result_free(r);
     xfree(&x);
     imdb_sql_stmt_free(st);
-    free(st);
+    imdb_free(st);
     return rc;
 }
 

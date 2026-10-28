@@ -1,12 +1,27 @@
 #include "util.h"
 
 #include <errno.h>
+#include <malloc.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/random.h>
 
 #include "fsio.h"
+
+/* The heap's counter (util.h): every block the helpers below return is charged what malloc reserved
+ * for it, and imdb_free credits the same, so the count is exact whatever size each caller asked for.
+ * One for the process: the helpers know no database handle, and the pool's workers allocate too. */
+static _Atomic uint64_t g_heap;
+
+static void *charged(void *p)
+{
+    if (p) atomic_fetch_add_explicit(&g_heap, malloc_usable_size(p), memory_order_relaxed);
+    return p;
+}
+
+uint64_t imdb_heap_bytes(void) { return atomic_load_explicit(&g_heap, memory_order_relaxed); }
 
 int imdb_fail(imdb_err *e, int code, const char *fmt, ...)
 {
@@ -54,7 +69,7 @@ void *imdb_alloc(size_t n, imdb_err *e)
         imdb_fail(e, IMDB_ERR_LIMIT, "allocation of %zu bytes exceeds limit", n);
         return NULL;
     }
-    void *p = imdb_io_fail_alloc(n) ? NULL : calloc(1, n ? n : 1);
+    void *p = imdb_io_fail_alloc(n) ? NULL : charged(calloc(1, n ? n : 1));
     if (!p) imdb_fail(e, IMDB_ERR_NOMEM, "out of memory (%zu bytes)", n);
     return p;
 }
@@ -82,7 +97,7 @@ void *imdb_realloc_array(void *p, size_t old_count, size_t new_count, size_t siz
         return NULL;
     }
     if (!p) old_total = 0; /* a NULL block with a stale count was harmless before; keep it so */
-    uint8_t *q = imdb_io_fail_alloc(total) ? NULL : malloc(total ? total : 1);
+    uint8_t *q = imdb_io_fail_alloc(total) ? NULL : charged(malloc(total ? total : 1));
     if (!q) {
         imdb_fail(e, IMDB_ERR_NOMEM, "out of memory (%zu bytes)", total);
         return NULL;
@@ -92,12 +107,17 @@ void *imdb_realloc_array(void *p, size_t old_count, size_t new_count, size_t siz
     if (total > keep) memset(q + keep, 0, total - keep);
     if (p) {
         imdb_wipe(p, old_total);
-        free(p);
+        imdb_free(p);
     }
     return q;
 }
 
-void imdb_free(void *p) { free(p); }
+void imdb_free(void *p)
+{
+    if (!p) return;
+    atomic_fetch_sub_explicit(&g_heap, malloc_usable_size(p), memory_order_relaxed);
+    free(p);
+}
 
 void *imdb_alloc_aligned(size_t count, size_t size, imdb_err *e)
 {
@@ -107,7 +127,7 @@ void *imdb_alloc_aligned(size_t count, size_t size, imdb_err *e)
         return NULL;
     }
     total = (total + 31) & ~(size_t)31;
-    void *p = imdb_io_fail_alloc(total) ? NULL : aligned_alloc(32, total ? total : 32);
+    void *p = imdb_io_fail_alloc(total) ? NULL : charged(aligned_alloc(32, total ? total : 32));
     if (!p) {
         imdb_fail(e, IMDB_ERR_NOMEM, "out of memory (%zu bytes)", total);
         return NULL;
@@ -162,7 +182,7 @@ void imdb_buf_init(imdb_buf *b)
 
 void imdb_buf_free(imdb_buf *b)
 {
-    free(b->p);
+    imdb_free(b->p);
     imdb_buf_init(b);
 }
 
@@ -190,7 +210,7 @@ bool imdb_buf_reserve_limit(imdb_buf *b, size_t extra, size_t limit)
         }
     }
     if (ncap > limit) ncap = need;
-    uint8_t *q = imdb_io_fail_alloc(ncap) ? NULL : malloc(ncap); /* not realloc: see imdb_realloc_array */
+    uint8_t *q = imdb_io_fail_alloc(ncap) ? NULL : charged(malloc(ncap)); /* not realloc: see imdb_realloc_array */
     if (!q) {
         b->err = IMDB_ERR_NOMEM;
         return false;
@@ -199,7 +219,7 @@ bool imdb_buf_reserve_limit(imdb_buf *b, size_t extra, size_t limit)
     memset(q + b->len, 0, ncap - b->len);
     if (b->p) {
         imdb_wipe(b->p, b->cap);
-        free(b->p);
+        imdb_free(b->p);
     }
     b->p = q;
     b->cap = ncap;

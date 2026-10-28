@@ -117,7 +117,7 @@ int imdb_replica_key(const char *dir, bool create, imdb_signer *s, bool *created
     if (n != IMDB_SEED_LEN) rc = imdb_fail(e, IMDB_ERR_CORRUPT, "replica.key: wrong length");
     else imdb_signer_init(s, b);
     imdb_wipe(b, n);
-    free(b);
+    imdb_free(b);
     return rc;
 }
 
@@ -207,7 +207,7 @@ int imdb_allowlist_load(int dirfd, imdb_allow **out, size_t *n, imdb_err *e)
         memset(&a, 0, sizeof a);
         memcpy(a.name, de->d_name, len - 4);
         bool ok = bl == 65 && b[64] == '\n' && imdb_unhex((const char *)b, 64, a.pub, IMDB_PUBKEY_LEN);
-        free(b);
+        imdb_free(b);
         if (!ok) {
             rc = imdb_fail(e, IMDB_ERR_CORRUPT, "replicas/%s: not a public key", de->d_name);
             break;
@@ -227,7 +227,7 @@ int imdb_allowlist_load(int dirfd, imdb_allow **out, size_t *n, imdb_err *e)
     closedir(d);
     close(rfd);
     if (rc) {
-        free(*out);
+        imdb_free(*out);
         *out = NULL;
         *n = 0;
         return rc;
@@ -238,7 +238,7 @@ int imdb_allowlist_load(int dirfd, imdb_allow **out, size_t *n, imdb_err *e)
             if (memcmp((*out)[i].pub, (*out)[j].pub, IMDB_PUBKEY_LEN) == 0)
                 rc = imdb_fail(e, IMDB_ERR_CORRUPT, "replicas/: %s and %s hold the same key", (*out)[i].name, (*out)[j].name);
     if (rc) {
-        free(*out);
+        imdb_free(*out);
         *out = NULL;
         *n = 0;
     }
@@ -284,7 +284,7 @@ int imdb_replica_add(const char *primary, const char *name, const uint8_t pub[IM
         else if (same_name && !replace)
             rc = imdb_fail(e, IMDB_ERR_CONSTRAINT, "replica %s is already allowlisted (--replace gives it a new key)", name);
     }
-    free(list);
+    imdb_free(list);
     if (!rc && replace && !have) rc = imdb_fail(e, IMDB_ERR_NOTFOUND, "no replica %s to replace", name);
     char fn[IMDB_REPLICA_NAME_MAX + 16];
     if (!rc && replace) { /* the old key's record and divergence go with it */
@@ -393,7 +393,7 @@ int imdb_ack_receive(int dirfd, const uint8_t db_id[16], const uint8_t nonce[IMD
         imdb_allow *nl;
         size_t nn;
         if (imdb_allowlist_load(dirfd, &nl, &nn, e)) return e->code;
-        free(*allow);
+        imdb_free(*allow);
         *allow = nl;
         *nallow = nn;
         who = allow_find(*allow, *nallow, a.replica);
@@ -421,7 +421,7 @@ int imdb_ack_receive(int dirfd, const uint8_t db_id[16], const uint8_t nonce[IMD
         rc = imdb_fail(e, IMDB_ERR_CORRUPT, "replicas/%s: not a public key", fn);
     if (!rc && memcmp(current, a.replica, sizeof current) != 0)
         rc = imdb_fail(e, IMDB_ERR_AUTH, "replica %s's key has been replaced", who->name);
-    free(pub);
+    imdb_free(pub);
     if (rc) goto out;
     snprintf(fn, sizeof fn, "%s.diverged", who->name);
     if (imdb_io_fstatat(rfd, fn, &(struct stat){0}, AT_SYMLINK_NOFOLLOW) == 0) {
@@ -521,13 +521,13 @@ int imdb_replicas_status(imdb_db *db, imdb_replica_status **out, size_t *n, imdb
     if (!nl) return IMDB_OK;
     int rfd = replicas_dir(db->dirfd, false, e);
     if (rfd < 0) {
-        free(list);
+        imdb_free(list);
         return rfd == -2 ? IMDB_OK : e->code;
     }
     imdb_replica_status *v = imdb_alloc_array(nl, sizeof *v, e);
     if (!v) {
         close(rfd);
-        free(list);
+        imdb_free(list);
         return e->code;
     }
     int64_t now = wall_ms();
@@ -541,7 +541,7 @@ int imdb_replicas_status(imdb_db *db, imdb_replica_status **out, size_t *n, imdb
         s->state = s->incident ? IMDB_REPL_DIVERGED : s->acked ? ack_state(db, &s->ack) : IMDB_REPL_NONE;
     }
     close(rfd);
-    free(list);
+    imdb_free(list);
     *out = v;
     *n = nl;
     return IMDB_OK;
@@ -563,7 +563,7 @@ int imdb_replicas_wait(imdb_db *db, uint64_t seq, uint32_t k, uint32_t timeout_m
     if (imdb_allowlist_load(db->dirfd, &list, &nl, e)) return e->code;
     int rfd = nl ? replicas_dir(db->dirfd, false, e) : -2;
     if (rfd == -1) {
-        free(list);
+        imdb_free(list);
         return e->code;
     }
     bool *done = nl ? imdb_alloc_array(nl, sizeof *done, e) : NULL;
@@ -592,8 +592,8 @@ int imdb_replicas_wait(imdb_db *db, uint64_t seq, uint32_t k, uint32_t timeout_m
         (void)poll(NULL, 0, 1);
     }
     if (rfd >= 0) close(rfd);
-    free(done);
-    free(last);
-    free(list);
+    imdb_free(done);
+    imdb_free(last);
+    imdb_free(list);
     return rc;
 }

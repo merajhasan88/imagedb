@@ -228,7 +228,7 @@ static imdb_lthash *chunk_slot(vchunk *ch, uint32_t table)
         return NULL;
     }
     if (ch->nd) memcpy(nd, ch->delta, ch->nd * sizeof *nd);
-    free(ch->delta);
+    imdb_free(ch->delta);
     ch->delta = nd;
     ch->tab[ch->nd] = table;
     imdb_lthash_zero(&ch->delta[ch->nd]);
@@ -295,13 +295,13 @@ static void batch_free(vbatch *b)
     for (size_t i = 0; i < b->nf; i++)
         if (b->f[i].decoded) imdb_commit_free(&b->f[i].c);
     for (size_t i = 0; i < b->nch; i++) {
-        free(b->ch[i].tab);
-        free(b->ch[i].delta);
-        free(b->ch[i].st);
-        free(b->ch[i].subj);
+        imdb_free(b->ch[i].tab);
+        imdb_free(b->ch[i].delta);
+        imdb_free(b->ch[i].st);
+        imdb_free(b->ch[i].subj);
     }
-    free(b->ch);
-    free(b->nt_new);
+    imdb_free(b->ch);
+    imdb_free(b->nt_new);
     b->ch = NULL;
     b->nt_new = NULL;
     b->nch = b->nnew = 0;
@@ -782,9 +782,9 @@ static int verify_log(imdb_db *db, vctx *x, double *t_read, double *t_par, doubl
     }
     /* every commit the writer acknowledged must still be in the log */
     if (!rc && db->have_dur) rc = imdb_tail_check(&db->dur, true, x->seq, IMDB_SCAN_END, "the log ends at a frame boundary", e);
-    free(fr);
-    free(states);
-    free(sfirst);
+    imdb_free(fr);
+    imdb_free(states);
+    imdb_free(sfirst);
     return rc;
 }
 
@@ -819,14 +819,14 @@ static void lake_item(void *ctx, size_t i)
     if ((it->rc = imdb_lake_read_object(L->ofd, mt->seg[it->k].seg, ".seg", &sb, &sl, e))) return;
     uint8_t *al = imdb_alloc_aligned(1, sl, e);
     if (!al) {
-        free(sb);
+        imdb_free(sb);
         it->rc = e->code;
         return;
     }
     memcpy(al, sb, sl);
-    free(sb);
+    imdb_free(sb);
     if ((it->rc = imdb_segment_parse(&vt->s, al, sl, &it->g, e))) {
-        free(al);
+        imdb_free(al);
         return;
     }
     imdb_segment *g = it->g;
@@ -847,9 +847,9 @@ static void lake_item(void *ctx, size_t i)
             for (uint32_t r = 0; r < n && !it->rc; r++)
                 if (ents[r].end > S) it->rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: DV records a future delete");
                 else g->end[ents[r].row] = ents[r].end;
-            free(ents);
+            imdb_free(ents);
         }
-        free(dvb);
+        imdb_free(dvb);
         if (it->rc) return;
     }
     int subj = vt->s.subject;
@@ -970,7 +970,7 @@ static int verify_lake(imdb_db *db, const vctx *x, imdb_verify_report *rep, imdb
     imdb_hex(db->lake_manifest, 32, hex);
     int wl = snprintf(want, sizeof want, "imagedb-lake 1\nseq %llu\nmanifest %s\n", (unsigned long long)db->lake_seq, hex);
     bool head_ok = (size_t)wl == hl && memcmp(hb, want, hl) == 0;
-    free(hb);
+    imdb_free(hb);
     if (!head_ok) return imdb_fail(e, IMDB_ERR_VERIFY, "lake: LAKE_HEAD does not name the current manifest");
     if (!at->seen || db->lake_seq != x->last_publish || memcmp(at->manifest, db->lake_manifest, 32) != 0)
         return imdb_fail(e, IMDB_ERR_VERIFY, "lake: the manifest is not the one the last publishing commit (%llu) records",
@@ -1099,7 +1099,7 @@ static int verify_lake(imdb_db *db, const vctx *x, imdb_verify_report *rep, imdb
             rc = add_refs(&refs, &nrefs, &caprefs, x->pin[i], &qm, e);
         }
         imdb_manifest_free(&qm);
-        free(qb);
+        imdb_free(qb);
     }
     if (!rc) {
         qsort(refs, nrefs, sizeof *refs, cmp_ref);
@@ -1125,14 +1125,14 @@ static int verify_lake(imdb_db *db, const vctx *x, imdb_verify_report *rep, imdb
         }
         if (d) closedir(d);
     }
-    free(refs);
-    for (uint32_t ti = 0; seen && ti < m.nt; ti++) free(seen[ti]);
-    free(seen);
-    free(items);
+    imdb_free(refs);
+    for (uint32_t ti = 0; seen && ti < m.nt; ti++) imdb_free(seen[ti]);
+    imdb_free(seen);
+    imdb_free(items);
     imdb_manifest_free(&pm);
     imdb_manifest_free(&m);
-    free(pb);
-    free(mb);
+    imdb_free(pb);
+    imdb_free(mb);
     close(ofd);
     return rc;
 }
@@ -1268,12 +1268,12 @@ int imdb_verify(imdb_db *db, imdb_verify_report *rep, imdb_err *e)
     memcpy(rep->head, x.head, 32);
     imdb_lthash_digest(db->meta.digest_alg, &x.global, rep->digest);
     for (uint32_t i = 0; i < x.nt; i++) {
-        free(x.t[i].v);
-        free(x.t[i].d);
+        imdb_free(x.t[i].v);
+        imdb_free(x.t[i].d);
     }
-    free(x.t);
-    free(x.at_s.t);
-    free(x.pin);
-    free(x.pin_at);
+    imdb_free(x.t);
+    imdb_free(x.at_s.t);
+    imdb_free(x.pin);
+    imdb_free(x.pin_at);
     return rc;
 }

@@ -737,10 +737,43 @@ static void t_mem_vstore_refused(void)
     imdb_close(db);
 }
 
+/* The heap's counter (util.h), whose return to its start the runner checks after every test: each
+ * helper charges what malloc reserved for its block and imdb_free credits the same, growth nets the
+ * new block against the old one it frees, and a refused allocation charges nothing. No parallel loop
+ * runs here, so the counter moves by this thread's blocks alone. */
+static void t_mem_heap_counter(void)
+{
+    uint64_t h0 = imdb_heap_bytes();
+    uint8_t *a = imdb_alloc(100, E);
+    CHECK(a && imdb_heap_bytes() == h0 + malloc_usable_size(a));
+    uint8_t *b = imdb_realloc_array(a, 100, 5000, 1, E);
+    CHECK(b && imdb_heap_bytes() == h0 + malloc_usable_size(b));
+    uint64_t *c = imdb_alloc_aligned(7, sizeof *c, E);
+    CHECK(c && imdb_heap_bytes() == h0 + malloc_usable_size(b) + malloc_usable_size(c));
+    imdb_buf buf;
+    imdb_buf_init(&buf);
+    imdb_buf_put(&buf, "x", 1);
+    CHECK(imdb_buf_reserve(&buf, 100000)); /* past its first block: the growth nets too */
+    CHECK(imdb_heap_bytes() == h0 + malloc_usable_size(b) + malloc_usable_size(c) + malloc_usable_size(buf.p));
+    imdb_buf_free(&buf);
+    imdb_free(c);
+    imdb_free(b);
+    imdb_free(NULL);
+    CHECK(imdb_heap_bytes() == h0);
+    imdb_err e = {0};
+    g_refuse_at = 1;
+    g_allocs = 0;
+    imdb_io_set_hooks(&g_refuse_hooks);
+    void *d = imdb_alloc(64, &e);
+    imdb_io_set_hooks(NULL);
+    CHECK(!d && e.code == IMDB_ERR_NOMEM && imdb_heap_bytes() == h0);
+}
+
 const test_case mem_tests[] = {
     {"mem_vstore_chunks", t_mem_vstore_chunks},
     {"mem_vstore_admission", t_mem_vstore_admission},
     {"mem_vstore_refused", t_mem_vstore_refused},
+    {"mem_heap_counter", t_mem_heap_counter},
     {"mem_admission", t_mem_admission},
     {"mem_result_cap", t_mem_result_cap},
     {"mem_replica", t_mem_replica},

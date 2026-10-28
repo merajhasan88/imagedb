@@ -57,7 +57,12 @@ const char *imdb_err_name(int code);
 void *imdb_alloc(size_t n, imdb_err *e);
 void *imdb_alloc_array(size_t count, size_t size, imdb_err *e);
 void *imdb_realloc_array(void *p, size_t old_count, size_t new_count, size_t size, imdb_err *e);
+/* Every block from these helpers is freed here, never by free() (make lint): the heap's counter
+ * credits it. */
 void imdb_free(void *p);
+/* The heap's counter: the bytes malloc reserved for the blocks these helpers returned and
+ * imdb_free has not freed, for the whole process (every handle and the pool's workers). */
+uint64_t imdb_heap_bytes(void);
 /* 32-byte aligned, zeroed (for SIMD-friendly arrays such as LtHash states). */
 void *imdb_alloc_aligned(size_t count, size_t size, imdb_err *e);
 char *imdb_strndup(const char *s, size_t n, imdb_err *e);

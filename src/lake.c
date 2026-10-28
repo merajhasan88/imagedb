@@ -83,10 +83,10 @@ void imdb_segment_free(imdb_segment *g)
 {
     if (!g) return;
     if (g->bytes) imdb_wipe(g->bytes, g->len);
-    free(g->bytes);
-    free(g->end);
-    free(g->stubmask);
-    free(g);
+    imdb_free(g->bytes);
+    imdb_free(g->end);
+    imdb_free(g->stubmask);
+    imdb_free(g);
 }
 
 static bool all_zero(const uint8_t *p, size_t n)
@@ -243,9 +243,9 @@ int imdb_segment_parse(const imdb_schema *s, uint8_t *b, size_t len, imdb_segmen
         }
     }
     if (rc) {
-        free(g->end);
-        free(g->stubmask);
-        free(g);
+        imdb_free(g->end);
+        imdb_free(g->stubmask);
+        imdb_free(g);
         return rc;
     }
     g->bytes = b;
@@ -360,7 +360,7 @@ static int seg_build(const imdb_table *t, const uint64_t *vids, uint32_t n, cons
             text_len[c] += v.len;
         }
         if (text_len[c] > UINT32_MAX) {
-            free(fl);
+            imdb_free(fl);
             return imdb_fail(e, IMDB_ERR_LIMIT, "segment text column too large");
         }
     }
@@ -372,22 +372,22 @@ static int seg_build(const imdb_table *t, const uint64_t *vids, uint32_t n, cons
         pos = align8(pos);
         off[k] = pos;
         if (d[k].len > IMDB_MAX_OBJECT - pos) {
-            free(fl);
+            imdb_free(fl);
             return imdb_fail(e, IMDB_ERR_LIMIT, "segment too large");
         }
         pos += (size_t)d[k].len;
     }
     uint8_t *b = imdb_alloc_aligned(1, pos, e);
     if (!b) {
-        free(fl);
+        imdb_free(fl);
         return e->code;
     }
     memcpy(b, kSegMagic, 8);
     imdb_le32(b + 8, 2);
     imdb_le32(b + 12, s->id);
     if (schema_hash(s, b + 16, e)) {
-        free(b);
-        free(fl);
+        imdb_free(b);
+        imdb_free(fl);
         return e->code;
     }
     imdb_le32(b + 48, n);
@@ -458,12 +458,12 @@ static int seg_build(const imdb_table *t, const uint64_t *vids, uint32_t n, cons
         imdb_le64(zm + 24u * c + 8, (uint64_t)mn);
         imdb_le64(zm + 24u * c + 16, (uint64_t)mx);
     }
-    free(fl);
+    imdb_free(fl);
     /* Parse our own output: the encoder is always checked by the strict decoder. */
     imdb_segment *g;
     int rc = imdb_segment_parse(s, b, pos, &g, e);
     if (rc) {
-        free(b);
+        imdb_free(b);
         return rc;
     }
     for (uint32_t i = 0; i < n; i++) g->end[i] = imdb_vh(t, vids[i])->end;
@@ -511,12 +511,12 @@ int imdb_dv_parse(const uint8_t *b, size_t len, uint8_t seg_hash[32], imdb_dv_en
         uint32_t pad = imdb_rd_u32(&r);
         v[i].end = imdb_rd_u64(&r);
         if (pad || v[i].row >= nrows || v[i].end == 0 || v[i].end >= IMDB_LIVE || (i && v[i].row <= v[i - 1].row)) {
-            free(v);
+            imdb_free(v);
             return imdb_fail(e, IMDB_ERR_CORRUPT, "dv: bad entry");
         }
     }
     if (r.err || imdb_rd_left(&r)) {
-        free(v);
+        imdb_free(v);
         return imdb_fail(e, IMDB_ERR_CORRUPT, "dv: trailing or truncated");
     }
     *ents = v;
@@ -528,8 +528,8 @@ int imdb_dv_parse(const uint8_t *b, size_t len, uint8_t seg_hash[32], imdb_dv_en
 
 void imdb_manifest_free(imdb_manifest *m)
 {
-    for (uint32_t i = 0; i < m->nt; i++) free(m->t[i].seg);
-    free(m->t);
+    for (uint32_t i = 0; i < m->nt; i++) imdb_free(m->t[i].seg);
+    imdb_free(m->t);
     memset(m, 0, sizeof *m);
 }
 
@@ -551,7 +551,7 @@ static int manifest_index_names(const imdb_manifest *m, imdb_err *e)
     qsort(p, n, sizeof *p, cmp_name_ptr);
     bool dup = false;
     for (size_t i = 1; i < n && !dup; i++) dup = strcmp(p[i - 1], p[i]) == 0;
-    free(p);
+    imdb_free(p);
     return dup ? IMDB_ERR_CORRUPT : IMDB_OK;
 }
 
@@ -706,7 +706,7 @@ static void pinset_free(pinset *P)
         if (P->p[i].kept) imdb_manifest_free(&P->p[i].m);
         if (P->p[i].fd >= 0) close(P->p[i].fd);
     }
-    free(P->p);
+    imdb_free(P->p);
     memset(P, 0, sizeof *P);
 }
 
@@ -757,11 +757,11 @@ static void pins_collect(imdb_db *db, int ofd, pinset *P)
         size_t ml = 0;
         if (!imdb_unhex(de->d_name, 64, x->h, 32) || read_obj(ofd, x->h, ".man", &mb, &ml, &e) ||
             imdb_manifest_parse(mb, ml, &x->m, &e)) {
-            free(mb);
+            imdb_free(mb);
             imdb_err_clear(&e);
             continue;
         }
-        free(mb);
+        imdb_free(mb);
         if (memcmp(x->m.db_id, db->db_id, 16) != 0 || x->m.seq < floor || x->m.seq > db->lake_seq ||
             db->lake_seq - x->m.seq > db->pin_max_lag) {
             imdb_manifest_free(&x->m);
@@ -814,14 +814,14 @@ static void plan_free(imdb_lake_plan *p)
             if (pt->owned && pt->owned[k]) imdb_segment_free(pt->seg[k]);
             if (pt->dv) imdb_buf_free(&pt->dv[k]);
         }
-        free(pt->seg);
-        free(pt->owned);
-        free(pt->dv);
+        imdb_free(pt->seg);
+        imdb_free(pt->owned);
+        imdb_free(pt->dv);
     }
-    free(p->tab);
+    imdb_free(p->tab);
     imdb_buf_free(&p->manifest);
-    free(p->rw);
-    free(p);
+    imdb_free(p->rw);
+    imdb_free(p);
 }
 
 static int pt_push(plan_tab *pt, imdb_segment *g, bool owned, imdb_err *e)
@@ -860,7 +860,7 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
     imdb_buf_init(&p->manifest);
     p->tab = imdb_alloc_array(db->nt ? db->nt : 1, sizeof *p->tab, e);
     if (!p->tab) {
-        free(p);
+        imdb_free(p);
         return e->code;
     }
     p->nt = db->nt;
@@ -905,7 +905,7 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
                 rc = imdb_fail(e, IMDB_ERR_LIMIT, "memtable of %s exceeds one segment; checkpoint more often", t->s.name);
                 break;
             }
-            free(vids);
+            imdb_free(vids);
             vids = imdb_alloc_array(cnt, sizeof *vids, e);
             if (!vids) {
                 rc = e->code;
@@ -926,7 +926,7 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
         if (kind == IMDB_OP_COMPACT && ti == ctable) {
             uint64_t total = 0;
             for (uint32_t k = 0; k < pt->nseg; k++) total += pt->seg[k]->nrows;
-            free(vids);
+            imdb_free(vids);
             vids = imdb_alloc_array(total ? total : 1, sizeof *vids, e);
             if (!vids) {
                 rc = e->code;
@@ -955,7 +955,7 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
                 if (!rc && !(rc = pt_push(pt, merged[k], true, e))) continue;
                 imdb_segment_free(merged[k]); /* the one pt_push failed to take (it stays the caller's), and the rest */
             }
-            free(merged);
+            imdb_free(merged);
             if (rc) break;
             pt->compacted = true;
             if (purge_before > pt->horizon) pt->horizon = purge_before;
@@ -972,7 +972,7 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
             if ((rc = imdb_buf_check(&pt->dv[k], e))) break;
         }
     }
-    free(vids);
+    imdb_free(vids);
     if (rc) {
         plan_free(p);
         return rc;
@@ -1067,7 +1067,7 @@ static int plan_install(imdb_db *db, imdb_lake_plan *p, imdb_err *e)
             for (uint32_t j = 0; j < pt->nseg && !kept; j++) kept = pt->seg[j] == t->seg[k];
             if (!kept) imdb_segment_free(t->seg[k]);
         }
-        free(t->seg);
+        imdb_free(t->seg);
         t->seg = ns;
         t->nseg = t->capseg = pt->nseg;
         for (uint32_t k = 0; k < pt->nseg; k++) {
@@ -1105,7 +1105,7 @@ static int plan_install(imdb_db *db, imdb_lake_plan *p, imdb_err *e)
             if (purged) imdb_index_rebuild_table(db, t); /* the purged versions leave the indexes */
         }
     }
-    free(db->lake_mbytes);
+    imdb_free(db->lake_mbytes);
     db->lake_mbytes = p->manifest.p;
     db->lake_mlen = p->manifest.len;
     imdb_buf_init(&p->manifest);
@@ -1136,7 +1136,7 @@ static int obj_put(imdb_db *db, int ofd, const uint8_t h[32], const char *ext, c
             imdb_err e2 = {0};
             bool same = imdb_read_file_at(ofd, name, &cur, &len, IMDB_MAX_OBJECT, &e2) == IMDB_OK && len == n &&
                         memcmp(cur, p, n) == 0;
-            if (!e2.code) free(cur);
+            if (!e2.code) imdb_free(cur);
             if (same) return IMDB_OK;
         }
         snprintf(db->warning, sizeof db->warning, "repaired lake object %s (it did not match the log)", name);
@@ -1284,10 +1284,10 @@ static int lake_persist(imdb_db *db, const uint8_t *keep, size_t keeplen, imdb_e
  * so GC (and therefore the set of object files) never depends on restarts. */
 static void rotate_prev(imdb_db *db, uint8_t *prev, size_t prevlen, bool erase)
 {
-    free(db->lake_prev);
+    imdb_free(db->lake_prev);
     db->lake_prev = erase ? NULL : prev;
     db->lake_prevlen = erase ? 0 : prevlen;
-    if (erase) free(prev);
+    if (erase) imdb_free(prev);
 }
 
 /* ---- primary operations ------------------------------------------------------ */
@@ -1309,7 +1309,7 @@ static int physical_commit(imdb_db *db, uint8_t kind, uint32_t table, uint64_t p
     for (uint32_t i = 0; i < db->nt; i++) post[i] = db->t[i]->digest;
     imdb_lake_plan *p;
     int rc = plan_build(db, kind, table, purge_before, NULL, post, &db->global, db->seq + 1, db->head, &p, e);
-    free(post);
+    imdb_free(post);
     if (rc) return rc;
     /* write the new segments first: once the commit is durable the lake is complete */
     int ofd = open_objects(db, e);
@@ -1396,9 +1396,9 @@ int imdb_lake_plan_erase(imdb_db *db, const imdb_erase_ent *ents, uint32_t n, im
     erased_set es = {ents, n};
     imdb_lake_plan *p = NULL;
     if (!rc) rc = plan_build(db, IMDB_OP_ERASE, 0, 0, &es, post, &global, db->seq + 1, db->head, &p, e);
-    free(post);
-    free(delta);
-    free(touched);
+    imdb_free(post);
+    imdb_free(delta);
+    imdb_free(touched);
     if (rc) return rc;
     if (p->nrw) {
         *rw = imdb_alloc_array(p->nrw, sizeof **rw, e);
@@ -1531,16 +1531,16 @@ void imdb_lake_db_free(imdb_db *db)
 {
     plan_free(db->erase_plan);
     db->erase_plan = NULL;
-    free(db->lake_mbytes);
+    imdb_free(db->lake_mbytes);
     db->lake_mbytes = NULL;
-    free(db->lake_prev);
+    imdb_free(db->lake_prev);
     db->lake_prev = NULL;
 }
 
 void imdb_lake_table_free(imdb_table *t)
 {
     for (uint32_t k = 0; k < t->nseg; k++) imdb_segment_free(t->seg[k]);
-    free(t->seg);
+    imdb_free(t->seg);
     t->seg = NULL;
     t->nseg = 0;
 }
@@ -1576,7 +1576,7 @@ static int read_obj(int ofd, const uint8_t h[32], const char *ext, uint8_t **out
     uint8_t got[32];
     imdb_sha256(*out, *len, got);
     if (memcmp(got, h, 32) != 0) {
-        free(*out);
+        imdb_free(*out);
         *out = NULL;
         return imdb_fail(e, IMDB_ERR_VERIFY, "lake: object %s does not hash to its name", name);
     }
@@ -1611,7 +1611,7 @@ int imdb_lake_head(int dirfd, bool *present, uint64_t *seq, uint8_t mh[32], imdb
     if (!rc && (i == d0 || (s[d0] == '0' && i - d0 > 1) || n - i != sizeof m - 1 + 64 + 1 ||
                 memcmp(s + i, m, sizeof m - 1) != 0 || !imdb_unhex(s + i + sizeof m - 1, 64, mh, 32) || s[n - 1] != '\n'))
         rc = imdb_fail(e, IMDB_ERR_CORRUPT, "LAKE_HEAD: malformed");
-    free(b);
+    imdb_free(b);
     if (!rc) {
         *present = true;
         *seq = v;
@@ -1689,15 +1689,15 @@ static int load_table(imdb_db *db, int ofd, const imdb_manifest_tab *mt, uint32_
         if (read_obj(ofd, mt->seg[k].seg, ".seg", &sb, &sl, e)) return e->code;
         uint8_t *al = imdb_alloc_aligned(1, sl, e);
         if (!al) {
-            free(sb);
+            imdb_free(sb);
             return e->code;
         }
         memcpy(al, sb, sl);
         imdb_wipe(sb, sl);
-        free(sb);
+        imdb_free(sb);
         imdb_segment *g;
         if (imdb_segment_parse(&t->s, al, sl, &g, e)) {
-            free(al);
+            imdb_free(al);
             return e->code;
         }
         t->seg[t->nseg++] = g;
@@ -1709,13 +1709,13 @@ static int load_table(imdb_db *db, int ofd, const imdb_manifest_tab *mt, uint32_
             uint32_t n;
             if (read_obj(ofd, mt->seg[k].dv, ".dv", &dvb, &dl, e)) return e->code;
             int rc = imdb_dv_parse(dvb, dl, sh, &ents, &n, g->nrows, e);
-            free(dvb);
+            imdb_free(dvb);
             if (rc) return rc;
             for (uint32_t i = 0; i < n && !rc; i++) {
                 if (ents[i].end > seq) rc = imdb_fail(e, IMDB_ERR_CORRUPT, "snapshot: DV records a later delete");
                 else g->end[ents[i].row] = ents[i].end;
             }
-            free(ents);
+            imdb_free(ents);
             if (rc) return rc;
             if (memcmp(sh, g->hash, 32) != 0) return imdb_fail(e, IMDB_ERR_CORRUPT, "snapshot: DV names another segment");
             memcpy(g->dv_hash, mt->seg[k].dv, 32);
@@ -1728,7 +1728,7 @@ static int load_table(imdb_db *db, int ofd, const imdb_manifest_tab *mt, uint32_
     if (mt->versions > held) return imdb_fail(e, IMDB_ERR_CORRUPT, "snapshot: more versions than its segments hold");
     uint8_t *seen = NULL;
     if (imdb_ver_reserve(t, mt->versions, e) || !(seen = imdb_alloc(mt->versions / 8 + 1, e))) {
-        free(seen);
+        imdb_free(seen);
         return e->code;
     }
     t->nver = mt->versions;
@@ -1760,7 +1760,7 @@ static int load_table(imdb_db *db, int ofd, const imdb_manifest_tab *mt, uint32_
     for (uint64_t vid = 0; !rc && vid < t->nver; vid++)
         if (!(seen[vid >> 3] & (1u << (vid & 7))))
             rc = imdb_fail(e, IMDB_ERR_CORRUPT, "snapshot: version %llu is in no segment", (unsigned long long)vid);
-    free(seen);
+    imdb_free(seen);
     if (rc) return rc;
     if (live != mt->live) return imdb_fail(e, IMDB_ERR_CORRUPT, "snapshot: live count differs from the manifest");
     t->live = live;
@@ -1877,9 +1877,9 @@ int imdb_lake_load_snapshot(imdb_db *db, uint64_t *seq, bool *moved, imdb_err *e
     imdb_commit_free(&c);
     imdb_manifest_free(&m);
     if (cbuf) imdb_wipe(cbuf, clen);
-    free(cbuf);
-    free(mb);
-    free(pb);
+    imdb_free(cbuf);
+    imdb_free(mb);
+    imdb_free(pb);
     close(ofd);
     imdb_lake_unpin(pin); /* the segments are in memory now: the files are no longer read */
     return rc;

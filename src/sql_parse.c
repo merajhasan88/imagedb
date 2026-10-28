@@ -33,12 +33,12 @@ int imdb_sql_lex(const char *s, size_t n, sql_tok **out, uint32_t *ntok, imdb_er
         }
         if (k + 1 >= cap) {
             if (cap >= IMDB_MAX_TOKENS) {
-                free(t);
+                imdb_free(t);
                 return imdb_fail(e, IMDB_ERR_LIMIT, "statement has more than %u tokens", IMDB_MAX_TOKENS);
             }
             sql_tok *nt = imdb_realloc_array(t, cap, cap * 2, sizeof *t, e);
             if (!nt) {
-                free(t);
+                imdb_free(t);
                 return e->code;
             }
             t = nt;
@@ -50,7 +50,7 @@ int imdb_sql_lex(const char *s, size_t n, sql_tok **out, uint32_t *ntok, imdb_er
             size_t j = i;
             while (j < n && (is_alpha(s[j]) || is_digit(s[j]))) j++;
             if (j - i > IMDB_MAX_IDENT) {
-                free(t);
+                imdb_free(t);
                 return imdb_fail(e, IMDB_ERR_LIMIT, "identifier at offset %zu longer than %u bytes", i, IMDB_MAX_IDENT);
             }
             tk->kind = TK_IDENT;
@@ -65,7 +65,7 @@ int imdb_sql_lex(const char *s, size_t n, sql_tok **out, uint32_t *ntok, imdb_er
                 size_t f = j;
                 while (j < n && is_digit(s[j])) j++;
                 if (j == f) {
-                    free(t);
+                    imdb_free(t);
                     return imdb_fail(e, IMDB_ERR_SYNTAX, "malformed number at offset %zu", i);
                 }
                 tk->kind = TK_DEC;
@@ -76,18 +76,18 @@ int imdb_sql_lex(const char *s, size_t n, sql_tok **out, uint32_t *ntok, imdb_er
                 size_t x0 = x;
                 while (x < n && is_digit(s[x])) x++;
                 if (x == x0) {
-                    free(t);
+                    imdb_free(t);
                     return imdb_fail(e, IMDB_ERR_SYNTAX, "malformed number at offset %zu", i);
                 }
                 j = x;
                 tk->kind = TK_FLOAT;
             }
             if (j < n && (is_alpha(s[j]) || s[j] == '.')) {
-                free(t);
+                imdb_free(t);
                 return imdb_fail(e, IMDB_ERR_SYNTAX, "malformed number at offset %zu", i);
             }
             if (j - i > IMDB_MAX_NUMERIC) {
-                free(t);
+                imdb_free(t);
                 return imdb_fail(e, IMDB_ERR_LIMIT, "numeric literal at offset %zu too long", i);
             }
             tk->len = (uint32_t)(j - i);
@@ -96,7 +96,7 @@ int imdb_sql_lex(const char *s, size_t n, sql_tok **out, uint32_t *ntok, imdb_er
             size_t j = i + 1, content = 0;
             for (;;) {
                 if (j >= n) {
-                    free(t);
+                    imdb_free(t);
                     return imdb_fail(e, IMDB_ERR_SYNTAX, "unterminated string starting at offset %zu", i);
                 }
                 if (s[j] == '\'') {
@@ -111,7 +111,7 @@ int imdb_sql_lex(const char *s, size_t n, sql_tok **out, uint32_t *ntok, imdb_er
                 content++;
             }
             if (content > IMDB_MAX_TEXT) {
-                free(t);
+                imdb_free(t);
                 return imdb_fail(e, IMDB_ERR_LIMIT, "string literal at offset %zu longer than %u bytes", i, IMDB_MAX_TEXT);
             }
             tk->kind = TK_STR;
@@ -122,7 +122,7 @@ int imdb_sql_lex(const char *s, size_t n, sql_tok **out, uint32_t *ntok, imdb_er
             size_t j = i + 1;
             while (j < n && is_digit(s[j])) j++;
             if (j == i + 1 || j - i > 4) {
-                free(t);
+                imdb_free(t);
                 return imdb_fail(e, IMDB_ERR_SYNTAX, "malformed parameter at offset %zu", i);
             }
             tk->kind = TK_PARAM;
@@ -157,7 +157,7 @@ int imdb_sql_lex(const char *s, size_t n, sql_tok **out, uint32_t *ntok, imdb_er
                 }
                 /* fallthrough */
             default:
-                free(t);
+                imdb_free(t);
                 return imdb_fail(e, IMDB_ERR_SYNTAX, "unexpected character at offset %zu", i);
             }
             i += tk->len;
@@ -612,7 +612,7 @@ static int parse_select(parser *p, sql_stmt *st)
 
 void imdb_sql_stmt_free(sql_stmt *st)
 {
-    free(st->vals);
+    imdb_free(st->vals);
     st->vals = NULL;
 }
 
@@ -626,7 +626,7 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
     int rc = IMDB_OK;
     if (nt == 0 || (nt == 1 && t[0].kind == TK_SEMI)) {
         st->kind = ST_EMPTY;
-        free(t);
+        imdb_free(t);
         return IMDB_OK;
     }
     if (kw(&p, "create")) {
@@ -764,7 +764,7 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
         tok(&p, TK_SEMI);
         if (p.t[p.i].kind != TK_EOF) rc = fail_at(&p, "end of statement");
     }
-    free(t);
+    imdb_free(t);
     if (rc) imdb_sql_stmt_free(st);
     return rc;
 }

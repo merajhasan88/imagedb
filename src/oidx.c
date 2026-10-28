@@ -31,7 +31,7 @@ static void free_run(uint64_t *r, uint64_t n, size_t w)
 {
     if (!r) return;
     imdb_wipe(r, n * w * sizeof *r);
-    free(r);
+    imdb_free(r);
 }
 
 /* the two sorted runs merged into a new one */
@@ -116,7 +116,7 @@ int imdb_oidx_build(imdb_oidx *x, uint64_t *all, uint64_t n, imdb_err *e)
     /* the runs are in any order relative to each other: each is sorted, which is all a range needs */
     if (all) {
         imdb_wipe(all, n * w * sizeof *all);
-        free(all);
+        imdb_free(all);
     }
     if (rc) imdb_oidx_free(x);
     return rc;

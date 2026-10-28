@@ -459,7 +459,8 @@ static void oidx_model(uint8_t nk)
         for (uint8_t c = 0; c < nk; c++) model[i][c] = test_rand() % span;
         OK(imdb_oidx_insert(&x, model[i], i, E));
         if (i == N / 2) { /* the open's path: one build from everything so far */
-            uint64_t *all = malloc((i + 1) * w * sizeof *all);
+            /* imdb_oidx_build takes the block and frees it: one from the helpers, as the open's is */
+            uint64_t *all = imdb_alloc_array((size_t)((i + 1) * w), sizeof *all, E);
             CHECK(all);
             if (!all) return;
             for (uint64_t j = 0; j <= i; j++) {
