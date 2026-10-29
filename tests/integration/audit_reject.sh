@@ -283,18 +283,19 @@ for kind in column duplicate drop-absent; do
 done
 echo "   T a missing column, U a name in use, V a DROP of an absent index: the engine and the auditor refuse each"
 
-echo "== W, X: a manifest breaking a version-3 rule, re-pointed and re-signed so only that rule refuses it"
+echo "== W, X: a manifest breaking a version-4 rule, re-pointed and re-signed so only that rule refuses it"
 PW=$WORK/w; make_db "$PW"
-"$FORGE" manifest-lie "$PW" v3-empty
-must_fail "physical divergence" "$BIN" verify "$PW"   # it rebuilds the lake from the log: the bytes differ
-must_fail "version 3 without an index" "$AUD" verify "$PW"
+"$FORGE" manifest-lie "$PW" boundary
+must_fail "retirement boundary differs from the log's" "$BIN" verify "$PW"   # the open took the manifest's; the log's is 0
+must_fail "retirement boundary differs from the log's" "$AUD" verify "$PW"
 PX=$WORK/x; make_db "$PX"
 "$BIN" sql "$PX" --nosync -c "CREATE INDEX t_u ON t (u);" -c "CHECKPOINT;" >/dev/null
 "$FORGE" manifest-lie "$PX" column
 must_fail "physical divergence" "$BIN" verify "$PX"
 must_fail "manifest: bad index" "$AUD" verify "$PX"
-echo "   W version 3 without an index (version 2 is that encoding), X an index on a missing column: the auditor
-   refuses on the rule, the engine on rebuilding the lake (t_index manifest_strict: the engine's rule itself)"
+echo "   W a retirement boundary no op made, X an index on a missing column: the auditor refuses on the rule,
+   the engine on its boundary against the log's (W) or on rebuilding the lake (X) (t_index manifest_strict: the
+   engine's rule itself)"
 
 echo "== Y: an INSERT repeating a live row's key of a unique index, its state digest right, signed by the writer"
 PY=$WORK/y; make_db "$PY"

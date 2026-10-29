@@ -60,5 +60,6 @@ TESTS(round3)
 TESTS(mem)
 TESTS(index)
 TESTS(join)
+TESTS(retain)
 
 #endif

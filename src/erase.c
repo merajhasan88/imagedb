@@ -28,7 +28,7 @@ int imdb_erase_versions(imdb_db *db, imdb_erase_ent *ents, uint32_t n, imdb_eras
     uint32_t last_table = UINT32_MAX;
     for (uint32_t i = 0; i < n; i++) {
         imdb_table *t = imdb_table_by_id(db, ents[i].table);
-        if (!t || ents[i].vid >= t->nver || (i && cmp_ent(&ents[i - 1], &ents[i]) == 0) ||
+        if (!t || !imdb_v_present(t, ents[i].vid) || (i && cmp_ent(&ents[i - 1], &ents[i]) == 0) ||
             (imdb_vh(t, ents[i].vid)->flags & IMDB_V_STUB)) {
             imdb_free(ents);
             return imdb_fail(e, IMDB_ERR_INVALID, "ERASE: invalid or duplicate version");

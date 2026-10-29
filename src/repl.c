@@ -487,6 +487,10 @@ static imdb_repl_state ack_state(imdb_db *db, const imdb_ack *a)
     uint8_t h[32];
     if (a->seq == 0) {
         imdb_genesis_hash(db->db_id, h);
+    } else if (db->log_floor && a->seq == db->log_floor) {
+        memcpy(h, db->floor_hash, 32); /* the floor's commit (FLOOR): the one retired commit this log still names */
+    } else if (a->seq <= db->boundary) {
+        return IMDB_REPL_RETIRED;
     } else {
         imdb_err e = {0};
         const imdb_commit_info *ci = imdb_ci_at(db, a->seq, &e);
@@ -545,6 +549,32 @@ int imdb_replicas_status(imdb_db *db, imdb_replica_status **out, size_t *n, imdb
     *out = v;
     *n = nl;
     return IMDB_OK;
+}
+
+int imdb_replicas_hold(imdb_db *db, uint64_t *cap, imdb_err *e)
+{
+    *cap = UINT64_MAX;
+    int rfd = replicas_dir(db->dirfd, false, e);
+    if (rfd == -2) return IMDB_OK; /* no replica was ever added */
+    if (rfd < 0) return e->code;
+    if (imdb_io_flock(rfd, LOCK_SH | LOCK_NB) != 0) {
+        bool busy = errno == EWOULDBLOCK;
+        int rc = busy ? 1 : imdb_fail(e, IMDB_ERR_IO, "replicas/: lock: %s", strerror(errno));
+        close(rfd);
+        return rc;
+    }
+    imdb_replica_status *v = NULL;
+    size_t n = 0;
+    int rc = imdb_replicas_status(db, &v, &n, e);
+    for (size_t i = 0; !rc && i < n; i++) {
+        const imdb_replica_status *s = &v[i];
+        if (s->acked && s->state != IMDB_REPL_DIVERGED && s->age_ms <= IMDB_REPLICA_HOLD_MS && s->ack.seq >= db->boundary &&
+            s->ack.seq < *cap)
+            *cap = s->ack.seq;
+    }
+    imdb_free(v);
+    close(rfd);
+    return rc;
 }
 
 static int64_t mono_ms(void)

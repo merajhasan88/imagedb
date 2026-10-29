@@ -538,29 +538,21 @@ static void t_round3_meta_digest_alg(void)
         imdb_err_clear(E);
         CHECK(imdb_identity_parse(buf, strlen(buf), &b, E) == bad[i].rc);
     }
-    /* META: 2 and 3 are alg 1; 4 with a root key or without, either algorithm */
-    snprintf(buf, sizeof buf, "imagedb-meta 2\ndb_id %s\nrole primary\nwriter %s\n", hx, wx);
-    CHECK(meta_text(dir, 0, buf, &b, &rep) == 0 && b.digest_alg == IMDB_DIGEST_ALG_LTHASH16 && !b.has_root && !rep);
-    snprintf(buf, sizeof buf, "imagedb-meta 3\ndb_id %s\nrole replica\nwriter %s\nroot %s\n", hx, wx, rx);
+    /* META 5, with a root key or without, either algorithm; 1 to 4 (earlier formats) refused by name */
+    snprintf(buf, sizeof buf, "imagedb-meta 5\ndb_id %s\nrole primary\nwriter %s\ndigest 2\n", hx, wx);
+    CHECK(meta_text(dir, 0, buf, &b, &rep) == 0 && b.digest_alg == IMDB_DIGEST_ALG_LTHASH16_TREE && !b.has_root && !rep);
+    snprintf(buf, sizeof buf, "imagedb-meta 5\ndb_id %s\nrole replica\nwriter %s\nroot %s\ndigest 1\n", hx, wx, rx);
     CHECK(meta_text(dir, 1, buf, &b, &rep) == 0 && b.digest_alg == IMDB_DIGEST_ALG_LTHASH16 && b.has_root && rep);
-    snprintf(buf, sizeof buf, "imagedb-meta 4\ndb_id %s\nrole primary\nwriter %s\ndigest 2\n", hx, wx);
-    CHECK(meta_text(dir, 2, buf, &b, &rep) == 0 && b.digest_alg == IMDB_DIGEST_ALG_LTHASH16_TREE && !b.has_root);
-    snprintf(buf, sizeof buf, "imagedb-meta 4\ndb_id %s\nrole primary\nwriter %s\nroot %s\ndigest 1\n", hx, wx, rx);
-    CHECK(meta_text(dir, 3, buf, &b, &rep) == 0 && b.digest_alg == IMDB_DIGEST_ALG_LTHASH16 && b.has_root);
-    static const struct {
-        int ver;
-        const char *tail;
-        int rc;
-    } badm[] = {{4, "digest 3\n", IMDB_ERR_UNSUPPORTED}, {4, "", IMDB_ERR_CORRUPT}, {4, "digest 1", IMDB_ERR_CORRUPT},
-                {4, "digest 1\nx", IMDB_ERR_CORRUPT}, {4, "digest 0\n", IMDB_ERR_UNSUPPORTED},
-                {3, "root " /* rx follows */, IMDB_ERR_CORRUPT}, {2, "digest 1\n", IMDB_ERR_CORRUPT}};
+    for (int v = 1; v <= 4; v++) {
+        snprintf(buf, sizeof buf, "imagedb-meta %d\ndb_id %s\nrole primary\nwriter %s\ndigest 2\n", v, hx, wx);
+        CHECK(meta_text(dir, 1 + v, buf, &b, &rep) == IMDB_ERR_UNSUPPORTED && strstr(g_e.msg, "before the retention format"));
+    }
+    static const char *const badm[] = {"digest 3\n", "", "digest 1", "digest 1\nx", "digest 0\n", "root zz\ndigest 1\n"};
+    static const int badrc[] = {IMDB_ERR_UNSUPPORTED, IMDB_ERR_CORRUPT, IMDB_ERR_CORRUPT,
+                                IMDB_ERR_CORRUPT, IMDB_ERR_UNSUPPORTED, IMDB_ERR_CORRUPT};
     for (size_t i = 0; i < sizeof badm / sizeof *badm; i++) {
-        if (badm[i].ver == 3) /* version 3 knows no digest line: a root line, then a digest line, is trailing bytes */
-            snprintf(buf, sizeof buf, "imagedb-meta 3\ndb_id %s\nrole primary\nwriter %s\nroot %s\ndigest 1\n", hx, wx, rx);
-        else
-            snprintf(buf, sizeof buf, "imagedb-meta %d\ndb_id %s\nrole primary\nwriter %s\n%s", badm[i].ver, hx, wx,
-                     badm[i].tail);
-        CHECK(meta_text(dir, 10 + (int)i, buf, &b, &rep) == badm[i].rc);
+        snprintf(buf, sizeof buf, "imagedb-meta 5\ndb_id %s\nrole primary\nwriter %s\n%s", hx, wx, badm[i]);
+        CHECK(meta_text(dir, 10 + (int)i, buf, &b, &rep) == badrc[i]);
     }
 }
 
@@ -576,7 +568,7 @@ static void meta_with_alg(const char *dir, uint8_t alg)
     snprintf(m, sizeof m, "%s/META", dir);
     imdb_hex(id.db_id, 16, hx);
     imdb_hex(id.writer, 32, wx);
-    snprintf(buf, sizeof buf, "imagedb-meta 4\ndb_id %s\nrole %s\nwriter %s\ndigest %u\n", hx, rep ? "replica" : "primary",
+    snprintf(buf, sizeof buf, "imagedb-meta 5\ndb_id %s\nrole %s\nwriter %s\ndigest %u\n", hx, rep ? "replica" : "primary",
              wx, (unsigned)alg);
     spit(m, (const uint8_t *)buf, strlen(buf));
 }
@@ -754,32 +746,55 @@ static void fixture_check(const char *tgz, uint8_t alg, const char *meta_head, b
     free(m);
 }
 
-/* The digest_alg 1 fixture, made by imagedb before digest_alg 2: META version 2, read as alg 1 */
+/* The format's fixtures (make_fixtures.sh, 2026-10-29: META 5, manifest version 4, op 16, tagged
+ * segments), one a digest algorithm: they pin the format, so a change to it fails here first */
 static void t_round3_alg1_fixture(void)
 {
-    fixture_check("tests/fixtures/alg1-20261026.tar.gz", IMDB_DIGEST_ALG_LTHASH16, "imagedb-meta 2\n", false);
+    fixture_check("tests/fixtures/alg1-20261029.tar.gz", IMDB_DIGEST_ALG_LTHASH16, "imagedb-meta 5\n", true);
 }
 
-/* The digest_alg 2 fixture, made once alg 2 was final (its element keyed by the commitment, 2026-10-26):
- * it pins that definition, so a change to it fails here and not in a user's directory */
 static void t_round3_alg2_fixture(void)
 {
-    fixture_check("tests/fixtures/alg2-20261026.tar.gz", IMDB_DIGEST_ALG_LTHASH16_TREE, "imagedb-meta 4\n", false);
+    fixture_check("tests/fixtures/alg2-20261029.tar.gz", IMDB_DIGEST_ALG_LTHASH16_TREE, "imagedb-meta 5\n", true);
 }
 
-/* The tagged-segment fixture (make_tagged.sh: alg 2's steps, written by the first imagedb with tagged,
- * preallocated segments, 2026-10-27): it pins that log format (design.md §3) the same way */
-static void t_round3_tagged_fixture(void)
+/* The fixtures of the formats before the retention's (alg1-20261026: META 2; alg2-20261026 and
+ * tagged-20261027: META 4): directories this imagedb refuses by name, and the auditor too, since no
+ * reader is kept for them before the format freeze */
+static void t_round3_old_fixtures(void)
 {
-    fixture_check("tests/fixtures/tagged-20261027.tar.gz", IMDB_DIGEST_ALG_LTHASH16_TREE, "imagedb-meta 4\n", true);
+    static const char *const tgz[] = {"tests/fixtures/alg1-20261026.tar.gz", "tests/fixtures/alg2-20261026.tar.gz",
+                                      "tests/fixtures/tagged-20261027.tar.gz"};
+    const char *dir = test_tmpdir();
+    for (size_t i = 0; i < sizeof tgz / sizeof *tgz; i++) {
+        struct stat st;
+        if (stat(tgz[i], &st) != 0) {
+            test_fail(__FILE__, __LINE__, "a fixture tarball (tests/fixtures) is missing: run the suite from the tree root");
+            return;
+        }
+        char d[700], cmd[1600], p[760];
+        snprintf(d, sizeof d, "%s/f%zu", dir, i);
+        CHECK(mkdir(d, 0700) == 0);
+        snprintf(cmd, sizeof cmd, "tar -xzf '%s' -C '%s'", tgz[i], d);
+        CHECK(system(cmd) == 0);
+        snprintf(p, sizeof p, "%s/primary", d);
+        imdb_identity id;
+        bool rep;
+        imdb_err_clear(E);
+        CHECK(imdb_identity_read(p, &id, &rep, E) == IMDB_ERR_UNSUPPORTED && strstr(g_e.msg, "before the retention format"));
+        imdb_open_opts o = {.sync = 0};
+        imdb_db *db = NULL;
+        imdb_err_clear(E);
+        CHECK(imdb_open(p, &o, &db, E) == IMDB_ERR_UNSUPPORTED && !db && strstr(g_e.msg, "before the retention format"));
+        CHECK(audit_dir(p) != 0); /* refused (1), or no auditor in this build (-1) */
+    }
 }
 
-/* META 3 (a root key and no digest line: what imagedb wrote before digest_alg 2) is alg 1, and its
- * next rewrite, the promotion's, makes it version 4 with the root line kept and "digest 1" */
-static void t_round3_meta3_promotion(void)
+/* A promotion rewrites the replica's META as a primary's: version 5, the root line and "digest 1" kept */
+static void t_round3_meta_promotion(void)
 {
     const char *dir = test_tmpdir();
-    char p[700], r[700], s[700], f[760], buf[400], hx[33], wx[65], rx[65];
+    char p[700], r[700], s[700], f[760];
     snprintf(p, sizeof p, "%s/p", dir);
     snprintf(r, sizeof r, "%s/r", dir);
     snprintf(s, sizeof s, "%s/stream", dir);
@@ -798,13 +813,7 @@ static void t_round3_meta3_promotion(void)
     imdb_close(db);
     imdb_identity id;
     bool rep = false;
-    OK(imdb_identity_read(r, &id, &rep, E));
-    imdb_hex(id.db_id, 16, hx);
-    imdb_hex(id.writer, 32, wx);
-    imdb_hex(id.root, 32, rx);
-    snprintf(buf, sizeof buf, "imagedb-meta 3\ndb_id %s\nrole replica\nwriter %s\nroot %s\n", hx, wx, rx);
     snprintf(f, sizeof f, "%s/META", r);
-    spit(f, (const uint8_t *)buf, strlen(buf));
     OK(imdb_identity_read(r, &id, &rep, E));
     CHECK(id.digest_alg == IMDB_DIGEST_ALG_LTHASH16 && rep && id.has_root);
     OK(ship_to_file(p, 0, s, E));
@@ -819,7 +828,7 @@ static void t_round3_meta3_promotion(void)
     OK(imdb_promote(r, seed, &o, &pr, E));
     size_t n = 0;
     uint8_t *m = slurp(f, &n);
-    CHECK(m && n > 15 && memcmp(m, "imagedb-meta 4\n", 15) == 0 && mem_contains(m, n, "role primary\n") &&
+    CHECK(m && n > 15 && memcmp(m, "imagedb-meta 5\n", 15) == 0 && mem_contains(m, n, "role primary\n") &&
           mem_contains(m, n, "\nroot ") && mem_contains(m, n, "\ndigest 1\n"));
     free(m);
     OK(imdb_identity_read(r, &id, &rep, E));
@@ -830,8 +839,8 @@ const test_case round3_tests[] = {
     {"round3_meta_digest_alg", t_round3_meta_digest_alg},
     {"round3_alg1_fixture", t_round3_alg1_fixture},
     {"round3_alg2_fixture", t_round3_alg2_fixture},
-    {"round3_tagged_fixture", t_round3_tagged_fixture},
-    {"round3_meta3_promotion", t_round3_meta3_promotion},
+    {"round3_old_fixtures", t_round3_old_fixtures},
+    {"round3_meta_promotion", t_round3_meta_promotion},
     {"round3_digest_alg_mismatch", t_round3_digest_alg_mismatch},
     {"round3_anchor_unavailable", t_round3_anchor_unavailable},
     {"round3_anchor_epoch_priority", t_round3_anchor_epoch_priority},

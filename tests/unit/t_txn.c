@@ -240,8 +240,10 @@ static void t_txn_lost_update_prevented(void)
     imdb_close(db);
 }
 
-/* A snapshot below a table's purge horizon cannot be answered exactly: reads
- * and the row selection of writes fail with a history error. */
+/* A snapshot below a table's purge horizon cannot be answered exactly. A transaction whose own
+ * snapshot fell below it (it outlived the history the table keeps) conflicts, at a read and at the
+ * row selection of a write, and can only roll back: a retry's fresh snapshot is above the horizon.
+ * AS OF that far back is a history error. */
 static void t_txn_snapshot_below_horizon(void)
 {
     imdb_session a, b;
@@ -254,10 +256,16 @@ static void t_txn_snapshot_below_horizon(void)
     char sql[100];
     snprintf(sql, sizeof sql, "COMPACT t PURGE BEFORE %llu", (unsigned long long)db->seq);
     SRUN(&b, sql);
-    CHECK(srun(&a, "SELECT COUNT(*) FROM t") == IMDB_ERR_HISTORY);
-    CHECK(srun(&a, "UPDATE t SET v = 0 WHERE id = 1") == IMDB_ERR_HISTORY);
+    CHECK(srun(&a, "SELECT COUNT(*) FROM t") == IMDB_ERR_CONFLICT);
+    CHECK(strstr(g_e.msg, "roll back and retry") != NULL);
+    CHECK(srun(&a, "UPDATE t SET v = 0 WHERE id = 1") == IMDB_ERR_CONFLICT); /* doomed */
     SRUN(&a, "ROLLBACK");
     CHECK(sval(&a, "SELECT SUM(v) FROM t") == 32);
+    CHECK(srun(&a, "SELECT COUNT(*) FROM t AS OF 2") == IMDB_ERR_HISTORY);
+    SRUN(&a, "BEGIN");
+    SRUN(&a, "UPDATE t SET v = 0 WHERE id = 1"); /* the retry */
+    SRUN(&a, "COMMIT");
+    CHECK(sval(&b, "SELECT SUM(v) FROM t") == 22);
     imdb_session_close(&a);
     imdb_session_close(&b);
     imdb_close(db);

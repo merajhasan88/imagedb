@@ -120,7 +120,8 @@ typedef enum {
     IMDB_REPL_NONE,     /* no acknowledgement recorded */
     IMDB_REPL_SAME_HISTORY, /* its head is this primary's commit at its seq: the same history (not caught up: see lag) */
     IMDB_REPL_DIVERGED, /* another history at its seq, or a recorded divergence */
-    IMDB_REPL_AHEAD     /* it holds commits beyond this log (lost here in a --nosync crash, or another primary) */
+    IMDB_REPL_AHEAD,    /* it holds commits beyond this log (lost here in a --nosync crash, or another primary) */
+    IMDB_REPL_RETIRED   /* its commit is retired here (RETIRE, stage 3a), the floor's excepted: nothing to compare */
 } imdb_repl_state;
 
 typedef enum {
@@ -146,6 +147,12 @@ typedef struct imdb_replica_status {
 /* SHOW REPLICAS: every allowlisted replica, its latest acknowledgement (re-verified) and its state
  * against db's own history. */
 int imdb_replicas_status(struct imdb_db *db, imdb_replica_status **out, size_t *n, imdb_err *e);
+
+/* The lowest commit a replica the log still owes is acknowledged at (UINT64_MAX: none): one heard from within
+ * IMDB_REPLICA_HOLD_MS, not diverged, at or past the retirement boundary. The RETIRE policy stops there: its cut
+ * would leave ship nothing to send it. Read under flock(LOCK_SH) on replicas/, so no receipt's in-place rewrite
+ * reads torn (as no acknowledgement); 1 if a receipt holds it (the caller looks again later). */
+int imdb_replicas_hold(struct imdb_db *db, uint64_t *cap, imdb_err *e);
 
 /* COMMIT under SET sync_replicas = k: waits until k replicas acknowledge holding commit seq (an
  * acknowledgement at seq or later, of db's history at its epoch), or until timeout_ms.

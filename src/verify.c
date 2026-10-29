@@ -47,14 +47,21 @@ typedef struct vver {
     bool payload;      /* its row is still in the log */
     bool redacted;     /* the log holds a redaction marker instead */
     bool has_subj;
+    bool held;         /* a version this model holds (vv) */
+    bool seen;         /* the lake check met its row */
 } vver;
 
 typedef struct vtab {
     imdb_schema s;
-    vver *v;
-    uint64_t n, cap;
+    vver **vc;         /* versions in chunks of 2^16 as the store's (db.h): one only where a vid this model holds lands */
+    uint32_t nchunk;
+    uint64_t cap0;     /* chunk 0's entries: it grows from 64, so a small table stays small */
+    uint64_t n;        /* vids handed out */
+    uint64_t floor_n;  /* at the log floor: its vids below it the floor's RETIRE may have dropped (FLOOR) */
     uint64_t live;
-    uint64_t horizon;  /* highest PURGE BEFORE of its COMPACTs */
+    uint64_t horizon;  /* AS OF below it is refused: the highest PURGE BEFORE of its COMPACTs, or EXPIRE */
+    uint64_t purged;   /* the highest PURGE BEFORE: versions ended at or before it are tombstones */
+    uint64_t retention_us; /* its last op 16 */
     imdb_lthash *d;    /* separate: LtHash needs 32-byte alignment */
     imdb_index idx[IMDB_MAX_INDEXES]; /* the log's index definitions, sorted by name */
     uint32_t nidx;
@@ -62,7 +69,7 @@ typedef struct vtab {
 
 typedef struct vsnap_tab {
     imdb_lthash d;
-    uint64_t n, live, horizon;
+    uint64_t n, live, horizon, purged, retention_us;
     imdb_index idx[IMDB_MAX_INDEXES];
     uint32_t nidx;
 } vsnap_tab;
@@ -74,7 +81,12 @@ typedef struct vsnap {
     vsnap_tab *t;      /* aligned */
     imdb_lthash global;
     uint8_t prev[32], manifest[32], prev_manifest[32];
+    uint64_t boundary; /* the log's retirement boundary at that commit (0 until RETIRE, stage 3a's step (c)) */
 } vsnap;
+
+typedef struct vstart { /* a log segment's first commit, and its time: what an EXPIRE may name (log.h) */
+    uint64_t seq, time_us;
+} vstart;
 
 typedef struct vctx {
     vtab *t;
@@ -95,6 +107,12 @@ typedef struct vctx {
     size_t npin;
     uint8_t key[IMDB_PUBKEY_LEN]; /* the writer key in effect, from META's on (WRITER_KEY moves it) */
     uint32_t epoch;
+    vstart *starts;          /* every segment start so far, by seq */
+    size_t nstarts, capstarts;
+    uint64_t boundary;       /* its last RETIRE's: versions ended at or before it are gone from the engine and the lake */
+    vstart *pubs;            /* every publish of the log read, its manifest's hash in place of a time (the keepers) */
+    uint8_t (*pubhash)[32];
+    size_t npubs, cappubs;
 } vctx;
 
 /* ---- per-batch work --------------------------------------------------------------- */
@@ -309,19 +327,62 @@ static void batch_free(vbatch *b)
 
 /* ---- d: the ordered state machine ------------------------------------------------- */
 
+/* version vid of the model, NULL when it holds none there */
+static vver *vv(const vtab *t, uint64_t vid)
+{
+    uint64_t k = vid >> IMDB_VCHUNK_BITS;
+    if (vid >= t->n || k >= t->nchunk || !t->vc[k] || (!k && vid >= t->cap0)) return NULL;
+    vver *v = &t->vc[k][vid & (IMDB_VCHUNK - 1)];
+    return v->held ? v : NULL;
+}
+
+/* the model's entry for vid, its chunk allocated (the entry zeroed, live, held); vid at or past t->n moves the count */
+static vver *vv_need(vtab *t, uint64_t vid, imdb_err *e)
+{
+    uint64_t k = vid >> IMDB_VCHUNK_BITS;
+    if (vid >= IMDB_MAX_VERSIONS) {
+        imdb_fail(e, IMDB_ERR_LIMIT, "verify: a table of more than %llu versions", IMDB_MAX_VERSIONS);
+        return NULL;
+    }
+    if (k >= t->nchunk) {
+        uint64_t nc = t->nchunk ? (uint64_t)t->nchunk * 2 : 4;
+        if (nc <= k) nc = k + 1;
+        vver **n = imdb_realloc_array(t->vc, t->nchunk, nc, sizeof *n, e);
+        if (!n) return NULL;
+        t->vc = n;
+        t->nchunk = (uint32_t)nc;
+    }
+    if (!k && vid >= t->cap0) { /* chunk 0 doubles (from 64) up to a whole chunk; the new entries zeroed */
+        uint64_t to = t->cap0 ? t->cap0 : 64;
+        while (to <= vid) to *= 2;
+        if (to > IMDB_VCHUNK) to = IMDB_VCHUNK;
+        vver *g = imdb_realloc_array(t->vc[0], t->cap0, to, sizeof *g, e);
+        if (!g) return NULL;
+        t->vc[0] = g;
+        t->cap0 = to;
+    } else if (k && !t->vc[k] && !(t->vc[k] = imdb_alloc_array(IMDB_VCHUNK, sizeof **t->vc, e))) {
+        return NULL;
+    }
+    vver *v = &t->vc[k][vid & (IMDB_VCHUNK - 1)];
+    memset(v, 0, sizeof *v);
+    v->end = IMDB_LIVE;
+    v->held = true;
+    if (vid >= t->n) t->n = vid + 1;
+    return v;
+}
+
 static int vt_push(vtab *t, imdb_err *e)
 {
-    if (t->n == t->cap) {
-        uint64_t nc = t->cap ? t->cap * 2 : 64;
-        vver *nv = imdb_realloc_array(t->v, t->cap, nc, sizeof *nv, e);
-        if (!nv) return e->code;
-        t->v = nv;
-        t->cap = nc;
-    }
-    memset(&t->v[t->n], 0, sizeof t->v[t->n]);
-    t->v[t->n].end = IMDB_LIVE;
-    t->n++;
-    return IMDB_OK;
+    return vv_need(t, t->n, e) ? IMDB_OK : e->code;
+}
+
+static void vt_free(vtab *t)
+{
+    for (uint32_t k = 0; k < t->nchunk; k++) imdb_free(t->vc[k]);
+    imdb_free(t->vc);
+    t->vc = NULL;
+    t->nchunk = 0;
+    t->cap0 = 0;
 }
 
 static int v_insert(vctx *x, vtab *t, const vbatch *b, size_t fi, uint32_t k, uint64_t vid, const uint8_t commit[32],
@@ -350,7 +411,7 @@ static int v_insert(vctx *x, vtab *t, const vbatch *b, size_t fi, uint32_t k, ui
         x->rep->payload_rows_checked++;
     }
     if (vt_push(t, e)) return e->code;
-    vver *v = &t->v[vid];
+    vver *v = vv(t, vid);
     memcpy(v->commit, commit, 32);
     v->begin = seq;
     v->payload = o->pkind == IMDB_PAYLOAD_ROW;
@@ -363,9 +424,10 @@ static int v_insert(vctx *x, vtab *t, const vbatch *b, size_t fi, uint32_t k, ui
 
 static int v_end(vtab *t, uint64_t vid, const uint8_t commit[32], uint64_t seq, imdb_err *e)
 {
-    if (vid >= t->n || t->v[vid].end != IMDB_LIVE || memcmp(t->v[vid].commit, commit, 32) != 0)
+    vver *v = vv(t, vid);
+    if (!v || v->end != IMDB_LIVE || memcmp(v->commit, commit, 32) != 0)
         return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: delete precondition fails", (unsigned long long)seq);
-    t->v[vid].end = seq;
+    v->end = seq;
     t->live--;
     return IMDB_OK;
 }
@@ -391,6 +453,17 @@ static bool same_indexes(const imdb_index *a, uint32_t na, const imdb_index *b, 
     return true;
 }
 
+static const vstart *find_start(const vctx *x, uint64_t seq)
+{
+    size_t lo = 0, hi = x->nstarts;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (x->starts[mid].seq < seq) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < x->nstarts && x->starts[lo].seq == seq ? &x->starts[lo] : NULL;
+}
+
 /* The ops of one commit; *published = the manifest it records, if any. */
 static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published, bool *erase, imdb_err *e)
 {
@@ -401,7 +474,8 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
     for (uint32_t k = 0; k < c->nops; k++) {
         const imdb_op *o = &c->ops[k];
         bool on_table = o->code == IMDB_OP_INSERT || o->code == IMDB_OP_DELETE || o->code == IMDB_OP_UPDATE ||
-                        o->code == IMDB_OP_COMPACT || o->code == IMDB_OP_CREATE_INDEX || o->code == IMDB_OP_DROP_INDEX;
+                        o->code == IMDB_OP_COMPACT || o->code == IMDB_OP_CREATE_INDEX || o->code == IMDB_OP_DROP_INDEX ||
+                        o->code == IMDB_OP_SET_RETENTION || o->code == IMDB_OP_EXPIRE;
         vtab *t = on_table && o->table < x->nt ? &x->t[o->table] : NULL;
         if (on_table && !t) return imdb_fail(e, IMDB_ERR_VERIFY, "verify: unknown table");
         if (imdb_op_publishes_manifest(o->code)) *published = o->manifest;
@@ -457,7 +531,11 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
             *erase = true;
             for (uint32_t j = 0; j < o->n_erase && !rc; j++) {
                 const imdb_erase_ent *en = &o->erase[j];
-                vver *v = en->table < x->nt && en->vid < x->t[en->table].n ? &x->t[en->table].v[en->vid] : NULL;
+                vver *v = en->table < x->nt ? vv(&x->t[en->table], en->vid) : NULL;
+                if (!v && en->table < x->nt && en->vid < x->t[en->table].floor_n) { /* below the floor (FLOOR) */
+                    x->rep->erase_below_floor++; /* ended there, dropped by the floor's RETIRE: its commitment unknowable */
+                    continue;
+                }
                 if (!v || memcmp(v->commit, en->commit, 32) != 0 || v->end == IMDB_LIVE)
                     rc = imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: invalid ERASE entry", (unsigned long long)seq);
                 else if (v->payload)
@@ -476,8 +554,41 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
                 rc = imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: PURGE BEFORE moves the horizon back",
                                (unsigned long long)seq);
             else if (o->purge_before)
+                t->horizon = t->purged = o->purge_before;
+            break;
+        case IMDB_OP_SET_RETENTION:
+            t->retention_us = o->retention_us; /* the decoder checked its range and its place after CREATE_TABLE */
+            break;
+        case IMDB_OP_RETIRE: { /* past the last, ending a segment before this commit, below every horizon */
+            uint64_t bnd = o->purge_before;
+            if (bnd <= x->boundary || !find_start(x, bnd + 1)) {
+                rc = imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: RETIRE's boundary %llu is not past %llu or ends no "
+                               "log segment", (unsigned long long)seq, (unsigned long long)bnd, (unsigned long long)x->boundary);
+                break;
+            }
+            for (uint32_t ti = 0; ti < x->nt && !rc; ti++)
+                if (bnd >= x->t[ti].horizon)
+                    rc = imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: RETIRE's boundary is not below table %s's "
+                                   "horizon", (unsigned long long)seq, x->t[ti].s.name);
+            if (!rc) x->boundary = bnd; /* the versions ended at or before it: gone (the lake and engine checks) */
+            break;
+        }
+        case IMDB_OP_EXPIRE: { /* the retention honoured: a segment start at least the table's retention older */
+            const vstart *s = find_start(x, o->purge_before);
+            if (t->retention_us == IMDB_RETAIN_FOREVER)
+                rc = imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: EXPIRE of a table kept FOREVER", (unsigned long long)seq);
+            else if (o->purge_before <= t->horizon)
+                rc = imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: EXPIRE does not move the horizon", (unsigned long long)seq);
+            else if (!s)
+                rc = imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: EXPIRE names commit %llu, which begins no log segment",
+                               (unsigned long long)seq, (unsigned long long)o->purge_before);
+            else if (s->time_us > c->time_us || c->time_us - s->time_us < t->retention_us)
+                rc = imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: EXPIRE of history younger than the table's retention",
+                               (unsigned long long)seq);
+            else
                 t->horizon = o->purge_before;
             break;
+        }
         case IMDB_OP_WRITER_KEY: { /* the next epoch, and the engine must hold the same one */
             const imdb_db *db = x->db;
             uint32_t ep = o->epoch;
@@ -516,9 +627,12 @@ static int snapshot_at_s(vctx *x, const imdb_commit_rec *c, const uint8_t *publi
         s->t[ti].n = x->t[ti].n;
         s->t[ti].live = x->t[ti].live;
         s->t[ti].horizon = x->t[ti].horizon;
+        s->t[ti].purged = x->t[ti].purged;
+        s->t[ti].retention_us = x->t[ti].retention_us;
         memcpy(s->t[ti].idx, x->t[ti].idx, sizeof s->t[ti].idx);
         s->t[ti].nidx = x->t[ti].nidx;
     }
+    s->boundary = x->boundary;
     s->global = x->global;
     memcpy(s->prev, c->prev, 32);
     memcpy(s->manifest, published, 32);
@@ -552,6 +666,16 @@ static int ordered_frame(vctx *x, vbatch *b, size_t i, uint64_t seg_first, bool 
                          (unsigned long long)c->seq, c->alg, x->db->meta.digest_alg);
     if (!f->sig_ok) return imdb_fail(e, IMDB_ERR_AUTH, "verify: commit %llu signature invalid", (unsigned long long)c->seq);
     x->rep->sigs_checked++;
+    if (f->first_of_seg) { /* its time, for the EXPIREs that may name it */
+        if (x->nstarts == x->capstarts) {
+            size_t nc = x->capstarts ? x->capstarts * 2 : 64;
+            vstart *ns = imdb_realloc_array(x->starts, x->capstarts, nc, sizeof *ns, e);
+            if (!ns) return e->code;
+            x->starts = ns;
+            x->capstarts = nc;
+        }
+        x->starts[x->nstarts++] = (vstart){c->seq, c->time_us};
+    }
     for (size_t k = 0; k < f->nch; k++) {
         if (b->ch[f->ch0 + k].nomem) return imdb_fail(e, IMDB_ERR_NOMEM, "verify: out of memory");
         if (b->ch[f->ch0 + k].overflow) f->dense = true;
@@ -591,7 +715,19 @@ static int ordered_frame(vctx *x, vbatch *b, size_t i, uint64_t seg_first, bool 
         uint8_t (*p)[32] = bsearch(published, x->pin, x->npin, sizeof *x->pin, cmp_hash32);
         if (p) x->pin_at[p - x->pin] = c->seq;
     }
-    if (published) {
+    if (published) { /* its manifest may stay as a keeper (lake.c): the objects check allows it past the boundary */
+        if (x->npubs == x->cappubs) {
+            size_t nc = x->cappubs ? x->cappubs * 2 : 64;
+            uint8_t(*nh)[32] = imdb_realloc_array(x->pubhash, x->cappubs, nc, sizeof *nh, e);
+            if (!nh) return e->code;
+            x->pubhash = nh;
+            vstart *np = imdb_realloc_array(x->pubs, x->cappubs, nc, sizeof *np, e);
+            if (!np) return e->code;
+            x->pubs = np;
+            x->cappubs = nc;
+        }
+        x->pubs[x->npubs] = (vstart){c->seq, 0};
+        memcpy(x->pubhash[x->npubs++], published, 32);
         memcpy(x->last_manifest, published, 32);
         x->last_publish = c->seq;
     }
@@ -708,6 +844,7 @@ static int verify_log(imdb_db *db, vctx *x, double *t_read, double *t_par, doubl
     bool log_start = true;
     bool tagged_before = false; /* the format only moves forward (design.md §3) */
     for (size_t si = 0; si < nseg && !rc; si++) {
+        if (si + 1 < nseg && sfirst[si + 1] - 1 <= x->seq) continue; /* below the floor, not yet cut */
         double t0 = vnow();
         imdb_logseg seg;
         if ((rc = imdb_logseg_load(db->logdirfd, sfirst[si], &seg, e))) break;
@@ -860,9 +997,19 @@ static void lake_item(void *ctx, size_t i)
                                (unsigned long long)vid, vt->s.name);
             return;
         }
-        const vver *v = &vt->v[vid];
+        const vver *v = vv(vt, vid);
+        if (!v) {
+            it->rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: a segment of table %s holds version %llu, which the log never made",
+                               vt->s.name, (unsigned long long)vid);
+            return;
+        }
         uint64_t vend = v->end <= S ? v->end : IMDB_LIVE; /* the log may have moved on */
-        bool purged = vend != IMDB_LIVE && vend <= st->horizon;
+        if (vend != IMDB_LIVE && vend <= L->x->at_s.boundary) {
+            it->rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: a segment of table %s holds version %llu, which its boundary retired",
+                               vt->s.name, (unsigned long long)vid);
+            return;
+        }
+        bool purged = vend != IMDB_LIVE && vend <= st->purged; /* an EXPIRE purges nothing */
         uint8_t want = (uint8_t)((v->stub ? IMDB_SEG_STUB : 0u) | (purged ? IMDB_SEG_PURGED : 0u));
         if (memcmp(v->commit, g->commit + 32u * r, 32) != 0 || v->begin != g->begin[r] || vend != g->end[r] ||
             g->flags[r] != want) {
@@ -989,7 +1136,7 @@ static int verify_lake(imdb_db *db, const vctx *x, imdb_verify_report *rep, imdb
         rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: manifest on disk differs from the engine's");
     if (!rc) rc = imdb_manifest_parse(mb, ml, &m, e);
     if (!rc && (m.seq != db->lake_seq || memcmp(m.db_id, db->db_id, 16) != 0 || m.nt != at->nt ||
-                memcmp(m.prev, at->prev, 32) != 0))
+                memcmp(m.prev, at->prev, 32) != 0 || m.boundary != at->boundary))
         rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: manifest identity mismatch");
     if (!rc && memcmp(m.state, digest, 32) != 0)
         rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: manifest digest differs from the log at commit %llu", (unsigned long long)m.seq);
@@ -1007,7 +1154,7 @@ static int verify_lake(imdb_db *db, const vctx *x, imdb_verify_report *rep, imdb
         if (!same_schema(&mt->s, &x->t[ti].s))
             rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: manifest schema of table %s differs from the log", x->t[ti].s.name);
         else if (mt->versions != st->n || mt->live != st->live || mt->horizon != st->horizon ||
-                 memcmp(&mt->digest, &st->d, sizeof st->d) != 0)
+                 mt->retention_us != st->retention_us || memcmp(&mt->digest, &st->d, sizeof st->d) != 0)
             rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: table %s in the manifest differs from the log at commit %llu",
                            x->t[ti].s.name, (unsigned long long)m.seq);
         else if (!same_indexes(mt->idx, mt->nidx, st->idx, st->nidx))
@@ -1018,10 +1165,7 @@ static int verify_lake(imdb_db *db, const vctx *x, imdb_verify_report *rep, imdb
     size_t nitems = 0;
     for (uint32_t ti = 0; ti < m.nt; ti++) nitems += m.t[ti].nseg;
     litem *items = !rc ? imdb_alloc_array(nitems ? nitems : 1, sizeof *items, e) : NULL;
-    uint8_t **seen = !rc ? imdb_alloc_array(m.nt ? m.nt : 1, sizeof *seen, e) : NULL;
-    if (!rc && (!items || !seen)) rc = e->code;
-    for (uint32_t ti = 0; ti < m.nt && !rc; ti++)
-        if (!(seen[ti] = imdb_alloc(at->t[ti].n / 8 + 1, e))) rc = e->code;
+    if (!rc && !items) rc = e->code;
     size_t ni = 0;
     for (uint32_t ti = 0; ti < m.nt && !rc; ti++)
         for (uint32_t k = 0; k < m.t[ti].nseg; k++) items[ni++] = (litem){.table = ti, .k = k};
@@ -1046,11 +1190,11 @@ static int verify_lake(imdb_db *db, const vctx *x, imdb_verify_report *rep, imdb
             if (!rc && it->rc) rc = imdb_fail(e, it->rc, "%s", it->err.msg);
             for (uint32_t r = 0; !rc && it->g && r < it->g->nrows; r++) {
                 uint64_t vid = it->g->vid[r];
-                uint8_t *s = &seen[it->table][vid >> 3], bit = (uint8_t)(1u << (vid & 7));
-                if (*s & bit)
+                vver *v = vv(&x->t[it->table], vid); /* lake_item found every row's version held */
+                if (!v || v->seen)
                     rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: version %llu of table %s is outside the manifest or twice in it",
                                    (unsigned long long)vid, x->t[it->table].s.name);
-                *s |= bit;
+                else v->seen = true;
             }
             if (it->g) {
                 rep->lake_rows_checked += it->g->nrows;
@@ -1062,14 +1206,21 @@ static int verify_lake(imdb_db *db, const vctx *x, imdb_verify_report *rep, imdb
     }
     for (size_t i = 0; items && i < ni; i++) /* after an early stop */
         if (items[i].g) imdb_segment_free(items[i].g);
-    /* every version of the snapshot is in exactly one segment (tombstones included) */
+    /* every version of the snapshot is in exactly one segment (tombstones included), but those its boundary retired */
     for (uint32_t ti = 0; ti < m.nt && !rc; ti++)
-        for (uint64_t vid = 0; vid < at->t[ti].n; vid++)
-            if (!(seen[ti][vid >> 3] & (1u << (vid & 7)))) {
+        for (uint64_t vid = 0; vid < at->t[ti].n; vid++) {
+            const vver *v = vv(&x->t[ti], vid);
+            if (!v) { /* not held: a whole absent chunk passes at once */
+                if (!x->t[ti].vc || (vid >> IMDB_VCHUNK_BITS) >= x->t[ti].nchunk || !x->t[ti].vc[vid >> IMDB_VCHUNK_BITS])
+                    vid |= IMDB_VCHUNK - 1;
+                continue;
+            }
+            if (!v->seen && v->begin <= m.seq && !(v->end <= at->boundary && v->end <= m.seq)) {
                 rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: version %llu of table %s is missing from the snapshot",
                                (unsigned long long)vid, x->t[ti].s.name);
                 break;
             }
+        }
     /* objects/ holds exactly the current generation and the retained one */
     vref *refs = NULL;
     size_t nrefs = 0, caprefs = 0;
@@ -1102,6 +1253,17 @@ static int verify_lake(imdb_db *db, const vctx *x, imdb_verify_report *rep, imdb
         imdb_free(qb);
     }
     if (!rc) {
+        size_t extra = 0; /* the keepers past the boundary: manifests a retained publish names */
+        for (size_t i = 0; i < x->npubs; i++) extra += x->pubs[i].seq > x->boundary;
+        vref *nr = extra ? imdb_realloc_array(refs, caprefs, nrefs + extra, sizeof *nr, e) : refs;
+        if (!nr) {
+            rc = e->code;
+        } else {
+            refs = nr;
+            caprefs = extra ? nrefs + extra : caprefs;
+            for (size_t i = 0; i < x->npubs; i++)
+                if (x->pubs[i].seq > x->boundary) put_ref(&refs[nrefs++], x->pubhash[i], 'm');
+        }
         qsort(refs, nrefs, sizeof *refs, cmp_ref);
         int dfd = dup(ofd);
         DIR *d = dfd >= 0 ? imdb_io_fdopendir(dfd) : NULL;
@@ -1126,8 +1288,6 @@ static int verify_lake(imdb_db *db, const vctx *x, imdb_verify_report *rep, imdb
         if (d) closedir(d);
     }
     imdb_free(refs);
-    for (uint32_t ti = 0; seen && ti < m.nt; ti++) imdb_free(seen[ti]);
-    imdb_free(seen);
     imdb_free(items);
     imdb_manifest_free(&pm);
     imdb_manifest_free(&m);
@@ -1146,11 +1306,13 @@ static int verify_engine(imdb_db *db, const vctx *x, imdb_verify_report *rep, im
     if (memcmp(&x->global, &db->global, sizeof x->global) != 0)
         return imdb_fail(e, IMDB_ERR_VERIFY, "verify: engine state digest differs from the log");
     if (x->nt != db->nt) return imdb_fail(e, IMDB_ERR_VERIFY, "verify: table count differs");
+    if (db->boundary != x->boundary)
+        return imdb_fail(e, IMDB_ERR_VERIFY, "verify: the engine's retirement boundary differs from the log's");
     for (uint32_t ti = 0; ti < x->nt; ti++) {
         imdb_table *et = db->t[ti];
         const vtab *vt = &x->t[ti];
         if (vt->n != et->nver || vt->live != et->live || vt->horizon != et->horizon ||
-            memcmp(vt->d, &et->digest, sizeof *vt->d) != 0)
+            vt->retention_us != et->retention_us || memcmp(vt->d, &et->digest, sizeof *vt->d) != 0)
             return imdb_fail(e, IMDB_ERR_VERIFY, "verify: table %s differs from the log", et->s.name);
         if (!same_indexes(vt->idx, vt->nidx, et->idx, et->nidx))
             return imdb_fail(e, IMDB_ERR_VERIFY, "verify: the engine's indexes of table %s differ from the log's", et->s.name);
@@ -1160,10 +1322,24 @@ static int verify_engine(imdb_db *db, const vctx *x, imdb_verify_report *rep, im
         if (memcmp(&re, &et->digest, sizeof re) != 0)
             return imdb_fail(e, IMDB_ERR_VERIFY, "verify: table %s incremental digest drifted", et->s.name);
         for (uint64_t vid = 0; vid < vt->n; vid++) {
+            const vver *v = vv(vt, vid);
+            if (!v) { /* below the floor and dropped there: the engine holds none of it either */
+                uint64_t k = vid >> IMDB_VCHUNK_BITS;
+                if (imdb_v_present(et, vid))
+                    return imdb_fail(e, IMDB_ERR_VERIFY, "verify: table %s holds version %llu, which the log does not",
+                                     et->s.name, (unsigned long long)vid);
+                if ((k >= vt->nchunk || !vt->vc[k]) && !et->vh[k]) vid |= IMDB_VCHUNK - 1; /* both chunks absent */
+                continue;
+            }
+            bool retired = v->end != IMDB_LIVE && v->end <= x->boundary; /* exactly these are gone */
+            if (retired != !imdb_v_present(et, vid))
+                return imdb_fail(e, IMDB_ERR_VERIFY, "verify: table %s version %llu is %s, but the log's boundary %s it",
+                                 et->s.name, (unsigned long long)vid, retired ? "still held" : "gone",
+                                 retired ? "retired" : "keeps");
+            if (retired) continue;
             const imdb_version *ev = imdb_vh(et, vid);
-            const vver *v = &vt->v[vid];
             bool estub = (ev->flags & IMDB_V_STUB) != 0;
-            bool purged = v->end != IMDB_LIVE && v->end <= vt->horizon;
+            bool purged = v->end != IMDB_LIVE && v->end <= vt->purged;
             if (v->end != ev->end || v->begin != ev->begin || v->stub != (estub && !(ev->flags & IMDB_V_PENDING_AUTH)) ||
                 purged != ((ev->flags & IMDB_V_PURGED) != 0) || memcmp(v->commit, imdb_vc(et, vid)->commit, 32) != 0)
                 return imdb_fail(e, IMDB_ERR_VERIFY, "verify: table %s version %llu differs", et->s.name,
@@ -1184,6 +1360,155 @@ static int verify_engine(imdb_db *db, const vctx *x, imdb_verify_report *rep, im
         rep->live += vt->live;
     }
     return IMDB_OK;
+}
+
+/* Past a cut (FLOOR, stage 3a (d)): the model starts at the floor F, not at the genesis. The tables at F come from
+ * FLOOR's copy of F's manifest (its hash is in F's signed publish op); the versions at F from the current lake's rows
+ * begun at or before F, all live at F (F's RETIRE dropped every row ended at or before it), a row's stub flag as the
+ * lake has it (an ERASE in the retained log sets it again: VERIFY's ERASE takes a stub); each table's LtHash and live
+ * count must be F's manifest's, and their sum F's signed state digest, so the seed is the state at F. A version that
+ * ended at or before F is in no file any more: an ERASE in the retained log naming one is counted, not checked. */
+static int verify_seed(imdb_db *db, vctx *x, imdb_err *e)
+{
+    imdb_manifest fm, m;
+    memset(&m, 0, sizeof m);
+    if (imdb_manifest_parse(db->floor_man, db->floor_manlen, &fm, e)) return e->code;
+    uint64_t F = db->log_floor;
+    int rc = IMDB_OK;
+    if (!(x->t = imdb_alloc_array(fm.nt ? fm.nt : 1, sizeof *x->t, e))) rc = e->code;
+    for (uint32_t i = 0; !rc && i < fm.nt; i++) {
+        vtab *t = &x->t[i];
+        t->s = fm.t[i].s;
+        if (!(t->d = imdb_alloc_aligned(1, sizeof *t->d, e))) {
+            rc = e->code;
+            break;
+        }
+        imdb_lthash_zero(t->d);
+        x->nt = i + 1;
+        t->n = t->floor_n = fm.t[i].versions;
+        t->horizon = fm.t[i].horizon;
+        t->retention_us = fm.t[i].retention_us;
+        memcpy(t->idx, fm.t[i].idx, sizeof t->idx);
+        t->nidx = fm.t[i].nidx;
+    }
+    x->boundary = fm.boundary;
+    uint8_t *mb = NULL, *sb = NULL;
+    size_t ml = 0, sl = 0;
+    int ofd = rc ? -1 : imdb_open_dir_at(db->dirfd, "objects", e);
+    if (!rc && ofd < 0) rc = e->code;
+    if (!rc && !(rc = imdb_lake_read_object(ofd, db->lake_manifest, ".man", &mb, &ml, e))) rc = imdb_manifest_parse(mb, ml, &m, e);
+    for (uint32_t ti = 0; !rc && ti < m.nt && ti < fm.nt; ti++) { /* a table made past F holds no row begun by F */
+        vtab *t = &x->t[ti];
+        for (uint32_t k = 0; !rc && k < m.t[ti].nseg; k++) {
+            if ((rc = imdb_lake_read_object(ofd, m.t[ti].seg[k].seg, ".seg", &sb, &sl, e))) break;
+            uint8_t *al = imdb_alloc_aligned(1, sl, e);
+            imdb_segment *g = NULL;
+            if (!al) rc = e->code;
+            else memcpy(al, sb, sl);
+            imdb_free(sb);
+            sb = NULL;
+            if (!rc && (rc = imdb_segment_parse(&t->s, al, sl, &g, e))) imdb_free(al);
+            /* the ends its deletion vector records at or before F: a seed's floor is its snapshot, whose lake still
+             * holds history (a RETIRE's has dropped all of it); later ends are the replay's */
+            if (!rc && memcmp(m.t[ti].seg[k].dv, (uint8_t[32]){0}, 32) != 0) {
+                uint8_t *dvb = NULL, sh[32];
+                size_t dl = 0;
+                imdb_dv_ent *ents = NULL;
+                uint32_t ne = 0;
+                if (!(rc = imdb_lake_read_object(ofd, m.t[ti].seg[k].dv, ".dv", &dvb, &dl, e)) &&
+                    !(rc = imdb_dv_parse(dvb, dl, sh, &ents, &ne, g->nrows, e))) {
+                    if (memcmp(sh, g->hash, 32) != 0) rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: DV names another segment");
+                    for (uint32_t q = 0; !rc && q < ne; q++)
+                        if (ents[q].end <= F) g->end[ents[q].row] = ents[q].end;
+                    imdb_free(ents);
+                }
+                imdb_free(dvb);
+            }
+            for (uint32_t r = 0; !rc && r < g->nrows; r++) {
+                if (g->begin[r] > F) continue;
+                uint64_t vid = g->vid[r];
+                if (vid >= t->floor_n || vv(t, vid)) {
+                    rc = imdb_fail(e, IMDB_ERR_VERIFY, "verify: the lake's version %llu of table %s is not one the floor had",
+                                   (unsigned long long)vid, t->s.name);
+                    break;
+                }
+                vver *v = vv_need(t, vid, e);
+                if (!v) {
+                    rc = e->code;
+                    break;
+                }
+                memcpy(v->commit, g->commit + 32u * r, 32);
+                v->begin = g->begin[r];
+                v->end = g->end[r]; /* LIVE, or an end at or before F */
+                if ((g->flags[r] & IMDB_SEG_PURGED) && v->end != IMDB_LIVE && v->end > t->purged)
+                    t->purged = v->end; /* purged by F: every version ended before a purge is, so its highest end divides */
+                v->stub = (g->flags[r] & IMDB_SEG_STUB) != 0;
+                if (!v->stub && t->s.subject >= 0) {
+                    imdb_value sv = {.type = t->s.cols[t->s.subject].type};
+                    const imdb_segcol *sc = &g->col[t->s.subject];
+                    if (sv.type == IMDB_T_TEXT) {
+                        sv.s = sc->data + sc->off[r];
+                        sv.len = sc->off[r + 1] - sc->off[r];
+                    } else {
+                        sv.i = sc->i64[r];
+                    }
+                    subj_key(&sv, v->subj);
+                    v->has_subj = true;
+                }
+                x->rep->seeded++;
+                if (v->end != IMDB_LIVE) continue; /* history at F: not in its digest */
+                imdb_lthash el;
+                imdb_lthash_element(db->meta.digest_alg, v->commit, &el);
+                imdb_lthash_add(t->d, &el);
+                t->live++;
+            }
+            if (g) imdb_segment_free(g);
+        }
+    }
+    imdb_lthash_zero(&x->global);
+    for (uint32_t i = 0; !rc && i < x->nt; i++) {
+        if (memcmp(x->t[i].d, &fm.t[i].digest, sizeof fm.t[i].digest) != 0 || x->t[i].live != fm.t[i].live)
+            rc = imdb_fail(e, IMDB_ERR_VERIFY, "verify: the lake's rows of table %s at the floor (commit %llu) are not the floor's",
+                           x->t[i].s.name, (unsigned long long)F);
+        else imdb_lthash_add(&x->global, x->t[i].d);
+    }
+    uint8_t d[32];
+    imdb_lthash_digest(db->meta.digest_alg, &x->global, d);
+    if (!rc && memcmp(d, db->floor_digest, 32) != 0)
+        rc = imdb_fail(e, IMDB_ERR_VERIFY, "verify: the state at the floor (commit %llu) is not the one its commit signed",
+                       (unsigned long long)F);
+    if (!rc && db->nfloor_starts) { /* the segment starts below the floor an EXPIRE past it may name */
+        if (!(x->starts = imdb_alloc_array(db->nfloor_starts, sizeof *x->starts, e))) rc = e->code;
+        for (uint32_t i = 0; !rc && i < db->nfloor_starts; i++)
+            x->starts[i] = (vstart){imdb_get_le64(db->floor_starts + 16 * i), imdb_get_le64(db->floor_starts + 16 * i + 8)};
+        x->nstarts = x->capstarts = rc ? 0 : db->nfloor_starts;
+    }
+    if (!rc) {
+        x->seq = F;
+        memcpy(x->head, db->floor_hash, 32);
+        x->ended = true; /* the floor published a manifest: the retained log begins a segment */
+        x->last_time = db->floor_time;
+        x->epoch = imdb_writer_epoch_at(db, F);
+        memcpy(x->key, imdb_writer_key_at(db, F), IMDB_PUBKEY_LEN);
+        /* the floor published a manifest (FLOOR requires it): the last publish so far; and a seeded copy's lake is
+         * still the floor's, so the snapshot its lake check compares is taken here, never in the replay */
+        uint8_t pubm[32];
+        imdb_sha256(db->floor_man, db->floor_manlen, pubm);
+        memcpy(x->last_manifest, pubm, 32);
+        x->last_publish = F;
+        imdb_commit_rec fc;
+        if (db->lake_seq == F && !(rc = imdb_commit_decode_header(db->floor_hdr, db->floor_hlen, &fc, e))) {
+            rc = snapshot_at_s(x, &fc, pubm, false, e);
+            memcpy(x->at_s.prev_manifest, fm.prev_manifest, 32); /* what GC kept, as the manifest records it */
+            imdb_commit_free(&fc);
+        }
+        x->rep->floor = F;
+    }
+    if (ofd >= 0) close(ofd);
+    imdb_free(mb);
+    imdb_manifest_free(&m);
+    imdb_manifest_free(&fm);
+    return rc;
 }
 
 /* The generations pins/ names, before the log pass learns which of them it published. */
@@ -1240,18 +1565,26 @@ int imdb_verify(imdb_db *db, imdb_verify_report *rep, imdb_err *e)
     imdb_lthash_zero(&x.global);
     double t_read = 0, t_par = 0, t_seq = 0;
     int rc = vpins_collect(db, &x, e);
+    if (!rc && db->log_floor) rc = verify_seed(db, &x, e); /* past a cut: from the floor (FLOOR) */
     if (!rc) rc = verify_log(db, &x, &t_read, &t_par, &t_seq, e);
     if (!rc && x.epoch + 1 != db->nwep)
         rc = imdb_fail(e, IMDB_ERR_VERIFY, "verify: the engine holds %u writer epochs, the log %u", db->nwep, x.epoch + 1);
     /* a redaction marker must be authorised by an ERASE somewhere in the log */
     for (uint32_t ti = 0; ti < x.nt && !rc; ti++)
-        for (uint64_t vid = 0; vid < x.t[ti].n; vid++)
-            if (x.t[ti].v[vid].redacted && !x.t[ti].v[vid].stub) {
+        for (uint64_t vid = 0; vid < x.t[ti].n; vid++) {
+            const vver *v = vv(&x.t[ti], vid);
+            if (!v) { /* not held: an absent chunk passes whole */
+                uint64_t k = vid >> IMDB_VCHUNK_BITS;
+                if (k >= x.t[ti].nchunk || !x.t[ti].vc[k]) vid |= IMDB_VCHUNK - 1;
+                continue;
+            }
+            if (v->redacted && !v->stub) {
                 rc = imdb_fail(e, IMDB_ERR_VERIFY,
                                "verify: redacted payload of version %llu of table %s not authorised by any ERASE",
                                (unsigned long long)vid, x.t[ti].s.name);
                 break;
             }
+        }
     rep->t_read = t_read;
     rep->t_par = t_par;
     rep->t_log = t_seq;
@@ -1268,12 +1601,15 @@ int imdb_verify(imdb_db *db, imdb_verify_report *rep, imdb_err *e)
     memcpy(rep->head, x.head, 32);
     imdb_lthash_digest(db->meta.digest_alg, &x.global, rep->digest);
     for (uint32_t i = 0; i < x.nt; i++) {
-        imdb_free(x.t[i].v);
+        vt_free(&x.t[i]);
         imdb_free(x.t[i].d);
     }
     imdb_free(x.t);
     imdb_free(x.at_s.t);
     imdb_free(x.pin);
+    imdb_free(x.starts);
+    imdb_free(x.pubs);
+    imdb_free(x.pubhash);
     imdb_free(x.pin_at);
     return rc;
 }

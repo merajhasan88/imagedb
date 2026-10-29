@@ -214,6 +214,94 @@ imdb_scan_status imdb_logseg_scan(const imdb_logseg *s, size_t off, size_t *flen
     return imdb_frame_scan(s->buf, s->len, off, flen, e);
 }
 
+/* n bytes at off, fewer only at the end of the file */
+static int pread_upto(int fd, uint8_t *p, size_t n, uint64_t off, size_t *got, imdb_err *e)
+{
+    *got = 0;
+    while (*got < n) {
+        ssize_t r = imdb_io_pread(fd, p + *got, n - *got, (off_t)(off + *got));
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0) return imdb_fail(e, IMDB_ERR_IO, "read log segment: %s", strerror(errno));
+        if (r == 0) break;
+        *got += (size_t)r;
+    }
+    return IMDB_OK;
+}
+
+int imdb_logseg_first_time(int logfd, uint64_t first, uint64_t *time_us, imdb_err *e)
+{
+    char name[IMDB_LOGSEG_NAME + 1];
+    imdb_logseg_name(first, name);
+    int fd = imdb_io_openat(logfd, name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return imdb_fail(e, IMDB_ERR_IO, "log segment %s: %s", name, strerror(errno));
+    imdb_buf b, fr;
+    imdb_buf_init(&b);
+    imdb_buf_init(&fr);
+    int rc = IMDB_OK;
+    struct stat st;
+    if (imdb_io_fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        rc = imdb_fail(e, IMDB_ERR_CORRUPT, "log segment %s is not a regular file", name);
+        goto out;
+    }
+    uint64_t size = (uint64_t)st.st_size;
+    const uint8_t *f = NULL;
+    size_t flen = 0;
+    /* a few sectors first, then twice as many until the first frame is whole: a read never goes past
+     * the file, so a frame's claimed length costs at most the file's own size */
+    for (size_t want = 8 * IMDB_TSEG_SECTOR;; want *= 2) {
+        size_t n = want < size ? want : (size_t)size, got = 0;
+        b.len = 0;
+        if (!imdb_buf_reserve(&b, n ? n : 1)) {
+            rc = imdb_fail(e, IMDB_ERR_NOMEM, "out of memory");
+            goto out;
+        }
+        if ((rc = pread_upto(fd, b.p, n, 0, &got, e))) goto out;
+        b.len = got;
+        bool more = true;
+        if (imdb_tseg_is_tagged(b.p, b.len)) {
+            /* the first group begins at sector 1, its first frame at its first byte */
+            imdb_tseg_pos pos = {.sector = 1, .byte = 0, .tag = 0, .next = first};
+            size_t whole = b.len / IMDB_TSEG_SECTOR * IMDB_TSEG_SECTOR;
+            if (whole > IMDB_TSEG_SECTOR &&
+                imdb_tseg_next(b.p + IMDB_TSEG_SECTOR, whole - IMDB_TSEG_SECTOR, 1, &pos, &fr, &more) == IMDB_SCAN_FRAME) {
+                f = fr.p;
+                flen = fr.len;
+                break;
+            }
+            if (imdb_buf_check(&fr, e)) {
+                rc = e->code;
+                goto out;
+            }
+            more = more || whole <= IMDB_TSEG_SECTOR;
+        } else {
+            imdb_err e2 = {0};
+            imdb_scan_status s = imdb_frame_scan(b.p, b.len, 0, &flen, &e2);
+            if (s == IMDB_SCAN_FRAME) {
+                f = b.p;
+                break;
+            }
+            more = s == IMDB_SCAN_TORN; /* a frame longer than the read, or a prefix not read whole yet */
+        }
+        if (!more || n == size) {
+            rc = imdb_fail(e, IMDB_ERR_CORRUPT, "log segment %s: no whole first frame", name);
+            goto out;
+        }
+    }
+    imdb_commit_rec c;
+    if ((rc = imdb_frame_decode_body(f + IMDB_FRAME_HDR, flen - IMDB_FRAME_HDR, &c, e))) goto out;
+    if (c.seq != first) rc = imdb_fail(e, IMDB_ERR_CORRUPT, "log segment %s: its first frame is commit %llu", name,
+                                       (unsigned long long)c.seq);
+    else *time_us = c.time_us; /* the header's hash matched the descriptor's: the time its signature covers */
+    imdb_commit_free(&c);
+out:
+    close(fd);
+    imdb_wipe(b.p, b.cap); /* payloads: an erased one may be here until redaction */
+    imdb_free(b.p);
+    imdb_wipe(fr.p, fr.cap);
+    imdb_free(fr.p);
+    return rc;
+}
+
 int imdb_durable_read(int dirfd, imdb_durable *w, bool *present, imdb_err *e)
 {
     memset(w, 0, sizeof *w);

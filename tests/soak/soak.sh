@@ -11,9 +11,9 @@
 # IMDB_SOAK_AUDIT (the auditor at every Nth VERIFY and at the end, 1; 0: never: 0.24 ms a commit at 3.28 M, so a long
 # run keeps its database, IMDB_SOAK_KEEP=1, and audits it afterwards), IMDB_SOAK_TREE (what is under test, for
 # MACHINE.txt),
-# IMDB_SOAK_SYNC (1; 0: --nosync), IMDB_SOAK_RETAIN (--retain-history commits, 0: all
-# history kept), IMDB_SOAK_CHECKPOINT and IMDB_SOAK_ERASE (commits between them, by the log's sequence, so
-# across restarts; 50000 and 20000; 0: never), IMDB_SOAK_FLOOR (MB of MemAvailable below which it stops,
+# IMDB_SOAK_SYNC (1; 0: --nosync), IMDB_SOAK_RETENTION (the table's RETENTION in seconds; unset: the engine's
+# default, 24 hours; stage 3a's soak runs 600), IMDB_SOAK_CHECKPOINT and IMDB_SOAK_ERASE (commits between them,
+# by the log's sequence, so across restarts; 50000 and 20000; 0: never), IMDB_SOAK_FLOOR (MB of MemAvailable below which it stops,
 # 4608: the user's 4 GB and a margin), IMDB_SOAK_KEEP=1 keeps the database.
 # A run in which an asked-for ERASE or CHECKPOINT never completed did not test what it was asked to: it
 # ends SOAK INCOMPLETE (exit 5), not PASSED. A final VERIFY that counts no erased version after an ERASE
@@ -38,7 +38,8 @@ cc -std=c11 -D_GNU_SOURCE -O2 -Wall -Wextra -Werror -pthread -I "$HERE/../../src
     "$HERE/soak_writer.c" "$B/libimagedb.a"
 OPTS=()
 [ "${IMDB_SOAK_SYNC:-1}" = 1 ] || OPTS+=(--nosync)
-[ "${IMDB_SOAK_RETAIN:-0}" = 0 ] || OPTS+=(--retain "$IMDB_SOAK_RETAIN")
+LOADOPTS=()
+[ -z "${IMDB_SOAK_RETENTION:-}" ] || LOADOPTS+=(--retention "$IMDB_SOAK_RETENTION")
 OPTS+=(--checkpoint "${IMDB_SOAK_CHECKPOINT:-50000}" --erase "${IMDB_SOAK_ERASE:-20000}")
 OUT=$W/out
 mkdir -p "$OUT"
@@ -72,7 +73,7 @@ check() { # NAME AUDIT: VERIFY through the CLI's writable open (recovery first),
 }
 
 "$BIN" init "$D" > /dev/null
-"$W/soak_writer" "$D" load "$LIVE" "$OUT/acks" || { echo "FAIL: the load"; exit 1; }
+"$W/soak_writer" "$D" load "$LIVE" "$OUT/acks" "${LOADOPTS[@]}" || { echo "FAIL: the load"; exit 1; }
 echo "t_s restarts commits log_bytes dir_bytes verify_s audit_s avail_mb alive_s" > "$OUT/disk.csv"
 echo "run t_s commits versions rows indexes segments commits_mem txns total rss_kb" > "$OUT/memory.csv"
 : > "$OUT/events"

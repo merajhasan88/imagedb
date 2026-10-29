@@ -33,6 +33,7 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "../../src/lake.h"
@@ -617,8 +618,8 @@ static void ack_closed(void)
 /* ---- scenarios ------------------------------------------------------------------------ */
 
 enum {
-    VIOL_FAILSTOP = 3, VIOL_OPEN = 4, VIOL_PINNED = 5, VIOL_RETAIN = 6, VIOL_INDEX = 7, VIOL_ORDERED = 8, VIOL_JOIN = 9,
-    VIOL_LEAK = 10, VIOL_FILL = 11, VIOL_PUTBACK = 12
+    VIOL_FAILSTOP = 3, VIOL_OPEN = 4, VIOL_PINNED = 5, VIOL_INDEX = 7, VIOL_ORDERED = 8, VIOL_JOIN = 9,
+    VIOL_LEAK = 10, VIOL_FILL = 11, VIOL_PUTBACK = 12, VIOL_EXPIRE = 13, VIOL_RETIRE = 14
 };
 
 typedef struct fscen {
@@ -744,30 +745,40 @@ static int run_compact(const char *run)
     return 0;
 }
 
-/* --retain-history: the policy's logged COMPACT ... PURGE runs from the executor after the
- * statements that make it due, here after every third ended version (retain_min lowered from
- * IMDB_RETAIN_MIN_ENDED): a statement acknowledged includes the purge it triggered, if that
- * commit became durable */
-static int run_retain(const char *run)
+/* Expiry by retention (stage 3a, step b): the copy's clock pinned to its last commit (so the calls do not
+ * depend on when a run happens), its table kept 10 seconds, two segments ended, then the clock moved 15
+ * seconds on: the next statement's policy reads when the segments began (every call of that read faulted:
+ * a failure only warns, and expires nothing) and commits an EXPIRE (every point of it crashed); a recovered
+ * state keeps the acknowledged horizon, which VERIFY and the auditor re-derive from the log. Not vacuous: a
+ * run nothing faulted expired the table once. */
+static int run_expire(const char *run)
 {
-    imdb_open_opts o = {.sync = 1, .retain_commits = 1};
+    imdb_open_opts o = {.sync = 1};
     imdb_db *db = NULL;
     imdb_err e = {0};
     if (imdb_open(dir_in(run, "p"), &o, &db, &e)) return 0;
-    db->retain_min = 2;
-    db->warning[0] = 0; /* only a purge's warning may excuse the check below (an open's may not) */
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    int64_t pin = (int64_t)db->last_time - ((int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000) + 1000;
+    imdb_clock_offset(pin);
+    db->warning[0] = 0; /* only the policy's warning may excuse the check below */
     imdb_session s;
     imdb_session_init(&s, db);
     static const char *const q[] = {
-        "INSERT INTO txns VALUES (10, 7, 1.00, 'x')", "DELETE FROM txns WHERE id = 10",
-        "INSERT INTO txns VALUES (11, 7, 1.00, 'x')", "DELETE FROM txns WHERE id = 11",
-        "INSERT INTO txns VALUES (12, 7, 1.00, 'x')", "DELETE FROM txns WHERE id = 12", /* due: a purge */
-        "UPDATE txns SET memo = 'y' WHERE id = 2",    "DELETE FROM txns WHERE id = 1",
-        "INSERT INTO txns VALUES (13, 7, 1.00, 'x')", "DELETE FROM txns WHERE id = 13", /* due again */
+        "ALTER TABLE txns SET RETENTION 10 SECONDS", "CHECKPOINT",
+        "INSERT INTO txns VALUES (10, 7, 1.00, 'x')", "CHECKPOINT",
+        NULL,                                          /* the clock 15 seconds on */
+        "SELECT COUNT(*) FROM txns",                   /* its policy: an EXPIRE */
+        "INSERT INTO txns VALUES (11, 7, 1.00, 'x')", /* the next start is not old: no second one */
     };
-    int v = 0, purges = 0;
+    int v = 0, expired = 0;
     size_t done = 0;
     for (size_t i = 0; i < sizeof q / sizeof *q; i++) {
+        if (!q[i]) {
+            imdb_clock_offset(pin + 15 * 1000000ll);
+            done++;
+            continue;
+        }
         imdb_result r;
         imdb_err_clear(&e);
         uint64_t h = db->t[0]->horizon;
@@ -777,13 +788,75 @@ static int run_retain(const char *run)
         }
         imdb_result_free(&r);
         ack(db);
-        purges += db->t[0]->horizon > h;
+        expired += db->t[0]->horizon > h;
         done++;
     }
-    /* not vacuous: a run nothing faulted (every statement through, no purge warning) purged twice */
-    if (!v && done == sizeof q / sizeof *q && !db->warning[0] && !db->failed && purges != 2) v = VIOL_RETAIN;
+    if (!v && done == sizeof q / sizeof *q && !db->warning[0] && !db->failed && expired != 1) v = VIOL_EXPIRE;
     imdb_session_close(&s);
     imdb_close(db);
+    imdb_clock_offset(0);
+    return v;
+}
+
+/* RETIRE (stage 3a, step c1): the copy's clock pinned as in run_expire, its table kept 10 seconds, history ended in
+ * one segment, then expired: a RETIRE below that segment's end (by hand, at the boundary the run knows), then an
+ * INSERT. Every point of the RETIRE crashed or faulted: its objects, its commit, LAKE_HEAD, the clean-up; a
+ * recovered state keeps the acknowledged commits (one at or below a recovered boundary is retired), and VERIFY
+ * and the auditor re-derive the boundary and the retired set from the log. Not vacuous: a clean run retires. */
+static int run_retire(const char *run)
+{
+    imdb_open_opts o = {.sync = 1};
+    imdb_db *db = NULL;
+    imdb_err e = {0};
+    if (imdb_open(dir_in(run, "p"), &o, &db, &e)) return 0;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    int64_t pin = (int64_t)db->last_time - ((int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000) + 1000;
+    imdb_clock_offset(pin);
+    db->no_auto_retire = true; /* the RETIRE below is the run's own, at a boundary it knows */
+    db->warning[0] = 0;
+    imdb_session s;
+    imdb_session_init(&s, db);
+    static const char *const q[] = {
+        "ALTER TABLE txns SET RETENTION 10 SECONDS", "UPDATE txns SET memo = 'r1' WHERE id = 2",
+        "CHECKPOINT",                                    /* the boundary: the end of this segment */
+        "UPDATE txns SET memo = 'r2' WHERE id = 2", "CHECKPOINT",
+        NULL,                                            /* the clock 15 seconds on */
+        "SELECT COUNT(*) FROM txns",                     /* the expiry past the boundary */
+        "",                                              /* the RETIRE */
+        "INSERT INTO txns VALUES (12, 7, 1.00, 'x')",
+    };
+    int v = 0;
+    uint64_t B = 0;
+    size_t done = 0;
+    for (size_t i = 0; i < sizeof q / sizeof *q; i++) {
+        if (!q[i]) {
+            imdb_clock_offset(pin + 15 * 1000000ll);
+            done++;
+            continue;
+        }
+        imdb_err_clear(&e);
+        int rc;
+        if (!*q[i]) {
+            rc = imdb_retire(db, B, &e);
+        } else {
+            imdb_result r;
+            rc = imdb_exec_one(&s, q[i], strlen(q[i]), NULL, 0, &r, &e);
+            if (!rc) imdb_result_free(&r);
+        }
+        if (rc) {
+            v = after_error(db);
+            break;
+        }
+        if (!B && strcmp(q[i], "CHECKPOINT") == 0) B = db->seq;
+        ack(db);
+        done++;
+    }
+    if (!v && done == sizeof q / sizeof *q && !db->warning[0] && !db->failed && (db->boundary != B || db->log_floor != B))
+        v = VIOL_RETIRE; /* retired, and the log cut there (FLOOR) */
+    imdb_session_close(&s);
+    imdb_close(db);
+    imdb_clock_offset(0);
     return v;
 }
 
@@ -1108,6 +1181,87 @@ static void setup_replica(const char *base)
     }
     free(w);
     free(b);
+}
+
+/* replica_seed (stage 3a (e)): a primary cut below commit 1 (run_retire's steps, here in the parent) and an empty
+ * replica, with the seed ship sends it from 0, and S, the commit it brings, in seed_seq */
+static void setup_seed(const char *base)
+{
+    setup_txns(base);
+    imdb_open_opts o = {.sync = 1};
+    imdb_db *db = NULL;
+    imdb_err e = {0};
+    if (imdb_open(dir_in(base, "p"), &o, &db, &e)) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    int64_t pin = (int64_t)db->last_time - ((int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000) + 1000;
+    imdb_clock_offset(pin);
+    db->no_auto_retire = true;
+    imdb_session s;
+    imdb_session_init(&s, db);
+    static const char *const q[] = {"ALTER TABLE txns SET RETENTION 10 SECONDS", "UPDATE txns SET memo = 'r1' WHERE id = 2",
+                                    "CHECKPOINT", "UPDATE txns SET memo = 'r2' WHERE id = 2", "CHECKPOINT", NULL,
+                                    "SELECT COUNT(*) FROM txns"};
+    uint64_t B = 0;
+    int rc = 0;
+    for (size_t i = 0; !rc && i < sizeof q / sizeof *q; i++) {
+        if (!q[i]) {
+            imdb_clock_offset(pin + 15 * 1000000ll);
+            continue;
+        }
+        imdb_result r;
+        rc = imdb_exec_one(&s, q[i], strlen(q[i]), NULL, 0, &r, &e);
+        if (!rc) imdb_result_free(&r);
+        if (!rc && !B && strcmp(q[i], "CHECKPOINT") == 0) B = db->seq;
+    }
+    if (!rc) rc = imdb_retire(db, B, &e);
+    uint64_t S = db->lake_seq;
+    imdb_session_close(&s);
+    imdb_close(db);
+    imdb_clock_offset(0);
+    if (rc || !S || imdb_init(dir_in(base, "r"), true, dir_in(base, "p"), &e) ||
+        ship_to_file(dir_in(base, "p"), 0, dir_in(base, "stream"), &e))
+        return;
+    char sv[32];
+    int n = snprintf(sv, sizeof sv, "%llu", (unsigned long long)S);
+    spit(dir_in(base, "seed_seq"), (const uint8_t *)sv, (size_t)n);
+}
+
+static uint64_t seed_seq(const char *dir)
+{
+    size_t n = 0;
+    uint8_t *b = slurp(dir_in(dir, "seed_seq"), &n);
+    uint64_t S = 0;
+    for (size_t i = 0; b && i < n && b[i] >= '0' && b[i] <= '9'; i++) S = S * 10 + (uint64_t)(b[i] - '0');
+    free(b);
+    return S;
+}
+
+static const char *seed_base_ok(const char *base)
+{
+    size_t n = 0;
+    uint8_t *b = slurp(dir_in(base, "stream"), &n);
+    bool ok = b && n > 28 && memcmp(b, "IMDBSED1", 8) == 0 && seed_seq(base);
+    free(b);
+    return ok ? NULL : "the setup made no seed (the primary was not cut below commit 1)";
+}
+
+/* the replica takes the seed, then opens at its floor: acknowledged there */
+static int run_seed(const char *run)
+{
+    imdb_db *db = child_open(dir_in(run, "r"), 1);
+    if (!db) return 0;
+    uint64_t applied = 0;
+    imdb_err e = {0};
+    int fd = open(dir_in(run, "stream"), O_RDONLY | O_CLOEXEC);
+    int rc = imdb_apply_stream(db, fd, &applied, &e);
+    close(fd);
+    bool seeded = !rc && db->seeded;
+    imdb_close(db);
+    if (!seeded || !(db = child_open(dir_in(run, "r"), 1))) return 0;
+    ack(db);
+    imdb_close(db);
+    return 0;
 }
 
 static int run_replica(const char *run)
@@ -1565,6 +1719,33 @@ static const char *strict_check(const char *dir, const frun *r)
 /* Whatever a fault or a crash left: once the replica holds epoch 1, the ledger refuses the copy that
  * epoch (a second epoch-1 writer key would fork the history: the review of 2026-10-26, F2 and F3).
  * Before that, the copy may take it or be refused (a reservation that outlived a failed promotion). */
+/* never half seeded: after the writable open, empty (no FLOOR, nothing in objects/) or at S, its floor */
+static const char *check_seed(const char *run)
+{
+    uint64_t S = seed_seq(run);
+    imdb_open_opts o = {.sync = 1, .read_only = true};
+    imdb_db *db = NULL;
+    imdb_err e = {0};
+    if (imdb_open(dir_in(run, "r"), &o, &db, &e)) {
+        snprintf(g_why, sizeof g_why, "the replica does not open read-only: %s", e.msg);
+        return g_why;
+    }
+    size_t nobj = 0;
+    DIR *d = opendir(dir_in(run, "r/objects"));
+    for (struct dirent *de; d && (de = readdir(d));) nobj += de->d_name[0] != '.';
+    if (d) closedir(d);
+    bool floor = access(dir_in(run, "r/FLOOR"), F_OK) == 0;
+    const char *why = NULL;
+    if (db->seq ? db->seq != S || db->log_floor != S || db->lake_seq != S : nobj || floor) {
+        snprintf(g_why, sizeof g_why, "the replica is neither empty nor seeded at %llu (commit %llu, floor %llu, %zu objects%s)",
+                 (unsigned long long)S, (unsigned long long)db->seq, (unsigned long long)db->log_floor, nobj,
+                 floor ? ", a FLOOR" : "");
+        why = g_why;
+    }
+    imdb_close(db);
+    return why;
+}
+
 static const char *check_promote_ledger(const char *run)
 {
     imdb_open_opts o = {.sync = 1};
@@ -1602,13 +1783,14 @@ static const char *check_run(const fscen *s, const char *run, const frun *r)
         snprintf(g_why, sizeof g_why, "the child reports %s (exit %d)",
                  code == VIOL_FAILSTOP  ? "a failed fdatasync that left the handle usable"
                  : code == VIOL_PINNED ? "erased bytes kept for a reader's pin"
-                 : code == VIOL_RETAIN ? "a clean run without its two automatic purges"
                  : code == VIOL_INDEX  ? "an ordered path that disagrees with the scan"
                  : code == VIOL_ORDERED ? "a clean run whose SELECTs did not take the ordered path"
                  : code == VIOL_JOIN   ? "a join that disagrees with its mirror plan, or a clean run's wrong answer"
                  : code == VIOL_LEAK   ? "memory the run leaked (LeakSanitizer's report is above)"
                  : code == VIOL_FILL   ? "a clean run whose tagged segment's fill did not move as design.md §3 says"
                  : code == VIOL_PUTBACK ? "a failed commit that left bytes in its tagged segment (no put-back)"
+                 : code == VIOL_EXPIRE ? "a clean run whose policy did not expire the table once"
+                 : code == VIOL_RETIRE ? "a clean run that did not retire below its boundary"
                                        : "a violation",
                  code);
         return g_why;
@@ -1651,6 +1833,9 @@ static const char *check_run(const fscen *s, const char *run, const frun *r)
             why = g_why;
             break;
         }
+        /* at or below the recovered boundary: retired, which only a durable commit can be (the RETIRE that set it
+         * names it, and is itself in the log the open just checked); its hash is no longer kept */
+        if (r->recs[i].seq && r->recs[i].seq <= db->boundary) continue;
         uint8_t gen[32]; /* commit 0: the genesis (a replica's first acknowledgement, before anything arrived) */
         imdb_genesis_hash(db->db_id, gen);
         const imdb_commit_info *ci = r->recs[i].seq ? imdb_ci_at(db, r->recs[i].seq, &e) : NULL;
@@ -1677,6 +1862,7 @@ static const char *check_run(const fscen *s, const char *run, const frun *r)
     imdb_close(db);
     if (!why) why = audit_run(dir);
     if (!why && strcmp(s->name, "replica_promote_ledger") == 0) why = check_promote_ledger(run);
+    if (!why && strcmp(s->name, "replica_seed") == 0) why = check_seed(run);
     return why;
 }
 
@@ -1888,13 +2074,15 @@ static const fscen kScen[] = {
     {"replica_promote_anchored", setup_promote, run_replica_promote_anchored, false, NULL, NULL, true, true, false},
     {"strict", setup_txns, run_strict, false, NULL, NULL, false, false, true},
     {"erase_pinned", setup_erase_pinned, run_erase_pinned, false, "secret-42", NULL, false, false, false},
-    {"retain", setup_txns, run_retain, false, NULL, NULL, false, false, false},
     {"index", setup_txns, run_index, false, NULL, NULL, false, false, false},
     {"join", setup_txns, run_join, false, NULL, NULL, false, false, false},
     {"replica_promote_ledger", setup_promote_ledger, run_replica_promote_ledger, false, NULL, NULL, false, true, false},
     {"fill", setup_txns, run_fill, false, NULL, NULL, false, false, false},
     {"rotate_reopen", setup_ended, run_commits, false, NULL, NULL, false, false, false},
     {"retry", setup_txns, run_retry, false, NULL, NULL, false, false, false},
+    {"expire", setup_txns, run_expire, false, NULL, NULL, false, false, false},
+    {"retire", setup_txns, run_retire, false, NULL, NULL, false, false, false},
+    {"replica_seed", setup_seed, run_seed, false, NULL, seed_base_ok, false, false, false},
 };
 
 static void t_fault_commits(void) { fault_scenario(&kScen[0]); }
@@ -1915,13 +2103,15 @@ static void t_fault_replica_promote(void) { fault_scenario(&kScen[14]); }
 static void t_fault_replica_promote_anchored(void) { fault_scenario(&kScen[15]); }
 static void t_fault_strict(void) { fault_scenario(&kScen[16]); }
 static void t_fault_erase_pinned(void) { fault_scenario(&kScen[17]); }
-static void t_fault_retain(void) { fault_scenario(&kScen[18]); }
-static void t_fault_index(void) { fault_scenario(&kScen[19]); }
-static void t_fault_join(void) { fault_scenario(&kScen[20]); }
-static void t_fault_replica_promote_ledger(void) { fault_scenario(&kScen[21]); }
-static void t_fault_fill(void) { fault_scenario(&kScen[22]); }
-static void t_fault_rotate_reopen(void) { fault_scenario(&kScen[23]); }
-static void t_fault_retry(void) { fault_scenario(&kScen[24]); }
+static void t_fault_index(void) { fault_scenario(&kScen[18]); }
+static void t_fault_join(void) { fault_scenario(&kScen[19]); }
+static void t_fault_replica_promote_ledger(void) { fault_scenario(&kScen[20]); }
+static void t_fault_fill(void) { fault_scenario(&kScen[21]); }
+static void t_fault_rotate_reopen(void) { fault_scenario(&kScen[22]); }
+static void t_fault_retry(void) { fault_scenario(&kScen[23]); }
+static void t_fault_expire(void) { fault_scenario(&kScen[24]); }
+static void t_fault_retire(void) { fault_scenario(&kScen[25]); }
+static void t_fault_replica_seed(void) { fault_scenario(&kScen[26]); }
 
 const test_case fault_tests[] = {
     {"fault_commits", t_fault_commits},     {"fault_nosync", t_fault_nosync}, {"fault_checkpoint", t_fault_checkpoint},
@@ -1937,12 +2127,14 @@ const test_case fault_tests[] = {
     {"fault_replica_promote_anchored", t_fault_replica_promote_anchored},
     {"fault_strict", t_fault_strict},
     {"fault_erase_pinned", t_fault_erase_pinned},
-    {"fault_retain", t_fault_retain},
     {"fault_index", t_fault_index},
     {"fault_join", t_fault_join},
     {"fault_replica_promote_ledger", t_fault_replica_promote_ledger},
     {"fault_fill", t_fault_fill},
     {"fault_rotate_reopen", t_fault_rotate_reopen},
     {"fault_retry", t_fault_retry},
+    {"fault_expire", t_fault_expire},
+    {"fault_retire", t_fault_retire},
+    {"fault_replica_seed", t_fault_replica_seed},
 };
 const size_t fault_ntests = sizeof fault_tests / sizeof *fault_tests;

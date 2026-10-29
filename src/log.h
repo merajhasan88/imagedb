@@ -44,6 +44,11 @@
  *                  so a stream reader authenticates it (root, then new key) before
  *                  decoding anything; the header's op must repeat epoch and new_pk.
  *                  Epochs count up from 0 (META's writer key) by one.
+ *  14 CREATE_INDEX u32 table | u8 flags | u8 ncols | ncols x u16 column | u8 len | name  (alone)
+ *  15 DROP_INDEX   u32 table | u8 len | name                                              (alone)
+ *  16 SET_RETENTION u32 table | u64 microseconds (all ones: FOREVER)  (after each CREATE_TABLE, or alone)
+ *  17 EXPIRE       u32 table | u64 before   (only EXPIREs in its commit, one a table, by table)
+ *  18 RETIRE       u64 boundary | manifest[32]                        (alone)
  */
 #ifndef IMDB_LOG_H
 #define IMDB_LOG_H
@@ -81,7 +86,29 @@ enum {
     IMDB_OP_CREATE_INDEX = 14, /* alone in its commit: u32 table, u8 flags (IMDB_INDEX_UNIQUE), u8 ncols,
                                   ncols u16 columns, the index name */
     IMDB_OP_DROP_INDEX = 15,   /* alone in its commit: u32 table, the index name */
+    IMDB_OP_SET_RETENTION = 16, /* u32 table, u64 retention_us: IMDB_RETAIN_FOREVER, or IMDB_RETAIN_MIN_US to
+                                   IMDB_RETAIN_MAX_US (limits.h). Every CREATE_TABLE is followed at once by its table's,
+                                   so a table's retention is always logged: a reader never supplies a default */
+    IMDB_OP_EXPIRE = 17,        /* u32 table, u64 before (purge_before below): the table's new horizon, its history
+                                   older than its retention no longer answered; nothing rewritten. A commit holding one
+                                   holds only EXPIREs, at most one a table, by table; before is past the table's horizon,
+                                   below the commit, and the first commit of a log segment at least the table's
+                                   retention older than this one (VERIFY and the auditor check it: the log proves the
+                                   retention was honoured) */
+    IMDB_OP_RETIRE = 18,        /* u64 boundary (purge_before below) | manifest[32]: every version ended at or before
+                                   the boundary leaves the version store, the lake and the indexes; alone in its
+                                   commit, a publish. The boundary ends a log segment, is past the previous one and
+                                   below every table's horizon (VERIFY and the auditor check it), so nothing a
+                                   horizon still answers is dropped */
 };
+
+/* A table's retention (op 16): how long its history stays answerable (AS OF) after a version ends. */
+#define IMDB_RETAIN_FOREVER UINT64_MAX
+#define IMDB_RETAIN_DEFAULT_US (24ull * 3600 * 1000000) /* a table created without RETENTION (the user, 2026-10-28) */
+static inline bool imdb_retention_ok(uint64_t us)
+{
+    return us == IMDB_RETAIN_FOREVER || (us >= IMDB_RETAIN_MIN_US && us <= IMDB_RETAIN_MAX_US);
+}
 
 enum { IMDB_WRITER_ROTATE = 1, IMDB_WRITER_PROMOTE = 2 };
 
@@ -115,9 +142,11 @@ typedef struct imdb_op {
     uint32_t row_len;
     /* CREATE_TABLE */
     imdb_schema *schema;
-    /* CHECKPOINT / COMPACT */
+    /* CHECKPOINT / COMPACT; EXPIRE: purge_before is the new horizon; RETIRE: the boundary */
     uint8_t manifest[32];
     uint64_t purge_before;
+    /* SET_RETENTION */
+    uint64_t retention_us;
     /* ERASE */
     imdb_erase_ent *erase;
     uint32_t n_erase;
@@ -155,7 +184,7 @@ void imdb_genesis_hash(const uint8_t db_id[16], uint8_t out[32]);
 static inline bool imdb_op_has_payload(uint8_t code) { return code == IMDB_OP_INSERT || code == IMDB_OP_UPDATE; }
 static inline bool imdb_op_publishes_manifest(uint8_t code)
 {
-    return code == IMDB_OP_CHECKPOINT || code == IMDB_OP_COMPACT || code == IMDB_OP_ERASE;
+    return code == IMDB_OP_CHECKPOINT || code == IMDB_OP_COMPACT || code == IMDB_OP_ERASE || code == IMDB_OP_RETIRE;
 }
 
 /* Encoding (writer side). */
@@ -214,6 +243,12 @@ int imdb_commit_decode_header(const uint8_t *h, size_t hlen, imdb_commit_rec *c,
 static inline uint64_t imdb_frame_seq(const uint8_t *frame) { return imdb_get_le64(frame + IMDB_FRAME_HDR + 5); }
 /* The commit hash from a frame's descriptor (the frame passed imdb_frame_scan). */
 static inline const uint8_t *imdb_frame_hash(const uint8_t *frame) { return frame + IMDB_FRAME_HDR + 13; }
+/* The commit's time from its header (a frame this process built, or one decoded whole). */
+static inline uint64_t imdb_frame_time(const uint8_t *frame)
+{
+    const uint8_t *body = frame + IMDB_FRAME_HDR;
+    return imdb_get_le64(body + imdb_body_desc_len(body) + 10); /* past the header's version, alg and seq */
+}
 
 typedef enum imdb_scan_status {
     IMDB_SCAN_FRAME = 0,   /* a valid frame at [off, off+len) */

@@ -47,6 +47,7 @@ enum {
     ST_SHOW_TABLES, ST_SHOW_DIGEST, ST_SHOW_HISTORY, ST_SHOW_LOG, ST_SHOW_LAKE, ST_SHOW_IDENTITY, ST_SHOW_REPLICAS, ST_SHOW_REPLICATION, ST_SHOW_ERASURE, ST_SHOW_MEMORY, ST_SET, ST_EMPTY,
     ST_SAVEPOINT, ST_ROLLBACK_TO, ST_RELEASE, ST_SET_TXN,
     ST_CREATE_INDEX, ST_DROP_INDEX, ST_SHOW_INDEXES,
+    ST_ALTER_RETENTION, ST_SHOW_RETENTION,
 };
 
 /* isolation levels as written (the executor maps them; SERIALIZABLE is refused for now) */
@@ -61,6 +62,8 @@ typedef struct sql_stmt {
     char table2[IMDB_MAX_IDENT + 1], alias2[IMDB_MAX_IDENT + 1];
     char on_qual[2][IMDB_MAX_IDENT + 1], on_col[2][IMDB_MAX_IDENT + 1];
     imdb_schema schema;                         /* CREATE */
+    bool has_retention;                         /* CREATE TABLE ... RETENTION, ALTER TABLE ... SET RETENTION */
+    uint64_t retention_us;
     char index_name[IMDB_MAX_IDENT + 1];        /* CREATE INDEX, DROP INDEX */
     char index_cols[IMDB_MAX_INDEX_COLS][IMDB_MAX_IDENT + 1]; /* CREATE [UNIQUE] INDEX: the key's columns */
     uint8_t index_ncols;

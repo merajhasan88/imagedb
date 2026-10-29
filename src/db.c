@@ -19,6 +19,7 @@
 #include "logdir.h"
 #include "pool.h"
 #include "repl.h"
+#include "seed.h"
 #include "writer.h"
 #include "vendor/monocypher/monocypher.h"
 
@@ -41,13 +42,13 @@ static int write_meta(int dirfd, const imdb_identity *id, bool replica, imdb_err
     if (id->has_root) imdb_hex(id->root, IMDB_PUBKEY_LEN, rhex);
     if (id->digest_alg != IMDB_DIGEST_ALG_LTHASH16 && id->digest_alg != IMDB_DIGEST_ALG_LTHASH16_TREE)
         return imdb_fail(e, IMDB_ERR_STATE, "META: no digest algorithm to record");
-    int n = snprintf(buf, sizeof buf, "imagedb-meta 4\ndb_id %s\nrole %s\nwriter %s\n%s%s%sdigest %u\n", hex,
+    int n = snprintf(buf, sizeof buf, "imagedb-meta 5\ndb_id %s\nrole %s\nwriter %s\n%s%s%sdigest %u\n", hex,
                      replica ? "replica" : "primary", whex, id->has_root ? "root " : "", rhex, id->has_root ? "\n" : "",
                      (unsigned)id->digest_alg);
     return imdb_write_file_atomic(dirfd, META_NAME, buf, (size_t)n, 0600, e);
 }
 
-/* "digest <1 or 2>\n" at r, the last line of META 4 and identity 3 */
+/* "digest <1 or 2>\n" at r, the last line of META 5 and identity 3 */
 static int meta_alg(const char **r, size_t *left, uint8_t *alg, imdb_err *e)
 {
     if (*left != 9 || memcmp(*r, "digest ", 7) != 0 || (*r)[7] < '0' || (*r)[7] > '9' || (*r)[8] != '\n')
@@ -79,20 +80,20 @@ static int read_meta(int dirfd, imdb_identity *id, bool *replica, imdb_err *e)
     size_t n;
     memset(id, 0, sizeof *id);
     if (imdb_read_file_at(dirfd, META_NAME, &p, &n, 4096, e)) return e->code;
-    /* strict, fixed layout */
-    static const char v1[] = "imagedb-meta 1\n";
-    static const char a2[] = "imagedb-meta 2\ndb_id ", a3[] = "imagedb-meta 3\ndb_id ", a4[] = "imagedb-meta 4\ndb_id ";
+    /* strict, fixed layout; 5 only: versions 1 to 4 are earlier formats (5: the retention's, 2026-10-29), and no
+     * reader is kept for them before the format freeze */
+    static const char old[] = "imagedb-meta ", a5[] = "imagedb-meta 5\ndb_id ";
     const char *s = (const char *)p;
     int rc = IMDB_OK;
-    size_t idend = sizeof a2 - 1 + 32;
-    bool v3 = n >= sizeof a3 - 1 && memcmp(s, a3, sizeof a3 - 1) == 0;
-    bool v4 = n >= sizeof a4 - 1 && memcmp(s, a4, sizeof a4 - 1) == 0;
-    if (n >= sizeof v1 - 1 && memcmp(s, v1, sizeof v1 - 1) == 0) {
+    size_t idend = sizeof a5 - 1 + 32;
+    bool v5 = n >= sizeof a5 - 1 && memcmp(s, a5, sizeof a5 - 1) == 0;
+    if (!v5 && n > sizeof old && memcmp(s, old, sizeof old - 1) == 0 && s[sizeof old - 1] >= '1' &&
+        s[sizeof old - 1] <= '4' && s[sizeof old] == '\n') {
         rc = imdb_fail(e, IMDB_ERR_UNSUPPORTED,
-                       "META: imagedb-meta 1: this directory was created by imagedb v0.1 (log format 1), "
-                       "which this version does not open");
-    } else if (n < idend + 1 || (!v3 && !v4 && memcmp(s, a2, sizeof a2 - 1) != 0) ||
-               !imdb_unhex(s + sizeof a2 - 1, 32, id->db_id, 16) || s[idend] != '\n') {
+                       "META: imagedb-meta %c: this directory was made by an imagedb before the retention format "
+                       "(META 5), which this version does not open",
+                       s[sizeof old - 1]);
+    } else if (!v5 || n < idend + 1 || !imdb_unhex(s + sizeof a5 - 1, 32, id->db_id, 16) || s[idend] != '\n') {
         rc = imdb_fail(e, IMDB_ERR_CORRUPT, "META: malformed");
     } else {
         const char *r = s + idend + 1;
@@ -103,13 +104,12 @@ static int read_meta(int dirfd, imdb_identity *id, bool *replica, imdb_err *e)
         r += 13;
         left = left >= 13 ? left - 13 : 0;
         if (!rc && !meta_key(&r, &left, "writer", id->writer)) rc = imdb_fail(e, IMDB_ERR_CORRUPT, "META: malformed writer key");
-        /* version 3 always has a root line; version 4 has one when its key begins the next line */
-        bool root = v3 || (v4 && left >= 5 && memcmp(r, "root ", 5) == 0);
+        /* a root line when its key begins the next line */
+        bool root = left >= 5 && memcmp(r, "root ", 5) == 0;
         if (!rc && root && !(id->has_root = meta_key(&r, &left, "root", id->root)))
             rc = imdb_fail(e, IMDB_ERR_CORRUPT, "META: malformed root key");
-        id->digest_alg = IMDB_DIGEST_ALG_LTHASH16; /* versions 2 and 3 */
         imdb_err ea = {0};
-        if (!rc && v4 && meta_alg(&r, &left, &id->digest_alg, &ea)) rc = imdb_fail(e, ea.code, "META: %s", ea.msg);
+        if (!rc && meta_alg(&r, &left, &id->digest_alg, &ea)) rc = imdb_fail(e, ea.code, "META: %s", ea.msg);
         if (!rc && left) rc = imdb_fail(e, IMDB_ERR_CORRUPT, "META: trailing bytes");
     }
     imdb_free(p);
@@ -342,6 +342,7 @@ int imdb_table_new(imdb_db *db, const imdb_schema *s, imdb_err *e)
         return e->code;
     }
     imdb_lthash_zero(&t->digest);
+    t->retention_us = IMDB_RETAIN_FOREVER; /* until its op 16, which the same commit carries (log.h) */
     db->t[db->nt++] = t;
     return IMDB_OK;
 }
@@ -422,7 +423,7 @@ uint64_t imdb_ver_next_cap(const imdb_table *t)
 
 uint64_t imdb_ver_bytes(const imdb_table *t)
 {
-    return t->capver * (sizeof(imdb_version) + sizeof(imdb_version_cold)) +
+    return (t->capver - (uint64_t)t->nfreed * IMDB_VCHUNK) * (sizeof(imdb_version) + sizeof(imdb_version_cold)) +
            (uint64_t)t->capchunk * (sizeof *t->vh + sizeof *t->vc);
 }
 
@@ -476,8 +477,48 @@ int imdb_ver_reserve(imdb_table *t, uint64_t n, imdb_err *e)
     return IMDB_OK;
 }
 
+int imdb_ver_reserve_sparse(imdb_table *t, uint64_t n, imdb_err *e)
+{
+    if (t->nchunk || t->nver) return imdb_fail(e, IMDB_ERR_STATE, "version store not empty");
+    if (n > IMDB_MAX_VERSIONS) return imdb_fail(e, IMDB_ERR_LIMIT, "a table of more than %llu versions", IMDB_MAX_VERSIONS);
+    if (n <= IMDB_VCHUNK) { /* one chunk, allocated: a small table stays dense */
+        if (chunk0_grow(t, n ? n : 1, e)) return e->code;
+        for (uint64_t vid = 0; vid < n; vid++) t->vh[0][vid].flags = IMDB_V_RETIRED;
+        return IMDB_OK;
+    }
+    uint64_t nc = (n + IMDB_VCHUNK - 1) >> IMDB_VCHUNK_BITS;
+    imdb_version **h = imdb_realloc_array(t->vh, t->capchunk, nc, sizeof *h, e);
+    if (!h) return e->code;
+    t->vh = h;
+    imdb_version_cold **c = imdb_realloc_array(t->vc, t->capchunk, nc, sizeof *c, e);
+    if (!c) return e->code; /* vh has the room already */
+    t->vc = c;
+    t->capchunk = t->nchunk = (uint32_t)nc;
+    t->capver = nc << IMDB_VCHUNK_BITS;
+    t->nfreed = (uint32_t)nc;
+    return imdb_ver_chunk_need(t, (uint32_t)(nc - 1), e);
+}
+
+int imdb_ver_chunk_need(imdb_table *t, uint32_t k, imdb_err *e)
+{
+    if (t->vh[k]) return IMDB_OK;
+    imdb_version *h = imdb_realloc_array(NULL, 0, IMDB_VCHUNK, sizeof *h, e);
+    imdb_version_cold *c = h ? imdb_realloc_array(NULL, 0, IMDB_VCHUNK, sizeof *c, e) : NULL;
+    if (!c) {
+        imdb_free(h);
+        return e->code;
+    }
+    for (uint64_t i = 0; i < IMDB_VCHUNK; i++) h[i].flags = IMDB_V_RETIRED; /* until a row names it */
+    t->vh[k] = h;
+    t->vc[k] = c;
+    t->nfreed--;
+    return IMDB_OK;
+}
+
 int imdb_ver_push(imdb_table *t, imdb_err *e)
 {
+    if (t->nver >= IMDB_MAX_VERSIONS) /* a manifest of more could not be loaded (lake.c) */
+        return imdb_fail(e, IMDB_ERR_LIMIT, "table %s holds %llu versions, the most a table may", t->s.name, IMDB_MAX_VERSIONS);
     if (t->nver == t->capver) {
         int rc = t->capver < IMDB_VCHUNK ? chunk0_grow(t, imdb_ver_next_cap(t), e) : chunk_add(t, e);
         if (rc) return rc;
@@ -545,7 +586,8 @@ static int vlist_push(imdb_vlist *l, uint64_t vid, imdb_err *e)
 static int unique_link(imdb_table *t, imdb_index *ix, uint64_t vid, imdb_err *e);
 static void unique_unlink_newest(imdb_table *t, imdb_index *ix, uint64_t vid);
 
-int imdb_index_version(imdb_table *t, uint64_t vid, imdb_undo *u, imdb_err *e)
+/* the key map and its chain, and the subject index */
+static int index_key_subject(imdb_table *t, uint64_t vid, imdb_undo *u, imdb_err *e)
 {
     imdb_version *v = imdb_vh(t, vid);
     imdb_value key;
@@ -564,9 +606,73 @@ int imdb_index_version(imdb_table *t, uint64_t vid, imdb_undo *u, imdb_err *e)
         imdb_version_key(t, vid, t->s.subject, &sv);
         if (imdb_index_subject(t, vid, &sv, u, e)) return e->code;
     }
+    return IMDB_OK;
+}
+
+int imdb_index_version(imdb_table *t, uint64_t vid, imdb_undo *u, imdb_err *e)
+{
+    if (index_key_subject(t, vid, u, e)) return e->code;
     for (uint32_t k = 0; k < t->nidx; k++) /* the unique chains (the ordered structures catch up after the commit) */
         if (t->idx[k].ux && unique_link(t, &t->idx[k], vid, e)) return e->code;
     return IMDB_OK;
+}
+
+int imdb_table_reindex(imdb_table *t, imdb_err *e)
+{
+    imdb_hmap_free(&t->pk);
+    imdb_hmap_free(&t->subj);
+    for (uint32_t i = 0; i < t->nsubj; i++) imdb_free(t->subj_lists[i].v);
+    imdb_free(t->subj_lists);
+    t->subj_lists = NULL;
+    t->nsubj = t->capsubj = 0;
+    if (imdb_hmap_init(&t->pk, t->s.cols[t->s.pk].type, e) ||
+        (t->s.subject >= 0 && imdb_hmap_init(&t->subj, t->s.cols[t->s.subject].type, e)))
+        return e->code;
+    int rc = IMDB_OK;
+    for (uint64_t vid = imdb_v_skip(t, 0); vid < t->nver && !rc; vid = imdb_v_skip(t, vid + 1)) {
+        if (!imdb_v_present(t, vid)) continue;
+        imdb_version *v = imdb_vh(t, vid);
+        v->pk_prev = IMDB_NONE;
+        if (!(v->flags & (IMDB_V_STUB | IMDB_V_PURGED))) {
+            rc = index_key_subject(t, vid, NULL, e);
+        } else if (!(v->flags & IMDB_V_STUB) && t->s.subject >= 0) {
+            imdb_value sv; /* purged history: the tombstone names its subject */
+            if (imdb_seg_value(t, v, t->s.subject, &sv) == IMDB_OK) rc = imdb_index_subject(t, vid, &sv, NULL, e);
+        }
+    }
+    return rc;
+}
+
+int imdb_retire_table(imdb_table *t, uint64_t boundary, imdb_err *e)
+{
+    for (uint32_t k = 0; k < t->nchunk; k++) {
+        if (!t->vh[k]) continue;
+        uint64_t lo = (uint64_t)k << IMDB_VCHUNK_BITS, hi = lo + chunk_cap(t, k);
+        if (hi > t->nver) hi = t->nver;
+        bool held = false;
+        for (uint64_t vid = lo; vid < hi; vid++) {
+            imdb_version *v = imdb_vh(t, vid);
+            if (v->flags & IMDB_V_RETIRED) continue;
+            if (v->end == IMDB_LIVE || v->end > boundary) {
+                held = true;
+                continue;
+            }
+            memset(v, 0, sizeof *v); /* its row left the lake with the RETIRE's plan; nothing of it stays */
+            v->flags = IMDB_V_RETIRED;
+            imdb_wipe(imdb_vc(t, vid), sizeof(imdb_version_cold));
+            t->nretired++;
+        }
+        if (held || k + 1 == t->nchunk) continue; /* the last chunk stays: vids are appended there */
+        uint64_t n = chunk_cap(t, k);
+        imdb_wipe(t->vh[k], n * sizeof(imdb_version));
+        imdb_wipe(t->vc[k], n * sizeof(imdb_version_cold));
+        imdb_free(t->vh[k]);
+        imdb_free(t->vc[k]);
+        t->vh[k] = NULL;
+        t->vc[k] = NULL;
+        t->nfreed++;
+    }
+    return imdb_table_reindex(t, e);
 }
 
 /* Appends vid to its subject's list (all versions ever written, for per-user
@@ -837,8 +943,12 @@ static void rc_run(void *ctx, size_t w)
     imdb_lthash el;
     imdb_lthash_zero(&j->acc);
     for (uint64_t vid = j->lo; vid < j->hi; vid++) {
+        if (!j->t->vh[vid >> IMDB_VCHUNK_BITS]) { /* a freed chunk: on to the next */
+            vid |= IMDB_VCHUNK - 1;
+            continue;
+        }
         const imdb_version *v = imdb_vh(j->t, vid);
-        if (v->flags & IMDB_V_PURGED) continue;
+        if (v->flags & (IMDB_V_PURGED | IMDB_V_RETIRED)) continue;
         if (v->begin <= j->snap && j->snap < v->end) { /* stubs count: their commitment stays in the digest */
             imdb_lthash_element(j->alg, imdb_vc(j->t, vid)->commit, &el);
             imdb_lthash_add(&j->acc, &el);
@@ -925,6 +1035,25 @@ int imdb_check_state(imdb_db *db, imdb_err *e)
  * snapshot's commit; the older entries are read from the log headers only if
  * something asks for them (AS OF TIMESTAMP, SHOW LOG). */
 
+void imdb_ci_retire(imdb_db *db, uint64_t boundary)
+{
+    if (boundary < db->ci_first || !db->nci) return;
+    uint64_t drop = boundary + 1 - db->ci_first;
+    if (drop > db->nci) drop = db->nci; /* a replay's RETIRE installs before its own commit joins */
+    memmove(db->ci, db->ci + drop, (size_t)(db->nci - drop) * sizeof *db->ci);
+    db->nci -= drop;
+    db->ci_first += drop;
+    if (db->capci > 4 * db->nci + 1024) { /* the memory back: commits at or below the boundary are not answered */
+        uint64_t ncap = 2 * db->nci + 256;
+        imdb_err e2 = {0};
+        imdb_commit_info *n = imdb_realloc_array(db->ci, db->nci, ncap, sizeof *n, &e2);
+        if (n) {
+            db->ci = n;
+            db->capci = ncap;
+        } /* else it keeps its room, which is no error */
+    }
+}
+
 int imdb_ci_push(imdb_db *db, uint64_t time_us, const uint8_t hash[32], const uint8_t digest[32], imdb_err *e)
 {
     if (db->nci == db->capci) {
@@ -950,14 +1079,18 @@ typedef struct ci_load {
 /* Reads commits 1 .. ci_first-1 from the log and puts them in front. */
 int imdb_ci_load_all(imdb_db *db, imdb_err *e)
 {
-    if (db->ci_first <= 1) return IMDB_OK;
+    /* only the commits past the boundary (and this copy's floor) are kept: the others are retired, and imdb_ci_at
+     * refuses them; the walk authenticates from the genesis, or past a cut from the floor's hash (FLOOR) */
+    uint64_t base = db->boundary > db->log_floor ? db->boundary : db->log_floor;
+    if (db->ci_first <= base + 1) return IMDB_OK;
     uint64_t want = db->ci_first - 1;
-    imdb_commit_info *v = imdb_alloc_array(want + db->nci, sizeof *v, e);
+    imdb_commit_info *v = imdb_alloc_array(want - base + db->nci, sizeof *v, e);
     if (!v) return e->code;
-    uint64_t got = 0;
+    uint64_t got = db->log_floor; /* past a cut the walk begins at the floor's successor, chained from its hash */
     uint64_t last_time = 0;
     uint8_t prev[32];
-    imdb_genesis_hash(db->db_id, prev);
+    if (db->log_floor) memcpy(prev, db->floor_hash, 32);
+    else imdb_genesis_hash(db->db_id, prev);
     int rc = IMDB_OK;
     /* The older headers are authenticated by the hash chain alone: c.hash is
      * recomputed from each header's bytes, each header names its predecessor, and
@@ -967,6 +1100,7 @@ int imdb_ci_load_all(imdb_db *db, imdb_err *e)
      * the first AS OF TIMESTAMP and nothing else. */
     for (size_t si = 0; si < db->nsegs && got <= want && !rc; si++) {
         if (db->segs[si] > db->ci_first) break;
+        if (si + 1 < db->nsegs && db->segs[si + 1] - 1 <= db->log_floor) continue; /* below the floor, not yet cut */
         imdb_logseg seg;
         if ((rc = imdb_logseg_load(db->logdirfd, db->segs[si], &seg, e))) break;
         const uint8_t *buf = seg.buf;
@@ -986,10 +1120,10 @@ int imdb_ci_load_all(imdb_db *db, imdb_err *e)
             else if (got == want && (!db->nci || memcmp(c.hash, db->ci[0].hash, 32) != 0))
                 rc = imdb_fail(e, IMDB_ERR_AUTH, "commit index: the log's history does not reach the signed snapshot commit");
             else {
-                if (got < want) {
-                    v[got].time_us = c.time_us;
-                    memcpy(v[got].hash, c.hash, 32);
-                    memcpy(v[got].digest, c.digest, 32);
+                if (got >= base && got < want) {
+                    v[got - base].time_us = c.time_us;
+                    memcpy(v[got - base].hash, c.hash, 32);
+                    memcpy(v[got - base].digest, c.digest, 32);
                 }
                 memcpy(prev, c.hash, 32);
                 last_time = c.time_us;
@@ -1007,13 +1141,71 @@ int imdb_ci_load_all(imdb_db *db, imdb_err *e)
         imdb_free(v);
         return rc;
     }
-    if (db->nci) memcpy(v + want, db->ci, db->nci * sizeof *v);
+    if (db->nci) memcpy(v + (want - base), db->ci, db->nci * sizeof *v);
     imdb_free(db->ci);
     db->ci = v;
-    db->nci += want;
+    db->nci += want - base;
     db->capci = db->nci;
-    db->ci_first = 1;
+    db->ci_first = base + 1;
     return IMDB_OK;
+}
+
+int imdb_log_commit_header(imdb_db *db, uint64_t seq, imdb_buf *hdr, uint8_t sig[IMDB_SIG_LEN], imdb_err *e)
+{
+    size_t si = imdb_logseg_find(db->segs, db->nsegs, seq);
+    if (si == db->nsegs) return imdb_fail(e, IMDB_ERR_NOTFOUND, "commit %llu is in no log segment", (unsigned long long)seq);
+    imdb_logseg seg;
+    int rc = imdb_logseg_load(db->logdirfd, db->segs[si], &seg, e);
+    if (rc) return rc;
+    bool found = false;
+    for (size_t off = 0; !found && !rc;) {
+        size_t flen = 0;
+        imdb_err e2 = {0};
+        if (imdb_logseg_scan(&seg, off, &flen, &e2) != IMDB_SCAN_FRAME) break;
+        const uint8_t *frame = seg.buf + off;
+        if (imdb_frame_seq(frame) == seq) {
+            imdb_commit_rec c;
+            if (!(rc = imdb_frame_decode_body(frame + IMDB_FRAME_HDR, flen - IMDB_FRAME_HDR, &c, e))) {
+                const uint8_t *body = frame + IMDB_FRAME_HDR;
+                hdr->len = 0;
+                imdb_buf_put(hdr, body + imdb_body_desc_len(body), c.hlen);
+                memcpy(sig, c.sig, IMDB_SIG_LEN);
+                imdb_commit_free(&c);
+                rc = imdb_buf_check(hdr, e);
+            }
+            found = true;
+        }
+        off += flen;
+    }
+    imdb_logseg_free(&seg);
+    if (!rc && !found) rc = imdb_fail(e, IMDB_ERR_NOTFOUND, "commit %llu is not in its log segment", (unsigned long long)seq);
+    return rc;
+}
+
+int imdb_log_cut(imdb_db *db, imdb_err *e)
+{
+    if (!db->log_floor || db->read_only) return IMDB_OK;
+    /* a segment goes only below both the floor and the published snapshot: an open always replays the rest */
+    uint64_t upto = db->log_floor < db->lake_seq ? db->log_floor : db->lake_seq;
+    size_t n = 0;
+    while (n + 1 < db->nsegs && db->segs[n + 1] - 1 <= upto) n++;
+    if (!n) return IMDB_OK;
+    size_t gone = 0;
+    int rc = IMDB_OK;
+    for (; gone < n; gone++) { /* oldest first: a crash leaves the log a contiguous suffix */
+        char name[IMDB_LOGSEG_NAME + 1];
+        imdb_logseg_name(db->segs[gone], name);
+        if (imdb_io_unlinkat(db->logdirfd, name, 0) != 0 && errno != ENOENT) {
+            rc = imdb_fail(e, IMDB_ERR_IO, "log segment %s: %s", name, strerror(errno));
+            break;
+        }
+    }
+    /* the list follows the disk, a cut stopped part way too: a redaction skips only what no file holds */
+    memmove(db->segs, db->segs + gone, (db->nsegs - gone) * sizeof *db->segs);
+    memmove(db->seg_time, db->seg_time + gone, (db->nsegs - gone) * sizeof *db->seg_time);
+    db->nsegs -= gone;
+    if (!rc && imdb_sync_dir(db->logdirfd, e)) rc = e->code;
+    return rc;
 }
 
 const imdb_commit_info *imdb_ci_at(imdb_db *db, uint64_t seq, imdb_err *e)
@@ -1022,15 +1214,22 @@ const imdb_commit_info *imdb_ci_at(imdb_db *db, uint64_t seq, imdb_err *e)
         imdb_fail(e, IMDB_ERR_NOTFOUND, "no commit %llu", (unsigned long long)seq);
         return NULL;
     }
+    if (seq <= db->boundary) { /* the boundary's RETIRE dropped what it alone could answer */
+        imdb_fail(e, IMDB_ERR_HISTORY, "commit %llu is retired (the boundary is commit %llu)", (unsigned long long)seq,
+                  (unsigned long long)db->boundary);
+        return NULL;
+    }
     if (seq < db->ci_first && imdb_ci_load_all(db, e)) return NULL;
     return &db->ci[seq - db->ci_first];
 }
 
 int imdb_seq_at_time(imdb_db *db, uint64_t time_us, uint64_t *seq, imdb_err *e)
 {
-    /* commits before ci_first are all older than ci[0]: count them without
-     * loading them unless the time falls before ci[0] */
-    if (db->ci_first > 1 && (db->nci == 0 || time_us < db->ci[0].time_us) && imdb_ci_load_all(db, e)) return e->code;
+    /* commits before ci_first are all older than ci[0]: count them without loading them unless the time falls
+     * before ci[0]; the index then begins past the boundary, and a time before it all names the boundary itself,
+     * which every horizon refuses (sql_exec.c checks the history next) */
+    if (db->ci_first > db->boundary + 1 && (db->nci == 0 || time_us < db->ci[0].time_us) && imdb_ci_load_all(db, e))
+        return e->code;
     uint64_t lo = 0, hi = db->nci; /* commits in the index with time <= time_us */
     while (lo < hi) {
         uint64_t mid = lo + (hi - lo) / 2;
@@ -1179,7 +1378,6 @@ static void undo_one(imdb_db *db, const imdb_undo *u)
         imdb_vh(t, u->vid)->end = IMDB_LIVE;
         imdb_seg_set_end(t, imdb_vh(t, u->vid), IMDB_LIVE);
         t->live++;
-        if (t->ended) t->ended--;
         break;
     }
     case UNDO_CREATE:
@@ -1227,11 +1425,19 @@ void imdb_rollback(imdb_db *db)
     imdb_savepoint sp = {0, 0};
     imdb_savepoint_restore(db, sp);
     db->in_txn = false;
+    db->tx_time = 0;
 }
 
 int imdb_create_table(imdb_db *db, imdb_schema *s, imdb_err *e)
 {
+    return imdb_create_table_ex(db, s, IMDB_RETAIN_DEFAULT_US, e);
+}
+
+int imdb_create_table_ex(imdb_db *db, imdb_schema *s, uint64_t retention_us, imdb_err *e)
+{
     if (!db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "no transaction");
+    if (!imdb_retention_ok(retention_us))
+        return imdb_fail(e, IMDB_ERR_INVALID, "RETENTION is a second to a century, or FOREVER");
     s->id = db->nt;
     if (imdb_table_new(db, s, e)) return e->code;
     imdb_undo u = {.kind = UNDO_CREATE, .table = s->id};
@@ -1251,6 +1457,43 @@ int imdb_create_table(imdb_db *db, imdb_schema *s, imdb_err *e)
         return e->code;
     }
     *op->schema = *s;
+    /* its retention at once after it (log.h); tx_push may move db->tx, so op is not used again */
+    imdb_op *ro = tx_push(db, e);
+    if (!ro) {
+        tx_op_free(&db->tx[db->ntx - 1]);
+        db->ntx--;
+        db->nundo--;
+        imdb_table_free(db->t[--db->nt]);
+        return e->code;
+    }
+    ro->code = IMDB_OP_SET_RETENTION;
+    ro->table = s->id;
+    ro->retention_us = retention_us;
+    return IMDB_OK;
+}
+
+int imdb_set_retention(imdb_db *db, imdb_table *t, uint64_t retention_us, imdb_err *e)
+{
+    if (!db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "no transaction");
+    if (!imdb_retention_ok(retention_us))
+        return imdb_fail(e, IMDB_ERR_INVALID, "RETENTION is a second to a century, or FOREVER");
+    imdb_op *op = tx_push(db, e);
+    if (!op) return e->code;
+    op->code = IMDB_OP_SET_RETENTION;
+    op->table = t->s.id;
+    op->retention_us = retention_us; /* the table's from the commit (install), so a rollback has nothing to undo */
+    return IMDB_OK;
+}
+
+int imdb_expire_op(imdb_db *db, uint32_t table, uint64_t before, imdb_err *e)
+{
+    if (!db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "no transaction");
+    if (table >= db->nt) return imdb_fail(e, IMDB_ERR_INVALID, "EXPIRE of table %u: no such table", table);
+    imdb_op *op = tx_push(db, e);
+    if (!op) return e->code;
+    op->code = IMDB_OP_EXPIRE;
+    op->table = table;
+    op->purge_before = before; /* the horizon from the commit (install) */
     return IMDB_OK;
 }
 
@@ -1300,13 +1543,31 @@ int imdb_index_add(imdb_table *t, const imdb_index_def *d, imdb_err *e)
  * is enforced): the newest committed version is the only one that can be live. */
 typedef struct imdb_uidx {
     imdb_hmap map;
-    uint64_t *prev; /* per vid: the version before it in its chain, or IMDB_NONE */
-    uint64_t cap;   /* prev's entries: at least the version array's capacity */
+    /* per vid: the version before it in its chain, or IMDB_NONE; in the version store's chunks (chunk 0
+     * grows from 64 entries), each allocated only once a vid in it is linked, so a retired range costs
+     * nothing (RETIRE's rebuild links only the versions present) */
+    uint64_t **prev;
+    uint32_t nprev;  /* chunk slots */
+    uint64_t cap0;   /* chunk 0's entries */
+    uint64_t nfull;  /* chunks past 0 allocated */
 } imdb_uidx;
+
+static uint64_t *uprev(const imdb_uidx *u, uint64_t vid)
+{
+    return &u->prev[vid >> IMDB_VCHUNK_BITS][vid & (IMDB_VCHUNK - 1)];
+}
+
+/* vid has a slot (unique_reserve gave it one) */
+static bool uprev_has(const imdb_uidx *u, uint64_t vid)
+{
+    uint64_t k = vid >> IMDB_VCHUNK_BITS;
+    return k < u->nprev && u->prev[k] && (k || vid < u->cap0);
+}
 
 static void unique_free(imdb_uidx *u)
 {
     imdb_hmap_free(&u->map); /* wipes the key copies: a key may be an erased value */
+    for (uint32_t k = 0; k < u->nprev; k++) imdb_free(u->prev[k]);
     imdb_free(u->prev);
     memset(u, 0, sizeof *u);
 }
@@ -1369,16 +1630,33 @@ static int ukey(const imdb_index *ix, const imdb_value *v, imdb_buf *b, imdb_val
     return IMDB_OK;
 }
 
-/* prev's room for vid, following the version array's capacity */
+/* a slot for vid: its chunk allocated (IMDB_NONE in every entry), chunk 0 doubling up to a whole chunk */
 static int unique_reserve(imdb_table *t, imdb_uidx *u, uint64_t vid, imdb_err *e)
 {
-    if (vid < u->cap) return IMDB_OK;
-    uint64_t ncap = t->capver > vid ? t->capver : vid + 1;
-    uint64_t *np = imdb_realloc_array(u->prev, u->cap, ncap, sizeof *np, e);
-    if (!np) return e->code;
-    for (uint64_t i = u->cap; i < ncap; i++) np[i] = IMDB_NONE;
-    u->prev = np;
-    u->cap = ncap;
+    (void)t;
+    if (uprev_has(u, vid)) return IMDB_OK;
+    uint64_t k = vid >> IMDB_VCHUNK_BITS;
+    if (k >= u->nprev) {
+        uint64_t nc = u->nprev ? (uint64_t)u->nprev * 2 : 4;
+        if (nc <= k) nc = k + 1;
+        if (nc > UINT32_MAX) return imdb_fail(e, IMDB_ERR_LIMIT, "too many versions");
+        uint64_t **np = imdb_realloc_array(u->prev, u->nprev, nc, sizeof *np, e);
+        if (!np) return e->code;
+        u->prev = np;
+        u->nprev = (uint32_t)nc;
+    }
+    uint64_t from = k ? 0 : u->cap0, to = IMDB_VCHUNK;
+    if (!k) { /* chunk 0 grows as the version store's does: a small table stays small */
+        to = u->cap0 ? u->cap0 : 64;
+        while (to <= vid) to *= 2;
+        if (to > IMDB_VCHUNK) to = IMDB_VCHUNK;
+    }
+    uint64_t *c = imdb_realloc_array(u->prev[k], from, to, sizeof *c, e);
+    if (!c) return e->code;
+    for (uint64_t i = from; i < to; i++) c[i] = IMDB_NONE;
+    if (k) u->nfull++;
+    else u->cap0 = to;
+    u->prev[k] = c;
     return IMDB_OK;
 }
 
@@ -1390,19 +1668,19 @@ int imdb_index_unique_build(imdb_table *t, imdb_index *ix, imdb_err *e)
     unique_free(u);
     uint8_t kt = ix->d.ncols == 1 && t->s.cols[ix->d.cols[0]].type != IMDB_T_TEXT ? IMDB_T_INT64 : IMDB_T_TEXT;
     if (imdb_hmap_init(&u->map, kt, e)) return e->code;
-    if (unique_reserve(t, u, t->nver ? t->nver - 1 : 0, e)) return e->code;
     imdb_buf b;
     imdb_buf_init(&b);
     int rc = IMDB_OK;
-    for (uint64_t vid = 0; vid < t->nver && !rc; vid++) {
+    for (uint64_t vid = imdb_v_skip(t, 0); vid < t->nver && !rc; vid = imdb_v_skip(t, vid + 1)) {
+        if (!imdb_v_present(t, vid)) continue;
         const imdb_version *v = imdb_vh(t, vid);
         imdb_value vals[IMDB_MAX_INDEX_COLS], k;
         if (v->end != IMDB_LIVE || !ukey_vals_version(t, vid, ix, vals)) continue;
         if ((rc = ukey(ix, vals, &b, &k, e))) break;
         if (imdb_hmap_get(&u->map, &k))
             rc = imdb_fail(e, IMDB_ERR_CONSTRAINT, "table %s holds a key of unique index %s twice", t->s.name, ix->d.name);
-        else
-            rc = imdb_hmap_put(&u->map, &k, vid, e);
+        else /* its slot (IMDB_NONE: the chain begins with it), then the key */
+            rc = unique_reserve(t, u, vid, e) ? e->code : imdb_hmap_put(&u->map, &k, vid, e);
     }
     imdb_buf_wipe_free(&b);
     return rc;
@@ -1420,7 +1698,7 @@ static int unique_link(imdb_table *t, imdb_index *ix, uint64_t vid, imdb_err *e)
     int rc = ukey(ix, vals, &b, &k, e);
     if (!rc) {
         uint64_t *head = imdb_hmap_get(&u->map, &k);
-        u->prev[vid] = head ? *head : IMDB_NONE;
+        *uprev(u, vid) = head ? *head : IMDB_NONE;
         rc = imdb_hmap_put(&u->map, &k, vid, e);
     }
     imdb_buf_wipe_free(&b);
@@ -1432,18 +1710,18 @@ static void unique_unlink_newest(imdb_table *t, imdb_index *ix, uint64_t vid)
 {
     imdb_uidx *u = ix->ux;
     imdb_value vals[IMDB_MAX_INDEX_COLS], k;
-    if (vid >= u->cap || !ukey_vals_version(t, vid, ix, vals)) return;
+    if (!uprev_has(u, vid) || !ukey_vals_version(t, vid, ix, vals)) return;
     imdb_buf b;
     imdb_buf_init(&b);
     imdb_err e2 = {0};
     if (ukey(ix, vals, &b, &k, &e2) == IMDB_OK) {
         uint64_t *head = imdb_hmap_get(&u->map, &k);
         if (head && *head == vid) {
-            if (u->prev[vid] == IMDB_NONE) imdb_hmap_del(&u->map, &k);
-            else *head = u->prev[vid];
+            if (*uprev(u, vid) == IMDB_NONE) imdb_hmap_del(&u->map, &k);
+            else *head = *uprev(u, vid);
         }
     }
-    u->prev[vid] = IMDB_NONE;
+    *uprev(u, vid) = IMDB_NONE;
     imdb_buf_wipe_free(&b);
 }
 
@@ -1471,7 +1749,7 @@ static int unique_check(imdb_db *db, imdb_table *t, const uint8_t *row, size_t l
         if (!ukey_vals(ix, rv, vals)) continue;
         if ((rc = ukey(ix, vals, &b, &key, e))) break;
         uint64_t *head = imdb_hmap_get(&ix->ux->map, &key);
-        for (uint64_t vid = head ? *head : IMDB_NONE; vid != IMDB_NONE && !rc; vid = ix->ux->prev[vid]) {
+        for (uint64_t vid = head ? *head : IMDB_NONE; vid != IMDB_NONE && !rc; vid = *uprev(ix->ux, vid)) {
             const imdb_version *v = imdb_vh(t, vid);
             bool own = v->begin > db->seq;
             if (v->end == IMDB_LIVE && (own || v->begin <= snap))
@@ -1512,7 +1790,9 @@ int imdb_index_unique_replay(imdb_table *t, const imdb_value *row, uint64_t seq,
 uint64_t imdb_index_unique_bytes(const imdb_index *ix)
 {
     const imdb_uidx *u = ix->ux;
-    return u ? u->map.cap * sizeof *u->map.slots + u->map.key_bytes + u->cap * sizeof *u->prev : 0;
+    return u ? u->map.cap * sizeof *u->map.slots + u->map.key_bytes + (u->cap0 + u->nfull * IMDB_VCHUNK) * sizeof(uint64_t) +
+                   u->nprev * sizeof *u->prev
+             : 0;
 }
 
 bool imdb_index_key_of(const imdb_value *v, uint64_t *key)
@@ -1551,11 +1831,13 @@ bool imdb_index_version_key(imdb_table *t, uint64_t vid, const imdb_index *ix, u
 static int index_build(imdb_table *t, imdb_index *ix, imdb_err *e)
 {
     size_t w = (size_t)ix->d.ncols + 1;
-    uint64_t *all = imdb_alloc_array(t->idx_upto ? t->idx_upto : 1, imdb_oidx_entry_bytes(ix->d.ncols), e);
+    uint64_t held = 0; /* the versions still present, not every vid the table had (RETIRE) */
+    for (uint64_t vid = imdb_v_skip(t, 0); vid < t->idx_upto; vid = imdb_v_skip(t, vid + 1)) held += imdb_v_present(t, vid);
+    uint64_t *all = imdb_alloc_array(held ? held : 1, imdb_oidx_entry_bytes(ix->d.ncols), e);
     if (!all) return e->code;
     uint64_t n = 0;
-    for (uint64_t vid = 0; vid < t->idx_upto; vid++)
-        if (imdb_index_version_key(t, vid, ix, all + n * w)) all[n++ * w + ix->d.ncols] = vid;
+    for (uint64_t vid = imdb_v_skip(t, 0); vid < t->idx_upto; vid = imdb_v_skip(t, vid + 1))
+        if (imdb_v_present(t, vid) && imdb_index_version_key(t, vid, ix, all + n * w)) all[n++ * w + ix->d.ncols] = vid;
     if (!ix->ox) {
         if (!(ix->ox = imdb_alloc(sizeof *ix->ox, e))) {
             imdb_free(all);
@@ -1725,7 +2007,8 @@ static uint64_t insert_growth(const imdb_db *db, const imdb_table *t, size_t len
     for (uint32_t k = 0; k < t->nidx; k++) { /* a unique index: its links, its map, a TEXT key's copy */
         const imdb_uidx *u = t->idx[k].ux;
         if (!u) continue;
-        if (t->nver >= u->cap) g += (t->capver > t->nver ? t->capver : imdb_ver_next_cap(t)) * sizeof(uint64_t);
+        if (!uprev_has(u, t->nver)) /* the new vid's slot: chunk 0 doubled, or a whole chunk */
+            g += (t->nver < IMDB_VCHUNK ? (u->cap0 ? 2 * u->cap0 : 64) : IMDB_VCHUNK) * sizeof(uint64_t);
         if ((u->map.count + 1) * 4 > u->map.cap * 3) g += u->map.cap * sizeof(imdb_hslot);
         if (u->map.ktype == IMDB_T_TEXT) g += len + 4 * IMDB_MAX_INDEX_COLS;
     }
@@ -1885,7 +2168,6 @@ int imdb_delete(imdb_db *db, imdb_table *t, uint64_t vid, imdb_err *e)
     v->end = db->seq + 1;
     imdb_seg_set_end(t, v, v->end);
     t->live--;
-    t->ended++;
     op->code = IMDB_OP_DELETE;
     op->table = t->s.id;
     op->vid = vid;
@@ -1937,7 +2219,6 @@ int imdb_update_row(imdb_db *db, imdb_table *t, uint64_t vid, const uint8_t *row
     old->end = db->seq + 1;
     imdb_seg_set_end(t, old, old->end);
     t->live--;
-    t->ended++;
     uint64_t nvid;
     /* after the old version ended: a row that keeps its key does not collide with itself */
     if ((rc = unique_check(db, t, row, len, e)) || (rc = add_version(db, t, row, len, salt, &nvid, e))) {
@@ -2004,12 +2285,16 @@ int imdb_tx_add_writer(imdb_db *db, uint32_t epoch, const uint8_t new_pk[IMDB_PU
 
 int imdb_meta_write(imdb_db *db, bool replica, imdb_err *e) { return write_meta(db->dirfd, &db->meta, replica, e); }
 
+static int64_t g_clock_offset; /* imdb_clock_offset: tests only */
+
 static uint64_t now_us(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u + (uint64_t)g_clock_offset;
 }
+
+void imdb_clock_offset(int64_t us) { g_clock_offset = us; }
 
 uint64_t imdb_now_us(void) { return now_us(); }
 
@@ -2048,6 +2333,9 @@ static int log_new_segment(imdb_db *db, uint64_t seq, imdb_err *e)
         uint64_t *ns = imdb_realloc_array(db->segs, db->capsegs, nc, sizeof *ns, e);
         if (!ns) return e->code;
         db->segs = ns;
+        uint64_t *nt = imdb_realloc_array(db->seg_time, db->capsegs, nc, sizeof *nt, e);
+        if (!nt) return e->code; /* segs grew alone: harmless, capsegs still bounds both */
+        db->seg_time = nt;
         db->capsegs = nc;
     }
     /* Only the last segment may end torn (log.h), so the one it follows must be whole on disk
@@ -2514,7 +2802,10 @@ static int log_put_tagged(imdb_db *db, const uint8_t *frame, size_t len, imdb_er
 
 int imdb_log_append(imdb_db *db, const uint8_t *frame, size_t len, imdb_err *e)
 {
-    if ((db->logfd < 0 || db->log_rotate) && log_new_segment(db, imdb_frame_seq(frame), e)) return e->code;
+    if (db->logfd < 0 || db->log_rotate) {
+        if (log_new_segment(db, imdb_frame_seq(frame), e)) return e->code;
+        db->seg_time[db->nsegs - 1] = imdb_frame_time(frame); /* the segment's first commit: expiry reads it */
+    }
     int rc = db->log_tagged ? log_put_tagged(db, frame, len, e) : log_put_untagged(db, frame, len, e);
     if (rc) return rc;
     db->log_size += len;
@@ -2544,39 +2835,168 @@ int imdb_log_append(imdb_db *db, const uint8_t *frame, size_t len, imdb_err *e)
     return IMDB_OK;
 }
 
-/* Automatic retention (--retain-history N; primary only, between transactions): a table that
- * has ended at least retain_min (IMDB_RETAIN_MIN_ENDED) versions since its last purge, and at
- * least as many as it holds live, gets a logged COMPACT ... PURGE of the history before the
- * last N commits, never of history an open transaction's snapshot can still read (parked ones
- * included: every open transaction is on db->txns). A purge rewrites the whole table,
- * tombstones included, so the threshold keeps it to a constant share of the updates that made
- * it due; the tombstones stay until log retirement (deferred.md R4). Replicas replay the same
- * logged purges. */
-static void retain(imdb_db *db)
+/* Segment i's first commit time: recorded when this process began the segment, else read once from
+ * its first frame. 0 when there is none yet (a segment begun for a commit not made); UINT64_MAX when
+ * it cannot be read (warned once). Expiry takes either as too recent to expire at. */
+static uint64_t seg_start_time(imdb_db *db, size_t i)
 {
-    if (!db->retain_commits || db->seq <= db->retain_commits) return;
-    uint64_t floor = db->seq - db->retain_commits;
-    for (const imdb_txn *x = db->txns; x; x = x->next)
-        if (x->open && x->started && x->snap < floor) floor = x->snap;
-    for (uint32_t i = 0; i < db->nt && !db->failed; i++) {
-        imdb_table *t = db->t[i];
-        if (t->ended < db->retain_min || t->ended < t->live || floor <= t->horizon) continue;
+    if (!db->seg_time[i] && db->segs[i] <= db->seq) {
         imdb_err e2 = {0};
-        if (imdb_compact(db, t, floor, &e2))
-            snprintf(db->warning, sizeof db->warning, "automatic COMPACT %s PURGE failed (%s)", t->s.name, e2.msg);
+        uint64_t t = 0;
+        if (imdb_logseg_first_time(db->logdirfd, db->segs[i], &t, &e2) == IMDB_OK) {
+            db->seg_time[i] = t;
+        } else {
+            db->seg_time[i] = UINT64_MAX;
+            snprintf(db->warning, sizeof db->warning, "expiry cannot read when log segment %llu began (%s)",
+                     (unsigned long long)db->segs[i], e2.msg);
+        }
     }
+    return db->seg_time[i];
 }
 
-/* After an open the purges' own count is gone: every ended version a purge kept counts again,
- * so the first automatic purge may come a cycle early, never late. */
-static void retain_count(imdb_db *db)
+/* The newest segment start at least r old at time now (0: none). Commit times only increase, so the
+ * segments' first times do too: a binary search, each time it reads kept, after the oldest alone (a
+ * database younger than its retentions reads one segment's first frame, once). */
+static uint64_t expiry_point(imdb_db *db, uint64_t now, uint64_t r)
 {
-    for (uint32_t i = 0; i < db->nt; i++) {
-        imdb_table *t = db->t[i];
-        t->ended = 0;
-        for (uint64_t vid = 0; vid < t->nver; vid++)
-            if (imdb_vh(t, vid)->end != IMDB_LIVE && !(imdb_vh(t, vid)->flags & (IMDB_V_PURGED | IMDB_V_STUB))) t->ended++;
+    if (now <= r || !db->nsegs) return 0;
+    uint64_t cut = now - r, t0 = seg_start_time(db, 0);
+    if (!t0 || t0 == UINT64_MAX || t0 > cut) return 0;
+    size_t lo = 1, hi = db->nsegs;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        uint64_t t = seg_start_time(db, mid);
+        if (t && t != UINT64_MAX && t <= cut) lo = mid + 1;
+        else hi = mid;
     }
+    return lo ? db->segs[lo - 1] : 0;
+}
+
+/* Expiry by retention (primary only, between transactions): a table kept for R moves its horizon
+ * to the newest log segment start at least R old, by one logged EXPIRE commit for every table due
+ * (log.h). A segment start, because those are the commits a verifier keeps the times of, so the log
+ * itself proves that R was honoured; it is also where RETIRE can cut the log. History is answered
+ * for at least R, and up to one segment longer. No open transaction holds it back: one whose
+ * snapshot is older than R has been open that long, and its next read of the table conflicts
+ * (sql_exec.c). */
+static void expire(imdb_db *db)
+{
+    if (!db->nsegs || !db->seg_time) return;
+    uint64_t now = now_us();
+    if (now <= db->last_time) now = db->last_time + 1; /* the EXPIRE commit's own time: its rule's */
+    bool due = false;
+    for (uint32_t i = 0; i < db->nt && !due; i++) {
+        const imdb_table *t = db->t[i];
+        due = t->retention_us != IMDB_RETAIN_FOREVER && expiry_point(db, now, t->retention_us) > t->horizon;
+    }
+    if (!due) return;
+    imdb_err e2 = {0};
+    int rc = imdb_begin(db, &e2);
+    for (uint32_t i = 0; i < db->nt && !rc; i++) { /* by table: one op each */
+        const imdb_table *t = db->t[i];
+        uint64_t s = t->retention_us == IMDB_RETAIN_FOREVER ? 0 : expiry_point(db, now, t->retention_us);
+        if (s > t->horizon) rc = imdb_expire_op(db, t->s.id, s, &e2);
+    }
+    if (rc && db->in_txn) imdb_rollback(db);
+    if (!rc) {
+        db->tx_time = now;
+        rc = imdb_commit(db, &e2);
+    }
+    if (rc) snprintf(db->warning, sizeof db->warning, "automatic expiry failed (%s)", e2.msg);
+}
+
+/* Retirement (primary only, between transactions, after expiry): the boundary is the lowest horizon less one,
+ * lowered to the last commit of a log segment (a horizon set by COMPACT ... PURGE need not be a segment start);
+ * a table kept FOREVER holds horizon 0, so there is none while one exists. RETIRE rewrites the segments that
+ * straddle the boundary and rebuilds every index, so it waits until the versions it drops reach the live rows
+ * and an eighth of those held: its work stays a constant share of what it frees. The count for a boundary never
+ * changes (versions ending later end past it), so it is taken once, when the boundary moves. */
+int imdb_seg_starts(imdb_db *db, uint64_t lo, uint64_t hi, imdb_buf *out, uint32_t *n, imdb_err *e)
+{
+    *n = 0;
+    /* first those an earlier cut took from the disk: its FLOOR has them, below the first segment still here (a later
+     * floor's range can reach below the earlier one: an EXPIRE after it may name one; found by the 10-30 smoke) */
+    uint64_t first = db->nsegs ? db->segs[0] : UINT64_MAX;
+    for (uint32_t i = 0; i < db->nfloor_starts; i++) {
+        uint64_t s = imdb_get_le64(db->floor_starts + 16 * i);
+        if (s <= lo || s > hi || s >= first) continue;
+        imdb_buf_put(out, db->floor_starts + 16 * i, 16);
+        (*n)++;
+    }
+    for (size_t i = 0; i < db->nsegs && db->segs[i] <= hi; i++) {
+        if (db->segs[i] <= lo) continue;
+        uint64_t t = seg_start_time(db, i);
+        if (!t || t == UINT64_MAX)
+            return imdb_fail(e, IMDB_ERR_IO, "when log segment %llu began cannot be read", (unsigned long long)db->segs[i]);
+        imdb_buf_put_u64(out, db->segs[i]);
+        imdb_buf_put_u64(out, t);
+        (*n)++;
+    }
+    return imdb_buf_check(out, e);
+}
+
+uint64_t imdb_retire_candidate(const imdb_db *db, uint64_t cap)
+{
+    uint64_t hmin = UINT64_MAX;
+    for (uint32_t i = 0; i < db->nt; i++)
+        if (db->t[i]->horizon < hmin) hmin = db->t[i]->horizon;
+    if (!db->nt || hmin <= db->boundary + 1 || !db->nsegs) return 0;
+    if (cap < hmin - 1) hmin = cap + 1; /* a protected replica's acknowledged commit caps it (retire_policy) */
+    size_t si = imdb_logseg_find(db->segs, db->nsegs, hmin); /* the start at or below the lowest horizon */
+    if (si == db->nsegs || db->segs[si] < 2) return 0;
+    /* lowered to the latest keeper, the end of segment j - 1: its manifest is there for the FLOOR (lake.c) */
+    for (size_t j = si; j >= 1; j--) {
+        uint64_t B = db->segs[j] - 1;
+        if (B <= db->boundary) return 0;
+        if (B < db->seq && imdb_is_keeper(db->floor_stride, db->segs[j - 1], B)) return B;
+    }
+    return 0;
+}
+
+/* whether a RETIRE at B is due: the versions it would drop reach the live count and an eighth of those held (each
+ * RETIRE rewrites the segments holding them); the count, a walk, is kept per candidate (slot 0 the policy's own,
+ * 1 one a replica capped) until B moves or a RETIRE drops versions (lake.c resets both) */
+static bool retire_due(imdb_db *db, uint64_t B, int slot)
+{
+    if (B != db->retire_cand[slot]) {
+        uint64_t n = 0;
+        for (uint32_t i = 0; i < db->nt; i++) {
+            const imdb_table *t = db->t[i];
+            for (uint64_t vid = imdb_v_skip(t, 0); vid < t->nver; vid = imdb_v_skip(t, vid + 1))
+                if (imdb_v_present(t, vid) && imdb_vh(t, vid)->end != IMDB_LIVE && imdb_vh(t, vid)->end <= B) n++;
+        }
+        db->retire_cand[slot] = B;
+        db->retire_cand_n[slot] = n;
+    }
+    uint64_t live = 0, held = 0, n = db->retire_cand_n[slot];
+    for (uint32_t i = 0; i < db->nt; i++) {
+        live += db->t[i]->live;
+        held += db->t[i]->nver - db->t[i]->nretired;
+    }
+    return n && n >= live && n >= held / 8;
+}
+
+static void retire_policy(imdb_db *db)
+{
+    if (db->no_auto_retire) return;
+    uint64_t B = imdb_retire_candidate(db, UINT64_MAX);
+    if (!B || !retire_due(db, B, 0)) return;
+    /* due: first the replicas it would strand. One heard from within the hold keeps the log past its acknowledged
+     * commit, which the cut would take from ship; one silent longer is seeded again (stage 3a (e)). Held back, the
+     * policy looks again a second later, not at every statement (a backward clock looks at once). */
+    uint64_t now = now_us();
+    if (db->retire_held_us && now >= db->retire_held_us && now - db->retire_held_us < IMDB_RETIRE_RECHECK_US) return;
+    db->retire_held_us = 0;
+    uint64_t cap = UINT64_MAX;
+    imdb_err re = {0};
+    int hr = imdb_replicas_hold(db, &cap, &re);
+    if (hr < 0) snprintf(db->warning, sizeof db->warning, "automatic RETIRE waits: %s", re.msg);
+    if (hr || (cap < B && (!(B = imdb_retire_candidate(db, cap)) || !retire_due(db, B, 1)))) {
+        db->retire_held_us = now ? now : 1;
+        return;
+    }
+    imdb_err e2 = {0};
+    if (imdb_retire(db, B, &e2)) snprintf(db->warning, sizeof db->warning, "automatic RETIRE failed (%s)", e2.msg);
 }
 
 /* Primary-only policy, but a logged op: once the segment passes the threshold a
@@ -2587,7 +3007,9 @@ int imdb_maintain(imdb_db *db, imdb_err *e)
 {
     (void)e;
     if (db->in_txn || db->active || db->replica || db->read_only || db->failed) return IMDB_OK;
-    retain(db); /* first: a purge publishes the lake and ends the segment, so no CHECKPOINT is then due */
+    expire(db); /* a logical op: nothing published, so it changes no CHECKPOINT's timing */
+    if (db->failed) return IMDB_OK;
+    retire_policy(db); /* a publish: it ends the segment, as a CHECKPOINT would */
     if (db->failed) return IMDB_OK;
     /* synchronous publication: the lake files then answer at the latest commit too (one more commit and a
      * lake publication per change: the price is measured in docs/plan-round3.md) */
@@ -2646,6 +3068,8 @@ static int anchor_fenced(imdb_db *db, imdb_err *e)
 int imdb_commit(imdb_db *db, imdb_err *e)
 {
     if (!db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "no transaction");
+    uint64_t tx_time = db->tx_time; /* this commit's alone */
+    db->tx_time = 0;
     if (db->ntx == 0) {
         db->in_txn = false;
         db->nundo = 0;
@@ -2695,7 +3119,7 @@ int imdb_commit(imdb_db *db, imdb_err *e)
     memset(&c, 0, sizeof c);
     c.seq = db->seq + 1;
     c.alg = db->meta.digest_alg;
-    c.time_us = now_us();
+    c.time_us = tx_time ? tx_time : now_us();
     if (c.time_us <= db->last_time) c.time_us = db->last_time + 1;
     memcpy(c.prev, db->head, 32);
     c.ops = db->tx;
@@ -2723,8 +3147,11 @@ int imdb_commit(imdb_db *db, imdb_err *e)
     for (uint32_t i = 0; i < db->ntx; i++) {
         uint8_t code = db->tx[i].code;
         if (code == IMDB_OP_INSERT || code == IMDB_OP_DELETE || code == IMDB_OP_UPDATE || code == IMDB_OP_CREATE_TABLE ||
-            code == IMDB_OP_CREATE_INDEX || code == IMDB_OP_DROP_INDEX) /* the manifest records the definitions */
-            db->lake_dirty = true;
+            code == IMDB_OP_CREATE_INDEX || code == IMDB_OP_DROP_INDEX || code == IMDB_OP_SET_RETENTION ||
+            code == IMDB_OP_EXPIRE)
+            db->lake_dirty = true; /* the manifest records the definitions, the retentions and the horizons */
+        if (code == IMDB_OP_SET_RETENTION) db->t[db->tx[i].table]->retention_us = db->tx[i].retention_us;
+        if (code == IMDB_OP_EXPIRE) db->t[db->tx[i].table]->horizon = db->tx[i].purge_before;
     }
     db->seq = c.seq;
     memcpy(db->head, c.hash, 32);
@@ -2850,6 +3277,11 @@ int imdb_close(imdb_db *db)
     if (db->logfd >= 0) close(db->logfd);
     if (db->logdirfd >= 0) close(db->logdirfd);
     imdb_free(db->segs);
+    imdb_free(db->seg_time);
+    imdb_free(db->floor_starts);
+    imdb_free(db->floor_man);
+    imdb_free(db->floor_hdr);
+    imdb_free(db->keep);
     imdb_free(db->redact_seqs);
     imdb_writers_free(db); /* after the closing sync: the anchor still names its commit's epoch */
     if (db->lockfd >= 0) close(db->lockfd);
@@ -2869,23 +3301,19 @@ int imdb_open(const char *path, const imdb_open_opts *o, imdb_db **out, imdb_err
     if (o && o->durable_ack && (!o->sync || o->read_only))
         return imdb_fail(e, IMDB_ERR_INVALID, "--durable-ack needs a writable open with synchronous commits: it syncs the "
                                              "watermark as each durable commit returns");
-    if (o && o->retain_commits && o->read_only)
-        return imdb_fail(e, IMDB_ERR_INVALID, "--retain-history needs a writable primary: it purges with logged "
-                                             "COMPACT ... PURGE commits");
     imdb_db *db = imdb_alloc(sizeof *db, e);
     if (!db) return e->code;
     db->dirfd = db->logfd = db->lockfd = db->logdirfd = db->durfd = db->anchorfd = db->anchor_lockfd = -1;
     db->ci_first = 1;
     db->pin_max_lag = IMDB_PIN_MAX_LAG;
-    db->retain_min = IMDB_RETAIN_MIN_ENDED;
     db->sync = o ? o->sync : 1;
     db->strict = o && o->durable_ack;
     db->mem_limit = o ? o->mem_limit : 0;
     db->full_replay = o && o->full_replay;
     db->lake_sync = o && o->lake_sync;
+    db->floor_stride = !o || !o->floor_stride ? IMDB_FLOOR_STRIDE : o->floor_stride;
     db->checkpoint_bytes = !o || !o->checkpoint_bytes ? IMDB_CHECKPOINT_BYTES
                            : o->checkpoint_bytes == UINT64_MAX ? 0 : o->checkpoint_bytes;
-    db->retain_commits = o ? o->retain_commits : 0;
     db->lim_txn_bytes = o && o->txn_bytes ? o->txn_bytes : IMDB_MAX_TXN_BYTES;
     db->lim_txn_ops = o && o->txn_ops ? o->txn_ops : IMDB_MAX_OPS_PER_COMMIT;
     db->lim_txn_locks = o && o->txn_locks ? o->txn_locks : IMDB_MAX_TXN_LOCKS;
@@ -2925,6 +3353,8 @@ int imdb_open(const char *path, const imdb_open_opts *o, imdb_db **out, imdb_err
     if ((rc = read_meta(db->dirfd, &db->meta, &db->replica, e))) goto fail;
     memcpy(db->db_id, db->meta.db_id, 16);
     if ((rc = imdb_writers_init(db, e))) goto fail; /* epoch 0 from META, the rest from WRITERS or the replay */
+    if (db->replica && !ro && (rc = imdb_seed_leftovers(db, e))) goto fail; /* a seed cut short: empty again */
+    if ((rc = imdb_floor_read(db, e))) goto fail; /* a copy whose log was cut: where it begins, and the keys to there */
     /* checked against the log's current key once the replay has found it (imdb_writer_settle) */
     if (!db->replica && !ro && (rc = imdb_seed_read(db->dirfd, SIGNING_KEY_NAME, &db->signer, &db->can_sign, e))) goto fail;
     imdb_genesis_hash(db->db_id, db->head);
@@ -2940,11 +3370,6 @@ int imdb_open(const char *path, const imdb_open_opts *o, imdb_db **out, imdb_err
     rc = imdb_replay(db, ro, e);
     db->replaying = false;
     if (rc) goto fail;
-    if (db->retain_commits && db->replica) {
-        rc = imdb_fail(e, IMDB_ERR_INVALID, "--retain-history is set on the primary: a replica applies the purges it logs");
-        goto fail;
-    }
-    if (db->retain_commits) retain_count(db);
     if ((rc = imdb_index_build_all(db, e))) goto fail; /* once, after the replay: one sort each */
     bool anchor_new;
     if ((rc = anchor_check(db, o, &anchor_new, e))) goto fail; /* before recovery changes anything in the directory */
@@ -2991,7 +3416,11 @@ int imdb_open(const char *path, const imdb_open_opts *o, imdb_db **out, imdb_err
         } else if (errno != EEXIST) {
             imdb_warn(db, "pins/ could not be made (%s): lake readers read unpinned", strerror(errno));
         }
+        if ((rc = imdb_lake_keepers_load(db, e))) goto fail; /* before the open's GC: a later FLOOR's manifests */
         if ((rc = imdb_lake_finish_open(db, e))) goto fail;
+        imdb_err ce = {0}; /* a cut a crash left half done (lake.c lake_persist): cleanup, as GC */
+        if (imdb_log_cut(db, &ce)) imdb_warn(db, "the log below commit %llu could not all be removed (%s)",
+                                             (unsigned long long)db->log_floor + 1, ce.msg);
     }
     *out = db;
     return IMDB_OK;

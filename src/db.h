@@ -31,6 +31,7 @@ enum {
     IMDB_V_PENDING_AUTH = 2,  /* stub seen before the ERASE that authorises it (replica) */
     IMDB_V_PURGED = 4,        /* physically removed by COMPACT ... PURGE                  */
     IMDB_V_SEG = 8,           /* row bytes live in a segment                              */
+    IMDB_V_RETIRED = 16,      /* ended at or before the boundary: gone (RETIRE); its chunk may be freed */
 };
 
 /* A version is stored in two parts, so that visibility checks, scans, joins and index maintenance
@@ -88,7 +89,9 @@ typedef struct imdb_table {
     imdb_version **vh;        /* the version store: chunk k holds vids from k << IMDB_VCHUNK_BITS */
     imdb_version_cold **vc;   /* the same vids' cold parts */
     uint32_t nchunk, capchunk; /* chunks allocated, room in vh and vc */
-    uint64_t nver, capver;    /* versions; room for them in the chunks allocated */
+    uint64_t nver, capver;    /* versions (vids handed out); the vids the chunks' slots cover */
+    uint32_t nfreed;          /* chunks whose versions RETIRE dropped: slot NULL, memory returned (never the last) */
+    uint64_t nretired;        /* vids below nver that RETIRE dropped: nver - nretired versions are held */
     imdb_buf arena;           /* canonical bytes of memtable rows          */
     uint64_t mem_first;       /* first vid not yet flushed to a segment    */
     imdb_hmap pk;             /* key -> newest non-stub version            */
@@ -97,11 +100,11 @@ typedef struct imdb_table {
     uint32_t nsubj, capsubj;
     imdb_lthash digest;       /* over live versions                        */
     uint64_t live;
-    uint64_t ended;           /* versions ended since its last purge (automatic retention) */
     /* lake (segments) */
     struct imdb_segment **seg;
     uint32_t nseg, capseg;
     uint64_t horizon;         /* AS OF below this seq is unavailable (purged) */
+    uint64_t retention_us;    /* op 16: how long a version stays answerable after it ends; IMDB_RETAIN_FOREVER */
     imdb_index idx[IMDB_MAX_INDEXES];
     uint32_t nidx;
     uint64_t idx_upto;        /* versions below are in the indexes' structures; the rest are the */
@@ -117,6 +120,21 @@ static inline imdb_version *imdb_vh(const imdb_table *t, uint64_t vid)
 static inline imdb_version_cold *imdb_vc(const imdb_table *t, uint64_t vid)
 {
     return &t->vc[vid >> IMDB_VCHUNK_BITS][vid & (IMDB_VCHUNK - 1)];
+}
+/* The one presence rule (stage 3a): a vid below t->nver names a version unless RETIRE dropped it, its chunk
+ * then perhaps freed (a NULL slot). Every walk over vids and every vid read from the log asks this first;
+ * imdb_vh and imdb_vc are for present versions only. */
+static inline bool imdb_v_present(const imdb_table *t, uint64_t vid)
+{
+    return vid < t->nver && t->vh[vid >> IMDB_VCHUNK_BITS] && !(imdb_vh(t, vid)->flags & IMDB_V_RETIRED);
+}
+/* The first vid at or after vid whose chunk is still allocated: a walk passes a freed chunk at once, so walking
+ * a store whose old chunks are retired costs its chunks, not every vid it ever had (14 billion a year at the
+ * soak's rate). Walks: for (vid = imdb_v_skip(t, 0); vid < t->nver; vid = imdb_v_skip(t, vid + 1)). */
+static inline uint64_t imdb_v_skip(const imdb_table *t, uint64_t vid)
+{
+    while (vid < t->nver && !t->vh[vid >> IMDB_VCHUNK_BITS]) vid = (vid | (IMDB_VCHUNK - 1)) + 1;
+    return vid;
 }
 
 typedef struct imdb_commit_info {
@@ -159,6 +177,7 @@ typedef struct imdb_db {
     int logdirfd;             /* log/: the segments (see logdir.h)        */
     uint64_t *segs;           /* first seq of every segment, ascending     */
     size_t nsegs, capsegs;
+    uint64_t *seg_time;       /* each one's first commit's time (0: not read yet; expiry reads it), capsegs long */
     bool log_rotate;          /* the next append starts a new segment       */
     bool log_tagged;          /* the last segment is tagged (log.h): appends overwrite its zero fill */
     bool log_group;           /* tagged: a write group is open (frames appended since the last fdatasync) */
@@ -173,11 +192,29 @@ typedef struct imdb_db {
     bool full_replay;         /* open: ignore the lake snapshot             */
     uint64_t snapshot_seq;    /* open started from the lake snapshot at this commit (0: full replay) */
     uint64_t last_erase;      /* the last commit with an ERASE this handle applied (replayed or its own) */
+    uint64_t boundary;        /* RETIRE's: versions ended at or before it are gone (the same on every copy) */
+    uint64_t log_floor;       /* this copy's own: its log begins at log_floor + 1 (FLOOR; 0: at the genesis) */
+    uint8_t floor_hash[32];   /* commit log_floor's hash (its successor's prev) and its signed state digest */
+    uint8_t floor_digest[32];
+    uint64_t floor_time;      /* commit log_floor's time: its successor's must be later */
+    uint8_t *floor_starts;    /* FLOOR's segment starts below the floor, u64 seq | u64 time each (VERIFY's) */
+    uint32_t nfloor_starts;
+    uint8_t *floor_man;       /* FLOOR's copy of commit log_floor's manifest: the tables at the floor (VERIFY's) */
+    size_t floor_manlen;
+    uint8_t *floor_hdr;       /* FLOOR's copy of commit log_floor's header, and its signature: a snapshot at the floor */
+    uint32_t floor_hlen;      /* (a seeded copy's, whose log begins after it) is authenticated by them (lake.c) */
+    uint8_t floor_sig[64];
+    uint64_t seeded;          /* apply took a seed at this commit (seed.c): the handle is stale, reopen it */
+    uint32_t floor_stride;    /* keepers: a publish p is one iff p / stride > (the previous segment's end) / stride */
+    struct imdb_keeper *keep; /* the keepers' manifests past the boundary, by hash (GC keeps them; lake.c) */
+    size_t nkeep, capkeep;
+    uint64_t retire_cand[2], retire_cand_n[2]; /* the RETIRE policy's candidates (0 its own, 1 a replica's cap) and the
+                                                * versions each would drop; reset by every RETIRE */
+    uint64_t retire_held_us; /* when a replica last held the policy back (0: none): it looks again a second later */
+    bool no_auto_retire;      /* tests that RETIRE by hand turn the policy off for their handle */
     uint64_t pin_max_lag;     /* IMDB_PIN_MAX_LAG (tests lower it) */
-    uint64_t retain_min;      /* IMDB_RETAIN_MIN_ENDED (tests lower it) */
     uint64_t mem_limit;       /* the memory budget (imdb_open_opts.mem_limit; 0: none) */
     uint64_t checkpoint_bytes; /* primary: auto-CHECKPOINT past this segment size (0 = off) */
-    uint64_t retain_commits;  /* primary: automatic retention keeps the history of this many commits (0 = off) */
     bool lake_sync;           /* primary: CHECKPOINT after every commit that changed data (imdb_open_opts) */
     bool strict;              /* durable_ack with sync: every DURABLE record fsynced before its commit returns */
     uint8_t db_id[16];
@@ -193,6 +230,7 @@ typedef struct imdb_db {
     uint64_t seq;
     uint8_t head[32];
     uint64_t last_time;
+    uint64_t tx_time;         /* set: the next commit's time (expiry checked its rule against it) */
     uint32_t last_hlen;       /* commit seq's signed descriptor (header length, signature): an anchor names it */
     uint8_t last_sig[IMDB_SIG_LEN];
     imdb_commit_info *ci;     /* ci[i] is commit ci_first + i (see db.c)   */
@@ -236,6 +274,7 @@ typedef struct imdb_open_opts {
     int sync;                 /* default 1 */
     bool read_only;           /* verification tools: never truncate/redact */
     uint64_t checkpoint_bytes; /* 0: the default (IMDB_CHECKPOINT_BYTES); UINT64_MAX: never */
+    uint32_t floor_stride;     /* 0: the default (IMDB_FLOOR_STRIDE): which publishes' manifests a future FLOOR may use */
     bool full_replay;         /* replay the whole log instead of starting from the lake snapshot */
     bool lake_sync;           /* publish the lake after every commit that changed data (a CHECKPOINT each: priced) */
     const char *anchor;       /* the external anchor file (log.h), outside the data directory; NULL: none */
@@ -244,9 +283,6 @@ typedef struct imdb_open_opts {
                                  it is then provably unacknowledged and recovery may drop it; +1 device flush
                                  per commit (measured +3.3 ms on the test machine) */
     uint64_t mem_limit;       /* bytes the database may hold in memory (0: no budget); see imdb_mem */
-    uint64_t retain_commits;  /* automatic retention (primary): keep the history of the last N commits and purge
-                                 older history with a logged COMPACT ... PURGE once a table has ended as many
-                                 versions as it holds live ones (imdb_maintain); 0: off, history is kept */
     /* per-transaction limits, at most the limits.h maxima (0: the maximum); a statement that
      * would exceed one fails with IMDB_ERR_LIMIT and the transaction stays usable */
     uint64_t txn_bytes;       /* row bytes written (IMDB_MAX_TXN_BYTES) */
@@ -283,7 +319,11 @@ int imdb_open(const char *path, const imdb_open_opts *o, imdb_db **out, imdb_err
 int imdb_close(imdb_db *db);
 
 /* ---- schema --------------------------------------------------------------- */
+/* A table with the default retention (IMDB_RETAIN_DEFAULT_US), or the one given; either is logged with it (op 16). */
 int imdb_create_table(imdb_db *db, imdb_schema *s, imdb_err *e);
+int imdb_create_table_ex(imdb_db *db, imdb_schema *s, uint64_t retention_us, imdb_err *e);
+/* ALTER TABLE t SET RETENTION: logged in the transaction, in effect from its commit. */
+int imdb_set_retention(imdb_db *db, imdb_table *t, uint64_t retention_us, imdb_err *e);
 /* CREATE INDEX / DROP INDEX, each the only op of its transaction; names are unique per database;
  * a unique index is refused over live duplicates */
 int imdb_create_index(imdb_db *db, imdb_table *t, const imdb_index_def *d, imdb_err *e);
@@ -365,6 +405,7 @@ typedef struct imdb_txn {
     bool open, started, doomed;
     uint8_t iso;
     uint64_t snap;             /* the commit its first statement saw */
+    uint64_t snap_us;          /* that commit's time: a table's expiry passes it once older than the retention */
     uint64_t stmt_snap;        /* the current statement's snapshot */
     imdb_saved_op *ops;        /* its op list while it is not active */
     uint32_t nops, capops;
@@ -394,6 +435,9 @@ int imdb_txn_lock_rows(imdb_db *db, imdb_txn *x, const imdb_table *t, const uint
 /* After a committed ERASE: dooms every transaction whose saved writes or locks
  * name an erased version, and wipes its saved row bytes at once. */
 void imdb_txn_doom_erased(imdb_db *db, const imdb_erase_ent *ents, uint32_t n);
+/* After a RETIRE below boundary: dooms every transaction whose snapshot is at or below it (every table's
+ * horizon is past it, so none of its reads could be answered). */
+void imdb_txn_doom_retired(imdb_db *db, uint64_t boundary);
 /* After a statement of x lost a write-write race: it can only roll back. */
 void imdb_txn_doom(imdb_txn *x, const char *why);
 /* A doomed transaction drops its writes at once (pending versions undone and wiped, saved
@@ -503,6 +547,7 @@ typedef struct imdb_apply_opts {
     bool truncated; /* out */
     bool has_session; /* out */
     uint8_t nonce[16]; /* out */
+    uint64_t seeded; /* out: the stream was a seed, taken at this commit (seed.h): the handle is stale, reopen */
 } imdb_apply_opts;
 int imdb_apply_stream_ex(imdb_db *db, int fd, uint64_t *applied, imdb_apply_opts *o, imdb_err *e);
 /* The last commit through which physical cleanup is complete: every ERASE up to it has left this
@@ -563,6 +608,9 @@ typedef struct imdb_verify_report {
     uint64_t segments_checked;
     uint64_t lake_rows_checked;
     uint64_t sigs_checked;    /* Ed25519 commit signatures verified */
+    uint64_t floor;           /* the log floor VERIFY began at (0: the genesis) */
+    uint64_t seeded;          /* versions it took from the lake at the floor, checked against the floor's digests */
+    uint64_t erase_below_floor; /* ERASE entries for versions the floor's RETIRE dropped: their commitments unknowable */
     double t_read, t_par, t_log, t_state, t_lake; /* seconds: reading, parallel stages, ordered stage, engine, lake */
     uint8_t head[32];
     uint8_t digest[32];
@@ -588,6 +636,12 @@ int imdb_log_append(imdb_db *db, const uint8_t *frame, size_t len, imdb_err *e);
 /* Tests only: segments made from now on untagged (false), as before 2026-10-27, so that the old
  * format's paths, which an old database's last segment still takes, stay tested. */
 void imdb_log_set_tagged(bool on);
+/* Tests only: the engine's clock (commit times, expiry) moved by us from the wall clock's; reset to 0
+ * before every test. */
+void imdb_clock_offset(int64_t us);
+/* In an open transaction: an EXPIRE of table to the horizon before (log.h). Expiry's (db.c), which
+ * chooses before by the rule VERIFY checks; tests commit ones that break it. */
+int imdb_expire_op(imdb_db *db, uint32_t table, uint64_t before, imdb_err *e);
 int imdb_redact_log(imdb_db *db, imdb_err *e);
 /* Records that the payload written by commit seq must be redacted. */
 int imdb_redact_note(imdb_db *db, uint64_t seq, imdb_err *e);

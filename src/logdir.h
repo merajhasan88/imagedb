@@ -61,6 +61,10 @@ typedef struct imdb_logseg {
 } imdb_logseg;
 int imdb_logseg_load(int logfd, uint64_t first, imdb_logseg *s, imdb_err *e);
 void imdb_logseg_free(imdb_logseg *s); /* wipes: an erased payload may be in it until redaction */
+/* The time of the segment's first commit, from its first frame alone (expiry: db.c): the frame read
+ * and checked whole (either format), then decoded, which checks its header against the descriptor's
+ * hash, so the time is the one the commit's signature covers (VERIFY checks the signature). */
+int imdb_logseg_first_time(int logfd, uint64_t first, uint64_t *time_us, imdb_err *e);
 /* imdb_frame_scan over its frames; at their end, a tagged segment's verdict (with its message). */
 imdb_scan_status imdb_logseg_scan(const imdb_logseg *s, size_t off, size_t *flen, imdb_err *e);
 /* Nothing but zeros, or no byte at all: a new segment whose header never landed (a crash in

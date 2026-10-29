@@ -3,10 +3,12 @@
  * one write(2), so a SIGKILL never loses an acknowledged line; at its start a churn run checks that
  * the last acknowledged commit survived the kill with its hash (exit 3 if not). Every 10 s it appends
  * a stats line: seconds, commits, the engine's memory report (imdb_mem) and the process's RSS.
- *   soak_writer DIR load LIVE ACKS
- *   soak_writer DIR churn LIVE SECONDS SEED ACKS STATS [--nosync] [--retain COMMITS] [--checkpoint N] [--erase N]
+ *   soak_writer DIR load LIVE ACKS [--retention SECONDS]
+ *   soak_writer DIR churn LIVE SECONDS SEED ACKS STATS [--nosync] [--checkpoint N] [--erase N]
  *                                                      [--events FILE]
- * The live set: ids 1..LIVE, a SUBJECT among LIVE/10 people (id % people), a memo of 16-200 bytes.
+ * The live set: ids 1..LIVE, a SUBJECT among LIVE/10 people (id % people), a memo of 16-200 bytes; the table
+ * keeps its history --retention seconds (its RETENTION; the engine's default when absent), past which the
+ * engine expires it and retires it, log segments included (stage 3a).
  * Churn, from a seeded generator: an UPDATE of a random id (85%), a DELETE and re-INSERT of one in a
  * transaction (10%), a transaction of ten UPDATEs (5%); a CHECKPOINT each time the log's sequence passes a
  * multiple of N (--checkpoint, 50,000; the engine checkpoints on its own too), and at each multiple of N
@@ -122,8 +124,8 @@ static uint64_t last_ack(const char *path, char hex[65])
 int main(int argc, char **argv)
 {
     if (argc < 5) {
-        fprintf(stderr, "usage: soak_writer DIR load LIVE ACKS | DIR churn LIVE SECONDS SEED ACKS STATS [--nosync] "
-                        "[--retain COMMITS] [--checkpoint N] [--erase N] [--events FILE]\n");
+        fprintf(stderr, "usage: soak_writer DIR load LIVE ACKS [--retention SECONDS] | DIR churn LIVE SECONDS SEED ACKS "
+                        "STATS [--nosync] [--checkpoint N] [--erase N] [--events FILE]\n");
         return 2;
     }
     const char *dir = argv[1];
@@ -135,9 +137,13 @@ int main(int argc, char **argv)
     imdb_open_opts o = {.sync = 1};
     uint64_t every_ckpt = 50000, every_erase = 20000;
     const char *events = NULL;
-    for (int i = 8; i < argc; i++) {
+    long retention = 0; /* the table's RETENTION in seconds (load; 0: the engine's default) */
+    for (int i = load ? 5 : 8; i < argc; i++) {
+        if (load) {
+            if (strcmp(argv[i], "--retention") == 0 && i + 1 < argc && (retention = atol(argv[++i])) > 0) continue;
+            return 2;
+        }
         if (strcmp(argv[i], "--nosync") == 0) o.sync = 0;
-        else if (strcmp(argv[i], "--retain") == 0 && i + 1 < argc) o.retain_commits = strtoull(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--checkpoint") == 0 && i + 1 < argc) every_ckpt = strtoull(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--erase") == 0 && i + 1 < argc) every_erase = strtoull(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--events") == 0 && i + 1 < argc) events = argv[++i];
@@ -179,7 +185,13 @@ int main(int argc, char **argv)
     int rc = load ? 0 : event(efd, "open", db->seq, open_s);
     char sql[512], m[256];
     if (load) {
-        rc = run(&s, "CREATE TABLE t (id INT64 PRIMARY KEY, user_id INT64 SUBJECT, memo TEXT)") || ack(afd, db, &last);
+        char ct[160];
+        if (retention)
+            snprintf(ct, sizeof ct, "CREATE TABLE t (id INT64 PRIMARY KEY, user_id INT64 SUBJECT, memo TEXT) RETENTION %ld SECONDS",
+                     retention);
+        else
+            snprintf(ct, sizeof ct, "CREATE TABLE t (id INT64 PRIMARY KEY, user_id INT64 SUBJECT, memo TEXT)");
+        rc = run(&s, ct) || ack(afd, db, &last);
         for (long id = 1; id <= live && !rc; id += 1000) {
             rc = run(&s, "BEGIN");
             for (long k = id; k < id + 1000 && k <= live && !rc; k++) {

@@ -585,8 +585,8 @@ static int path_store(xctx *x, const qspec *q, sink *k, imdb_err *e)
 {
     imdb_table *t = q->t;
     imdb_value vals[IMDB_MAX_COLS];
-    for (uint64_t vid = 0; vid < t->nver && !k->err; vid++) {
-        if (!visible_q(q, imdb_vh(t, vid))) continue;
+    for (uint64_t vid = imdb_v_skip(t, 0); vid < t->nver && !k->err; vid = imdb_v_skip(t, vid + 1)) {
+        if (!imdb_v_present(t, vid) || !visible_q(q, imdb_vh(t, vid))) continue;
         if (fetch_row(x, t, vid, vals, e)) return e->code;
         if (preds_ok(q, vals)) sink_row(k, vid, vals);
     }
@@ -1150,6 +1150,24 @@ static void read_view(const xctx *x, uint64_t *snap, uint64_t *pend)
     imdb_txn_view(x->db, x->ss->txn.open ? &x->ss->txn : NULL, snap, pend);
 }
 
+/* imdb_check_history for a statement's view. A transaction's own snapshot below the table's horizon
+ * means the transaction has outlived the history that table keeps (its retention: db.c's expiry):
+ * the transaction is doomed, and a retry with a fresh snapshot succeeds. AS OF asks for that history
+ * itself: HISTORY. */
+static int check_view(xctx *x, const imdb_table *t, uint64_t snap, bool asof, imdb_err *e)
+{
+    int rc = imdb_check_history(x->db, t, snap, e);
+    imdb_txn *tx = &x->ss->txn;
+    if (rc != IMDB_ERR_HISTORY || asof || !tx->open) return rc;
+    imdb_err_clear(e); /* the first error wins: this one replaces it */
+    imdb_fail(e, IMDB_ERR_CONFLICT,
+              "the history of %s that this transaction's snapshot (commit %llu) reads is no longer kept (expired by "
+              "its retention, or purged); roll back and retry the transaction",
+              t->s.name, (unsigned long long)snap);
+    imdb_txn_doom(tx, e->msg);
+    return IMDB_ERR_CONFLICT;
+}
+
 static int resolve_snapshot(xctx *x, const sql_stmt *st, imdb_table *t, uint64_t *snap, uint64_t *pend, imdb_err *e)
 {
     imdb_db *db = x->db;
@@ -1166,7 +1184,7 @@ static int resolve_snapshot(xctx *x, const sql_stmt *st, imdb_table *t, uint64_t
             if (imdb_seq_at_time(db, (uint64_t)ts, snap, e)) return e->code;
         }
     }
-    return imdb_check_history(db, t, *snap, e);
+    return check_view(x, t, *snap, st->has_asof, e);
 }
 
 /* SELECT ... FOR UPDATE: every selected committed row must still be live when the
@@ -1907,7 +1925,7 @@ static int exec_join(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
     }
     /* one snapshot for both sides, below neither table's purge horizon */
     uint64_t snap = 0, pend = 0;
-    if (!rc && (resolve_snapshot(x, st, t[0], &snap, &pend, e) || imdb_check_history(db, t[1], snap, e))) rc = e->code;
+    if (!rc && (resolve_snapshot(x, st, t[0], &snap, &pend, e) || check_view(x, t[1], snap, st->has_asof, e))) rc = e->code;
     qspec q[2];
     memset(q, 0, sizeof q);
     for (int s = 0; s < 2; s++) {
@@ -2030,7 +2048,7 @@ static int select_vids(xctx *x, const sql_stmt *st, imdb_table *t, bool all_vers
     read_view(x, &q.snap, &q.pend);
     q.all_versions = all_versions;
     /* a transaction's snapshot may be old: below the purge horizon the rows to change are unknown */
-    if (!all_versions && imdb_check_history(x->db, t, q.snap, e)) return e->code;
+    if (!all_versions && check_view(x, t, q.snap, false, e)) return e->code;
     if (bind_preds(x, st, &q, e)) return e->code;
     sink k;
     memset(&k, 0, sizeof k);
@@ -2173,10 +2191,46 @@ static void erase_status(imdb_result *r, const imdb_erase_report *er, const imdb
 
 /* ---- admin ------------------------------------------------------------------------- */
 
+/* a retention as SQL writes it: its largest whole unit, or FOREVER */
+static void retention_text(uint64_t us, char *out, size_t n)
+{
+    static const struct {
+        uint64_t us;
+        const char *one, *many;
+    } u[] = {{86400ull * 1000000, "DAY", "DAYS"}, {3600ull * 1000000, "HOUR", "HOURS"},
+             {60ull * 1000000, "MINUTE", "MINUTES"}, {1000000ull, "SECOND", "SECONDS"}};
+    if (us == IMDB_RETAIN_FOREVER) {
+        snprintf(out, n, "FOREVER");
+        return;
+    }
+    for (size_t i = 0; i < sizeof u / sizeof *u; i++)
+        if (us % u[i].us == 0) {
+            snprintf(out, n, "%llu %s", (unsigned long long)(us / u[i].us), us / u[i].us == 1 ? u[i].one : u[i].many);
+            return;
+        }
+    snprintf(out, n, "%llu MICROSECONDS", (unsigned long long)us); /* the C API takes any count above a second */
+}
+
 static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
 {
     imdb_db *db = x->db;
     char hex[65];
+    if (st->kind == ST_SHOW_RETENTION) {
+        res_cols(r, 3);
+        const char *nm[] = {"table", "retention", "history_from"};
+        for (int i = 0; i < 3; i++) res_name(r, (uint16_t)i, nm[i]);
+        for (uint32_t i = 0; i < db->nt; i++) {
+            const imdb_table *t = db->t[i];
+            char ret[48];
+            retention_text(t->retention_us, ret, sizeof ret);
+            imdb_cell *row = res_row(r, e);
+            if (!row) return e->code;
+            res_put_str(r, &row[0], t->s.name);
+            res_put_str(r, &row[1], ret);
+            res_put_int(r, &row[2], (int64_t)t->horizon);
+        }
+        return res_finish(r, e);
+    }
     if (st->kind == ST_SHOW_INDEXES) {
         res_cols(r, 4);
         const char *nm[] = {"index", "table", "columns", "unique"};
@@ -2340,6 +2394,7 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
             bool usable = s->acked && !s->incident && s->state == IMDB_REPL_SAME_HISTORY;
             if (!usable)
                 snprintf(d, sizeof d, "%s", s->incident ? "refused: see SHOW REPLICAS"
+                                            : s->state == IMDB_REPL_RETIRED ? "behind the retired log: seed it again"
                                             : s->acked ? "its acknowledgement is not of this history"
                                                        : "no acknowledgement received");
             else {
@@ -2375,7 +2430,8 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
         /* received_utc and age_ms say when: an acknowledgement is what the replica held then (repl.h) */
         static const char *const nm[] = {"replica", "key",          "commit", "epoch",   "lag",
                                          "cleanup_commit", "received_utc", "age_ms", "session", "state"};
-        static const char *const sn[] = {"no acknowledgement", "same history", "diverged", "ahead of this log"};
+        static const char *const sn[] = {"no acknowledgement", "same history", "diverged", "ahead of this log",
+                                         "behind the retired log: seed it again"};
         enum { NCOL = sizeof nm / sizeof *nm };
         imdb_replica_status *v;
         size_t n;
@@ -2608,7 +2664,7 @@ static int check_iso(const sql_stmt *st, imdb_err *e)
 static bool is_write(uint8_t k)
 {
     return k == ST_CREATE || k == ST_INSERT || k == ST_UPDATE || k == ST_DELETE || k == ST_CREATE_INDEX ||
-           k == ST_DROP_INDEX;
+           k == ST_DROP_INDEX || k == ST_ALTER_RETENTION;
 }
 
 int imdb_exec_one(imdb_session *ss, const char *sql, size_t len, const imdb_value *params, uint32_t nparams,
@@ -2660,9 +2716,13 @@ int imdb_exec_one(imdb_session *ss, const char *sql, size_t len, const imdb_valu
     bool control = st->kind == ST_BEGIN || st->kind == ST_COMMIT || st->kind == ST_ROLLBACK || st->kind == ST_SET ||
                    st->kind == ST_EMPTY || st->kind == ST_SAVEPOINT || st->kind == ST_ROLLBACK_TO ||
                    st->kind == ST_RELEASE || st->kind == ST_SET_TXN;
-    if (txn && (st->kind == ST_CREATE || st->kind == ST_CREATE_INDEX || st->kind == ST_DROP_INDEX)) {
+    if (txn && (st->kind == ST_CREATE || st->kind == ST_CREATE_INDEX || st->kind == ST_DROP_INDEX ||
+                st->kind == ST_ALTER_RETENTION)) {
         rc = imdb_fail(e, IMDB_ERR_STATE, "%s commits on its own: run it outside the transaction",
-                       st->kind == ST_CREATE ? "CREATE TABLE" : st->kind == ST_CREATE_INDEX ? "CREATE INDEX" : "DROP INDEX");
+                       st->kind == ST_CREATE         ? "CREATE TABLE"
+                       : st->kind == ST_CREATE_INDEX ? "CREATE INDEX"
+                       : st->kind == ST_DROP_INDEX   ? "DROP INDEX"
+                                                     : "ALTER TABLE");
         goto done;
     }
     if (txn && physical) {
@@ -2683,9 +2743,15 @@ int imdb_exec_one(imdb_session *ss, const char *sql, size_t len, const imdb_valu
     switch (st->kind) {
     case ST_EMPTY: break;
     case ST_CREATE:
-        rc = imdb_create_table(db, &st->schema, e);
+        rc = imdb_create_table_ex(db, &st->schema, st->has_retention ? st->retention_us : IMDB_RETAIN_DEFAULT_US, e);
         if (!rc) snprintf(r->status, sizeof r->status, "CREATE TABLE %s", st->schema.name);
         break;
+    case ST_ALTER_RETENTION: {
+        imdb_table *t = imdb_table_by_name(db, st->table);
+        rc = t ? imdb_set_retention(db, t, st->retention_us, e) : imdb_fail(e, IMDB_ERR_INVALID, "no table %s", st->table);
+        if (!rc) snprintf(r->status, sizeof r->status, "ALTER TABLE %s", st->table);
+        break;
+    }
     case ST_CREATE_INDEX: {
         imdb_table *t = imdb_table_by_name(db, st->table);
         imdb_index_def d;
@@ -2840,6 +2906,7 @@ int imdb_exec_one(imdb_session *ss, const char *sql, size_t len, const imdb_valu
     case ST_VERIFY: rc = exec_verify(&x, r, e); break;
     case ST_SHOW_TABLES:
     case ST_SHOW_INDEXES:
+    case ST_SHOW_RETENTION:
     case ST_SHOW_DIGEST:
     case ST_SHOW_HISTORY:
     case ST_SHOW_LOG:

@@ -88,6 +88,7 @@ int main(int argc, char **argv)
         {"mem", mem_tests, &mem_ntests},
         {"index", index_tests, &index_ntests},
         {"join", join_tests, &join_ntests},
+        {"retain", retain_tests, &retain_ntests},
     };
     int failed = 0, run = 0;
     for (size_t g = 0; g < sizeof groups / sizeof *groups; g++) {
@@ -97,6 +98,7 @@ int main(int argc, char **argv)
             g_rng = 0x9E3779B97F4A7C15ull ^ (uint64_t)(i + 1) * 0xBF58476D1CE4E5B9ull;
             g_test_failed = 0;
             imdb_log_set_tagged(true); /* a test of the untagged format turns it off for itself only */
+            imdb_clock_offset(0);      /* a test that moves the clock (expiry) moves it for itself only */
             g_errmsg[0] = 0;
             printf("[%s] %s\n", groups[g].name, tc->name);
             fflush(stdout);

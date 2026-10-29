@@ -24,14 +24,14 @@
  *   Every version of a table is in exactly one segment of the manifest.
  *
  * Deletion vector ("IMDBDV01"): seg_hash[32] u32 count u32 0 | count x { u32 row, u32 0, u64 end }
- * Manifest ("IMDBMAN1"): u32 version (2) u32 ntables db_id[16] u64 seq prev_hash[32] state_digest[32]
+ * Manifest ("IMDBMAN1"): u32 version (4) u32 ntables db_id[16] u64 seq prev_hash[32] state_digest[32]
  *   prev_manifest[32] (the generation GC keeps beside this one; zero for the first manifest and
- *   after an ERASE, which keeps nothing)
+ *   after an ERASE, which keeps nothing) u64 boundary (the commit at or below which the log is retired; 0: none)
  *   per table: u32 len | schema | u64 horizon | u64 live | u64 versions | lthash[2048] |
- *              u32 nseg | nseg x { seg_hash[32], dv_hash[32] (zero = none), u32 nrows }
- *              [version 3: u32 nidx | nidx x { u8 len | name | u16 column }, names strictly
- *              increasing per table and unique across tables; version 3 only when some table
- *              has an index, so a database without one keeps version 2, byte for byte]
+ *              u32 nseg | nseg x { seg_hash[32], dv_hash[32] (zero = none), u32 nrows } |
+ *              u32 nidx | nidx x { u8 len | name | u8 flags | u8 ncols | ncols x u16 column } (names
+ *              strictly increasing per table and unique across tables) | u64 retention_us (op 16)
+ *   Versions 2 and 3 (before the retention, 2026-10-29) are not read.
  * LAKE_HEAD: "imagedb-lake 1\nseq <n>\nmanifest <64 hex>\n"
  */
 #ifndef IMDB_LAKE_H
@@ -104,13 +104,15 @@ typedef struct imdb_manifest_tab {
     imdb_lthash digest;
     imdb_manifest_seg *seg;
     uint32_t nseg;
-    imdb_index idx[IMDB_MAX_INDEXES]; /* version 3: the table's index definitions, sorted by name */
+    imdb_index idx[IMDB_MAX_INDEXES]; /* the table's index definitions, sorted by name */
     uint32_t nidx;
+    uint64_t retention_us;
 } imdb_manifest_tab;
 typedef struct imdb_manifest {
     uint8_t db_id[16];
     uint64_t seq;
     uint8_t prev[32], state[32], prev_manifest[32];
+    uint64_t boundary; /* the commit at or below which the log is retired (0: none) */
     imdb_manifest_tab *t;
     uint32_t nt;
 } imdb_manifest;
@@ -145,5 +147,12 @@ int imdb_checkpoint(imdb_db *db, imdb_err *e);
 /* Merge a table's segments into one; drop versions that ended at or before
  * purge_before (0 = keep all history) and raise the history horizon. */
 int imdb_compact(imdb_db *db, imdb_table *t, uint64_t purge_before, imdb_err *e);
+/* RETIRE below boundary (stage 3a): every version ended at or before it leaves the lake, the version store
+ * and the indexes. boundary must end a log segment (the next commit begins one), be past the database's and
+ * below every table's horizon (so nothing still answered is dropped): INVALID otherwise, nothing signed. */
+int imdb_retire(imdb_db *db, uint64_t boundary, imdb_err *e);
+/* Tests only: the same op without those checks, so that VERIFY, the auditor and replay can be shown to refuse
+ * what the engine never signs. */
+int imdb_retire_unchecked(imdb_db *db, uint64_t boundary, imdb_err *e);
 
 #endif

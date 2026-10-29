@@ -136,6 +136,7 @@ static bool locks_live(const imdb_db *db, const imdb_txn *x)
 {
     for (uint32_t i = 0; i < x->nlocks; i++) {
         const imdb_table *t = db->t[x->locks[i].table];
+        if (!imdb_v_present(t, x->locks[i].vid)) return false; /* retired: it ended long before the commit */
         const imdb_version *v = imdb_vh(t, x->locks[i].vid);
         /* seq+1 is an uncommitted end, including our own UPDATE/DELETE.
          * Only a committed change can break an optimistic observation. */
@@ -323,6 +324,13 @@ static bool erased(const imdb_erase_ent *ents, uint32_t n, uint32_t table, uint6
 {
     imdb_erase_ent k = {.table = table, .vid = vid};
     return n && bsearch(&k, ents, n, sizeof k, cmp_ent) != NULL;
+}
+
+void imdb_txn_doom_retired(imdb_db *db, uint64_t boundary)
+{
+    for (imdb_txn *x = db->txns; x; x = x->next)
+        if (x->open && x->started && x->iso != IMDB_ISO_READ_COMMITTED && x->snap <= boundary && !x->doomed)
+            doom(x, "its snapshot is at or below the retirement boundary: no table keeps that history");
 }
 
 void imdb_txn_doom_erased(imdb_db *db, const imdb_erase_ent *ents, uint32_t n)

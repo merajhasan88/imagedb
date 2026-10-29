@@ -27,6 +27,13 @@
 #define IMDB_MAX_FRAME          (1u << 30)   /* bytes in one log frame body          */
 #define IMDB_MAX_HEADER         ((1u << 30) - 128u) /* chained header bytes in one commit */
 #define IMDB_MAX_SEGMENT_ROWS   (1u << 22)   /* row versions in one segment          */
+#define IMDB_MAX_VERSIONS       (1ull << 40) /* vids one table hands out: bounds its chunk directory (16 B a 2^16) */
+#define IMDB_REPLICA_HOLD_MS    (24ll * 3600 * 1000) /* a replica heard from within this keeps the log it still needs */
+#define IMDB_RETIRE_RECHECK_US  1000000u /* a policy RETIRE a replica held back looks again after this */
+#define IMDB_FLOOR_STRIDE       4096u        /* a manifest kept for a future log floor: the first publish of each such
+                                                block of commits (lake.c keepers); every one at a 64 MB cadence */
+#define IMDB_SEED_HEAD_MAX      (64u << 20) /* a seed's FLOOR head: the floor's header, its key changes, its starts */
+#define IMDB_SEED_OBJECTS_MAX   (1u << 24)  /* objects in one seed (a snapshot's manifests, segments, vectors) */
 #define IMDB_MAX_OBJECT         (1ull << 34) /* bytes in one object file             */
 #define IMDB_MAX_ALLOC          (1ull << 34) /* largest single allocation            */
 #define IMDB_MAX_ERASE_ENTRIES  (1u << 24)   /* versions named by one ERASE          */
@@ -35,7 +42,8 @@
 #define IMDB_CHECKPOINT_BYTES   (64ull << 20) /* default auto-CHECKPOINT segment size (primary) */
 #define IMDB_LOG_FILL_CHUNK     (1u << 20)   /* zeros written ahead in a tagged segment at a time (design.md §3) */
 #define IMDB_LOG_FILL_LOW       (256u << 10) /* less fill than this left after an append: the next chunk */
-#define IMDB_RETAIN_MIN_ENDED   4096u        /* automatic retention: versions a table must end first */
+#define IMDB_RETAIN_MIN_US      1000000ull   /* a table's shortest retention (op 16): a second */
+#define IMDB_RETAIN_MAX_US      (36525ull * 24 * 3600 * 1000000) /* its longest but FOREVER: a century */
 #define IMDB_MAX_INDEXES        16u          /* CREATE INDEX: indexes per table      */
 #define IMDB_MAX_INDEX_COLS     4u           /* CREATE INDEX: columns per index      */
 #define IMDB_MAX_JOIN_ROWS      (1u << 22)   /* a join: build entries, joined rows   */

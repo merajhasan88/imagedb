@@ -57,6 +57,10 @@ void imdb_commit_encode_header(const imdb_commit_rec *c, imdb_buf *b)
         imdb_buf_put_u8(b, o->code);
         switch (o->code) {
         case IMDB_OP_CREATE_TABLE:
+            if (i + 1 == c->nops || c->ops[i + 1].code != IMDB_OP_SET_RETENTION || c->ops[i + 1].table != o->table) {
+                b->err = IMDB_ERR_INVALID; /* the decoder refuses it (log.h): never signed */
+                break;
+            }
             imdb_buf_put_u32(b, o->table);
             imdb_schema_encode(o->schema, b);
             break;
@@ -78,6 +82,14 @@ void imdb_commit_encode_header(const imdb_commit_rec *c, imdb_buf *b)
             break;
         case IMDB_OP_COMPACT:
             imdb_buf_put_u32(b, o->table);
+            imdb_buf_put_u64(b, o->purge_before);
+            imdb_buf_put(b, o->manifest, 32);
+            break;
+        case IMDB_OP_RETIRE: /* alone; the commit after the boundary comes before it (log.h) */
+            if (c->nops != 1 || !o->purge_before || c->seq < 2 || o->purge_before > c->seq - 2) {
+                b->err = IMDB_ERR_INVALID;
+                break;
+            }
             imdb_buf_put_u64(b, o->purge_before);
             imdb_buf_put(b, o->manifest, 32);
             break;
@@ -121,6 +133,24 @@ void imdb_commit_encode_header(const imdb_commit_rec *c, imdb_buf *b)
             imdb_buf_put_u32(b, o->epoch);
             imdb_buf_put(b, o->new_pk, IMDB_PUBKEY_LEN);
             imdb_buf_put_u8(b, o->how);
+            break;
+        case IMDB_OP_SET_RETENTION:
+            if (!imdb_retention_ok(o->retention_us)) {
+                b->err = IMDB_ERR_INVALID;
+                break;
+            }
+            imdb_buf_put_u32(b, o->table);
+            imdb_buf_put_u64(b, o->retention_us);
+            break;
+        case IMDB_OP_EXPIRE: /* only EXPIREs in its commit, by table, each before its commit (log.h) */
+            if (!o->purge_before || o->purge_before >= c->seq ||
+                (i && (c->ops[i - 1].code != IMDB_OP_EXPIRE || c->ops[i - 1].table >= o->table)) ||
+                (i + 1 < c->nops && c->ops[i + 1].code != IMDB_OP_EXPIRE)) {
+                b->err = IMDB_ERR_INVALID;
+                break;
+            }
+            imdb_buf_put_u32(b, o->table);
+            imdb_buf_put_u64(b, o->purge_before);
             break;
         default:
             b->err = IMDB_ERR_INVALID;
@@ -278,7 +308,8 @@ void imdb_frame_build_ext(const uint8_t *header, size_t hlen, uint64_t seq, cons
 
 /* ---- decoding ------------------------------------------------------------ */
 
-#define OP_MIN_BYTES 33u /* smallest encoded op (CHECKPOINT); bounds n_ops by input size */
+#define OP_MIN_BYTES 13u /* smallest encoded op among many (SET_RETENTION; a DROP_INDEX's 7 come alone); bounds
+                          * n_ops by input size */
 
 static int cmp_erase(const imdb_erase_ent *a, const imdb_erase_ent *b)
 {
@@ -347,6 +378,12 @@ int imdb_commit_decode_header(const uint8_t *h, size_t hlen, imdb_commit_rec *c,
             o->purge_before = imdb_rd_u64(&r);
             imdb_rd_copy(&r, o->manifest, 32);
             break;
+        case IMDB_OP_RETIRE:
+            o->purge_before = imdb_rd_u64(&r);
+            imdb_rd_copy(&r, o->manifest, 32);
+            if (!r.err && (nops != 1 || !o->purge_before || c->seq < 2 || o->purge_before > c->seq - 2))
+                return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: RETIRE must be the only op, the commit after its boundary before it");
+            break;
         case IMDB_OP_ERASE: {
             uint32_t n = imdb_rd_u32(&r);
             if (r.err || n == 0 || n > IMDB_MAX_ERASE_ENTRIES || n > imdb_rd_left(&r) / 44)
@@ -401,11 +438,34 @@ int imdb_commit_decode_header(const uint8_t *h, size_t hlen, imdb_commit_rec *c,
             if (!r.err && (nops != 1 || o->epoch == 0 || (o->how != IMDB_WRITER_ROTATE && o->how != IMDB_WRITER_PROMOTE)))
                 return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: WRITER_KEY must be the only op, with epoch >= 1 and how 1 or 2");
             break;
+        case IMDB_OP_SET_RETENTION:
+            o->table = imdb_rd_u32(&r);
+            o->retention_us = imdb_rd_u64(&r);
+            if (!r.err && !imdb_retention_ok(o->retention_us))
+                return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: retention out of range");
+            break;
+        case IMDB_OP_EXPIRE:
+            o->table = imdb_rd_u32(&r);
+            o->purge_before = imdb_rd_u64(&r);
+            if (!r.err && (!o->purge_before || o->purge_before >= c->seq))
+                return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: EXPIRE's horizon is not in the past");
+            break;
         default:
             return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: unknown op code %u", o->code);
         }
         if (r.err) return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: truncated op");
     }
+    /* a commit with an EXPIRE holds only EXPIREs, one a table at most, by table (log.h) */
+    for (uint32_t i = 0; i < nops; i++) {
+        bool ex = c->ops[i].code == IMDB_OP_EXPIRE, ex0 = c->ops[0].code == IMDB_OP_EXPIRE;
+        if (ex != ex0 || (ex && i && c->ops[i - 1].table >= c->ops[i].table))
+            return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: EXPIREs must stand alone, one a table, by table");
+    }
+    /* a table's retention is always logged: its CREATE_TABLE is followed at once by its SET_RETENTION (log.h) */
+    for (uint32_t i = 0; i < nops; i++)
+        if (c->ops[i].code == IMDB_OP_CREATE_TABLE &&
+            (i + 1 == nops || c->ops[i + 1].code != IMDB_OP_SET_RETENTION || c->ops[i + 1].table != c->ops[i].table))
+            return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: CREATE_TABLE without its SET_RETENTION");
     imdb_rd_copy(&r, c->digest, 32);
     if (r.err) return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: truncated digest");
     if (imdb_rd_left(&r)) return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: trailing header bytes");

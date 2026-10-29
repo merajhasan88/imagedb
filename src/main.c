@@ -30,12 +30,9 @@ static int usage(void)
           "  imagedb identity <dir>                     print the db id and writer public key (no secrets)\n"
           "  imagedb sql <dir> [-c SQL]... [-f FILE] [--csv] [--cross-check] [--nosync] [--lake-sync]\n"
           "                    [--anchor FILE [--accept-rollback]] [--read-only] [--durable-ack] [--mem-limit BYTES]\n"
-          "                    [--retain-history COMMITS]\n"
           "                                             run SQL (interactive when no -c/-f and stdin is a tty);\n"
           "                                             --durable-ack: the watermark synced as each commit returns,\n"
           "                                             so a damaged last frame past it is known unacknowledged;\n"
-          "                                             --retain-history: purge history older than the last\n"
-          "                                             COMMITS automatically (logged COMPACT ... PURGE)\n"
           "  imagedb ship <primary-dir> [--after N] [--follow] [--acks]\n"
           "                                             write commits after N to stdout (--acks: read the\n"
           "                                             replica's acknowledgements on stdin)\n"
@@ -70,20 +67,6 @@ static void print_err(const char *what, const imdb_err *e)
 }
 
 static uint64_t g_mem_limit; /* --mem-limit (db.h: the memory budget), for the command's open */
-static uint64_t g_retain;    /* --retain-history (db.h: automatic retention), for the command's open */
-
-/* COMMITS: decimal digits, no leading zero (0 would be no retention, so refused) */
-static bool parse_count(const char *s, uint64_t *out)
-{
-    uint64_t v = 0;
-    if (s[0] < '1' || s[0] > '9') return false;
-    for (; *s; s++) {
-        if (*s < '0' || *s > '9' || v > (UINT64_MAX - 9) / 10) return false;
-        v = v * 10 + (uint64_t)(*s - '0');
-    }
-    *out = v;
-    return true;
-}
 
 /* BYTES: decimal digits, no leading zero, optionally K, M or G (binary); 0 is no budget, so refused */
 static bool parse_size(const char *s, uint64_t *out)
@@ -106,7 +89,7 @@ static imdb_db *open_anchored(const char *dir, bool ro, int sync, const char *an
                               bool durable_ack)
 {
     imdb_open_opts o = {.sync = sync, .read_only = ro, .anchor = anchor, .accept_rollback = accept_rollback,
-                        .durable_ack = durable_ack, .mem_limit = g_mem_limit, .retain_commits = g_retain};
+                        .durable_ack = durable_ack, .mem_limit = g_mem_limit};
     imdb_db *db;
     imdb_err e = {0};
     if (imdb_open(dir, &o, &db, &e)) {
@@ -250,12 +233,6 @@ static int cmd_sql(int argc, char **argv)
         else if (strcmp(argv[i], "--mem-limit") == 0 && i + 1 < argc) {
             if (!parse_size(argv[++i], &g_mem_limit)) {
                 fprintf(stderr, "imagedb: sql: --mem-limit takes BYTES (digits, then K, M or G)\n");
-                return 2;
-            }
-        }
-        else if (strcmp(argv[i], "--retain-history") == 0 && i + 1 < argc) {
-            if (!parse_count(argv[++i], &g_retain)) {
-                fprintf(stderr, "imagedb: sql: --retain-history takes COMMITS (decimal digits, at least 1)\n");
                 return 2;
             }
         }
@@ -493,6 +470,17 @@ static int cmd_follow(int argc, char **argv)
         while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
         }
         g_child = 0;
+        if (ao.seeded || (arc && ao.truncated && db->failed && !db->seq)) {
+            /* a seed taken (or cut short: the reopen removes what it left): its snapshot, then ship from there */
+            if (ao.seeded) fprintf(stderr, "imagedb: follow: seeded at commit %llu\n", (unsigned long long)ao.seeded);
+            if (imdb_close(db)) rc = 1;
+            db = open_or_die(dir, false, 0);
+            if (!db) {
+                rc = 1;
+                break;
+            }
+            if (ao.seeded) continue;
+        }
         if (arc && (!ao.truncated || db->failed)) { /* hostile, diverged, or a failed handle: not a dropped connection */
             print_err("follow", &ea);
             rc = 1;
@@ -766,6 +754,9 @@ int main(int argc, char **argv)
         uint64_t applied = 0;
         int rc = imdb_apply_stream(db, 0, &applied, &e);
         if (rc) print_err("apply", &e);
+        else if (db->seeded)
+            fprintf(stderr, "seeded at commit %llu (its log begins after it): ship --after %llu to go on\n",
+                    (unsigned long long)db->seeded, (unsigned long long)db->seeded);
         else fprintf(stderr, "applied %llu commits; replica at commit %llu\n", (unsigned long long)applied,
                      (unsigned long long)db->seq);
         imdb_close(db);

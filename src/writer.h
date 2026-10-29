@@ -23,6 +23,7 @@
 
 #define IMDB_WRITERS_NAME "WRITERS"
 #define IMDB_SIGNING_NEXT_NAME "signing.key.next"
+#define IMDB_FLOOR_NAME "FLOOR"
 
 typedef struct imdb_wep {
     imdb_writer_epoch k;
@@ -53,6 +54,31 @@ uint32_t imdb_current_epoch(const imdb_db *db);
 int imdb_writer_apply(imdb_db *db, const imdb_commit_rec *c, imdb_err *e);
 /* WRITERS, replaced atomically when it differs from the schedule (writable handles). */
 int imdb_writers_publish(imdb_db *db, imdb_err *e);
+/* FLOOR (stage 3a (c2)): a copy's log floor F, its log beginning at F + 1, the log below cut. Replaced atomically:
+ *   "IMDBFLR1" | db_id[16] | u64 F | u32 header_len | commit F's header | its sig[64] |
+ *   u32 n | n WRITERS entries (the epochs whose WRITER_KEY commit is at or below F) |
+ *   u32 m | m x (u64 seq | u64 time) (the segment starts in (the lowest horizon at F, F]: an EXPIRE past the floor
+ *   may name one) | u64 len | F's manifest (the tables at the floor; its hash is in F's publish op) | CRC32C
+ * Proven from META alone: the entries in order, then F's signature under the key in effect at F (F is a publish,
+ * never a key change). With the log gone below F, it is what a damaged WRITERS falls back on for those epochs.
+ * read: absent is no error (log_floor stays 0); else db->log_floor, floor_hash and floor_digest set, and with
+ * no epoch from WRITERS, its entries make the schedule up to F. */
+int imdb_floor_write(imdb_db *db, uint64_t floor, const uint8_t *hdr, uint32_t hlen, const uint8_t sig[IMDB_SIG_LEN],
+                     const uint8_t *starts, uint32_t nstarts, const uint8_t *man, size_t manlen, imdb_err *e);
+int imdb_floor_read(imdb_db *db, imdb_err *e);
+
+/* FLOOR's head, everything before its manifest's length: checked as the open checks it (the key changes up to the
+ * floor from META's keys and WRITERS, the floor's header under the key at it, the starts). Pointers into r's bytes.
+ * A seed checks the head it received with it before trusting anything it names (seed.c). */
+typedef struct imdb_floor_hd {
+    uint64_t floor, time;
+    const uint8_t *hdr; /* the floor commit's header */
+    uint32_t hlen;
+    uint8_t sig[IMDB_SIG_LEN], manifest[32], hash[32], digest[32]; /* manifest: the hash its publish op names */
+    const uint8_t *starts; /* nstarts (seq, first time) pairs, 16 bytes each */
+    uint32_t nstarts;
+} imdb_floor_hd;
+int imdb_floor_head(imdb_db *db, imdb_rd *r, imdb_floor_hd *h, imdb_err *e);
 /* A writable primary's signing.key against the log's current key, after replay: a rotation or
  * promotion that reached the log is completed (signing.key.next renamed), one that did not is
  * dropped; any other mismatch is an error. */

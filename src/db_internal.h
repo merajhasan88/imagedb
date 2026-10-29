@@ -13,6 +13,12 @@ int imdb_ver_push(imdb_table *t, imdb_err *e);
 /* An empty store with room for exactly n versions (chunk 0 sized to n when n fits one chunk), for an
  * open that knows the count (the snapshot). */
 int imdb_ver_reserve(imdb_table *t, uint64_t n, imdb_err *e);
+/* An empty store covering vids [0, n) with no chunk allocated but the last (where vids are appended) and, for
+ * n within one chunk, chunk 0 itself; imdb_ver_chunk_need allocates the chunk of a vid a row names. Every vid
+ * of an allocated chunk starts retired (IMDB_V_RETIRED) until filled: the snapshot load, which then holds
+ * only what its rows name. */
+int imdb_ver_reserve_sparse(imdb_table *t, uint64_t n, imdb_err *e);
+int imdb_ver_chunk_need(imdb_table *t, uint32_t k, imdb_err *e);
 /* What the store holds in memory, and what its next growth step adds (both parts and the directories). */
 uint64_t imdb_ver_bytes(const imdb_table *t);
 uint64_t imdb_ver_growth(const imdb_table *t);
@@ -28,6 +34,13 @@ int imdb_update_row(imdb_db *db, imdb_table *t, uint64_t vid, const uint8_t *row
                     imdb_err *e);
 int imdb_index_version(imdb_table *t, uint64_t vid, imdb_undo *u, imdb_err *e);
 int imdb_index_subject(imdb_table *t, uint64_t vid, const imdb_value *sv, imdb_undo *u, imdb_err *e);
+/* The key map with its chains and the subject index, from the versions present, in vid order as incremental
+ * insertion builds them: the snapshot load, and RETIRE (the CREATE INDEX structures are the caller's). */
+int imdb_table_reindex(imdb_table *t, imdb_err *e);
+/* RETIRE in the version store (stage 3a): every version ended at or before boundary leaves it (wiped,
+ * flagged IMDB_V_RETIRED), a chunk left with none present is freed but for the last, and the table is
+ * reindexed. Its rows have left the lake already (the RETIRE's plan). */
+int imdb_retire_table(imdb_table *t, uint64_t boundary, imdb_err *e);
 /* Drops all loaded state (tables, lake, commit index) back to an empty database. */
 void imdb_reset_state(imdb_db *db);
 /* The memory budget's admission (db.h): IMDB_ERR_LIMIT when growing by growth bytes would cross it. */
@@ -61,6 +74,30 @@ uint64_t imdb_now_us(void);
 void imdb_stub_version(imdb_table *t, uint64_t vid);
 void imdb_pk_unlink(imdb_table *t, uint64_t vid, const imdb_value *key);
 int imdb_ci_push(imdb_db *db, uint64_t time_us, const uint8_t hash[32], const uint8_t digest[32], imdb_err *e);
+/* RETIRE: the commit index keeps the commits past boundary only (an AS OF at or below it is refused: every
+ * horizon is past it), and gives its room back. */
+void imdb_ci_retire(imdb_db *db, uint64_t boundary);
+/* Commit seq's header (replaced into hdr) and signature, read from its log segment (FLOOR's). */
+int imdb_log_commit_header(imdb_db *db, uint64_t seq, imdb_buf *hdr, uint8_t sig[IMDB_SIG_LEN], imdb_err *e);
+/* Stage 3a (c2): unlinks the log segments that end at or below both the floor and the published snapshot, oldest
+ * first, then syncs the directory; db->segs and seg_time follow. Cleanup: a writable open repeats it. */
+int imdb_log_cut(imdb_db *db, imdb_err *e);
+/* The boundary the RETIRE policy would choose now (the lowest horizon less one, lowered to a segment end): 0 if
+ * none (a table kept FOREVER, or nothing expired past the boundary). */
+/* A publish p, the end of the log segment that begins at seg_start, is a keeper (its manifest kept for a future
+ * FLOOR, lake.c) iff it is the first publish of its block of stride commits: absolute, so the set only shrinks
+ * as the boundary rises, and every copy of the log agrees on it. */
+static inline bool imdb_is_keeper(uint32_t stride, uint64_t seg_start, uint64_t p)
+{
+    uint64_t k = stride ? stride : 1;
+    return p / k > (seg_start - 1) / k;
+}
+/* The keepers' manifests past the boundary (lake.c): those objects/ holds, at a writable open. */
+int imdb_lake_keepers_load(imdb_db *db, imdb_err *e);
+uint64_t imdb_retire_candidate(const imdb_db *db, uint64_t cap); /* at or below cap, too */
+/* The log segment starts s with lo < s <= hi, each as u64 seq | u64 its first commit's time, appended to out (*n
+ * of them): what a FLOOR carries for the EXPIREs after it to name. */
+int imdb_seg_starts(imdb_db *db, uint64_t lo, uint64_t hi, imdb_buf *out, uint32_t *n, imdb_err *e);
 int imdb_digest_delta(uint8_t alg, const imdb_op *ops, uint32_t nops, uint32_t nt, imdb_lthash *out, bool *touched, imdb_err *e);
 
 /* transaction helpers for erase/lake */

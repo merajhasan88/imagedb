@@ -80,6 +80,27 @@ static int need(imdb_stream *s, void *dst, size_t n, imdb_err *e)
     return IMDB_OK;
 }
 
+int imdb_stream_need(imdb_stream *s, void *dst, size_t n, imdb_err *e)
+{
+    return need(s, dst, n, e);
+}
+
+int imdb_stream_seed(imdb_stream *s, uint8_t p[28], bool *have, imdb_err *e)
+{
+    *have = false;
+    if (!s->nback) { /* after a session record: what follows it, read ahead as imdb_stream_session does */
+        size_t got = 0;
+        if (s->read(s->ctx, s->back, IMDB_FRAME_HDR, &got, e)) return e->code;
+        s->nback = got;
+    }
+    if (s->nback != IMDB_FRAME_HDR || memcmp(s->back, "IMDBSED1", 8) != 0) return IMDB_OK;
+    memcpy(p, s->back, IMDB_FRAME_HDR);
+    s->nback = 0;
+    if (need(s, p + IMDB_FRAME_HDR, 28 - IMDB_FRAME_HDR, e)) return e->code;
+    *have = true;
+    return IMDB_OK;
+}
+
 int imdb_stream_session(imdb_stream *s, uint8_t nonce[16], bool *have, imdb_err *e)
 {
     *have = false;

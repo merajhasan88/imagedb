@@ -62,6 +62,11 @@ void imdb_stream_set_trust(imdb_stream *s, const uint8_t db_id[16], const uint8_
  * the bytes read belong to the first frame, and imdb_stream_next starts with them. A damaged
  * record, or another database's, is an error. */
 int imdb_stream_session(imdb_stream *s, uint8_t nonce[16], bool *have, imdb_err *e);
+/* After the session record: a seed (seed.h) begins here? Its 28-byte prefix then in p (*have); else the 16 bytes
+ * read stay ahead for the first frame. */
+int imdb_stream_seed(imdb_stream *s, uint8_t p[28], bool *have, imdb_err *e);
+/* Exactly n raw bytes (a seed's): the end of input inside them is an error (truncated). */
+int imdb_stream_need(imdb_stream *s, void *dst, size_t n, imdb_err *e);
 /* Reads the next frame, which must be commit expect_seq chaining to prev.
  * *eof is set at a clean end of stream (between frames). */
 int imdb_stream_next(imdb_stream *s, uint64_t expect_seq, const uint8_t prev[32], bool *eof, imdb_err *e);

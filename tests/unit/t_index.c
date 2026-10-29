@@ -136,8 +136,8 @@ static void t_index_rollback(void)
     imdb_close(db);
 }
 
-/* a full replay and a snapshot open both rebuild the definitions, VERIFY checking them; a
- * database without an index writes version 2 manifests, and goes back to them after its last DROP */
+/* a full replay and a snapshot open both rebuild the definitions, VERIFY checking them; every
+ * manifest is version 4, with indexes or without */
 static void t_index_persist(void)
 {
     const char *dir = test_tmpdir();
@@ -150,10 +150,10 @@ static void t_index_persist(void)
     OK(ex(&s, "CREATE TABLE t (id INT64 PRIMARY KEY, v INT64, s TEXT)"));
     OK(ex(&s, "INSERT INTO t VALUES (1, 10, 'a'), (2, 20, 'b')"));
     OK(ex(&s, "CHECKPOINT"));
-    CHECK(manifest_version(db) == 2);
+    CHECK(manifest_version(db) == 4);
     OK(ex(&s, "CREATE INDEX t_v ON t (v)"));
     OK(ex(&s, "CHECKPOINT"));
-    CHECK(manifest_version(db) == 3);
+    CHECK(manifest_version(db) == 4);
     OK(ex(&s, "CREATE INDEX t_s ON t (s)")); /* in the log tail only */
     imdb_session_close(&s);
     imdb_close(db);
@@ -173,7 +173,7 @@ static void t_index_persist(void)
     OK(ex(&s, "DROP INDEX t_v"));
     OK(ex(&s, "DROP INDEX t_s"));
     OK(ex(&s, "CHECKPOINT"));
-    CHECK(manifest_version(db) == 2);
+    CHECK(manifest_version(db) == 4);
     imdb_session_close(&s);
     OK(verify_db(db));
     imdb_close(db);
@@ -342,7 +342,7 @@ static size_t name_at(const uint8_t *b, size_t n, const char *s)
     return 0;
 }
 
-/* the engine's version-3 rules on real manifest bytes, one rule broken at a time */
+/* the engine's version-4 rules on real manifest bytes, one rule broken at a time */
 static void t_index_manifest_strict(void)
 {
     const char *dir = test_tmpdir();
@@ -359,7 +359,7 @@ static void t_index_manifest_strict(void)
     OK(ex(&s, "CREATE INDEX u_w ON u (w)"));
     OK(ex(&s, "INSERT INTO t VALUES (1, 10)"));
     OK(ex(&s, "CHECKPOINT"));
-    CHECK(manifest_version(db) == 3);
+    CHECK(manifest_version(db) == 4);
     size_t n;
     uint8_t *b = manifest_copy(db, &n);
     CHECK(b && parse_bytes(b, n) == IMDB_OK);
@@ -367,17 +367,21 @@ static void t_index_manifest_strict(void)
     uint8_t *w = malloc(n);
     CHECK(w);
     if (!w) return;
-    /* an entry: u8 length, the name, u8 flags, u8 ncols, u16 per column; u_w is the last */
+    /* an entry: u8 length, the name, u8 flags, u8 ncols, u16 per column; u_w is u's last, and u's
+     * u64 retention ends the manifest */
     memcpy(w, b, n); /* the last index (u_w) on a column u lacks */
-    w[n - 2] = 2;
-    w[n - 1] = 0;
+    w[n - 10] = 2;
+    w[n - 9] = 0;
     CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
     memcpy(w, b, n); /* an unknown flag */
-    CHECK(w[n - 4] == 0 && w[n - 3] == 1);
-    w[n - 4] = 2;
+    CHECK(w[n - 12] == 0 && w[n - 11] == 1);
+    w[n - 12] = 2;
     CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
     memcpy(w, b, n); /* no column */
-    w[n - 3] = 0;
+    w[n - 11] = 0;
+    CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
+    memcpy(w, b, n); /* u's retention below a second */
+    memset(w + n - 8, 0, 8);
     CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
     memcpy(w, b, n); /* u_w renamed t_v: one name in two tables */
     size_t at = name_at(w, n, "u_w");
@@ -392,18 +396,19 @@ static void t_index_manifest_strict(void)
     CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
     free(w);
     free(b);
-    /* version 3 with no index anywhere: only version 2 may encode that */
+    /* no index anywhere: version 4 encodes that too */
     OK(ex(&s, "DROP INDEX t_v"));
     OK(ex(&s, "DROP INDEX t_x"));
     OK(ex(&s, "CHECKPOINT"));
-    CHECK(manifest_version(db) == 3); /* u_w remains, last: u32 1, u8 3, "u_w", u8 0, u8 1, u16 */
+    CHECK(manifest_version(db) == 4); /* u_w remains, last: u32 1, u8 3, "u_w", u8 0, u8 1, u16, then u64 retention */
     b = manifest_copy(db, &n);
-    CHECK(b && n > 12 && parse_bytes(b, n) == IMDB_OK);
+    CHECK(b && n > 20 && parse_bytes(b, n) == IMDB_OK);
     if (!b) return;
-    uint8_t *p = b + n - 12;
+    uint8_t *p = b + n - 20;
     CHECK(p[0] == 1 && p[1] == 0 && p[2] == 0 && p[3] == 0 && p[4] == 3);
-    memset(p, 0, 4); /* nidx = 0, and the entry gone */
-    CHECK(parse_bytes(b, n - 8) == IMDB_ERR_CORRUPT);
+    memset(p, 0, 4);          /* nidx = 0 */
+    memmove(p + 4, p + 12, 8); /* the entry gone, the retention after it */
+    CHECK(parse_bytes(b, n - 8) == IMDB_OK);
     free(b);
     imdb_session_close(&s);
     imdb_close(db);

@@ -117,21 +117,49 @@ int imdb_writer_apply(imdb_db *db, const imdb_commit_rec *c, imdb_err *e)
 
 /* ---- WRITERS ------------------------------------------------------------------------ */
 
+static void entry_encode(const imdb_wep *w, imdb_buf *b);
+
 static void writers_encode(const imdb_db *db, imdb_buf *b)
 {
     imdb_buf_put(b, "IMDBWRS1", 8);
     imdb_buf_put(b, db->db_id, 16);
     imdb_buf_put_u32(b, db->nwep - 1);
-    for (uint32_t i = 1; i < db->nwep; i++) {
-        const imdb_wep *w = &db->wep[i];
-        imdb_buf_put_u64(b, w->seq);
-        imdb_buf_put_u8(b, w->promote);
-        imdb_buf_put_u32(b, w->hlen);
-        imdb_buf_put(b, w->hdr, w->hlen);
-        imdb_buf_put(b, w->sig, IMDB_SIG_LEN);
-        if (w->promote) imdb_buf_put(b, w->root_sig, IMDB_SIG_LEN);
-    }
+    for (uint32_t i = 1; i < db->nwep; i++) entry_encode(&db->wep[i], b);
     if (!b->err) imdb_buf_put_u32(b, imdb_kern()->crc32c(0, b->p, b->len));
+}
+
+/* One entry, proven by the schedule so far (from META's keys) and applied to it; what names the file (WRITERS,
+ * FLOOR) goes into the messages. apply false: the entry must instead be epoch i + 1 of the schedule already
+ * held (FLOOR beside a WRITERS that proved it), checked all the same. */
+static int entry_load(imdb_db *db, imdb_rd *r, uint32_t i, uint64_t *last, bool apply, const char *what, imdb_err *e)
+{
+    uint64_t seq = imdb_rd_u64(r);
+    uint8_t promote = imdb_rd_u8(r);
+    uint32_t hlen = imdb_rd_u32(r);
+    if (r->err || promote > 1 || seq <= *last || hlen < IMDB_HEADER_MIN || hlen > IMDB_MAX_HEADER || hlen > imdb_rd_left(r))
+        return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad entry %u", what, i + 1);
+    const uint8_t *h = imdb_rd_bytes(r, hlen);
+    imdb_commit_rec c;
+    if (!h || imdb_commit_decode_header(h, hlen, &c, e)) return h ? e->code : imdb_fail(e, IMDB_ERR_CORRUPT, "%s: truncated", what);
+    c.hlen = hlen;
+    c.promote = promote;
+    imdb_rd_copy(r, c.sig, IMDB_SIG_LEN);
+    if (promote) imdb_rd_copy(r, c.root_sig, IMDB_SIG_LEN);
+    const imdb_op *w = imdb_commit_writer_op(&c);
+    const uint8_t *before = apply ? db->writer_pk : (i < db->nwep ? db->wep[i].k.pk : NULL);
+    int rc = IMDB_OK;
+    if (r->err || c.seq != seq || !w || (w->how == IMDB_WRITER_PROMOTE) != (bool)promote)
+        rc = imdb_fail(e, IMDB_ERR_CORRUPT, "%s: entry %u is not a WRITER_KEY commit", what, i + 1);
+    else if (!before || !imdb_commit_authentic(&c, before, db->db_id, db->meta.has_root ? db->meta.root : NULL))
+        rc = imdb_fail(e, IMDB_ERR_AUTH, "%s: entry %u (commit %llu) is not signed by the keys before it", what, i + 1,
+                       (unsigned long long)seq);
+    else if (apply)
+        rc = imdb_writer_apply(db, &c, e);
+    else if (i + 1 >= db->nwep || db->wep[i + 1].seq != seq || memcmp(db->wep[i + 1].k.pk, w->new_pk, IMDB_PUBKEY_LEN) != 0)
+        rc = imdb_fail(e, IMDB_ERR_AUTH, "%s: entry %u differs from the key schedule WRITERS proves", what, i + 1);
+    imdb_commit_free(&c);
+    if (!rc) *last = seq;
+    return rc;
 }
 
 /* Each entry proven from META's keys, in order; the schedule grows as they verify. */
@@ -149,34 +177,170 @@ static int writers_load(imdb_db *db, const uint8_t *p, size_t n, imdb_err *e)
         return imdb_fail(e, IMDB_ERR_CORRUPT, "WRITERS: not this database's");
     if (cnt >= IMDB_MAX_EPOCHS) return imdb_fail(e, IMDB_ERR_LIMIT, "WRITERS: too many epochs");
     uint64_t last = 0;
-    for (uint32_t i = 0; i < cnt; i++) {
-        uint64_t seq = imdb_rd_u64(&r);
-        uint8_t promote = imdb_rd_u8(&r);
-        uint32_t hlen = imdb_rd_u32(&r);
-        if (r.err || promote > 1 || seq <= last || hlen < IMDB_HEADER_MIN || hlen > IMDB_MAX_HEADER ||
-            hlen > imdb_rd_left(&r))
-            return imdb_fail(e, IMDB_ERR_CORRUPT, "WRITERS: bad entry %u", i + 1);
-        const uint8_t *h = imdb_rd_bytes(&r, hlen);
-        imdb_commit_rec c;
-        if (!h || imdb_commit_decode_header(h, hlen, &c, e)) return h ? e->code : imdb_fail(e, IMDB_ERR_CORRUPT, "WRITERS: truncated");
-        c.hlen = hlen;
-        c.promote = promote;
-        imdb_rd_copy(&r, c.sig, IMDB_SIG_LEN);
-        if (promote) imdb_rd_copy(&r, c.root_sig, IMDB_SIG_LEN);
-        const imdb_op *w = imdb_commit_writer_op(&c);
-        int rc = IMDB_OK;
-        if (r.err || c.seq != seq || !w || (w->how == IMDB_WRITER_PROMOTE) != (bool)promote)
-            rc = imdb_fail(e, IMDB_ERR_CORRUPT, "WRITERS: entry %u is not a WRITER_KEY commit", i + 1);
-        else if (!imdb_commit_authentic(&c, db->writer_pk, db->db_id, db->meta.has_root ? db->meta.root : NULL))
-            rc = imdb_fail(e, IMDB_ERR_AUTH, "WRITERS: entry %u (commit %llu) is not signed by the keys before it", i + 1,
-                           (unsigned long long)seq);
-        else rc = imdb_writer_apply(db, &c, e);
-        imdb_commit_free(&c);
-        if (rc) return rc;
-        last = seq;
-    }
+    for (uint32_t i = 0; i < cnt; i++)
+        if (entry_load(db, &r, i, &last, true, "WRITERS", e)) return e->code;
     if (imdb_rd_left(&r)) return imdb_fail(e, IMDB_ERR_CORRUPT, "WRITERS: trailing bytes");
     return IMDB_OK;
+}
+
+static void entry_encode(const imdb_wep *w, imdb_buf *b)
+{
+    imdb_buf_put_u64(b, w->seq);
+    imdb_buf_put_u8(b, w->promote);
+    imdb_buf_put_u32(b, w->hlen);
+    imdb_buf_put(b, w->hdr, w->hlen);
+    imdb_buf_put(b, w->sig, IMDB_SIG_LEN);
+    if (w->promote) imdb_buf_put(b, w->root_sig, IMDB_SIG_LEN);
+}
+
+/* ---- FLOOR --------------------------------------------------------------------------- */
+
+int imdb_floor_write(imdb_db *db, uint64_t floor, const uint8_t *hdr, uint32_t hlen, const uint8_t sig[IMDB_SIG_LEN],
+                     const uint8_t *starts, uint32_t nstarts, const uint8_t *man, size_t manlen, imdb_err *e)
+{
+    if (manlen > IMDB_MAX_OBJECT) return imdb_fail(e, IMDB_ERR_LIMIT, "FLOOR: the floor's manifest is too large");
+    imdb_buf b;
+    imdb_buf_init(&b);
+    imdb_buf_put(&b, "IMDBFLR1", 8);
+    imdb_buf_put(&b, db->db_id, 16);
+    imdb_buf_put_u64(&b, floor);
+    imdb_buf_put_u32(&b, hlen);
+    imdb_buf_put(&b, hdr, hlen);
+    imdb_buf_put(&b, sig, IMDB_SIG_LEN);
+    uint32_t n = 0;
+    while (n + 1 < db->nwep && db->wep[n + 1].seq <= floor) n++;
+    imdb_buf_put_u32(&b, n);
+    for (uint32_t i = 1; i <= n; i++) entry_encode(&db->wep[i], &b);
+    imdb_buf_put_u32(&b, nstarts);
+    imdb_buf_put(&b, starts, (size_t)nstarts * 16);
+    imdb_buf_put_u64(&b, manlen);
+    imdb_buf_put(&b, man, manlen);
+    if (!b.err) imdb_buf_put_u32(&b, imdb_kern()->crc32c(0, b.p, b.len));
+    int rc = imdb_buf_check(&b, e);
+    if (!rc) rc = imdb_write_file_atomic(db->dirfd, IMDB_FLOOR_NAME, b.p, b.len, 0600, e);
+    imdb_buf_free(&b);
+    return rc;
+}
+
+int imdb_floor_head(imdb_db *db, imdb_rd *r, imdb_floor_hd *h, imdb_err *e)
+{
+    memset(h, 0, sizeof *h);
+    uint8_t magic[8], id[16];
+    imdb_rd_copy(r, magic, 8);
+    imdb_rd_copy(r, id, 16);
+    uint64_t floor = imdb_rd_u64(r);
+    uint32_t hlen = imdb_rd_u32(r);
+    if (r->err || memcmp(magic, "IMDBFLR1", 8) != 0 || memcmp(id, db->db_id, 16) != 0 || !floor || hlen < IMDB_HEADER_MIN ||
+        hlen > IMDB_MAX_HEADER || hlen > imdb_rd_left(r))
+        return imdb_fail(e, IMDB_ERR_CORRUPT, "FLOOR: not this database's, or malformed");
+    const uint8_t *hd = imdb_rd_bytes(r, hlen);
+    uint8_t sig[IMDB_SIG_LEN];
+    imdb_rd_copy(r, sig, IMDB_SIG_LEN);
+    uint32_t cnt = imdb_rd_u32(r);
+    if (r->err || cnt >= IMDB_MAX_EPOCHS) return imdb_fail(e, IMDB_ERR_CORRUPT, "FLOOR: malformed");
+    /* the schedule up to the floor: its own entries when WRITERS proved none, else the same as WRITERS' */
+    bool apply = db->nwep == 1;
+    uint64_t last = 0;
+    int rc = IMDB_OK;
+    for (uint32_t i = 0; i < cnt && !rc; i++) rc = entry_load(db, r, i, &last, apply, "FLOOR", e);
+    if (!rc && last > floor) rc = imdb_fail(e, IMDB_ERR_CORRUPT, "FLOOR: a key change past the floor");
+    /* the segment starts the EXPIREs past the floor may name (ascending, at or below it) */
+    uint32_t nstarts = rc ? 0 : imdb_rd_u32(r);
+    if (!rc && (r->err || nstarts > imdb_rd_left(r) / 16)) rc = imdb_fail(e, IMDB_ERR_CORRUPT, "FLOOR: malformed starts");
+    const uint8_t *st = rc ? NULL : imdb_rd_bytes(r, (size_t)nstarts * 16);
+    for (uint32_t i = 0; !rc && i < nstarts; i++) {
+        uint64_t s = imdb_get_le64(st + 16 * i), t = imdb_get_le64(st + 16 * i + 8);
+        if (!s || s > floor || !t || (i && (s <= imdb_get_le64(st + 16 * (i - 1)) || t <= imdb_get_le64(st + 16 * (i - 1) + 8))))
+            rc = imdb_fail(e, IMDB_ERR_CORRUPT, "FLOOR: its segment starts are not ascending below the floor");
+    }
+    imdb_commit_rec c;
+    if (rc || (rc = imdb_commit_decode_header(hd, hlen, &c, e))) return rc;
+    c.hlen = hlen;
+    memcpy(c.sig, sig, IMDB_SIG_LEN);
+    const uint8_t *mh = NULL; /* the floor published a manifest: its hash, under the floor's signature */
+    for (uint32_t i = 0; i < c.nops && !mh; i++)
+        if (imdb_op_publishes_manifest(c.ops[i].code)) mh = c.ops[i].manifest;
+    if (c.seq != floor || imdb_commit_writer_op(&c) || !mh)
+        rc = imdb_fail(e, IMDB_ERR_CORRUPT, "FLOOR: its header is not commit %llu's, or publishes no manifest",
+                       (unsigned long long)floor);
+    else if (!imdb_commit_authentic(&c, imdb_writer_key_at(db, floor), db->db_id, NULL))
+        rc = imdb_fail(e, IMDB_ERR_AUTH, "FLOOR: commit %llu is not signed by its writer key", (unsigned long long)floor);
+    if (!rc) {
+        h->floor = floor;
+        h->hdr = hd;
+        h->hlen = hlen;
+        memcpy(h->sig, sig, IMDB_SIG_LEN);
+        memcpy(h->manifest, mh, 32);
+        memcpy(h->hash, c.hash, 32);
+        memcpy(h->digest, c.digest, 32);
+        h->time = c.time_us;
+        h->starts = st;
+        h->nstarts = nstarts;
+    }
+    imdb_commit_free(&c);
+    return rc;
+}
+
+int imdb_floor_read(imdb_db *db, imdb_err *e)
+{
+    uint8_t *p = NULL;
+    size_t n = 0;
+    int rc = imdb_read_file_at(db->dirfd, IMDB_FLOOR_NAME, &p, &n, IMDB_MAX_OBJECT, e);
+    if (rc == IMDB_ERR_NOTFOUND) {
+        imdb_err_clear(e);
+        return IMDB_OK;
+    }
+    if (rc) return rc;
+    imdb_rd r;
+    imdb_floor_hd h;
+    if (n < 64 || imdb_kern()->crc32c(0, p, n - 4) != imdb_get_le32(p + n - 4)) {
+        rc = imdb_fail(e, IMDB_ERR_CORRUPT, "FLOOR: damaged");
+        goto out;
+    }
+    imdb_rd_init(&r, p, n - 4);
+    if ((rc = imdb_floor_head(db, &r, &h, e))) goto out;
+    uint64_t manlen = imdb_rd_u64(&r);
+    if (r.err || manlen != imdb_rd_left(&r)) {
+        rc = imdb_fail(e, IMDB_ERR_CORRUPT, "FLOOR: malformed manifest");
+        goto out;
+    }
+    const uint8_t *man = imdb_rd_bytes(&r, (size_t)manlen);
+    uint8_t got[32];
+    imdb_sha256(man, (size_t)manlen, got);
+    if (memcmp(got, h.manifest, 32) != 0) {
+        rc = imdb_fail(e, IMDB_ERR_AUTH, "FLOOR: the manifest is not the one commit %llu published", (unsigned long long)h.floor);
+        goto out;
+    }
+    /* kept: the starts and the manifest for VERIFY's seed, the header and signature for a snapshot at the floor (a
+     * seeded copy's, whose log begins after it: lake.c) */
+    uint8_t *sc = imdb_alloc(h.nstarts ? (size_t)h.nstarts * 16 : 1, e), *mc = sc ? imdb_alloc(manlen ? manlen : 1, e) : NULL,
+            *hc = mc ? imdb_alloc(h.hlen, e) : NULL;
+    if (!hc) {
+        imdb_free(sc);
+        imdb_free(mc);
+        rc = e->code;
+        goto out;
+    }
+    if (h.nstarts) memcpy(sc, h.starts, (size_t)h.nstarts * 16);
+    memcpy(mc, man, (size_t)manlen);
+    memcpy(hc, h.hdr, h.hlen);
+    imdb_free(db->floor_starts);
+    imdb_free(db->floor_man);
+    imdb_free(db->floor_hdr);
+    db->floor_starts = sc;
+    db->nfloor_starts = h.nstarts;
+    db->floor_man = mc;
+    db->floor_manlen = (size_t)manlen;
+    db->floor_hdr = hc;
+    db->floor_hlen = h.hlen;
+    memcpy(db->floor_sig, h.sig, IMDB_SIG_LEN);
+    db->log_floor = h.floor;
+    memcpy(db->floor_hash, h.hash, 32);
+    memcpy(db->floor_digest, h.digest, 32);
+    db->floor_time = h.time;
+out:
+    imdb_free(p);
+    return rc;
 }
 
 static int epoch0(imdb_db *db, imdb_err *e)

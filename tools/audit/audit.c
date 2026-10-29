@@ -51,6 +51,8 @@
 #define MAX_FRAME (1u << 30)
 #define MAX_OBJECT (1ull << 34)
 #define LANES 1024
+#define RETAIN_MIN_US 1000000ull                      /* SET_RETENTION (16): a second ... */
+#define RETAIN_MAX_US (36525ull * 24 * 3600 * 1000000) /* ... to a century, or all ones (FOREVER) */
 
 enum { T_INT64 = 1, T_DECIMAL = 2, T_TEXT = 3, T_BOOL = 4, T_TIMESTAMP = 5, T_FLOAT64 = 6 };
 enum { F_PK = 1, F_SUBJECT = 2, F_NULLABLE = 4 };
@@ -518,9 +520,8 @@ static void lt_digest(uint8_t alg, const lt *a, uint8_t out[32])
 
 /* ---- META ----------------------------------------------------------------------------- */
 
-/* META v2: db id, role, the writer key of epoch 0; v3 adds the root key that may certify a
- * promotion; v4 (digest_alg 2's) always names the digest algorithm, after the root key's line,
- * which it has only when the database has a root key. v2 and v3 are digest_alg 1. */
+/* META v5 (the only one read; earlier formats are refused): db id, role, the writer key of epoch 0,
+ * the root key that may certify a promotion when the database has one, the digest algorithm. */
 typedef struct meta {
     uint8_t db_id[16], writer[32], root[32];
     bool replica, has_root;
@@ -532,15 +533,13 @@ static int read_meta(int dirfd, meta *m)
     uint8_t *b;
     size_t n;
     if (read_file(dirfd, "META", &b, &n, 4096)) return -1;
-    static const char a2[] = "imagedb-meta 2\ndb_id ", a3[] = "imagedb-meta 3\ndb_id ", a4[] = "imagedb-meta 4\ndb_id ";
+    static const char a5[] = "imagedb-meta 5\ndb_id ";
     const char *s = (const char *)b;
-    size_t off = sizeof a2 - 1;
+    size_t off = sizeof a5 - 1;
     int rc = 0;
-    bool v3 = n >= off && memcmp(s, a3, off) == 0, v4 = n >= off && memcmp(s, a4, off) == 0;
     memset(m, 0, sizeof *m);
-    m->alg = 1;
-    if (n < off + 33 || (!v3 && !v4 && memcmp(s, a2, off) != 0) || !unhex(s + off, 32, m->db_id, 16) || s[off + 32] != '\n') {
-        rc = fail("META malformed (expected imagedb-meta 2, 3 or 4)");
+    if (n < off + 33 || memcmp(s, a5, off) != 0 || !unhex(s + off, 32, m->db_id, 16) || s[off + 32] != '\n') {
+        rc = fail("META malformed (expected imagedb-meta 5)");
     } else {
         off += 33;
         if (n - off >= 13 && memcmp(s + off, "role primary\n", 13) == 0) m->replica = false;
@@ -551,13 +550,13 @@ static int read_meta(int dirfd, meta *m)
                     s[off + 71] != '\n'))
             rc = fail("META: malformed writer key");
         off += 72;
-        bool root = v3 || (v4 && !rc && n - off >= 5 && memcmp(s + off, "root ", 5) == 0);
+        bool root = !rc && n - off >= 5 && memcmp(s + off, "root ", 5) == 0;
         if (!rc && root && (n - off < 5 + 64 + 1 || memcmp(s + off, "root ", 5) != 0 || !unhex(s + off + 5, 64, m->root, 32) ||
                             s[off + 69] != '\n'))
             rc = fail("META: malformed root key");
         if (!rc && root) off += 70;
         m->has_root = root;
-        if (!rc && v4) {
+        if (!rc) {
             if (n - off != 9 || memcmp(s + off, "digest ", 7) != 0 || s[off + 8] != '\n' || (s[off + 7] != '1' && s[off + 7] != '2'))
                 rc = fail("META: malformed digest algorithm (1 or 2)");
             else m->alg = (uint8_t)(s[off + 7] - '0'), off += 9;
@@ -663,6 +662,7 @@ typedef struct op {
     uint8_t code;
     uint32_t table;
     uint64_t vid, new_vid, purge_before;
+    uint64_t retention; /* SET_RETENTION (16): microseconds, or all ones for FOREVER */
     const uint8_t *commit, *new_commit, *manifest;
     schema *sch;
     erase_ent *erase;
@@ -758,7 +758,7 @@ static int decode_body(const uint8_t *b, size_t n, const meta *m, keys *ks, comm
     c->prev = rd_bytes(&hr, 32);
     uint32_t nops = rd_u32(&hr);
     if (hr.bad || c->seq != dseq) return fail("header: truncated or descriptor seq mismatch");
-    if (nops > (1u << 20) || nops > rd_left(&hr) / 33) return fail("header: op count out of range");
+    if (nops > (1u << 20) || nops > rd_left(&hr) / 13) return fail("header: op count out of range"); /* 13: op 16 */
     c->ops = xcalloc(nops, sizeof *c->ops);
     c->nops = nops;
     for (uint32_t i = 0; i < nops; i++) {
@@ -841,11 +841,38 @@ static int decode_body(const uint8_t *b, size_t n, const meta *m, keys *ks, comm
             if (!hr.bad && (nops != 1 || o->epoch == 0 || (o->how != 1 && o->how != 2)))
                 return fail("header: WRITER_KEY must be the only op, with epoch >= 1 and how 1 or 2");
             break;
+        case 16:
+            o->table = rd_u32(&hr);
+            o->retention = rd_u64(&hr);
+            if (!hr.bad && o->retention != UINT64_MAX && (o->retention < RETAIN_MIN_US || o->retention > RETAIN_MAX_US))
+                return fail("header: retention out of range");
+            break;
+        case 17:
+            o->table = rd_u32(&hr);
+            o->purge_before = rd_u64(&hr);
+            if (!hr.bad && (o->purge_before == 0 || o->purge_before >= c->seq))
+                return fail("header: EXPIRE's horizon is not in the past");
+            break;
+        case 18:
+            o->purge_before = rd_u64(&hr);
+            o->manifest = rd_bytes(&hr, 32);
+            if (!hr.bad && (nops != 1 || o->purge_before == 0 || c->seq < 2 || o->purge_before > c->seq - 2))
+                return fail("header: RETIRE must be the only op, the commit after its boundary before it");
+            break;
         default:
             return fail("header: unknown op %u", o->code);
         }
         if (hr.bad) return fail("header: truncated op");
     }
+    /* every CREATE_TABLE (1) is followed at once by its table's SET_RETENTION (16) */
+    for (uint32_t i = 0; i < nops; i++)
+        if (c->ops[i].code == 1 && (i + 1 == nops || c->ops[i + 1].code != 16 || c->ops[i + 1].table != c->ops[i].table))
+            return fail("header: CREATE_TABLE without its SET_RETENTION");
+    /* a commit with an EXPIRE (17) holds only EXPIREs, one a table at most, by table */
+    for (uint32_t i = 0; i < nops; i++)
+        if ((c->ops[i].code == 17) != (c->ops[0].code == 17) ||
+            (c->ops[i].code == 17 && i && c->ops[i - 1].table >= c->ops[i].table))
+            return fail("header: EXPIREs must stand alone, one a table, by table");
     c->digest = rd_bytes(&hr, 32);
     if (hr.bad || rd_left(&hr)) return fail("header: truncated or trailing bytes");
     const op *w = nops == 1 && c->ops[0].code == 13 ? &c->ops[0] : NULL;
@@ -889,17 +916,71 @@ typedef struct ver {
     uint32_t subj_len;
     uint8_t *row; /* a live version's payload, kept for the unique indexes (freed when it ends) */
     uint32_t row_len;
+    bool held;    /* a version this model holds (av) */
+    bool seen;    /* the lake check met its row */
 } ver;
 
 typedef struct table {
     schema s;
-    ver *v;
-    uint64_t n, cap, live;
+    ver **vc;            /* versions in chunks of 2^16 (chunk 0 grows from 64): one only where a vid held lands */
+    uint32_t nchunk;
+    uint64_t cap0, n, live; /* chunk 0's room, the vids handed out, the live rows */
+    uint64_t floor_n, n_at_lake; /* the vids at the log floor (FLOOR), and at the lake snapshot commit */
     lt d, d_at_lake;     /* digest now, and at the lake snapshot commit */
-    uint64_t horizon_at_lake;
+    uint64_t horizon, horizon_at_lake; /* AS OF below it refused (COMPACT's PURGE BEFORE, EXPIRE): now, at the lake */
+    uint64_t purged_at_lake;           /* COMPACT's alone: versions ended at or before it are tombstones */
+    uint64_t retention, retention_at_lake; /* SET_RETENTION (16): now, and at the lake snapshot commit */
     aidx idx[MAX_INDEXES], idx_at_lake[MAX_INDEXES]; /* sorted by name, now and at the lake snapshot */
     uint32_t nidx, nidx_at_lake;
 } table;
+
+#define VCHUNK_BITS 16
+#define VCHUNK ((uint64_t)1 << VCHUNK_BITS)
+
+/* version vid as the model holds it, NULL if it holds none there */
+static ver *av(const table *t, uint64_t vid)
+{
+    uint64_t k = vid >> VCHUNK_BITS;
+    if (vid >= t->n || k >= t->nchunk || !t->vc[k] || (!k && vid >= t->cap0)) return NULL;
+    ver *v = &t->vc[k][vid & (VCHUNK - 1)];
+    return v->held ? v : NULL;
+}
+
+/* the entry for vid, zeroed and held, its chunk allocated; the count moves past it */
+static ver *av_need(table *t, uint64_t vid)
+{
+    uint64_t k = vid >> VCHUNK_BITS;
+    if (k >= t->nchunk) {
+        uint64_t nc = t->nchunk ? (uint64_t)t->nchunk * 2 : 4;
+        if (nc <= k) nc = k + 1;
+        t->vc = xrealloc(t->vc, nc, sizeof *t->vc);
+        memset(t->vc + t->nchunk, 0, (nc - t->nchunk) * sizeof *t->vc);
+        t->nchunk = (uint32_t)nc;
+    }
+    if (!k && vid >= t->cap0) {
+        uint64_t to = t->cap0 ? t->cap0 : 64;
+        while (to <= vid) to *= 2;
+        if (to > VCHUNK) to = VCHUNK;
+        t->vc[0] = xrealloc(t->vc[0], to, sizeof **t->vc);
+        memset(t->vc[0] + t->cap0, 0, (to - t->cap0) * sizeof **t->vc);
+        t->cap0 = to;
+    } else if (k && !t->vc[k]) {
+        t->vc[k] = xcalloc(VCHUNK, sizeof **t->vc);
+    }
+    ver *v = &t->vc[k][vid & (VCHUNK - 1)];
+    memset(v, 0, sizeof *v);
+    v->end = LIVE;
+    v->held = true;
+    if (vid >= t->n) t->n = vid + 1;
+    return v;
+}
+
+/* the next vid at or after vid that a chunk of the model covers */
+static uint64_t av_skip(const table *t, uint64_t vid)
+{
+    while (vid < t->n && ((vid >> VCHUNK_BITS) >= t->nchunk || !t->vc[vid >> VCHUNK_BITS])) vid = (vid | (VCHUNK - 1)) + 1;
+    return vid;
+}
 
 typedef struct state {
     meta m;
@@ -927,6 +1008,15 @@ typedef struct state {
     uint8_t (*pin)[32];      /* the generations pins/ names (a reader holds or held each), sorted */
     uint64_t *pin_at;        /* the commit that published each, 0 if none */
     size_t npin, cappin;
+    uint64_t *start_seq, *start_time; /* each log segment's first commit and its time: what an EXPIRE may name */
+    size_t nstart, capstart;
+    uint64_t time;           /* the commit being applied */
+    uint64_t erase_below_floor; /* ERASE entries naming versions the floor's RETIRE dropped (counted, not checked) */
+    uint64_t floor, floor_time; /* FLOOR's F (the log begins at F + 1; 0: at the genesis) and its commit's time */
+    uint64_t *pub_seq;       /* every publish of the retained log, and its manifest: the keepers objects/ may keep */
+    uint8_t (*pub_hash)[32];
+    size_t npub, cappub;
+    uint64_t boundary, boundary_at_lake; /* RETIRE (18): versions ended at or before it are gone; now, at the lake */
     char note[200];
 } state;
 
@@ -1088,8 +1178,8 @@ static int uk_add(const table *t, aidx *x, const val *vals, uint64_t vid, uint64
 /* version vid ends: its key leaves the unique indexes */
 static void uk_end(table *t, uint64_t vid)
 {
-    ver *v = &t->v[vid];
-    if (!v->row) return;
+    ver *v = av(t, vid);
+    if (!v || !v->row) return;
     val vals[MAX_COLS];
     if (!decode_row(&t->s, v->row, v->row_len, vals))
         for (uint32_t x = 0; x < t->nidx; x++) {
@@ -1119,6 +1209,11 @@ static int apply_op(state *S, const op *o, uint64_t seq)
         S->nt++;
         return 0;
     }
+    if (o->code == 16) {
+        if (o->table >= S->nt) return fail("commit %llu: SET_RETENTION of an unknown table", (unsigned long long)seq);
+        S->t[o->table].retention = o->retention;
+        return 0;
+    }
     if (o->code == 14 || o->code == 15) {
         if (o->table >= S->nt) return fail("commit %llu: an index op on an unknown table", (unsigned long long)seq);
         table *t = &S->t[o->table];
@@ -1145,18 +1240,57 @@ static int apply_op(state *S, const op *o, uint64_t seq)
         t->nidx++;
         if (!(o->ix.flags & 1)) return 0;
         t->idx[p].uk = xcalloc(1, sizeof *t->idx[p].uk); /* from the rows live now */
-        for (uint64_t vid = 0; vid < t->n; vid++) {
-            const ver *v = &t->v[vid];
+        for (uint64_t vid = av_skip(t, 0); vid < t->n; vid = av_skip(t, vid + 1)) {
+            const ver *v = av(t, vid);
             val vals[MAX_COLS];
-            if (v->end != LIVE || !v->row) continue;
+            if (!v || v->end != LIVE || !v->row) continue;
             if (decode_row(&t->s, v->row, v->row_len, vals)) return -1;
             if (uk_add(t, &t->idx[p], vals, vid, seq)) return -1;
         }
         return 0;
     }
+    if (o->code == 18) { /* past the last, ending a segment before this commit, below every table's horizon */
+        size_t lo = 0, hi = S->nstart;
+        while (lo < hi) {
+            size_t mid = lo + (hi - lo) / 2;
+            if (S->start_seq[mid] < o->purge_before + 1) lo = mid + 1;
+            else hi = mid;
+        }
+        if (o->purge_before <= S->boundary || lo == S->nstart || S->start_seq[lo] != o->purge_before + 1)
+            return fail("commit %llu: RETIRE's boundary is not past the last, or ends no log segment", (unsigned long long)seq);
+        for (uint32_t i = 0; i < S->nt; i++)
+            if (o->purge_before >= S->t[i].horizon)
+                return fail("commit %llu: RETIRE's boundary is not below table %s's horizon", (unsigned long long)seq,
+                            S->t[i].s.name);
+        S->boundary = o->purge_before;
+        return 0;
+    }
     if (o->code == 10) return 0;
     if (o->code == 11) {
         if (o->table >= S->nt) return fail("commit %llu: COMPACT of unknown table", (unsigned long long)seq);
+        table *t = &S->t[o->table];
+        if (o->purge_before && o->purge_before < t->horizon)
+            return fail("commit %llu: PURGE BEFORE moves the horizon back", (unsigned long long)seq);
+        if (o->purge_before >= seq) return fail("commit %llu: PURGE BEFORE is not in the past", (unsigned long long)seq);
+        if (o->purge_before) t->horizon = o->purge_before;
+        return 0;
+    }
+    if (o->code == 17) { /* the retention honoured: a segment start at least the table's retention older */
+        if (o->table >= S->nt) return fail("commit %llu: EXPIRE of an unknown table", (unsigned long long)seq);
+        table *t = &S->t[o->table];
+        size_t lo = 0, hi = S->nstart;
+        while (lo < hi) {
+            size_t mid = lo + (hi - lo) / 2;
+            if (S->start_seq[mid] < o->purge_before) lo = mid + 1;
+            else hi = mid;
+        }
+        if (t->retention == UINT64_MAX) return fail("commit %llu: EXPIRE of a table kept FOREVER", (unsigned long long)seq);
+        if (o->purge_before <= t->horizon) return fail("commit %llu: EXPIRE does not move the horizon", (unsigned long long)seq);
+        if (lo == S->nstart || S->start_seq[lo] != o->purge_before)
+            return fail("commit %llu: EXPIRE names a commit that begins no log segment", (unsigned long long)seq);
+        if (S->start_time[lo] > S->time || S->time - S->start_time[lo] < t->retention)
+            return fail("commit %llu: EXPIRE of history younger than the table's retention", (unsigned long long)seq);
+        t->horizon = o->purge_before;
         return 0;
     }
     if (o->code == 12) {
@@ -1164,7 +1298,12 @@ static int apply_op(state *S, const op *o, uint64_t seq)
             const erase_ent *en = &o->erase[k];
             if (en->table >= S->nt || en->vid >= S->t[en->table].n)
                 return fail("commit %llu: ERASE names an unknown version", (unsigned long long)seq);
-            ver *v = &S->t[en->table].v[en->vid];
+            ver *v = av(&S->t[en->table], en->vid);
+            if (!v && en->vid < S->t[en->table].floor_n) { /* ended below the floor (FLOOR): dropped there, unknowable */
+                S->erase_below_floor++;
+                continue;
+            }
+            if (!v) return fail("commit %llu: ERASE names an unknown version", (unsigned long long)seq);
             if (memcmp(v->commit, en->commit, 32) != 0 || v->end == LIVE)
                 return fail("commit %llu: invalid ERASE entry", (unsigned long long)seq);
             if (v->payload)
@@ -1178,9 +1317,10 @@ static int apply_op(state *S, const op *o, uint64_t seq)
     if (o->table >= S->nt) return fail("commit %llu: unknown table %u", (unsigned long long)seq, o->table);
     table *t = &S->t[o->table];
     if (o->code == 3 || o->code == 4) {
-        if (o->vid >= t->n || t->v[o->vid].end != LIVE || memcmp(t->v[o->vid].commit, o->commit, 32) != 0)
+        ver *dv = av(t, o->vid);
+        if (!dv || dv->end != LIVE || memcmp(dv->commit, o->commit, 32) != 0)
             return fail("commit %llu: delete precondition fails", (unsigned long long)seq);
-        t->v[o->vid].end = seq;
+        dv->end = seq;
         uk_end(t, o->vid);
         t->live--;
         lt_sub(S->m.alg, &t->d, o->commit);
@@ -1198,12 +1338,7 @@ static int apply_op(state *S, const op *o, uint64_t seq)
             if (decode_row(&t->s, o->row, o->row_len, vals)) return -1;
             S->payload_rows++;
         }
-        if (t->n == t->cap) {
-            t->cap = t->cap ? t->cap * 2 : 64;
-            t->v = xrealloc(t->v, t->cap, sizeof *t->v);
-        }
-        ver *v = &t->v[t->n++];
-        memset(v, 0, sizeof *v);
+        ver *v = av_need(t, t->n); /* zeroed, live, held */
         memcpy(v->commit, cm, 32);
         v->begin = seq;
         v->end = LIVE;
@@ -1441,7 +1576,7 @@ static int list_segments(int dirfd, int *logfd, uint64_t **out, size_t *n)
 static bool publishes(const commit *c)
 {
     for (uint32_t i = 0; i < c->nops; i++)
-        if (c->ops[i].code == 10 || c->ops[i].code == 11 || c->ops[i].code == 12) return true;
+        if (c->ops[i].code == 10 || c->ops[i].code == 11 || c->ops[i].code == 12 || c->ops[i].code == 18) return true;
     return false;
 }
 
@@ -1480,14 +1615,16 @@ static int load_durable(int dirfd, state *S)
 
 static int replay(state *S, int dirfd, uint64_t *commits)
 {
+    uint8_t gen[32]; /* the genesis: the head before commit 1, and what DURABLE at commit 0 must name */
     {
         uint8_t g[24];
         memcpy(g, "IMDBGEN1", 8);
         memcpy(g + 8, S->m.db_id, 16);
-        a_sha256(g, sizeof g, S->head);
+        a_sha256(g, sizeof g, gen);
     }
+    if (!S->floor) memcpy(S->head, gen, 32); /* past a cut the head is the floor's (floor_seed) */
     if (load_durable(dirfd, S)) return -1;
-    if (S->dur_present && S->dur_seq == 0 && memcmp(S->dur_head, S->head, 32) != 0)
+    if (S->dur_present && S->dur_seq == 0 && memcmp(S->dur_head, gen, 32) != 0)
         return fail("DURABLE names commit 0 with another hash: it belongs to another database");
     int logfd;
     uint64_t *segs;
@@ -1496,10 +1633,11 @@ static int replay(state *S, int dirfd, uint64_t *commits)
         if (logfd >= 0) close(logfd);
         return -1;
     }
-    uint64_t last_time = 0;
+    uint64_t last_time = S->floor_time;
     int rc = 0;
     bool seen_tagged = false; /* the format only moves forward (design.md §3) */
     for (size_t si = 0; !rc && si < nsegs; si++) {
+        if (si + 1 < nsegs && segs[si + 1] - 1 <= S->floor) continue; /* below the floor, not yet cut */
         bool lastseg = si + 1 == nsegs, ended = false;
         char name[32];
         snprintf(name, sizeof name, "%020llu.ilg", (unsigned long long)segs[si]);
@@ -1577,6 +1715,16 @@ static int replay(state *S, int dirfd, uint64_t *commits)
             else if (c.seq != S->seq + 1) rc = fail("commit %llu out of sequence", (unsigned long long)c.seq);
             else if (memcmp(c.prev, S->head, 32) != 0) rc = fail("hash chain broken at commit %llu", (unsigned long long)c.seq);
             else if (c.time <= last_time) rc = fail("commit %llu: time not increasing", (unsigned long long)c.seq);
+            if (!rc && frames == 0) { /* a segment's first commit: an EXPIRE may name it */
+                if (S->nstart == S->capstart) {
+                    S->capstart = S->capstart ? 2 * S->capstart : 64;
+                    S->start_seq = xrealloc(S->start_seq, S->capstart, sizeof *S->start_seq);
+                    S->start_time = xrealloc(S->start_time, S->capstart, sizeof *S->start_time);
+                }
+                S->start_seq[S->nstart] = c.seq;
+                S->start_time[S->nstart++] = c.time;
+            }
+            S->time = c.time;
             for (uint32_t i = 0; !rc && i < c.nops; i++) rc = apply_op(S, &c.ops[i], c.seq);
             uint8_t d[32];
             lt_digest(S->m.alg, &S->glob, d);
@@ -1592,15 +1740,22 @@ static int replay(state *S, int dirfd, uint64_t *commits)
                     S->t[ti].d_at_lake = S->t[ti].d;
                     memcpy(S->t[ti].idx_at_lake, S->t[ti].idx, sizeof S->t[ti].idx);
                     S->t[ti].nidx_at_lake = S->t[ti].nidx;
+                    S->t[ti].retention_at_lake = S->t[ti].retention;
+                    S->t[ti].n_at_lake = S->t[ti].n;
                 }
+                S->boundary_at_lake = S->boundary;
                 memcpy(S->lake_digest, c.digest, 32);
                 memcpy(S->lake_prev, c.prev, 32);
                 for (uint32_t i = 0; i < c.nops; i++)
                     if (c.ops[i].manifest && memcmp(c.ops[i].manifest, S->lake_manifest, 32) == 0) S->lake_recorded = true;
             }
-            for (uint32_t i = 0; !rc && i < c.nops; i++) /* history horizon as of the lake snapshot */
-                if (c.ops[i].code == 11 && c.seq <= S->lake_seq && c.ops[i].purge_before > S->t[c.ops[i].table].horizon_at_lake)
-                    S->t[c.ops[i].table].horizon_at_lake = c.ops[i].purge_before;
+            for (uint32_t i = 0; !rc && i < c.nops; i++) { /* history horizon as of the lake snapshot */
+                const op *o = &c.ops[i];
+                if ((o->code != 11 && o->code != 17) || c.seq > S->lake_seq) continue;
+                table *t = &S->t[o->table]; /* apply_op checked it */
+                if (o->purge_before > t->horizon_at_lake) t->horizon_at_lake = o->purge_before;
+                if (o->code == 11 && o->purge_before > t->purged_at_lake) t->purged_at_lake = o->purge_before; /* EXPIRE purges nothing */
+            }
             if (!rc) {
                 if (S->dur_present && c.seq == S->dur_seq && memcmp(c.hash, S->dur_head, 32) != 0)
                     rc = fail("DURABLE names commit %llu with another hash: it belongs to a different history",
@@ -1615,6 +1770,18 @@ static int replay(state *S, int dirfd, uint64_t *commits)
                 last_time = c.time;
                 S->seq = c.seq;
                 ended = publishes(&c);
+                if (ended) { /* its manifest may stay as a keeper past the boundary (the objects check) */
+                    for (uint32_t i = 0; i < c.nops; i++)
+                        if (c.ops[i].manifest) {
+                            if (S->npub == S->cappub) {
+                                S->cappub = S->cappub ? 2 * S->cappub : 64;
+                                S->pub_seq = xrealloc(S->pub_seq, S->cappub, sizeof *S->pub_seq);
+                                S->pub_hash = xrealloc(S->pub_hash, S->cappub, sizeof *S->pub_hash);
+                            }
+                            S->pub_seq[S->npub] = c.seq;
+                            memcpy(S->pub_hash[S->npub++], c.ops[i].manifest, 32);
+                        }
+                }
                 for (uint32_t i = 0; i < c.nops; i++)
                     if (c.ops[i].manifest) {
                         memcpy(S->last_manifest, c.ops[i].manifest, 32);
@@ -1644,10 +1811,12 @@ static int replay(state *S, int dirfd, uint64_t *commits)
                  "the log", used ? "; " : "", (unsigned long long)(S->seq + 1), (unsigned long long)S->dur_seq);
     }
     for (uint32_t ti = 0; ti < S->nt; ti++)
-        for (uint64_t vid = 0; vid < S->t[ti].n; vid++)
-            if (S->t[ti].v[vid].redacted && !S->t[ti].v[vid].stub)
+        for (uint64_t vid = av_skip(&S->t[ti], 0); vid < S->t[ti].n; vid = av_skip(&S->t[ti], vid + 1)) {
+            const ver *v = av(&S->t[ti], vid);
+            if (v && v->redacted && !v->stub)
                 return fail("version %llu of table %s: redacted payload not authorised by any ERASE",
                             (unsigned long long)vid, S->t[ti].s.name);
+        }
     *commits = S->seq;
     return 0;
 }
@@ -1915,13 +2084,15 @@ typedef struct mtable {
     uint8_t lthash[2048];
     uint8_t (*seg)[32], (*dv)[32];
     uint32_t *nrows, nseg;
-    aidx idx[MAX_INDEXES]; /* version 3 */
+    aidx idx[MAX_INDEXES];
     uint32_t nidx;
+    uint64_t retention; /* version 4: SET_RETENTION's microseconds, or all ones */
 } mtable;
 
 typedef struct manifest {
     uint8_t db_id[16], prev[32], state[32], hash[32], prev_manifest[32];
     uint64_t seq;
+    uint64_t boundary; /* version 4: the commit at or below which the log is retired (0: none) */
     mtable *t;
     uint32_t nt;
 } manifest;
@@ -2002,11 +2173,13 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
     rd r = {b, len, 0, false};
     const uint8_t *mg = rd_bytes(&r, 8);
     uint32_t mver = mg && memcmp(mg, "IMDBMAN1", 8) == 0 ? rd_u32(&r) : 0;
-    if (mver != 2 && mver != 3) return fail("manifest: bad header");
+    if (mver != 4) return fail("manifest: bad header (version 4 only)");
     uint32_t nt = rd_u32(&r);
     const uint8_t *id = rd_bytes(&r, 16);
     m->seq = rd_u64(&r);
     const uint8_t *prev = rd_bytes(&r, 32), *st = rd_bytes(&r, 32), *pm = rd_bytes(&r, 32);
+    m->boundary = rd_u64(&r);
+    if (!r.bad && m->boundary >= m->seq) return fail("manifest: boundary not below its commit");
     if (r.bad || nt > 1024 || nt > rd_left(&r) / 64) return fail("manifest: bad table count");
     memcpy(m->db_id, id, 16);
     memcpy(m->prev, prev, 32);
@@ -2038,26 +2211,27 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
             memcpy(t->seg[k], sg, 32);
             memcpy(t->dv[k], dv, 32);
         }
-        if (mver == 3) { /* indexes, sorted by name; their names unique across tables (checked below) */
-            t->nidx = rd_u32(&r);
-            if (r.bad || t->nidx > MAX_INDEXES) return fail("manifest: bad index count");
-            for (uint32_t k = 0; k < t->nidx; k++) {
-                uint8_t nl = rd_u8(&r);
-                const uint8_t *nm = rd_bytes(&r, nl);
-                t->idx[k].flags = rd_u8(&r);
-                t->idx[k].ncols = rd_u8(&r);
-                for (int c = 0; c < t->idx[k].ncols && c < MAX_INDEX_COLS; c++) t->idx[k].cols[c] = rd_u16(&r);
-                if (r.bad || !ident_ok(nm, nl) || !aidx_ok(&t->idx[k], t->s.ncols)) return fail("manifest: bad index");
-                memcpy(t->idx[k].name, nm, nl);
-                if (k && strcmp(t->idx[k - 1].name, t->idx[k].name) >= 0) return fail("manifest: indexes not sorted");
-            }
+        /* indexes, sorted by name; their names unique across tables (checked below) */
+        t->nidx = rd_u32(&r);
+        if (r.bad || t->nidx > MAX_INDEXES) return fail("manifest: bad index count");
+        for (uint32_t k = 0; k < t->nidx; k++) {
+            uint8_t nl = rd_u8(&r);
+            const uint8_t *nm = rd_bytes(&r, nl);
+            t->idx[k].flags = rd_u8(&r);
+            t->idx[k].ncols = rd_u8(&r);
+            for (int c = 0; c < t->idx[k].ncols && c < MAX_INDEX_COLS; c++) t->idx[k].cols[c] = rd_u16(&r);
+            if (r.bad || !ident_ok(nm, nl) || !aidx_ok(&t->idx[k], t->s.ncols)) return fail("manifest: bad index");
+            memcpy(t->idx[k].name, nm, nl);
+            if (k && strcmp(t->idx[k - 1].name, t->idx[k].name) >= 0) return fail("manifest: indexes not sorted");
         }
+        t->retention = rd_u64(&r);
+        if (r.bad || (t->retention != UINT64_MAX && (t->retention < RETAIN_MIN_US || t->retention > RETAIN_MAX_US)))
+            return fail("manifest: bad retention");
     }
     if (rd_left(&r)) return fail("manifest: trailing bytes");
-    if (mver == 3) { /* version 3 only with an index (else version 2 is its encoding), names unique */
-        size_t total = 0;
-        for (uint32_t i = 0; i < nt; i++) total += m->t[i].nidx;
-        if (!total) return fail("manifest: version 3 without an index");
+    size_t total = 0; /* index names unique across tables */
+    for (uint32_t i = 0; i < nt; i++) total += m->t[i].nidx;
+    if (total) {
         const char **nm = xcalloc(total, sizeof *nm);
         size_t k = 0;
         for (uint32_t i = 0; i < nt; i++)
@@ -2141,6 +2315,9 @@ static int check_objects(int dirfd, const manifest *m, const state *S)
             break;
         }
         for (size_t i = 0; pk && !pinned && i < S->npin; i++) pinned = pk[i] && manifest_refs(&pg[i], h);
+        /* a keeper: a manifest a retained publish past the boundary names, kept for a later FLOOR (lake.c) */
+        for (size_t i = 0; !pinned && strcmp(de->d_name + 64, ".man") == 0 && i < S->npub; i++)
+            pinned = S->pub_seq[i] > S->boundary && memcmp(S->pub_hash[i], h, 32) == 0;
         if (!manifest_refs(m, h) && !(retained && manifest_refs(&pm, h)) && !pinned)
             rc = fail("objects/ holds %s, which neither the manifest nor its retained generation references (nor a "
                       "pinned one)", de->d_name);
@@ -2323,7 +2500,6 @@ static int walk_lake_pinned(int dirfd, uint8_t alg, const uint8_t mh[32], uint64
 typedef struct vctx {
     state *S;
     manifest *m;
-    uint8_t **seen; /* per table: bitmap of vids found in segments */
 } vctx;
 
 static int verify_row(void *ctx, uint32_t ti, const schema *s, const seg *g, uint32_t i)
@@ -2332,9 +2508,12 @@ static int verify_row(void *ctx, uint32_t ti, const schema *s, const seg *g, uin
     const segrow *r = &g->row[i];
     table *t = &x->S->t[ti];
     if (r->vid >= t->n) return fail("lake: segment holds an unknown version of table %s", t->s.name);
-    const ver *v = &t->v[r->vid];
+    ver *v = av(t, r->vid);
+    if (!v) return fail("lake: a segment of table %s holds a version the log never made", t->s.name);
     uint64_t end = v->end <= x->m->seq ? v->end : LIVE;
-    bool purged = t->horizon_at_lake && v->end <= t->horizon_at_lake;
+    if (end != LIVE && end <= x->S->boundary_at_lake)
+        return fail("lake: a segment of table %s holds a version its boundary retired", t->s.name);
+    bool purged = t->purged_at_lake && v->end <= t->purged_at_lake;
     if (memcmp(v->commit, r->commit, 32) != 0 || v->begin != r->begin || end != r->end || v->stub != r->stub ||
         purged != r->purged)
         return fail("lake: a segment row of table %s disagrees with the log", t->s.name);
@@ -2346,8 +2525,8 @@ static int verify_row(void *ctx, uint32_t ti, const schema *s, const seg *g, uin
                         : tv.i == v->subj_i;
         if (!same) return fail("lake: a tombstone of table %s names another subject than its row in the log", t->s.name);
     }
-    if (x->seen[ti][r->vid >> 3] & (1u << (r->vid & 7))) return fail("lake: version in two segments");
-    x->seen[ti][r->vid >> 3] |= (uint8_t)(1u << (r->vid & 7));
+    if (v->seen) return fail("lake: version in two segments");
+    v->seen = true;
     return 0;
 }
 
@@ -2426,6 +2605,223 @@ static int anchor_final(state *S, const char *path)
     return 0;
 }
 
+/* ---- FLOOR (stage 3a (c2)): a copy whose log was cut below commit F ---------------------------- */
+
+static int head_manifest(int dirfd, const uint8_t mh[32], manifest *m);
+static int writers_entry(const meta *m, keys *k, rd *r, uint32_t i, uint64_t *lastp, uint64_t S, const char *what);
+
+typedef struct flr {
+    bool present;
+    uint64_t seq, time;
+    uint8_t hash[32], digest[32], prev[32], man_hash[32];
+    manifest m; /* F's: the tables at the floor */
+} flr;
+
+/* the record, every part from META's keys: the key changes up to F in order, then F's header and signature (its
+ * descriptor rebuilt as a body without payload: a publish carries no row), then F's manifest against the hash F's
+ * publish op names; the segment starts it carries become the state's */
+static int floor_load(int dirfd, state *S, flr *f)
+{
+    memset(f, 0, sizeof *f);
+    int fd = openat(dirfd, "FLOOR", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0 && errno == ENOENT) return 0;
+    if (fd >= 0) close(fd);
+    uint8_t *b;
+    size_t n;
+    if (read_file(dirfd, "FLOOR", &b, &n, MAX_OBJECT)) return -1;
+    int rc = 0;
+    if (n < 64 || a_crc32c(b, n - 4) != le32(b + n - 4) || memcmp(b, "IMDBFLR1", 8) != 0 || memcmp(b + 8, S->m.db_id, 16) != 0)
+        rc = fail("FLOOR: damaged or another database's");
+    rd r = {b, n - 4, 24, false};
+    uint64_t F = rc ? 0 : rd_u64(&r);
+    uint32_t hlen = rd_u32(&r);
+    const uint8_t *h = rd_bytes(&r, hlen), *sig = rd_bytes(&r, 64);
+    uint32_t cnt = rd_u32(&r);
+    if (!rc && (r.bad || !F || hlen < 86 || cnt >= 4096u)) rc = fail("FLOOR: malformed");
+    uint64_t last = 0;
+    for (uint32_t i = 0; !rc && i < cnt; i++) {
+        int er = writers_entry(&S->m, &S->K, &r, i, &last, UINT64_MAX, "FLOOR");
+        rc = er == 1 ? fail("FLOOR: malformed") : er;
+    }
+    if (!rc && last > F) rc = fail("FLOOR: a key change past the floor");
+    uint32_t ns = rc ? 0 : rd_u32(&r);
+    if (!rc && (r.bad || ns > rd_left(&r) / 16)) rc = fail("FLOOR: malformed segment starts");
+    for (uint32_t i = 0; !rc && i < ns; i++) {
+        uint64_t s = rd_u64(&r), t = rd_u64(&r);
+        if (!s || s > F || !t || (S->nstart && (s <= S->start_seq[S->nstart - 1] || t <= S->start_time[S->nstart - 1]))) {
+            rc = fail("FLOOR: its segment starts are not ascending below the floor");
+            break;
+        }
+        if (S->nstart == S->capstart) {
+            S->capstart = S->capstart ? 2 * S->capstart : 64;
+            S->start_seq = xrealloc(S->start_seq, S->capstart, sizeof *S->start_seq);
+            S->start_time = xrealloc(S->start_time, S->capstart, sizeof *S->start_time);
+        }
+        S->start_seq[S->nstart] = s;
+        S->start_time[S->nstart++] = t;
+    }
+    uint64_t ml = rc ? 0 : rd_u64(&r);
+    const uint8_t *man = rc ? NULL : rd_bytes(&r, ml);
+    if (!rc && (r.bad || rd_left(&r))) rc = fail("FLOOR: malformed manifest");
+    if (!rc) { /* commit F: the body its frame had, less the payload */
+        size_t bl = 1 + 4 + 8 + 32 + 64 + hlen + 4;
+        uint8_t *body = xcalloc(bl, 1), tagged[8];
+        body[0] = 2;
+        put32(body + 1, hlen);
+        put64(body + 5, F);
+        memcpy(tagged, "IMDBCHN2", 8);
+        a_sha256_ctx hc;
+        a_sha256_init(&hc);
+        a_sha256_update(&hc, tagged, 8);
+        a_sha256_update(&hc, h, hlen);
+        a_sha256_final(&hc, body + 13);
+        memcpy(body + 45, sig, 64);
+        memcpy(body + 109, h, hlen);
+        commit c;
+        memset(&c, 0, sizeof c);
+        rc = decode_body(body, bl, &S->m, &S->K, &c); /* the hash, then the signature under the key at F; c points into
+                                                       * body until commit_free, so body goes after it */
+        const uint8_t *mh = NULL;
+        for (uint32_t i = 0; !rc && i < c.nops && !mh; i++)
+            if (c.ops[i].code == 10 || c.ops[i].code == 11 || c.ops[i].code == 12 || c.ops[i].code == 18) mh = c.ops[i].manifest;
+        uint8_t got[32];
+        if (!rc) a_sha256(man, ml, got);
+        if (!rc && (c.seq != F || !mh)) rc = fail("FLOOR: its header is not commit %llu's, or publishes no manifest", (unsigned long long)F);
+        else if (!rc && memcmp(got, mh, 32) != 0) rc = fail("FLOOR: the manifest is not the one commit %llu published", (unsigned long long)F);
+        if (!rc && !(rc = parse_manifest(man, ml, &f->m))) {
+            f->present = true;
+            f->seq = F;
+            f->time = c.time;
+            memcpy(f->hash, c.hash, 32);
+            memcpy(f->digest, c.digest, 32);
+            memcpy(f->prev, c.prev, 32);
+            memcpy(f->man_hash, got, 32);
+        }
+        if (c.ops) commit_free(&c);
+        free(body);
+    }
+    free(b);
+    return rc;
+}
+
+typedef struct seedctx {
+    state *S;
+    uint64_t F;
+    uint8_t *buf;
+    size_t cap;
+} seedctx;
+
+/* a lake row begun at or before the floor: a version live there, with its row (re-encoded: the segment check matched
+ * it to its commitment), its unique keys and its subject */
+static int seed_row(void *ctx, uint32_t ti, const schema *s, const seg *g, uint32_t i)
+{
+    seedctx *x = ctx;
+    const segrow *r = &g->row[i];
+    if (r->begin > x->F) return 0;
+    state *S = x->S;
+    if (ti >= S->nt) return fail("lake: a table made past the floor holds a row begun before it");
+    table *t = &S->t[ti];
+    if (r->vid >= t->floor_n || av(t, r->vid))
+        return fail("lake: version %llu of table %s is not one the floor had", (unsigned long long)r->vid, t->s.name);
+    ver *v = av_need(t, r->vid);
+    memcpy(v->commit, r->commit, 32);
+    v->begin = r->begin;
+    v->stub = r->stub;
+    v->end = r->end <= x->F ? r->end : LIVE; /* a seed's floor is its snapshot: history ended by it stays history */
+    if (r->purged && v->end != LIVE && v->end > t->purged_at_lake) /* every version ended before a purge is purged: */
+        t->purged_at_lake = v->end;                                   /* the highest such end divides them */
+    if (r->flags != 1) { /* a row or a tombstone: the subject (and a row's payload) */
+        val vals[MAX_COLS];
+        for (int c = 0; c < s->ncols; c++) seg_value(s, g, i, c, &vals[c]);
+        if (!r->flags && v->end == LIVE) {
+            size_t rl = encode_row(s, vals, &x->buf, &x->cap);
+            v->row = xcalloc(rl ? rl : 1, 1);
+            memcpy(v->row, x->buf, rl);
+            v->row_len = (uint32_t)rl;
+            for (uint32_t k = 0; k < t->nidx; k++)
+                if (t->idx[k].uk && uk_add(t, &t->idx[k], vals, r->vid, x->F)) return -1;
+        }
+        if (s->subject >= 0) {
+            const val *sv = &vals[s->subject];
+            v->has_subj = true;
+            v->subj_i = sv->i;
+            v->subj_len = sv->len;
+            if (sv->len) {
+                v->subj_s = xcalloc(sv->len, 1);
+                memcpy(v->subj_s, sv->s, sv->len);
+            }
+        }
+    }
+    if (v->end != LIVE) return 0; /* not in the digest at F */
+    lt_add(S->m.alg, &t->d, v->commit);
+    lt_add(S->m.alg, &S->glob, v->commit);
+    t->live++;
+    return 0;
+}
+
+/* the state at the floor: the tables from F's manifest, the versions from the current lake's rows begun by F (each
+ * table's LtHash and live count F's manifest's, their sum F's signed digest); then the replay continues from F */
+static int floor_seed(int dirfd, state *S, flr *f)
+{
+    S->t = xcalloc(f->m.nt ? f->m.nt : 1, sizeof *S->t);
+    S->nt = f->m.nt;
+    for (uint32_t i = 0; i < f->m.nt; i++) {
+        table *t = &S->t[i];
+        const mtable *mt = &f->m.t[i];
+        t->s = mt->s;
+        t->s.raw = xcalloc(mt->s.rawlen ? mt->s.rawlen : 1, 1);
+        memcpy(t->s.raw, mt->s.raw, mt->s.rawlen);
+        t->n = t->floor_n = mt->versions;
+        t->horizon = mt->horizon;
+        t->horizon_at_lake = mt->horizon;
+        t->retention = mt->retention;
+        memcpy(t->idx, mt->idx, sizeof t->idx);
+        t->nidx = mt->nidx;
+        for (uint32_t k = 0; k < t->nidx; k++) t->idx[k].uk = (t->idx[k].flags & 1) ? xcalloc(1, sizeof *t->idx[k].uk) : NULL;
+    }
+    S->boundary = f->m.boundary;
+    manifest m;
+    memset(&m, 0, sizeof m);
+    seedctx x = {S, f->seq, NULL, 0};
+    uint64_t rows = 0;
+    int rc = walk_lake(dirfd, S->m.alg, &m, seed_row, &x, &rows); /* LAKE_HEAD's manifest: the walk parses it into m */
+    free(x.buf);
+    manifest_free(&m);
+    for (uint32_t i = 0; !rc && i < S->nt; i++) {
+        uint8_t got[2048];
+        lt_bytes(&S->t[i].d, got);
+        if (memcmp(got, f->m.t[i].lthash, 2048) != 0 || S->t[i].live != f->m.t[i].live)
+            rc = fail("lake: the rows of table %s at the floor (commit %llu) are not the floor's", S->t[i].s.name,
+                      (unsigned long long)f->seq);
+    }
+    uint8_t d[32];
+    lt_digest(S->m.alg, &S->glob, d);
+    if (!rc && memcmp(d, f->digest, 32) != 0)
+        rc = fail("the state at the floor (commit %llu) is not the one its commit signed", (unsigned long long)f->seq);
+    if (!rc) {
+        S->seq = f->seq;
+        S->floor = f->seq;
+        S->floor_time = f->time;
+        memcpy(S->last_manifest, f->man_hash, 32); /* the floor published it: the last publish so far */
+        if (S->lake_seq == f->seq) { /* a seeded copy: its lake is the floor's, never reached in the replay */
+            memcpy(S->lake_prev_manifest, f->m.prev_manifest, 32);
+            for (uint32_t ti = 0; ti < S->nt; ti++) {
+                S->t[ti].d_at_lake = S->t[ti].d;
+                memcpy(S->t[ti].idx_at_lake, S->t[ti].idx, sizeof S->t[ti].idx);
+                S->t[ti].nidx_at_lake = S->t[ti].nidx;
+                S->t[ti].retention_at_lake = S->t[ti].retention;
+                S->t[ti].n_at_lake = S->t[ti].n;
+            }
+            S->boundary_at_lake = S->boundary;
+            memcpy(S->lake_digest, f->digest, 32);
+            memcpy(S->lake_prev, f->prev, 32);
+            S->lake_recorded = memcmp(S->lake_manifest, f->man_hash, 32) == 0;
+        }
+        memcpy(S->head, f->hash, 32);
+    }
+    return rc;
+}
+
 static int cmd_verify(const char *dir, const char *anchor)
 {
     int dirfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
@@ -2439,6 +2835,12 @@ static int cmd_verify(const char *dir, const char *anchor)
     if (!rc) rc = load_head(dirfd, &S.lake_seq, S.lake_manifest, &lake);
     uint64_t commits = 0;
     if (!rc) rc = load_pins(dirfd, &S);
+    flr fl; /* a copy whose log was cut: its state at the floor first (FLOOR, stage 3a) */
+    memset(&fl, 0, sizeof fl);
+    if (!rc) rc = floor_load(dirfd, &S, &fl);
+    if (!rc && fl.present)
+        rc = lake ? floor_seed(dirfd, &S, &fl)
+                  : fail("FLOOR without a lake snapshot: the log below commit %llu is retired", (unsigned long long)fl.seq + 1);
     if (!rc) rc = replay(&S, dirfd, &commits);
     if (!rc && S.anc_n) rc = anchor_final(&S, anchor);
     if (!rc) {
@@ -2446,11 +2848,16 @@ static int cmd_verify(const char *dir, const char *anchor)
         uint8_t d[32];
         lt_digest(S.m.alg, &S.glob, d);
         hex(d, 32, dh);
+        if (S.floor)
+            printf("log floor: commit %llu (FLOOR), the state there seeded from the lake and checked against its signed "
+                   "digest; %llu ERASE entries below it counted\n", (unsigned long long)S.floor,
+                   (unsigned long long)S.erase_below_floor);
         printf("log ok: %llu commits, chain + %llu Ed25519 signatures, %llu payloads re-hashed, digest %s\n",
                (unsigned long long)commits, (unsigned long long)S.sigs, (unsigned long long)S.payload_rows, dh);
         for (uint32_t i = 0; i < S.nt; i++) {
             uint64_t stubs = 0;
-            for (uint64_t k = 0; k < S.t[i].n; k++) stubs += S.t[i].v[k].stub;
+            for (uint64_t k = av_skip(&S.t[i], 0); k < S.t[i].n; k = av_skip(&S.t[i], k + 1))
+                if (av(&S.t[i], k)) stubs += av(&S.t[i], k)->stub;
             printf("  table %-12s %llu versions, %llu live, %llu erased\n", S.t[i].s.name, (unsigned long long)S.t[i].n,
                    (unsigned long long)S.t[i].live, (unsigned long long)stubs);
         }
@@ -2462,9 +2869,7 @@ static int cmd_verify(const char *dir, const char *anchor)
     if (!rc && lake) {
         manifest m;
         memset(&m, 0, sizeof m);
-        vctx x = {&S, &m, NULL};
-        x.seen = xcalloc(S.nt ? S.nt : 1, sizeof *x.seen);
-        for (uint32_t i = 0; i < S.nt; i++) x.seen[i] = xcalloc(S.t[i].n / 8 + 1, 1);
+        vctx x = {&S, &m};
         uint64_t rows = 0;
         /* the files first (structure, names, hashes), then their binding to the log */
         rc = walk_lake(dirfd, S.m.alg, &m, verify_row, &x, &rows);
@@ -2482,6 +2887,8 @@ static int cmd_verify(const char *dir, const char *anchor)
             rc = fail("lake digest differs from the log digest at commit %llu", (unsigned long long)m.seq);
         if (!rc && memcmp(m.prev_manifest, S.lake_prev_manifest, 32) != 0)
             rc = fail("manifest names the wrong retained generation (prev_manifest)");
+        if (!rc && m.boundary != S.boundary_at_lake)
+            rc = fail("manifest's retirement boundary differs from the log's at its commit");
         if (!rc) rc = check_objects(dirfd, &m, &S);
         if (!rc && m.nt > S.nt) rc = fail("manifest names tables the log does not have");
         for (uint32_t ti = 0; !rc && ti < m.nt; ti++) {
@@ -2490,41 +2897,51 @@ static int cmd_verify(const char *dir, const char *anchor)
             uint8_t at[2048];
             lt_bytes(&t->d_at_lake, at);
             uint64_t versions = 0;
-            while (versions < t->n && t->v[versions].begin <= m.seq) versions++;
+            versions = t->n_at_lake; /* the vids handed out by the snapshot's commit */
             if (mt->s.rawlen != t->s.rawlen || memcmp(mt->s.raw, t->s.raw, t->s.rawlen) != 0)
                 rc = fail("manifest schema of %s differs from the log", t->s.name);
             else if (memcmp(at, mt->lthash, 2048) != 0)
                 rc = fail("table %s: manifest digest differs from the log at commit %llu", t->s.name, (unsigned long long)m.seq);
             else if (mt->versions != versions || mt->horizon != t->horizon_at_lake)
                 rc = fail("table %s: manifest version count or history horizon differs from the log", t->s.name);
+            else if (mt->retention != t->retention_at_lake)
+                rc = fail("table %s: the manifest's retention differs from the log's", t->s.name);
             else if (mt->nidx != t->nidx_at_lake)
                 rc = fail("table %s: the manifest's indexes differ from the log's", t->s.name);
             for (uint32_t k = 0; !rc && k < mt->nidx; k++)
                 if (!aidx_same(&mt->idx[k], &t->idx_at_lake[k]))
                     rc = fail("table %s: the manifest's indexes differ from the log's", t->s.name);
-            for (uint64_t vid = 0; !rc && vid < versions; vid++) {
-                if (!(x.seen[ti][vid >> 3] & (1u << (vid & 7))))
+            for (uint64_t vid = av_skip(t, 0); !rc && vid < versions; vid = av_skip(t, vid + 1)) {
+                const ver *v = av(t, vid); /* one the model holds: below the floor nothing is required */
+                if (v && !v->seen && !(v->end <= S.boundary_at_lake))
                     rc = fail("table %s: version %llu is missing from the lake (purged versions keep a tombstone)", t->s.name,
                               (unsigned long long)vid);
             }
         }
-        for (uint32_t i = 0; i < S.nt; i++) free(x.seen[i]);
-        free(x.seen);
         if (!rc)
             printf("lake ok: snapshot at commit %llu, %u tables, %llu rows re-derived from segment files\n",
                    (unsigned long long)m.seq, m.nt, (unsigned long long)rows);
         manifest_free(&m);
     }
     if (!rc && S.note[0]) printf("note: %s\n", S.note);
+    manifest_free(&fl.m);
+    free(S.pub_seq);
+    free(S.pub_hash);
     for (uint32_t i = 0; i < S.nt; i++) {
-        for (uint64_t k = 0; k < S.t[i].n; k++) free(S.t[i].v[k].subj_s), free(S.t[i].v[k].row);
+        for (uint32_t c = 0; c < S.t[i].nchunk; c++) {
+            uint64_t cn = !S.t[i].vc[c] ? 0 : c ? VCHUNK : S.t[i].cap0;
+            for (uint64_t k = 0; k < cn; k++) free(S.t[i].vc[c][k].subj_s), free(S.t[i].vc[c][k].row);
+            free(S.t[i].vc[c]);
+        }
         for (uint32_t k = 0; k < S.t[i].nidx; k++) uk_free(S.t[i].idx[k].uk);
-        free(S.t[i].v);
+        free(S.t[i].vc);
         free(S.t[i].s.raw);
     }
     keys_free(&S.K);
     free(S.t);
     free(S.pin);
+    free(S.start_seq);
+    free(S.start_time);
     free(S.pin_at);
     close(dirfd);
     return rc;
@@ -2652,10 +3069,14 @@ static int tail_op(ttail *T, const op *o, uint64_t seq, bool apply)
         for (uint32_t i = 0; i + 1 < T->nt; i++) T->t[i].s = T->t[i].own.raw ? &T->t[i].own : T->t[i].s;
         return 0;
     }
-    if (o->code == 10) return 0;
+    if (o->code == 10 || o->code == 18) return 0; /* RETIRE drops only what no horizon answers */
     if (o->table >= T->nt) return fail("commit %llu: unknown table %u", (unsigned long long)seq, o->table);
     ttab *t = &T->t[o->table];
     if (o->code == 11) {
+        if (o->purge_before > t->horizon) t->horizon = o->purge_before;
+        return 0;
+    }
+    if (o->code == 17) { /* the horizon alone (the main pass checked its rule) */
         if (o->purge_before > t->horizon) t->horizon = o->purge_before;
         return 0;
     }
@@ -2746,36 +3167,29 @@ static int seg_frames(const uint8_t *log, size_t n, const char *name, size_t **o
  * WRITER_KEY of the next epoch, and verifies under the key before it (a rotation) or under the
  * root key and its own (a promotion). Absent: the keys stay at epoch 0 (and a snapshot under a
  * later epoch then fails its signature check). Entries past the snapshot are left to the tail. */
-static int load_writers(int dirfd, const meta *m, uint64_t S, keys *k)
+/* One WRITERS entry (the format both WRITERS and FLOOR use), checked as the engine checks it, from META's keys
+ * and the ones before it: the header is a WRITER_KEY commit's, the epoch the next, the signature (or the root's
+ * certificate) valid; its key pushed. 1: an entry at or past stop (the tail holds it), left unread. */
+static int writers_entry(const meta *m, keys *k, rd *r, uint32_t i, uint64_t *lastp, uint64_t S, const char *what)
 {
-    uint8_t *b;
-    size_t n;
-    int fd = openat(dirfd, "WRITERS", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0 && errno == ENOENT) return 0;
-    if (fd >= 0) close(fd);
-    if (read_file(dirfd, "WRITERS", &b, &n, 4096u * 4096u)) return -1;
     int rc = 0;
-    if (n < 32 || a_crc32c(b, n - 4) != le32(b + n - 4) || memcmp(b, "IMDBWRS1", 8) != 0 || memcmp(b + 8, m->db_id, 16) != 0)
-        rc = fail("WRITERS: damaged or another database's");
-    rd r = {b, n - 4, 28, false};
-    uint32_t cnt = rc ? 0 : le32(b + 24);
-    uint64_t last = 0;
-    for (uint32_t i = 0; !rc && i < cnt; i++) {
-        uint64_t seq = rd_u64(&r);
-        uint8_t promote = rd_u8(&r);
-        uint32_t hlen = rd_u32(&r);
-        const uint8_t *h = rd_bytes(&r, hlen), *sig = rd_bytes(&r, 64), *rs = promote ? rd_bytes(&r, 64) : NULL;
+    uint64_t last = *lastp;
+    do {
+        uint64_t seq = rd_u64(r);
+        uint8_t promote = rd_u8(r);
+        uint32_t hlen = rd_u32(r);
+        const uint8_t *h = rd_bytes(r, hlen), *sig = rd_bytes(r, 64), *rs = promote ? rd_bytes(r, 64) : NULL;
         /* header: version 2 | alg (META's) | seq | time | prev | n_ops 1 | 13 | epoch | key | how | digest */
-        if (r.bad || promote > 1 || seq <= last || hlen != 86 + 38 || h[0] != 2 || h[1] != m->alg || le64(h + 2) != seq ||
+        if (r->bad || promote > 1 || seq <= last || hlen != 86 + 38 || h[0] != 2 || h[1] != m->alg || le64(h + 2) != seq ||
             le32(h + 50) != 1 || h[54] != 13 || (h[91] != 1 && h[91] != 2) || (h[91] == 2) != (promote == 1)) {
-            rc = fail("WRITERS: entry %u is not a WRITER_KEY commit", i + 1);
+            rc = fail("%s: entry %u is not a WRITER_KEY commit", what, i + 1);
             break;
         }
-        if (seq >= S) break; /* the tail holds this one and those after it */
+        if (seq >= S) return 1; /* the tail holds this one and those after it: it stays unread */
         uint32_t ep = le32(h + 55);
         const uint8_t *pk = h + 59;
         if (ep != k->epoch + 1) {
-            rc = fail("WRITERS: entry %u names epoch %u after %u", i + 1, ep, k->epoch);
+            rc = fail("%s: entry %u names epoch %u after %u", what, i + 1, ep, k->epoch);
             break;
         }
         uint8_t hash[32], msg[52], tagged[8];
@@ -2799,17 +3213,40 @@ static int load_writers(int dirfd, const meta *m, uint64_t S, keys *k)
             memcpy(pm + 36, h + 18, 32);
             memcpy(pm + 68, pk, 32);
             if (!m->has_root || !a_ed25519_verify(m->root, pm, sizeof pm, rs)) {
-                rc = fail("WRITERS: entry %u: a promotion without this database's root certificate", i + 1);
+                rc = fail("%s: entry %u: a promotion without this database's root certificate", what, i + 1);
                 break;
             }
             signer = pk;
         }
         if (!a_ed25519_verify(signer, msg, sizeof msg, sig)) {
-            rc = fail("WRITERS: entry %u (commit %llu) is not signed by the keys before it", i + 1, (unsigned long long)seq);
+            rc = fail("%s: entry %u (commit %llu) is not signed by the keys before it", what, i + 1, (unsigned long long)seq);
             break;
         }
         keys_push(k, pk, promote ? seq : seq + 1, promote);
         last = seq;
+    } while (0);
+    *lastp = last;
+    return rc;
+}
+
+static int load_writers(int dirfd, const meta *m, uint64_t S, keys *k)
+{
+    uint8_t *b;
+    size_t n;
+    int fd = openat(dirfd, "WRITERS", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0 && errno == ENOENT) return 0;
+    if (fd >= 0) close(fd);
+    if (read_file(dirfd, "WRITERS", &b, &n, 4096u * 4096u)) return -1;
+    int rc = 0;
+    if (n < 32 || a_crc32c(b, n - 4) != le32(b + n - 4) || memcmp(b, "IMDBWRS1", 8) != 0 || memcmp(b + 8, m->db_id, 16) != 0)
+        rc = fail("WRITERS: damaged or another database's");
+    rd r = {b, n - 4, 28, false};
+    uint32_t cnt = rc ? 0 : le32(b + 24);
+    uint64_t last = 0;
+    for (uint32_t i = 0; !rc && i < cnt; i++) {
+        int er = writers_entry(m, k, &r, i, &last, S, "WRITERS");
+        if (er == 1) break;
+        rc = er;
     }
     free(b);
     return rc;

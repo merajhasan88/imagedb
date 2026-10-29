@@ -417,6 +417,25 @@ static int parse_create_index(parser *p, sql_stmt *st, bool unique)
     return expect(p, TK_RP, ")");
 }
 
+/* after RETENTION: n SECONDS | MINUTES | HOURS | DAYS (or the singular), or FOREVER */
+static int parse_retention(parser *p, uint64_t *us)
+{
+    if (kw(p, "forever")) {
+        *us = IMDB_RETAIN_FOREVER;
+        return IMDB_OK;
+    }
+    uint64_t n, unit;
+    if (uint_lit(p, &n)) return p->e->code;
+    if (kw(p, "seconds") || kw(p, "second")) unit = 1000000ull;
+    else if (kw(p, "minutes") || kw(p, "minute")) unit = 60ull * 1000000;
+    else if (kw(p, "hours") || kw(p, "hour")) unit = 3600ull * 1000000;
+    else if (kw(p, "days") || kw(p, "day")) unit = 86400ull * 1000000;
+    else return fail_at(p, "SECONDS, MINUTES, HOURS or DAYS");
+    if (imdb_mul_ovf(n, unit, us) || !imdb_retention_ok(*us))
+        return imdb_fail(p->e, IMDB_ERR_INVALID, "RETENTION is a second to a century, or FOREVER");
+    return IMDB_OK;
+}
+
 static int parse_create(parser *p, sql_stmt *st)
 {
     st->kind = ST_CREATE;
@@ -464,6 +483,10 @@ static int parse_create(parser *p, sql_stmt *st)
     if (expect(p, TK_RP, ")")) return p->e->code;
     if (pk < 0) return imdb_fail(p->e, IMDB_ERR_INVALID, "table needs a PRIMARY KEY column");
     s->pk = (uint16_t)pk;
+    if (kw(p, "retention")) {
+        st->has_retention = true;
+        return parse_retention(p, &st->retention_us);
+    }
     return IMDB_OK;
 }
 
@@ -638,6 +661,13 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
         st->kind = ST_DROP_INDEX;
         if (!(rc = expect_kw(&p, "index"))) rc = ident(&p, st->index_name);
     }
+    else if (kw(&p, "alter")) { /* ALTER TABLE t SET RETENTION ... */
+        st->kind = ST_ALTER_RETENTION;
+        st->has_retention = true;
+        if (!(rc = expect_kw(&p, "table")) && !(rc = ident(&p, st->table)) && !(rc = expect_kw(&p, "set")) &&
+            !(rc = expect_kw(&p, "retention")))
+            rc = parse_retention(&p, &st->retention_us);
+    }
     else if (kw(&p, "insert")) rc = parse_insert(&p, st);
     else if (kw(&p, "update")) {
         st->kind = ST_UPDATE;
@@ -702,6 +732,7 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
     else if (kw(&p, "show")) {
         if (kw(&p, "tables")) st->kind = ST_SHOW_TABLES;
         else if (kw(&p, "indexes")) st->kind = ST_SHOW_INDEXES;
+        else if (kw(&p, "retention")) st->kind = ST_SHOW_RETENTION;
         else if (kw(&p, "lake")) st->kind = ST_SHOW_LAKE;
         else if (kw(&p, "identity")) st->kind = ST_SHOW_IDENTITY;
         else if (kw(&p, "replicas")) st->kind = ST_SHOW_REPLICAS;
