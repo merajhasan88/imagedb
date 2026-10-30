@@ -12,7 +12,8 @@
 # run keeps its database, IMDB_SOAK_KEEP=1, and audits it afterwards), IMDB_SOAK_TREE (what is under test, for
 # MACHINE.txt),
 # IMDB_SOAK_SYNC (1; 0: --nosync), IMDB_SOAK_RETENTION (the table's RETENTION in seconds; unset: the engine's
-# default, 24 hours; stage 3a's soak runs 600), IMDB_SOAK_CHECKPOINT and IMDB_SOAK_ERASE (commits between them,
+# default, 24 hours; stage 3a's soak runs 600), IMDB_SOAK_WINDOW (the writer's memory window in seconds; unset:
+# the engine's, 10 minutes; stage 3b), IMDB_SOAK_CHECKPOINT and IMDB_SOAK_ERASE (commits between them,
 # by the log's sequence, so across restarts; 50000 and 20000; 0: never), IMDB_SOAK_FLOOR (MB of MemAvailable below which it stops,
 # 4608: the user's 4 GB and a margin), IMDB_SOAK_KEEP=1 keeps the database.
 # A run in which an asked-for ERASE or CHECKPOINT never completed did not test what it was asked to: it

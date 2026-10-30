@@ -61,5 +61,6 @@ TESTS(mem)
 TESTS(index)
 TESTS(join)
 TESTS(retain)
+TESTS(evict)
 
 #endif

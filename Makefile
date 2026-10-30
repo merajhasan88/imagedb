@@ -19,7 +19,7 @@ CFLAGS_BASE = -std=c11 -D_GNU_SOURCE -g -fno-common -fno-strict-overflow -pthrea
 
 ifeq ($(SAN),1)
   BUILD   = build-san
-  OPT     = -O1 -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=undefined -DIMDB_FE_CHECKS
+  OPT     = -O1 -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=undefined -DIMDB_FE_CHECKS -DIMDB_STORE_CHECKS
   LDSAN   = -fsanitize=address,undefined
   HARDEN  =
 else
@@ -122,12 +122,15 @@ lint:
 	  { echo "raw free in src/: use imdb_free (util.h: the heap's counter credits it)"; exit 1; }
 
 # The fault group (t_fault.c) runs in the first pass only: the second repeats the kernels in their
-# C references, which the fault handling does not depend on.
+# C references, which the fault handling does not depend on. The third evicts at every publish (IMDB_EVICT=eager,
+# stage 3b): every read below the memory floor then goes to the lake, as a long-running copy's would.
 test: lint $(TBIN) $(BIN) $(AUDIT) $(FORGE)
 	IMDB_AUDIT_BIN=$(AUDIT) $(TBIN)
 	IMDB_FAULT_SKIP=1 IMDB_NO_SIMD=1 IMDB_THREADS=1 $(TBIN)
+	IMDB_FAULT_SKIP=1 IMDB_EVICT=eager IMDB_AUDIT_BIN=$(AUDIT) $(TBIN)
 	bash tests/integration/run.sh $(BIN)
 	IMDB_NO_SIMD=1 IMDB_THREADS=1 bash tests/integration/run.sh $(BIN)
+	IMDB_EVICT=eager bash tests/integration/run.sh $(BIN)
 	bash tests/integration/audit_reject.sh $(BIN)
 
 integration: $(BIN) $(AUDIT) $(FORGE)
@@ -155,14 +158,16 @@ san: lint
 	$(MAKE) SAN=1 build-san/test_unit build-san/imagedb build-san/imagedb-audit build-san/imdb-forge
 	IMDB_AUDIT_BIN=build-san/imagedb-audit $(SANRUN) build-san/test_unit
 	IMDB_FAULT_SKIP=1 IMDB_NO_SIMD=1 IMDB_THREADS=1 $(SANRUN) build-san/test_unit
+	IMDB_FAULT_SKIP=1 IMDB_EVICT=eager IMDB_AUDIT_BIN=build-san/imagedb-audit $(SANRUN) build-san/test_unit
 	bash tests/integration/run.sh build-san/imagedb
 	IMDB_NO_SIMD=1 IMDB_THREADS=1 bash tests/integration/run.sh build-san/imagedb
+	IMDB_EVICT=eager bash tests/integration/run.sh build-san/imagedb
 	bash tests/integration/audit_reject.sh build-san/imagedb
 
 FUZZ_TARGETS = $(patsubst fuzz/%.c,build-fuzz/%,$(wildcard fuzz/fuzz_*.c))
 FUZZ_ASM     = $(ASMSRC:asm/%.asm=build-fuzz/asm/%.o)
 FUZZ_FLAGS   = -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined \
-               -DIMDB_HAVE_ASM -DIMDB_FUZZ -DIMDB_FE_CHECKS -Wall -Wextra -Werror -Wno-unused-parameter
+               -DIMDB_HAVE_ASM -DIMDB_FUZZ -DIMDB_FE_CHECKS -DIMDB_STORE_CHECKS -Wall -Wextra -Werror -Wno-unused-parameter
 fuzz: $(FUZZ_TARGETS)
 
 build-fuzz/asm/%.o: asm/%.asm asm/common.inc

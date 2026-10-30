@@ -28,6 +28,7 @@
 #include <unistd.h>
 
 #include "../../src/db.h"
+#include "../../src/lake.h"
 #include "../../src/sql.h"
 
 static uint64_t rng;
@@ -75,6 +76,28 @@ static int event(int fd, const char *what, uint64_t seq, double secs) /* an --ev
     char line[100];
     if (secs < 0) snprintf(line, sizeof line, "%s start %llu\n", what, (unsigned long long)seq);
     else snprintf(line, sizeof line, "%s done %llu %.3f\n", what, (unsigned long long)seq, secs);
+    return append_line(fd, line);
+}
+
+/* stage 3b: where the memory window stands when the open returns (the floor its load took, then any pass its replay
+ * ran: a pass may run between any two commits, the replayed ones too) and whenever a pass moves the floor: a
+ * "window" line, WHEN SEQ floor F held H of K chunks C (the versions in memory, those the tables keep, the lake's
+ * included) */
+static int window(int fd, const char *when, imdb_db *db)
+{
+    if (fd < 0) return 0;
+    uint64_t held = 0, kept = 0, chunks = 0;
+    for (uint32_t i = 0; i < db->nt; i++) {
+        const imdb_table *t = db->t[i];
+        held += t->nheld;
+        kept += t->nver - t->mem_first;
+        for (uint32_t k = 0; k < t->nseg; k++) kept += t->seg[k]->nrows;
+        for (uint32_t k = 0; k < t->nchunk; k++) chunks += t->ch[k] != NULL;
+    }
+    char line[160];
+    snprintf(line, sizeof line, "window %s %llu floor %llu held %llu of %llu chunks %llu\n", when,
+             (unsigned long long)db->seq, (unsigned long long)db->mem_floor, (unsigned long long)held,
+             (unsigned long long)kept, (unsigned long long)chunks);
     return append_line(fd, line);
 }
 
@@ -135,6 +158,8 @@ int main(int argc, char **argv)
     double seconds = load ? 0 : atof(argv[4]);
     const char *acks = load ? argv[4] : argv[6], *stats = load ? NULL : argv[7];
     imdb_open_opts o = {.sync = 1};
+    const char *win = getenv("IMDB_SOAK_WINDOW"); /* stage 3b: the memory window, seconds (unset: the default) */
+    if (win && atol(win) > 0) o.mem_window_us = (uint64_t)atol(win) * 1000000u;
     uint64_t every_ckpt = 50000, every_erase = 20000;
     const char *events = NULL;
     long retention = 0; /* the table's RETENTION in seconds (load; 0: the engine's default) */
@@ -182,7 +207,8 @@ int main(int argc, char **argv)
     imdb_session s;
     imdb_session_init(&s, db);
     uint64_t last = db->seq;
-    int rc = load ? 0 : event(efd, "open", db->seq, open_s);
+    int rc = load ? 0 : event(efd, "open", db->seq, open_s) || window(efd, "open", db);
+    uint64_t floor = db->mem_floor;
     char sql[512], m[256];
     if (load) {
         char ct[160];
@@ -248,6 +274,10 @@ int main(int argc, char **argv)
                 rc = rc || run(&s, "COMMIT");
             }
             rc = rc || ack(afd, db, &last);
+            if (!rc && db->mem_floor != floor) {
+                floor = db->mem_floor;
+                rc = window(efd, "pass", db);
+            }
             if (now() >= next_stats) {
                 imdb_mem_report r;
                 imdb_mem(db, &r);

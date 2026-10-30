@@ -31,13 +31,14 @@ enum {
     IMDB_V_PENDING_AUTH = 2,  /* stub seen before the ERASE that authorises it (replica) */
     IMDB_V_PURGED = 4,        /* physically removed by COMPACT ... PURGE                  */
     IMDB_V_SEG = 8,           /* row bytes live in a segment                              */
-    IMDB_V_RETIRED = 16,      /* ended at or before the boundary: gone (RETIRE); its chunk may be freed */
+    IMDB_V_GONE = 16,         /* a slot of a dense chunk that holds no version (RETIRE dropped it) */
 };
 
 /* A version is stored in two parts, so that visibility checks, scans, joins and index maintenance
  * walk only the hot one (48 bytes) and the commitment and salt, read for verification, erasure and
- * the digest, stay in the cold one (48 bytes). Both live in the table's chunked store (imdb_vh,
- * imdb_vc). */
+ * the digest, stay in the cold one (48 bytes). The hot parts live in the table's chunked store (imdb_vh);
+ * a cold part only while its version is in the memtable (imdb_vc): once flushed, the salt and commitment
+ * are its segment row's (imdb_v_commit, imdb_v_salt), so the store holds 48 bytes a version (stage 3b). */
 typedef struct imdb_version {
     uint64_t begin;           /* commit seq that created it                 */
     uint64_t end;             /* commit seq that deleted it, IMDB_LIVE      */
@@ -59,6 +60,19 @@ typedef struct imdb_version_cold {
  * part empty, where one doubling array copied itself at each step and kept up to half of it empty. */
 #define IMDB_VCHUNK_BITS 16
 #define IMDB_VCHUNK ((uint64_t)1 << IMDB_VCHUNK_BITS)
+/* A chunk other than the last that holds fewer versions than this keeps only those (sparse), so a few survivors
+ * among versions RETIRE dropped cost their entries, not the chunk's 6 MB (stage 3b) */
+#define IMDB_VSPARSE (IMDB_VCHUNK / 16)
+
+/* One chunk: vids k << IMDB_VCHUNK_BITS onwards. Dense, a slot for each (n slots: chunk 0 grows to a whole chunk; a
+ * slot holding no version flagged IMDB_V_GONE), or sparse, only the versions it holds (n of them, off[i] the offset
+ * in the chunk of h[i]'s vid, ascending). */
+typedef struct imdb_vchunk {
+    uint16_t *off;            /* sparse: n offsets, in this allocation after h; NULL: dense */
+    uint32_t n;
+    uint32_t pad;
+    imdb_version h[];
+} imdb_vchunk;
 
 typedef struct imdb_vlist {
     uint64_t *v;
@@ -86,12 +100,13 @@ typedef struct imdb_index {
 
 typedef struct imdb_table {
     imdb_schema s;
-    imdb_version **vh;        /* the version store: chunk k holds vids from k << IMDB_VCHUNK_BITS */
-    imdb_version_cold **vc;   /* the same vids' cold parts */
-    uint32_t nchunk, capchunk; /* chunks allocated, room in vh and vc */
+    imdb_vchunk **ch;         /* the version store: chunk k holds vids from k << IMDB_VCHUNK_BITS (NULL: it holds none) */
+    uint32_t nchunk, capchunk; /* chunks in the directory, its room */
     uint64_t nver, capver;    /* versions (vids handed out); the vids the chunks' slots cover */
-    uint32_t nfreed;          /* chunks whose versions RETIRE dropped: slot NULL, memory returned (never the last) */
-    uint64_t nretired;        /* vids below nver that RETIRE dropped: nver - nretired versions are held */
+    uint64_t nheld;           /* versions the store holds: nver less those RETIRE dropped */
+    uint64_t vbytes;          /* the store's bytes: its chunks and its directory */
+    imdb_version_cold *mcold; /* the memtable's cold parts: vid v's at mcold[v - mem_first], until the flush */
+    uint64_t capcold;
     imdb_buf arena;           /* canonical bytes of memtable rows          */
     uint64_t mem_first;       /* first vid not yet flushed to a segment    */
     imdb_hmap pk;             /* key -> newest non-stub version            */
@@ -111,30 +126,84 @@ typedef struct imdb_table {
                               /* active transaction's own (versions are only appended) */
 } imdb_table;
 
-/* A version's parts, vid < t->nver. A pointer into chunk 0 moves while chunk 0 grows (as any pointer
- * into the store did before it was chunked): take it again after an append. */
+/* vid's entry in sparse chunk c (UINT32_MAX: none) */
+static inline uint32_t imdb_vchunk_find(const imdb_vchunk *c, uint64_t vid)
+{
+    uint32_t o = (uint32_t)(vid & (IMDB_VCHUNK - 1)), lo = 0, hi = c->n;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (c->off[mid] < o) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < c->n && c->off[lo] == o ? lo : UINT32_MAX;
+}
+/* The one held rule (stage 3a's presence rule): a vid below t->nver names a version the store holds unless RETIRE
+ * dropped it, its chunk then freed (a NULL slot), sparse without it, or holding its slot flagged IMDB_V_GONE. Every
+ * walk over vids and every vid read from the log asks this first; imdb_vh and imdb_vc are for held versions only,
+ * and abort on any other in the checked builds (IMDB_STORE_CHECKS: SAN and fuzz), where a sparse chunk's
+ * neighbouring entry would otherwise be read in silence. */
+static inline bool imdb_v_held(const imdb_table *t, uint64_t vid)
+{
+    if (vid >= t->nver) return false;
+    const imdb_vchunk *c = t->ch[vid >> IMDB_VCHUNK_BITS];
+    if (!c) return false;
+    if (!c->off) return !(c->h[vid & (IMDB_VCHUNK - 1)].flags & IMDB_V_GONE);
+    uint32_t i = imdb_vchunk_find(c, vid);
+    return i != UINT32_MAX && !(c->h[i].flags & IMDB_V_GONE);
+}
+/* the checked builds' stop when the store breaks its contract (what: which check) */
+void imdb_v_misuse(const imdb_table *t, uint64_t vid, const char *what) __attribute__((noreturn));
+/* vid's entry in its chunk: its slot (dense) or its place among the held (sparse) */
+static inline uint32_t imdb_v_entry(const imdb_table *t, uint64_t vid)
+{
+#ifdef IMDB_STORE_CHECKS
+    if (!imdb_v_held(t, vid)) imdb_v_misuse(t, vid, "read but not held (db.h: the held rule)");
+#endif
+    const imdb_vchunk *c = t->ch[vid >> IMDB_VCHUNK_BITS];
+    return c->off ? imdb_vchunk_find(c, vid) : (uint32_t)(vid & (IMDB_VCHUNK - 1));
+}
+/* A held version's parts. A pointer into chunk 0 moves while chunk 0 grows, and one into any chunk when a RETIRE
+ * frees it or makes it sparse: take it again after an append or a RETIRE. */
 static inline imdb_version *imdb_vh(const imdb_table *t, uint64_t vid)
 {
-    return &t->vh[vid >> IMDB_VCHUNK_BITS][vid & (IMDB_VCHUNK - 1)];
+    return &t->ch[vid >> IMDB_VCHUNK_BITS]->h[imdb_v_entry(t, vid)];
 }
+/* A memtable version's cold part (vid at or past t->mem_first); a flushed one's are its segment row's. */
 static inline imdb_version_cold *imdb_vc(const imdb_table *t, uint64_t vid)
 {
-    return &t->vc[vid >> IMDB_VCHUNK_BITS][vid & (IMDB_VCHUNK - 1)];
+#ifdef IMDB_STORE_CHECKS
+    if (vid < t->mem_first || vid >= t->nver) imdb_v_misuse(t, vid, "cold part of a version not in the memtable");
+#endif
+    return &t->mcold[vid - t->mem_first];
 }
-/* The one presence rule (stage 3a): a vid below t->nver names a version unless RETIRE dropped it, its chunk
- * then perhaps freed (a NULL slot). Every walk over vids and every vid read from the log asks this first;
- * imdb_vh and imdb_vc are for present versions only. */
-static inline bool imdb_v_present(const imdb_table *t, uint64_t vid)
+/* Where version vid is (stage 3b): IMDB_VAT_HELD, the store holds it (at->v; at->g and at->row too once it is in a
+ * segment); IMDB_VAT_LAKE, a segment of the lake holds it (at->g, at->row) and the store does not; IMDB_VAT_NONE,
+ * neither: past the count, or RETIRE dropped it. The one check for a vid from the log or an API (replay's ops,
+ * ERASE's entries, a transaction's writes and locks), so that what it decides never depends on what the store
+ * holds, only where the answer is read. */
+enum { IMDB_VAT_NONE = 0, IMDB_VAT_HELD = 1, IMDB_VAT_LAKE = 2 };
+typedef struct imdb_vloc {
+    imdb_version *v;
+    struct imdb_segment *g;
+    uint32_t row;
+} imdb_vloc;
+int imdb_v_find(const imdb_table *t, uint64_t vid, imdb_vloc *at);
+/* A version's commitment and salt, wherever they are: the memtable's cold part, or its segment row's
+ * (NULL: IMDB_VAT_NONE; a flagged row's salt is zeros) */
+const uint8_t *imdb_v_commit(const imdb_table *t, uint64_t vid);
+const uint8_t *imdb_v_salt(const imdb_table *t, uint64_t vid);
+uint64_t imdb_v_next_slow(const imdb_table *t, uint64_t vid);
+/* The first held vid at or after vid (t->nver: none). A walk passes a freed chunk at once and a sparse one by its
+ * entries, so walking a store whose old chunks are retired costs what it holds, not every vid it ever had (14
+ * billion a year at the soak's rate). Walks: for (vid = imdb_v_next(t, 0); vid < t->nver; vid = imdb_v_next(t,
+ * vid + 1)). */
+static inline uint64_t imdb_v_next(const imdb_table *t, uint64_t vid)
 {
-    return vid < t->nver && t->vh[vid >> IMDB_VCHUNK_BITS] && !(imdb_vh(t, vid)->flags & IMDB_V_RETIRED);
-}
-/* The first vid at or after vid whose chunk is still allocated: a walk passes a freed chunk at once, so walking
- * a store whose old chunks are retired costs its chunks, not every vid it ever had (14 billion a year at the
- * soak's rate). Walks: for (vid = imdb_v_skip(t, 0); vid < t->nver; vid = imdb_v_skip(t, vid + 1)). */
-static inline uint64_t imdb_v_skip(const imdb_table *t, uint64_t vid)
-{
-    while (vid < t->nver && !t->vh[vid >> IMDB_VCHUNK_BITS]) vid = (vid | (IMDB_VCHUNK - 1)) + 1;
-    return vid;
+    if (vid < t->nver) {
+        const imdb_vchunk *c = t->ch[vid >> IMDB_VCHUNK_BITS];
+        if (c && !c->off && !(c->h[vid & (IMDB_VCHUNK - 1)].flags & IMDB_V_GONE)) return vid;
+    }
+    return imdb_v_next_slow(t, vid);
 }
 
 typedef struct imdb_commit_info {
@@ -214,6 +283,11 @@ typedef struct imdb_db {
     bool no_auto_retire;      /* tests that RETIRE by hand turn the policy off for their handle */
     uint64_t pin_max_lag;     /* IMDB_PIN_MAX_LAG (tests lower it) */
     uint64_t mem_limit;       /* the memory budget (imdb_open_opts.mem_limit; 0: none) */
+    uint64_t mem_window_us;   /* stage 3b: a version ended within it stays in memory (imdb_open_opts.mem_window_us) */
+    uint64_t mem_floor;       /* every version ended past it is held; one ended at or before it may be the lake's alone,
+                                 so a read below it goes to the lake (sql_exec.c); it only rises, and is never logged */
+    uint64_t ended_pass;      /* versions ended since the last eviction pass: its trigger */
+    bool evict_eager;         /* every publish evicts to its own commit (IMDB_EVICT=eager: the matrix's third unit pass) */
     uint64_t checkpoint_bytes; /* primary: auto-CHECKPOINT past this segment size (0 = off) */
     bool lake_sync;           /* primary: CHECKPOINT after every commit that changed data (imdb_open_opts) */
     bool strict;              /* durable_ack with sync: every DURABLE record fsynced before its commit returns */
@@ -234,6 +308,8 @@ typedef struct imdb_db {
     uint32_t last_hlen;       /* commit seq's signed descriptor (header length, signature): an anchor names it */
     uint8_t last_sig[IMDB_SIG_LEN];
     imdb_commit_info *ci;     /* ci[i] is commit ci_first + i (see db.c)   */
+    imdb_commit_info *ci_old; /* stage 3b: one log segment's commits below ci_first, read on demand (imdb_ci_at) */
+    uint64_t ci_old_first, nci_old;
     uint64_t nci, capci, ci_first;
     imdb_table **t;
     uint32_t nt;
@@ -283,6 +359,8 @@ typedef struct imdb_open_opts {
                                  it is then provably unacknowledged and recovery may drop it; +1 device flush
                                  per commit (measured +3.3 ms on the test machine) */
     uint64_t mem_limit;       /* bytes the database may hold in memory (0: no budget); see imdb_mem */
+    uint64_t mem_window_us;   /* stage 3b: a version ended within this stays in memory, an older one in the lake alone
+                                 (each copy its own, never logged: 0, IMDB_MEM_WINDOW_US; UINT64_MAX, none leaves) */
     /* per-transaction limits, at most the limits.h maxima (0: the maximum); a statement that
      * would exceed one fails with IMDB_ERR_LIMIT and the transaction stays usable */
     uint64_t txn_bytes;       /* row bytes written (IMDB_MAX_TXN_BYTES) */
@@ -489,6 +567,8 @@ static inline bool imdb_visible_at(const imdb_version *v, uint64_t snap, uint64_
 uint64_t imdb_read_snapshot(const imdb_db *db);
 /* Values of a version (TEXT pointers stay valid until the next write). */
 int imdb_version_values(imdb_db *db, imdb_table *t, uint64_t vid, imdb_value *vals, imdb_err *e);
+/* A held version's values, by its entry (imdb_vh): a walk over the held (imdb_v_next) has it already */
+int imdb_version_values_v(imdb_table *t, const imdb_version *v, imdb_value *vals, imdb_err *e);
 /* Version of key visible at snap, or IMDB_NONE. */
 uint64_t imdb_lookup_pk(imdb_db *db, imdb_table *t, const imdb_value *key, uint64_t snap);
 uint64_t imdb_lookup_pk_at(imdb_db *db, imdb_table *t, const imdb_value *key, uint64_t snap, uint64_t pend);
@@ -570,6 +650,17 @@ typedef struct imdb_mem_report {
     uint64_t versions, rows, indexes, segments, commits, txns, total, limit;
 } imdb_mem_report;
 void imdb_mem(const imdb_db *db, imdb_mem_report *r);
+
+/* ---- the memory window (stage 3b) --------------------------------------------------------------
+ * A copy keeps in memory every version live, ended within its window (imdb_open_opts.mem_window_us), or not yet in a
+ * segment; an older one leaves the store and every index, and the lake answers for it: a read at a snapshot below
+ * the floor (db->mem_floor), or of ALL VERSIONS, goes to the lake (the segments and the memtable; sql_exec.c), so
+ * nothing anyone reads and nothing derived depends on what was evicted. The policy, between transactions, moves the
+ * floor to the end of a log segment at least the window old once enough versions have ended; imdb_evict moves it
+ * (tests too): every held version ended at or before floor, in a segment and not awaiting its ERASE, leaves memory.
+ * A table whose new structures cannot be made keeps what it holds (the error says so) and the floor moves anyway:
+ * every version ended past it is held either way. A no-op inside a transaction. */
+int imdb_evict(imdb_db *db, uint64_t floor, imdb_err *e);
 
 /* ---- recovery (imagedb recover) -------------------------------------------- */
 typedef struct imdb_recover_report {

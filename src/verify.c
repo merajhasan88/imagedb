@@ -1325,29 +1325,41 @@ static int verify_engine(imdb_db *db, const vctx *x, imdb_verify_report *rep, im
             const vver *v = vv(vt, vid);
             if (!v) { /* below the floor and dropped there: the engine holds none of it either */
                 uint64_t k = vid >> IMDB_VCHUNK_BITS;
-                if (imdb_v_present(et, vid))
+                if (imdb_v_held(et, vid))
                     return imdb_fail(e, IMDB_ERR_VERIFY, "verify: table %s holds version %llu, which the log does not",
                                      et->s.name, (unsigned long long)vid);
-                if ((k >= vt->nchunk || !vt->vc[k]) && !et->vh[k]) vid |= IMDB_VCHUNK - 1; /* both chunks absent */
+                if ((k >= vt->nchunk || !vt->vc[k]) && !et->ch[k]) vid |= IMDB_VCHUNK - 1; /* both chunks absent */
                 continue;
             }
             bool retired = v->end != IMDB_LIVE && v->end <= x->boundary; /* exactly these are gone */
-            if (retired != !imdb_v_present(et, vid))
+            bool held = imdb_v_held(et, vid), purged = v->end != IMDB_LIVE && v->end <= vt->purged;
+            imdb_vloc at; /* not held and not retired: past the memory window (stage 3b), the lake's alone */
+            bool lake = !held && !retired && v->end != IMDB_LIVE && v->end <= db->mem_floor &&
+                        imdb_v_find(et, vid, &at) == IMDB_VAT_LAKE;
+            if (retired ? held : !held && !lake)
                 return imdb_fail(e, IMDB_ERR_VERIFY, "verify: table %s version %llu is %s, but the log's boundary %s it",
                                  et->s.name, (unsigned long long)vid, retired ? "still held" : "gone",
                                  retired ? "retired" : "keeps");
             if (retired) continue;
+            if (lake) { /* its row is the log's version: the lake check reads every row, this one by vid */
+                uint8_t f = at.g->flags[at.row];
+                if (at.g->begin[at.row] != v->begin || at.g->end[at.row] != v->end || v->stub != ((f & IMDB_SEG_STUB) != 0) ||
+                    purged != ((f & IMDB_SEG_PURGED) != 0) || memcmp(v->commit, at.g->commit + 32u * at.row, 32) != 0)
+                    return imdb_fail(e, IMDB_ERR_VERIFY, "verify: table %s version %llu differs", et->s.name,
+                                     (unsigned long long)vid);
+                if (f & IMDB_SEG_STUB) rep->stubs++;
+                continue;
+            }
             const imdb_version *ev = imdb_vh(et, vid);
             bool estub = (ev->flags & IMDB_V_STUB) != 0;
-            bool purged = v->end != IMDB_LIVE && v->end <= vt->purged;
             if (v->end != ev->end || v->begin != ev->begin || v->stub != (estub && !(ev->flags & IMDB_V_PENDING_AUTH)) ||
-                purged != ((ev->flags & IMDB_V_PURGED) != 0) || memcmp(v->commit, imdb_vc(et, vid)->commit, 32) != 0)
+                purged != ((ev->flags & IMDB_V_PURGED) != 0) || memcmp(v->commit, imdb_v_commit(et, vid), 32) != 0)
                 return imdb_fail(e, IMDB_ERR_VERIFY, "verify: table %s version %llu differs", et->s.name,
                                  (unsigned long long)vid);
             if (estub) {
                 /* an erased version must not keep any payload in memory */
-                for (size_t k = 0; k < sizeof imdb_vc(et, vid)->salt; k++)
-                    if (imdb_vc(et, vid)->salt[k]) return imdb_fail(e, IMDB_ERR_VERIFY, "verify: erased version still holds its salt");
+                for (size_t k = 0; k < 16; k++) /* the memtable's cold part, or its row's (zeros once flagged) */
+                    if (imdb_v_salt(et, vid)[k]) return imdb_fail(e, IMDB_ERR_VERIFY, "verify: erased version still holds its salt");
                 if (!(ev->flags & IMDB_V_SEG) && ev->row_len) {
                     const uint8_t *p = imdb_mem_row(et, ev);
                     for (uint32_t k = 0; k < ev->row_len; k++)

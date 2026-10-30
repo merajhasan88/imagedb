@@ -988,6 +988,43 @@ static void t_index_unique(void)
     }
 }
 
+/* A unique index's links cover only the versions pending (stage 3b): rows whose key is NULL are never linked, so
+ * after a rolled-back keyed row their vids are below the links' window; the next keyed row, at a reused vid below
+ * it, starts the window again (it was refused before the fix), and the index still refuses a duplicate. The same
+ * with the rollback a parked transaction's swap makes (txn.c swap_out undoes its versions). */
+static void t_index_unique_null_rollback(void)
+{
+    const char *dir = test_tmpdir();
+    OK(imdb_init(dir, false, NULL, E));
+    imdb_db *db = iopen(dir, false);
+    CHECK(db);
+    if (!db) return;
+    imdb_session s, s2;
+    imdb_session_init(&s, db);
+    imdb_session_init(&s2, db);
+    OK(ex(&s, "CREATE TABLE u (id INT64 PRIMARY KEY, k INT64 NULL)"));
+    OK(ex(&s, "CREATE UNIQUE INDEX u_k ON u (k)"));
+    OK(ex(&s, "INSERT INTO u VALUES (100, 1)"));
+    OK(ex(&s, "BEGIN"));
+    OK(ex(&s, "INSERT INTO u VALUES (1, NULL), (2, NULL), (3, NULL)"));
+    OK(ex(&s, "INSERT INTO u VALUES (4, 7)"));
+    OK(ex(&s, "ROLLBACK"));
+    OK(ex(&s, "INSERT INTO u VALUES (5, 7)")); /* the vid the first NULL row had */
+    CHECK(ex(&s, "INSERT INTO u VALUES (6, 7)") == IMDB_ERR_CONSTRAINT && strstr(g_e.msg, "u_k"));
+    /* parked: s's NULL rows and keyed row leave the store when s2 writes, s2's keyed row reuses their vids */
+    OK(ex(&s, "BEGIN"));
+    OK(ex(&s, "INSERT INTO u VALUES (7, NULL), (8, NULL)"));
+    OK(ex(&s, "INSERT INTO u VALUES (9, 8)"));
+    OK(ex(&s2, "INSERT INTO u VALUES (10, 9)"));
+    CHECK(ex(&s2, "INSERT INTO u VALUES (11, 9)") == IMDB_ERR_CONSTRAINT && strstr(g_e.msg, "u_k"));
+    OK(ex(&s, "COMMIT")); /* replayed: its own key 8 still free */
+    CHECK(ex(&s2, "INSERT INTO u VALUES (12, 8)") == IMDB_ERR_CONSTRAINT && strstr(g_e.msg, "u_k"));
+    imdb_session_close(&s2);
+    imdb_session_close(&s);
+    OK(verify_db(db));
+    imdb_close(db);
+}
+
 /* runs q, counting what its path was: index-only, the ordered index reading rows, or another */
 static void comp_q(imdb_session *s, const char *q, int *only, int *ordered)
 {
@@ -1123,6 +1160,7 @@ const test_case index_tests[] = {
     {"index_replica", t_index_replica}, {"index_codec", t_index_codec},   {"index_manifest_strict", t_index_manifest_strict},
     {"index_oidx", t_index_oidx},       {"index_ordered_crosscheck", t_index_ordered_crosscheck}, {"index_erase", t_index_erase},
     {"index_budget", t_index_budget},   {"index_planner", t_index_planner}, {"index_unique", t_index_unique},
+    {"index_unique_null_rollback", t_index_unique_null_rollback},
     {"index_composite", t_index_composite},
 };
 const size_t index_ntests = sizeof index_tests / sizeof *index_tests;

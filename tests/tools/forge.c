@@ -847,7 +847,7 @@ static void index_lie(const char *dir, const char *kind)
         imdb_table *t = db->t[0];
         uint64_t src = IMDB_NONE;
         int64_t maxpk = 0;
-        for (uint64_t vid = 0; vid < t->nver; vid++) {
+        for (uint64_t vid = imdb_v_next(t, 0); vid < t->nver; vid = imdb_v_next(t, vid + 1)) {
             imdb_value k;
             if (imdb_vh(t, vid)->end != IMDB_LIVE || imdb_version_key(t, vid, t->s.pk, &k) != IMDB_OK) continue;
             if (src == IMDB_NONE) src = vid;

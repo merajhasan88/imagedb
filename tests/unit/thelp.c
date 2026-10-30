@@ -94,8 +94,23 @@ uint64_t count_subject(imdb_db *db, int64_t user, uint64_t snap)
 {
     imdb_table *t = imdb_table_by_name(db, "txns");
     imdb_value k = {.type = IMDB_T_INT64, .i = user};
-    const imdb_vlist *l = imdb_subject_versions(t, &k);
     uint64_t n = 0;
+    if (snap < db->mem_floor) { /* below the memory floor the list holds only what memory does (stage 3b): the lake */
+        for (uint32_t s = 0; s < t->nseg; s++)
+            for (uint32_t r = 0; r < t->seg[s]->nrows; r++) {
+                const imdb_segment *g = t->seg[s];
+                imdb_value v;
+                if (g->flags[r] || g->begin[r] > snap || g->end[r] <= snap) continue;
+                imdb_seg_get(&t->s, g, r, (uint32_t)t->s.subject, &v);
+                n += v.i == user;
+            }
+        for (uint64_t vid = t->mem_first; vid < t->nver; vid++) {
+            imdb_value v;
+            if (imdb_visible(imdb_vh(t, vid), snap) && imdb_version_key(t, vid, t->s.subject, &v) == IMDB_OK) n += v.i == user;
+        }
+        return n;
+    }
+    const imdb_vlist *l = imdb_subject_versions(t, &k);
     for (uint32_t i = 0; l && i < l->n; i++) n += imdb_visible(imdb_vh(t, l->v[i]), snap);
     return n;
 }
@@ -493,4 +508,11 @@ long seg_frames_len(const char *path)
     uint8_t *b = seg_frames(path, &n, &first, &tagged);
     free(b);
     return b ? (long)n : -1;
+}
+
+void keep_in_memory(imdb_db *db)
+{
+    if (!db) return;
+    db->mem_window_us = UINT64_MAX;
+    db->evict_eager = false;
 }

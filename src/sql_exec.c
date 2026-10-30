@@ -493,7 +493,7 @@ static void sink_row(sink *k, uint64_t vid, const imdb_value *vals)
     case SINK_JOUTER: join_outer_row(k, vid, vals); return;
     case SINK_JINNER: join_inner_row(k, vid, vals); return;
     case SINK_DIGEST:
-        imdb_lthash_add_commit(k->x->db->meta.digest_alg, &k->digest, imdb_vc(k->t, vid)->commit);
+        imdb_lthash_add_commit(k->x->db->meta.digest_alg, &k->digest, imdb_v_commit(k->t, vid));
         k->digest_rows++;
         return;
     case SINK_GROUP: {
@@ -585,9 +585,10 @@ static int path_store(xctx *x, const qspec *q, sink *k, imdb_err *e)
 {
     imdb_table *t = q->t;
     imdb_value vals[IMDB_MAX_COLS];
-    for (uint64_t vid = imdb_v_skip(t, 0); vid < t->nver && !k->err; vid = imdb_v_skip(t, vid + 1)) {
-        if (!imdb_v_present(t, vid) || !visible_q(q, imdb_vh(t, vid))) continue;
-        if (fetch_row(x, t, vid, vals, e)) return e->code;
+    for (uint64_t vid = imdb_v_next(t, 0); vid < t->nver && !k->err; vid = imdb_v_next(t, vid + 1)) {
+        const imdb_version *v = imdb_vh(t, vid); /* held: the walk has its entry */
+        if (!visible_q(q, v)) continue;
+        if (imdb_version_values_v(t, v, vals, e)) return e->code;
         if (preds_ok(q, vals)) sink_row(k, vid, vals);
     }
     return k->err;
@@ -608,8 +609,9 @@ static int path_index(xctx *x, const qspec *q, sink *k, imdb_err *e)
         const imdb_vlist *l = imdb_subject_versions(t, &q->p[q->subj_pred].a);
         for (uint32_t i = 0; l && i < l->n && !k->err; i++) {
             uint64_t vid = l->v[i];
-            if (!visible_q(q, imdb_vh(t, vid))) continue;
-            if (fetch_row(x, t, vid, vals, e)) return e->code;
+            const imdb_version *v = imdb_vh(t, vid); /* held: the walk has its entry */
+            if (!visible_q(q, v)) continue;
+            if (imdb_version_values_v(t, v, vals, e)) return e->code;
             if (preds_ok(q, vals)) sink_row(k, vid, vals);
         }
         return k->err;
@@ -826,7 +828,7 @@ static int path_scan(xctx *x, const qspec *q, sink *k, imdb_err *e)
                         uint32_t r = (uint32_t)(w * 64 + (uint64_t)__builtin_ctzll(m));
                         m &= m - 1;
                         imdb_value v;
-                        imdb_seg_value(t, imdb_vh(t, g->vid[r]), b->col, &v);
+                        imdb_seg_get(&t->s, g, r, b->col, &v);
                         if (!pred_ok(b, &v)) bits[w] &= ~(1ull << (r & 63));
                     }
                 }
@@ -864,7 +866,7 @@ static int path_scan(xctx *x, const qspec *q, sink *k, imdb_err *e)
                 uint32_t r = (uint32_t)(w * 64 + (uint64_t)__builtin_ctzll(m));
                 m &= m - 1;
                 uint64_t vid = g->vid[r];
-                if ((rc = fetch_row(x, t, vid, vals, e))) break;
+                for (uint32_t c = 0; c < t->s.ncols; c++) imdb_seg_get(&t->s, g, r, c, &vals[c]); /* the row itself */
                 sink_row(k, vid, vals);
             }
         }
@@ -874,20 +876,61 @@ static int path_scan(xctx *x, const qspec *q, sink *k, imdb_err *e)
     if (rc || k->err) return rc ? rc : k->err;
     /* memtable rows (not yet in a segment) */
     for (uint64_t vid = t->mem_first; vid < t->nver && !k->err; vid++) {
-        if (!visible_q(q, imdb_vh(t, vid))) continue;
-        if (fetch_row(x, t, vid, vals, e)) return e->code;
+        const imdb_version *v = imdb_vh(t, vid); /* held: the walk has its entry */
+        if (!visible_q(q, v)) continue;
+        if (imdb_version_values_v(t, v, vals, e)) return e->code;
         if (preds_ok(q, vals)) sink_row(k, vid, vals);
     }
     return k->err;
 }
 
+/* The lake read row by row (stage 3b): each segment's rows decoded and checked like any row, then the memtable.
+ * Below the memory floor it is the scan's cross-check: the scan reads the same rows through range filters over
+ * whole columns and zone maps, this one value by value. */
+static int path_rows(xctx *x, const qspec *q, sink *k, imdb_err *e)
+{
+    imdb_table *t = q->t;
+    imdb_value vals[IMDB_MAX_COLS];
+    for (uint32_t s = 0; s < t->nseg && !k->err; s++) {
+        const imdb_segment *g = t->seg[s];
+        for (uint32_t r = 0; r < g->nrows && !k->err; r++) {
+            if (g->flags[r]) continue; /* a stub or a tombstone: no values (visible_q's rule) */
+            if (!q->all_versions && (g->begin[r] > q->snap || g->end[r] <= q->snap || (q->pend && g->end[r] == q->pend)))
+                continue;
+            for (uint32_t c = 0; c < t->s.ncols; c++) imdb_seg_get(&t->s, g, r, c, &vals[c]);
+            if (preds_ok(q, vals)) sink_row(k, g->vid[r], vals);
+        }
+    }
+    for (uint64_t vid = t->mem_first; vid < t->nver && !k->err; vid++) { /* the memtable: always held */
+        const imdb_version *v = imdb_vh(t, vid); /* held: the walk has its entry */
+        if (!visible_q(q, v)) continue;
+        if (imdb_version_values_v(t, v, vals, e)) return e->code;
+        if (preds_ok(q, vals)) sink_row(k, vid, vals);
+    }
+    return k->err;
+}
+
+/* A read the memory window does not answer (stage 3b): a snapshot below the floor, where versions ended before it may
+ * be the lake's alone, or every version there is (ERASE's selection). Only the lake's paths serve it. */
+static bool below_floor(const imdb_db *db, const qspec *q)
+{
+    return q->all_versions || q->snap < db->mem_floor;
+}
+
 static int run_path(xctx *x, int path, const qspec *q, sink *k, imdb_err *e)
 {
     if (q->never) return IMDB_OK;
+    if (below_floor(x->db, q) && path != IMDB_PATH_SCAN && path != IMDB_PATH_ROWS) {
+#ifdef IMDB_STORE_CHECKS /* the one choke point: every planner chose the lake for it, so a miss is a bug */
+        imdb_v_misuse(q->t, q->snap, "a read below the memory floor was planned through memory");
+#endif
+        path = IMDB_PATH_SCAN; /* never a wrong answer for a missed plan */
+    }
     switch (path) {
     case IMDB_PATH_INDEX: return path_index(x, q, k, e);
     case IMDB_PATH_SCAN: return path_scan(x, q, k, e);
     case IMDB_PATH_ORDERED: return path_ordered(x, q, k, e);
+    case IMDB_PATH_ROWS: return path_rows(x, q, k, e);
     default: return path_store(x, q, k, e);
     }
 }
@@ -896,6 +939,7 @@ static const char *path_name(int p, const qspec *q)
 {
     if (p == IMDB_PATH_INDEX) return q->pk_pred >= 0 ? "index(primary key)" : q->subj_pred >= 0 ? "index(subject)" : "store";
     if (p == IMDB_PATH_SCAN) return "scan";
+    if (p == IMDB_PATH_ROWS) return "rows";
     if (p == IMDB_PATH_ORDERED && q->ord_pred >= 0 && !q->all_versions)
         return q->ord_only ? "index(ordered, only)" : "index(ordered)";
     return "store";
@@ -939,6 +983,7 @@ static bool scan_cheaper(const qspec *q, const sink *k)
 
 static int choose_path(const imdb_session *ss, const qspec *q, const sink *k)
 {
+    if (below_floor(ss->db, q)) return IMDB_PATH_SCAN; /* before SET access_path: memory cannot answer it */
     if (ss->access_path != IMDB_PATH_AUTO) return ss->access_path;
     if (q->pk_pred >= 0 || q->subj_pred >= 0) return IMDB_PATH_INDEX;
     if (q->ord_pred >= 0 && !q->all_versions) return scan_cheaper(q, k) ? IMDB_PATH_SCAN : IMDB_PATH_ORDERED;
@@ -1735,13 +1780,17 @@ static jplan join_choose(jctx *j, const qspec q[2], bool force)
 
 /* the plan as the result names it: join(build 2), join(index 2) (side 2 probed for each side-1
  * row), and the cross-check's join(build 1; scan, scan) */
+static const char *join_path_word(int path)
+{
+    return path == IMDB_PATH_SCAN ? "scan" : path == IMDB_PATH_ROWS ? "rows" : "store";
+}
+
 static void join_plan_name(const jplan *p, char *out, size_t n)
 {
     if (p->kind == JP_INDEX) snprintf(out, n, "join(index %c)", p->side ? '1' : '2');
     else if (p->path[0] < 0) snprintf(out, n, "join(build %c)", p->side ? '2' : '1');
     else
-        snprintf(out, n, "join(build %c; %s, %s)", p->side ? '2' : '1', p->path[0] == IMDB_PATH_SCAN ? "scan" : "store",
-                 p->path[1] == IMDB_PATH_SCAN ? "scan" : "store");
+        snprintf(out, n, "join(build %c; %s, %s)", p->side ? '2' : '1', join_path_word(p->path[0]), join_path_word(p->path[1]));
 }
 
 /* a column reference of a join: its side and column; an unqualified name must be in one table */
@@ -1952,7 +2001,8 @@ static int exec_join(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
      * path is every table read's) */
     jplan p = {JP_HASH, 1, {-1, -1}};
     int jp = x->ss->join_plan;
-    if (!rc && (jp == IMDB_JOIN_INDEX || (jp == IMDB_JOIN_AUTO && x->ss->access_path == IMDB_PATH_AUTO)))
+    if (!rc && !below_floor(x->db, &q[0]) && /* below the memory floor: the hash join over the lake (stage 3b) */
+        (jp == IMDB_JOIN_INDEX || (jp == IMDB_JOIN_AUTO && x->ss->access_path == IMDB_PATH_AUTO)))
         p = join_choose(j, q, jp == IMDB_JOIN_INDEX);
     char n1[28]; /* the longest name: join(build 1; store, store) */
     join_plan_name(&p, n1, sizeof n1);
@@ -1968,7 +2018,8 @@ static int exec_join(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
         /* the hash join building side 0, each side read by scan, or by store where the first plan
          * read it by scan: no read path or lookup in common with the first plan */
         jplan m = {JP_HASH, 0, {0, 0}};
-        for (int s = 0; s < 2; s++) m.path[s] = j->ran[s] == IMDB_PATH_SCAN ? IMDB_PATH_STORE : IMDB_PATH_SCAN;
+        for (int s = 0; s < 2; s++) /* below the memory floor the scan's twin is the lake row by row (stage 3b) */
+            m.path[s] = below_floor(x->db, &q[s]) ? IMDB_PATH_ROWS : j->ran[s] == IMDB_PATH_SCAN ? IMDB_PATH_STORE : IMDB_PATH_SCAN;
         char n2[28];
         join_plan_name(&m, n2, sizeof n2);
         imdb_result r2;
@@ -2017,7 +2068,8 @@ static int exec_select(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
     if (!x->ss->cross_check) return IMDB_OK;
     /* the same query along a different path must give the identical result; a scan the cost rule
      * chose over an index is checked against that index */
-    int p2 = p1 != IMDB_PATH_SCAN                 ? IMDB_PATH_SCAN
+    int p2 = below_floor(x->db, &q)              ? IMDB_PATH_ROWS /* the lake alone answers it (stage 3b) */
+             : p1 != IMDB_PATH_SCAN               ? IMDB_PATH_SCAN
              : q.pk_pred >= 0 || q.subj_pred >= 0 ? IMDB_PATH_INDEX
              : q.ord_pred >= 0                    ? IMDB_PATH_ORDERED
                                                   : IMDB_PATH_STORE;
@@ -2072,7 +2124,7 @@ static int select_vids(xctx *x, const sql_stmt *st, imdb_table *t, bool all_vers
         k2.st = st;
         k2.t = t;
         k2.e = e;
-        int p2 = p1 == IMDB_PATH_SCAN ? IMDB_PATH_STORE : IMDB_PATH_SCAN;
+        int p2 = below_floor(x->db, &q) ? IMDB_PATH_ROWS : p1 == IMDB_PATH_SCAN ? IMDB_PATH_STORE : IMDB_PATH_SCAN;
         rc = run_path(x, p2, &q, &k2, e);
         if (!rc && k2.nvids) qsort(k2.vids, k2.nvids, sizeof *k2.vids, cmp_u64);
         if (!rc && (k.nvids != k2.nvids || (k.nvids && memcmp(k.vids, k2.vids, k.nvids * sizeof *k.vids) != 0)))
@@ -2327,6 +2379,21 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
             snprintf(r->status, sizeof r->status, "%llu bytes held, budget %llu%s", (unsigned long long)m.total,
                      (unsigned long long)m.limit, m.total > m.limit ? ": over it, writes that grow are refused" : "");
         else snprintf(r->status, sizeof r->status, "%llu bytes held, no budget", (unsigned long long)m.total);
+        uint64_t held = 0, kept = 0; /* stage 3b: the versions in memory, and those every table keeps (the lake's too) */
+        for (uint32_t i = 0; i < db->nt; i++) {
+            const imdb_table *t = db->t[i];
+            held += t->nheld;
+            kept += t->nver - t->mem_first;
+            for (uint32_t k = 0; k < t->nseg; k++) kept += t->seg[k]->nrows;
+        }
+        size_t at = strlen(r->status);
+        if (db->mem_window_us == UINT64_MAX)
+            snprintf(r->status + at, sizeof r->status - at, "; no memory window: %llu versions held",
+                     (unsigned long long)held);
+        else
+            snprintf(r->status + at, sizeof r->status - at, "; memory window %llu s, floor commit %llu: %llu versions held of %llu",
+                     (unsigned long long)(db->mem_window_us / 1000000), (unsigned long long)db->mem_floor,
+                     (unsigned long long)held, (unsigned long long)kept);
         return res_finish(r, e);
     }
     if (st->kind == ST_SHOW_REPLICATION) { /* the session's last commit: what is known beyond this database */
@@ -2527,25 +2594,45 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
         res_name(r, 1, "_from_commit");
         res_name(r, 2, "_until_commit");
         for (int c = 0; c < t->s.ncols; c++) res_name(r, (uint16_t)(3 + c), t->s.cols[c].name);
+        /* the key's chain (the versions held), and its rows only the lake holds (stage 3b: past the memory window) */
         uint64_t *head = imdb_hmap_get(&t->pk, &key);
         uint64_t nch = 0;
-        for (uint64_t vid = head ? *head : IMDB_NONE; vid != IMDB_NONE; vid = imdb_vh(t, vid)->pk_prev) nch++;
-        uint64_t *chain = xalloc(x, nch * sizeof *chain, e);
-        if (!chain) return e->code;
-        nch = 0;
-        for (uint64_t vid = head ? *head : IMDB_NONE; vid != IMDB_NONE; vid = imdb_vh(t, vid)->pk_prev) chain[nch++] = vid;
-        imdb_value vals[IMDB_MAX_COLS];
-        for (uint64_t i = nch; i-- > 0;) { /* oldest first */
-            imdb_version *v = imdb_vh(t, chain[i]);
-            if (v->flags & IMDB_V_PURGED) continue;
-            if (fetch_row(x, t, chain[i], vals, e)) return e->code;
-            imdb_cell *row = res_row(r, e);
-            if (!row) return e->code;
-            res_put_int(r, &row[0], (int64_t)chain[i]);
-            res_put_int(r, &row[1], (int64_t)v->begin);
-            if (v->end == IMDB_LIVE) res_put_str(r, &row[2], "live");
-            else res_put_int(r, &row[2], (int64_t)v->end);
-            for (int c = 0; c < t->s.ncols; c++) res_put(r, &row[3 + c], &vals[c]);
+        for (int pass = 0; pass < 2; pass++) {
+            uint64_t *chain = pass ? xalloc(x, nch * sizeof *chain, e) : NULL, n = 0;
+            if (pass && !chain) return e->code;
+            for (uint64_t vid = head ? *head : IMDB_NONE; vid != IMDB_NONE; vid = imdb_vh(t, vid)->pk_prev, n++)
+                if (pass) chain[n] = vid;
+            for (uint32_t s = 0; s < t->nseg; s++) {
+                const imdb_segment *g = t->seg[s];
+                for (uint32_t i = 0; i < g->nrows; i++) {
+                    imdb_value v;
+                    if (g->flags[i] || imdb_v_held(t, g->vid[i])) continue;
+                    imdb_seg_get(&t->s, g, i, (uint32_t)t->s.pk, &v);
+                    if (imdb_value_cmp(&v, &key) == 0 && pass) chain[n] = g->vid[i];
+                    n += imdb_value_cmp(&v, &key) == 0;
+                }
+            }
+            if (!pass) {
+                nch = n;
+                continue;
+            }
+            qsort(chain, nch, sizeof *chain, cmp_u64); /* oldest first: vids are handed out in order */
+            imdb_value vals[IMDB_MAX_COLS];
+            for (uint64_t i = 0; i < nch; i++) {
+                imdb_vloc at;
+                int where = imdb_v_find(t, chain[i], &at);
+                if (where == IMDB_VAT_HELD && (at.v->flags & IMDB_V_PURGED)) continue;
+                uint64_t begin = where == IMDB_VAT_HELD ? at.v->begin : at.g->begin[at.row];
+                uint64_t end = where == IMDB_VAT_HELD ? at.v->end : at.g->end[at.row];
+                if (fetch_row(x, t, chain[i], vals, e)) return e->code;
+                imdb_cell *row = res_row(r, e);
+                if (!row) return e->code;
+                res_put_int(r, &row[0], (int64_t)chain[i]);
+                res_put_int(r, &row[1], (int64_t)begin);
+                if (end == IMDB_LIVE) res_put_str(r, &row[2], "live");
+                else res_put_int(r, &row[2], (int64_t)end);
+                for (int c = 0; c < t->s.ncols; c++) res_put(r, &row[3 + c], &vals[c]);
+            }
         }
         return res_finish(r, e);
     }
@@ -2608,7 +2695,7 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
     k1.x = k2.x = x;
     imdb_lthash_zero(&k1.digest);
     imdb_lthash_zero(&k2.digest);
-    int pa = st->has_subject ? IMDB_PATH_INDEX : IMDB_PATH_STORE;
+    int pa = below_floor(x->db, &q) ? IMDB_PATH_ROWS : st->has_subject ? IMDB_PATH_INDEX : IMDB_PATH_STORE;
     if (run_path(x, pa, &q, &k1, e) || run_path(x, IMDB_PATH_SCAN, &q, &k2, e)) return e->code;
     res_cols(r, 5);
     res_name(r, 0, "path");
@@ -2624,7 +2711,7 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
         uint8_t d[32];
         imdb_lthash_digest(x->db->meta.digest_alg, &k->digest, d);
         imdb_hex(d, 32, hex);
-        res_put_str(r, &row[0], i ? "scan (lake segments)" : (st->has_subject ? "index (subject)" : "store"));
+        res_put_str(r, &row[0], i ? "scan (lake segments)" : pa == IMDB_PATH_ROWS ? "rows (lake segments)" : st->has_subject ? "index (subject)" : "store");
         res_put_int(r, &row[1], (int64_t)k->digest_rows);
         res_put_int(r, &row[2], (int64_t)q.snap);
         res_put_str(r, &row[3], hex);

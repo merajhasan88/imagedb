@@ -407,6 +407,7 @@ static void t_join_oracle(void)
     const char *dir = test_tmpdir();
     OK(imdb_init(dir, false, NULL, E));
     imdb_db *db = jopen(dir, false);
+    keep_in_memory(db); /* it counts the plans chosen: below the memory floor only the hash join runs (stage 3b) */
     CHECK(db);
     if (!db) return;
     imdb_session s;

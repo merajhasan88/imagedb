@@ -599,6 +599,48 @@ static void t_erase_compact_late_replica(void)
 
 /* ---- snapshot open (open from the lake, replay only the tail) -------------------- */
 
+/* a version's fields wherever a handle has it (stage 3b: in its store, or a lake row alone); false: nowhere */
+typedef struct vfields {
+    uint64_t begin, end;
+    uint8_t stub, purged, pending;
+    uint8_t commit[32], salt[16];
+} vfields;
+
+static bool vget(const imdb_table *t, uint64_t vid, vfields *f)
+{
+    memset(f, 0, sizeof *f);
+    imdb_vloc at;
+    int where = imdb_v_find(t, vid, &at);
+    if (where == IMDB_VAT_NONE) return false;
+    if (where == IMDB_VAT_HELD) {
+        f->begin = at.v->begin;
+        f->end = at.v->end;
+        f->stub = (at.v->flags & IMDB_V_STUB) != 0;
+        f->purged = (at.v->flags & IMDB_V_PURGED) != 0;
+        f->pending = (at.v->flags & IMDB_V_PENDING_AUTH) != 0;
+    } else {
+        f->begin = at.g->begin[at.row];
+        f->end = at.g->end[at.row];
+        f->stub = (at.g->flags[at.row] & IMDB_SEG_STUB) != 0;
+        f->purged = (at.g->flags[at.row] & IMDB_SEG_PURGED) != 0;
+    }
+    memcpy(f->commit, imdb_v_commit(t, vid), 32);
+    memcpy(f->salt, imdb_v_salt(t, vid), 16);
+    return true;
+}
+
+/* a subject's list, the versions live, ended past fl, or not yet in a segment: what every copy keeps in memory */
+static uint32_t subj_past(imdb_table *t, const imdb_value *sv, uint64_t fl, uint64_t *out, uint32_t cap)
+{
+    const imdb_vlist *l = imdb_subject_versions(t, sv);
+    uint32_t n = 0;
+    for (uint32_t i = 0; l && i < l->n && n < cap; i++) {
+        const imdb_version *v = imdb_vh(t, l->v[i]);
+        if (v->end == IMDB_LIVE || v->end > fl || !(v->flags & IMDB_V_SEG)) out[n++] = l->v[i];
+    }
+    return n;
+}
+
 /* Every piece of logical state two opens of the same directory must agree on. */
 static bool same_state(imdb_db *a, imdb_db *b, char *why, size_t wl)
 {
@@ -620,17 +662,18 @@ static bool same_state(imdb_db *a, imdb_db *b, char *why, size_t wl)
             snprintf(why, wl, "table %s header", x->s.name);
             return false;
         }
+        /* every version either holds, wherever each holds it: two handles of one database may hold different
+         * versions in memory (each copy evicts by its own window, stage 3b), never different versions */
         for (uint64_t vid = 0; vid < x->nver; vid++) {
-            const imdb_version *u = imdb_vh(x, vid), *w = imdb_vh(y, vid);
-            uint8_t fm = IMDB_V_STUB | IMDB_V_PURGED | IMDB_V_PENDING_AUTH;
-            if (u->begin != w->begin || u->end != w->end || (u->flags & fm) != (w->flags & fm) ||
-                memcmp(imdb_vc(x, vid)->commit, imdb_vc(y, vid)->commit, 32) || memcmp(imdb_vc(x, vid)->salt, imdb_vc(y, vid)->salt, 16)) {
+            vfields u, w;
+            bool hu = vget(x, vid, &u), hw = vget(y, vid, &w);
+            if (hu != hw || (hu && memcmp(&u, &w, sizeof u) != 0)) {
                 snprintf(why, wl, "table %s version %llu", x->s.name, (unsigned long long)vid);
                 return false;
             }
         }
         /* the indexes answer alike: every key at every snapshot from the horizon on */
-        for (uint64_t vid = 0; vid < x->nver; vid++) {
+        for (uint64_t vid = imdb_v_next(x, 0); vid < x->nver; vid = imdb_v_next(x, vid + 1)) { /* those held */
             imdb_value k;
             if (imdb_version_key(x, vid, x->s.pk, &k)) continue;
             for (uint64_t s = x->horizon; s <= a->seq; s += 1 + a->seq / 7)
@@ -642,9 +685,10 @@ static bool same_state(imdb_db *a, imdb_db *b, char *why, size_t wl)
         if (x->s.subject >= 0)
             for (int64_t subj = 0; subj < 12; subj++) {
                 imdb_value sv = {.type = IMDB_T_INT64, .i = subj};
-                const imdb_vlist *l1 = imdb_subject_versions(x, &sv), *l2 = imdb_subject_versions(y, &sv);
-                uint32_t n1 = l1 ? l1->n : 0, n2 = l2 ? l2->n : 0;
-                if (n1 != n2 || (n1 && memcmp(l1->v, l2->v, n1 * sizeof *l1->v))) {
+                /* the lists hold what each handle holds: alike past the higher floor (stage 3b) */
+                uint64_t fl = a->mem_floor > b->mem_floor ? a->mem_floor : b->mem_floor, v1[4096], v2[4096];
+                uint32_t n1 = subj_past(x, &sv, fl, v1, 4096), n2 = subj_past(y, &sv, fl, v2, 4096);
+                if (n1 != n2 || (n1 && memcmp(v1, v2, n1 * sizeof *v1))) {
                     snprintf(why, wl, "table %s subject %lld list", x->s.name, (long long)subj);
                     return false;
                 }
@@ -805,7 +849,7 @@ static void t_snapshot_fallbacks(void)
     OK(imdb_verify(db, &vr, E));
     imdb_close(db);
 
-    /* 3. AS OF TIMESTAMP and SHOW LOG reach before the snapshot (the lazy index) */
+    /* 3. AS OF TIMESTAMP and SHOW LOG reach before the snapshot (the commit index read per segment on demand) */
     db = open_db(p);
     imdb_db *full = open_full(p);
     CHECK(db && full && db->snapshot_seq > 0 && db->ci_first > 1);
@@ -815,7 +859,7 @@ static void t_snapshot_fallbacks(void)
         OK(imdb_seq_at_time(full, t_us, &s2, E));
         CHECK(s1 == q && s2 == q);
     }
-    CHECK(db->ci_first == 1);
+    CHECK(db->ci_first > 1 && db->nci_old > 0); /* answered from a segment read on demand, not a whole index (stage 3b) */
     uint64_t z;
     OK(imdb_seq_at_time(db, 0, &z, E));
     CHECK(z == 0);

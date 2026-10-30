@@ -89,6 +89,7 @@ int main(int argc, char **argv)
         {"index", index_tests, &index_ntests},
         {"join", join_tests, &join_ntests},
         {"retain", retain_tests, &retain_ntests},
+        {"evict", evict_tests, &evict_ntests},
     };
     int failed = 0, run = 0;
     for (size_t g = 0; g < sizeof groups / sizeof *groups; g++) {

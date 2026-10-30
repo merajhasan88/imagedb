@@ -35,6 +35,15 @@ static imdb_db *ropen(const char *dir, bool full_replay)
     return imdb_open(dir, &o, &db, E) ? NULL : db;
 }
 
+/* the same with every version kept in memory from the open on (stage 3b): a test that reads the store itself */
+static imdb_db *ropen_keep(const char *dir, bool full_replay)
+{
+    imdb_open_opts o = {.sync = 0, .full_replay = full_replay, .floor_stride = g_stride, .mem_window_us = UINT64_MAX};
+    imdb_db *db = NULL;
+    imdb_err_clear(E);
+    return imdb_open(dir, &o, &db, E) ? NULL : db;
+}
+
 static int ex(imdb_session *s, const char *sql)
 {
     imdb_result r;
@@ -678,13 +687,20 @@ static int64_t sval_of(imdb_session *s, const char *sql) /* a query's one value;
     return v;
 }
 
+/* the versions a table keeps, in memory or (stage 3b) the lake's alone: what RETIRE drops, whatever a window let go;
+ * UINT64_MAX when the store's own count is not its walk's */
 static uint64_t held_of(imdb_db *db, const char *name)
 {
     imdb_table *t = imdb_table_by_name(db, name);
-    uint64_t n = 0;
+    uint64_t n = 0, kept = 0;
     if (!t) return 0;
-    for (uint64_t vid = imdb_v_skip(t, 0); vid < t->nver; vid = imdb_v_skip(t, vid + 1)) n += imdb_v_present(t, vid);
-    return n;
+    for (uint64_t vid = imdb_v_next(t, 0); vid < t->nver; vid = imdb_v_next(t, vid + 1)) n++;
+    if (n != t->nheld) return UINT64_MAX;
+    for (uint64_t vid = 0; vid < t->nver; vid++) {
+        imdb_vloc at;
+        kept += imdb_v_find(t, vid, &at) != IMDB_VAT_NONE;
+    }
+    return kept;
 }
 
 /* Two tables kept 10 seconds, a with history in the first segment, a unique index on b; the policy's EXPIRE
@@ -899,6 +915,7 @@ static void t_retain_retire_chunks(void)
     const char *dir = test_tmpdir();
     OK(imdb_init(dir, false, NULL, E));
     imdb_db *db = ropen(dir, false);
+    keep_in_memory(db); /* the store's exact bytes */
     CHECK(db);
     if (!db) return;
     imdb_session s;
@@ -924,12 +941,12 @@ static void t_retain_retire_chunks(void)
     imdb_clock_offset(15 * SEC_US);
     OK(ex(&s, "SELECT COUNT(*) FROM a"));
     imdb_table *t = imdb_table_by_name(db, "a");
-    CHECK(t->horizon == s2 && t->nchunk == 2 && t->nfreed == 0);
+    CHECK(t->horizon == s2 && t->nchunk == 2 && t->ch[0] && t->ch[1]);
     uint64_t bytes = imdb_ver_bytes(t), heap = imdb_heap_bytes();
     OK(imdb_retire(db, s2 - 1, E));
-    uint64_t chunk = IMDB_VCHUNK * (sizeof(imdb_version) + sizeof(imdb_version_cold));
-    CHECK(t->nfreed == 1 && !t->vh[0] && imdb_ver_bytes(t) == bytes - chunk);
-    CHECK(imdb_heap_bytes() + chunk / 2 < heap); /* the chunk's 6 MB and the lake's dropped rows, less the rebuilt */
+    uint64_t chunk = sizeof(imdb_vchunk) + IMDB_VCHUNK * sizeof(imdb_version); /* hot parts: flushed, no cold ones */
+    CHECK(!t->ch[0] && imdb_ver_bytes(t) == bytes - chunk);
+    CHECK(imdb_heap_bytes() + chunk / 2 < heap); /* the chunk's 3 MB and the lake's dropped rows, less the rebuilt */
     CHECK(held_of(db, "a") == 1001 && sval_of(&s, "SELECT COUNT(*) FROM a") == 1001);
     imdb_verify_report vr;
     memset(&vr, 0, sizeof vr);
@@ -938,6 +955,7 @@ static void t_retain_retire_chunks(void)
     imdb_close(db);
     for (int full = 0; full < 2; full++) {
         db = ropen(dir, full);
+        keep_in_memory(db);
         if (full) { /* past the cut the log begins after the floor: only the snapshot starts it (FLOOR) */
             CHECK(!db && strstr(g_e.msg, "is retired"));
             if (db) imdb_close(db);
@@ -947,13 +965,109 @@ static void t_retain_retire_chunks(void)
         if (!db) return;
         t = imdb_table_by_name(db, "a");
         /* one chunk of entries allocated (the directory's own room may differ from the live handle's) */
-        CHECK(t->nfreed == 1 && !t->vh[0] && held_of(db, "a") == 1001 &&
-              t->capver - (uint64_t)t->nfreed * IMDB_VCHUNK == IMDB_VCHUNK);
+        CHECK(!t->ch[0] && t->ch[1] && !t->ch[1]->off && held_of(db, "a") == 1001 &&
+              imdb_ver_bytes(t) == chunk + t->capchunk * sizeof *t->ch);
         CHECK(full || (db->snapshot_seq > 0 && !db->warning[0]));
         memset(&vr, 0, sizeof vr);
         OK(imdb_verify(db, &vr, E));
         imdb_close(db);
     }
+    CHECK(audit_ok(dir));
+}
+
+/* Survivors cost their entries, not their chunk (stage 3b): 140,000 versions (vid = id) over three chunks; RETIRE
+ * drops all of chunk 0 but 10 and all of chunk 1 but 5,461 (at least IMDB_VSPARSE), so chunk 0 goes sparse, chunk
+ * 1 stays dense, chunk 2 (the last) too; the survivors read back through the key, the store's walk and a scan;
+ * VERIFY and the auditor pass; a snapshot open makes the same shape; updating five of chunk 0's survivors and
+ * retiring again leaves it sparse with five, the other five free it */
+static uint64_t sparse_bytes(uint64_t n)
+{
+    return sizeof(imdb_vchunk) + n * (sizeof(imdb_version) + sizeof(uint16_t));
+}
+
+static void store_shape(imdb_db *db, imdb_session *s, uint32_t sparse0, int64_t v0)
+{
+    imdb_table *t = imdb_table_by_name(db, "a");
+    const uint64_t dense = sizeof(imdb_vchunk) + IMDB_VCHUNK * sizeof(imdb_version);
+    uint64_t want = (sparse0 ? sparse_bytes(sparse0) : 0) + 2 * dense + t->capchunk * sizeof *t->ch;
+    CHECK(t->nchunk == 3 && t->ch[1] && !t->ch[1]->off && t->ch[2] && !t->ch[2]->off);
+    CHECK(sparse0 ? t->ch[0] && t->ch[0]->off && t->ch[0]->n == sparse0 : !t->ch[0]);
+    CHECK(imdb_ver_bytes(t) == want);
+    CHECK(sval_of(s, "SELECT COUNT(*) FROM a WHERE id < 65536 AND v = 1") == sparse0);
+    CHECK(sval_of(s, "SELECT v FROM a WHERE id = 58986") == v0); /* through the key's chain into chunk 0 */
+    OK(ex(s, "SET access_path = store"));
+    CHECK(sval_of(s, "SELECT COUNT(*) FROM a WHERE id < 65536 AND v = 1") == sparse0); /* the store's walk */
+    CHECK(sval_of(s, "SELECT COUNT(*) FROM a WHERE v = 1") == (int64_t)sparse0 + 5461 + 8928);
+    OK(ex(s, "SET access_path = auto"));
+    imdb_verify_report vr;
+    memset(&vr, 0, sizeof vr);
+    OK(imdb_verify(db, &vr, E));
+}
+
+static void t_retain_store_sparse(void)
+{
+    const char *dir = test_tmpdir();
+    OK(imdb_init(dir, false, NULL, E));
+    imdb_db *db = ropen(dir, false);
+    keep_in_memory(db); /* the store's exact shape: every version held but those RETIRE drops */
+    CHECK(db);
+    if (!db) return;
+    imdb_session s;
+    imdb_session_init(&s, db);
+    db->no_auto_retire = true;
+    /* an hour: no expiry of its own, however slow the build (ASan inserts 140,000 rows in more than 10 s) */
+    OK(ex(&s, "CREATE TABLE a (id INT64 PRIMARY KEY, v INT64) RETENTION 1 HOURS"));
+    char *q = malloc(32 * 1000 + 64);
+    CHECK(q != NULL);
+    if (!q) return;
+    OK(ex(&s, "BEGIN"));
+    for (int b = 0; b < 140; b++) {
+        size_t at = (size_t)snprintf(q, 64, "INSERT INTO a VALUES ");
+        for (int i = 0; i < 1000; i++) {
+            int id = b * 1000 + i, keep = id < 65536 ? id % 6554 == 0 : id < 131072 ? id % 12 == 0 : 1;
+            at += (size_t)snprintf(q + at, 32, "%s(%d, %d)", i ? ", " : "", id, keep);
+        }
+        OK(ex(&s, q));
+    }
+    free(q);
+    OK(ex(&s, "COMMIT"));
+    OK(ex(&s, "DELETE FROM a WHERE v = 0"));
+    OK(ex(&s, "CHECKPOINT"));
+    uint64_t s2 = db->seq + 1;
+    OK(ex(&s, "INSERT INTO a VALUES (200000, 3)"));
+    OK(ex(&s, "CHECKPOINT"));
+    imdb_clock_offset(7200 * SEC_US);
+    OK(ex(&s, "SELECT COUNT(*) FROM a"));
+    uint64_t heap = imdb_heap_bytes();
+    OK(imdb_retire(db, s2 - 1, E));
+    CHECK(imdb_heap_bytes() + (3u << 20) < heap); /* chunk 0's 3 MB, and the lake's dropped rows */
+    CHECK(held_of(db, "a") == 14400);
+    store_shape(db, &s, 10, 1);
+    imdb_session_close(&s);
+    imdb_close(db);
+    db = ropen(dir, false); /* the snapshot open makes the same shape */
+    keep_in_memory(db);
+    CHECK(db && db->snapshot_seq > 0);
+    if (!db) return;
+    imdb_session_init(&s, db);
+    db->no_auto_retire = true;
+    CHECK(held_of(db, "a") == 14400);
+    store_shape(db, &s, 10, 1);
+    for (int round = 0; round < 2; round++) {
+        OK(ex(&s, round ? "UPDATE a SET v = 2 WHERE id BETWEEN 32770 AND 65535 AND v = 1"
+                        : "UPDATE a SET v = 2 WHERE id BETWEEN 0 AND 26216 AND v = 1"));
+        OK(ex(&s, "CHECKPOINT"));
+        uint64_t sn = db->seq + 1;
+        OK(ex(&s, round ? "INSERT INTO a VALUES (400000, 3)" : "INSERT INTO a VALUES (300000, 3)"));
+        OK(ex(&s, "CHECKPOINT"));
+        imdb_clock_offset((14400 + 7200 * round) * SEC_US);
+        OK(ex(&s, "SELECT COUNT(*) FROM a"));
+        OK(imdb_retire(db, sn - 1, E));
+        CHECK(held_of(db, "a") == 14400 + 1 + (uint64_t)round);
+        store_shape(db, &s, round ? 0 : 5, round ? 2 : 1);
+    }
+    imdb_session_close(&s);
+    imdb_close(db);
     CHECK(audit_ok(dir));
 }
 
@@ -1067,7 +1181,7 @@ static void t_retain_retire_purged(void)
 {
     const char *dir = test_tmpdir();
     OK(imdb_init(dir, false, NULL, E));
-    imdb_db *db = ropen(dir, false);
+    imdb_db *db = ropen_keep(dir, false); /* it reads the store's tombstones and subject lists themselves */
     CHECK(db);
     if (!db) return;
     imdb_session s;
@@ -1090,7 +1204,7 @@ static void t_retain_retire_purged(void)
     CHECK(horizon_of(db, "c") == s2 + 1);
     OK(imdb_retire(db, s2 - 1, E));
     imdb_table *t = imdb_table_by_name(db, "c");
-    CHECK(held_of(db, "c") == 4 && !imdb_v_present(t, 0) && !imdb_v_present(t, 2));
+    CHECK(held_of(db, "c") == 4 && !imdb_v_held(t, 0) && !imdb_v_held(t, 2));
     CHECK((imdb_vh(t, 3)->flags & IMDB_V_PURGED) && (imdb_vh(t, 4)->flags & IMDB_V_PURGED));
     imdb_value sv = {.type = IMDB_T_INT64, .i = 7};
     uint64_t *li = imdb_hmap_get(&t->subj, &sv);
@@ -1103,7 +1217,7 @@ static void t_retain_retire_purged(void)
     imdb_session_close(&s);
     imdb_close(db);
     for (int full = 0; full < 2; full++) {
-        db = ropen(dir, full);
+        db = ropen_keep(dir, full);
         if (full) { /* past the cut the log begins after the floor: only the snapshot starts it (FLOOR) */
             CHECK(!db && strstr(g_e.msg, "is retired"));
             if (db) imdb_close(db);
@@ -1944,6 +2058,7 @@ const test_case retain_tests[] = {
     {"retain_retire", t_retain_retire},
     {"retain_retire_rules", t_retain_retire_rules},
     {"retain_retire_chunks", t_retain_retire_chunks},
+    {"retain_store_sparse", t_retain_store_sparse},
     {"retain_retire_again", t_retain_retire_again},
     {"retain_retire_purged", t_retain_retire_purged},
     {"retain_retire_txn", t_retain_retire_txn},

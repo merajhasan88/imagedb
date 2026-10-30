@@ -45,6 +45,9 @@ imdb_db *open_db(const char *dir);
 void txn_schema(imdb_schema *s);
 void row_vals(imdb_value v[4], int64_t id, int64_t user, int64_t cents, const char *memo);
 int make_table(imdb_db *db, imdb_err *e);
+/* A test of the store's exact shape, its bytes or the heap's counter keeps every version in memory: no window, and
+ * no eager pass (stage 3b), whatever IMDB_EVICT says. */
+void keep_in_memory(imdb_db *db);
 int ins1(imdb_db *db, int64_t id, int64_t user, int64_t cents, const char *memo);
 uint64_t pk_lookup(imdb_db *db, int64_t id, uint64_t snap);
 uint64_t count_subject(imdb_db *db, int64_t user, uint64_t snap);

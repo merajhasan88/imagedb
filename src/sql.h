@@ -27,7 +27,8 @@
 
 #include "db.h"
 
-enum { IMDB_PATH_AUTO = 0, IMDB_PATH_INDEX = 1, IMDB_PATH_SCAN = 2, IMDB_PATH_STORE = 3, IMDB_PATH_ORDERED = 4 };
+/* IMDB_PATH_ROWS, the lake read row by row, is no SET access_path's: below the memory floor it cross-checks the scan */
+enum { IMDB_PATH_AUTO = 0, IMDB_PATH_INDEX = 1, IMDB_PATH_SCAN = 2, IMDB_PATH_STORE = 3, IMDB_PATH_ORDERED = 4, IMDB_PATH_ROWS = 5 };
 enum { IMDB_JOIN_AUTO = 0, IMDB_JOIN_HASH = 1, IMDB_JOIN_INDEX = 2 };
 
 /* What the session's last commit is known to hold beyond this database (SHOW REPLICATION, and the

@@ -10,15 +10,27 @@ enum { UNDO_INSERT = 1, UNDO_END = 2, UNDO_CREATE = 3, UNDO_INDEX = 4, UNDO_UNIN
 int imdb_table_new(imdb_db *db, const imdb_schema *s, imdb_err *e);
 void imdb_table_free(imdb_table *t);
 int imdb_ver_push(imdb_table *t, imdb_err *e);
+/* The newest version leaves the store again (a rollback, an insert that failed): its parts wiped. */
+void imdb_ver_pop(imdb_table *t);
 /* An empty store with room for exactly n versions (chunk 0 sized to n when n fits one chunk), for an
  * open that knows the count (the snapshot). */
 int imdb_ver_reserve(imdb_table *t, uint64_t n, imdb_err *e);
-/* An empty store covering vids [0, n) with no chunk allocated but the last (where vids are appended) and, for
- * n within one chunk, chunk 0 itself; imdb_ver_chunk_need allocates the chunk of a vid a row names. Every vid
- * of an allocated chunk starts retired (IMDB_V_RETIRED) until filled: the snapshot load, which then holds
- * only what its rows name. */
-int imdb_ver_reserve_sparse(imdb_table *t, uint64_t n, imdb_err *e);
-int imdb_ver_chunk_need(imdb_table *t, uint32_t k, imdb_err *e);
+/* The snapshot's store (lake.c load_table), its rows in vid order: imdb_ver_load_begin makes the directory for vids
+ * [0, n), no chunk yet; then for each chunk a row lands in, imdb_ver_load_chunk with the number of its rows, and
+ * imdb_ver_load_put for each of them in turn (i counts them from 0), whose entries the caller fills; the last chunk
+ * is made too when no row lands in it (vids are appended there). A database never retired holds every vid, so its
+ * chunks come out dense (each slot IMDB_V_GONE until its row fills it); past a boundary, a chunk other than the last
+ * that holds fewer than IMDB_VSPARSE rows comes out sparse: what was read bounds what is allocated, the count only
+ * the directory. */
+int imdb_ver_load_begin(imdb_table *t, uint64_t n, imdb_err *e);
+int imdb_ver_load_chunk(imdb_table *t, uint32_t k, uint64_t cnt, imdb_err *e);
+imdb_version *imdb_ver_load_put(imdb_table *t, uint64_t vid, uint32_t i);
+/* The memtable was flushed (a publish): its cold parts go, wiped, and mem_first moves to the count. */
+void imdb_ver_flushed(imdb_table *t);
+/* After versions left the store (their entries flagged IMDB_V_GONE): every chunk but the last is freed when it holds
+ * none, and kept sparse when it holds fewer than IMDB_VSPARSE. A chunk that cannot be remade (memory) stays as it
+ * is, which is no error: no reader takes an entry flagged gone. */
+void imdb_ver_compact(imdb_table *t);
 /* What the store holds in memory, and what its next growth step adds (both parts and the directories). */
 uint64_t imdb_ver_bytes(const imdb_table *t);
 uint64_t imdb_ver_growth(const imdb_table *t);
@@ -38,8 +50,8 @@ int imdb_index_subject(imdb_table *t, uint64_t vid, const imdb_value *sv, imdb_u
  * insertion builds them: the snapshot load, and RETIRE (the CREATE INDEX structures are the caller's). */
 int imdb_table_reindex(imdb_table *t, imdb_err *e);
 /* RETIRE in the version store (stage 3a): every version ended at or before boundary leaves it (wiped,
- * flagged IMDB_V_RETIRED), a chunk left with none present is freed but for the last, and the table is
- * reindexed. Its rows have left the lake already (the RETIRE's plan). */
+ * flagged IMDB_V_GONE), the chunks are compacted (imdb_ver_compact), and the table is reindexed. Its rows
+ * have left the lake already (the RETIRE's plan). */
 int imdb_retire_table(imdb_table *t, uint64_t boundary, imdb_err *e);
 /* Drops all loaded state (tables, lake, commit index) back to an empty database. */
 void imdb_reset_state(imdb_db *db);
@@ -74,8 +86,9 @@ uint64_t imdb_now_us(void);
 void imdb_stub_version(imdb_table *t, uint64_t vid);
 void imdb_pk_unlink(imdb_table *t, uint64_t vid, const imdb_value *key);
 int imdb_ci_push(imdb_db *db, uint64_t time_us, const uint8_t hash[32], const uint8_t digest[32], imdb_err *e);
-/* RETIRE: the commit index keeps the commits past boundary only (an AS OF at or below it is refused: every
- * horizon is past it), and gives its room back. */
+/* RETIRE: the commit index keeps the commits past boundary only (an AS OF at or below it is refused: every horizon is
+ * past it), and gives its room back. Stage 3b's eviction calls it with the memory floor: the commits at or below it
+ * are read from the log on demand then (imdb_ci_at). */
 void imdb_ci_retire(imdb_db *db, uint64_t boundary);
 /* Commit seq's header (replaced into hdr) and signature, read from its log segment (FLOOR's). */
 int imdb_log_commit_header(imdb_db *db, uint64_t seq, imdb_buf *hdr, uint8_t sig[IMDB_SIG_LEN], imdb_err *e);
@@ -107,6 +120,11 @@ int imdb_tx_add_physical(imdb_db *db, uint8_t code, uint32_t table, uint64_t pur
                          const uint8_t manifest[32], imdb_err *e);
 
 int imdb_check_state(imdb_db *db, imdb_err *e);
+/* The memory window's policy (db.h imdb_evict), between transactions: the primary's imdb_maintain, every applied commit. */
+void imdb_evict_policy(imdb_db *db);
+/* The floor the window allows now (stage 3b): the end of the newest log segment whose successor began at least the
+ * window ago, at most cap (0: none; the eager mode, cap itself). The snapshot open takes it, capped at its commit. */
+uint64_t imdb_window_floor(imdb_db *db, uint64_t cap);
 int imdb_lthash_sum_commits(uint8_t alg, const uint8_t *const *ptrs, size_t n, imdb_lthash *out, imdb_err *e);
 
 /* replay.c */
@@ -127,6 +145,9 @@ int imdb_apply_commit(imdb_db *db, imdb_commit_rec *c, const imdb_commit_pre *pr
 /* lake.c (segments, deletion vectors, manifests) */
 int imdb_lake_open(imdb_db *db, imdb_err *e);
 void imdb_lake_table_free(imdb_table *t);
+/* The segment and row of the lake holding vid, whether the store holds it or not (false: none). A table's segments
+ * hold rows in ascending, disjoint vid ranges: the snapshot open checks it, and every install. */
+bool imdb_lake_find(const imdb_table *t, uint64_t vid, uint32_t *seg, uint32_t *row);
 int imdb_seg_values(imdb_table *t, const imdb_version *v, imdb_value *vals, imdb_err *e);
 int imdb_seg_value(imdb_table *t, const imdb_version *v, int col, imdb_value *out);
 void imdb_seg_set_end(imdb_table *t, const imdb_version *v, uint64_t end);

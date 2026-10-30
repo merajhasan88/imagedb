@@ -136,7 +136,7 @@ static bool locks_live(const imdb_db *db, const imdb_txn *x)
 {
     for (uint32_t i = 0; i < x->nlocks; i++) {
         const imdb_table *t = db->t[x->locks[i].table];
-        if (!imdb_v_present(t, x->locks[i].vid)) return false; /* retired: it ended long before the commit */
+        if (!imdb_v_held(t, x->locks[i].vid)) return false; /* retired, or past the memory window: it ended long since */
         const imdb_version *v = imdb_vh(t, x->locks[i].vid);
         /* seq+1 is an uncommitted end, including our own UPDATE/DELETE.
          * Only a committed change can break an optimistic observation. */
@@ -281,10 +281,11 @@ int imdb_txn_lock_rows(imdb_db *db, imdb_txn *x, const imdb_table *t, const uint
     uint64_t na = 0;
     int rc = IMDB_OK;
     for (uint64_t i = 0; i < n && !rc; i++) {
-        const imdb_version *v = imdb_vh(t, vids[i]);
+        /* not held: a version past the memory window (stage 3b), which ended at or before its floor */
+        const imdb_version *v = imdb_v_held(t, vids[i]) ? imdb_vh(t, vids[i]) : NULL;
         imdb_txn_lock k = {t->s.id, vids[i]};
-        if (v->begin == db->seq + 1) continue; /* its own pending row needs no lock */
-        if (v->end <= db->seq || (v->flags & (IMDB_V_STUB | IMDB_V_PURGED)))
+        if (v && v->begin == db->seq + 1) continue; /* its own pending row needs no lock */
+        if (!v || v->end <= db->seq || (v->flags & (IMDB_V_STUB | IMDB_V_PURGED)))
             rc = imdb_fail(e, IMDB_ERR_CONFLICT,
                            "could not serialize access: a row selected FOR UPDATE was changed by a commit after the "
                            "snapshot; retry the transaction");

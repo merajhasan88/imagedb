@@ -984,8 +984,8 @@ static size_t salts_after(imdb_db *db, uint64_t after, uint8_t (*out)[16], size_
 {
     imdb_table *t = imdb_table_by_name(db, "t");
     size_t n = 0;
-    for (uint64_t vid = 0; t && vid < t->nver && n < cap; vid++)
-        if (imdb_vh(t, vid)->begin > after) memcpy(out[n++], imdb_vc(t, vid)->salt, 16);
+    for (uint64_t vid = t ? imdb_v_next(t, 0) : 0; t && vid < t->nver && n < cap; vid = imdb_v_next(t, vid + 1))
+        if (imdb_vh(t, vid)->begin > after) memcpy(out[n++], imdb_v_salt(t, vid), 16);
     qsort(out, n, 16, cmp16);
     return n;
 }

@@ -94,6 +94,16 @@ expect_cell 15 "$(sql "SELECT COUNT(*) FROM txns AS OF $before WHERE user_id = 4
 expect "count=15 " "$("$AUD" count "$P" txns user_id=42 --as-of "$before")"
 echo "now 14 in db, lake, replica; AS OF $before still 15 (engine and lake files)"
 
+step "the memory window (stage 3b): --mem-window takes seconds or none; history below its floor is read from the lake"
+out=$("$BIN" sql "$P" --nosync --mem-window 30 -c "SHOW MEMORY;")
+expect "memory window 30 s, floor commit " "$out"
+out=$("$BIN" sql "$P" --nosync --mem-window none -c "SHOW MEMORY;")
+expect "no memory window: " "$out"
+"$BIN" sql "$P" --nosync --mem-window 0 -c "SHOW MEMORY;" >/dev/null 2>&1 && fail "--mem-window 0 accepted"
+"$BIN" sql "$P" --nosync --mem-window 12x -c "SHOW MEMORY;" >/dev/null 2>&1 && fail "--mem-window 12x accepted"
+expect_cell 15 "$("$BIN" sql "$P" --nosync --cross-check --mem-window 1 -c "SELECT COUNT(*) FROM txns AS OF $before WHERE user_id = 42;")"
+echo "--mem-window 30 and none taken, 0 and 12x refused; AS OF $before still 15 under a one-second window"
+
 step "past the checkpoint: the auditor reads the lake plus the log tail, and prints the engine's view token"
 sql "INSERT INTO txns VALUES (900, 7, 1.00, 'tail', '2026-10-16 09:00:00');" >/dev/null
 ship

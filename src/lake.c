@@ -273,6 +273,11 @@ static void seg_get(const imdb_schema *s, const imdb_segment *g, uint32_t row, u
     }
 }
 
+void imdb_seg_get(const imdb_schema *s, const imdb_segment *g, uint32_t row, uint32_t c, imdb_value *v)
+{
+    seg_get(s, g, row, c, v);
+}
+
 int imdb_segment_row(const imdb_schema *s, const imdb_segment *g, uint32_t row, imdb_buf *out, imdb_err *e)
 {
     imdb_value vals[IMDB_MAX_COLS];
@@ -318,52 +323,99 @@ static bool erased_has(const erased_set *es, uint32_t table, uint64_t vid)
     return false;
 }
 
-static bool row_is_stub(const imdb_table *t, uint64_t vid, const erased_set *es)
+/* Where a row of a segment being built comes from (stage 3b): a row of a segment (g, r), read there whether the
+ * store holds its version or not, or the memtable (g NULL: the store's version vid, which it always holds). A row
+ * of a segment carries everything the new row needs: its flags are its version's (an ERASE rewrites the segments
+ * of the versions it stubs, a purge those it purges, each in the same publish), and its end is current
+ * (imdb_seg_set_end at every commit), so the lake rebuilds itself without the store. */
+typedef struct seg_src {
+    const imdb_segment *g;
+    uint32_t r;
+    uint64_t vid;
+} seg_src;
+
+static uint64_t src_begin(const imdb_table *t, const seg_src *s)
 {
-    return (imdb_vh(t, vid)->flags & IMDB_V_STUB) || erased_has(es, t->s.id, vid);
+    return s->g ? s->g->begin[s->r] : imdb_vh(t, s->vid)->begin;
 }
 
-/* Value of column c of a (non-stub) version, wherever it lives. */
-static void ver_get(const imdb_table *t, uint64_t vid, uint32_t c, imdb_value *v)
+static uint64_t src_end(const imdb_table *t, const seg_src *s)
 {
-    const imdb_version *ver = imdb_vh(t, vid);
-    if (ver->flags & IMDB_V_SEG) seg_get(&t->s, t->seg[ver->seg], ver->seg_row, c, v);
-    else imdb_row_get(&t->s, t->arena.p + ver->row_off, ver->row_len, (int)c, v);
+    return s->g ? s->g->end[s->r] : imdb_vh(t, s->vid)->end;
 }
 
-/* Row flags of a version in a segment being built (lake.h): erased now or
- * by this ERASE, purged before or by this COMPACT ... PURGE. */
-/* RETIRE below b drops the version: it ended at or before b */
-static bool retired_by(const imdb_table *t, uint64_t vid, uint64_t b)
+static const uint8_t *src_salt(const imdb_table *t, const seg_src *s)
 {
-    const imdb_version *v = imdb_vh(t, vid);
-    return v->end != IMDB_LIVE && v->end <= b;
+    return s->g ? s->g->salt + 16u * s->r : imdb_vc(t, s->vid)->salt;
 }
 
-static uint8_t row_flags(const imdb_table *t, uint64_t vid, const erased_set *es, uint64_t purge_before)
+static const uint8_t *src_commit(const imdb_table *t, const seg_src *s)
 {
-    const imdb_version *v = imdb_vh(t, vid);
-    uint8_t f = row_is_stub(t, vid, es) ? IMDB_SEG_STUB : 0;
-    if ((v->flags & IMDB_V_PURGED) || (purge_before && v->end != IMDB_LIVE && v->end <= purge_before))
-        f |= IMDB_SEG_PURGED;
+    return s->g ? s->g->commit + 32u * s->r : imdb_vc(t, s->vid)->commit;
+}
+
+/* column c of a (non-stub) row */
+static void src_get(const imdb_table *t, const seg_src *s, uint32_t c, imdb_value *v)
+{
+    if (s->g) {
+        seg_get(&t->s, s->g, s->r, c, v);
+        return;
+    }
+    const imdb_version *ver = imdb_vh(t, s->vid);
+    imdb_row_get(&t->s, t->arena.p + ver->row_off, ver->row_len, (int)c, v);
+}
+
+/* Row flags of a version in a segment being built (lake.h): erased before or by this ERASE, purged before or by
+ * this COMPACT ... PURGE. */
+static uint8_t src_flags(const imdb_table *t, const seg_src *s, const erased_set *es, uint64_t purge_before)
+{
+    uint8_t f = s->g ? s->g->flags[s->r]
+                     : (uint8_t)(((imdb_vh(t, s->vid)->flags & IMDB_V_STUB) ? IMDB_SEG_STUB : 0) |
+                                 ((imdb_vh(t, s->vid)->flags & IMDB_V_PURGED) ? IMDB_SEG_PURGED : 0));
+    uint8_t erased = erased_has(es, t->s.id, s->vid) ? IMDB_SEG_STUB : 0;
+#ifdef IMDB_STORE_CHECKS
+    /* the store agrees with the row it holds the version of; a replica stubs the ERASE's versions in the store before
+     * this plan rewrites their rows, so the ERASE's own bit is on both sides */
+    if (s->g && imdb_v_held(t, s->vid)) {
+        const imdb_version *v = imdb_vh(t, s->vid);
+        uint8_t held = (uint8_t)(((v->flags & IMDB_V_STUB) ? IMDB_SEG_STUB : 0) | ((v->flags & IMDB_V_PURGED) ? IMDB_SEG_PURGED : 0));
+        if ((held | erased) != (f | erased) || v->end != s->g->end[s->r] || v->begin != s->g->begin[s->r])
+            imdb_v_misuse(t, s->vid, "the store's flags, begin or end differ from its segment row's");
+    }
+#endif
+    f |= erased;
+    uint64_t end = src_end(t, s);
+    if (purge_before && end != IMDB_LIVE && end <= purge_before) f |= IMDB_SEG_PURGED;
     return f;
 }
 
-static int seg_build(const imdb_table *t, const uint64_t *vids, uint32_t n, const erased_set *es,
+/* RETIRE below b drops a row ended at or before b */
+static bool ended_by(uint64_t end, uint64_t b)
+{
+    return end != IMDB_LIVE && end <= b;
+}
+
+/* every row of g, as sources (n = g->nrows) */
+static void src_rows(const imdb_segment *g, seg_src *out)
+{
+    for (uint32_t i = 0; i < g->nrows; i++) out[i] = (seg_src){g, i, g->vid[i]};
+}
+
+static int seg_build(const imdb_table *t, const seg_src *src, uint32_t n, const erased_set *es,
                      uint64_t purge_before, imdb_segment **out, imdb_err *e)
 {
     const imdb_schema *s = &t->s;
     if (n > IMDB_MAX_SEGMENT_ROWS) return imdb_fail(e, IMDB_ERR_LIMIT, "segment would exceed %u rows", IMDB_MAX_SEGMENT_ROWS);
     uint8_t *fl = imdb_alloc(n ? n : 1, e);
     if (!fl) return e->code;
-    for (uint32_t i = 0; i < n; i++) fl[i] = row_flags(t, vids[i], es, purge_before);
+    for (uint32_t i = 0; i < n; i++) fl[i] = src_flags(t, &src[i], es, purge_before);
     uint64_t text_len[IMDB_MAX_COLS] = {0};
     for (uint32_t c = 0; c < s->ncols; c++) {
         if (s->cols[c].type != IMDB_T_TEXT) continue;
         for (uint32_t i = 0; i < n; i++) {
             if (!seg_keeps(fl[i], s, c)) continue;
             imdb_value v;
-            ver_get(t, vids[i], c, &v);
+            src_get(t, &src[i], c, &v);
             text_len[c] += v.len;
         }
         if (text_len[c] > UINT32_MAX) {
@@ -408,13 +460,12 @@ static int seg_build(const imdb_table *t, const uint64_t *vids, uint32_t n, cons
         imdb_le64(de + 16, d[k].len);
     }
     for (uint32_t i = 0; i < n; i++) {
-        const imdb_version *v = imdb_vh(t, vids[i]);
-        imdb_le64(b + off[0] + 8u * i, vids[i]);
-        imdb_le64(b + off[1] + 8u * i, v->begin);
+        const seg_src *si = &src[i];
+        imdb_le64(b + off[0] + 8u * i, si->vid);
+        imdb_le64(b + off[1] + 8u * i, src_begin(t, si));
         b[off[2] + i] = fl[i];
-        const imdb_version_cold *c = imdb_vc(t, vids[i]);
-        if (!fl[i]) memcpy(b + off[3] + 16u * i, c->salt, 16);
-        memcpy(b + off[4] + 32u * i, c->commit, 32);
+        if (!fl[i]) memcpy(b + off[3] + 16u * i, src_salt(t, si), 16);
+        memcpy(b + off[4] + 32u * i, src_commit(t, si), 32);
     }
     uint32_t k = 5;
     uint8_t *zm = b + off[nsec - 1];
@@ -429,7 +480,7 @@ static int seg_build(const imdb_table *t, const uint64_t *vids, uint32_t n, cons
                 imdb_le32(o + 4u * i, at);
                 if (!seg_keeps(fl[i], s, c)) continue;
                 imdb_value v;
-                ver_get(t, vids[i], c, &v);
+                src_get(t, &src[i], c, &v);
                 if (v.null) {
                     has_null |= !fl[i];
                     continue;
@@ -444,7 +495,7 @@ static int seg_build(const imdb_table *t, const uint64_t *vids, uint32_t n, cons
             for (uint32_t i = 0; i < n; i++) {
                 if (!seg_keeps(fl[i], s, c)) continue;
                 imdb_value v;
-                ver_get(t, vids[i], c, &v);
+                src_get(t, &src[i], c, &v);
                 if (v.null) {
                     has_null |= !fl[i];
                     continue;
@@ -473,7 +524,7 @@ static int seg_build(const imdb_table *t, const uint64_t *vids, uint32_t n, cons
         imdb_free(b);
         return rc;
     }
-    for (uint32_t i = 0; i < n; i++) g->end[i] = imdb_vh(t, vids[i])->end;
+    for (uint32_t i = 0; i < n; i++) g->end[i] = src_end(t, &src[i]);
     *out = g;
     return IMDB_OK;
 }
@@ -873,7 +924,7 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
     }
     p->nt = db->nt;
     int rc = IMDB_OK;
-    uint64_t *vids = NULL;
+    seg_src *srcs = NULL;
     for (uint32_t ti = 0; ti < db->nt && !rc; ti++) {
         imdb_table *t = db->t[ti];
         plan_tab *pt = &p->tab[ti];
@@ -884,21 +935,21 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
             imdb_segment *g = t->seg[k];
             if (kind == IMDB_OP_RETIRE) {
                 uint32_t keep = 0;
-                for (uint32_t i = 0; i < g->nrows; i++) keep += !retired_by(t, g->vid[i], purge_before);
+                for (uint32_t i = 0; i < g->nrows; i++) keep += !ended_by(g->end[i], purge_before);
                 if (keep == g->nrows) {
                     rc = pt_push(pt, g, false, e);
                     continue;
                 }
                 if (!keep) continue; /* every row dropped: the segment leaves the lake */
-                imdb_free(vids);
-                if (!(vids = imdb_alloc_array(keep, sizeof *vids, e))) {
+                imdb_free(srcs);
+                if (!(srcs = imdb_alloc_array(keep, sizeof *srcs, e))) {
                     rc = e->code;
                     break;
                 }
                 for (uint32_t i = 0, n = 0; i < g->nrows; i++)
-                    if (!retired_by(t, g->vid[i], purge_before)) vids[n++] = g->vid[i]; /* vid order kept */
+                    if (!ended_by(g->end[i], purge_before)) srcs[n++] = (seg_src){g, i, g->vid[i]}; /* vid order kept */
                 imdb_segment *ng;
-                if ((rc = seg_build(t, vids, keep, NULL, 0, &ng, e))) break;
+                if ((rc = seg_build(t, srcs, keep, NULL, 0, &ng, e))) break;
                 if ((rc = pt_push(pt, ng, true, e))) {
                     imdb_segment_free(ng);
                     break;
@@ -912,8 +963,14 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
                 rc = pt_push(pt, g, false, e);
                 continue;
             }
+            imdb_free(srcs);
+            if (!(srcs = imdb_alloc_array(g->nrows ? g->nrows : 1, sizeof *srcs, e))) {
+                rc = e->code;
+                break;
+            }
+            src_rows(g, srcs);
             imdb_segment *ng;
-            if ((rc = seg_build(t, g->vid, g->nrows, es, 0, &ng, e))) break;
+            if ((rc = seg_build(t, srcs, g->nrows, es, 0, &ng, e))) break;
             if ((rc = pt_push(pt, ng, true, e))) {
                 imdb_segment_free(ng);
                 break;
@@ -933,7 +990,7 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
         /* a version the boundary drops was begun at or before it, so the publish that ends there flushed it
          * (every publish flushes): never in a memtable */
         for (uint64_t vid = t->mem_first; kind == IMDB_OP_RETIRE && vid < t->nver && !rc; vid++)
-            if (retired_by(t, vid, purge_before))
+            if (ended_by(imdb_vh(t, vid)->end, purge_before))
                 rc = imdb_fail(e, IMDB_ERR_STATE, "RETIRE: version %llu of %s, which ends at or before the boundary, is not "
                                "in the lake", (unsigned long long)vid, t->s.name);
         if (rc) break;
@@ -944,15 +1001,15 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
                 rc = imdb_fail(e, IMDB_ERR_LIMIT, "memtable of %s exceeds one segment; checkpoint more often", t->s.name);
                 break;
             }
-            imdb_free(vids);
-            vids = imdb_alloc_array(cnt, sizeof *vids, e);
-            if (!vids) {
+            imdb_free(srcs);
+            srcs = imdb_alloc_array(cnt, sizeof *srcs, e);
+            if (!srcs) {
                 rc = e->code;
                 break;
             }
-            for (uint64_t i = 0; i < cnt; i++) vids[i] = t->mem_first + i;
+            for (uint64_t i = 0; i < cnt; i++) srcs[i] = (seg_src){NULL, 0, t->mem_first + i};
             imdb_segment *ng;
-            if ((rc = seg_build(t, vids, (uint32_t)cnt, es, 0, &ng, e))) break;
+            if ((rc = seg_build(t, srcs, (uint32_t)cnt, es, 0, &ng, e))) break;
             if ((rc = pt_push(pt, ng, true, e))) {
                 imdb_segment_free(ng);
                 break;
@@ -965,16 +1022,16 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
         if (kind == IMDB_OP_COMPACT && ti == ctable) {
             uint64_t total = 0;
             for (uint32_t k = 0; k < pt->nseg; k++) total += pt->seg[k]->nrows;
-            imdb_free(vids);
-            vids = imdb_alloc_array(total ? total : 1, sizeof *vids, e);
-            if (!vids) {
+            imdb_free(srcs);
+            srcs = imdb_alloc_array(total ? total : 1, sizeof *srcs, e);
+            if (!srcs) {
                 rc = e->code;
                 break;
             }
             uint64_t m = 0;
-            for (uint32_t k = 0; k < pt->nseg; k++) {
-                const imdb_segment *g = pt->seg[k];
-                for (uint32_t i = 0; i < g->nrows; i++) vids[m++] = g->vid[i]; /* disjoint, vid-ordered */
+            for (uint32_t k = 0; k < pt->nseg; k++) { /* disjoint, vid-ordered */
+                src_rows(pt->seg[k], srcs + m);
+                m += pt->seg[k]->nrows;
             }
             imdb_segment **merged = imdb_alloc_array(m / IMDB_MAX_SEGMENT_ROWS + 1, sizeof *merged, e);
             if (!merged) {
@@ -984,7 +1041,7 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
             uint32_t nm = 0;
             for (uint64_t at = 0; at < m && !rc; at += IMDB_MAX_SEGMENT_ROWS) {
                 uint64_t cnt = m - at < IMDB_MAX_SEGMENT_ROWS ? m - at : IMDB_MAX_SEGMENT_ROWS;
-                rc = seg_build(t, vids + at, (uint32_t)cnt, es, purge_before, &merged[nm], e);
+                rc = seg_build(t, srcs + at, (uint32_t)cnt, es, purge_before, &merged[nm], e);
                 if (!rc) nm++;
             }
             for (uint32_t k = 0; k < pt->nseg; k++)
@@ -1011,7 +1068,7 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
             if ((rc = imdb_buf_check(&pt->dv[k], e))) break;
         }
     }
-    imdb_free(vids);
+    imdb_free(srcs);
     if (rc) {
         plan_free(p);
         return rc;
@@ -1077,6 +1134,37 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
 
 /* ---- install / persist ------------------------------------------------------- */
 
+/* a table's segments hold rows, their vid ranges ascending and disjoint (each segment's own ascend: parse) */
+static bool segs_in_order(const imdb_table *t)
+{
+    for (uint32_t k = 0; k < t->nseg; k++)
+        if (!t->seg[k]->nrows || (k && t->seg[k - 1]->vid[t->seg[k - 1]->nrows - 1] >= t->seg[k]->vid[0])) return false;
+    return true;
+}
+
+bool imdb_lake_find(const imdb_table *t, uint64_t vid, uint32_t *seg, uint32_t *row)
+{
+    uint32_t lo = 0, hi = t->nseg;
+    while (lo < hi) { /* the first segment whose last vid is at or past vid */
+        uint32_t mid = lo + (hi - lo) / 2;
+        const imdb_segment *g = t->seg[mid];
+        if (g->vid[g->nrows - 1] < vid) lo = mid + 1;
+        else hi = mid;
+    }
+    if (lo == t->nseg) return false;
+    const imdb_segment *g = t->seg[lo];
+    uint32_t a = 0, b = g->nrows;
+    while (a < b) {
+        uint32_t mid = a + (b - a) / 2;
+        if (g->vid[mid] < vid) a = mid + 1;
+        else b = mid;
+    }
+    if (a == g->nrows || g->vid[a] != vid) return false;
+    *seg = lo;
+    *row = a;
+    return true;
+}
+
 /* Swaps the planned segments in; afterwards the table owns them. */
 static int plan_install(imdb_db *db, imdb_lake_plan *p, imdb_err *e)
 {
@@ -1088,7 +1176,9 @@ static int plan_install(imdb_db *db, imdb_lake_plan *p, imdb_err *e)
         for (uint32_t k = 0; pt->compacted && k < pt->nseg; k++) {
             const imdb_segment *g = pt->seg[k];
             for (uint32_t i = 0; i < g->nrows; i++) {
-                if (!(g->flags[i] & IMDB_SEG_PURGED) || (imdb_vh(t, g->vid[i])->flags & (IMDB_V_PURGED | IMDB_V_STUB))) continue;
+                if (!(g->flags[i] & IMDB_SEG_PURGED) || !imdb_v_held(t, g->vid[i]) ||
+                    (imdb_vh(t, g->vid[i])->flags & (IMDB_V_PURGED | IMDB_V_STUB)))
+                    continue;
                 imdb_value key;
                 if (imdb_version_key(t, g->vid[i], t->s.pk, &key) == IMDB_OK) imdb_pk_unlink(t, g->vid[i], &key);
             }
@@ -1113,18 +1203,23 @@ static int plan_install(imdb_db *db, imdb_lake_plan *p, imdb_err *e)
             if (pt->dv[k].len) imdb_sha256(pt->dv[k].p, pt->dv[k].len, t->seg[k]->dv_hash);
             else memset(t->seg[k]->dv_hash, 0, 32);
         }
+        if (!segs_in_order(t)) { /* every plan keeps them so; imdb_lake_find relies on it */
+            db->failed = true;
+            return imdb_fail(e, IMDB_ERR_STATE, "lake: the segments of %s are not in vid order", t->s.name);
+        }
         if (pt->flushed) {
             imdb_buf_wipe_free(&t->arena);
             imdb_buf_init(&t->arena);
-            t->mem_first = t->nver;
+            imdb_ver_flushed(t); /* the cold parts are the new segment's rows now */
         }
         bool newly = false; /* versions this install made tombstones */
         /* map every version to its (possibly new) location */
-        for (uint64_t vid = imdb_v_skip(t, 0); vid < t->nver; vid = imdb_v_skip(t, vid + 1))
+        for (uint64_t vid = imdb_v_next(t, 0); vid < t->nver; vid = imdb_v_next(t, vid + 1))
             imdb_vh(t, vid)->flags &= (uint8_t)~IMDB_V_SEG;
         for (uint32_t k = 0; k < t->nseg; k++) {
             imdb_segment *g = t->seg[k];
             for (uint32_t i = 0; i < g->nrows; i++) {
+                if (!imdb_v_held(t, g->vid[i])) continue; /* the lake's alone */
                 imdb_version *v = imdb_vh(t, g->vid[i]);
                 v->flags |= IMDB_V_SEG;
                 v->seg = k;
@@ -1133,7 +1228,6 @@ static int plan_install(imdb_db *db, imdb_lake_plan *p, imdb_err *e)
                     /* purged now: its tombstone keeps vid, begin, commitment, subject */
                     newly = true;
                     v->flags |= IMDB_V_PURGED;
-                    imdb_wipe(imdb_vc(t, g->vid[i])->salt, sizeof imdb_vc(t, g->vid[i])->salt);
                     v->row_len = 0;
                 }
             }
@@ -1566,6 +1660,7 @@ static int physical_commit(imdb_db *db, uint8_t kind, uint32_t table, uint64_t p
                  "lake state of commit %llu committed but not yet published: a log redaction is pending "
                  "(LAKE_HEAD moves once it completes)", (unsigned long long)db->lake_seq);
     plan_free(p);
+    imdb_evict_policy(db); /* between transactions: what this publish lets go may leave memory */
     return rc;
 }
 
@@ -1661,6 +1756,7 @@ int imdb_lake_after_erase(imdb_db *db, imdb_err *e)
     rotate_prev(db, prev, prevlen, true);
     if (!rc) rc = lake_persist(db, NULL, 0, e);
     plan_free(p);
+    imdb_evict_policy(db); /* after the ERASE's commit: no transaction is open */
     return rc;
 }
 
@@ -1951,7 +2047,8 @@ static int load_table(imdb_db *db, int ofd, const imdb_manifest_tab *mt, uint32_
             return e->code;
         }
         t->seg[t->nseg++] = g;
-        if (g->nrows != mt->seg[k].nrows) return imdb_fail(e, IMDB_ERR_CORRUPT, "snapshot: segment row count");
+        if (g->nrows != mt->seg[k].nrows || !g->nrows) /* a segment is never empty (segs_in_order) */
+            return imdb_fail(e, IMDB_ERR_CORRUPT, "snapshot: segment row count");
         if (!all_zero(mt->seg[k].dv, 32)) {
             uint8_t *dvb, sh[32];
             size_t dl;
@@ -1972,46 +2069,74 @@ static int load_table(imdb_db *db, int ofd, const imdb_manifest_tab *mt, uint32_
         }
     }
     /* The rows are authenticated (each segment by its name, the manifest by the log's hash of it): every version
-     * they hold, once. A database never retired holds every vid below the count, so the count is the rows' (and,
-     * none twice, every vid is seen); past a boundary the others are those a RETIRE dropped. The store gets a
-     * chunk only where a row lands (and the last, where vids are appended), each vid in it retired until a row
-     * names it: what was read bounds what is allocated, the count only the chunk directory (limits.h). */
+     * they hold, once, in vid order: each segment's vids ascend (imdb_segment_parse) and each segment's first is past
+     * the last of the one before it, checked here, which also proves no version twice. A database never retired holds
+     * every vid below the count, so the count is the rows'; past a boundary the others are those a RETIRE dropped.
+     * The store gets a chunk only where a row lands (and the last, where vids are appended), dense or, past a
+     * boundary, sparse: what was read bounds what is allocated, the count only the chunk directory (limits.h). */
     uint64_t held = 0;
     for (uint32_t k = 0; k < t->nseg; k++) held += t->seg[k]->nrows;
     if (mt->versions < held || (!boundary && mt->versions != held) || mt->versions > IMDB_MAX_VERSIONS)
         return imdb_fail(e, IMDB_ERR_CORRUPT, "snapshot: the version count does not fit the segments' rows");
-    if (imdb_ver_reserve_sparse(t, mt->versions, e)) return e->code;
-    t->nretired = mt->versions - held; /* the vids no row names (none unless past a boundary) */
-    t->nver = mt->versions;
+    if (imdb_ver_load_begin(t, mt->versions, e)) return e->code;
     int rc = IMDB_OK;
-    uint64_t live = 0;
-    for (uint32_t k = 0; k < t->nseg && !rc; k++) {
-        const imdb_segment *g = t->seg[k];
-        for (uint32_t i = 0; i < g->nrows && !rc; i++) {
-            uint64_t vid = g->vid[i];
-            if (vid >= t->nver || g->begin[i] > seq || (g->end[i] != IMDB_LIVE && g->end[i] <= boundary)) {
+    uint64_t live = 0, last = 0;
+    bool any = false;
+    uint32_t sk = 0, si = 0; /* the next row: segment sk, row si */
+    uint64_t floor = db->mem_floor; /* a row ended at or before it stays the lake's alone (stage 3b) */
+    for (uint32_t k = 0; k < t->nchunk && !rc; k++) {
+        uint64_t rows = 0, cnt = 0; /* chunk k's rows, the run from the cursor, and those the store takes */
+        for (uint32_t ck = sk, ci = si; ck < t->nseg;) {
+            const imdb_segment *g = t->seg[ck];
+            if (ci >= g->nrows) {
+                ck++;
+                ci = 0;
+            } else if (g->vid[ci] >> IMDB_VCHUNK_BITS == k) {
+                rows++;
+                cnt += !ended_by(g->end[ci], floor);
+                ci++;
+            } else {
+                break;
+            }
+        }
+        if (!rows && k + 1 < t->nchunk) continue;
+        if ((cnt || k + 1 == t->nchunk) && (rc = imdb_ver_load_chunk(t, k, cnt, e))) break;
+        for (uint64_t j = 0, i = 0; j < rows && !rc;) {
+            const imdb_segment *g = t->seg[sk];
+            if (si >= g->nrows) {
+                sk++;
+                si = 0;
+                continue;
+            }
+            uint64_t vid = g->vid[si];
+            if (vid >= t->nver || (any && vid <= last) || g->begin[si] > seq ||
+                (g->end[si] != IMDB_LIVE && g->end[si] <= boundary)) {
                 rc = imdb_fail(e, IMDB_ERR_CORRUPT, "snapshot: segments do not hold each version once, past the boundary");
                 break;
             }
-            if ((rc = imdb_ver_chunk_need(t, (uint32_t)(vid >> IMDB_VCHUNK_BITS), e))) break;
-            if (!(imdb_vh(t, vid)->flags & IMDB_V_RETIRED)) {
-                rc = imdb_fail(e, IMDB_ERR_CORRUPT, "snapshot: segments do not hold each version once, past the boundary");
-                break;
+            live += g->end[si] == IMDB_LIVE;
+            last = vid;
+            any = true;
+            if (!ended_by(g->end[si], floor)) {
+                imdb_version *v = imdb_ver_load_put(t, vid, (uint32_t)i++); /* its salt and commitment stay its row's */
+                v->begin = g->begin[si];
+                v->end = g->end[si];
+                v->pk_prev = IMDB_NONE;
+                v->seg = sk;
+                v->seg_row = si;
+                v->flags = IMDB_V_SEG | ((g->flags[si] & IMDB_SEG_STUB) ? IMDB_V_STUB : 0) |
+                           ((g->flags[si] & IMDB_SEG_PURGED) ? IMDB_V_PURGED : 0);
             }
-            imdb_version *v = imdb_vh(t, vid);
-            imdb_version_cold *c = imdb_vc(t, vid);
-            v->begin = g->begin[i];
-            v->end = g->end[i];
-            v->pk_prev = IMDB_NONE;
-            v->seg = k;
-            v->seg_row = i;
-            v->flags = IMDB_V_SEG | ((g->flags[i] & IMDB_SEG_STUB) ? IMDB_V_STUB : 0) |
-                       ((g->flags[i] & IMDB_SEG_PURGED) ? IMDB_V_PURGED : 0);
-            if (!g->flags[i]) memcpy(c->salt, g->salt + 16u * i, 16);
-            memcpy(c->commit, g->commit + 32u * i, 32);
-            live += v->end == IMDB_LIVE;
+            si++;
+            j++;
         }
     }
+    while (!rc && sk < t->nseg && si >= t->seg[sk]->nrows) {
+        sk++;
+        si = 0;
+    }
+    if (!rc && sk < t->nseg) /* a row in no chunk: past the count, or out of order */
+        rc = imdb_fail(e, IMDB_ERR_CORRUPT, "snapshot: segments do not hold each version once, past the boundary");
     if (rc) return rc;
     if (live != mt->live) return imdb_fail(e, IMDB_ERR_CORRUPT, "snapshot: live count differs from the manifest");
     t->live = live;
@@ -2066,6 +2191,7 @@ int imdb_lake_load_snapshot(imdb_db *db, uint64_t *seq, bool *moved, imdb_err *e
     if (!rc && (memcmp(m.prev, c.prev, 32) != 0 || memcmp(m.state, c.digest, 32) != 0))
         rc = imdb_fail(e, IMDB_ERR_STATE, "snapshot: manifest disagrees with commit %llu", (unsigned long long)S);
     if (!rc && !all_zero(m.prev_manifest, 32)) rc = read_obj(ofd, m.prev_manifest, ".man", &pb, &pl, e);
+    db->mem_floor = imdb_window_floor(db, S); /* stage 3b: the store takes no row ended at or before it */
     for (uint32_t ti = 0; !rc && ti < m.nt; ti++) rc = load_table(db, ofd, &m.t[ti], ti, S, m.boundary, e);
     if (!rc) {
         imdb_lthash sum;

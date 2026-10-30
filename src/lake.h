@@ -73,7 +73,7 @@ typedef struct imdb_segment {
     const uint8_t *commit;   /* 32 bytes per row */
     imdb_segcol col[IMDB_MAX_COLS];
     uint64_t *end;           /* mutable: end seq per row (IMDB_LIVE) */
-    uint64_t *stubmask;      /* bit i set iff row i is an erased stub (immutable) */
+    uint64_t *stubmask;      /* bit i set iff row i is flagged, a stub or a tombstone: no values (immutable) */
     uint8_t dv_hash[32];     /* deletion vector at the last manifest (zero if none) */
 } imdb_segment;
 
@@ -84,6 +84,8 @@ int imdb_segment_parse(const imdb_schema *s, uint8_t *bytes, size_t len, imdb_se
 void imdb_segment_free(imdb_segment *g);
 /* Recomputes every non-stub row's commitment from the columns. */
 int imdb_segment_check_commitments(const imdb_schema *s, const imdb_segment *g, imdb_err *e);
+/* Column c of row `row` (non-stub; a TEXT value points into the segment). */
+void imdb_seg_get(const imdb_schema *s, const imdb_segment *g, uint32_t row, uint32_t c, imdb_value *v);
 /* Canonical row bytes of one segment row (non-stub). */
 int imdb_segment_row(const imdb_schema *s, const imdb_segment *g, uint32_t row, imdb_buf *out, imdb_err *e);
 
