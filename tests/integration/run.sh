@@ -104,6 +104,20 @@ expect "no memory window: " "$out"
 expect_cell 15 "$("$BIN" sql "$P" --nosync --cross-check --mem-window 1 -c "SELECT COUNT(*) FROM txns AS OF $before WHERE user_id = 42;")"
 echo "--mem-window 30 and none taken, 0 and 12x refused; AS OF $before still 15 under a one-second window"
 
+step "the segment cache (stage 3c-1): --seg-cache takes bytes or all; with no image kept between statements each is read again"
+out=$("$BIN" sql "$P" --nosync --seg-cache 1M -c "SHOW MEMORY;")
+expect "; segment images " "$out"
+expect ", budget 1048576; " "$out"
+out=$("$BIN" sql "$P" --nosync --seg-cache all -c "SHOW MEMORY;")
+expect " bytes, every one kept; 0 loaded since the open" "$out"
+"$BIN" sql "$P" --nosync --seg-cache 0 -c "SHOW MEMORY;" >/dev/null 2>&1 && fail "--seg-cache 0 accepted"
+"$BIN" sql "$P" --nosync --seg-cache 12x -c "SHOW MEMORY;" >/dev/null 2>&1 && fail "--seg-cache 12x accepted"
+expect_cell 15 "$(IMDB_SEGCACHE=tiny "$BIN" sql "$P" --nosync --cross-check -c "SELECT COUNT(*) FROM txns AS OF $before WHERE user_id = 42;")"
+out=$(IMDB_SEGCACHE=tiny "$BIN" sql "$P" --nosync -c "SELECT SUM(amount) FROM txns; SHOW MEMORY;")
+echo "$out" | grep -q "segment images 0 bytes, budget 0; [1-9][0-9]* loaded since the open" || fail "tiny: no image read again:
+$out"
+echo "--seg-cache 1M and all taken, 0 and 12x refused; tiny: AS OF $before still 15, every image read again and dropped"
+
 step "past the checkpoint: the auditor reads the lake plus the log tail, and prints the engine's view token"
 sql "INSERT INTO txns VALUES (900, 7, 1.00, 'tail', '2026-10-16 09:00:00');" >/dev/null
 ship

@@ -37,6 +37,9 @@ uint64_t *imdb_hmap_get(const imdb_hmap *m, const imdb_value *k);
 int imdb_hmap_put(imdb_hmap *m, const imdb_value *k, uint64_t val, imdb_err *e);
 /* Removes the key and wipes its stored copy; true if it existed. */
 bool imdb_hmap_del(imdb_hmap *m, const imdb_value *k);
+/* Removes every entry whose value keep() refuses (each key copy wiped), without reading a key: the stage 3b eviction
+ * prunes by vid. The walk's order makes no bytes: the map's layout is never read for output (D1). Returns how many. */
+size_t imdb_hmap_prune(imdb_hmap *m, bool (*keep)(void *ctx, uint64_t val), void *ctx);
 uint64_t imdb_hash_seed(void);
 
 #endif

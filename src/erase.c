@@ -31,14 +31,24 @@ int imdb_erase_versions(imdb_db *db, imdb_erase_ent *ents, uint32_t n, imdb_eras
     for (uint32_t i = 0; i < n; i++) {
         imdb_table *t = imdb_table_by_id(db, ents[i].table);
         imdb_vloc at;
-        int where = t ? imdb_v_find(t, ents[i].vid, &at) : IMDB_VAT_NONE;
+        int where = t ? imdb_v_find(t, ents[i].vid, &at, e) : IMDB_VAT_NONE;
+        const imdb_segimg *gi = where == IMDB_VAT_LAKE ? imdb_seg_pin(t, at.g, e) : NULL;
+        if (where < 0 || (where == IMDB_VAT_LAKE && !gi)) {
+            imdb_free(ents);
+            return e->code;
+        }
         bool stub = where == IMDB_VAT_HELD ? (at.v->flags & IMDB_V_STUB) != 0
-                                           : where == IMDB_VAT_LAKE && (at.g->flags[at.row] & IMDB_SEG_STUB);
+                                           : where == IMDB_VAT_LAKE && (gi->flags[at.row] & IMDB_SEG_STUB);
         if (where == IMDB_VAT_NONE || (i && cmp_ent(&ents[i - 1], &ents[i]) == 0) || stub) {
             imdb_free(ents);
             return imdb_fail(e, IMDB_ERR_INVALID, "ERASE: invalid or duplicate version");
         }
-        memcpy(ents[i].commit, imdb_v_commit(t, ents[i].vid), 32);
+        const uint8_t *cm;
+        if (imdb_v_commit(t, ents[i].vid, &cm, e)) {
+            imdb_free(ents);
+            return e->code;
+        }
+        memcpy(ents[i].commit, cm, 32);
         if (ents[i].table != last_table) {
             rep->tables++;
             last_table = ents[i].table;
@@ -124,8 +134,14 @@ static int subject_versions(imdb_table *t, const imdb_value *subject, imdb_erase
     size_t capw = 0, n0 = *n;
     int rc = IMDB_OK;
     for (uint32_t k = 0; k < t->nseg && !rc; k++) {
-        const imdb_segment *g = t->seg[k];
-        const imdb_segcol *c = &g->col[t->s.subject];
+        imdb_segment *g = t->seg[k];
+        /* every segment: its zone map leaves out the flagged rows, and a purged one keeps its subject */
+        const imdb_segimg *gi = imdb_seg_pin(t, g, e);
+        if (!gi) {
+            rc = e->code;
+            break;
+        }
+        const imdb_segcol *c = &gi->col[t->s.subject];
         size_t words = ((size_t)g->nrows + 63) / 64;
         if (c->i64) { /* the column's int64s: one range filter */
             if (words > capw) {
@@ -137,15 +153,15 @@ static int subject_versions(imdb_table *t, const imdb_value *subject, imdb_erase
             for (size_t w = 0; w < words && !rc; w++)
                 for (uint64_t m = bits[w]; m && !rc; m &= m - 1) { /* not the stub mask: it covers tombstones too */
                     uint64_t r = w * 64 + (uint64_t)__builtin_ctzll(m);
-                    if (!(g->flags[r] & IMDB_SEG_STUB)) rc = ent_push(ents, n, cap, t->s.id, g->vid[r], e);
+                    if (!(gi->flags[r] & IMDB_SEG_STUB)) rc = ent_push(ents, n, cap, t->s.id, gi->vid[r], e);
                 }
             continue;
         }
         for (uint32_t r = 0; r < g->nrows && !rc; r++) {
-            if (g->flags[r] & IMDB_SEG_STUB) continue;
+            if (gi->flags[r] & IMDB_SEG_STUB) continue;
             imdb_value v;
-            imdb_seg_get(&t->s, g, r, (uint32_t)t->s.subject, &v);
-            if (imdb_value_cmp(&v, subject) == 0) rc = ent_push(ents, n, cap, t->s.id, g->vid[r], e);
+            imdb_seg_get(&t->s, gi, r, (uint32_t)t->s.subject, &v);
+            if (imdb_value_cmp(&v, subject) == 0) rc = ent_push(ents, n, cap, t->s.id, gi->vid[r], e);
         }
     }
     imdb_free(bits);
@@ -162,7 +178,7 @@ static int subject_versions(imdb_table *t, const imdb_value *subject, imdb_erase
     return rc;
 }
 
-int imdb_erase_subject(imdb_db *db, const imdb_value *subject, imdb_erase_report *rep, imdb_err *e)
+static int erase_subject_body(imdb_db *db, const imdb_value *subject, imdb_erase_report *rep, imdb_err *e)
 {
     memset(rep, 0, sizeof *rep);
     if (subject->null) return imdb_fail(e, IMDB_ERR_INVALID, "ERASE SUBJECT needs a value, not NULL");
@@ -175,4 +191,13 @@ int imdb_erase_subject(imdb_db *db, const imdb_value *subject, imdb_erase_report
         }
     }
     return imdb_erase_versions(db, ents, (uint32_t)n, rep, e);
+}
+
+/* one operation (stage 3c-1): the segment cache trims when the outermost ends */
+int imdb_erase_subject(imdb_db *db, const imdb_value *subject, imdb_erase_report *rep, imdb_err *e)
+{
+    imdb_op_enter(db);
+    int rc = erase_subject_body(db, subject, rep, e);
+    imdb_op_leave(db);
+    return rc;
 }

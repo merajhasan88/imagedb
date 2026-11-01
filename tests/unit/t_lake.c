@@ -144,10 +144,12 @@ static void t_compact_purge_horizon(void)
      * subject only, so ERASE SUBJECT still finds them (their payloads stay in the log) */
     CHECK(t->seg[0]->nrows == 45);
     uint32_t tomb = 0;
+    imdb_segimg *g0 = imdb_seg_pin(t, t->seg[0], E);
+    CHECK(g0);
     for (uint32_t i = 0; i < t->seg[0]->nrows; i++) {
-        if (t->seg[0]->flags[i] != IMDB_SEG_PURGED) continue;
+        if (g0->flags[i] != IMDB_SEG_PURGED) continue;
         tomb++;
-        const imdb_segment *g = t->seg[0];
+        const imdb_segimg *g = g0;
         CHECK(g->col[1].i64[i] == 1 && g->col[0].i64[i] == 0 && g->col[2].i64[i] == 0 && g->col[3].off[i] == g->col[3].off[i + 1]);
         CHECK(g->end[i] != IMDB_LIVE && g->end[i] <= s_after);
     }
@@ -375,34 +377,37 @@ static void t_segment_decoder_strict(void)
     for (int i = 1; i <= 6; i++) OK(ins1(db, i, i, i, i % 2 ? "a\xc3\xa9" : ""));
     OK(imdb_checkpoint(db, E));
     imdb_table *t = imdb_table_by_name(db, "txns");
-    const imdb_segment *g = t->seg[0];
-    size_t n = g->len;
+    imdb_segment *g = t->seg[0];
+    const imdb_segimg *gimg = imdb_seg_pin(t, g, E);
+    CHECK(gimg);
+    size_t n = gimg->len;
     int accepted_mut = 0;
     for (size_t cut = 0; cut < n; cut++) {
         uint8_t *b = imdb_alloc_aligned(1, cut ? cut : 1, E);
-        memcpy(b, g->bytes, cut);
+        memcpy(b, gimg->bytes, cut);
         imdb_segment *x;
         imdb_err e2 = {0};
-        CHECK(imdb_segment_parse(&t->s, b, cut, &x, &e2) != 0);
+        CHECK(imdb_segment_parse(&t->s, b, cut, NULL, &x, &e2) != 0);
         imdb_free(b);
     }
     for (size_t at = 0; at < n; at++) {
         uint8_t *b = imdb_alloc_aligned(1, n, E);
-        memcpy(b, g->bytes, n);
+        memcpy(b, gimg->bytes, n);
         b[at] ^= 0x01;
         imdb_segment *x;
         imdb_err e2 = {0};
-        if (imdb_segment_parse(&t->s, b, n, &x, &e2) == 0) {
+        if (imdb_segment_parse(&t->s, b, n, NULL, &x, &e2) == 0) {
             /* A structurally valid mutation always changes the content hash.
              * If it also survives the commitment check it can only be in the
              * VID or BEGIN columns, which VERIFY compares with the version store. */
             uint8_t h[32];
-            imdb_sha256(x->bytes, x->len, h);
+            imdb_segimg *xi = imdb_seg_pin(NULL, x, E); /* a parse of its own: apart, resident */
+            imdb_sha256(xi->bytes, xi->len, h);
             CHECK(memcmp(h, g->hash, 32) != 0);
             imdb_err e3 = {0};
-            if (imdb_segment_check_commitments(&t->s, x, &e3) == 0) {
-                uint64_t vid_off = imdb_get_le64(g->bytes + IMDB_SEG_HEADER + 8);
-                uint64_t beg_off = imdb_get_le64(g->bytes + IMDB_SEG_HEADER + 24 + 8);
+            if (imdb_segment_check_commitments(&t->s, x, xi, &e3) == 0) {
+                uint64_t vid_off = imdb_get_le64(gimg->bytes + IMDB_SEG_HEADER + 8);
+                uint64_t beg_off = imdb_get_le64(gimg->bytes + IMDB_SEG_HEADER + 24 + 8);
                 bool in_sys = (at >= vid_off && at < vid_off + 8u * g->nrows) ||
                               (at >= beg_off && at < beg_off + 8u * g->nrows);
                 CHECK(in_sys);
@@ -610,7 +615,9 @@ static bool vget(const imdb_table *t, uint64_t vid, vfields *f)
 {
     memset(f, 0, sizeof *f);
     imdb_vloc at;
-    int where = imdb_v_find(t, vid, &at);
+    imdb_err e = {0};
+    int where = imdb_v_find(t, vid, &at, &e);
+    if (where < 0) return false;
     if (where == IMDB_VAT_NONE) return false;
     if (where == IMDB_VAT_HELD) {
         f->begin = at.v->begin;
@@ -619,13 +626,17 @@ static bool vget(const imdb_table *t, uint64_t vid, vfields *f)
         f->purged = (at.v->flags & IMDB_V_PURGED) != 0;
         f->pending = (at.v->flags & IMDB_V_PENDING_AUTH) != 0;
     } else {
-        f->begin = at.g->begin[at.row];
-        f->end = at.g->end[at.row];
-        f->stub = (at.g->flags[at.row] & IMDB_SEG_STUB) != 0;
-        f->purged = (at.g->flags[at.row] & IMDB_SEG_PURGED) != 0;
+        const imdb_segimg *gi = imdb_seg_pin(t, at.g, &e);
+        if (!gi) return false;
+        f->begin = gi->begin[at.row];
+        f->end = gi->end[at.row];
+        f->stub = (gi->flags[at.row] & IMDB_SEG_STUB) != 0;
+        f->purged = (gi->flags[at.row] & IMDB_SEG_PURGED) != 0;
     }
-    memcpy(f->commit, imdb_v_commit(t, vid), 32);
-    memcpy(f->salt, imdb_v_salt(t, vid), 16);
+    const uint8_t *cm, *sl;
+    if (imdb_v_commit(t, vid, &cm, &e) || imdb_v_salt(t, vid, &sl, &e) || !cm || !sl) return false;
+    memcpy(f->commit, cm, 32);
+    memcpy(f->salt, sl, 16);
     return true;
 }
 

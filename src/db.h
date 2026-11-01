@@ -13,6 +13,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <pthread.h>
 
 #include "codec.h"
 #include "hashmap.h"
@@ -98,6 +99,22 @@ typedef struct imdb_index {
     struct imdb_uidx *ux; /* a unique index's key chains (db.c): engine tables only, else NULL */
 } imdb_index;
 
+/* The lake's segment images in memory (stage 3c-1): one cache for the database, each table pointing at it. An image
+ * loads when an operation pins it (imdb_seg_pin, lake.h) and the least recently pinned are dropped when the outermost
+ * operation ends, past the budget (imdb_op_leave), so the lake's memory follows the budget, not the retention.
+ * Nothing is in use then: a pointer into an image lives until its operation ends. */
+typedef struct imdb_segcache {
+    uint64_t budget;          /* bytes of images kept between operations (imdb_open_opts.seg_cache_bytes;
+                                 IMDB_SEGCACHE=tiny: 0, every image dropped as every operation ends) */
+    uint64_t resident;        /* the images' bytes now: charged as an image becomes a table's or loads, credited
+                                 as it leaves (lake.c: seg_img_bytes) */
+    uint64_t loads, load_bytes; /* images loaded since the open and the object bytes read for them (SHOW MEMORY) */
+    uint64_t clock;           /* outermost operations begun: a pin stamps its segment with it, a trim drops the oldest first */
+    uint32_t depth;           /* operations open: a trim only when the outermost ends */
+    struct imdb_db *db;       /* the database it belongs to: a load opens its objects/ */
+    pthread_mutex_t lock;     /* loads by imdb_par_for's workers, and the counters they move */
+} imdb_segcache;
+
 typedef struct imdb_table {
     imdb_schema s;
     imdb_vchunk **ch;         /* the version store: chunk k holds vids from k << IMDB_VCHUNK_BITS (NULL: it holds none) */
@@ -117,6 +134,7 @@ typedef struct imdb_table {
     uint64_t live;
     /* lake (segments) */
     struct imdb_segment **seg;
+    imdb_segcache *segcache;  /* the database's (stage 3c-1): where its segments' images are loaded and kept */
     uint32_t nseg, capseg;
     uint64_t horizon;         /* AS OF below this seq is unavailable (purged) */
     uint64_t retention_us;    /* op 16: how long a version stays answerable after it ends; IMDB_RETAIN_FOREVER */
@@ -180,18 +198,19 @@ static inline imdb_version_cold *imdb_vc(const imdb_table *t, uint64_t vid)
  * segment); IMDB_VAT_LAKE, a segment of the lake holds it (at->g, at->row) and the store does not; IMDB_VAT_NONE,
  * neither: past the count, or RETIRE dropped it. The one check for a vid from the log or an API (replay's ops,
  * ERASE's entries, a transaction's writes and locks), so that what it decides never depends on what the store
- * holds, only where the answer is read. */
+ * holds, only where the answer is read. Negative (e set): the lake's image of the segment holding it could not be had
+ * (stage 3c-1: a read error, a corrupt object, memory). A caller reading at->g's row pins it first (imdb_seg_pin). */
 enum { IMDB_VAT_NONE = 0, IMDB_VAT_HELD = 1, IMDB_VAT_LAKE = 2 };
 typedef struct imdb_vloc {
     imdb_version *v;
     struct imdb_segment *g;
     uint32_t row;
 } imdb_vloc;
-int imdb_v_find(const imdb_table *t, uint64_t vid, imdb_vloc *at);
+int imdb_v_find(const imdb_table *t, uint64_t vid, imdb_vloc *at, imdb_err *e);
 /* A version's commitment and salt, wherever they are: the memtable's cold part, or its segment row's
- * (NULL: IMDB_VAT_NONE; a flagged row's salt is zeros) */
-const uint8_t *imdb_v_commit(const imdb_table *t, uint64_t vid);
-const uint8_t *imdb_v_salt(const imdb_table *t, uint64_t vid);
+ * (*out NULL: IMDB_VAT_NONE; a flagged row's salt is zeros); negative as imdb_v_find */
+int imdb_v_commit(const imdb_table *t, uint64_t vid, const uint8_t **out, imdb_err *e);
+int imdb_v_salt(const imdb_table *t, uint64_t vid, const uint8_t **out, imdb_err *e);
 uint64_t imdb_v_next_slow(const imdb_table *t, uint64_t vid);
 /* The first held vid at or after vid (t->nver: none). A walk passes a freed chunk at once and a sparse one by its
  * entries, so walking a store whose old chunks are retired costs what it holds, not every vid it ever had (14
@@ -288,6 +307,7 @@ typedef struct imdb_db {
                                  so a read below it goes to the lake (sql_exec.c); it only rises, and is never logged */
     uint64_t ended_pass;      /* versions ended since the last eviction pass: its trigger */
     bool evict_eager;         /* every publish evicts to its own commit (IMDB_EVICT=eager: the matrix's third unit pass) */
+    imdb_segcache segcache;   /* stage 3c-1: the lake's segment images in memory, under a budget */
     uint64_t checkpoint_bytes; /* primary: auto-CHECKPOINT past this segment size (0 = off) */
     bool lake_sync;           /* primary: CHECKPOINT after every commit that changed data (imdb_open_opts) */
     bool strict;              /* durable_ack with sync: every DURABLE record fsynced before its commit returns */
@@ -361,6 +381,8 @@ typedef struct imdb_open_opts {
     uint64_t mem_limit;       /* bytes the database may hold in memory (0: no budget); see imdb_mem */
     uint64_t mem_window_us;   /* stage 3b: a version ended within this stays in memory, an older one in the lake alone
                                  (each copy its own, never logged: 0, IMDB_MEM_WINDOW_US; UINT64_MAX, none leaves) */
+    uint64_t seg_cache_bytes; /* stage 3c-1: the lake's segment images kept in memory between operations (0:
+                                 IMDB_SEG_CACHE_BYTES; UINT64_MAX: every image kept) */
     /* per-transaction limits, at most the limits.h maxima (0: the maximum); a statement that
      * would exceed one fails with IMDB_ERR_LIMIT and the transaction stays usable */
     uint64_t txn_bytes;       /* row bytes written (IMDB_MAX_TXN_BYTES) */
@@ -420,6 +442,9 @@ void imdb_index_remove(imdb_table *t, uint32_t pos);
 int imdb_index_build_all(imdb_db *db, imdb_err *e);
 void imdb_index_catch_up(imdb_db *db);
 void imdb_index_rebuild_table(imdb_db *db, imdb_table *t);
+/* After RETIRE dropped versions: the unique maps and the ordered structures keep what stays, by vid, reading no key
+ * (what imdb_index_rebuild_table makes from the keys; a failure fails the handle, as the rebuild's does) */
+void imdb_index_after_retire(imdb_db *db, imdb_table *t);
 /* the value as one word of the structure's unsigned key (a TEXT's 8-byte prefix); false: NULL */
 bool imdb_index_key_of(const imdb_value *v, uint64_t *key);
 /* version vid's key in index ix, one word per column, a later column's NULL as 0; false: the first
@@ -565,13 +590,19 @@ static inline bool imdb_visible_at(const imdb_version *v, uint64_t snap, uint64_
 }
 /* Snapshot for reads issued by this session (sees its own pending writes). */
 uint64_t imdb_read_snapshot(const imdb_db *db);
-/* Values of a version (TEXT pointers stay valid until the next write). */
+/* Values of a version. A TEXT value points into the memtable or a segment's image: it stays valid until the next
+ * statement, write or commit (any operation, stage 3c-1: the outermost one's end may drop the image; a write may move
+ * the memtable). Copy what is kept longer, as a query's result does. A read itself drops nothing. */
 int imdb_version_values(imdb_db *db, imdb_table *t, uint64_t vid, imdb_value *vals, imdb_err *e);
 /* A held version's values, by its entry (imdb_vh): a walk over the held (imdb_v_next) has it already */
 int imdb_version_values_v(imdb_table *t, const imdb_version *v, imdb_value *vals, imdb_err *e);
-/* Version of key visible at snap, or IMDB_NONE. */
+/* Version of key visible at snap, or IMDB_NONE (and IMDB_NONE when the lake's image could not be had below the memory
+ * floor: the handle then stops, db->failed; this is the API's convenience, the engine's paths take imdb_lookup_pk_at). */
 uint64_t imdb_lookup_pk(imdb_db *db, imdb_table *t, const imdb_value *key, uint64_t snap);
-uint64_t imdb_lookup_pk_at(imdb_db *db, imdb_table *t, const imdb_value *key, uint64_t snap, uint64_t pend);
+/* The same as seen by a reader with pending end pend; *vid IMDB_NONE when none; negative (e) when a lake image could
+ * not be had (stage 3c-1) */
+int imdb_lookup_pk_at(imdb_db *db, imdb_table *t, const imdb_value *key, uint64_t snap, uint64_t pend, uint64_t *vid,
+                      imdb_err *e);
 /* All versions ever recorded for a subject value (index path). */
 const imdb_vlist *imdb_subject_versions(imdb_table *t, const imdb_value *subject);
 /* Required before a snapshot read (including low-level C lookup/scan calls):
@@ -648,6 +679,9 @@ uint64_t imdb_cleanup_seq(imdb_db *db);
  * (IMDB_MAX_RESULT_BYTES, a quarter of the budget when there is one). */
 typedef struct imdb_mem_report {
     uint64_t versions, rows, indexes, segments, commits, txns, total, limit;
+    /* the segment cache (stage 3c-1): its images' bytes (in segments), its budget, the images loaded since the open and
+     * the object bytes read for them */
+    uint64_t seg_images, seg_budget, seg_loads, seg_load_bytes;
 } imdb_mem_report;
 void imdb_mem(const imdb_db *db, imdb_mem_report *r);
 

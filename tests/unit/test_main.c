@@ -90,6 +90,7 @@ int main(int argc, char **argv)
         {"join", join_tests, &join_ntests},
         {"retain", retain_tests, &retain_ntests},
         {"evict", evict_tests, &evict_ntests},
+        {"segcache", segcache_tests, &segcache_ntests},
     };
     int failed = 0, run = 0;
     for (size_t g = 0; g < sizeof groups / sizeof *groups; g++) {

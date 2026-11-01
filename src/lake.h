@@ -55,15 +55,18 @@ typedef struct imdb_segcol {
     const uint32_t *off;     /* TEXT offsets (n+1) */
     const uint8_t *data;     /* TEXT bytes */
     const uint8_t *valid;    /* NULLABLE: bit i set = row i has a value; NULL for NOT NULL columns */
-    bool has;                /* zone map: a data row with a value */
-    bool has_null;           /* zone map: a data row that is NULL */
-    int64_t min, max;
 } imdb_segcol;
 
-typedef struct imdb_segment {
-    uint8_t hash[32];
-    uint32_t table;
-    uint32_t nrows;
+typedef struct imdb_segzone { /* a column's zone map, kept with the descriptor: a scan skips a segment without its image */
+    bool has;                /* a data row with a value */
+    bool has_null;           /* a data row that is NULL */
+    int64_t min, max;
+} imdb_segzone;
+
+/* A segment's IMAGE (stage 3c-1): the file and the views into it, the per-row end times and the stubmask, all that grows
+ * with its rows. Reached only through imdb_seg_pin, which pins it for the current operation (a statement, an engine
+ * call, a commit's apply, VERIFY, a publish): a pointer into it (a TEXT value) stays valid until that operation ends. */
+typedef struct imdb_segimg {
     uint8_t *bytes;          /* owned file image; views point into it */
     size_t len;
     const uint64_t *vid;
@@ -74,20 +77,71 @@ typedef struct imdb_segment {
     imdb_segcol col[IMDB_MAX_COLS];
     uint64_t *end;           /* mutable: end seq per row (IMDB_LIVE) */
     uint64_t *stubmask;      /* bit i set iff row i is flagged, a stub or a tombstone: no values (immutable) */
+} imdb_segimg;
+
+/* A segment's DESCRIPTOR: what stays resident whatever the retention (a few hundred bytes); its image is img_ (NULL:
+ * not in memory), read only by imdb_seg_pin and imdb_seg_resident (stage 3c-1: loaded on a pin, dropped by a trim). */
+typedef struct imdb_segment {
+    uint8_t hash[32];
+    uint32_t table;
+    uint32_t nrows;
+    uint64_t vid_first, vid_last; /* its rows' vids, the first and the last: rows are in vid order */
+    imdb_segzone zone[IMDB_MAX_COLS];
     uint8_t dv_hash[32];     /* deletion vector at the last manifest (zero if none) */
+    uint64_t touched;        /* the cache's clock at its last pin: a trim drops the least recent first */
+    bool ondisk;             /* its object and its deletion vector's are in objects/: the image may leave memory
+                                and load again (loaded from disk, or written by the publish; a new one is not) */
+    bool seg_ondisk;         /* its .seg object is in objects/ (loaded from it, or put by physical_commit before its
+                                commit, or by lake_persist); never cleared: a descriptor's bytes never change. With
+                                ondisk, what lake_persist skips (stage 3c-1 (b2)) */
+    bool dv_stale;           /* an end of its rows changed since its deletion vector was made (imdb_seg_set_end, any
+                                residency): the next publish makes the vector again; any other keeps it, and its hash,
+                                whole, without the image (stage 3c-1 (b2)) */
+    uint32_t pos;            /* its index in its table's segment list (plan_install keeps it): a held version's v->seg
+                                is re-pointed through it when a publish changes the list */
+    uint32_t nended;         /* its rows with an end, and bounds on those ends (end_lo <= every one <= end_hi; an
+                                undo leaves them loose, still bounds): RETIRE counts a segment's rows ended at or
+                                before a boundary from these alone unless they straddle it (imdb_seg_ended_by) */
+    uint64_t end_lo, end_hi;
+    imdb_segcache *cache;    /* the cache its image is charged to (NULL: apart from any table, never dropped) */
+    imdb_segimg *img_;
 } imdb_segment;
+
+/* The rest of imdb_seg_pin (lake.c): the stamp of a segment first pinned in this operation, or the load. */
+imdb_segimg *imdb_seg_pin_slow(const imdb_table *t, imdb_segment *g, imdb_err *e);
+/* Segment g's image, pinned for the current operation (t: g's table; NULL for a segment parsed apart from any table,
+ * as VERIFY's and a seed's checks parse them, always resident). NULL with e set when it cannot be had. Inline: a walk
+ * pins at every row, and the common case (in memory, pinned already in this operation) is two loads and a compare. */
+static inline imdb_segimg *imdb_seg_pin(const imdb_table *t, imdb_segment *g, imdb_err *e)
+{
+    imdb_segimg *gi = __atomic_load_n(&g->img_, __ATOMIC_ACQUIRE);
+    if (gi && t && __atomic_load_n(&g->touched, __ATOMIC_RELAXED) == t->segcache->clock) return gi;
+    return imdb_seg_pin_slow(t, g, e);
+}
+/* Segment g's image if it is in memory, else NULL: never a load, and no stamp either (a commit's end goes in only where
+ * the image is resident, and writing it is not a use the trim's order counts) */
+imdb_segimg *imdb_seg_resident(const imdb_table *t, imdb_segment *g);
+/* Rows of g ended at or before b, from its marks alone; -1 when they straddle b (only its image can say) */
+int64_t imdb_seg_ended_by(const imdb_segment *g, uint64_t b);
+/* The checked builds (IMDB_STORE_CHECKS: SAN and fuzz): the cache's count is its images' bytes, by a walk of every
+ * table's segments (each image a table holds charged to its cache); aborts otherwise. Nothing in the others. */
+void imdb_seg_cache_check(const imdb_db *db);
 
 /* Strict parse of a segment file image against the table schema. Takes
  * ownership of bytes on success. Every structural rule of the canonical
- * encoding is enforced; nothing outside [bytes, bytes+len) is read. */
-int imdb_segment_parse(const imdb_schema *s, uint8_t *bytes, size_t len, imdb_segment **out, imdb_err *e);
+ * encoding is enforced; nothing outside [bytes, bytes+len) is read. known: the bytes' SHA-256 when the caller checked
+ * it already (an object read by its name: hashing a lake twice was most of a load's time); NULL: computed here. */
+int imdb_segment_parse(const imdb_schema *s, uint8_t *bytes, size_t len, const uint8_t known[32], imdb_segment **out,
+                       imdb_err *e);
 void imdb_segment_free(imdb_segment *g);
 /* Recomputes every non-stub row's commitment from the columns. */
-int imdb_segment_check_commitments(const imdb_schema *s, const imdb_segment *g, imdb_err *e);
+int imdb_segment_check_commitments(const imdb_schema *s, const imdb_segment *g, const imdb_segimg *gi, imdb_err *e);
 /* Column c of row `row` (non-stub; a TEXT value points into the segment). */
-void imdb_seg_get(const imdb_schema *s, const imdb_segment *g, uint32_t row, uint32_t c, imdb_value *v);
+void imdb_seg_get(const imdb_schema *s, const imdb_segimg *gi, uint32_t row, uint32_t c, imdb_value *v);
+/* Every column of row `row` (non-stub) of a pinned image: a walk that pinned the segment once reads its rows so */
+void imdb_seg_row_values(const imdb_schema *s, const imdb_segimg *gi, uint32_t row, imdb_value *vals);
 /* Canonical row bytes of one segment row (non-stub). */
-int imdb_segment_row(const imdb_schema *s, const imdb_segment *g, uint32_t row, imdb_buf *out, imdb_err *e);
+int imdb_segment_row(const imdb_schema *s, const imdb_segimg *gi, uint32_t row, imdb_buf *out, imdb_err *e);
 
 typedef struct imdb_dv_ent {
     uint32_t row;

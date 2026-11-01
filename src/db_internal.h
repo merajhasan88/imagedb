@@ -145,9 +145,14 @@ int imdb_apply_commit(imdb_db *db, imdb_commit_rec *c, const imdb_commit_pre *pr
 /* lake.c (segments, deletion vectors, manifests) */
 int imdb_lake_open(imdb_db *db, imdb_err *e);
 void imdb_lake_table_free(imdb_table *t);
-/* The segment and row of the lake holding vid, whether the store holds it or not (false: none). A table's segments
+/* The segment and row of the lake holding vid, whether the store holds it or not (*found false: none; negative: the
+ * segment's image, which its row needs, could not be had, e set). A table's segments
  * hold rows in ascending, disjoint vid ranges: the snapshot open checks it, and every install. */
-bool imdb_lake_find(const imdb_table *t, uint64_t vid, uint32_t *seg, uint32_t *row);
+int imdb_lake_find(const imdb_table *t, uint64_t vid, uint32_t *seg, uint32_t *row, bool *found, imdb_err *e);
+/* An operation's bounds (stage 3c-1): a statement, an engine write, a commit's apply, a publish, VERIFY, the open. The
+ * segment cache trims only when the outermost ends: nothing pinned is in use then. */
+void imdb_op_enter(imdb_db *db);
+void imdb_op_leave(imdb_db *db);
 int imdb_seg_values(imdb_table *t, const imdb_version *v, imdb_value *vals, imdb_err *e);
 int imdb_seg_value(imdb_table *t, const imdb_version *v, int col, imdb_value *out);
 void imdb_seg_set_end(imdb_table *t, const imdb_version *v, uint64_t end);

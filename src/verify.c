@@ -962,16 +962,21 @@ static void lake_item(void *ctx, size_t i)
     }
     memcpy(al, sb, sl);
     imdb_free(sb);
-    if ((it->rc = imdb_segment_parse(&vt->s, al, sl, &it->g, e))) {
+    if ((it->rc = imdb_segment_parse(&vt->s, al, sl, mt->seg[it->k].seg, &it->g, e))) { /* read by its name */
         imdb_free(al);
         return;
     }
     imdb_segment *g = it->g;
+    imdb_segimg *gi = imdb_seg_pin(NULL, g, e); /* VERIFY's own parse: apart from any table, resident */
+    if (!gi) {
+        it->rc = e->code;
+        return;
+    }
     if (g->nrows != mt->seg[it->k].nrows) {
         it->rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: segment row count mismatch");
         return;
     }
-    if ((it->rc = imdb_segment_check_commitments(&vt->s, g, e))) return;
+    if ((it->rc = imdb_segment_check_commitments(&vt->s, g, gi, e))) return;
     if (memcmp(mt->seg[it->k].dv, (uint8_t[32]){0}, 32) != 0) {
         uint8_t *dvb = NULL;
         size_t dl;
@@ -983,7 +988,7 @@ static void lake_item(void *ctx, size_t i)
             if (memcmp(sh, g->hash, 32) != 0) it->rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: DV names another segment");
             for (uint32_t r = 0; r < n && !it->rc; r++)
                 if (ents[r].end > S) it->rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: DV records a future delete");
-                else g->end[ents[r].row] = ents[r].end;
+                else gi->end[ents[r].row] = ents[r].end;
             imdb_free(ents);
         }
         imdb_free(dvb);
@@ -991,7 +996,7 @@ static void lake_item(void *ctx, size_t i)
     }
     int subj = vt->s.subject;
     for (uint32_t r = 0; r < g->nrows; r++) {
-        uint64_t vid = g->vid[r];
+        uint64_t vid = gi->vid[r];
         if (vid >= st->n) {
             it->rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: version %llu of table %s is outside the manifest or twice in it",
                                (unsigned long long)vid, vt->s.name);
@@ -1011,14 +1016,14 @@ static void lake_item(void *ctx, size_t i)
         }
         bool purged = vend != IMDB_LIVE && vend <= st->purged; /* an EXPIRE purges nothing */
         uint8_t want = (uint8_t)((v->stub ? IMDB_SEG_STUB : 0u) | (purged ? IMDB_SEG_PURGED : 0u));
-        if (memcmp(v->commit, g->commit + 32u * r, 32) != 0 || v->begin != g->begin[r] || vend != g->end[r] ||
-            g->flags[r] != want) {
+        if (memcmp(v->commit, gi->commit + 32u * r, 32) != 0 || v->begin != gi->begin[r] || vend != gi->end[r] ||
+            gi->flags[r] != want) {
             it->rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: segment row disagrees with the log (table %s)", vt->s.name);
             return;
         }
         if (want == IMDB_SEG_PURGED && subj >= 0) { /* the tombstone's subject is what ERASE SUBJECT will look for */
             imdb_value sv = {.type = vt->s.cols[subj].type};
-            const imdb_segcol *sc = &g->col[subj];
+            const imdb_segcol *sc = &gi->col[subj];
             if (sv.type == IMDB_T_TEXT) {
                 sv.s = sc->data + sc->off[r];
                 sv.len = sc->off[r + 1] - sc->off[r];
@@ -1189,7 +1194,7 @@ static int verify_lake(imdb_db *db, const vctx *x, imdb_verify_report *rep, imdb
             litem *it = &items[w0 + i];
             if (!rc && it->rc) rc = imdb_fail(e, it->rc, "%s", it->err.msg);
             for (uint32_t r = 0; !rc && it->g && r < it->g->nrows; r++) {
-                uint64_t vid = it->g->vid[r];
+                uint64_t vid = imdb_seg_pin(NULL, it->g, e)->vid[r]; /* its own parse: resident, never NULL */
                 vver *v = vv(&x->t[it->table], vid); /* lake_item found every row's version held */
                 if (!v || v->seen)
                     rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: version %llu of table %s is outside the manifest or twice in it",
@@ -1334,32 +1339,42 @@ static int verify_engine(imdb_db *db, const vctx *x, imdb_verify_report *rep, im
             bool retired = v->end != IMDB_LIVE && v->end <= x->boundary; /* exactly these are gone */
             bool held = imdb_v_held(et, vid), purged = v->end != IMDB_LIVE && v->end <= vt->purged;
             imdb_vloc at; /* not held and not retired: past the memory window (stage 3b), the lake's alone */
-            bool lake = !held && !retired && v->end != IMDB_LIVE && v->end <= db->mem_floor &&
-                        imdb_v_find(et, vid, &at) == IMDB_VAT_LAKE;
+            bool lake = false;
+            if (!held && !retired && v->end != IMDB_LIVE && v->end <= db->mem_floor) {
+                int where = imdb_v_find(et, vid, &at, e);
+                if (where < 0) return where;
+                lake = where == IMDB_VAT_LAKE;
+            }
             if (retired ? held : !held && !lake)
                 return imdb_fail(e, IMDB_ERR_VERIFY, "verify: table %s version %llu is %s, but the log's boundary %s it",
                                  et->s.name, (unsigned long long)vid, retired ? "still held" : "gone",
                                  retired ? "retired" : "keeps");
             if (retired) continue;
             if (lake) { /* its row is the log's version: the lake check reads every row, this one by vid */
-                uint8_t f = at.g->flags[at.row];
-                if (at.g->begin[at.row] != v->begin || at.g->end[at.row] != v->end || v->stub != ((f & IMDB_SEG_STUB) != 0) ||
-                    purged != ((f & IMDB_SEG_PURGED) != 0) || memcmp(v->commit, at.g->commit + 32u * at.row, 32) != 0)
+                const imdb_segimg *gi = imdb_seg_pin(et, at.g, e);
+                if (!gi) return e->code;
+                uint8_t f = gi->flags[at.row];
+                if (gi->begin[at.row] != v->begin || gi->end[at.row] != v->end || v->stub != ((f & IMDB_SEG_STUB) != 0) ||
+                    purged != ((f & IMDB_SEG_PURGED) != 0) || memcmp(v->commit, gi->commit + 32u * at.row, 32) != 0)
                     return imdb_fail(e, IMDB_ERR_VERIFY, "verify: table %s version %llu differs", et->s.name,
                                      (unsigned long long)vid);
                 if (f & IMDB_SEG_STUB) rep->stubs++;
                 continue;
             }
             const imdb_version *ev = imdb_vh(et, vid);
+            const uint8_t *ec;
+            if (imdb_v_commit(et, vid, &ec, e)) return e->code;
             bool estub = (ev->flags & IMDB_V_STUB) != 0;
             if (v->end != ev->end || v->begin != ev->begin || v->stub != (estub && !(ev->flags & IMDB_V_PENDING_AUTH)) ||
-                purged != ((ev->flags & IMDB_V_PURGED) != 0) || memcmp(v->commit, imdb_v_commit(et, vid), 32) != 0)
+                purged != ((ev->flags & IMDB_V_PURGED) != 0) || memcmp(v->commit, ec, 32) != 0)
                 return imdb_fail(e, IMDB_ERR_VERIFY, "verify: table %s version %llu differs", et->s.name,
                                  (unsigned long long)vid);
             if (estub) {
                 /* an erased version must not keep any payload in memory */
-                for (size_t k = 0; k < 16; k++) /* the memtable's cold part, or its row's (zeros once flagged) */
-                    if (imdb_v_salt(et, vid)[k]) return imdb_fail(e, IMDB_ERR_VERIFY, "verify: erased version still holds its salt");
+                const uint8_t *es; /* the memtable's cold part, or its row's (zeros once flagged) */
+                if (imdb_v_salt(et, vid, &es, e)) return e->code;
+                for (size_t k = 0; k < 16; k++)
+                    if (es[k]) return imdb_fail(e, IMDB_ERR_VERIFY, "verify: erased version still holds its salt");
                 if (!(ev->flags & IMDB_V_SEG) && ev->row_len) {
                     const uint8_t *p = imdb_mem_row(et, ev);
                     for (uint32_t k = 0; k < ev->row_len; k++)
@@ -1419,7 +1434,8 @@ static int verify_seed(imdb_db *db, vctx *x, imdb_err *e)
             else memcpy(al, sb, sl);
             imdb_free(sb);
             sb = NULL;
-            if (!rc && (rc = imdb_segment_parse(&t->s, al, sl, &g, e))) imdb_free(al);
+            if (!rc && (rc = imdb_segment_parse(&t->s, al, sl, m.t[ti].seg[k].seg, &g, e))) imdb_free(al);
+            imdb_segimg *gi = rc ? NULL : imdb_seg_pin(NULL, g, e); /* its own parse: apart from any table, resident */
             /* the ends its deletion vector records at or before F: a seed's floor is its snapshot, whose lake still
              * holds history (a RETIRE's has dropped all of it); later ends are the replay's */
             if (!rc && memcmp(m.t[ti].seg[k].dv, (uint8_t[32]){0}, 32) != 0) {
@@ -1431,14 +1447,14 @@ static int verify_seed(imdb_db *db, vctx *x, imdb_err *e)
                     !(rc = imdb_dv_parse(dvb, dl, sh, &ents, &ne, g->nrows, e))) {
                     if (memcmp(sh, g->hash, 32) != 0) rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: DV names another segment");
                     for (uint32_t q = 0; !rc && q < ne; q++)
-                        if (ents[q].end <= F) g->end[ents[q].row] = ents[q].end;
+                        if (ents[q].end <= F) gi->end[ents[q].row] = ents[q].end;
                     imdb_free(ents);
                 }
                 imdb_free(dvb);
             }
             for (uint32_t r = 0; !rc && r < g->nrows; r++) {
-                if (g->begin[r] > F) continue;
-                uint64_t vid = g->vid[r];
+                if (gi->begin[r] > F) continue;
+                uint64_t vid = gi->vid[r];
                 if (vid >= t->floor_n || vv(t, vid)) {
                     rc = imdb_fail(e, IMDB_ERR_VERIFY, "verify: the lake's version %llu of table %s is not one the floor had",
                                    (unsigned long long)vid, t->s.name);
@@ -1449,15 +1465,15 @@ static int verify_seed(imdb_db *db, vctx *x, imdb_err *e)
                     rc = e->code;
                     break;
                 }
-                memcpy(v->commit, g->commit + 32u * r, 32);
-                v->begin = g->begin[r];
-                v->end = g->end[r]; /* LIVE, or an end at or before F */
-                if ((g->flags[r] & IMDB_SEG_PURGED) && v->end != IMDB_LIVE && v->end > t->purged)
+                memcpy(v->commit, gi->commit + 32u * r, 32);
+                v->begin = gi->begin[r];
+                v->end = gi->end[r]; /* LIVE, or an end at or before F */
+                if ((gi->flags[r] & IMDB_SEG_PURGED) && v->end != IMDB_LIVE && v->end > t->purged)
                     t->purged = v->end; /* purged by F: every version ended before a purge is, so its highest end divides */
-                v->stub = (g->flags[r] & IMDB_SEG_STUB) != 0;
+                v->stub = (gi->flags[r] & IMDB_SEG_STUB) != 0;
                 if (!v->stub && t->s.subject >= 0) {
                     imdb_value sv = {.type = t->s.cols[t->s.subject].type};
-                    const imdb_segcol *sc = &g->col[t->s.subject];
+                    const imdb_segcol *sc = &gi->col[t->s.subject];
                     if (sv.type == IMDB_T_TEXT) {
                         sv.s = sc->data + sc->off[r];
                         sv.len = sc->off[r + 1] - sc->off[r];
@@ -1562,7 +1578,7 @@ static int vpins_collect(imdb_db *db, vctx *x, imdb_err *e)
     return rc;
 }
 
-int imdb_verify(imdb_db *db, imdb_verify_report *rep, imdb_err *e)
+static int verify_body(imdb_db *db, imdb_verify_report *rep, imdb_err *e)
 {
     memset(rep, 0, sizeof *rep);
     if (db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "VERIFY cannot run inside a transaction");
@@ -1623,5 +1639,14 @@ int imdb_verify(imdb_db *db, imdb_verify_report *rep, imdb_err *e)
     imdb_free(x.pubs);
     imdb_free(x.pubhash);
     imdb_free(x.pin_at);
+    return rc;
+}
+
+/* one operation (stage 3c-1): the segment cache trims when the outermost ends */
+int imdb_verify(imdb_db *db, imdb_verify_report *rep, imdb_err *e)
+{
+    imdb_op_enter(db);
+    int rc = verify_body(db, rep, e);
+    imdb_op_leave(db);
     return rc;
 }

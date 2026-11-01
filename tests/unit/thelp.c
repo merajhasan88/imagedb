@@ -98,10 +98,13 @@ uint64_t count_subject(imdb_db *db, int64_t user, uint64_t snap)
     if (snap < db->mem_floor) { /* below the memory floor the list holds only what memory does (stage 3b): the lake */
         for (uint32_t s = 0; s < t->nseg; s++)
             for (uint32_t r = 0; r < t->seg[s]->nrows; r++) {
-                const imdb_segment *g = t->seg[s];
+                imdb_segment *g = t->seg[s];
+                imdb_err pe = {0};
+                const imdb_segimg *gi = imdb_seg_pin(t, g, &pe);
+                if (!gi) return UINT64_MAX; /* no count: the caller's CHECK fails */
                 imdb_value v;
-                if (g->flags[r] || g->begin[r] > snap || g->end[r] <= snap) continue;
-                imdb_seg_get(&t->s, g, r, (uint32_t)t->s.subject, &v);
+                if (gi->flags[r] || gi->begin[r] > snap || gi->end[r] <= snap) continue;
+                imdb_seg_get(&t->s, gi, r, (uint32_t)t->s.subject, &v);
                 n += v.i == user;
             }
         for (uint64_t vid = t->mem_first; vid < t->nver; vid++) {
@@ -515,4 +518,5 @@ void keep_in_memory(imdb_db *db)
     if (!db) return;
     db->mem_window_us = UINT64_MAX;
     db->evict_eager = false;
+    db->segcache.budget = UINT64_MAX; /* every segment image kept too (IMDB_SEGCACHE=tiny would drop them) */
 }

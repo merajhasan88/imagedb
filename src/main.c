@@ -30,7 +30,7 @@ static int usage(void)
           "  imagedb identity <dir>                     print the db id and writer public key (no secrets)\n"
           "  imagedb sql <dir> [-c SQL]... [-f FILE] [--csv] [--cross-check] [--nosync] [--lake-sync]\n"
           "                    [--anchor FILE [--accept-rollback]] [--read-only] [--durable-ack] [--mem-limit BYTES]\n"
-          "                    [--mem-window SECONDS|none]\n"
+          "                    [--mem-window SECONDS|none] [--seg-cache BYTES|all]\n"
           "                                             run SQL (interactive when no -c/-f and stdin is a tty);\n"
           "                                             --durable-ack: the watermark synced as each commit returns,\n"
           "                                             so a damaged last frame past it is known unacknowledged;\n"
@@ -38,8 +38,10 @@ static int usage(void)
           "                                             write commits after N to stdout (--acks: read the\n"
           "                                             replica's acknowledgements on stdin)\n"
           "  imagedb apply <replica-dir> [--durable-ack] [--mem-limit BYTES] [--mem-window SECONDS|none]\n"
+          "                    [--seg-cache BYTES|all]\n"
           "                                             apply a commit stream from stdin\n"
-          "  imagedb follow <replica-dir> [--mem-limit BYTES] [--mem-window SECONDS|none] -- CMD [ARG...]\n"
+          "  imagedb follow <replica-dir> [--mem-limit BYTES] [--mem-window SECONDS|none] [--seg-cache BYTES|all]\n"
+          "                    -- CMD [ARG...]\n"
           "                                             run CMD ({after}: the replica's commit), apply its stream,\n"
           "                                             acknowledge on its stdin; run it again when it ends\n"
           "  imagedb replica-key <replica-dir> [--new]  print the replica's public key (made if missing); --new: a\n"
@@ -69,6 +71,7 @@ static void print_err(const char *what, const imdb_err *e)
 
 static uint64_t g_mem_limit; /* --mem-limit (db.h: the memory budget), for the command's open */
 static uint64_t g_mem_window; /* --mem-window (db.h: the memory window, stage 3b; 0: the default) */
+static uint64_t g_seg_cache; /* --seg-cache (db.h: the segment cache, stage 3c-1; 0: the default) */
 
 /* SECONDS: decimal digits, no leading zero, at most a century; or none: no version leaves memory */
 static bool parse_window(const char *s, uint64_t *out)
@@ -105,11 +108,22 @@ static bool parse_size(const char *s, uint64_t *out)
     return true;
 }
 
+/* BYTES as --mem-limit takes them, or all: every segment image kept in memory */
+static bool parse_seg_cache(const char *s, uint64_t *out)
+{
+    if (strcmp(s, "all") == 0) {
+        *out = UINT64_MAX;
+        return true;
+    }
+    return parse_size(s, out);
+}
+
 static imdb_db *open_anchored(const char *dir, bool ro, int sync, const char *anchor, bool accept_rollback,
                               bool durable_ack)
 {
     imdb_open_opts o = {.sync = sync, .read_only = ro, .anchor = anchor, .accept_rollback = accept_rollback,
-                        .durable_ack = durable_ack, .mem_limit = g_mem_limit, .mem_window_us = g_mem_window};
+                        .durable_ack = durable_ack, .mem_limit = g_mem_limit, .mem_window_us = g_mem_window,
+                        .seg_cache_bytes = g_seg_cache};
     imdb_db *db;
     imdb_err e = {0};
     if (imdb_open(dir, &o, &db, &e)) {
@@ -259,6 +273,12 @@ static int cmd_sql(int argc, char **argv)
         else if (strcmp(argv[i], "--mem-window") == 0 && i + 1 < argc) {
             if (!parse_window(argv[++i], &g_mem_window)) {
                 fprintf(stderr, "imagedb: sql: --mem-window takes SECONDS (digits) or none\n");
+                return 2;
+            }
+        }
+        else if (strcmp(argv[i], "--seg-cache") == 0 && i + 1 < argc) {
+            if (!parse_seg_cache(argv[++i], &g_seg_cache)) {
+                fprintf(stderr, "imagedb: sql: --seg-cache takes BYTES (digits, then K, M or G) or all\n");
                 return 2;
             }
         }
@@ -417,10 +437,13 @@ static int cmd_follow(int argc, char **argv)
     while (dd + 1 < argc && strcmp(argv[dd], "--") != 0) {
         if (strcmp(argv[dd], "--mem-limit") == 0 && parse_size(argv[dd + 1], &g_mem_limit)) dd += 2;
         else if (strcmp(argv[dd], "--mem-window") == 0 && parse_window(argv[dd + 1], &g_mem_window)) dd += 2;
-        else if (strcmp(argv[dd], "--mem-limit") != 0 && strcmp(argv[dd], "--mem-window") != 0) return usage();
+        else if (strcmp(argv[dd], "--seg-cache") == 0 && parse_seg_cache(argv[dd + 1], &g_seg_cache)) dd += 2;
+        else if (strcmp(argv[dd], "--mem-limit") != 0 && strcmp(argv[dd], "--mem-window") != 0 &&
+                 strcmp(argv[dd], "--seg-cache") != 0)
+            return usage();
         else {
             fprintf(stderr, "imagedb: follow: --mem-limit takes BYTES (digits, then K, M or G), --mem-window SECONDS "
-                            "or none\n");
+                            "or none, --seg-cache BYTES or all\n");
             return 2;
         }
     }
@@ -780,6 +803,7 @@ int main(int argc, char **argv)
             if (strcmp(argv[i], "--durable-ack") == 0) durable_ack = true;
             else if (strcmp(argv[i], "--mem-limit") == 0 && i + 1 < argc && parse_size(argv[i + 1], &g_mem_limit)) i++;
             else if (strcmp(argv[i], "--mem-window") == 0 && i + 1 < argc && parse_window(argv[i + 1], &g_mem_window)) i++;
+            else if (strcmp(argv[i], "--seg-cache") == 0 && i + 1 < argc && parse_seg_cache(argv[i + 1], &g_seg_cache)) i++;
             else return usage();
         }
         imdb_db *db = open_anchored(argv[2], false, 1, NULL, false, durable_ack);

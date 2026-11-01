@@ -12,9 +12,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     memcpy(b, data + 1, n);
     imdb_segment *g;
     imdb_err e = {0};
-    if (imdb_segment_parse(&s, b, n, &g, &e) == 0) {
+    if (imdb_segment_parse(&s, b, n, NULL, &g, &e) == 0) {
         imdb_err e2 = {0};
-        (void)imdb_segment_check_commitments(&s, g, &e2);
+        imdb_segimg *gi = imdb_seg_pin(NULL, g, &e2); /* a parse of its own: apart from any table, resident */
+        if (gi) (void)imdb_segment_check_commitments(&s, g, gi, &e2);
         imdb_segment_free(g);
     } else {
         free(b);

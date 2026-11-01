@@ -14,7 +14,8 @@
 # IMDB_SOAK_SYNC (1; 0: --nosync), IMDB_SOAK_RETENTION (the table's RETENTION in seconds; unset: the engine's
 # default, 24 hours; stage 3a's soak runs 600), IMDB_SOAK_WINDOW (the writer's memory window in seconds; unset:
 # the engine's, 10 minutes; stage 3b), IMDB_SOAK_CHECKPOINT and IMDB_SOAK_ERASE (commits between them,
-# by the log's sequence, so across restarts; 50000 and 20000; 0: never), IMDB_SOAK_FLOOR (MB of MemAvailable below which it stops,
+# by the log's sequence, so across restarts; 50000 and 20000; 0: never), IMDB_SOAK_SEG_CACHE (the writer's segment cache
+# budget, bytes or all; unset: the engine's, 256 MB; stage 3c-1), IMDB_SOAK_FLOOR (MB of MemAvailable below which it stops,
 # 4608: the user's 4 GB and a margin), IMDB_SOAK_KEEP=1 keeps the database.
 # A run in which an asked-for ERASE or CHECKPOINT never completed did not test what it was asked to: it
 # ends SOAK INCOMPLETE (exit 5), not PASSED. A final VERIFY that counts no erased version after an ERASE
@@ -76,7 +77,7 @@ check() { # NAME AUDIT: VERIFY through the CLI's writable open (recovery first),
 "$BIN" init "$D" > /dev/null
 "$W/soak_writer" "$D" load "$LIVE" "$OUT/acks" "${LOADOPTS[@]}" || { echo "FAIL: the load"; exit 1; }
 echo "t_s restarts commits log_bytes dir_bytes verify_s audit_s avail_mb alive_s" > "$OUT/disk.csv"
-echo "run t_s commits versions rows indexes segments commits_mem txns total rss_kb" > "$OUT/memory.csv"
+echo "run t_s commits versions rows indexes segments commits_mem txns total rss_kb seg_images seg_loads seg_load_bytes" > "$OUT/memory.csv"
 : > "$OUT/events"
 start=$(date +%s)
 end=$((start + MIN * 60))

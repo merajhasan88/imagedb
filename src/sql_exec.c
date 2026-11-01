@@ -492,10 +492,16 @@ static void sink_row(sink *k, uint64_t vid, const imdb_value *vals)
     case SINK_JPROBE: join_probe_row(k, vid, vals); return;
     case SINK_JOUTER: join_outer_row(k, vid, vals); return;
     case SINK_JINNER: join_inner_row(k, vid, vals); return;
-    case SINK_DIGEST:
-        imdb_lthash_add_commit(k->x->db->meta.digest_alg, &k->digest, imdb_v_commit(k->t, vid));
+    case SINK_DIGEST: {
+        const uint8_t *cm;
+        if (imdb_v_commit(k->t, vid, &cm, k->e)) {
+            k->err = k->e->code;
+            return;
+        }
+        imdb_lthash_add_commit(k->x->db->meta.digest_alg, &k->digest, cm);
         k->digest_rows++;
         return;
+    }
     case SINK_GROUP: {
         const imdb_value *key = &vals[k->gcol];
         uint64_t *gi = key->null ? (k->has_null_group ? &k->null_group : NULL) : imdb_hmap_get(&k->gmap, key);
@@ -575,6 +581,26 @@ static int fetch_row(xctx *x, imdb_table *t, uint64_t vid, imdb_value *vals, imd
     return imdb_version_values(x->db, t, vid, vals, e);
 }
 
+/* A walk's pinned segment (stage 3c-1): the held versions of a segment come together in vid order, so a walk pins
+ * each segment once and reads its rows from the image directly, not through a pin a row. Good for the walk only
+ * (nothing drops an image, and no publish replaces the segments, inside an operation). */
+typedef struct walk_pin {
+    uint32_t seg; /* t->seg index of gi (UINT32_MAX: none yet) */
+    const imdb_segimg *gi;
+} walk_pin;
+
+static int walk_values(imdb_table *t, const imdb_version *v, walk_pin *wp, imdb_value *vals, imdb_err *e)
+{
+    if ((v->flags & (IMDB_V_SEG | IMDB_V_STUB | IMDB_V_PURGED)) != IMDB_V_SEG) return imdb_version_values_v(t, v, vals, e);
+    if (v->seg != wp->seg) {
+        if (v->seg >= t->nseg) return imdb_fail(e, IMDB_ERR_STATE, "version maps to a missing segment");
+        if (!(wp->gi = imdb_seg_pin(t, t->seg[v->seg], e))) return e->code;
+        wp->seg = v->seg;
+    }
+    imdb_seg_row_values(&t->s, wp->gi, v->seg_row, vals);
+    return IMDB_OK;
+}
+
 static bool visible_q(const qspec *q, const imdb_version *v)
 {
     if (q->all_versions) return !(v->flags & (IMDB_V_STUB | IMDB_V_PURGED));
@@ -585,10 +611,11 @@ static int path_store(xctx *x, const qspec *q, sink *k, imdb_err *e)
 {
     imdb_table *t = q->t;
     imdb_value vals[IMDB_MAX_COLS];
+    walk_pin wp = {UINT32_MAX, NULL};
     for (uint64_t vid = imdb_v_next(t, 0); vid < t->nver && !k->err; vid = imdb_v_next(t, vid + 1)) {
         const imdb_version *v = imdb_vh(t, vid); /* held: the walk has its entry */
         if (!visible_q(q, v)) continue;
-        if (imdb_version_values_v(t, v, vals, e)) return e->code;
+        if (walk_values(t, v, &wp, vals, e)) return e->code;
         if (preds_ok(q, vals)) sink_row(k, vid, vals);
     }
     return k->err;
@@ -599,19 +626,21 @@ static int path_index(xctx *x, const qspec *q, sink *k, imdb_err *e)
     imdb_table *t = q->t;
     imdb_value vals[IMDB_MAX_COLS];
     if (q->pk_pred >= 0 && !q->all_versions) {
-        uint64_t vid = imdb_lookup_pk_at(x->db, t, &q->p[q->pk_pred].a, q->snap, q->pend);
+        uint64_t vid;
+        if (imdb_lookup_pk_at(x->db, t, &q->p[q->pk_pred].a, q->snap, q->pend, &vid, e)) return e->code;
         if (vid == IMDB_NONE) return IMDB_OK;
         if (fetch_row(x, t, vid, vals, e)) return e->code;
         if (preds_ok(q, vals)) sink_row(k, vid, vals);
         return k->err;
     }
     if (q->subj_pred >= 0) {
+        walk_pin wp = {UINT32_MAX, NULL};
         const imdb_vlist *l = imdb_subject_versions(t, &q->p[q->subj_pred].a);
         for (uint32_t i = 0; l && i < l->n && !k->err; i++) {
             uint64_t vid = l->v[i];
             const imdb_version *v = imdb_vh(t, vid); /* held: the walk has its entry */
             if (!visible_q(q, v)) continue;
-            if (imdb_version_values_v(t, v, vals, e)) return e->code;
+            if (walk_values(t, v, &wp, vals, e)) return e->code;
             if (preds_ok(q, vals)) sink_row(k, vid, vals);
         }
         return k->err;
@@ -757,7 +786,7 @@ static bool seg_skipped(const qspec *q, const imdb_segment *g)
     bool skip = false;
     for (uint16_t i = 0; i < q->np && !skip; i++) {
         const bpred *b = &q->p[i];
-        const imdb_segcol *zc = &g->col[b->col];
+        const imdb_segzone *zc = &g->zone[b->col]; /* the descriptor's: no image */
         if (b->op == CMP_ISNULL) skip = !zc->has_null;
         else if (b->type == IMDB_T_TEXT) continue; /* TEXT has no min/max */
         else if (b->op == CMP_NOTNULL || b->neg) skip = !zc->has;
@@ -778,10 +807,15 @@ static int path_scan(xctx *x, const qspec *q, sink *k, imdb_err *e)
     bool fast = fast_aggregate(k);
     int rc = IMDB_OK;
     for (uint32_t s = 0; s < t->nseg && !rc && !k->err; s++) {
-        const imdb_segment *g = t->seg[s];
+        imdb_segment *g = t->seg[s];
         uint32_t n = g->nrows;
         if (!n) continue;
         if (!q->all_versions && seg_skipped(q, g)) continue;
+        const imdb_segimg *gi = imdb_seg_pin(t, g, e); /* only a segment the zone maps did not skip */
+        if (!gi) {
+            rc = e->code;
+            break;
+        }
         size_t words = (n + 63) / 64;
         if (words > capw) {
             imdb_free(bits);
@@ -798,18 +832,18 @@ static int path_scan(xctx *x, const qspec *q, sink *k, imdb_err *e)
             for (size_t w = 0; w < words; w++) bits[w] = ~0ull;
             mask_tail(bits, n);
         } else {
-            K->filter_range_i64((const int64_t *)g->begin, n, 1, (int64_t)q->snap, bits);
-            K->filter_range_i64((const int64_t *)g->end, n, (int64_t)q->snap + 1, INT64_MAX, tmp);
+            K->filter_range_i64((const int64_t *)gi->begin, n, 1, (int64_t)q->snap, bits);
+            K->filter_range_i64((const int64_t *)gi->end, n, (int64_t)q->snap + 1, INT64_MAX, tmp);
             for (size_t w = 0; w < words; w++) bits[w] &= tmp[w];
             if (q->pend) { /* rows the reader itself has ended (segments hold no pending inserts) */
-                K->filter_range_i64((const int64_t *)g->end, n, (int64_t)q->pend, (int64_t)q->pend, tmp);
+                K->filter_range_i64((const int64_t *)gi->end, n, (int64_t)q->pend, (int64_t)q->pend, tmp);
                 for (size_t w = 0; w < words; w++) bits[w] &= ~tmp[w];
             }
         }
-        for (size_t w = 0; w < words; w++) bits[w] &= ~g->stubmask[w];
+        for (size_t w = 0; w < words; w++) bits[w] &= ~gi->stubmask[w];
         for (uint16_t i = 0; i < q->np; i++) {
             const bpred *b = &q->p[i];
-            const imdb_segcol *c = &g->col[b->col];
+            const imdb_segcol *c = &gi->col[b->col];
             /* VALID is whole 64-bit words: the section is 8-byte aligned and its padding is zero */
             const uint64_t *vw = (const uint64_t *)(const void *)c->valid;
             if (b->op == CMP_ISNULL || b->op == CMP_NOTNULL) {
@@ -828,7 +862,7 @@ static int path_scan(xctx *x, const qspec *q, sink *k, imdb_err *e)
                         uint32_t r = (uint32_t)(w * 64 + (uint64_t)__builtin_ctzll(m));
                         m &= m - 1;
                         imdb_value v;
-                        imdb_seg_get(&t->s, g, r, b->col, &v);
+                        imdb_seg_get(&t->s, gi, r, b->col, &v);
                         if (!pred_ok(b, &v)) bits[w] &= ~(1ull << (r & 63));
                     }
                 }
@@ -838,7 +872,7 @@ static int path_scan(xctx *x, const qspec *q, sink *k, imdb_err *e)
             for (uint16_t i = 0; i < k->st->nitems && !rc; i++) {
                 agg_acc *a = &k->acc[i];
                 uint8_t ag = k->st->items[i].agg;
-                const imdb_segcol *sc = ag == AGG_COUNT_STAR ? NULL : &g->col[k->item_col[i]];
+                const imdb_segcol *sc = ag == AGG_COUNT_STAR ? NULL : &gi->col[k->item_col[i]];
                 const uint64_t *m = bits, *vw = sc ? (const uint64_t *)(const void *)sc->valid : NULL;
                 if (vw) { /* NULLs are neither counted nor summed */
                     for (size_t w = 0; w < words; w++) tmp[w] = bits[w] & vw[w];
@@ -865,8 +899,8 @@ static int path_scan(xctx *x, const qspec *q, sink *k, imdb_err *e)
             while (m) {
                 uint32_t r = (uint32_t)(w * 64 + (uint64_t)__builtin_ctzll(m));
                 m &= m - 1;
-                uint64_t vid = g->vid[r];
-                for (uint32_t c = 0; c < t->s.ncols; c++) imdb_seg_get(&t->s, g, r, c, &vals[c]); /* the row itself */
+                uint64_t vid = gi->vid[r];
+                for (uint32_t c = 0; c < t->s.ncols; c++) imdb_seg_get(&t->s, gi, r, c, &vals[c]); /* the row itself */
                 sink_row(k, vid, vals);
             }
         }
@@ -892,13 +926,15 @@ static int path_rows(xctx *x, const qspec *q, sink *k, imdb_err *e)
     imdb_table *t = q->t;
     imdb_value vals[IMDB_MAX_COLS];
     for (uint32_t s = 0; s < t->nseg && !k->err; s++) {
-        const imdb_segment *g = t->seg[s];
+        imdb_segment *g = t->seg[s];
+        const imdb_segimg *gi = imdb_seg_pin(t, g, e);
+        if (!gi) return e->code;
         for (uint32_t r = 0; r < g->nrows && !k->err; r++) {
-            if (g->flags[r]) continue; /* a stub or a tombstone: no values (visible_q's rule) */
-            if (!q->all_versions && (g->begin[r] > q->snap || g->end[r] <= q->snap || (q->pend && g->end[r] == q->pend)))
+            if (gi->flags[r]) continue; /* a stub or a tombstone: no values (visible_q's rule) */
+            if (!q->all_versions && (gi->begin[r] > q->snap || gi->end[r] <= q->snap || (q->pend && gi->end[r] == q->pend)))
                 continue;
-            for (uint32_t c = 0; c < t->s.ncols; c++) imdb_seg_get(&t->s, g, r, c, &vals[c]);
-            if (preds_ok(q, vals)) sink_row(k, g->vid[r], vals);
+            for (uint32_t c = 0; c < t->s.ncols; c++) imdb_seg_get(&t->s, gi, r, c, &vals[c]);
+            if (preds_ok(q, vals)) sink_row(k, gi->vid[r], vals);
         }
     }
     for (uint64_t vid = t->mem_first; vid < t->nver && !k->err; vid++) { /* the memtable: always held */
@@ -2394,6 +2430,16 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
             snprintf(r->status + at, sizeof r->status - at, "; memory window %llu s, floor commit %llu: %llu versions held of %llu",
                      (unsigned long long)(db->mem_window_us / 1000000), (unsigned long long)db->mem_floor,
                      (unsigned long long)held, (unsigned long long)kept);
+        at = strlen(r->status); /* stage 3c-1: the lake's images in memory, and those read again since the open */
+        if (m.seg_budget == UINT64_MAX)
+            snprintf(r->status + at, sizeof r->status - at, "; segment images %llu bytes, every one kept",
+                     (unsigned long long)m.seg_images);
+        else
+            snprintf(r->status + at, sizeof r->status - at, "; segment images %llu bytes, budget %llu",
+                     (unsigned long long)m.seg_images, (unsigned long long)m.seg_budget);
+        at = strlen(r->status);
+        snprintf(r->status + at, sizeof r->status - at, "; %llu loaded since the open (%llu bytes read)",
+                 (unsigned long long)m.seg_loads, (unsigned long long)m.seg_load_bytes);
         return res_finish(r, e);
     }
     if (st->kind == ST_SHOW_REPLICATION) { /* the session's last commit: what is known beyond this database */
@@ -2603,12 +2649,14 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
             for (uint64_t vid = head ? *head : IMDB_NONE; vid != IMDB_NONE; vid = imdb_vh(t, vid)->pk_prev, n++)
                 if (pass) chain[n] = vid;
             for (uint32_t s = 0; s < t->nseg; s++) {
-                const imdb_segment *g = t->seg[s];
+                imdb_segment *g = t->seg[s];
+                const imdb_segimg *gi = imdb_seg_pin(t, g, e);
+                if (!gi) return e->code;
                 for (uint32_t i = 0; i < g->nrows; i++) {
                     imdb_value v;
-                    if (g->flags[i] || imdb_v_held(t, g->vid[i])) continue;
-                    imdb_seg_get(&t->s, g, i, (uint32_t)t->s.pk, &v);
-                    if (imdb_value_cmp(&v, &key) == 0 && pass) chain[n] = g->vid[i];
+                    if (gi->flags[i] || imdb_v_held(t, gi->vid[i])) continue;
+                    imdb_seg_get(&t->s, gi, i, (uint32_t)t->s.pk, &v);
+                    if (imdb_value_cmp(&v, &key) == 0 && pass) chain[n] = gi->vid[i];
                     n += imdb_value_cmp(&v, &key) == 0;
                 }
             }
@@ -2620,10 +2668,13 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
             imdb_value vals[IMDB_MAX_COLS];
             for (uint64_t i = 0; i < nch; i++) {
                 imdb_vloc at;
-                int where = imdb_v_find(t, chain[i], &at);
+                int where = imdb_v_find(t, chain[i], &at, e);
+                if (where < 0) return where;
+                const imdb_segimg *gi = where == IMDB_VAT_LAKE ? imdb_seg_pin(t, at.g, e) : NULL;
+                if (where == IMDB_VAT_LAKE && !gi) return e->code;
                 if (where == IMDB_VAT_HELD && (at.v->flags & IMDB_V_PURGED)) continue;
-                uint64_t begin = where == IMDB_VAT_HELD ? at.v->begin : at.g->begin[at.row];
-                uint64_t end = where == IMDB_VAT_HELD ? at.v->end : at.g->end[at.row];
+                uint64_t begin = where == IMDB_VAT_HELD ? at.v->begin : gi->begin[at.row];
+                uint64_t end = where == IMDB_VAT_HELD ? at.v->end : gi->end[at.row];
                 if (fetch_row(x, t, chain[i], vals, e)) return e->code;
                 imdb_cell *row = res_row(r, e);
                 if (!row) return e->code;
@@ -2754,7 +2805,7 @@ static bool is_write(uint8_t k)
            k == ST_DROP_INDEX || k == ST_ALTER_RETENTION;
 }
 
-int imdb_exec_one(imdb_session *ss, const char *sql, size_t len, const imdb_value *params, uint32_t nparams,
+static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const imdb_value *params, uint32_t nparams,
                   imdb_result *r, imdb_err *e)
 {
     imdb_result_init(r);
@@ -3094,6 +3145,18 @@ done:
     xfree(&x);
     imdb_sql_stmt_free(st);
     imdb_free(st);
+    return rc;
+}
+
+/* One operation (stage 3c-1): the segment cache trims when the outermost ends, so a statement's result holds no
+ * pointer into a segment's image (res_put copies TEXT). */
+int imdb_exec_one(imdb_session *ss, const char *sql, size_t len, const imdb_value *params, uint32_t nparams,
+                  imdb_result *r, imdb_err *e)
+{
+    imdb_db *db = ss->db;
+    imdb_op_enter(db);
+    int rc = exec_one_body(ss, sql, len, params, nparams, r, e);
+    imdb_op_leave(db);
     return rc;
 }
 

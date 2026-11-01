@@ -160,6 +160,9 @@ int main(int argc, char **argv)
     imdb_open_opts o = {.sync = 1};
     const char *win = getenv("IMDB_SOAK_WINDOW"); /* stage 3b: the memory window, seconds (unset: the default) */
     if (win && atol(win) > 0) o.mem_window_us = (uint64_t)atol(win) * 1000000u;
+    const char *sc = getenv("IMDB_SOAK_SEG_CACHE"); /* stage 3c-1: the segment cache's budget, bytes or all (unset: 256 MB) */
+    if (sc && strcmp(sc, "all") == 0) o.seg_cache_bytes = UINT64_MAX;
+    else if (sc && strtoull(sc, NULL, 10) > 0) o.seg_cache_bytes = strtoull(sc, NULL, 10);
     uint64_t every_ckpt = 50000, every_erase = 20000;
     const char *events = NULL;
     long retention = 0; /* the table's RETENTION in seconds (load; 0: the engine's default) */
@@ -281,11 +284,12 @@ int main(int argc, char **argv)
             if (now() >= next_stats) {
                 imdb_mem_report r;
                 imdb_mem(db, &r);
-                fprintf(sf, "%.1f %llu %llu %llu %llu %llu %llu %llu %llu %ld\n", now() - t0,
+                fprintf(sf, "%.1f %llu %llu %llu %llu %llu %llu %llu %llu %ld %llu %llu %llu\n", now() - t0,
                         (unsigned long long)db->seq, (unsigned long long)r.versions, (unsigned long long)r.rows,
                         (unsigned long long)r.indexes, (unsigned long long)r.segments,
                         (unsigned long long)r.commits, (unsigned long long)r.txns, (unsigned long long)r.total,
-                        rss_kb());
+                        rss_kb(), (unsigned long long)r.seg_images, (unsigned long long)r.seg_loads,
+                        (unsigned long long)r.seg_load_bytes);
                 fflush(sf);
                 next_stats = now() + 10;
             }

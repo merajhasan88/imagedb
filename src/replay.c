@@ -81,17 +81,50 @@ static int retire_rule(const imdb_db *db, uint64_t b, uint64_t seq, imdb_err *e)
     return IMDB_OK;
 }
 
+/* What the checks of a commit's ops read of a version, wherever it is (held, or the lake's alone: stage 3b), so they
+ * never read the store alone: where (IMDB_VAT_NONE: nowhere), begin, end, whether it is a stub, and (want_commit) its
+ * commitment. Negative: the lake's image of it could not be had (stage 3c-1). */
+typedef struct vfacts {
+    int where;
+    uint64_t begin, end;
+    bool stub;
+    const uint8_t *commit;
+} vfacts;
+
+static int v_facts(imdb_table *t, uint64_t vid, bool want_commit, vfacts *f, imdb_err *e)
+{
+    memset(f, 0, sizeof *f);
+    imdb_vloc at;
+    if ((f->where = imdb_v_find(t, vid, &at, e)) < 0) return f->where;
+    if (f->where == IMDB_VAT_NONE) return IMDB_OK;
+    if (f->where == IMDB_VAT_HELD) {
+        f->begin = at.v->begin;
+        f->end = at.v->end;
+        f->stub = (at.v->flags & IMDB_V_STUB) != 0;
+    } else {
+        const imdb_segimg *gi = imdb_seg_pin(t, at.g, e);
+        if (!gi) return e->code;
+        f->begin = gi->begin[at.row];
+        f->end = gi->end[at.row];
+        f->stub = (gi->flags[at.row] & IMDB_SEG_STUB) != 0;
+    }
+    return want_commit ? imdb_v_commit(t, vid, &f->commit, e) : IMDB_OK;
+}
+
 static int apply_end(imdb_table *t, uint64_t vid, const uint8_t commit[32], uint64_t seq, imdb_err *e)
 {
     imdb_vloc at; /* unknown, or retired: a log never ends one twice; the lake's alone (stage 3b): it ended */
-    int where = imdb_v_find(t, vid, &at);
+    int where = imdb_v_find(t, vid, &at, e);
+    if (where < 0) return where;
     if (where == IMDB_VAT_NONE)
         return imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: delete of unknown version", (unsigned long long)seq);
     imdb_version *v = at.v;
     if (!v || v->end != IMDB_LIVE)
         return imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: delete of a version that is not live (table %s)",
                          (unsigned long long)seq, t->s.name);
-    if (memcmp(imdb_v_commit(t, vid), commit, 32) != 0)
+    const uint8_t *cm; /* before any change */
+    if (imdb_v_commit(t, vid, &cm, e)) return e->code;
+    if (memcmp(cm, commit, 32) != 0)
         return imdb_fail(e, IMDB_ERR_VERIFY, "commit %llu: delete precondition failed: version commitment differs",
                          (unsigned long long)seq);
     v->end = seq;
@@ -100,23 +133,7 @@ static int apply_end(imdb_table *t, uint64_t vid, const uint8_t commit[32], uint
     return IMDB_OK;
 }
 
-/* a version's end, and whether it began at seq, wherever it is (held, or the lake's alone: stage 3b), for the checks
- * after a commit's ops, which must not read the store alone (0, false: it is nowhere) */
-static uint64_t v_end(const imdb_table *t, uint64_t vid)
-{
-    imdb_vloc at;
-    int where = imdb_v_find(t, vid, &at);
-    return where == IMDB_VAT_HELD ? at.v->end : where == IMDB_VAT_LAKE ? at.g->end[at.row] : 0;
-}
-
-static bool v_begun(const imdb_table *t, uint64_t vid, uint64_t seq)
-{
-    imdb_vloc at;
-    int where = imdb_v_find(t, vid, &at);
-    return where == IMDB_VAT_HELD ? at.v->begin == seq : where == IMDB_VAT_LAKE && at.g->begin[at.row] == seq;
-}
-
-int imdb_apply_commit(imdb_db *db, imdb_commit_rec *c, const imdb_commit_pre *pre, imdb_err *e)
+static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_pre *pre, imdb_err *e)
 {
     if (c->seq != db->seq + 1)
         return imdb_fail(e, IMDB_ERR_VERIFY, "commit %llu out of order (expected %llu)", (unsigned long long)c->seq,
@@ -258,26 +275,26 @@ int imdb_apply_commit(imdb_db *db, imdb_commit_rec *c, const imdb_commit_pre *pr
             for (uint32_t k = 0; k < o->n_erase && !rc; k++) {
                 const imdb_erase_ent *en = &o->erase[k];
                 imdb_table *et = imdb_table_by_id(db, en->table);
-                imdb_vloc at; /* held, or (stage 3b) the lake's alone: an ended version past the memory window */
-                int where = et ? imdb_v_find(et, en->vid, &at) : IMDB_VAT_NONE;
-                if (where == IMDB_VAT_NONE) {
+                vfacts f; /* held, or (stage 3b) the lake's alone: an ended version past the memory window */
+                if (et && (rc = v_facts(et, en->vid, true, &f, e))) break;
+                if (!et || f.where == IMDB_VAT_NONE) {
                     rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: ERASE names an unknown version", (unsigned long long)seq);
                     break;
                 }
-                if (memcmp(imdb_v_commit(et, en->vid), en->commit, 32) != 0) {
+                if (!f.commit || memcmp(f.commit, en->commit, 32) != 0) {
                     rc = imdb_fail(e, IMDB_ERR_VERIFY, "commit %llu: ERASE commitment mismatch", (unsigned long long)seq);
                     break;
                 }
-                imdb_version *v = at.v;
-                if (v ? v->end == IMDB_LIVE : at.g->end[at.row] == IMDB_LIVE) {
+                imdb_version *v = f.where == IMDB_VAT_HELD ? imdb_vh(et, en->vid) : NULL;
+                if (f.end == IMDB_LIVE) {
                     rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: ERASE of a live version", (unsigned long long)seq);
                     break;
                 }
                 if (v && (v->flags & IMDB_V_PENDING_AUTH)) {
                     db->pending_auth--;
-                } else if (v ? !(v->flags & IMDB_V_STUB) : !(at.g->flags[at.row] & IMDB_SEG_STUB)) {
+                } else if (!f.stub) {
                     db->needs_redaction = true; /* its payload is still in the segment of commit begin */
-                    if ((rc = imdb_redact_note(db, v ? v->begin : at.g->begin[at.row], e))) break;
+                    if ((rc = imdb_redact_note(db, f.begin, e))) break;
                 }
                 if (v) imdb_stub_version(et, en->vid); /* the lake's alone: its segment is rewritten below */
             }
@@ -330,31 +347,49 @@ int imdb_apply_commit(imdb_db *db, imdb_commit_rec *c, const imdb_commit_pre *pr
         const imdb_op *o = &c->ops[i];
         imdb_table *t = imdb_table_by_id(db, o->table);
         bool ok = true;
+        vfacts fa, fb;
         switch (o->code) {
         case IMDB_OP_INSERT:
-            ok = t && v_begun(t, o->vid, seq) && !memcmp(imdb_v_commit(t, o->vid), o->commit, 32) &&
-                 (v_end(t, o->vid) == IMDB_LIVE || v_end(t, o->vid) == seq);
+            if (!t) {
+                ok = false;
+                break;
+            }
+            if ((rc = v_facts(t, o->vid, true, &fa, e))) break;
+            ok = fa.where != IMDB_VAT_NONE && fa.begin == seq && fa.commit && !memcmp(fa.commit, o->commit, 32) &&
+                 (fa.end == IMDB_LIVE || fa.end == seq);
             break;
         case IMDB_OP_DELETE:
-            ok = t && v_end(t, o->vid) == seq;
+            if (!t) {
+                ok = false;
+                break;
+            }
+            if ((rc = v_facts(t, o->vid, false, &fa, e))) break;
+            ok = fa.where != IMDB_VAT_NONE && fa.end == seq;
             break;
         case IMDB_OP_UPDATE:
-            ok = t && v_end(t, o->vid) == seq && v_begun(t, o->new_vid, seq) &&
-                 !memcmp(imdb_v_commit(t, o->new_vid), o->new_commit, 32);
+            if (!t) {
+                ok = false;
+                break;
+            }
+            if ((rc = v_facts(t, o->vid, false, &fa, e)) || (rc = v_facts(t, o->new_vid, true, &fb, e))) break;
+            ok = fa.where != IMDB_VAT_NONE && fa.end == seq && fb.where != IMDB_VAT_NONE && fb.begin == seq && fb.commit &&
+                 !memcmp(fb.commit, o->new_commit, 32);
             break;
         case IMDB_OP_ERASE:
             for (uint32_t k = 0; k < o->n_erase && ok; k++) {
                 imdb_table *et = imdb_table_by_id(db, o->erase[k].table);
-                imdb_vloc at;
-                int where = et ? imdb_v_find(et, o->erase[k].vid, &at) : IMDB_VAT_NONE;
-                ok = where == IMDB_VAT_HELD ? (at.v->flags & IMDB_V_STUB) != 0
-                                            : where == IMDB_VAT_LAKE && (at.g->flags[at.row] & IMDB_SEG_STUB);
+                if (!et) {
+                    ok = false;
+                    break;
+                }
+                if ((rc = v_facts(et, o->erase[k].vid, false, &fa, e))) break;
+                ok = fa.where != IMDB_VAT_NONE && fa.stub;
             }
             break;
         default:
             break;
         }
-        if (!ok)
+        if (!rc && !ok)
             rc = imdb_fail(e, IMDB_ERR_VERIFY, "commit %llu: version store does not reflect op %u", (unsigned long long)seq, i);
     }
     if (rc) goto out;
@@ -388,6 +423,15 @@ out:
     imdb_free(post);
     imdb_free(delta);
     imdb_free(touched);
+    return rc;
+}
+
+/* one operation (stage 3c-1): the segment cache trims when the outermost ends */
+int imdb_apply_commit(imdb_db *db, imdb_commit_rec *c, const imdb_commit_pre *pre, imdb_err *e)
+{
+    imdb_op_enter(db);
+    int rc = apply_commit_body(db, c, pre, e);
+    imdb_op_leave(db);
     return rc;
 }
 
@@ -903,13 +947,16 @@ static int redact_segment(imdb_db *db, size_t si, imdb_err *e)
             if (!imdb_op_has_payload(o->code) || o->pkind != IMDB_PAYLOAD_ROW) continue;
             imdb_table *t = imdb_table_by_id(db, o->table);
             uint64_t vid = o->code == IMDB_OP_INSERT ? o->vid : o->new_vid;
-            imdb_vloc at; /* a stub the store holds, or one only the lake does (stage 3b) */
-            int where = t ? imdb_v_find(t, vid, &at) : IMDB_VAT_NONE;
-            if (where == IMDB_VAT_HELD ? (at.v->flags & IMDB_V_STUB) != 0
-                                       : where == IMDB_VAT_LAKE && (at.g->flags[at.row] & IMDB_SEG_STUB)) {
+            vfacts f; /* a stub the store holds, or one only the lake does (stage 3b) */
+            if (t && (rc = v_facts(t, vid, false, &f, e))) break;
+            if (t && f.where != IMDB_VAT_NONE && f.stub) {
                 o->pkind = IMDB_PAYLOAD_REDACTED;
                 changed = true;
             }
+        }
+        if (rc) {
+            imdb_commit_free(&c);
+            break;
         }
         if (changed) {
             pay.len = 0;
@@ -984,7 +1031,7 @@ static int cmp_u64(const void *a, const void *b)
  * last redaction (their creating commits were noted), then publishes a lake
  * state that waited for it. With nothing noted (state from a crash before the
  * notes existed), every segment is checked. */
-int imdb_redact_log(imdb_db *db, imdb_err *e)
+static int redact_log_body(imdb_db *db, imdb_err *e)
 {
     if (db->read_only) return imdb_fail(e, IMDB_ERR_STATE, "database opened read-only");
     int rc = IMDB_OK;
@@ -1008,6 +1055,15 @@ int imdb_redact_log(imdb_db *db, imdb_err *e)
     db->nredact = 0;
     db->needs_redaction = false;
     return imdb_lake_publish_pending(db, e);
+}
+
+/* one operation (stage 3c-1): the segment cache trims when the outermost ends */
+int imdb_redact_log(imdb_db *db, imdb_err *e)
+{
+    imdb_op_enter(db);
+    int rc = redact_log_body(db, e);
+    imdb_op_leave(db);
+    return rc;
 }
 
 /* ---- shipping --------------------------------------------------------------------- */

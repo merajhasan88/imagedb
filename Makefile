@@ -124,13 +124,18 @@ lint:
 # The fault group (t_fault.c) runs in the first pass only: the second repeats the kernels in their
 # C references, which the fault handling does not depend on. The third evicts at every publish (IMDB_EVICT=eager,
 # stage 3b): every read below the memory floor then goes to the lake, as a long-running copy's would.
+# The fourth and fifth keep no segment image between operations (IMDB_SEGCACHE=tiny, stage 3c-1), without the eager
+# mode and with it: every image is read again at its next use, under the held versions' ends and below the floor.
 test: lint $(TBIN) $(BIN) $(AUDIT) $(FORGE)
 	IMDB_AUDIT_BIN=$(AUDIT) $(TBIN)
 	IMDB_FAULT_SKIP=1 IMDB_NO_SIMD=1 IMDB_THREADS=1 $(TBIN)
 	IMDB_FAULT_SKIP=1 IMDB_EVICT=eager IMDB_AUDIT_BIN=$(AUDIT) $(TBIN)
+	IMDB_FAULT_SKIP=1 IMDB_SEGCACHE=tiny IMDB_AUDIT_BIN=$(AUDIT) $(TBIN)
+	IMDB_FAULT_SKIP=1 IMDB_SEGCACHE=tiny IMDB_EVICT=eager IMDB_AUDIT_BIN=$(AUDIT) $(TBIN)
 	bash tests/integration/run.sh $(BIN)
 	IMDB_NO_SIMD=1 IMDB_THREADS=1 bash tests/integration/run.sh $(BIN)
 	IMDB_EVICT=eager bash tests/integration/run.sh $(BIN)
+	IMDB_SEGCACHE=tiny bash tests/integration/run.sh $(BIN)
 	bash tests/integration/audit_reject.sh $(BIN)
 
 integration: $(BIN) $(AUDIT) $(FORGE)
@@ -159,9 +164,12 @@ san: lint
 	IMDB_AUDIT_BIN=build-san/imagedb-audit $(SANRUN) build-san/test_unit
 	IMDB_FAULT_SKIP=1 IMDB_NO_SIMD=1 IMDB_THREADS=1 $(SANRUN) build-san/test_unit
 	IMDB_FAULT_SKIP=1 IMDB_EVICT=eager IMDB_AUDIT_BIN=build-san/imagedb-audit $(SANRUN) build-san/test_unit
+	IMDB_FAULT_SKIP=1 IMDB_SEGCACHE=tiny IMDB_AUDIT_BIN=build-san/imagedb-audit $(SANRUN) build-san/test_unit
+	IMDB_FAULT_SKIP=1 IMDB_SEGCACHE=tiny IMDB_EVICT=eager IMDB_AUDIT_BIN=build-san/imagedb-audit $(SANRUN) build-san/test_unit
 	bash tests/integration/run.sh build-san/imagedb
 	IMDB_NO_SIMD=1 IMDB_THREADS=1 bash tests/integration/run.sh build-san/imagedb
 	IMDB_EVICT=eager bash tests/integration/run.sh build-san/imagedb
+	IMDB_SEGCACHE=tiny bash tests/integration/run.sh build-san/imagedb
 	bash tests/integration/audit_reject.sh build-san/imagedb
 
 FUZZ_TARGETS = $(patsubst fuzz/%.c,build-fuzz/%,$(wildcard fuzz/fuzz_*.c))

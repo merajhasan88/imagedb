@@ -698,7 +698,10 @@ static uint64_t held_of(imdb_db *db, const char *name)
     if (n != t->nheld) return UINT64_MAX;
     for (uint64_t vid = 0; vid < t->nver; vid++) {
         imdb_vloc at;
-        kept += imdb_v_find(t, vid, &at) != IMDB_VAT_NONE;
+        imdb_err e = {0};
+        int where = imdb_v_find(t, vid, &at, &e);
+        if (where < 0) return UINT64_MAX;
+        kept += where != IMDB_VAT_NONE;
     }
     return kept;
 }

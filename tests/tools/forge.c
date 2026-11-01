@@ -412,11 +412,12 @@ static void lie_tombstone(const char *dir)
             uint8_t *al = aligned_alloc(32, (sn + 31) & ~(size_t)31);
             memcpy(al, raw, sn);
             imdb_segment *g;
-            if (imdb_segment_parse(&mt->s, al, sn, &g, &e)) die("segment", &e);
+            if (imdb_segment_parse(&mt->s, al, sn, NULL, &g, &e)) die("segment", &e);
+            const imdb_segimg *gi = imdb_seg_pin(NULL, g, &e); /* a parse of its own: apart, resident */
             size_t at = SIZE_MAX;
             for (uint32_t r = 0; r < g->nrows && at == SIZE_MAX; r++)
-                if (g->flags[r] == IMDB_SEG_PURGED)
-                    at = (size_t)((const uint8_t *)&g->col[mt->s.subject].i64[r] - g->bytes);
+                if (gi->flags[r] == IMDB_SEG_PURGED)
+                    at = (size_t)((const uint8_t *)&gi->col[mt->s.subject].i64[r] - gi->bytes);
             imdb_segment_free(g);
             if (at == SIZE_MAX) {
                 free(raw);

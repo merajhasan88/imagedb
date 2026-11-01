@@ -30,6 +30,7 @@
 #define IMDB_MAX_VERSIONS       (1ull << 40) /* vids one table hands out: bounds its chunk directory (8 B a 2^16) */
 #define IMDB_MEM_WINDOW_US      (600ull * 1000000) /* stage 3b: a version ended within it stays in memory (per process) */
 #define IMDB_EVICT_MIN          4096u        /* an eviction pass waits for this many versions ended since the last */
+#define IMDB_SEG_CACHE_BYTES    (256ull << 20) /* stage 3c-1: the lake's segment images kept in memory between operations */
 #define IMDB_REPLICA_HOLD_MS    (24ll * 3600 * 1000) /* a replica heard from within this keeps the log it still needs */
 #define IMDB_RETIRE_RECHECK_US  1000000u /* a policy RETIRE a replica held back looks again after this */
 #define IMDB_FLOOR_STRIDE       4096u        /* a manifest kept for a future log floor: the first publish of each such

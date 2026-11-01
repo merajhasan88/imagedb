@@ -115,12 +115,12 @@ int imdb_hmap_put(imdb_hmap *m, const imdb_value *k, uint64_t val, imdb_err *e)
     return IMDB_OK;
 }
 
-bool imdb_hmap_del(imdb_hmap *m, const imdb_value *k)
+/* slot i leaves; backward-shift deletion keeps probe sequences intact without tombstones: a later entry of the
+ * cluster may move into i (imdb_hmap_prune looks at i again) */
+static void slot_remove(imdb_hmap *m, size_t i)
 {
-    uint64_t h = khash(k);
-    imdb_hslot *s = find(m, k, h);
-    if (!s) return false;
-    size_t mask = m->cap - 1, i = (size_t)(s - m->slots);
+    size_t mask = m->cap - 1;
+    imdb_hslot *s = &m->slots[i];
     if (s->skey) {
         imdb_wipe(s->skey, s->slen);
         imdb_free(s->skey);
@@ -128,7 +128,6 @@ bool imdb_hmap_del(imdb_hmap *m, const imdb_value *k)
     }
     memset(s, 0, sizeof *s);
     m->count--;
-    /* backward-shift deletion keeps probe sequences intact without tombstones */
     for (size_t j = (i + 1) & mask; m->slots[j].hash; j = (j + 1) & mask) {
         size_t home = m->slots[j].hash & mask;
         bool between = (i <= j) ? (i < home && home <= j) : (i < home || home <= j);
@@ -137,5 +136,27 @@ bool imdb_hmap_del(imdb_hmap *m, const imdb_value *k)
         memset(&m->slots[j], 0, sizeof m->slots[j]);
         i = j;
     }
+}
+
+bool imdb_hmap_del(imdb_hmap *m, const imdb_value *k)
+{
+    uint64_t h = khash(k);
+    imdb_hslot *s = find(m, k, h);
+    if (!s) return false;
+    slot_remove(m, (size_t)(s - m->slots));
     return true;
+}
+
+size_t imdb_hmap_prune(imdb_hmap *m, bool (*keep)(void *ctx, uint64_t val), void *ctx)
+{
+    size_t n = 0;
+    for (size_t i = 0; m->slots && i < m->cap;) {
+        if (m->slots[i].hash && !keep(ctx, m->slots[i].val)) { /* i again: an entry may have moved into it */
+            slot_remove(m, i);
+            n++;
+        } else {
+            i++;
+        }
+    }
+    return n;
 }

@@ -231,3 +231,22 @@ uint64_t imdb_oidx_growth(const imdb_oidx *x, uint64_t k)
     }
     return g;
 }
+
+int imdb_oidx_filter_into(const imdb_oidx *x, bool (*keep)(void *ctx, uint64_t vid), void *ctx, imdb_oidx *out,
+                          imdb_err *e)
+{
+    size_t w = (size_t)x->nk + 1;
+    uint64_t n = 0;
+    for (int i = 0; i < IMDB_OIDX_LEVELS; i++)
+        for (uint64_t j = 0; x->run[i] && j < ((uint64_t)IMDB_OIDX_BASE << i); j++) n += keep(ctx, x->run[i][j * w + x->nk]);
+    for (uint32_t j = 0; j < x->nbuf; j++) n += keep(ctx, x->buf[j * w + x->nk]);
+    uint64_t *all = imdb_alloc_array(n ? n : 1, imdb_oidx_entry_bytes(x->nk), e);
+    if (!all) return e->code;
+    uint64_t m = 0;
+    for (int i = 0; i < IMDB_OIDX_LEVELS; i++)
+        for (uint64_t j = 0; x->run[i] && j < ((uint64_t)IMDB_OIDX_BASE << i); j++)
+            if (keep(ctx, x->run[i][j * w + x->nk])) memcpy(all + m++ * w, x->run[i] + j * w, w * sizeof *all);
+    for (uint32_t j = 0; j < x->nbuf; j++)
+        if (keep(ctx, x->buf[j * w + x->nk])) memcpy(all + m++ * w, x->buf + j * w, w * sizeof *all);
+    return imdb_oidx_build(out, all, n, e); /* takes all over, sorts it */
+}

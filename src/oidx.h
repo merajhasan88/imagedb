@@ -38,6 +38,10 @@ int imdb_oidx_range(const imdb_oidx *x, const uint64_t *lo, const uint64_t *hi,
 /* how many entries that range holds, in O(log^2 n): the planner's estimate (sql_exec.c) */
 uint64_t imdb_oidx_count(const imdb_oidx *x, const uint64_t *lo, const uint64_t *hi);
 uint64_t imdb_oidx_bytes(const imdb_oidx *x); /* what it holds, for imdb_mem */
+/* out (initialised, nk as x's) holds the entries of x whose vid keep() accepts: the words of each are x's own, so no
+ * key is read (the stage 3b eviction: a version leaving memory leaves its index without its row's image). x is unchanged. */
+int imdb_oidx_filter_into(const imdb_oidx *x, bool (*keep)(void *ctx, uint64_t vid), void *ctx, imdb_oidx *out,
+                          imdb_err *e);
 /* what k more inserts allocate at most (every carry they set off, counted whole), for admission */
 uint64_t imdb_oidx_growth(const imdb_oidx *x, uint64_t k);
 /* the bytes one entry takes with nk key words, for admission before the structure exists */
