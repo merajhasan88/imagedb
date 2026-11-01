@@ -263,6 +263,38 @@ if "$BIN" ship "$E/p" --after 5 | "$BIN" apply "$E/q" >/dev/null 2>&1; then
 fi
 echo "rotation (epoch 1) and promotion (epoch 2) verified on all three; the old writer's fork is refused"
 
+step "backup and restore: an encrypted snapshot, a test restore, a restored copy promoted"
+B=$WORK/backup
+mkdir -p "$B/scratch"
+BROOT=$("$BIN" root-key "$B/root.key" 2>/dev/null)
+"$BIN" init "$B/p" --root "$BROOT" >/dev/null
+bsql() { "$BIN" sql "$B/$1" --nosync -c "$2" >/dev/null; }
+bsql p "CREATE TABLE acct (id INT64 PRIMARY KEY, owner INT64 SUBJECT, memo TEXT);"
+bsql p "INSERT INTO acct VALUES (1, 42, 'BACKUPMARKER-1'), (2, 7, 'BACKUPMARKER-2');"
+bsql p "CHECKPOINT;"
+bsql p "INSERT INTO acct VALUES (3, 42, 'BACKUPMARKER-3');"
+"$BIN" backup-key "$B/backup.key" >/dev/null 2>&1
+out=$("$BIN" backup "$B/p" --key "$B/backup.key" --out "$B/full.bak")
+echo "$out" | grep -q "a seed, then the commits after it" || fail "the backup is not a snapshot: $out"
+! grep -q BACKUPMARKER "$B/full.bak" || fail "the backup holds a row in the clear"
+"$BIN" backup-verify --key "$B/backup.key" --scratch "$B/scratch" "$B/full.bak" | grep -q "VERIFY passed" ||
+  fail "backup-verify did not pass"
+[ -z "$(ls -A "$B/scratch")" ] || fail "backup-verify left its copy"
+"$BIN" restore "$B/r" --key "$B/backup.key" "$B/full.bak" >/dev/null 2>&1 || fail "the restore failed"
+"$BIN" verify "$B/r" >/dev/null || fail "engine VERIFY fails on the restored copy"
+"$AUD" verify "$B/r" >/dev/null || fail "the auditor rejects the restored copy"
+[ "$("$BIN" info "$B/r" | awk '/^digest/{print $2}')" = "$("$BIN" info "$B/p" | awk '/^digest/{print $2}')" ] ||
+  fail "the restored copy's digest differs from the primary's"
+if "$BIN" restore "$B/r" --key "$B/backup.key" "$B/full.bak" >/dev/null 2>&1; then fail "a restore over an existing copy"; fi
+"$BIN" backup-key "$B/other.key" >/dev/null 2>&1
+if "$BIN" restore "$B/r2" --key "$B/other.key" "$B/full.bak" >/dev/null 2>&1; then fail "a restore under another key"; fi
+[ ! -e "$B/r2" ] && [ ! -e "$B/r2.tmp" ] || fail "a refused restore left a directory"
+"$BIN" promote "$B/r" --root-key "$B/root.key" --old-writer-stopped >/dev/null
+bsql r "INSERT INTO acct VALUES (4, 7, 'BACKUPMARKER-4');"
+"$BIN" verify "$B/r" >/dev/null || fail "engine VERIFY fails on the promoted copy"
+"$AUD" verify "$B/r" >/dev/null || fail "the auditor rejects the promoted copy"
+echo "backup (a snapshot, sealed: no row in the clear), backup-verify, restore (the primary's digest), another key refused, promoted and written"
+
 step "tampering is detected by both verifiers"
 T=$WORK/tampered
 cp -a "$P" "$T"

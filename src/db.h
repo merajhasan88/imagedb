@@ -20,6 +20,7 @@
 #include "log.h"
 #include "lthash.h"
 #include "sign.h"
+#include "stream.h"
 
 /* "Not deleted" marker for version.end. INT64_MAX (not UINT64_MAX) so the
  * same bits compare correctly as signed int64 in the SIMD range filters. It
@@ -638,6 +639,17 @@ typedef struct imdb_ship_opts {
     int ackfd;
 } imdb_ship_opts;
 int imdb_ship_ex(const char *path, uint64_t after_seq, int fd, const imdb_ship_opts *o, imdb_err *e);
+/* What a shipping sent (imdb_ship_to). */
+typedef struct imdb_ship_result {
+    uint64_t seeded;          /* a seed was sent (the log cut below commit 1), taken at this commit: the stream ended there */
+    uint8_t seeded_hash[32];  /* that commit's hash */
+    uint64_t last_seq;        /* the last commit sent (0: none) */
+    uint8_t last_hash[32];
+    bool cut;                 /* refused: the log before what was asked for is cut here (the replica must be seeded) */
+} imdb_ship_result;
+/* imdb_ship_ex into a sink (stream.h: a backup's sealing writer), reporting what it sent (res may be NULL). */
+int imdb_ship_to(const char *path, uint64_t after_seq, const imdb_sink *out, const imdb_ship_opts *o,
+                 imdb_ship_result *res, imdb_err *e);
 /* Applies frames read from fd; returns after EOF. *applied gets the durable
  * prefix count, even on error. EOF before redaction authorisation returns
  * IMDB_ERR_AUTH; resume from db->seq, and do not read until authorisation is
@@ -661,6 +673,9 @@ typedef struct imdb_apply_opts {
     uint64_t seeded; /* out: the stream was a seed, taken at this commit (seed.h): the handle is stale, reopen */
 } imdb_apply_opts;
 int imdb_apply_stream_ex(imdb_db *db, int fd, uint64_t *applied, imdb_apply_opts *o, imdb_err *e);
+/* imdb_apply_stream_ex from a caller's source (stream.h; its end is the stream's): a source cannot tell whether more is
+ * ready now, so its points come every o->every commits and at its end (a restore's). */
+int imdb_apply_source(imdb_db *db, imdb_read_fn read, void *ctx, uint64_t *applied, imdb_apply_opts *o, imdb_err *e);
 /* The last commit through which physical cleanup is complete: every ERASE up to it has left this
  * directory's files (the log redacted, the lake rewritten and published, the old objects removed;
  * free disk blocks may still hold the bytes, until crypto-shredding, deferred.md R6). */

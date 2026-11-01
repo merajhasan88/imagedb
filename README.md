@@ -237,6 +237,47 @@ superaccumulator). The two agree bit for bit, out-of-range results included.
   window is not closed. **Stop and fence off the old writer before promoting**;
   this implementation does not provide exclusive failover across hosts.
 
+## Backup and restore
+
+```sh
+build/imagedb backup-key /safe/backup.key            # once: 32 random bytes (0400); prints the key's id
+build/imagedb backup /data/p --key /safe/backup.key --out /backups/p-20261101.bak
+build/imagedb backup-verify --key /safe/backup.key --scratch /tmp/check /backups/p-20261101.bak
+build/imagedb restore /data/p2 --key /safe/backup.key /backups/p-20261101.bak
+build/imagedb promote /data/p2 --root-key /offline/root.key --old-writer-stopped   # to write to the copy
+```
+
+- A backup runs beside the database, from its files: the last published snapshot (the manifest and lake objects of
+  the last CHECKPOINT, with that commit's signed header and the writer keys up to it, as a new replica is seeded) and
+  every commit after it that is durable when the backup ends. A database that never published a snapshot is backed
+  up as its log from commit 1.
+- The file is sealed with XChaCha20-Poly1305 under the key, in chunks of 1 MiB whose place in the file is bound into
+  each tag: a damaged, moved, missing or added chunk is refused, and a file that ends before its summary is
+  incomplete, never a shorter backup. Without the key a backup cannot be read or restored: keep the key apart from
+  the backups (and the root key apart from both).
+- It is written as FILE.tmp, synced, then renamed: a crash leaves FILE.tmp (remove it before the next backup), never
+  a partial FILE. When the database publishes and retires its log under a running backup, the backup starts again
+  from the newer snapshot (three attempts).
+- `backup-verify` is a test restore: the backup restored into a new directory under `--scratch`, VERIFY run on it,
+  the directory removed. Run it after each backup: `backup` checks its own seal and frames, but only a restore reads
+  the snapshot's seed.
+- `restore` reads every file whole first (a damaged one is refused before anything is written), then applies the
+  backup as a replica applies a stream, every commit's signature, chain and digest checked, into DEST.tmp, makes it
+  durable and renames it to DEST. A crash leaves DEST.tmp: remove it and restore again.
+- **The copy** is a replica seeded at the snapshot's commit S, holding the database as it was at the backup's last
+  commit (the same view token). Its history starts at S: VERIFY and the auditor start there, and `AS OF` an earlier
+  commit is refused on it ("commit N is in no log segment"), where the source, which holds its whole log, answers.
+- **No secret is in a backup**: the writer key stays with the primary. The copy becomes writable by promotion with
+  the offline root key (a new signed epoch; the root key's ledger lets each epoch be taken once, so two restores
+  cannot both become writers). A database made without `init --root` restores to a copy that stays read-only.
+  Not in a backup: `replicas/` (enrol replicas again with `replica-add`), the anchor (give the copy a new one), pins.
+- What is lost when the database is: the commits after the backup's last (its RPO is the time since the last
+  backup). A restore's time follows the snapshot's size and the commits after it, not the history: a database of
+  373,510 commits (200,000 live rows, 380 MB) restored in 20 s from its snapshot and the 13,509 commits after it,
+  against 151 s to replay its whole log (a USB SSD, 2026-11-01; its backup took 3.4 s).
+- An ERASE after a backup does not reach the backup: delete the file, or destroy the key, which makes every backup
+  sealed under it unreadable. `SHOW ERASURE` counts backups among the copies it does not track.
+
 ## Erasure
 
 DELETE keeps history. COMPACT ... PURGE removes old payloads from the lake but

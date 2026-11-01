@@ -74,6 +74,15 @@ int imdb_stream_next(imdb_stream *s, uint64_t expect_seq, const uint8_t prev[32]
 /* imdb_read_fn over a file descriptor (ctx = int *). */
 int imdb_stream_fd_read(void *ctx, void *buf, size_t n, size_t *got, imdb_err *e);
 
+/* Writes all n bytes or fails: where ship and the seed put the stream (a descriptor, or a backup's sealing writer). */
+typedef int (*imdb_write_fn)(void *ctx, const void *p, size_t n, imdb_err *e);
+typedef struct imdb_sink {
+    imdb_write_fn write;
+    void *ctx;
+} imdb_sink;
+/* imdb_write_fn over a file descriptor (ctx = int *). */
+int imdb_sink_fd_write(void *ctx, const void *p, size_t n, imdb_err *e);
+
 /* The same, buffered: one fixed buffer, refilled by a single read() at a time,
  * so a follower never waits for more than the pipe holds and a row costs no
  * system call of its own. Read-ahead lands only in this buffer: the reader still

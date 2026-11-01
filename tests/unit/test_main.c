@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "../../src/backup.h"
 #include "../../src/db.h"
 #include "test.h"
 
@@ -91,6 +92,7 @@ int main(int argc, char **argv)
         {"retain", retain_tests, &retain_ntests},
         {"evict", evict_tests, &evict_ntests},
         {"segcache", segcache_tests, &segcache_ntests},
+        {"backup", backup_tests, &backup_ntests},
     };
     int failed = 0, run = 0;
     for (size_t g = 0; g < sizeof groups / sizeof *groups; g++) {
@@ -101,6 +103,7 @@ int main(int argc, char **argv)
             g_test_failed = 0;
             imdb_log_set_tagged(true); /* a test of the untagged format turns it off for itself only */
             imdb_clock_offset(0);      /* a test that moves the clock (expiry) moves it for itself only */
+            imdb_backup_test_between(NULL, NULL); /* a test that cuts between a backup's parts does it for itself only */
             g_errmsg[0] = 0;
             printf("[%s] %s\n", groups[g].name, tc->name);
             fflush(stdout);

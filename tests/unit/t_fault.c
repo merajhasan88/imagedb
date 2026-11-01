@@ -36,6 +36,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../../src/backup.h"
 #include "../../src/lake.h"
 #include "../../src/logdir.h"
 #include "../../src/repl.h"
@@ -1716,6 +1717,177 @@ static const char *strict_check(const char *dir, const frun *r)
     return NULL;
 }
 
+
+/* ---- backup and restore (src/backup.c) ----------------------------------------------------------------- */
+
+/* a primary with a snapshot and two commits after it, a backup key beside it; with_file: its backup too, made
+ * without faults (the restore scenario's input), and the commit it ends at (backup_seq) */
+static void setup_backup_common(const char *base, bool with_file)
+{
+    setup_txns(base);
+    imdb_db *db = child_open(dir_in(base, "p"), 1);
+    if (!db) return;
+    imdb_err e = {0};
+    int rc = imdb_checkpoint(db, &e);
+    if (!rc) rc = ins1(db, 4, 7, 400, "after-the-snapshot");
+    if (!rc) rc = ins1(db, 5, 9, 500, "after-the-snapshot-too");
+    imdb_close(db);
+    uint8_t id[32], key[IMDB_BACKUP_KEY_LEN];
+    if (rc || imdb_backup_key_create(dir_in(base, "backup.key"), id, &e)) return;
+    if (!with_file) return;
+    imdb_backup_info bi;
+    char out[700];
+    snprintf(out, sizeof out, "%s/full.bak", base);
+    if (imdb_backup_key_load(dir_in(base, "backup.key"), key, &e) || imdb_backup_full(dir_in(base, "p"), out, key, &bi, &e))
+        return;
+    char sv[32];
+    int n = snprintf(sv, sizeof sv, "%llu", (unsigned long long)bi.last_seq);
+    spit(dir_in(base, "backup_seq"), (const uint8_t *)sv, (size_t)n);
+}
+
+static void setup_backup(const char *base) { setup_backup_common(base, false); }
+static void setup_restore(const char *base) { setup_backup_common(base, true); }
+
+static uint64_t backup_seq(const char *dir)
+{
+    size_t n = 0;
+    uint8_t *b = slurp(dir_in(dir, "backup_seq"), &n);
+    uint64_t s = 0;
+    for (size_t i = 0; b && i < n && b[i] >= '0' && b[i] <= '9'; i++) s = s * 10 + (uint64_t)(b[i] - '0');
+    free(b);
+    return s;
+}
+
+static const char *backup_base_ok(const char *base)
+{
+    return access(dir_in(base, "backup.key"), F_OK) == 0 ? NULL : "the setup made no backup key";
+}
+
+static const char *restore_base_ok(const char *base)
+{
+    return access(dir_in(base, "full.bak"), F_OK) == 0 && backup_seq(base) ? NULL : "the setup made no backup";
+}
+
+/* a full backup of the primary (a snapshot: its seed, then the two commits after it) */
+static int run_backup(const char *run)
+{
+    uint8_t key[IMDB_BACKUP_KEY_LEN];
+    imdb_backup_info bi;
+    imdb_err e = {0};
+    char out[700];
+    snprintf(out, sizeof out, "%s/full.bak", run);
+    if (imdb_backup_key_load(dir_in(run, "backup.key"), key, &e)) return 0; /* reading the key was faulted */
+    (void)imdb_backup_full(dir_in(run, "p"), out, key, &bi, &e);
+    return 0;
+}
+
+/* that backup restored into a new directory */
+static int run_restore(const char *run)
+{
+    uint8_t key[IMDB_BACKUP_KEY_LEN];
+    imdb_backup_info bi;
+    imdb_err e = {0};
+    char in[700], dst[700];
+    snprintf(in, sizeof in, "%s/full.bak", run);
+    snprintf(dst, sizeof dst, "%s/restored", run);
+    if (imdb_backup_key_load(dir_in(run, "backup.key"), key, &e)) return 0;
+    const char *files[1] = {in};
+    (void)imdb_restore(dst, key, files, 1, &bi, &e);
+    return 0;
+}
+/* A copy restored at dst: the primary at commit want (nothing wrote the primary since), VERIFY and the auditor pass. */
+static const char *copy_equal(const char *run, const char *dst, uint64_t want)
+{
+    imdb_open_opts ro = {.sync = 1, .read_only = true};
+    imdb_db *p = NULL, *c = NULL;
+    imdb_err e = {0};
+    char pp[700];
+    snprintf(pp, sizeof pp, "%s/p", run);
+    uint8_t a[32], b[32];
+    const char *why = NULL;
+    imdb_verify_report vr;
+    if (imdb_open(pp, &ro, &p, &e) || imdb_view_token(p, a, &e))
+        snprintf(g_why, sizeof g_why, "the primary does not open read-only: %s", e.msg), why = g_why;
+    else if (imdb_open(dst, &ro, &c, &e) || imdb_view_token(c, b, &e))
+        snprintf(g_why, sizeof g_why, "the restored copy does not open: %s", e.msg), why = g_why;
+    else if (c->seq != want || memcmp(a, b, 32) != 0)
+        snprintf(g_why, sizeof g_why, "the restored copy (commit %llu) is not the primary at commit %llu",
+                 (unsigned long long)c->seq, (unsigned long long)want), why = g_why;
+    else if (imdb_verify(c, &vr, &e))
+        snprintf(g_why, sizeof g_why, "VERIFY fails on the restored copy: %s", e.msg), why = g_why;
+    imdb_close(c);
+    imdb_close(p);
+    if (!why) why = audit_run(dst);
+    return why;
+}
+
+/* Whatever the fault left: a complete backup under the name, or none (then at most this run's temporary, which the
+ * next backup refuses until it is removed: removed here, and the backup run again). Either way the file checks and
+ * restores to the primary. */
+static const char *check_backup(const char *run)
+{
+    char kf[700], out[700], tmp[700], dst[700], pp[700];
+    snprintf(kf, sizeof kf, "%s/backup.key", run);
+    snprintf(out, sizeof out, "%s/full.bak", run);
+    snprintf(tmp, sizeof tmp, "%s/full.bak.tmp", run);
+    snprintf(dst, sizeof dst, "%s/check-copy", run);
+    snprintf(pp, sizeof pp, "%s/p", run);
+    uint8_t key[IMDB_BACKUP_KEY_LEN];
+    imdb_backup_info bi;
+    imdb_err e = {0};
+    if (imdb_backup_key_load(kf, key, &e)) {
+        snprintf(g_why, sizeof g_why, "the backup key does not load: %s", e.msg);
+        return g_why;
+    }
+    if (access(out, F_OK) != 0) {
+        unlink(tmp);
+        if (imdb_backup_full(pp, out, key, &bi, &e)) {
+            snprintf(g_why, sizeof g_why, "the backup, run again after the fault, fails: %s", e.msg);
+            return g_why;
+        }
+    }
+    if (imdb_backup_check(out, key, &bi, &e)) {
+        snprintf(g_why, sizeof g_why, "a backup under its name fails its check: %s", e.msg);
+        return g_why;
+    }
+    const char *files[1] = {out};
+    if (imdb_restore(dst, key, files, 1, &bi, &e)) {
+        snprintf(g_why, sizeof g_why, "the backup does not restore: %s", e.msg);
+        return g_why;
+    }
+    return copy_equal(run, dst, bi.last_seq);
+}
+
+/* Whatever the fault left: a complete copy under the name, or none (then at most restored.tmp, which the next restore
+ * refuses until it is removed: removed here, and the restore run again). Either way the copy is the primary. */
+static const char *check_restore(const char *run)
+{
+    char kf[700], in[700], dst[700], tmp[700];
+    snprintf(kf, sizeof kf, "%s/backup.key", run);
+    snprintf(in, sizeof in, "%s/full.bak", run);
+    snprintf(dst, sizeof dst, "%s/restored", run);
+    snprintf(tmp, sizeof tmp, "%s/restored.tmp", run);
+    uint8_t key[IMDB_BACKUP_KEY_LEN];
+    imdb_backup_info bi;
+    imdb_err e = {0};
+    if (imdb_backup_key_load(kf, key, &e)) {
+        snprintf(g_why, sizeof g_why, "the backup key does not load: %s", e.msg);
+        return g_why;
+    }
+    if (access(dst, F_OK) != 0) {
+        if (access(tmp, F_OK) == 0) { /* rm_one keeps the root it walks: emptied, then removed */
+            nftw(tmp, rm_one, 16, FTW_DEPTH | FTW_PHYS);
+            rmdir(tmp);
+        }
+        const char *files[1] = {in};
+        if (imdb_restore(dst, key, files, 1, &bi, &e)) {
+            snprintf(g_why, sizeof g_why, "the restore, run again after the fault, fails: %s", e.msg);
+            return g_why;
+        }
+    }
+    return copy_equal(run, dst, backup_seq(run));
+}
+
 /* Whatever a fault or a crash left: once the replica holds epoch 1, the ledger refuses the copy that
  * epoch (a second epoch-1 writer key would fork the history: the review of 2026-10-26, F2 and F3).
  * Before that, the copy may take it or be refused (a reservation that outlived a failed promotion). */
@@ -1863,6 +2035,8 @@ static const char *check_run(const fscen *s, const char *run, const frun *r)
     if (!why) why = audit_run(dir);
     if (!why && strcmp(s->name, "replica_promote_ledger") == 0) why = check_promote_ledger(run);
     if (!why && strcmp(s->name, "replica_seed") == 0) why = check_seed(run);
+    if (!why && strcmp(s->name, "backup") == 0) why = check_backup(run);
+    if (!why && strcmp(s->name, "restore") == 0) why = check_restore(run);
     return why;
 }
 
@@ -2083,6 +2257,8 @@ static const fscen kScen[] = {
     {"expire", setup_txns, run_expire, false, NULL, NULL, false, false, false},
     {"retire", setup_txns, run_retire, false, NULL, NULL, false, false, false},
     {"replica_seed", setup_seed, run_seed, false, NULL, seed_base_ok, false, false, false},
+    {"backup", setup_backup, run_backup, false, NULL, backup_base_ok, false, false, false},
+    {"restore", setup_restore, run_restore, false, NULL, restore_base_ok, false, false, false},
 };
 
 static void t_fault_commits(void) { fault_scenario(&kScen[0]); }
@@ -2112,6 +2288,8 @@ static void t_fault_retry(void) { fault_scenario(&kScen[23]); }
 static void t_fault_expire(void) { fault_scenario(&kScen[24]); }
 static void t_fault_retire(void) { fault_scenario(&kScen[25]); }
 static void t_fault_replica_seed(void) { fault_scenario(&kScen[26]); }
+static void t_fault_backup(void) { fault_scenario(&kScen[27]); }
+static void t_fault_restore(void) { fault_scenario(&kScen[28]); }
 
 const test_case fault_tests[] = {
     {"fault_commits", t_fault_commits},     {"fault_nosync", t_fault_nosync}, {"fault_checkpoint", t_fault_checkpoint},
@@ -2136,5 +2314,7 @@ const test_case fault_tests[] = {
     {"fault_expire", t_fault_expire},
     {"fault_retire", t_fault_retire},
     {"fault_replica_seed", t_fault_replica_seed},
+    {"fault_backup", t_fault_backup},
+    {"fault_restore", t_fault_restore},
 };
 const size_t fault_ntests = sizeof fault_tests / sizeof *fault_tests;

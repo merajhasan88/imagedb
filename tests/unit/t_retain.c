@@ -11,6 +11,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../../src/backup.h"
 #include "../../src/cpu.h"
 #include "../../src/fsio.h"
 #include "../../src/db_internal.h"
@@ -2049,6 +2050,73 @@ static void t_retain_cut_partial(void)
     CHECK(access(seg, F_OK) != 0 && tree_contains(dir, "other") && audit_ok(dir));
 }
 
+
+/* Between a backup's seed and the commits after it, the primary goes on and RETIREs past the seed's snapshot: its log
+ * no longer holds the commits right after the seed, so that attempt's second part fails as cut; the backup tries
+ * again from the newer snapshot, and the copy it restores is the primary. */
+typedef struct cut_ctx {
+    imdb_session *s;
+    int calls;
+    uint64_t cut;   /* the boundary the hook retired at (0: it failed) */
+} cut_ctx;
+
+static void cut_between(void *arg)
+{
+    cut_ctx *c = arg;
+    if (c->calls++) return; /* the first attempt only */
+    imdb_session *s = c->s;
+    imdb_db *db = s->db;
+    if (ex(s, "UPDATE a SET v = 300 WHERE id = 1") || ex(s, "CHECKPOINT")) return; /* a segment after the seed's */
+    uint64_t b = db->seq;
+    if (ex(s, "UPDATE a SET v = 301 WHERE id = 1") || ex(s, "CHECKPOINT")) return; /* the newest segment, past b */
+    imdb_clock_offset(45 * SEC_US);
+    if (ex(s, "SELECT COUNT(*) FROM a") || horizon_of(db, "a") <= b || horizon_of(db, "b") <= b) return;
+    imdb_err e = {0};
+    if (imdb_retire(db, b, &e) || db->log_floor != b) return;
+    c->cut = b;
+}
+
+static void t_retain_backup_cut_between(void)
+{
+    const char *dir = test_tmpdir();
+    char p[700], out[700], r[700], kf[700];
+    snprintf(p, sizeof p, "%s/p", dir);
+    snprintf(out, sizeof out, "%s/full.bak", dir);
+    snprintf(r, sizeof r, "%s/r", dir);
+    snprintf(kf, sizeof kf, "%s/k", dir);
+    OK(imdb_init(p, false, NULL, E));
+    imdb_db *db = ropen(p, false);
+    CHECK(db);
+    imdb_session s;
+    imdb_session_init(&s, db);
+    uint64_t s2 = 0;
+    retire_setup(&s, &s2);
+    uint64_t S = db->lake_seq; /* the snapshot the first attempt seeds */
+    uint8_t key[IMDB_BACKUP_KEY_LEN], id[32];
+    OK(imdb_backup_key_create(kf, id, E));
+    OK(imdb_backup_key_load(kf, key, E));
+    cut_ctx c = {.s = &s};
+    imdb_backup_test_between(cut_between, &c);
+    imdb_backup_info bi;
+    int rc = imdb_backup_full(p, out, key, &bi, E);
+    imdb_backup_test_between(NULL, NULL);
+    CHECK(c.cut > S); /* the hook cut past the seed's snapshot */
+    OK_RC(rc);
+    CHECK(c.calls == 2 && bi.seed_seq > S && bi.last_seq == db->seq); /* the second attempt, from the newer snapshot */
+    uint8_t vt_p[32], vt_r[32];
+    OK(imdb_view_token(db, vt_p, E));
+    imdb_session_close(&s);
+    imdb_close(db);
+    const char *files[1] = {out};
+    OK(imdb_restore(r, key, files, 1, &bi, E));
+    imdb_db *rdb = ropen(r, false);
+    CHECK(rdb);
+    OK(imdb_view_token(rdb, vt_r, E));
+    CHECK(memcmp(vt_p, vt_r, 32) == 0);
+    imdb_verify_report vr;
+    OK(imdb_verify(rdb, &vr, E));
+    imdb_close(rdb);
+}
 const test_case retain_tests[] = {
     {"retain_ddl", t_retain_ddl},
     {"retain_persist", t_retain_persist},
@@ -2073,6 +2141,7 @@ const test_case retain_tests[] = {
     {"retain_cut_partial", t_retain_cut_partial},
     {"retain_floor_no_writers", t_retain_floor_no_writers},
     {"retain_seed", t_retain_seed},
+    {"retain_backup_cut_between", t_retain_backup_cut_between},
     {"retain_seed_refused", t_retain_seed_refused},
     {"retain_floor_carry", t_retain_floor_carry},
 };

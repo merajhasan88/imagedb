@@ -63,5 +63,6 @@ TESTS(join)
 TESTS(retain)
 TESTS(evict)
 TESTS(segcache)
+TESTS(backup)
 
 #endif

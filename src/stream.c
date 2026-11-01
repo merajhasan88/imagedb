@@ -32,6 +32,11 @@ int imdb_stream_fd_read(void *ctx, void *buf, size_t n, size_t *got, imdb_err *e
     return imdb_read_all(*(const int *)ctx, buf, n, got, e);
 }
 
+int imdb_sink_fd_write(void *ctx, const void *p, size_t n, imdb_err *e)
+{
+    return imdb_write_all(*(const int *)ctx, p, n, e);
+}
+
 void imdb_fdsrc_init(imdb_fdsrc *s, int fd)
 {
     s->fd = fd;

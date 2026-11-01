@@ -10,6 +10,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "backup.h"
 #include "cpu.h"
 #include "db.h"
 #include "fsio.h"
@@ -54,6 +55,13 @@ static int usage(void)
           "                                             inspect a damaged end of the log; with --discard-tail, cut it\n"
           "                                             (its bytes saved to FILE first) and lower DURABLE to match\n"
           "  imagedb root-key FILE                      make an offline root key (secret, 0400) and print its public key\n"
+          "  imagedb backup-key FILE                    make a backup key (secret, 0400) and print its id\n"
+          "  imagedb backup <dir> --key FILE --out FILE a full backup, encrypted: the last published snapshot and the\n"
+          "                                             commits after it, while the database runs\n"
+          "  imagedb backup-verify --key FILE --scratch DIR BACKUP...\n"
+          "                                             a test restore under DIR, VERIFY on it, then removed\n"
+          "  imagedb restore <new-dir> --key FILE BACKUP...\n"
+          "                                             a read-only copy; imagedb promote makes it writable\n"
           "  imagedb rotate-key <dir>                   a new writer key, signed into the log by the current one\n"
           "  imagedb promote <replica-dir> --root-key FILE (--anchor FILE [--abandon] | --old-writer-stopped)\n"
           "                                             make the replica the writer of the next epoch, certified\n"
@@ -644,6 +652,78 @@ int main(int argc, char **argv)
         }
         int n = imdb_identity_format(&id, buf, sizeof buf);
         fwrite(buf, 1, (size_t)n, stdout);
+        return 0;
+    }
+    if (strcmp(cmd, "backup-key") == 0 && argc == 3) {
+        uint8_t id[32];
+        if (imdb_backup_key_create(argv[2], id, &e)) {
+            print_err("backup-key", &e);
+            return 1;
+        }
+        char hex[65];
+        imdb_hex(id, sizeof id, hex);
+        fprintf(stderr, "imagedb: backup-key: wrote %s; keep it apart from the backups: without it they cannot be "
+                        "restored\n", argv[2]);
+        printf("%s\n", hex);
+        return 0;
+    }
+    if (strcmp(cmd, "backup") == 0 && argc == 7) {
+        const char *keyf = NULL, *out = NULL;
+        for (int i = 3; i + 1 < argc; i += 2) {
+            if (strcmp(argv[i], "--key") == 0) keyf = argv[i + 1];
+            else if (strcmp(argv[i], "--out") == 0) out = argv[i + 1];
+        }
+        if (!keyf || !out) return usage();
+        uint8_t key[IMDB_BACKUP_KEY_LEN];
+        imdb_backup_info bi;
+        int rc = imdb_backup_key_load(keyf, key, &e) || imdb_backup_full(argv[2], out, key, &bi, &e);
+        imdb_wipe(key, sizeof key);
+        if (rc) {
+            print_err("backup", &e);
+            return 1;
+        }
+        printf("backup %s: commits %llu to %llu%s, %llu bytes of stream in %llu chunks\n", out,
+               (unsigned long long)bi.first_seq, (unsigned long long)bi.last_seq,
+               bi.seed_seq ? " (a seed, then the commits after it)" : "", (unsigned long long)bi.payload_bytes,
+               (unsigned long long)bi.chunks);
+        return 0;
+    }
+    if (strcmp(cmd, "restore") == 0 && argc >= 6 && strcmp(argv[3], "--key") == 0) {
+        uint8_t key[IMDB_BACKUP_KEY_LEN];
+        imdb_backup_info bi;
+        int rc = imdb_backup_key_load(argv[4], key, &e) ||
+                 imdb_restore(argv[2], key, (const char *const *)argv + 5, (size_t)(argc - 5), &bi, &e);
+        imdb_wipe(key, sizeof key);
+        if (rc) {
+            print_err("restore", &e);
+            return 1;
+        }
+        printf("restored %s through commit %llu: a read-only replica\n", argv[2], (unsigned long long)bi.last_seq);
+        if (bi.id.has_root)
+            fprintf(stderr, "imagedb: restore: to write to it: imagedb promote %s --root-key FILE (--anchor FILE | "
+                            "--old-writer-stopped); then enrol replicas again (replica-add) and give it a new anchor\n",
+                    argv[2]);
+        else
+            fprintf(stderr, "imagedb: restore: the database has no root key, so the copy stays read-only (init --root "
+                            "makes promotion possible)\n");
+        return 0;
+    }
+    if (strcmp(cmd, "backup-verify") == 0 && argc >= 7 && strcmp(argv[2], "--key") == 0 &&
+        strcmp(argv[4], "--scratch") == 0) {
+        uint8_t key[IMDB_BACKUP_KEY_LEN];
+        imdb_backup_info bi;
+        imdb_verify_report vr;
+        int rc = imdb_backup_key_load(argv[3], key, &e) ||
+                 imdb_backup_verify(argv[5], key, (const char *const *)argv + 6, (size_t)(argc - 6), &bi, &vr, &e);
+        imdb_wipe(key, sizeof key);
+        if (rc) {
+            print_err("backup-verify", &e);
+            return 1;
+        }
+        printf("backup verified: restored through commit %llu and VERIFY passed (%llu commits, %llu signatures, %llu "
+               "versions, %llu segments)\n", (unsigned long long)bi.last_seq, (unsigned long long)vr.commits,
+               (unsigned long long)vr.sigs_checked, (unsigned long long)vr.versions,
+               (unsigned long long)vr.segments_checked);
         return 0;
     }
     if (strcmp(cmd, "root-key") == 0 && argc == 3) { /* the offline key that may certify a promotion */

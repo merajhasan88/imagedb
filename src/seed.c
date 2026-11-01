@@ -78,7 +78,8 @@ static int manifest_objects(const imdb_manifest *m, sobj **out, size_t *n, imdb_
 /* ---- the primary's side ------------------------------------------------------------------------------- */
 
 /* commit S's header and signature, from the frame that ends its segment */
-static int floor_frame(int logfd, const uint64_t *segs, size_t nsegs, uint64_t S, imdb_buf *hd, imdb_err *e)
+static int floor_frame(int logfd, const uint64_t *segs, size_t nsegs, uint64_t S, imdb_buf *hd, uint8_t hash[32],
+                       imdb_err *e)
 {
     size_t si = imdb_logseg_find(segs, nsegs, S);
     if (si == nsegs || (si + 1 < nsegs && segs[si + 1] != S + 1))
@@ -107,6 +108,7 @@ static int floor_frame(int logfd, const uint64_t *segs, size_t nsegs, uint64_t S
             imdb_buf_put_u32(hd, hlen);
             imdb_buf_put(hd, body + dl, hlen);
             imdb_buf_put(hd, body + 1 + 4 + 8 + 32, IMDB_SIG_LEN); /* kind | hlen | seq | hash | signature */
+            memcpy(hash, body + 1 + 4 + 8, 32);
         }
     }
     imdb_logseg_free(&seg);
@@ -176,7 +178,7 @@ static int read_pfloor(int dirfd, pfloor *f, imdb_err *e)
 
 /* The head: FLOOR's format up to its manifest, for the floor S (writer.h). */
 static int build_head(const char *path, int dirfd, int logfd, const uint64_t *segs, size_t nsegs, uint64_t S,
-                      const imdb_manifest *m, imdb_buf *hd, imdb_err *e)
+                      const imdb_manifest *m, imdb_buf *hd, uint8_t hash[32], imdb_err *e)
 {
     uint8_t id[16], wpk[IMDB_PUBKEY_LEN];
     int rc = imdb_read_identity(path, id, wpk, e);
@@ -186,7 +188,7 @@ static int build_head(const char *path, int dirfd, int logfd, const uint64_t *se
     imdb_buf_put(hd, "IMDBFLR1", 8);
     imdb_buf_put(hd, id, 16);
     imdb_buf_put_u64(hd, S);
-    if (!rc) rc = floor_frame(logfd, segs, nsegs, S, hd, e);
+    if (!rc) rc = floor_frame(logfd, segs, nsegs, S, hd, hash, e);
     /* the key changes up to S: WRITERS has them all; without it, the primary's FLOOR those up to its floor */
     imdb_buf en;
     imdb_buf_init(&en);
@@ -202,6 +204,7 @@ static int build_head(const char *path, int dirfd, int logfd, const uint64_t *se
                      : copy_entries(w, wn - 4, 28, imdb_get_le32(w + 24), S, &en, &took, e);
     }
     imdb_free(w);
+    if (!rc) rc = imdb_buf_check(&en, e); /* a list a failed allocation cut short never goes into the head */
     imdb_buf_put_u32(hd, took);
     imdb_buf_put(hd, en.p, en.len);
     imdb_buf_free(&en);
@@ -227,6 +230,7 @@ static int build_head(const char *path, int dirfd, int logfd, const uint64_t *se
         imdb_buf_put_u64(&st, t);
         ns++;
     }
+    if (!rc) rc = imdb_buf_check(&st, e); /* the same for the starts: a short list would be a malformed FLOOR */
     imdb_buf_put_u32(hd, ns);
     imdb_buf_put(hd, st.p, st.len);
     imdb_buf_free(&st);
@@ -235,7 +239,7 @@ static int build_head(const char *path, int dirfd, int logfd, const uint64_t *se
     return rc;
 }
 
-static int send_object(int ofd, int outfd, uint8_t kind, const uint8_t h[32], uint8_t *buf, imdb_err *e)
+static int send_object(int ofd, const imdb_sink *out, uint8_t kind, const uint8_t h[32], uint8_t *buf, imdb_err *e)
 {
     char name[80];
     obj_file(kind, h, name);
@@ -250,7 +254,7 @@ static int send_object(int ofd, int outfd, uint8_t kind, const uint8_t h[32], ui
     rec[0] = kind;
     memcpy(rec + 1, h, 32);
     imdb_le64(rec + 33, (uint64_t)st.st_size);
-    int rc = imdb_write_all(outfd, rec, sizeof rec, e);
+    int rc = out->write(out->ctx, rec, sizeof rec, e);
     for (uint64_t at = 0; !rc && at < (uint64_t)st.st_size;) {
         ssize_t r = imdb_io_pread(fd, buf, CHUNK, (off_t)at);
         if (r < 0 && errno == EINTR) continue;
@@ -258,14 +262,15 @@ static int send_object(int ofd, int outfd, uint8_t kind, const uint8_t h[32], ui
             rc = imdb_fail(e, IMDB_ERR_IO, "seed: lake object %s: short read", name);
             break;
         }
-        rc = imdb_write_all(outfd, buf, (size_t)r, e);
+        rc = out->write(out->ctx, buf, (size_t)r, e);
         at += (uint64_t)r;
     }
     close(fd);
     return rc;
 }
 
-int imdb_seed_send(const char *path, int dirfd, int logfd, int outfd, uint64_t *seq, imdb_err *e)
+int imdb_seed_send(const char *path, int dirfd, int logfd, const imdb_sink *out, uint64_t *seq, uint8_t hash[32],
+                   imdb_err *e)
 {
     *seq = 0;
     bool present = false;
@@ -294,7 +299,7 @@ int imdb_seed_send(const char *path, int dirfd, int logfd, int outfd, uint64_t *
     if (!rc) rc = imdb_manifest_parse(mb, ml, &m, e);
     if (!rc && m.seq != S) rc = imdb_fail(e, IMDB_ERR_STATE, "seed: the manifest LAKE_HEAD names is another commit's");
     if (!rc) rc = imdb_logdir_list(logfd, &segs, &nsegs, e);
-    if (!rc) rc = build_head(path, dirfd, logfd, segs, nsegs, S, &m, &hd, e);
+    if (!rc) rc = build_head(path, dirfd, logfd, segs, nsegs, S, &m, &hd, hash, e);
     if (!rc) rc = manifest_objects(&m, &objs, &nobj, e);
     if (!rc && (hd.len > IMDB_SEED_HEAD_MAX || nobj + 1 > IMDB_SEED_OBJECTS_MAX))
         rc = imdb_fail(e, IMDB_ERR_LIMIT, "seed: the snapshot at commit %llu is past a seed's limits", (unsigned long long)S);
@@ -307,12 +312,12 @@ int imdb_seed_send(const char *path, int dirfd, int logfd, int outfd, uint64_t *
         imdb_le32(p + 20, (uint32_t)(nobj + 1));
         imdb_le32(p + 24, imdb_kern()->crc32c(0, p, 24));
         imdb_le32(c, imdb_kern()->crc32c(0, hd.p, hd.len));
-        rc = imdb_write_all(outfd, p, sizeof p, e);
-        if (!rc) rc = imdb_write_all(outfd, hd.p, hd.len, e);
-        if (!rc) rc = imdb_write_all(outfd, c, sizeof c, e);
+        rc = out->write(out->ctx, p, sizeof p, e);
+        if (!rc) rc = out->write(out->ctx, hd.p, hd.len, e);
+        if (!rc) rc = out->write(out->ctx, c, sizeof c, e);
     }
-    if (!rc) rc = send_object(ofd, outfd, OBJ_MAN, mh, buf, e);
-    for (size_t i = 0; !rc && i < nobj; i++) rc = send_object(ofd, outfd, objs[i].kind, objs[i].h, buf, e);
+    if (!rc) rc = send_object(ofd, out, OBJ_MAN, mh, buf, e);
+    for (size_t i = 0; !rc && i < nobj; i++) rc = send_object(ofd, out, objs[i].kind, objs[i].h, buf, e);
     if (!rc) *seq = S;
     imdb_free(buf);
     imdb_free(objs);

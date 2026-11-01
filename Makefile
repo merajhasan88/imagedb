@@ -189,7 +189,7 @@ build-fuzz/%: fuzz/%.c fuzz/fuzz_common.h $(SRC) $(HDR) $(FUZZ_ASM)
 FUZZ_SECONDS ?= 60
 fuzz-run: fuzz $(BIN) $(FORGE)
 	bash fuzz/make_corpus.sh $(BIN) build-fuzz/corpus
-	@for t in frame stream segment manifest sql codec ed25519 tseg; do \
+	@for t in frame stream segment manifest sql codec ed25519 tseg backup; do \
 	  mkdir -p build-fuzz/work/$$t; \
 	  if ! $(SANRUN) build-fuzz/fuzz_$$t -max_total_time=$(FUZZ_SECONDS) -print_final_stats=1 -rss_limit_mb=2048 \
 	       -artifact_prefix=build-fuzz/crash-$$t- build-fuzz/work/$$t build-fuzz/corpus/$$t \

@@ -31,8 +31,9 @@
 #define IMDB_SEED_PREFIX 28
 
 /* The primary's side: the seed of the snapshot LAKE_HEAD names (its generation pinned while it is read),
- * written to outfd. *seq: S, the commit the replica then holds. */
-int imdb_seed_send(const char *path, int dirfd, int logfd, int outfd, uint64_t *seq, imdb_err *e);
+ * written to out. *seq: S, the commit the replica then holds; hash: its commit hash. */
+int imdb_seed_send(const char *path, int dirfd, int logfd, const imdb_sink *out, uint64_t *seq, uint8_t hash[32],
+                   imdb_err *e);
 
 /* The replica's side, its prefix already read (imdb_stream_seed): see above. db->seeded is S after it. */
 int imdb_seed_take(imdb_db *db, imdb_stream *s, const uint8_t prefix[IMDB_SEED_PREFIX], imdb_err *e);

@@ -107,4 +107,10 @@ echo "ed25519 seeds: $(ls "$OUT/ed25519" | wc -l)"
 idt=$("$BIN" identity "$ER")
 { hx "$(printf '%s\n' "$idt" | awk '/^writer /{print $2}')"; hx "$(printf '%s\n' "$idt" | awk '/^root /{print $2}')"
   cat "$ER/WRITERS"; } > "$OUT/frame/writers"
+# a backup for fuzz_backup, made with its fixed key (32 bytes of 'B'): the prologue, sealed chunks, two parts (a snapshot's
+# seed, then the commits after it) and the summary
+mkdir -p "$OUT/backup"
+printf 'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB' > "$WORK/fuzz-backup.key"
+chmod 0400 "$WORK/fuzz-backup.key"
+"$BIN" backup "$D" --key "$WORK/fuzz-backup.key" --out "$OUT/backup/full.bak" >/dev/null
 echo "corpus: $(find "$OUT" -type f | wc -l) seeds in $OUT"

@@ -1190,9 +1190,11 @@ static int acks_drain(ship_acks *a, imdb_err *e)
     return IMDB_OK;
 }
 
-int imdb_ship_ex(const char *path, uint64_t after_seq, int outfd, const imdb_ship_opts *o, imdb_err *e)
+int imdb_ship_to(const char *path, uint64_t after_seq, const imdb_sink *out, const imdb_ship_opts *o,
+                 imdb_ship_result *res, imdb_err *e)
 {
     bool follow = o && o->follow;
+    if (res) memset(res, 0, sizeof *res);
     int dirfd = imdb_io_open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (dirfd < 0) return imdb_fail(e, IMDB_ERR_IO, "open %s: %s", path, strerror(errno));
     int logfd = imdb_open_dir_at(dirfd, IMDB_LOG_DIR, e);
@@ -1213,7 +1215,7 @@ int imdb_ship_ex(const char *path, uint64_t after_seq, int outfd, const imdb_shi
         if (!rc) rc = imdb_random(A.nonce, sizeof A.nonce, e);
         uint8_t sr[IMDB_SESSION_LEN];
         imdb_session_encode(A.db_id, A.nonce, sr);
-        if (!rc) rc = imdb_write_all(outfd, sr, sizeof sr, e);
+        if (!rc) rc = out->write(out->ctx, sr, sizeof sr, e);
         acks = &A;
     }
     bool seeded = false;
@@ -1222,8 +1224,13 @@ int imdb_ship_ex(const char *path, uint64_t after_seq, int outfd, const imdb_shi
         size_t nfs = 0;
         rc = imdb_logdir_list(logfd, &fs, &nfs, e);
         if (!rc && nfs && fs[0] > 1) {
-            rc = imdb_seed_send(path, dirfd, logfd, outfd, &S, e);
+            uint8_t sh[32];
+            rc = imdb_seed_send(path, dirfd, logfd, out, &S, sh, e);
             seeded = true; /* the stream ends with it: the replica comes back from S */
+            if (!rc && res) {
+                res->seeded = S;
+                memcpy(res->seeded_hash, sh, 32);
+            }
         }
         imdb_free(fs);
     }
@@ -1258,9 +1265,11 @@ int imdb_ship_ex(const char *path, uint64_t after_seq, int outfd, const imdb_shi
         if (w.seq > last && (rc = imdb_logdir_list(logfd, &segs, &nsegs, e))) break; /* else nothing new to send */
         size_t si = imdb_logseg_find(segs, nsegs, last + 1);
         if (si == nsegs && nsegs) si = 0; /* everything after last is in the first segment or later */
-        if (nsegs && segs[0] > last + 1) /* cut below (FLOOR): what the replica lacks is in no file here */
+        if (nsegs && segs[0] > last + 1) { /* cut below (FLOOR): what the replica lacks is in no file here */
             rc = imdb_fail(e, IMDB_ERR_STATE, "ship: the log before commit %llu is retired here, and the replica holds commit "
                            "%llu: seed it again", (unsigned long long)segs[0], (unsigned long long)last);
+            if (res) res->cut = true;
+        }
         for (; si < nsegs && !rc; si++) {
             char name[IMDB_LOGSEG_NAME + 1];
             imdb_logseg_name(segs[si], name);
@@ -1347,9 +1356,13 @@ int imdb_ship_ex(const char *path, uint64_t after_seq, int outfd, const imdb_shi
                             stalled = true;
                             break;
                         }
-                        if ((rc = imdb_write_all(outfd, fb.p, fb.len, e))) break;
+                        if ((rc = out->write(out->ctx, fb.p, fb.len, e))) break;
                         if (acks && (rc = win_push(acks, seq, imdb_frame_hash(fb.p), e))) break;
                         last = seq;
+                        if (res) {
+                            res->last_seq = seq;
+                            memcpy(res->last_hash, imdb_frame_hash(fb.p), 32);
+                        }
                         progressed = true;
                         if (acks && ++nship % 256 == 0 && (rc = acks_drain(acks, e))) break;
                     }
@@ -1414,9 +1427,13 @@ int imdb_ship_ex(const char *path, uint64_t after_seq, int outfd, const imdb_shi
                         stalled = true;
                         break;
                     }
-                    if ((rc = imdb_write_all(outfd, buf + off, flen, e))) break;
+                    if ((rc = out->write(out->ctx, buf + off, flen, e))) break;
                     if (acks && (rc = win_push(acks, seq, imdb_frame_hash(buf + off), e))) break;
                     last = seq;
+                    if (res) {
+                        res->last_seq = seq;
+                        memcpy(res->last_hash, imdb_frame_hash(buf + off), 32);
+                    }
                     progressed = true;
                     if (acks && ++nship % 256 == 0 && (rc = acks_drain(acks, e))) break;
                 }
@@ -1452,6 +1469,12 @@ int imdb_ship_ex(const char *path, uint64_t after_seq, int outfd, const imdb_shi
     return rc;
 }
 
+int imdb_ship_ex(const char *path, uint64_t after_seq, int outfd, const imdb_ship_opts *o, imdb_err *e)
+{
+    imdb_sink out = {imdb_sink_fd_write, &outfd};
+    return imdb_ship_to(path, after_seq, &out, o, NULL, e);
+}
+
 int imdb_ship(const char *path, uint64_t after_seq, int outfd, bool follow, imdb_err *e)
 {
     imdb_ship_opts o = {.follow = follow, .ackfd = -1};
@@ -1478,7 +1501,17 @@ static int ack_point(imdb_db *db, imdb_apply_opts *o, imdb_err *e)
     return o->applied(o->ctx, db);
 }
 
-int imdb_apply_stream_ex(imdb_db *db, int fd, uint64_t *applied, imdb_apply_opts *o, imdb_err *e)
+/* Where apply reads: a descriptor through its buffer, which can tell whether more is ready now, or a caller's source
+ * (a backup's), which cannot: its points then come every o->every commits and at its end. */
+typedef struct apply_src {
+    imdb_read_fn read;
+    void *ctx;
+    const imdb_fdsrc *fd; /* NULL: a caller's source */
+} apply_src;
+
+static bool src_ready(const apply_src *a) { return a->fd ? input_ready(a->fd) : true; }
+
+static int apply_check(imdb_db *db, uint64_t *applied, imdb_apply_opts *o, imdb_err *e)
 {
     *applied = 0;
     if (o) {
@@ -1489,11 +1522,13 @@ int imdb_apply_stream_ex(imdb_db *db, int fd, uint64_t *applied, imdb_apply_opts
     if (db->read_only) return imdb_fail(e, IMDB_ERR_STATE, "database opened read-only");
     if (!db->replica) return imdb_fail(e, IMDB_ERR_STATE, "apply is only allowed on a replica");
     if (db->failed) return imdb_fail(e, IMDB_ERR_STATE, "replica is in a failed state; reopen it");
-    imdb_fdsrc *src = imdb_alloc(sizeof *src, e);
-    if (!src) return e->code;
-    imdb_fdsrc_init(src, fd);
+    return IMDB_OK;
+}
+
+static int apply_from(imdb_db *db, const apply_src *src, uint64_t *applied, imdb_apply_opts *o, imdb_err *e)
+{
     imdb_stream s;
-    imdb_stream_init(&s, db->writer_pk, imdb_fdsrc_read, src);
+    imdb_stream_init(&s, db->writer_pk, src->read, src->ctx);
     imdb_stream_set_trust(&s, db->db_id, db->meta.has_root ? db->meta.root : NULL);
     uint32_t since = 0, every = o && o->every ? o->every : 64; /* commits since the last acknowledgement point */
     bool session = false;
@@ -1515,8 +1550,6 @@ int imdb_apply_stream_ex(imdb_db *db, int fd, uint64_t *applied, imdb_apply_opts
             o->seeded = rc ? 0 : db->seeded;
         }
         imdb_stream_free(&s);
-        imdb_wipe(src, sizeof *src);
-        imdb_free(src);
         return rc;
     }
     for (; !rc;) {
@@ -1580,15 +1613,33 @@ int imdb_apply_stream_ex(imdb_db *db, int fd, uint64_t *applied, imdb_apply_opts
             break;
         }
         /* acknowledge when caught up with the stream, and at least every so many commits while catching up */
-        if (o && o->applied && (++since >= every || !input_ready(src))) {
+        if (o && o->applied && (++since >= every || !src_ready(src))) {
             since = 0;
             if ((rc = ack_point(db, o, e))) break;
         }
     }
     imdb_stream_free(&s);
+    return rc;
+}
+
+int imdb_apply_stream_ex(imdb_db *db, int fd, uint64_t *applied, imdb_apply_opts *o, imdb_err *e)
+{
+    if (apply_check(db, applied, o, e)) return e->code;
+    imdb_fdsrc *src = imdb_alloc(sizeof *src, e);
+    if (!src) return e->code;
+    imdb_fdsrc_init(src, fd);
+    apply_src a = {imdb_fdsrc_read, src, src};
+    int rc = apply_from(db, &a, applied, o, e);
     imdb_wipe(src, sizeof *src);
     imdb_free(src);
     return rc;
+}
+
+int imdb_apply_source(imdb_db *db, imdb_read_fn read, void *ctx, uint64_t *applied, imdb_apply_opts *o, imdb_err *e)
+{
+    if (apply_check(db, applied, o, e)) return e->code;
+    apply_src a = {read, ctx, NULL};
+    return apply_from(db, &a, applied, o, e);
 }
 
 int imdb_apply_stream(imdb_db *db, int fd, uint64_t *applied, imdb_err *e)
