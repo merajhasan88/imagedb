@@ -99,6 +99,7 @@ int main(int argc, char **argv)
         {"expr", expr_tests, &expr_ntests},
         {"cancel", cancel_tests, &cancel_ntests},
         {"drop", drop_tests, &drop_ntests},
+        {"qmem", qmem_tests, &qmem_ntests},
     };
     int failed = 0, run = 0;
     for (size_t g = 0; g < sizeof groups / sizeof *groups; g++) {

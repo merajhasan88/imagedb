@@ -61,6 +61,8 @@ typedef struct imdb_session {
     imdb_txn txn;            /* BEGIN ... COMMIT (db.h: session transactions) */
     uint64_t cross_checks_run;
     uint32_t stmt_timeout_ms; /* SET statement_timeout = ms: a statement running longer is cancelled (0: none) */
+    uint64_t stmt_memory;     /* SET statement_memory = bytes: a read statement's workspace ceiling (P0 R2; 0: the default,
+                               * a quarter of the memory budget or IMDB_MAX_RESULT_BYTES) */
     atomic_bool cancel;       /* imdb_session_cancel: the running statement stops at its next check (cleared at
                                * each statement's start, so a request between statements is dropped) */
 } imdb_session;
@@ -112,6 +114,8 @@ int imdb_exec_one(imdb_session *s, const char *sql, size_t len, const imdb_value
  * Calls cb for each; stops at the first error. */
 typedef int (*imdb_stmt_cb)(void *arg, const char *sql, size_t len);
 int imdb_split_statements(const char *sql, size_t len, imdb_stmt_cb cb, void *arg, imdb_err *e);
+/* A stream's chunk: only the complete statements at its front run; *used is what they took (sql_exec.c) */
+int imdb_split_complete(const char *sql, size_t len, imdb_stmt_cb cb, void *arg, size_t *used, imdb_err *e);
 
 /* Renders a result as an aligned, terminal-safe table (or CSV). */
 void imdb_result_render(const imdb_result *r, bool csv, imdb_buf *out);

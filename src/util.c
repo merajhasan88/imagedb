@@ -15,13 +15,82 @@
  * One for the process: the helpers know no database handle, and the pool's workers allocate too. */
 static _Atomic uint64_t g_heap;
 
-static void *charged(void *p)
+/* P0 R2: a read statement's ceiling on the counter (imdb_heap_ceiling_set; 0: none). A request is reserved
+ * against it before its block exists (added, then taken back if that passed the ceiling), so the pool's
+ * workers cannot all pass one check at once; the block's slack over the request is settled after, unchecked
+ * (malloc's rounding). */
+static _Atomic uint64_t g_ceiling;
+static _Atomic uint64_t g_workspace; /* the ceiling's workspace, for its message */
+/* This thread is inside an allocation the ceiling does not cover (a segment image's load: the segment cache's
+ * own budget bounds it): what it reserves raises the ceiling first, what it frees lowers it, so the ceiling
+ * keeps bounding the statement's workspace alone. A depth: loads may nest. */
+static _Thread_local int t_exempt;
+
+static void ceiling_move(uint64_t up, uint64_t down)
 {
-    if (p) atomic_fetch_add_explicit(&g_heap, malloc_usable_size(p), memory_order_relaxed);
+    uint64_t c = atomic_load_explicit(&g_ceiling, memory_order_relaxed);
+    for (;;) {
+        if (!c) return; /* none set: nothing to move */
+        uint64_t n = c + up;
+        n = n > down ? n - down : 1; /* stays set */
+        if (atomic_compare_exchange_weak_explicit(&g_ceiling, &c, n, memory_order_relaxed, memory_order_relaxed))
+            return;
+    }
+}
+
+static int reserve(size_t n, size_t *held, imdb_err *e)
+{
+    if (!t_exempt && !atomic_load_explicit(&g_ceiling, memory_order_relaxed)) {
+        *held = 0; /* no ceiling (set only between the engine thread's parallel loops): settle charges the block */
+        return IMDB_OK;
+    }
+    *held = n;
+    if (t_exempt) {
+        ceiling_move(n, 0); /* first: another thread's check never sees this block without its room */
+        atomic_fetch_add_explicit(&g_heap, n, memory_order_relaxed);
+        return IMDB_OK;
+    }
+    uint64_t now = atomic_fetch_add_explicit(&g_heap, n, memory_order_relaxed) + n;
+    uint64_t c = atomic_load_explicit(&g_ceiling, memory_order_relaxed);
+    if (c && now > c) {
+        atomic_fetch_sub_explicit(&g_heap, n, memory_order_relaxed);
+        return imdb_fail(e, IMDB_ERR_LIMIT,
+                         "statement memory: this statement would hold more than its %llu bytes (SET statement_memory); "
+                         "narrow it, or add LIMIT",
+                         (unsigned long long)atomic_load_explicit(&g_workspace, memory_order_relaxed));
+    }
+    return IMDB_OK;
+}
+
+static void unreserve(size_t n)
+{
+    atomic_fetch_sub_explicit(&g_heap, n, memory_order_relaxed);
+    if (t_exempt) ceiling_move(0, n);
+}
+
+/* p, just allocated for a reservation of n: the counter takes what malloc reserved for it */
+static void *settle(void *p, size_t n) /* n: what reserve held (0 on its fast path) */
+{
+    size_t u = malloc_usable_size(p);
+    if (u > n) {
+        if (t_exempt) ceiling_move(u - n, 0);
+        atomic_fetch_add_explicit(&g_heap, u - n, memory_order_relaxed);
+    } else if (u < n) {
+        atomic_fetch_sub_explicit(&g_heap, n - u, memory_order_relaxed);
+        if (t_exempt) ceiling_move(0, n - u);
+    }
     return p;
 }
 
 uint64_t imdb_heap_bytes(void) { return atomic_load_explicit(&g_heap, memory_order_relaxed); }
+void imdb_heap_ceiling_set(uint64_t ceiling, uint64_t workspace)
+{
+    atomic_store_explicit(&g_workspace, workspace, memory_order_relaxed);
+    atomic_store_explicit(&g_ceiling, ceiling, memory_order_relaxed);
+}
+uint64_t imdb_heap_ceiling(void) { return atomic_load_explicit(&g_ceiling, memory_order_relaxed); }
+void imdb_heap_exempt_begin(void) { t_exempt++; }
+void imdb_heap_exempt_end(void) { t_exempt--; }
 
 int imdb_fail(imdb_err *e, int code, const char *fmt, ...)
 {
@@ -70,9 +139,20 @@ void *imdb_alloc(size_t n, imdb_err *e)
         imdb_fail(e, IMDB_ERR_LIMIT, "allocation of %zu bytes exceeds limit", n);
         return NULL;
     }
-    void *p = imdb_io_fail_alloc(n) ? NULL : charged(calloc(1, n ? n : 1));
-    if (!p) imdb_fail(e, IMDB_ERR_NOMEM, "out of memory (%zu bytes)", n);
-    return p;
+    size_t req = n ? n : 1;
+    if (imdb_io_fail_alloc(n)) {
+        imdb_fail(e, IMDB_ERR_NOMEM, "out of memory (%zu bytes)", n);
+        return NULL;
+    }
+    size_t held;
+    if (reserve(req, &held, e)) return NULL; /* past a read statement's ceiling (P0 R2) */
+    void *p = calloc(1, req);
+    if (!p) {
+        unreserve(held);
+        imdb_fail(e, IMDB_ERR_NOMEM, "out of memory (%zu bytes)", n);
+        return NULL;
+    }
+    return settle(p, held);
 }
 
 void *imdb_alloc_array(size_t count, size_t size, imdb_err *e)
@@ -98,11 +178,20 @@ void *imdb_realloc_array(void *p, size_t old_count, size_t new_count, size_t siz
         return NULL;
     }
     if (!p) old_total = 0; /* a NULL block with a stale count was harmless before; keep it so */
-    uint8_t *q = imdb_io_fail_alloc(total) ? NULL : charged(malloc(total ? total : 1));
-    if (!q) {
+    size_t req = total ? total : 1;
+    if (imdb_io_fail_alloc(total)) {
         imdb_fail(e, IMDB_ERR_NOMEM, "out of memory (%zu bytes)", total);
         return NULL;
     }
+    size_t held;
+    if (reserve(req, &held, e)) return NULL; /* the old block is still held: both count while the copy is made */
+    uint8_t *q = malloc(req);
+    if (!q) {
+        unreserve(held);
+        imdb_fail(e, IMDB_ERR_NOMEM, "out of memory (%zu bytes)", total);
+        return NULL;
+    }
+    settle(q, held);
     size_t keep = old_total < total ? old_total : total;
     if (keep) memcpy(q, p, keep);
     if (total > keep) memset(q + keep, 0, total - keep);
@@ -116,7 +205,9 @@ void *imdb_realloc_array(void *p, size_t old_count, size_t new_count, size_t siz
 void imdb_free(void *p)
 {
     if (!p) return;
-    atomic_fetch_sub_explicit(&g_heap, malloc_usable_size(p), memory_order_relaxed);
+    size_t u = malloc_usable_size(p);
+    atomic_fetch_sub_explicit(&g_heap, u, memory_order_relaxed);
+    if (t_exempt) ceiling_move(0, u); /* an exempt section's own block (seg_load's temporaries) */
     free(p);
 }
 
@@ -128,11 +219,20 @@ void *imdb_alloc_aligned(size_t count, size_t size, imdb_err *e)
         return NULL;
     }
     total = (total + 31) & ~(size_t)31;
-    void *p = imdb_io_fail_alloc(total) ? NULL : charged(aligned_alloc(32, total ? total : 32));
-    if (!p) {
+    size_t req = total ? total : 32;
+    if (imdb_io_fail_alloc(total)) {
         imdb_fail(e, IMDB_ERR_NOMEM, "out of memory (%zu bytes)", total);
         return NULL;
     }
+    size_t held;
+    if (reserve(req, &held, e)) return NULL;
+    void *p = aligned_alloc(32, req);
+    if (!p) {
+        unreserve(held);
+        imdb_fail(e, IMDB_ERR_NOMEM, "out of memory (%zu bytes)", total);
+        return NULL;
+    }
+    settle(p, held);
     memset(p, 0, total ? total : 32);
     return p;
 }
@@ -211,11 +311,23 @@ bool imdb_buf_reserve_limit(imdb_buf *b, size_t extra, size_t limit)
         }
     }
     if (ncap > limit) ncap = need;
-    uint8_t *q = imdb_io_fail_alloc(ncap) ? NULL : charged(malloc(ncap)); /* not realloc: see imdb_realloc_array */
-    if (!q) {
+    if (imdb_io_fail_alloc(ncap)) {
         b->err = IMDB_ERR_NOMEM;
         return false;
     }
+    imdb_err er = {0};
+    size_t held;
+    if (reserve(ncap, &held, &er)) { /* past a read statement's ceiling (P0 R2) */
+        b->err = IMDB_ERR_LIMIT;
+        return false;
+    }
+    uint8_t *q = malloc(ncap); /* not realloc: see imdb_realloc_array */
+    if (!q) {
+        unreserve(held);
+        b->err = IMDB_ERR_NOMEM;
+        return false;
+    }
+    settle(q, held);
     if (b->len) memcpy(q, b->p, b->len);
     memset(q + b->len, 0, ncap - b->len);
     if (b->p) {
@@ -293,6 +405,8 @@ void imdb_buf_printf(imdb_buf *b, const char *fmt, ...)
 int imdb_buf_check(const imdb_buf *b, imdb_err *e)
 {
     if (b->err == IMDB_OK) return IMDB_OK;
+    if (b->err == IMDB_ERR_LIMIT) /* its own bound, or a read statement's memory (SET statement_memory) */
+        return imdb_fail(e, b->err, "buffer: past its limit or the statement's memory (SET statement_memory)");
     return imdb_fail(e, b->err, "buffer: %s", imdb_err_name(b->err));
 }
 

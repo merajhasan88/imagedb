@@ -223,29 +223,63 @@ static int run_text(runner *rn, const char *text, size_t len)
     return rc;
 }
 
-static char *read_all(FILE *f, size_t *len)
+/* A script read in chunks (-f FILE, -f -, piped input): each complete statement runs as it arrives, so a script of any
+ * size runs in the memory of its longest statement (IMDB_MAX_SQL) and a chunk; at the end of the stream the rest runs
+ * as imdb_split_statements runs a text (an unterminated literal is the error it is). Before 2026-11-04 the whole input
+ * was read first, and only its first 16 MiB: a longer script was cut, silently. */
+static int run_stream(runner *rn, FILE *f)
 {
-    size_t cap = 1 << 16, n = 0;
-    char *b = imdb_alloc(cap, &(imdb_err){0}); /* the helpers' throughout: imdb_realloc_array credits the old block */
-    if (!b) return NULL;
+    enum { CHUNK = 1 << 20 };
+    size_t cap = CHUNK, n = 0;
+    imdb_err e = {0};
+    char *b = imdb_alloc(cap, &e); /* the helpers' throughout: imdb_realloc_array credits the old block */
+    if (!b) {
+        print_err("error", &e);
+        return 1;
+    }
+    int rc = 0;
     for (;;) {
         if (n == cap) {
-            if (cap >= IMDB_MAX_SQL * 4u) break;
-            char *nb = imdb_realloc_array(b, cap, cap * 2, 1, &(imdb_err){0}); /* wipes the old block */
-            if (!nb) {
-                imdb_wipe(b, cap);
-                imdb_free(b);
-                return NULL;
+            if (cap >= (size_t)IMDB_MAX_SQL + CHUNK) {
+                fprintf(stderr, "imagedb: error: a statement longer than %u bytes (no ';' ends it)\n", IMDB_MAX_SQL);
+                rc = 1;
+                break;
             }
-            cap *= 2;
+            char *nb = imdb_realloc_array(b, cap, cap * 2, 1, &e); /* wipes the old block */
+            if (!nb) {
+                print_err("error", &e);
+                rc = 1;
+                break;
+            }
             b = nb;
+            cap *= 2;
         }
         size_t got = fread(b + n, 1, cap - n, f);
-        if (got == 0) break;
         n += got;
+        if (got == 0) {
+            if (ferror(f)) {
+                fprintf(stderr, "imagedb: error: reading the script: %s\n", strerror(errno));
+                rc = 1;
+            } else if (n) {
+                rc = run_text(rn, b, n);
+            }
+            break;
+        }
+        size_t used = 0;
+        imdb_err es = {0};
+        if ((rc = imdb_split_complete(b, n, run_stmt, rn, &used, &es))) {
+            if (es.code) print_err("error", &es);
+            break;
+        }
+        if (used) {
+            memmove(b, b + used, n - used);
+            imdb_wipe(b + n - used, used); /* SQL text carries row values */
+            n -= used;
+        }
     }
-    *len = n;
-    return b;
+    imdb_wipe(b, cap);
+    imdb_free(b);
+    return rc;
 }
 
 /* Interactive loop: accumulate lines until a statement-terminating ';'. */
@@ -346,16 +380,8 @@ static int cmd_sql(int argc, char **argv)
                 rc = 1;
                 break;
             }
-            size_t len;
-            char *text = read_all(f, &len);
+            rc = run_stream(&rn, f);
             if (f != stdin) fclose(f);
-            if (!text) {
-                rc = 1;
-                break;
-            }
-            rc = run_text(&rn, text, len);
-            imdb_wipe(text, len); /* SQL text carries row values */
-            imdb_free(text);
             ran = true;
         }
     }
@@ -363,13 +389,7 @@ static int cmd_sql(int argc, char **argv)
         if (isatty(0)) {
             repl(&rn);
         } else {
-            size_t len;
-            char *text = read_all(stdin, &len);
-            if (text) {
-                rc = run_text(&rn, text, len);
-                imdb_wipe(text, len);
-            }
-            imdb_free(text);
+            rc = run_stream(&rn, stdin);
         }
     }
     if (ss.txn.open) fprintf(stderr, "imagedb: open transaction rolled back at exit\n");

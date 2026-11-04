@@ -2191,7 +2191,7 @@ imdb_segimg *imdb_seg_resident(const imdb_table *t, imdb_segment *g)
  * ends by its deletion vector's, then each held version's own end, which is later or a running transaction's (an
  * end goes into a resident image only: imdb_seg_set_end). The bytes hash to the descriptor's name, so the
  * descriptor stands. Under the cache's lock: imdb_par_for's workers pin too. */
-static int seg_load(imdb_segcache *c, const imdb_table *t, imdb_segment *g, imdb_segimg **out, imdb_err *e)
+static int seg_load_body(imdb_segcache *c, const imdb_table *t, imdb_segment *g, imdb_segimg **out, imdb_err *e)
 {
     *out = NULL;
     if (!g->ondisk || g->cache != c)
@@ -2256,6 +2256,16 @@ static int seg_load(imdb_segcache *c, const imdb_table *t, imdb_segment *g, imdb
     __atomic_store_n(&g->img_, gi, __ATOMIC_RELEASE);
     *out = gi;
     return IMDB_OK;
+}
+
+/* An image is the segment cache's, under its own budget, not a read statement's workspace (P0 R2, util.h): its
+ * load is exempt from the statement's ceiling, which its allocations raise and its temporaries' frees lower again */
+static int seg_load(imdb_segcache *c, const imdb_table *t, imdb_segment *g, imdb_segimg **out, imdb_err *e)
+{
+    imdb_heap_exempt_begin();
+    int rc = seg_load_body(c, t, g, out, e);
+    imdb_heap_exempt_end();
+    return rc;
 }
 
 imdb_segimg *imdb_seg_pin_slow(const imdb_table *t, imdb_segment *g, imdb_err *e)

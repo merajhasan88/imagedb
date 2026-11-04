@@ -3811,12 +3811,20 @@ static bool is_write(uint8_t k)
            k == ST_DROP_INDEX || k == ST_ALTER_RETENTION || k == ST_DROP_TABLE;
 }
 
+/* A read statement's workspace (P0 R2): what SET statement_memory says, else a quarter of the memory budget, at most
+ * IMDB_MAX_RESULT_BYTES (the result cap before R2, which this replaces: the result is part of the workspace) */
+static uint64_t workspace_of(const imdb_session *ss)
+{
+    if (ss->stmt_memory) return ss->stmt_memory;
+    uint64_t share = ss->db->mem_limit / 4;
+    return share && share < IMDB_MAX_RESULT_BYTES ? share : IMDB_MAX_RESULT_BYTES;
+}
+
 static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const imdb_value *params, uint32_t nparams,
                   imdb_result *r, imdb_err *e)
 {
     imdb_result_init(r);
-    uint64_t share = ss->db->mem_limit / 4;
-    r->byte_cap = share && share < IMDB_MAX_RESULT_BYTES ? share : IMDB_MAX_RESULT_BYTES;
+    r->byte_cap = workspace_of(ss);
     sql_stmt *st = imdb_alloc(sizeof *st, e);
     if (!st) return e->code;
     int rc = imdb_sql_parse(sql, len, st, e);
@@ -3853,7 +3861,7 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
         imdb_free(st);
         return rc;
     }
-    bool autocommit = false, txn = ss->txn.open;
+    bool autocommit = false, txn = ss->txn.open, ceiling = false; /* ceiling: R2's, below */
     imdb_savepoint sp = {0, 0};
     bool physical = st->kind == ST_CHECKPOINT || st->kind == ST_COMPACT || st->kind == ST_ERASE_SUBJECT ||
                     st->kind == ST_ERASE_WHERE || st->kind == ST_VERIFY;
@@ -3894,6 +3902,18 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
         autocommit = true;
     }
     if (is_write(st->kind)) sp = imdb_savepoint_take(db); /* after the swap-in: it indexes this op list */
+    /* R2: a read statement's memory has a hard ceiling (util.h): set after the swap-in above (a parked transaction's
+     * writes replayed are the store's, not this statement's), cleared at the switch's end and at done, before the
+     * policies between transactions (expiry's commit, eviction's rebuild). Set once: an inner statement never moves
+     * an outer one's base. */
+    ceiling = !imdb_heap_ceiling() && (st->kind == ST_SELECT || st->kind == ST_SHOW_TABLES ||
+                                           st->kind == ST_SHOW_DIGEST || st->kind == ST_SHOW_HISTORY ||
+                                           st->kind == ST_SHOW_LOG || st->kind == ST_SHOW_LAKE ||
+                                           st->kind == ST_SHOW_IDENTITY || st->kind == ST_SHOW_REPLICAS ||
+                                           st->kind == ST_SHOW_REPLICATION || st->kind == ST_SHOW_ERASURE ||
+                                           st->kind == ST_SHOW_MEMORY || st->kind == ST_SHOW_INDEXES ||
+                                           st->kind == ST_SHOW_RETENTION);
+    if (ceiling) imdb_heap_ceiling_set(imdb_heap_bytes() + workspace_of(ss), workspace_of(ss));
     switch (st->kind) {
     case ST_EMPTY: break;
     case ST_CREATE:
@@ -4109,6 +4129,14 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
                                k ? IMDB_MAX_SYNC_REPLICAS : IMDB_MAX_SYNC_TIMEOUT_MS);
             else if (k) ss->sync_replicas = (uint32_t)v;
             else ss->sync_wait_ms = (uint32_t)v;
+        } else if (strcmp(st->set_name, "statement_memory") == 0) { /* R2: bytes; 0: the default */
+            int64_t v;
+            imdb_err ep = {0}; /* the range is the message, whatever the literal was */
+            if (imdb_parse_int64(st->set_value, strlen(st->set_value), &v, &ep) || v < 0 ||
+                (v && ((uint64_t)v < IMDB_MIN_STATEMENT_MEMORY || (uint64_t)v > IMDB_MAX_STATEMENT_MEMORY)))
+                rc = imdb_fail(e, IMDB_ERR_INVALID, "statement_memory is 0 (the default) or %llu to %llu bytes",
+                               (unsigned long long)IMDB_MIN_STATEMENT_MEMORY, (unsigned long long)IMDB_MAX_STATEMENT_MEMORY);
+            else ss->stmt_memory = (uint64_t)v;
         } else if (strcmp(st->set_name, "statement_timeout") == 0) { /* R1: milliseconds; 0: none */
             int64_t v;
             imdb_err ep = {0}; /* the range is the message, whatever the literal was */
@@ -4122,12 +4150,13 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
                 rc = imdb_fail(e, IMDB_ERR_INVALID, "min_commit is a commit number (0: no requirement)");
             else ss->min_commit = (uint64_t)v;
         } else {
-            rc = imdb_fail(e, IMDB_ERR_NOTFOUND, "unknown setting %s (cross_check, access_path, join_plan, identity, min_commit, statement_timeout, sync_replicas, sync_timeout_ms)",
+            rc = imdb_fail(e, IMDB_ERR_NOTFOUND, "unknown setting %s (cross_check, access_path, join_plan, identity, min_commit, statement_memory, statement_timeout, sync_replicas, sync_timeout_ms)",
                            st->set_name);
         }
         if (!rc) snprintf(r->status, sizeof r->status, "SET %s = %s", st->set_name, st->set_value);
         break;
     }
+    if (ceiling) imdb_heap_ceiling_set(0, 0);
     if (is_write(st->kind)) {
         if (rc) {
             imdb_savepoint_restore(db, sp);
@@ -4171,6 +4200,7 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
         }
     }
 done:
+    if (ceiling) imdb_heap_ceiling_set(0, 0);
     if (rc) imdb_result_free(r);
     xfree(&x);
     imdb_sql_stmt_free(st);
@@ -4226,6 +4256,54 @@ int imdb_split_statements(const char *s, size_t n, imdb_stmt_cb cb, void *arg, i
     for (size_t k = start; k < n; k++)
         if (s[k] != ' ' && s[k] != '\n' && s[k] != '\t' && s[k] != '\r') blank = false;
     if (!blank) return cb(arg, s + start, n - start);
+    return IMDB_OK;
+}
+
+
+/* The stream's form (the CLI's -f and piped input, read in chunks): the complete statements at the front of s, each
+ * ending in a ';' outside a string literal and a comment, through cb; *used: the bytes they took, the rest being a
+ * statement still arriving. A quote or a '-' at the very end stops it too: the next byte decides whether it is '' (a
+ * quote inside the literal) or -- (a comment). At the end of the stream the rest goes to imdb_split_statements. */
+int imdb_split_complete(const char *s, size_t n, imdb_stmt_cb cb, void *arg, size_t *used, imdb_err *e)
+{
+    size_t start = 0, i = 0;
+    *used = 0;
+    while (i < n) {
+        char c = s[i];
+        if (c == '\'') {
+            i++;
+            while (i < n) {
+                if (s[i] == '\'') {
+                    if (i + 1 == n) return IMDB_OK; /* '' or the end of the literal: the next chunk says */
+                    if (s[i + 1] == '\'') {
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                i++;
+            }
+            if (i >= n) return IMDB_OK; /* the literal goes on in the next chunk */
+            i++;
+            continue;
+        }
+        if (c == '-') {
+            if (i + 1 == n) return IMDB_OK;
+            if (s[i + 1] == '-') {
+                while (i < n && s[i] != '\n') i++;
+                if (i >= n) return IMDB_OK; /* the comment goes on in the next chunk */
+                continue;
+            }
+        }
+        if (c == ';') {
+            int rc = cb(arg, s + start, i + 1 - start);
+            if (rc) return rc;
+            start = i + 1;
+            *used = start;
+        }
+        i++;
+    }
+    (void)e;
     return IMDB_OK;
 }
 

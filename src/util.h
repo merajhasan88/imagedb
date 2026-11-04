@@ -64,6 +64,16 @@ void imdb_free(void *p);
 /* The heap's counter: the bytes malloc reserved for the blocks these helpers returned and
  * imdb_free has not freed, for the whole process (every handle and the pool's workers). */
 uint64_t imdb_heap_bytes(void);
+/* P0 R2: a read statement's ceiling on that counter (an absolute value; 0: none, the default). With one set, the
+ * allocation helpers refuse a request that would take the counter past it, IMDB_ERR_LIMIT (an imdb_buf: its sticky
+ * err). One for the process, as the counter is: the engine thread sets it around a read statement's execution only
+ * (sql_exec.c), when nothing else allocates but the pool's workers for that statement. */
+void imdb_heap_ceiling_set(uint64_t ceiling, uint64_t workspace); /* workspace: the bytes it allows, for messages */
+uint64_t imdb_heap_ceiling(void);
+/* This thread's allocations from here to the end are not the statement's workspace (a segment image's load, under
+ * the segment cache's own budget): each raises the ceiling first, each free lowers it. Nests. */
+void imdb_heap_exempt_begin(void);
+void imdb_heap_exempt_end(void);
 /* 32-byte aligned, zeroed (for SIMD-friendly arrays such as LtHash states). */
 void *imdb_alloc_aligned(size_t count, size_t size, imdb_err *e);
 char *imdb_strndup(const char *s, size_t n, imdb_err *e);

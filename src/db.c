@@ -1430,7 +1430,7 @@ static uint64_t seg_start_time(imdb_db *db, size_t i, uint64_t known);
  * to the one before, the chain tied to a commit already trusted: the index's own entry where the segment reaches it,
  * else the segment's last commit's signature under the key schedule. A promotion's commit is signed otherwise:
  * there, every commit is read up to the index (imdb_ci_load_all), as before. */
-static int ci_old_load(imdb_db *db, uint64_t seq, imdb_err *e)
+static int ci_old_load_body(imdb_db *db, uint64_t seq, imdb_err *e)
 {
     if (seq < db->ci_old_first || seq - db->ci_old_first >= db->nci_old) {
         size_t si = imdb_logseg_find(db->segs, db->nsegs, seq);
@@ -1504,6 +1504,16 @@ static int ci_old_load(imdb_db *db, uint64_t seq, imdb_err *e)
         db->nci_old = n;
     }
     return IMDB_OK;
+}
+
+/* The one segment's commits kept below the index are a cache, like a segment's image, and its read is bounded by the
+ * log segment, not by the statement that needed one commit: exempt from a read statement's ceiling (P0 R2, util.h) */
+static int ci_old_load(imdb_db *db, uint64_t seq, imdb_err *e)
+{
+    imdb_heap_exempt_begin();
+    int rc = ci_old_load_body(db, seq, e);
+    imdb_heap_exempt_end();
+    return rc;
 }
 
 const imdb_commit_info *imdb_ci_at(imdb_db *db, uint64_t seq, imdb_err *e)

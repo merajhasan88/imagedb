@@ -109,7 +109,8 @@ static void t_mem_admission(void)
     }
 }
 
-/* A result has its own cap: a quarter of the budget, or IMDB_MAX_RESULT_BYTES. */
+/* A result has its own cap: a quarter of the budget, or IMDB_MAX_RESULT_BYTES; since R2 a read statement's ceiling (the
+ * same quarter) holds it too, and its growth's overlap may reach that first */
 static void t_mem_result_cap(void)
 {
     const char *dir = test_tmpdir();
@@ -127,7 +128,8 @@ static void t_mem_result_cap(void)
     imdb_session s;
     imdb_session_init(&s, db);
     imdb_result r;
-    CHECK(run(&s, "SELECT * FROM txns", &r) == IMDB_ERR_LIMIT && strstr(g_e.msg, "result over its cap"));
+    CHECK(run(&s, "SELECT * FROM txns", &r) == IMDB_ERR_LIMIT &&
+          (strstr(g_e.msg, "result over its cap") || strstr(g_e.msg, "statement memory"))); /* the cap, or the ceiling (R2) */
     imdb_result_free(&r);
     OK(run(&s, "SELECT * FROM txns LIMIT 10", &r));
     CHECK(r.nrows == 10);

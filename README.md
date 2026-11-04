@@ -59,6 +59,7 @@ make                    # gcc or clang, make, NASM; the engine links only libc a
 make NOASM=1            # without the NASM kernels (make clean when switching)
 build/imagedb init /data/p
 build/imagedb sql /data/p
+build/imagedb sql /data/p -f script.sql   # or piped: each statement runs as it is read, any size
 ```
 
 ```sql
@@ -84,8 +85,19 @@ The database lives in memory (the log and the lake are its durable copies).
 `--mem-limit BYTES` (K, M or G suffix) gives it a budget: a write that would
 grow it past the budget is refused before anything is written, while DELETE,
 CHECKPOINT, COMPACT ... PURGE and ERASE are never refused, and an open always
-succeeds. `SHOW MEMORY` shows what it holds by kind. A query result is capped at
-1 GiB (a quarter of the budget when one is set): add LIMIT.
+succeeds. `SHOW MEMORY` shows what it holds by kind.
+
+A query (SELECT, joins included, and SHOW) has a hard memory limit: everything
+it allocates, its result, sort keys, groups and join pairs alike, is counted
+before it is allocated, and a query that would pass the limit fails with
+"statement memory" and changes nothing (narrow it, or add LIMIT). `SET
+statement_memory = BYTES` sets it for the session (1 MiB to 16 GiB); by default
+it is a quarter of the budget, or 1 GiB without one. The lake's segments a query
+reads are not in this limit: they stay in memory until the query ends (the
+segment cache, `--seg-cache`, trims them after it), so a query's peak is its limit
+plus the segments it read; a scan that lets go of what it has passed is still to
+come. Writes are bounded by the budget, not by this limit, and nothing spills to
+disk.
 
 `SET statement_timeout = MS` stops any statement of the session that runs longer
 (0, the default, is none), and Ctrl-C in `imagedb sql` stops the running statement:

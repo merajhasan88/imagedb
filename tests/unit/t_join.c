@@ -560,7 +560,8 @@ static void t_join_refusals(void)
     imdb_close(db);
 }
 
-/* the build side and the joined rows count against the result's cap: a join of every row with
+/* the build side and the joined rows count against the result's cap (and, since R2, the statement's ceiling, the same
+ * quarter of the budget, which their growth's overlap may reach first): a join of every row with
  * every row under a small budget is refused, not grown into memory */
 static void t_join_budget(void)
 {
@@ -588,7 +589,7 @@ static void t_join_budget(void)
     imdb_result r;
     imdb_err_clear(E);
     int rc = imdb_exec_one(&s, "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k", 44, NULL, 0, &r, E);
-    CHECK(rc == IMDB_ERR_LIMIT && strstr(g_e.msg, "a join over its cap")); /* 4,000,000 joined rows: refused while
+    CHECK(rc == IMDB_ERR_LIMIT && (strstr(g_e.msg, "a join over its cap") || strstr(g_e.msg, "statement memory"))); /* 4,000,000 joined rows: refused while
                                                                            counted, not once kept */
     if (!rc) imdb_result_free(&r);
     imdb_err_clear(E);
@@ -600,7 +601,7 @@ static void t_join_budget(void)
     s.join_plan = IMDB_JOIN_INDEX;
     imdb_err_clear(E);
     rc = imdb_exec_one(&s, "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k", 44, NULL, 0, &r, E);
-    CHECK(rc == IMDB_ERR_LIMIT && strstr(g_e.msg, "a join over its cap"));
+    CHECK(rc == IMDB_ERR_LIMIT && (strstr(g_e.msg, "a join over its cap") || strstr(g_e.msg, "statement memory")));
     if (!rc) imdb_result_free(&r);
     imdb_err_clear(E);
     OK(imdb_exec_one(&s, "SELECT COUNT(*) FROM a JOIN b ON a.k = b.k", 42, NULL, 0, &r, E));
