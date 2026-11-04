@@ -334,6 +334,19 @@ void imdb_txn_doom_retired(imdb_db *db, uint64_t boundary)
             doom(x, "its snapshot is at or below the retirement boundary: no table keeps that history");
 }
 
+void imdb_txn_doom_dropped(imdb_db *db, uint32_t table, uint64_t seq)
+{
+    for (imdb_txn *x = db->txns; x; x = x->next) { /* parked ones: the active one's ops are checked at its commit */
+        bool hit = false;
+        for (uint32_t i = 0; i < x->nops && !hit; i++) hit = x->ops[i].table == table;
+        for (uint32_t i = 0; i < x->nlocks && !hit; i++) hit = x->locks[i].table == table;
+        if (!hit || x->doomed) continue;
+        char why[96];
+        snprintf(why, sizeof why, "its table was dropped at commit %llu", (unsigned long long)seq);
+        doom(x, why);
+    }
+}
+
 void imdb_txn_doom_erased(imdb_db *db, const imdb_erase_ent *ents, uint32_t n)
 {
     for (imdb_txn *x = db->txns; x; x = x->next) {

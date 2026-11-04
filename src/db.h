@@ -139,6 +139,8 @@ typedef struct imdb_table {
     uint32_t nseg, capseg;
     uint64_t horizon;         /* AS OF below this seq is unavailable (purged) */
     uint64_t retention_us;    /* op 16: how long a version stays answerable after it ends; IMDB_RETAIN_FOREVER */
+    uint64_t created_at;      /* the commit that created it (a name resolves by a snapshot: imdb_table_at) */
+    uint64_t dropped_at;      /* op 19 (1f): the commit that dropped it, its live versions ended there; 0: live */
     imdb_index idx[IMDB_MAX_INDEXES];
     uint32_t nidx;
     uint64_t idx_upto;        /* versions below are in the indexes' structures; the rest are the */
@@ -457,7 +459,17 @@ int imdb_index_unique_build(imdb_table *t, imdb_index *ix, imdb_err *e);
 /* replay: a new row (its decoded values) whose key a live version holds already is IMDB_ERR_CORRUPT */
 int imdb_index_unique_replay(imdb_table *t, const imdb_value *row, uint64_t seq, imdb_err *e);
 uint64_t imdb_index_unique_bytes(const imdb_index *ix); /* for imdb_mem */
+/* a live table by name (a dropped one is a tombstone: its name is free); imdb_table_at: the table a read at snapshot
+ * snap sees by that name, dropped since or not (created at or before snap, dropped after it) */
 imdb_table *imdb_table_by_name(imdb_db *db, const char *name);
+imdb_table *imdb_table_at(imdb_db *db, const char *name, uint64_t snap);
+/* DROP TABLE (op 19, 1f): in a transaction holding nothing else; retention_us, when not 0, is logged first (op 16:
+ * DROP TABLE t RETENTION r), and a table kept FOREVER needs one, so its history can expire. The commit ends every
+ * live version and makes the table a tombstone (imdb_table_drop_install, after its frame is durable) */
+int imdb_drop_table(imdb_db *db, imdb_table *t, uint64_t retention_us, imdb_err *e);
+void imdb_table_drop_install(imdb_db *db, imdb_table *t, uint64_t seq);
+/* each DROP_TABLE of ops: minus its table's lanes into delta (touched), beside imdb_digest_delta's */
+void imdb_digest_drops(const imdb_db *db, const imdb_op *ops, uint32_t nops, uint32_t nt, imdb_lthash *delta, bool *touched);
 imdb_table *imdb_table_by_id(imdb_db *db, uint32_t id);
 
 /* ---- transactions --------------------------------------------------------- */
@@ -542,6 +554,8 @@ void imdb_txn_doom_erased(imdb_db *db, const imdb_erase_ent *ents, uint32_t n);
 /* After a RETIRE below boundary: dooms every transaction whose snapshot is at or below it (every table's
  * horizon is past it, so none of its reads could be answered). */
 void imdb_txn_doom_retired(imdb_db *db, uint64_t boundary);
+/* DROP TABLE (1f): every open transaction that wrote or locked rows of the table is doomed at its install */
+void imdb_txn_doom_dropped(imdb_db *db, uint32_t table, uint64_t seq);
 /* After a statement of x lost a write-write race: it can only roll back. */
 void imdb_txn_doom(imdb_txn *x, const char *why);
 /* A doomed transaction drops its writes at once (pending versions undone and wiped, saved
@@ -766,8 +780,9 @@ int imdb_verify(imdb_db *db, imdb_verify_report *rep, imdb_err *e);
 
 /* Digest (32 bytes) of one table, or of all tables when t == NULL. */
 void imdb_state_digest(const imdb_db *db, const imdb_table *t, uint8_t out[32]);
-/* The view token: SHA-256("IMDBVIEW1" || db id || u64 seq || head || u32 tables || for each table in
- * id order: u32 id || u32 schema length || its encoding || u64 horizon || u64 live || LtHash lanes).
+/* The view token: SHA-256("IMDBVIEW2" || db id || u64 seq || head || u32 tables || for each table in
+ * id order: u32 id || u32 schema length || its encoding || u64 horizon || u64 live || u64 created || u64 dropped
+ * (0: live) || LtHash lanes).
  * Equal tokens: the same database, chain position, schemas, horizons and rows (a digest alone says
  * nothing about which database or history). imagedb-audit identity computes it from files. */
 int imdb_view_token(const imdb_db *db, uint8_t out[32], imdb_err *e);

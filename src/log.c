@@ -142,6 +142,14 @@ void imdb_commit_encode_header(const imdb_commit_rec *c, imdb_buf *b)
             imdb_buf_put_u32(b, o->table);
             imdb_buf_put_u64(b, o->retention_us);
             break;
+        case IMDB_OP_DROP_TABLE: /* the commit's last op, after at most its table's SET_RETENTION (log.h) */
+            if (i + 1 != c->nops || i > 1 ||
+                (i == 1 && (c->ops[0].code != IMDB_OP_SET_RETENTION || c->ops[0].table != o->table))) {
+                b->err = IMDB_ERR_INVALID;
+                break;
+            }
+            imdb_buf_put_u32(b, o->table);
+            break;
         case IMDB_OP_EXPIRE: /* only EXPIREs in its commit, by table, each before its commit (log.h) */
             if (!o->purge_before || o->purge_before >= c->seq ||
                 (i && (c->ops[i - 1].code != IMDB_OP_EXPIRE || c->ops[i - 1].table >= o->table)) ||
@@ -450,6 +458,9 @@ int imdb_commit_decode_header(const uint8_t *h, size_t hlen, imdb_commit_rec *c,
             if (!r.err && (!o->purge_before || o->purge_before >= c->seq))
                 return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: EXPIRE's horizon is not in the past");
             break;
+        case IMDB_OP_DROP_TABLE:
+            o->table = imdb_rd_u32(&r);
+            break;
         default:
             return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: unknown op code %u", o->code);
         }
@@ -461,6 +472,12 @@ int imdb_commit_decode_header(const uint8_t *h, size_t hlen, imdb_commit_rec *c,
         if (ex != ex0 || (ex && i && c->ops[i - 1].table >= c->ops[i].table))
             return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: EXPIREs must stand alone, one a table, by table");
     }
+    /* a DROP_TABLE stands alone, after at most its own table's SET_RETENTION (log.h) */
+    for (uint32_t i = 0; i < nops; i++)
+        if (c->ops[i].code == IMDB_OP_DROP_TABLE &&
+            (i + 1 != nops || i > 1 ||
+             (i == 1 && (c->ops[0].code != IMDB_OP_SET_RETENTION || c->ops[0].table != c->ops[i].table))))
+            return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: DROP_TABLE must stand alone, after at most its table's retention");
     /* a table's retention is always logged: its CREATE_TABLE is followed at once by its SET_RETENTION (log.h) */
     for (uint32_t i = 0; i < nops; i++)
         if (c->ops[i].code == IMDB_OP_CREATE_TABLE &&

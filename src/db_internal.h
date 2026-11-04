@@ -62,6 +62,8 @@ int imdb_mem_admit(imdb_db *db, uint64_t growth, imdb_err *e);
  * whole log, unless *moved: an object vanished and LAKE_HEAD now names another generation (a
  * writer's GC after newer publications), so it tries again, from a new listing of the log. */
 int imdb_lake_load_snapshot(imdb_db *db, uint64_t *seq, bool *moved, imdb_err *e);
+/* before a full replay: a head manifest of an older format refused by name (IMDB_ERR_UNSUPPORTED), nothing else */
+int imdb_lake_format_check(imdb_db *db, imdb_err *e);
 /* LAKE_HEAD as it is on disk (present false: none). */
 int imdb_lake_head(int dirfd, bool *present, uint64_t *seq, uint8_t manifest[32], imdb_err *e);
 /* Makes every commit appended so far durable (the --nosync ones too) and the watermark say so.

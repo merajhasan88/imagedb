@@ -682,7 +682,7 @@ static int srun_db(imdb_db *db, const char *sql)
  * auditor pass both directories, a commit is written to it and shipped to its replica, and their
  * digests stay equal; a plain open never rewrites META (meta_head: its first line). Run from the tree
  * root (as make runs the suite); a missing tarball fails, never passes. */
-static void fixture_check(const char *tgz, uint8_t alg, const char *meta_head, bool tagged)
+static void fixture_check(const char *tgz, uint8_t alg, const char *meta_head, bool tagged, uint64_t base)
 {
     const char *dir = test_tmpdir();
     struct stat st;
@@ -701,16 +701,16 @@ static void fixture_check(const char *tgz, uint8_t alg, const char *meta_head, b
     OK(imdb_identity_read(p, &id, &rep, E));
     CHECK(id.digest_alg == alg && !rep && !id.has_root);
     imdb_db *db = open_db(p);
-    CHECK(db && db->meta.digest_alg == alg && db->seq == 13);
+    CHECK(db && db->meta.digest_alg == alg && db->seq == base);
     if (!db) return;
     imdb_verify_report vr;
     memset(&vr, 0, sizeof vr);
     OK(imdb_verify(db, &vr, E));
-    CHECK(srun_db(db, "INSERT INTO ev VALUES (3001, 9, 4, 'after digest_alg 2')") == 0 && db->seq == 14);
+    CHECK(srun_db(db, "INSERT INTO ev VALUES (3001, 9, 4, 'after digest_alg 2')") == 0 && db->seq == base + 1);
     /* a CHECKPOINT ends that segment, and the next commit begins a tagged one (design.md §3): an
      * untagged fixture's segments, then tagged ones, in both directories; a tagged one's all tagged */
     CHECK(srun_db(db, "CHECKPOINT") == 0 && srun_db(db, "INSERT INTO ev VALUES (3002, 9, 5, 'tagged')") == 0 &&
-          db->seq == 16);
+          db->seq == base + 3);
     size_t hn = 0;
     uint8_t *h0 = slurp(seg_path(p, 0), &hn), *hl = NULL;
     CHECK(h0 && imdb_tseg_is_tagged(h0, hn) == tagged);
@@ -723,14 +723,14 @@ static void fixture_check(const char *tgz, uint8_t alg, const char *meta_head, b
     uint8_t dp[32], dr[32];
     imdb_state_digest(db, NULL, dp);
     imdb_close(db);
-    OK(ship_to_file(p, 13, s, E));
+    OK(ship_to_file(p, base, s, E));
     imdb_db *rdb = open_db(r);
     CHECK(rdb);
     if (!rdb) return;
     uint64_t applied = 0;
     OK(apply_file(rdb, s, &applied, E));
     imdb_state_digest(rdb, NULL, dr);
-    CHECK(applied == 3 && rdb->seq == 16 && memcmp(dp, dr, 32) == 0);
+    CHECK(applied == 3 && rdb->seq == base + 3 && memcmp(dp, dr, 32) == 0);
     char la[800], lb[800], why[300] = "";
     snprintf(la, sizeof la, "%s/log", p);
     snprintf(lb, sizeof lb, "%s/log", r);
@@ -746,19 +746,19 @@ static void fixture_check(const char *tgz, uint8_t alg, const char *meta_head, b
     free(m);
 }
 
-/* The format's fixtures (make_fixtures.sh, 2026-10-29: META 5, manifest version 4, op 16, tagged
+/* The format's fixtures (make_fixtures.sh, 2026-11-04: META 5, manifest version 5, ops 16 and 19, tagged
  * segments), one a digest algorithm: they pin the format, so a change to it fails here first */
 static void t_round3_alg1_fixture(void)
 {
-    fixture_check("tests/fixtures/alg1-20261029.tar.gz", IMDB_DIGEST_ALG_LTHASH16, "imagedb-meta 5\n", true);
+    fixture_check("tests/fixtures/alg1-20261104.tar.gz", IMDB_DIGEST_ALG_LTHASH16, "imagedb-meta 5\n", true, 16);
 }
 
 static void t_round3_alg2_fixture(void)
 {
-    fixture_check("tests/fixtures/alg2-20261029.tar.gz", IMDB_DIGEST_ALG_LTHASH16_TREE, "imagedb-meta 5\n", true);
+    fixture_check("tests/fixtures/alg2-20261104.tar.gz", IMDB_DIGEST_ALG_LTHASH16_TREE, "imagedb-meta 5\n", true, 16);
 }
 
-/* The fixtures of the formats before the retention's (alg1-20261026: META 2; alg2-20261026 and
+/* The fixtures of the formats before the current one (alg1-20261026: META 2; alg2-20261026 and
  * tagged-20261027: META 4): directories this imagedb refuses by name, and the auditor too, since no
  * reader is kept for them before the format freeze */
 static void t_round3_old_fixtures(void)
@@ -787,6 +787,34 @@ static void t_round3_old_fixtures(void)
         imdb_err_clear(E);
         CHECK(imdb_open(p, &o, &db, E) == IMDB_ERR_UNSUPPORTED && !db && strstr(g_e.msg, "before the retention format"));
         CHECK(audit_dir(p) != 0); /* refused (1), or no auditor in this build (-1) */
+    }
+    /* the fixtures of META 5 with manifest version 4 (alg1-20261029, alg2-20261029: before DROP TABLE, 1f): META reads,
+     * and the open refuses the lake by name, never replaying past it to a rebuilt manifest of another version */
+    static const char *const tgz4[] = {"tests/fixtures/alg1-20261029.tar.gz", "tests/fixtures/alg2-20261029.tar.gz"};
+    for (size_t i = 0; i < sizeof tgz4 / sizeof *tgz4; i++) {
+        struct stat st;
+        if (stat(tgz4[i], &st) != 0) {
+            test_fail(__FILE__, __LINE__, "a fixture tarball (tests/fixtures) is missing: run the suite from the tree root");
+            return;
+        }
+        char d[700], cmd[1600], p[760];
+        snprintf(d, sizeof d, "%s/m%zu", dir, i);
+        CHECK(mkdir(d, 0700) == 0);
+        snprintf(cmd, sizeof cmd, "tar -xzf '%s' -C '%s'", tgz4[i], d);
+        CHECK(system(cmd) == 0);
+        snprintf(p, sizeof p, "%s/primary", d);
+        imdb_identity id;
+        bool rep;
+        OK(imdb_identity_read(p, &id, &rep, E));
+        for (int full = 0; full < 2; full++) { /* a full replay too, refused before its CHECKPOINTs rebuild another one */
+            imdb_open_opts o = {.sync = 0, .full_replay = full};
+            imdb_db *db = NULL;
+            imdb_err_clear(E);
+            int rc = imdb_open(p, &o, &db, E);
+            CHECK(!db && rc == IMDB_ERR_UNSUPPORTED && strstr(g_e.msg, "before DROP TABLE"));
+            if (db) imdb_close(db);
+        }
+        CHECK(audit_dir(p) != 0);
     }
 }
 

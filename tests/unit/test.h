@@ -69,5 +69,6 @@ TESTS(vectors)
 TESTS(backup)
 TESTS(expr)
 TESTS(cancel)
+TESTS(drop)
 
 #endif

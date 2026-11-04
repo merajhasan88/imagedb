@@ -184,6 +184,8 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
         }
     } else if ((rc = imdb_digest_delta(db->meta.digest_alg, c->ops, c->nops, nt, delta, touched, e))) {
         goto out;
+    } else {
+        imdb_digest_drops(db, c->ops, c->nops, nt, delta, touched); /* a DROP TABLE (the pre-pass never sums one) */
     }
     imdb_lthash global = db->global;
     for (uint32_t t = 0; t < nt; t++)
@@ -222,14 +224,30 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
                             : imdb_table_by_id(db, o->table);
         if (!t && (o->code == IMDB_OP_INSERT || o->code == IMDB_OP_DELETE || o->code == IMDB_OP_UPDATE ||
                    o->code == IMDB_OP_COMPACT || o->code == IMDB_OP_CREATE_INDEX || o->code == IMDB_OP_DROP_INDEX ||
-                   o->code == IMDB_OP_SET_RETENTION || o->code == IMDB_OP_EXPIRE)) {
+                   o->code == IMDB_OP_SET_RETENTION || o->code == IMDB_OP_EXPIRE || o->code == IMDB_OP_DROP_TABLE)) {
             rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: unknown table %u", (unsigned long long)seq, o->table);
+            break;
+        }
+        if (t && t->dropped_at && (o->code == IMDB_OP_INSERT || o->code == IMDB_OP_DELETE || o->code == IMDB_OP_UPDATE || o->code == IMDB_OP_COMPACT ||
+                                   o->code == IMDB_OP_CREATE_INDEX || o->code == IMDB_OP_DROP_INDEX ||
+                                   o->code == IMDB_OP_SET_RETENTION)) { /* its history may still expire or be erased */
+            rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: op %u on table %u, dropped at commit %llu", (unsigned long long)seq,
+                           o->code, o->table, (unsigned long long)t->dropped_at);
             break;
         }
         switch (o->code) {
         case IMDB_OP_CREATE_TABLE:
             if (o->table != db->nt) rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: table id out of sequence", (unsigned long long)seq);
-            else rc = imdb_table_new(db, o->schema, e);
+            else if (!(rc = imdb_table_new(db, o->schema, e))) db->t[db->nt - 1]->created_at = seq;
+            break;
+        case IMDB_OP_DROP_TABLE: /* live, and its history not kept FOREVER (its commit's op 16 applied first) */
+            if (t->dropped_at)
+                rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: DROP of table %u, dropped already", (unsigned long long)seq,
+                               o->table);
+            else if (t->retention_us == IMDB_RETAIN_FOREVER)
+                rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: DROP of table %u, which is kept FOREVER",
+                               (unsigned long long)seq, o->table);
+            else imdb_table_drop_install(db, t, seq);
             break;
         case IMDB_OP_SET_RETENTION:
             t->retention_us = o->retention_us;
@@ -400,7 +418,7 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
         uint8_t code = c->ops[i].code;
         if (code == IMDB_OP_INSERT || code == IMDB_OP_DELETE || code == IMDB_OP_UPDATE || code == IMDB_OP_CREATE_TABLE ||
             code == IMDB_OP_CREATE_INDEX || code == IMDB_OP_DROP_INDEX || code == IMDB_OP_SET_RETENTION ||
-            code == IMDB_OP_EXPIRE)
+            code == IMDB_OP_EXPIRE || code == IMDB_OP_DROP_TABLE)
             db->lake_dirty = true; /* the manifest records the definitions, the retentions and the horizons */
         if (code == IMDB_OP_ERASE) db->last_erase = seq; /* a pin from before it never keeps the files (lake.h) */
         db->ended_pass += code == IMDB_OP_DELETE || code == IMDB_OP_UPDATE; /* the memory window's trigger */
@@ -626,6 +644,8 @@ static int rbatch_prepare(imdb_db *db, rbatch *b, imdb_err *e)
         rframe *f = &b->f[i];
         uint32_t nd = 0;
         bool usable = f->decoded && f->c.sig_ok;
+        for (uint32_t k = 0; usable && k < f->c.nops; k++) /* a drop's sum is its table's state then: the commit's own */
+            usable = f->c.ops[k].code != IMDB_OP_DROP_TABLE;
         for (size_t k = 0; k < f->nch; k++) {
             if (b->ch[f->ch0 + k].nomem) return imdb_fail(e, IMDB_ERR_NOMEM, "replay: out of memory");
             usable = usable && !b->ch[f->ch0 + k].overflow;
@@ -808,7 +828,10 @@ int imdb_replay(imdb_db *db, bool ro, imdb_err *e)
         if (!db->seg_time) return e->code;
         db->log_rotate = true; /* no segment yet: the first append creates one */
         db->log_tagged = false; /* a retry reads the segments again from the first */
-        if (db->full_replay) break;
+        if (db->full_replay) {
+            if (imdb_lake_format_check(db, e)) return e->code;
+            break;
+        }
         uint64_t S = 0;
         bool moved = false;
         imdb_err e2 = {0};
@@ -822,6 +845,10 @@ int imdb_replay(imdb_db *db, bool ro, imdb_err *e)
             break;
         }
         imdb_reset_state(db);
+        if (e2.code == IMDB_ERR_UNSUPPORTED) { /* an older format: refused by name, never rebuilt by a replay */
+            *e = e2;
+            return e->code;
+        }
         if (moved && attempt < IMDB_PIN_RETRIES) { /* its generation went while it was read: as things are now */
             imdb_free(db->segs);
             db->segs = NULL;

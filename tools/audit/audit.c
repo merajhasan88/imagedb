@@ -853,6 +853,9 @@ static int decode_body(const uint8_t *b, size_t n, const meta *m, keys *ks, comm
             if (!hr.bad && (o->purge_before == 0 || o->purge_before >= c->seq))
                 return fail("header: EXPIRE's horizon is not in the past");
             break;
+        case 19: /* DROP_TABLE (1f): u32 table */
+            o->table = rd_u32(&hr);
+            break;
         case 18:
             o->purge_before = rd_u64(&hr);
             o->manifest = rd_bytes(&hr, 32);
@@ -864,6 +867,11 @@ static int decode_body(const uint8_t *b, size_t n, const meta *m, keys *ks, comm
         }
         if (hr.bad) return fail("header: truncated op");
     }
+    /* a DROP_TABLE (19) is its commit's last op, after at most its own table's SET_RETENTION (16) */
+    for (uint32_t i = 0; i < nops; i++)
+        if (c->ops[i].code == 19 &&
+            (i + 1 != nops || i > 1 || (i == 1 && (c->ops[0].code != 16 || c->ops[0].table != c->ops[i].table))))
+            return fail("header: DROP_TABLE must stand alone, after at most its table's retention");
     /* every CREATE_TABLE (1) is followed at once by its table's SET_RETENTION (16) */
     for (uint32_t i = 0; i < nops; i++)
         if (c->ops[i].code == 1 && (i + 1 == nops || c->ops[i + 1].code != 16 || c->ops[i + 1].table != c->ops[i].table))
@@ -930,6 +938,7 @@ typedef struct table {
     uint64_t horizon, horizon_at_lake; /* AS OF below it refused (COMPACT's PURGE BEFORE, EXPIRE): now, at the lake */
     uint64_t purged_at_lake;           /* COMPACT's alone: versions ended at or before it are tombstones */
     uint64_t retention, retention_at_lake; /* SET_RETENTION (16): now, and at the lake snapshot commit */
+    uint64_t created_at, dropped_at, dropped_at_lake; /* CREATE (1) and DROP_TABLE (19, 0: live): now; the drop at the lake */
     aidx idx[MAX_INDEXES], idx_at_lake[MAX_INDEXES]; /* sorted by name, now and at the lake snapshot */
     uint32_t nidx, nidx_at_lake;
 } table;
@@ -1202,13 +1211,37 @@ static int apply_op(state *S, const op *o, uint64_t seq)
         S->t = xrealloc(S->t, S->nt + 1, sizeof *S->t);
         memset(&S->t[S->nt], 0, sizeof S->t[S->nt]);
         S->t[S->nt].s = *o->sch;
+        S->t[S->nt].created_at = seq;
         S->t[S->nt].s.raw = xcalloc(o->sch->rawlen, 1);
         memcpy(S->t[S->nt].s.raw, o->sch->raw, o->sch->rawlen);
         for (uint32_t i = 0; i < S->nt; i++)
-            if (strcmp(S->t[i].s.name, o->sch->name) == 0) return fail("commit %llu: duplicate table", (unsigned long long)seq);
+            if (!S->t[i].dropped_at && strcmp(S->t[i].s.name, o->sch->name) == 0)
+                return fail("commit %llu: duplicate table", (unsigned long long)seq);
         S->nt++;
         return 0;
     }
+    if (o->code == 19) { /* DROP_TABLE: live, not kept FOREVER (its op 16 first); every live version ends, one by one */
+        if (o->table >= S->nt) return fail("commit %llu: DROP of an unknown table", (unsigned long long)seq);
+        table *t = &S->t[o->table];
+        if (t->dropped_at || t->retention == UINT64_MAX)
+            return fail("commit %llu: DROP of table %s, dropped already or kept FOREVER", (unsigned long long)seq, t->s.name);
+        for (uint64_t vid = av_skip(t, 0); vid < t->n; vid = av_skip(t, vid + 1)) {
+            ver *v = av(t, vid);
+            if (!v || v->end != LIVE) continue;
+            v->end = seq;
+            uk_end(t, vid);
+            lt_sub(S->m.alg, &t->d, v->commit);
+            lt_sub(S->m.alg, &S->glob, v->commit);
+            t->live--;
+        }
+        if (t->live) return fail("commit %llu: DROP of table %s leaves live rows", (unsigned long long)seq, t->s.name);
+        t->dropped_at = seq;
+        return 0;
+    }
+    if ((o->code == 2 || o->code == 3 || o->code == 4 || o->code == 11 || o->code == 14 || o->code == 15 || o->code == 16) &&
+        o->table < S->nt && S->t[o->table].dropped_at)
+        return fail("commit %llu: op %u on table %s, dropped at commit %llu", (unsigned long long)seq, o->code,
+                    S->t[o->table].s.name, (unsigned long long)S->t[o->table].dropped_at);
     if (o->code == 16) {
         if (o->table >= S->nt) return fail("commit %llu: SET_RETENTION of an unknown table", (unsigned long long)seq);
         S->t[o->table].retention = o->retention;
@@ -1227,7 +1260,7 @@ static int apply_op(state *S, const op *o, uint64_t seq)
             return 0;
         }
         for (uint32_t i = 0; i < S->nt; i++)
-            for (uint32_t j = 0; j < S->t[i].nidx; j++)
+            for (uint32_t j = 0; !S->t[i].dropped_at && j < S->t[i].nidx; j++) /* a dropped table's names are free */
                 if (strcmp(S->t[i].idx[j].name, o->iname) == 0)
                     return fail("commit %llu: CREATE INDEX with a name in use", (unsigned long long)seq);
         if (!aidx_ok(&o->ix, t->s.ncols) || t->nidx >= MAX_INDEXES)
@@ -1741,6 +1774,7 @@ static int replay(state *S, int dirfd, uint64_t *commits)
                     memcpy(S->t[ti].idx_at_lake, S->t[ti].idx, sizeof S->t[ti].idx);
                     S->t[ti].nidx_at_lake = S->t[ti].nidx;
                     S->t[ti].retention_at_lake = S->t[ti].retention;
+                    S->t[ti].dropped_at_lake = S->t[ti].dropped_at;
                     S->t[ti].n_at_lake = S->t[ti].n;
                 }
                 S->boundary_at_lake = S->boundary;
@@ -2086,7 +2120,8 @@ typedef struct mtable {
     uint32_t *nrows, nseg;
     aidx idx[MAX_INDEXES];
     uint32_t nidx;
-    uint64_t retention; /* version 4: SET_RETENTION's microseconds, or all ones */
+    uint64_t retention; /* SET_RETENTION's microseconds, or all ones */
+    uint64_t created_at, dropped_at; /* version 5: the commits that created and dropped it (0: live) */
 } mtable;
 
 typedef struct manifest {
@@ -2173,7 +2208,7 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
     rd r = {b, len, 0, false};
     const uint8_t *mg = rd_bytes(&r, 8);
     uint32_t mver = mg && memcmp(mg, "IMDBMAN1", 8) == 0 ? rd_u32(&r) : 0;
-    if (mver != 4) return fail("manifest: bad header (version 4 only)");
+    if (mver != 5) return fail("manifest: bad header (version 5 only)");
     uint32_t nt = rd_u32(&r);
     const uint8_t *id = rd_bytes(&r, 16);
     m->seq = rd_u64(&r);
@@ -2227,15 +2262,20 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
         t->retention = rd_u64(&r);
         if (r.bad || (t->retention != UINT64_MAX && (t->retention < RETAIN_MIN_US || t->retention > RETAIN_MAX_US)))
             return fail("manifest: bad retention");
+        t->created_at = rd_u64(&r);
+        t->dropped_at = rd_u64(&r);
+        if (r.bad || !t->created_at || t->created_at > m->seq ||
+            (t->dropped_at && (t->dropped_at <= t->created_at || t->dropped_at > m->seq || t->live)))
+            return fail("manifest: bad creation or drop commits");
     }
     if (rd_left(&r)) return fail("manifest: trailing bytes");
     size_t total = 0; /* index names unique across tables */
-    for (uint32_t i = 0; i < nt; i++) total += m->t[i].nidx;
+    for (uint32_t i = 0; i < nt; i++) total += m->t[i].dropped_at ? 0 : m->t[i].nidx; /* a dropped table's names are free */
     if (total) {
         const char **nm = xcalloc(total, sizeof *nm);
         size_t k = 0;
         for (uint32_t i = 0; i < nt; i++)
-            for (uint32_t j = 0; j < m->t[i].nidx; j++) nm[k++] = m->t[i].idx[j].name;
+            for (uint32_t j = 0; !m->t[i].dropped_at && j < m->t[i].nidx; j++) nm[k++] = m->t[i].idx[j].name;
         qsort(nm, total, sizeof *nm, cmp_str);
         bool dup = false;
         for (size_t i = 1; i < total && !dup; i++) dup = strcmp(nm[i - 1], nm[i]) == 0;
@@ -2775,6 +2815,8 @@ static int floor_seed(int dirfd, state *S, flr *f)
         t->horizon = mt->horizon;
         t->horizon_at_lake = mt->horizon;
         t->retention = mt->retention;
+        t->created_at = mt->created_at;
+        t->dropped_at = t->dropped_at_lake = mt->dropped_at;
         memcpy(t->idx, mt->idx, sizeof t->idx);
         t->nidx = mt->nidx;
         for (uint32_t k = 0; k < t->nidx; k++) t->idx[k].uk = (t->idx[k].flags & 1) ? xcalloc(1, sizeof *t->idx[k].uk) : NULL;
@@ -2810,6 +2852,7 @@ static int floor_seed(int dirfd, state *S, flr *f)
                 memcpy(S->t[ti].idx_at_lake, S->t[ti].idx, sizeof S->t[ti].idx);
                 S->t[ti].nidx_at_lake = S->t[ti].nidx;
                 S->t[ti].retention_at_lake = S->t[ti].retention;
+                S->t[ti].dropped_at_lake = S->t[ti].dropped_at;
                 S->t[ti].n_at_lake = S->t[ti].n;
             }
             S->boundary_at_lake = S->boundary;
@@ -2904,6 +2947,8 @@ static int cmd_verify(const char *dir, const char *anchor)
                 rc = fail("table %s: manifest digest differs from the log at commit %llu", t->s.name, (unsigned long long)m.seq);
             else if (mt->versions != versions || mt->horizon != t->horizon_at_lake)
                 rc = fail("table %s: manifest version count or history horizon differs from the log", t->s.name);
+            else if (mt->created_at != t->created_at || mt->dropped_at != t->dropped_at_lake)
+                rc = fail("table %s: the manifest's creation or drop commit differs from the log's", t->s.name);
             else if (mt->retention != t->retention_at_lake)
                 rc = fail("table %s: the manifest's retention differs from the log's", t->s.name);
             else if (mt->nidx != t->nidx_at_lake)
@@ -2976,6 +3021,7 @@ typedef struct ttab {
     const schema *s;
     schema own; /* a table the tail created */
     uint64_t lake_n, horizon, live;
+    uint64_t created_at, dropped_at; /* CREATE (1) and DROP_TABLE (19, 0: live): a name resolves by them at N */
     lend *le;
     size_t nle, cle;
     tver *v;
@@ -3066,6 +3112,7 @@ static int tail_op(ttail *T, const op *o, uint64_t seq, bool apply)
         t->own.raw = xcalloc(o->sch->rawlen, 1);
         memcpy(t->own.raw, o->sch->raw, o->sch->rawlen);
         t->s = &t->own;
+        t->created_at = seq;
         for (uint32_t i = 0; i + 1 < T->nt; i++) T->t[i].s = T->t[i].own.raw ? &T->t[i].own : T->t[i].s;
         return 0;
     }
@@ -3078,6 +3125,16 @@ static int tail_op(ttail *T, const op *o, uint64_t seq, bool apply)
     }
     if (o->code == 17) { /* the horizon alone (the main pass checked its rule) */
         if (o->purge_before > t->horizon) t->horizon = o->purge_before;
+        return 0;
+    }
+    if (o->code == 19) { /* DROP_TABLE: what it held leaves the state (the main pass re-derives it row by row); a
+                          * query at or past the drop no longer resolves the name to it */
+        for (uint64_t k = 0; k < t->n; k++)
+            if (t->v[k].end == LIVE) t->v[k].end = seq;
+        for (int i = 0; i < LANES; i++) T->glob.v[i] = (uint16_t)(T->glob.v[i] - t->d.v[i]);
+        memset(&t->d, 0, sizeof t->d);
+        t->live = 0;
+        t->dropped_at = seq;
         return 0;
     }
     if (o->code == 3 || o->code == 4) {
@@ -3268,6 +3325,8 @@ static int tail_load(int dirfd, const meta *mt, const manifest *m, const uint8_t
         t->lake_n = m->t[i].versions;
         t->horizon = m->t[i].horizon;
         t->live = m->t[i].live;
+        t->created_at = m->t[i].created_at;
+        t->dropped_at = m->t[i].dropped_at;
         lt_from(&t->d, m->t[i].lthash);
         lt_sum(&T->glob, &t->d);
     }
@@ -3613,7 +3672,8 @@ static int cmd_query(bool digest, const char *dir, int argc, char **argv)
     uint64_t horizon = 0;
     for (uint32_t i = 0; !rc && i < nt; i++) {
         const schema *s = q.tail ? T.t[i].s : &m.t[i].s;
-        if (strcmp(s->name, q.table) == 0) {
+        uint64_t ca = q.tail ? T.t[i].created_at : m.t[i].created_at, da = q.tail ? T.t[i].dropped_at : m.t[i].dropped_at;
+        if (strcmp(s->name, q.table) == 0 && ca <= N && (!da || N < da)) { /* the table of that name at N (1f) */
             q.ti = (int)i;
             qs = s;
             horizon = q.tail ? T.t[i].horizon : m.t[i].horizon;
@@ -3713,7 +3773,7 @@ static int cmd_identity(const char *dir, int argc, char **argv)
         a_sha256_ctx c;
         uint8_t b[16], tok[32], d[32];
         a_sha256_init(&c);
-        a_sha256_update(&c, (const uint8_t *)"IMDBVIEW1", 9);
+        a_sha256_update(&c, (const uint8_t *)"IMDBVIEW2", 9); /* 2: each table's creation and drop commits too */
         a_sha256_update(&c, mt.db_id, 16);
         put64(b, N);
         a_sha256_update(&c, b, 8);
@@ -3729,6 +3789,9 @@ static int cmd_identity(const char *dir, int argc, char **argv)
             a_sha256_update(&c, t->s->raw, t->s->rawlen);
             put64(b, t->horizon);
             put64(b + 8, t->live);
+            a_sha256_update(&c, b, 16);
+            put64(b, t->created_at);
+            put64(b + 8, t->dropped_at);
             a_sha256_update(&c, b, 16);
             lt_bytes(&t->d, lanes);
             a_sha256_update(&c, lanes, sizeof lanes);

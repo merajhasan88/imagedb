@@ -753,10 +753,10 @@ static void append_commit(const char *dir, imdb_db *db, imdb_op *ops, uint32_t n
     append_commit_digest(dir, db, ops, nops, key, ext, NULL);
 }
 
-/* a lake manifest that breaks one version-4 rule, re-pointed and re-signed so only that rule can
+/* a lake manifest (version 5) that breaks one of its rules, re-pointed and re-signed so only that rule can
  * refuse it: boundary (the header names a retirement boundary, commit 1, that no op of the log made)
  * or column (the last index names a column its table lacks; needs an index in the last table, whose
- * entry is then followed only by that table's retention) */
+ * entry is then followed only by that table's retention, creation and drop commits) */
 static void manifest_lie(const char *dir, const char *kind)
 {
     char p[1200];
@@ -779,15 +779,15 @@ static void manifest_lie(const char *dir, const char *kind)
     if (imdb_manifest_parse(man, mn, &m, &e)) die("manifest", &e);
     imdb_buf nb;
     imdb_buf_init(&nb);
-    if (strcmp(kind, "boundary") == 0 && imdb_get_le32(man + 8) == 4 && S > 1 && m.boundary == 0) {
+    if (strcmp(kind, "boundary") == 0 && imdb_get_le32(man + 8) == 5 && S > 1 && m.boundary == 0) {
         imdb_buf_put(&nb, man, mn);
         /* after magic, version, ntables, db id, seq, prev, state digest, prev manifest: the u64 boundary */
         nb.p[136] = 1;
     } else if (strcmp(kind, "column") == 0 && m.nt && m.t[m.nt - 1].nidx) {
         imdb_buf_put(&nb, man, mn);
-        uint16_t c = m.t[m.nt - 1].s.ncols; /* the last index's column, little endian, before the u64 retention */
-        nb.p[nb.len - 10] = (uint8_t)c;
-        nb.p[nb.len - 9] = (uint8_t)(c >> 8);
+        uint16_t c = m.t[m.nt - 1].s.ncols; /* the last index's column, little endian, before the three u64 */
+        nb.p[nb.len - 26] = (uint8_t)c;
+        nb.p[nb.len - 25] = (uint8_t)(c >> 8);
     } else {
         fputs("imdb-forge: manifest-lie DIR boundary (none yet) | column (an index in the last table)\n", stderr);
         exit(1);

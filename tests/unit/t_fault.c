@@ -750,7 +750,9 @@ static int run_compact(const char *run)
  * depend on when a run happens), its table kept 10 seconds, two segments ended, then the clock moved 15
  * seconds on: the next statement's policy reads when the segments began (every call of that read faulted:
  * a failure only warns, and expires nothing) and commits an EXPIRE (every point of it crashed); a recovered
- * state keeps the acknowledged horizon, which VERIFY and the auditor re-derive from the log. Not vacuous: a
+ * state keeps the acknowledged horizon, which VERIFY and the auditor re-derive from the log. First a table is
+ * created, filled and dropped (op 19, 1f: every point of its commit crashed too), so the EXPIRE names a dropped
+ * table's history as well. Not vacuous: a
  * run nothing faulted expired the table once. */
 static int run_expire(const char *run)
 {
@@ -766,6 +768,8 @@ static int run_expire(const char *run)
     imdb_session s;
     imdb_session_init(&s, db);
     static const char *const q[] = {
+        "CREATE TABLE gone (id INT64 PRIMARY KEY, v INT64) RETENTION 10 SECONDS",
+        "INSERT INTO gone VALUES (1, 1), (2, 2)", "DROP TABLE gone",
         "ALTER TABLE txns SET RETENTION 10 SECONDS", "CHECKPOINT",
         "INSERT INTO txns VALUES (10, 7, 1.00, 'x')", "CHECKPOINT",
         NULL,                                          /* the clock 15 seconds on */

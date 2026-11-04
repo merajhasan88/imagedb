@@ -723,18 +723,25 @@ static int cmp_name_ptr(const void *a, const void *b) { return strcmp(*(const ch
 static int manifest_index_names(const imdb_manifest *m, imdb_err *e)
 {
     size_t n = 0;
-    for (uint32_t i = 0; i < m->nt; i++) n += m->t[i].nidx;
+    for (uint32_t i = 0; i < m->nt; i++) n += m->t[i].dropped_at ? 0 : m->t[i].nidx; /* a dropped table's names are free */
     if (!n) return IMDB_OK;
     const char **p = imdb_alloc_array(n, sizeof *p, e);
     if (!p) return e->code;
     size_t k = 0;
     for (uint32_t i = 0; i < m->nt; i++)
-        for (uint32_t j = 0; j < m->t[i].nidx; j++) p[k++] = m->t[i].idx[j].d.name;
+        for (uint32_t j = 0; !m->t[i].dropped_at && j < m->t[i].nidx; j++) p[k++] = m->t[i].idx[j].d.name;
     qsort(p, n, sizeof *p, cmp_name_ptr);
     bool dup = false;
     for (size_t i = 1; i < n && !dup; i++) dup = strcmp(p[i - 1], p[i]) == 0;
     imdb_free(p);
     return dup ? IMDB_ERR_CORRUPT : IMDB_OK;
+}
+
+/* a manifest of an older format, refused by name (no reader is kept for one before the format freeze) */
+static int old_manifest(uint32_t ver, imdb_err *e)
+{
+    return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version %u: this lake was written by an imagedb before DROP TABLE's "
+                     "format (manifest 5), which this version does not read", ver);
 }
 
 int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err *e)
@@ -744,8 +751,9 @@ int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err
     imdb_rd_init(&r, b, len);
     const uint8_t *mg = imdb_rd_bytes(&r, 8);
     if (!mg || memcmp(mg, kManMagic, 8) != 0) return imdb_fail(e, IMDB_ERR_CORRUPT, "manifest: bad magic");
-    uint32_t ver = imdb_rd_u32(&r); /* 4: every table's indexes and retention (no reader is kept for 2 and 3) */
-    if (ver != 4) return imdb_fail(e, IMDB_ERR_CORRUPT, "manifest: unsupported version");
+    uint32_t ver = imdb_rd_u32(&r); /* 5: every table's indexes, retention, creation and drop (no reader for 2-4) */
+    if (ver >= 2 && ver <= 4) return old_manifest(ver, e);
+    if (ver != 5) return imdb_fail(e, IMDB_ERR_CORRUPT, "manifest: unsupported version");
     uint32_t nt = imdb_rd_u32(&r);
     imdb_rd_copy(&r, m->db_id, 16);
     m->seq = imdb_rd_u64(&r);
@@ -797,6 +805,12 @@ int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err
         }
         t->retention_us = imdb_rd_u64(&r);
         if (r.err || !imdb_retention_ok(t->retention_us)) goto bad;
+        t->created_at = imdb_rd_u64(&r);
+        t->dropped_at = imdb_rd_u64(&r);
+        /* created by its commit, before any drop, which leaves it nothing live; both at or before this snapshot */
+        if (r.err || !t->created_at || t->created_at > m->seq || (t->dropped_at && (t->dropped_at <= t->created_at ||
+                                                                            t->dropped_at > m->seq || t->live)))
+            goto bad;
     }
     if (imdb_rd_left(&r)) goto bad;
     int nrc = manifest_index_names(m, e);
@@ -1234,7 +1248,7 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
     /* manifest */
     imdb_buf *mb = &p->manifest;
     imdb_buf_put(mb, kManMagic, 8);
-    imdb_buf_put_u32(mb, 4); /* lake.h: every table's indexes and retention */
+    imdb_buf_put_u32(mb, 5); /* lake.h: every table's indexes, retention, creation and drop */
     imdb_buf_put_u32(mb, db->nt);
     imdb_buf_put(mb, db->db_id, 16);
     imdb_buf_put_u64(mb, seq);
@@ -1276,6 +1290,8 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
             for (uint8_t c = 0; c < d->ncols; c++) imdb_buf_put_u16(mb, d->cols[c]);
         }
         imdb_buf_put_u64(mb, t->retention_us);
+        imdb_buf_put_u64(mb, t->created_at);
+        imdb_buf_put_u64(mb, t->dropped_at);
     }
     imdb_buf_free(&sch);
     if (rc || (rc = imdb_buf_check(mb, e))) {
@@ -2448,6 +2464,8 @@ static int load_table(imdb_db *db, int ofd, const imdb_manifest_tab *mt, uint32_
     imdb_table *t = db->t[ti];
     t->horizon = mt->horizon;
     t->retention_us = mt->retention_us;
+    t->created_at = mt->created_at;
+    t->dropped_at = mt->dropped_at; /* now: a later table of the same name finds it free */
     t->digest = mt->digest;
     memcpy(t->idx, mt->idx, sizeof t->idx);
     t->nidx = mt->nidx;
@@ -2591,6 +2609,33 @@ static int load_table(imdb_db *db, int ofd, const imdb_manifest_tab *mt, uint32_
         if ((rc = imdb_index_unique_build(t, &t->idx[k], e)) == IMDB_ERR_CONSTRAINT)
             rc = imdb_fail(e, IMDB_ERR_CORRUPT, "snapshot: two live rows of table %s share a key of unique index %s",
                            t->s.name, t->idx[k].d.name);
+    return rc;
+}
+
+/* Before a full replay (1f): a lake whose head manifest is of an older format is refused by name, as the snapshot
+ * load refuses it, not rebuilt by the replay into another version's manifest and then reported as a divergence.
+ * Only that answer is an error here; anything else the replay meets on its own terms. */
+int imdb_lake_format_check(imdb_db *db, imdb_err *e)
+{
+    bool present;
+    uint64_t S;
+    uint8_t mh[32];
+    imdb_err e2 = {0};
+    if (read_head(db, &present, &S, mh, &e2) || !present) return IMDB_OK;
+    int ofd = open_objects(db, &e2);
+    if (ofd < 0) return IMDB_OK;
+    uint8_t *mb = NULL;
+    size_t ml = 0;
+    int rc = IMDB_OK;
+    if (!read_obj(ofd, mh, ".man", &mb, &ml, &e2)) {
+        imdb_rd r;
+        imdb_rd_init(&r, mb, ml);
+        const uint8_t *mg = imdb_rd_bytes(&r, 8);
+        uint32_t ver = imdb_rd_u32(&r);
+        if (mg && !r.err && memcmp(mg, kManMagic, 8) == 0 && ver >= 2 && ver <= 4) rc = old_manifest(ver, e);
+    }
+    imdb_free(mb);
+    close(ofd);
     return rc;
 }
 

@@ -283,7 +283,7 @@ for kind in column duplicate drop-absent; do
 done
 echo "   T a missing column, U a name in use, V a DROP of an absent index: the engine and the auditor refuse each"
 
-echo "== W, X: a manifest breaking a version-4 rule, re-pointed and re-signed so only that rule refuses it"
+echo "== W, X: a manifest breaking one of its rules, re-pointed and re-signed so only that rule refuses it"
 PW=$WORK/w; make_db "$PW"
 "$FORGE" manifest-lie "$PW" boundary
 must_fail "retirement boundary differs from the log's" "$BIN" verify "$PW"   # the open took the manifest's; the log's is 0

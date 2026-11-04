@@ -24,14 +24,15 @@
  *   Every version of a table is in exactly one segment of the manifest.
  *
  * Deletion vector ("IMDBDV01"): seg_hash[32] u32 count u32 0 | count x { u32 row, u32 0, u64 end }
- * Manifest ("IMDBMAN1"): u32 version (4) u32 ntables db_id[16] u64 seq prev_hash[32] state_digest[32]
+ * Manifest ("IMDBMAN1"): u32 version (5) u32 ntables db_id[16] u64 seq prev_hash[32] state_digest[32]
  *   prev_manifest[32] (the generation GC keeps beside this one; zero for the first manifest and
  *   after an ERASE, which keeps nothing) u64 boundary (the commit at or below which the log is retired; 0: none)
  *   per table: u32 len | schema | u64 horizon | u64 live | u64 versions | lthash[2048] |
  *              u32 nseg | nseg x { seg_hash[32], dv_hash[32] (zero = none), u32 nrows } |
  *              u32 nidx | nidx x { u8 len | name | u8 flags | u8 ncols | ncols x u16 column } (names
- *              strictly increasing per table and unique across tables) | u64 retention_us (op 16)
- *   Versions 2 and 3 (before the retention, 2026-10-29) are not read.
+ *              strictly increasing per table and unique across tables) | u64 retention_us (op 16) |
+ *              u64 created_at | u64 dropped_at (version 5, 1f: the commits that created and dropped it; 0: live)
+ *   Versions 2 to 4 (before the drops, 2026-11-04) are not read.
  * LAKE_HEAD: "imagedb-lake 1\nseq <n>\nmanifest <64 hex>\n"
  */
 #ifndef IMDB_LAKE_H
@@ -163,6 +164,7 @@ typedef struct imdb_manifest_tab {
     imdb_index idx[IMDB_MAX_INDEXES]; /* the table's index definitions, sorted by name */
     uint32_t nidx;
     uint64_t retention_us;
+    uint64_t created_at, dropped_at; /* version 5 (1f): the commits that created and dropped it (0: live) */
 } imdb_manifest_tab;
 typedef struct imdb_manifest {
     uint8_t db_id[16];

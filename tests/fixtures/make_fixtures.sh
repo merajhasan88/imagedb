@@ -1,17 +1,18 @@
 #!/bin/sh
-# Makes the format's fixtures (2026-10-29: META 5, manifest version 4, op 16; alg1-20261029.tar.gz and
-# alg2-20261029.tar.gz beside this script): a primary and its replica under digest algorithm ALG, by
+# Makes the format's fixtures (2026-11-04: META 5, manifest version 5, ops 16 and 19; alg1-20261104.tar.gz and
+# alg2-20261104.tar.gz beside this script): a primary and its replica under digest algorithm ALG, by
 # make_alg2.sh's steps, which reach every reader of the format: a log of several segments (each manifest
 # publish ends one), CHECKPOINTs (manifests, segments, the lanes), a two-column index and a unique one,
 # an UPDATE and a DELETE, ERASE SUBJECT (redacted log payloads, rewritten segments), commits after it, and
-# a replica by ship | apply. Both tables are RETENTION FOREVER: a fixture is frozen data, so its history
+# a replica by ship | apply, and a table dropped (op 19; the manifest's tombstone). Both live tables are RETENTION
+# FOREVER and the dropped one is kept a century, the longest but FOREVER: a fixture is frozen data, so its history
 # never expires under the tests that open it (the 24-hour default is tested by the unit tests). Every
 # statement runs cross-checked; the engine and the auditor verify both directories, and the replica's
 # digest must equal the primary's. The primary's signing key is in the tarball: it signs nothing but
-# this fixture. The old fixtures (alg1-20261026, alg2-20261026, tagged-20261027) stay as directories
-# this format refuses.
+# this fixture. The old fixtures (alg1-20261026, alg2-20261026, tagged-20261027; alg1-20261029 and alg2-20261029,
+# manifest version 4) stay as directories this format refuses.
 #   sh tests/fixtures/make_fixtures.sh BIN AUDIT ALG OUTDIR   (OUTDIR must not exist)
-#   tar -czf tests/fixtures/algALG-20261029.tar.gz -C OUTDIR primary replica
+#   tar -czf tests/fixtures/algALG-20261104.tar.gz -C OUTDIR primary replica
 set -eu
 BIN=$1
 AUD=$2
@@ -43,6 +44,9 @@ done
 sql "INSERT INTO ev VALUES $v"
 sql "CREATE INDEX ev_ak ON ev (acct, kind)"
 sql "CREATE UNIQUE INDEX acct_name ON acct (name)"
+sql "CREATE TABLE gone (id INT64 PRIMARY KEY, v INT64) RETENTION FOREVER"
+sql "INSERT INTO gone VALUES (1, 10), (2, 20)"
+sql "DROP TABLE gone RETENTION 36500 DAYS" # a FOREVER table is given a retention at its drop
 sql "CHECKPOINT"
 ship
 sql "UPDATE acct SET balance = 1.00 WHERE id <= 10"

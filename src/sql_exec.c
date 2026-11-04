@@ -2120,7 +2120,8 @@ static int check_view(xctx *x, const imdb_table *t, uint64_t snap, bool asof, im
     return IMDB_ERR_CONFLICT;
 }
 
-static int resolve_snapshot(xctx *x, const sql_stmt *st, imdb_table *t, uint64_t *snap, uint64_t *pend, imdb_err *e)
+/* a statement's read point: the session's view, or AS OF's commit or time (no table checked yet) */
+static int snapshot_of(xctx *x, const sql_stmt *st, uint64_t *snap, uint64_t *pend, imdb_err *e)
 {
     imdb_db *db = x->db;
     read_view(x, snap, pend);
@@ -2136,7 +2137,30 @@ static int resolve_snapshot(xctx *x, const sql_stmt *st, imdb_table *t, uint64_t
             if (imdb_seq_at_time(db, (uint64_t)ts, snap, e)) return e->code;
         }
     }
+    return IMDB_OK;
+}
+
+static int resolve_snapshot(xctx *x, const sql_stmt *st, imdb_table *t, uint64_t *snap, uint64_t *pend, imdb_err *e)
+{
+    if (snapshot_of(x, st, snap, pend, e)) return e->code;
     return check_view(x, t, *snap, st->has_asof, e);
+}
+
+/* The table a read names, at its read point (1f): the live one if it existed then; else the one dropped since that
+ * the read point still sees (AS OF before the drop, or a transaction older than it). Before its creation the live
+ * table answers, with no row, as it always did. */
+static int read_table(xctx *x, const sql_stmt *st, const char *name, imdb_table **out, imdb_err *e)
+{
+    uint64_t snap, pend;
+    if (snapshot_of(x, st, &snap, &pend, e)) return e->code;
+    imdb_table *t = imdb_table_by_name(x->db, name);
+    if (!t || t->created_at > snap) {
+        imdb_table *old = imdb_table_at(x->db, name, snap);
+        if (old) t = old;
+    }
+    if (!t) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", name);
+    *out = t;
+    return IMDB_OK;
 }
 
 /* SELECT ... FOR UPDATE: every selected committed row must still be live when the
@@ -2913,10 +2937,8 @@ static int join_run(xctx *x, const sql_stmt *st, jctx *j, qspec q[2], const jpla
 
 static int exec_join(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
 {
-    imdb_db *db = x->db;
-    imdb_table *t[2] = {imdb_table_by_name(db, st->table), imdb_table_by_name(db, st->table2)};
-    for (int s = 0; s < 2; s++)
-        if (!t[s]) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", s ? st->table2 : st->table);
+    imdb_table *t[2]; /* each at the read point (1f: a table dropped since, for AS OF before the drop) */
+    if (read_table(x, st, st->table, &t[0], e) || read_table(x, st, st->table2, &t[1], e)) return e->code;
     if (strcmp(st->alias[0] ? st->alias : st->table, st->alias2[0] ? st->alias2 : st->table2) == 0)
         return imdb_fail(e, IMDB_ERR_INVALID, "the two sides of a join need two names: give one an alias (AS)");
     if ((unsigned)t[0]->s.ncols + t[1]->s.ncols > IMDB_MAX_COLS)
@@ -3040,8 +3062,8 @@ static int exec_join(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
 static int exec_select(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
 {
     if (st->has_join) return exec_join(x, st, r, e);
-    imdb_table *t = imdb_table_by_name(x->db, st->table);
-    if (!t) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", st->table);
+    imdb_table *t;
+    if (read_table(x, st, st->table, &t, e)) return e->code;
     qspec q;
     memset(&q, 0, sizeof q);
     q.t = t;
@@ -3305,8 +3327,8 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
         res_cols(r, 4);
         const char *nm[] = {"index", "table", "columns", "unique"};
         for (int i = 0; i < 4; i++) res_name(r, (uint16_t)i, nm[i]);
-        for (uint32_t i = 0; i < db->nt; i++)
-            for (uint32_t k = 0; k < db->t[i]->nidx; k++) {
+        for (uint32_t i = 0; i < db->nt; i++) /* a dropped table's indexes are gone with its name (1f) */
+            for (uint32_t k = 0; !db->t[i]->dropped_at && k < db->t[i]->nidx; k++) {
                 const imdb_table *t = db->t[i];
                 const imdb_index_def *d = &t->idx[k].d;
                 char cols[IMDB_MAX_INDEX_COLS * (IMDB_MAX_IDENT + 2)];
@@ -3324,9 +3346,9 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
         return res_finish(r, e); /* TEXT cells hold offsets until then */
     }
     if (st->kind == ST_SHOW_TABLES) {
-        res_cols(r, 6);
-        const char *nm[] = {"table", "columns", "live_rows", "versions", "segments", "history_from"};
-        for (int i = 0; i < 6; i++) res_name(r, (uint16_t)i, nm[i]);
+        res_cols(r, 7); /* dropped_at (1f): the commit that dropped it, NULL while it lives; AS OF before it still reads it */
+        const char *nm[] = {"table", "columns", "live_rows", "versions", "segments", "history_from", "dropped_at"};
+        for (int i = 0; i < 7; i++) res_name(r, (uint16_t)i, nm[i]);
         for (uint32_t i = 0; i < db->nt; i++) {
             imdb_table *t = db->t[i];
             imdb_cell *row = res_row(r, e);
@@ -3352,6 +3374,8 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
             res_put_int(r, &row[3], (int64_t)t->nver);
             res_put_int(r, &row[4], (int64_t)t->nseg);
             res_put_int(r, &row[5], (int64_t)t->horizon);
+            imdb_value dv = {.type = IMDB_T_INT64, .i = (int64_t)t->dropped_at, .null = !t->dropped_at};
+            res_put(r, &row[6], &dv);
         }
         return res_finish(r, e);
     }
@@ -3613,8 +3637,8 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
         return res_finish(r, e);
     }
     if (st->kind == ST_SHOW_HISTORY) {
-        imdb_table *t = imdb_table_by_name(db, st->table);
-        if (!t) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", st->table);
+        imdb_table *t;
+        if (read_table(x, st, st->table, &t, e)) return e->code;
         imdb_value key;
         if (bind_lit(x, &st->key, &t->s.cols[t->s.pk], true, &key, e)) return e->code;
         res_cols(r, (uint16_t)(3 + t->s.ncols));
@@ -3700,8 +3724,8 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
         res_put_str(r, &row[3], hex);
         return res_finish(r, e);
     }
-    imdb_table *t = imdb_table_by_name(db, st->table);
-    if (!t) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", st->table);
+    imdb_table *t;
+    if (read_table(x, st, st->table, &t, e)) return e->code;
     qspec q;
     memset(&q, 0, sizeof q);
     q.t = t;
@@ -3784,7 +3808,7 @@ static int check_iso(const sql_stmt *st, imdb_err *e)
 static bool is_write(uint8_t k)
 {
     return k == ST_CREATE || k == ST_INSERT || k == ST_UPDATE || k == ST_DELETE || k == ST_CREATE_INDEX ||
-           k == ST_DROP_INDEX || k == ST_ALTER_RETENTION;
+           k == ST_DROP_INDEX || k == ST_ALTER_RETENTION || k == ST_DROP_TABLE;
 }
 
 static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const imdb_value *params, uint32_t nparams,
@@ -3841,15 +3865,17 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
      * way */
     atomic_store_explicit(&ss->cancel, false, memory_order_relaxed);
     x.checks = !physical && st->kind != ST_COMMIT && st->kind != ST_CREATE && st->kind != ST_CREATE_INDEX &&
-               st->kind != ST_DROP_INDEX && st->kind != ST_ALTER_RETENTION; /* each commits on its own */
+               st->kind != ST_DROP_INDEX && st->kind != ST_ALTER_RETENTION && st->kind != ST_DROP_TABLE; /* each commits on
+                                                                                                       * its own */
     x.next_check = TICK_ROWS;
     if (x.checks && ss->stmt_timeout_ms) x.deadline_ns = mono_ns() + (uint64_t)ss->stmt_timeout_ms * 1000000u;
     if (txn && (st->kind == ST_CREATE || st->kind == ST_CREATE_INDEX || st->kind == ST_DROP_INDEX ||
-                st->kind == ST_ALTER_RETENTION)) {
+                st->kind == ST_ALTER_RETENTION || st->kind == ST_DROP_TABLE)) {
         rc = imdb_fail(e, IMDB_ERR_STATE, "%s commits on its own: run it outside the transaction",
                        st->kind == ST_CREATE         ? "CREATE TABLE"
                        : st->kind == ST_CREATE_INDEX ? "CREATE INDEX"
                        : st->kind == ST_DROP_INDEX   ? "DROP INDEX"
+                       : st->kind == ST_DROP_TABLE   ? "DROP TABLE"
                                                      : "ALTER TABLE");
         goto done;
     }
@@ -3895,6 +3921,13 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
         }
         if (!rc) rc = imdb_create_index(db, t, &d, e);
         if (!rc) snprintf(r->status, sizeof r->status, "CREATE %sINDEX %s", st->index_unique ? "UNIQUE " : "", st->index_name);
+        break;
+    }
+    case ST_DROP_TABLE: { /* 1f: its history kept for its retention (RETENTION here sets one first) */
+        imdb_table *t = imdb_table_by_name(db, st->table);
+        rc = t ? imdb_drop_table(db, t, st->has_retention ? st->retention_us : 0, e)
+               : imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", st->table);
+        if (!rc) snprintf(r->status, sizeof r->status, "DROP TABLE %s", st->table);
         break;
     }
     case ST_DROP_INDEX:

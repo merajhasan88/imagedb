@@ -616,8 +616,10 @@ static void print_info(imdb_db *db)
         imdb_table *t = db->t[i];
         imdb_state_digest(db, t, d);
         imdb_hex(d, 32, hex);
-        printf("table      %-20s live %-10llu versions %-10llu segments %-4u digest %.16s\n", t->s.name,
-               (unsigned long long)t->live, (unsigned long long)t->nver, t->nseg, hex);
+        char dropped[48] = ""; /* a tombstone (1f): AS OF before the drop still reads it */
+        if (t->dropped_at) snprintf(dropped, sizeof dropped, "  dropped at commit %llu", (unsigned long long)t->dropped_at);
+        printf("table      %-20s live %-10llu versions %-10llu segments %-4u digest %.16s%s\n", t->s.name,
+               (unsigned long long)t->live, (unsigned long long)t->nver, t->nseg, hex, dropped);
     }
     const imdb_kernels *k = imdb_kern();
     printf("kernels    crc32c=%s lthash=%s expand=%s expand2=%s sha256x8=%s utf8=%s filter=%s sum=%s\n", k->crc32c_name,

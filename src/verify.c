@@ -62,6 +62,7 @@ typedef struct vtab {
     uint64_t horizon;  /* AS OF below it is refused: the highest PURGE BEFORE of its COMPACTs, or EXPIRE */
     uint64_t purged;   /* the highest PURGE BEFORE: versions ended at or before it are tombstones */
     uint64_t retention_us; /* its last op 16 */
+    uint64_t created_at, dropped_at; /* the commits that created and dropped it (op 19, 1f; 0: live) */
     imdb_lthash *d;    /* separate: LtHash needs 32-byte alignment */
     imdb_index idx[IMDB_MAX_INDEXES]; /* the log's index definitions, sorted by name */
     uint32_t nidx;
@@ -69,7 +70,7 @@ typedef struct vtab {
 
 typedef struct vsnap_tab {
     imdb_lthash d;
-    uint64_t n, live, horizon, purged, retention_us;
+    uint64_t n, live, horizon, purged, retention_us, created_at, dropped_at;
     imdb_index idx[IMDB_MAX_INDEXES];
     uint32_t nidx;
 } vsnap_tab;
@@ -436,7 +437,7 @@ static int v_end(vtab *t, uint64_t vid, const uint8_t commit[32], uint64_t seq, 
 static bool v_index_taken(const vctx *x, const char *name)
 {
     for (uint32_t i = 0; i < x->nt; i++)
-        for (uint32_t j = 0; j < x->t[i].nidx; j++)
+        for (uint32_t j = 0; !x->t[i].dropped_at && j < x->t[i].nidx; j++) /* a dropped table's names are free */
             if (strcmp(x->t[i].idx[j].d.name, name) == 0) return true;
     return false;
 }
@@ -475,9 +476,14 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
         const imdb_op *o = &c->ops[k];
         bool on_table = o->code == IMDB_OP_INSERT || o->code == IMDB_OP_DELETE || o->code == IMDB_OP_UPDATE ||
                         o->code == IMDB_OP_COMPACT || o->code == IMDB_OP_CREATE_INDEX || o->code == IMDB_OP_DROP_INDEX ||
-                        o->code == IMDB_OP_SET_RETENTION || o->code == IMDB_OP_EXPIRE;
+                        o->code == IMDB_OP_SET_RETENTION || o->code == IMDB_OP_EXPIRE || o->code == IMDB_OP_DROP_TABLE;
         vtab *t = on_table && o->table < x->nt ? &x->t[o->table] : NULL;
         if (on_table && !t) return imdb_fail(e, IMDB_ERR_VERIFY, "verify: unknown table");
+        if (t && t->dropped_at && /* replay's and the auditor's rule: a dropped table's history may still expire */
+            (o->code == IMDB_OP_INSERT || o->code == IMDB_OP_DELETE || o->code == IMDB_OP_UPDATE || o->code == IMDB_OP_COMPACT ||
+             o->code == IMDB_OP_CREATE_INDEX || o->code == IMDB_OP_DROP_INDEX || o->code == IMDB_OP_SET_RETENTION))
+            return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: op %u on table %u, dropped at commit %llu",
+                             (unsigned long long)seq, o->code, o->table, (unsigned long long)t->dropped_at);
         if (imdb_op_publishes_manifest(o->code)) *published = o->manifest;
         int rc = IMDB_OK;
         switch (o->code) {
@@ -488,6 +494,7 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
             x->t = nt;
             memset(&x->t[x->nt], 0, sizeof x->t[x->nt]);
             x->t[x->nt].s = *o->schema;
+            x->t[x->nt].created_at = seq;
             x->t[x->nt].d = imdb_alloc_aligned(1, sizeof *x->t[x->nt].d, e);
             if (!x->t[x->nt].d) return e->code;
             x->nt++;
@@ -555,6 +562,21 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
                                (unsigned long long)seq);
             else if (o->purge_before)
                 t->horizon = t->purged = o->purge_before;
+            break;
+        case IMDB_OP_DROP_TABLE: /* live, not kept FOREVER (its commit's op 16 first); every live version ends here */
+            if (t->dropped_at || t->retention_us == IMDB_RETAIN_FOREVER) {
+                rc = imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: DROP of table %s, dropped already or kept "
+                               "FOREVER", (unsigned long long)seq, t->s.name);
+                break;
+            }
+            for (uint64_t vid = 0; vid < t->n; vid++) {
+                vver *dv = vv(t, vid);
+                if (dv && dv->end == IMDB_LIVE) dv->end = seq;
+            }
+            t->live = 0;
+            t->dropped_at = seq;
+            imdb_lthash_sub(&x->global, t->d); /* all it held leaves the state: its lanes, then none */
+            imdb_lthash_zero(t->d);
             break;
         case IMDB_OP_SET_RETENTION:
             t->retention_us = o->retention_us; /* the decoder checked its range and its place after CREATE_TABLE */
@@ -629,6 +651,8 @@ static int snapshot_at_s(vctx *x, const imdb_commit_rec *c, const uint8_t *publi
         s->t[ti].horizon = x->t[ti].horizon;
         s->t[ti].purged = x->t[ti].purged;
         s->t[ti].retention_us = x->t[ti].retention_us;
+        s->t[ti].created_at = x->t[ti].created_at;
+        s->t[ti].dropped_at = x->t[ti].dropped_at;
         memcpy(s->t[ti].idx, x->t[ti].idx, sizeof s->t[ti].idx);
         s->t[ti].nidx = x->t[ti].nidx;
     }
@@ -1159,7 +1183,8 @@ static int verify_lake(imdb_db *db, const vctx *x, imdb_verify_report *rep, imdb
         if (!same_schema(&mt->s, &x->t[ti].s))
             rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: manifest schema of table %s differs from the log", x->t[ti].s.name);
         else if (mt->versions != st->n || mt->live != st->live || mt->horizon != st->horizon ||
-                 mt->retention_us != st->retention_us || memcmp(&mt->digest, &st->d, sizeof st->d) != 0)
+                 mt->retention_us != st->retention_us || mt->created_at != st->created_at ||
+                 mt->dropped_at != st->dropped_at || memcmp(&mt->digest, &st->d, sizeof st->d) != 0)
             rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: table %s in the manifest differs from the log at commit %llu",
                            x->t[ti].s.name, (unsigned long long)m.seq);
         else if (!same_indexes(mt->idx, mt->nidx, st->idx, st->nidx))
@@ -1317,7 +1342,8 @@ static int verify_engine(imdb_db *db, const vctx *x, imdb_verify_report *rep, im
         imdb_table *et = db->t[ti];
         const vtab *vt = &x->t[ti];
         if (vt->n != et->nver || vt->live != et->live || vt->horizon != et->horizon ||
-            vt->retention_us != et->retention_us || memcmp(vt->d, &et->digest, sizeof *vt->d) != 0)
+            vt->retention_us != et->retention_us || vt->created_at != et->created_at || vt->dropped_at != et->dropped_at ||
+            memcmp(vt->d, &et->digest, sizeof *vt->d) != 0)
             return imdb_fail(e, IMDB_ERR_VERIFY, "verify: table %s differs from the log", et->s.name);
         if (!same_indexes(vt->idx, vt->nidx, et->idx, et->nidx))
             return imdb_fail(e, IMDB_ERR_VERIFY, "verify: the engine's indexes of table %s differ from the log's", et->s.name);
@@ -1415,6 +1441,8 @@ static int verify_seed(imdb_db *db, vctx *x, imdb_err *e)
         t->n = t->floor_n = fm.t[i].versions;
         t->horizon = fm.t[i].horizon;
         t->retention_us = fm.t[i].retention_us;
+        t->created_at = fm.t[i].created_at;
+        t->dropped_at = fm.t[i].dropped_at;
         memcpy(t->idx, fm.t[i].idx, sizeof t->idx);
         t->nidx = fm.t[i].nidx;
     }

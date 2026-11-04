@@ -90,17 +90,27 @@ succeeds. `SHOW MEMORY` shows what it holds by kind. A query result is capped at
 `SET statement_timeout = MS` stops any statement of the session that runs longer
 (0, the default, is none), and Ctrl-C in `imagedb sql` stops the running statement:
 either fails it with "cancelled", and nothing it did stays (its writes are undone;
-a transaction goes on). COMMIT, CREATE, DROP INDEX, ALTER, CHECKPOINT, COMPACT, ERASE and VERIFY always run
+a transaction goes on). COMMIT, CREATE, DROP TABLE, DROP INDEX, ALTER, CHECKPOINT, COMPACT, ERASE and VERIFY always run
 to their end. From C, `imdb_session_cancel` does the same from another thread.
 
-`--retain-history COMMITS` purges history older than the last COMMITS commits
-automatically, on the primary, with a logged COMPACT ... PURGE that replicas
-replay. It runs once a table has ended at least as many versions as it holds
-live (and at least 4,096), and never reaches what an open transaction can
-still read. It is off by default, because it removes AS OF history. It returns
-the history's row payloads (about 16% of the per-update memory with typical
-rows); every update still leaves a version entry, a tombstone once purged,
-until log retirement exists.
+History is kept per table. `CREATE TABLE ... RETENTION 30 DAYS` (SECONDS, MINUTES,
+HOURS or DAYS, up to a century; 24 HOURS by default) or `RETENTION FOREVER` says
+how long AS OF can read a table's past; `ALTER TABLE t SET RETENTION ...` changes
+it, and `SHOW RETENTION` shows each table's and the commit its readable history
+starts at. On the primary, history older than that expires, by a logged EXPIRE
+that replicas replay; AS OF below it is an error, never a partial answer. Once
+every table's history has expired past a log segment, RETIRE drops the versions
+ended before it from memory and the lake and cuts the log below it (a replica
+heard from within 24 hours holds it back).
+
+`DROP TABLE t` ends every row of t in one commit and frees its name and its
+index names. Its history stays readable with AS OF before the drop, by the
+same paths as any table's, until it expires by the table's retention; a table
+kept FOREVER is dropped with a retention for that history (`DROP TABLE t
+RETENTION 30 DAYS`). DROP TABLE commits on its own, outside an explicit
+transaction, and a transaction that wrote or locked rows of the table can then
+only roll back. `SHOW TABLES` lists a dropped table with the commit that
+dropped it (`dropped_at`); ERASE SUBJECT still reaches its history.
 
 ## Durability and recovery
 
@@ -326,6 +336,10 @@ is refused; snapshot write skew is possible.
 Types: INT64, DECIMAL, TEXT, BOOL, TIMESTAMP, finite FLOAT64 (exact SUM,
 rounded once) and nullable non-key columns. Comparisons with NULL, including
 NULL parameters, are refused: use IS NULL / IS NOT NULL.
+
+TEXT is UTF-8, validated, without NUL, and compared and ordered byte by byte: there
+are no collations. imagedb runs on Linux on x86-64 (AVX2 kernels, or the portable C
+ones with `make NOASM=1`); other systems are untested.
 
 Arithmetic: `+ - * / %`, unary minus and parentheses in SELECT lists, WHERE,
 UPDATE ... SET and VALUES, aggregates included:

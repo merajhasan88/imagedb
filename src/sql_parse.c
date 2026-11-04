@@ -946,8 +946,16 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
         if (!rc) rc = unique || kw(&p, "index") ? parse_create_index(&p, st, unique) : parse_create(&p, st);
     }
     else if (kw(&p, "drop")) {
-        st->kind = ST_DROP_INDEX;
-        if (!(rc = expect_kw(&p, "index"))) rc = ident(&p, st->index_name);
+        if (kw(&p, "table")) { /* DROP TABLE t [RETENTION n UNIT] (1f): its history kept, for that long */
+            st->kind = ST_DROP_TABLE;
+            if (!(rc = ident(&p, st->table)) && kw(&p, "retention")) {
+                st->has_retention = true;
+                rc = parse_retention(&p, &st->retention_us);
+            }
+        } else {
+            st->kind = ST_DROP_INDEX;
+            if (!(rc = expect_kw(&p, "index"))) rc = ident(&p, st->index_name);
+        }
     }
     else if (kw(&p, "alter")) { /* ALTER TABLE t SET RETENTION ... */
         st->kind = ST_ALTER_RETENTION;

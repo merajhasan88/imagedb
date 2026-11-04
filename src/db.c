@@ -316,7 +316,16 @@ int imdb_init_replica(const char *path, const imdb_identity *id, imdb_err *e) { 
 imdb_table *imdb_table_by_name(imdb_db *db, const char *name)
 {
     for (uint32_t i = 0; i < db->nt; i++)
-        if (strcmp(db->t[i]->s.name, name) == 0) return db->t[i];
+        if (!db->t[i]->dropped_at && strcmp(db->t[i]->s.name, name) == 0) return db->t[i];
+    return NULL;
+}
+
+imdb_table *imdb_table_at(imdb_db *db, const char *name, uint64_t snap)
+{
+    for (uint32_t i = 0; i < db->nt; i++) { /* at most one: a name is reused only after its table's drop */
+        imdb_table *t = db->t[i];
+        if (t->created_at <= snap && (!t->dropped_at || snap < t->dropped_at) && strcmp(t->s.name, name) == 0) return t;
+    }
     return NULL;
 }
 
@@ -1065,6 +1074,17 @@ int imdb_digest_delta(uint8_t alg, const imdb_op *ops, uint32_t nops, uint32_t n
     return rc;
 }
 
+void imdb_digest_drops(const imdb_db *db, const imdb_op *ops, uint32_t nops, uint32_t nt, imdb_lthash *delta, bool *touched)
+{
+    for (uint32_t i = 0; i < nops; i++) { /* its commit changes nothing else of the table (log.h): minus all it holds */
+        uint32_t t = ops[i].table;
+        if (ops[i].code != IMDB_OP_DROP_TABLE || t >= nt || t >= db->nt) continue;
+        imdb_lthash_zero(&delta[t]);
+        imdb_lthash_sub(&delta[t], &db->t[t]->digest);
+        touched[t] = true;
+    }
+}
+
 void imdb_state_digest(const imdb_db *db, const imdb_table *t, uint8_t out[32])
 {
     imdb_lthash_digest(db->meta.digest_alg, t ? &t->digest : &db->global, out);
@@ -1075,7 +1095,7 @@ int imdb_view_token(const imdb_db *db, uint8_t out[32], imdb_err *e)
     imdb_sha256_ctx c;
     uint8_t b[16];
     imdb_sha256_init(&c);
-    imdb_sha256_update(&c, "IMDBVIEW1", 9);
+    imdb_sha256_update(&c, "IMDBVIEW2", 9); /* 2: each table's created and dropped commits too (1f) */
     imdb_sha256_update(&c, db->db_id, 16);
     imdb_le64(b, db->seq);
     imdb_sha256_update(&c, b, 8);
@@ -1096,6 +1116,9 @@ int imdb_view_token(const imdb_db *db, uint8_t out[32], imdb_err *e)
         imdb_sha256_update(&c, sb.p, sb.len);
         imdb_le64(b, t->horizon);
         imdb_le64(b + 8, t->live);
+        imdb_sha256_update(&c, b, 16);
+        imdb_le64(b, t->created_at);
+        imdb_le64(b + 8, t->dropped_at);
         imdb_sha256_update(&c, b, 16);
         uint8_t lanes[IMDB_LTHASH_BYTES];
         imdb_lthash_to_bytes(&t->digest, lanes);
@@ -1825,6 +1848,46 @@ int imdb_set_retention(imdb_db *db, imdb_table *t, uint64_t retention_us, imdb_e
     return IMDB_OK;
 }
 
+int imdb_drop_table(imdb_db *db, imdb_table *t, uint64_t retention_us, imdb_err *e)
+{
+    if (!db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "no transaction");
+    if (db->ntx) return imdb_fail(e, IMDB_ERR_STATE, "DROP TABLE commits on its own");
+    if (t->dropped_at) return imdb_fail(e, IMDB_ERR_NOTFOUND, "table %s was dropped already", t->s.name);
+    if (retention_us && !imdb_retention_ok(retention_us))
+        return imdb_fail(e, IMDB_ERR_INVALID, "RETENTION is a second to a century, or FOREVER");
+    uint64_t r = retention_us ? retention_us : t->retention_us;
+    if (r == IMDB_RETAIN_FOREVER) /* a tombstone kept FOREVER would hold every RETIRE below its creation for good */
+        return imdb_fail(e, IMDB_ERR_INVALID,
+                         "table %s keeps its history FOREVER: give the drop a retention (DROP TABLE %s RETENTION 30 "
+                         "DAYS) so its history can expire",
+                         t->s.name, t->s.name);
+    if (retention_us && imdb_set_retention(db, t, retention_us, e)) return e->code;
+    imdb_op *op = tx_push(db, e);
+    if (!op) {
+        if (db->ntx) db->ntx--; /* the retention pushed before it: nothing of the drop stays in the transaction */
+        return e->code;
+    }
+    op->code = IMDB_OP_DROP_TABLE;
+    op->table = t->s.id;
+    return IMDB_OK;
+}
+
+void imdb_table_drop_install(imdb_db *db, imdb_table *t, uint64_t seq)
+{
+    uint64_t ended = 0;
+    for (uint64_t vid = imdb_v_next(t, 0); vid < t->nver; vid = imdb_v_next(t, vid + 1)) {
+        imdb_version *v = imdb_vh(t, vid); /* held: every live version is (only ended ones leave for the lake) */
+        if (v->end != IMDB_LIVE) continue;
+        v->end = seq;
+        imdb_seg_set_end(t, v, seq); /* a resident image takes the end now; a gone one at its reload (lake.h) */
+        ended++;
+    }
+    t->live = 0;
+    t->dropped_at = seq;
+    db->ended_pass += ended; /* the memory window's trigger, as DELETE's ends */
+    imdb_txn_doom_dropped(db, t->s.id, seq);
+}
+
 int imdb_expire_op(imdb_db *db, uint32_t table, uint64_t before, imdb_err *e)
 {
     if (!db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "no transaction");
@@ -1842,8 +1905,8 @@ int imdb_expire_op(imdb_db *db, uint32_t table, uint64_t before, imdb_err *e)
 
 imdb_table *imdb_index_find(const imdb_db *db, const char *name, uint32_t *pos)
 {
-    for (uint32_t i = 0; i < db->nt; i++)
-        for (uint32_t k = 0; k < db->t[i]->nidx; k++)
+    for (uint32_t i = 0; i < db->nt; i++) /* a dropped table's index names are free again (1f) */
+        for (uint32_t k = 0; !db->t[i]->dropped_at && k < db->t[i]->nidx; k++)
             if (strcmp(db->t[i]->idx[k].d.name, name) == 0) {
                 if (pos) *pos = k;
                 return db->t[i];
@@ -3787,6 +3850,16 @@ static int commit_body(imdb_db *db, imdb_err *e)
         return IMDB_OK;
     }
     int frc = anchor_fenced(db, e);
+    /* a table dropped since this transaction wrote it (a parked transaction, resumed after the drop) takes nothing */
+    for (uint32_t i = 0; !frc && i < db->ntx; i++) {
+        uint8_t code = db->tx[i].code;
+        bool on_table = code == IMDB_OP_INSERT || code == IMDB_OP_DELETE || code == IMDB_OP_UPDATE || code == IMDB_OP_COMPACT ||
+                        code == IMDB_OP_CREATE_INDEX || code == IMDB_OP_DROP_INDEX || code == IMDB_OP_SET_RETENTION ||
+                        code == IMDB_OP_DROP_TABLE; /* not EXPIRE: a dropped table's history still expires */
+        if (on_table && db->tx[i].table < db->nt && db->t[db->tx[i].table]->dropped_at)
+            frc = imdb_fail(e, IMDB_ERR_CONFLICT, "table %s was dropped at commit %llu; roll back and retry the transaction",
+                            db->t[db->tx[i].table]->s.name, (unsigned long long)db->t[db->tx[i].table]->dropped_at);
+    }
     /* the commit index doubles now and then: a commit that writes rows is refused here, before
      * anything is logged; deletions and the physical ops (the ways down) never are */
     bool grows = false;
@@ -3822,6 +3895,7 @@ static int commit_body(imdb_db *db, imdb_err *e)
         if (o->code == IMDB_OP_INSERT || o->code == IMDB_OP_UPDATE) o->row = db->t[o->table]->arena.p + db->tx_row_off[i];
     }
     if ((rc = imdb_digest_delta(db->meta.digest_alg, db->tx, db->ntx, db->nt, delta, touched, e))) goto fail;
+    imdb_digest_drops(db, db->tx, db->ntx, db->nt, delta, touched); /* a DROP TABLE: minus its table's lanes */
     imdb_lthash global = db->global;
     for (uint32_t t = 0; t < db->nt; t++)
         if (touched[t]) imdb_lthash_add(&global, &delta[t]);
@@ -3859,10 +3933,12 @@ static int commit_body(imdb_db *db, imdb_err *e)
         uint8_t code = db->tx[i].code;
         if (code == IMDB_OP_INSERT || code == IMDB_OP_DELETE || code == IMDB_OP_UPDATE || code == IMDB_OP_CREATE_TABLE ||
             code == IMDB_OP_CREATE_INDEX || code == IMDB_OP_DROP_INDEX || code == IMDB_OP_SET_RETENTION ||
-            code == IMDB_OP_EXPIRE)
-            db->lake_dirty = true; /* the manifest records the definitions, the retentions and the horizons */
+            code == IMDB_OP_EXPIRE || code == IMDB_OP_DROP_TABLE)
+            db->lake_dirty = true; /* the manifest records the definitions, the retentions, the horizons, the drops */
+        if (code == IMDB_OP_CREATE_TABLE) db->t[db->tx[i].table]->created_at = c.seq;
         if (code == IMDB_OP_SET_RETENTION) db->t[db->tx[i].table]->retention_us = db->tx[i].retention_us;
         if (code == IMDB_OP_EXPIRE) db->t[db->tx[i].table]->horizon = db->tx[i].purge_before;
+        if (code == IMDB_OP_DROP_TABLE) imdb_table_drop_install(db, db->t[db->tx[i].table], c.seq);
     }
     db->seq = c.seq;
     memcpy(db->head, c.hash, 32);

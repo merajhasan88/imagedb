@@ -100,6 +100,11 @@ enum {
                                    commit, a publish. The boundary ends a log segment, is past the previous one and
                                    below every table's horizon (VERIFY and the auditor check it), so nothing a
                                    horizon still answers is dropped */
+    IMDB_OP_DROP_TABLE = 19,    /* u32 table (1f): every live version of the table ends at this commit, and the table
+                                   becomes a tombstone: its name free, its history kept for AS OF and ERASE until its
+                                   retention expires it. Its commit holds only it, after at most one SET_RETENTION of
+                                   the same table (DROP TABLE t RETENTION r); the table is live, and its retention,
+                                   that op applied, is not FOREVER (replay, VERIFY and the auditor check both) */
 };
 
 /* A table's retention (op 16): how long its history stays answerable (AS OF) after a version ends. */
