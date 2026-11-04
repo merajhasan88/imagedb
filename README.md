@@ -248,8 +248,12 @@ superaccumulator). The two agree bit for bit, out-of-range results included.
 ```sh
 build/imagedb backup-key /safe/backup.key            # once: 32 random bytes (0400); prints the key's id
 build/imagedb backup /data/p --key /safe/backup.key --out /backups/p-20261101.bak
+build/imagedb backup /data/p --key /safe/backup.key --out /backups/p-1.bak --after /backups/p-20261101.bak
+build/imagedb backup /data/p --key /safe/backup.key --out /backups/p-2.bak --after /backups/p-1.bak
 build/imagedb backup-verify --key /safe/backup.key --scratch /tmp/check /backups/p-20261101.bak
-build/imagedb restore /data/p2 --key /safe/backup.key /backups/p-20261101.bak
+build/imagedb restore /data/p2 --key /safe/backup.key /backups/p-20261101.bak /backups/p-1.bak /backups/p-2.bak
+build/imagedb restore /data/p3 --key /safe/backup.key --until-time '2026-11-04 12:00:00' \
+    /backups/p-20261101.bak /backups/p-1.bak /backups/p-2.bak       # the full one first, then in order
 build/imagedb promote /data/p2 --root-key /offline/root.key --old-writer-stopped   # to write to the copy
 ```
 
@@ -264,6 +268,11 @@ build/imagedb promote /data/p2 --root-key /offline/root.key --old-writer-stopped
 - It is written as FILE.tmp, synced, then renamed: a crash leaves FILE.tmp (remove it before the next backup), never
   a partial FILE. When the database publishes and retires its log under a running backup, the backup starts again
   from the newer snapshot (three attempts).
+- `--after PREV` makes an incremental backup: the commits after PREV's last, checked to continue PREV's history
+  (the source's next commit must name PREV's last as the one before it). Refused: nothing new since PREV (no file
+  is written), a PREV of another database, and a source whose log no longer holds the commits after PREV (RETIRE cut
+  it): take a full backup then, and take fulls at least as often as RETIRE runs. A restore takes a full backup and
+  then its incrementals in order; a gap or another history is refused before anything is written.
 - `backup-verify` is a test restore: the backup restored into a new directory under `--scratch`, VERIFY run on it,
   the directory removed. Run it after each backup: `backup` checks its own seal and frames, but only a restore reads
   the snapshot's seed.
@@ -271,6 +280,11 @@ build/imagedb promote /data/p2 --root-key /offline/root.key --old-writer-stopped
   backup as a replica applies a stream, every commit's signature, chain and digest checked, into DEST.tmp, makes it
   durable and renames it to DEST. A restore that fails removes DEST.tmp; a crash leaves it: remove it and restore
   again.
+- `--until N` restores through commit N, `--until-time 'YYYY-MM-DD HH:MM:SS[.ffffff]'` (UTC) through the last
+  commit made at or before it: the apply stops before the next commit, as at a stream's end (the copy's state
+  checked), and the copy is the database as it was there (its head is that commit's hash). A point the backups do
+  not hold (before the full backup's snapshot, past the last commit, before the first commit's time) is refused
+  before anything is written.
 - **The copy** is a replica seeded at the snapshot's commit S, holding the database as it was at the backup's last
   commit (the same view token). Its history starts at S: VERIFY and the auditor start there, and `AS OF` an earlier
   commit is refused on it ("commit N is in no log segment"), where the source, which holds its whole log, answers.
@@ -278,10 +292,14 @@ build/imagedb promote /data/p2 --root-key /offline/root.key --old-writer-stopped
   the offline root key (a new signed epoch; the root key's ledger lets each epoch be taken once, so two restores
   cannot both become writers). A database made without `init --root` restores to a copy that stays read-only.
   Not in a backup: `replicas/` (enrol replicas again with `replica-add`), the anchor (give the copy a new one), pins.
-- What is lost when the database is: the commits after the backup's last (its RPO is the time since the last
-  backup). A restore's time follows the snapshot's size and the commits after it, not the history: a database of
-  373,510 commits (200,000 live rows, 380 MB) restored in 20 s from its snapshot and the 13,509 commits after it,
-  against 151 s to replay its whole log (a USB SSD, 2026-11-01; its backup took 3.4 s).
+- What is lost when the database is: the commits after the last backup's last commit, so the RPO is the interval
+  between backups (incrementals make that interval short and cheap: each holds only the commits since the one
+  before), or a replica's lag with `follow` (none with `SET sync_replicas`). A restore's time (the RTO) follows
+  the snapshot's size and the commits after it, not the history: a database of 373,510 commits (200,000 live rows,
+  380 MB) restored in 20 s from its snapshot and the 13,509 commits after it, against 151 s to replay its whole log
+  (a USB SSD, 2026-11-01; its backup took 3.4 s); one of 10^6 rows of ~420 bytes (949 MB on disk) backed up in 5.6 s
+  to a 492 MB file and restored in 15.5 s, opening in 6.2 s more, with the source's view token (the internal SSD,
+  2026-11-04).
 - An ERASE after a backup does not reach the backup: delete the file, or destroy the key, which makes every backup
   sealed under it unreadable. `SHOW ERASURE` counts backups among the copies it does not track.
 

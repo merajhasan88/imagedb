@@ -66,12 +66,26 @@ int imdb_backup_full(const char *src, const char *out, const uint8_t key[IMDB_BA
 /* Reads and checks a whole backup file without applying it: the prologue, every chunk's tag, the order and the
  * summary. info: what it holds. */
 int imdb_backup_check(const char *file, const uint8_t key[IMDB_BACKUP_KEY_LEN], imdb_backup_info *info, imdb_err *e);
+/* An incremental backup (P0 backup slice 2): the commits after prev's last (a backup this key opens, of the same
+ * database), one part, its prologue naming prev's last commit and hash; refused when the source's log no longer holds
+ * them (retired: take a full), when nothing is new, or when the source's history is not prev's. Written as out.tmp,
+ * synced, renamed, the directory synced, as a full one. */
+int imdb_backup_incremental(const char *src, const char *prev, const char *out, const uint8_t key[IMDB_BACKUP_KEY_LEN],
+                            imdb_backup_info *info, imdb_err *e);
 
 /* Restores backups (a full one, then incrementals in order) into dest, a new directory: every file is checked
  * whole first (imdb_backup_check), then applied into dest.tmp as a replica applies a stream, made durable, and
  * renamed to dest. dest or dest.tmp existing is refused. *info: the last file's, with the restored commit. */
 int imdb_restore(const char *dest, const uint8_t key[IMDB_BACKUP_KEY_LEN], const char *const *files, size_t nfiles,
                  imdb_backup_info *info, imdb_err *e);
+/* Point in time (P0 backup slice 2): the copy ends at commit until_seq, or at the last commit made at or before
+ * until_time (microseconds since 1970, UTC; commit times rise), applying no further; one of the two, 0: none. A commit
+ * outside what the backups hold (before a full's snapshot, past the last) is refused before anything is written. */
+typedef struct imdb_restore_opts {
+    uint64_t until_seq, until_time;
+} imdb_restore_opts;
+int imdb_restore_ex(const char *dest, const uint8_t key[IMDB_BACKUP_KEY_LEN], const char *const *files, size_t nfiles,
+                    const imdb_restore_opts *ro, imdb_backup_info *info, imdb_err *e);
 
 /* Tests only: fn runs between a seeded backup's two parts (where a RETIRE's log cut makes the backup try again). */
 void imdb_backup_test_between(void (*fn)(void *ctx), void *ctx);

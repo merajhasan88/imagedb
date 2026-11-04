@@ -5,7 +5,10 @@
 #include <openssl/evp.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "../../src/backup.h"
@@ -502,6 +505,311 @@ static void t_backup_verify(void)
     CHECK(count_files(scratch, "") == 0); /* the copy removed */
 }
 
+
+/* ---- slice 2: incrementals and point in time -------------------------------------------------------------------- */
+
+/* A full backup and two incrementals, each the commits after the one before's last: restored as a chain, the copy is
+ * the source at its last commit (the view token), VERIFY and the auditor pass it. Refused: an incremental with nothing
+ * new (no file left), one after a backup of another database, and a restore with a gap in the chain. */
+static void t_backup_incremental(void)
+{
+    const char *tmp = test_tmpdir();
+    char p[600], q[600], kf[600], f0[600], f1[600], f2[600], fx[600], fo[600], r[600], rg[600];
+    snprintf(p, sizeof p, "%s/p", tmp);
+    snprintf(q, sizeof q, "%s/q", tmp);
+    snprintf(kf, sizeof kf, "%s/backup.key", tmp);
+    snprintf(f0, sizeof f0, "%s/full.bak", tmp);
+    snprintf(f1, sizeof f1, "%s/inc1.bak", tmp);
+    snprintf(f2, sizeof f2, "%s/inc2.bak", tmp);
+    snprintf(fx, sizeof fx, "%s/empty.bak", tmp);
+    snprintf(fo, sizeof fo, "%s/other.bak", tmp);
+    snprintf(r, sizeof r, "%s/r", tmp);
+    snprintf(rg, sizeof rg, "%s/rg", tmp);
+    uint8_t root_seed[IMDB_SEED_LEN], key[IMDB_BACKUP_KEY_LEN], id[32], head[32];
+    test_rand_bytes(root_seed, sizeof root_seed);
+    imdb_signer root;
+    imdb_signer_init(&root, root_seed);
+    uint64_t seq = 0;
+    CHECK(make_source(p, root.pk, &seq, head) == 0);
+    OK(imdb_backup_key_create(kf, id, E));
+    OK(imdb_backup_key_load(kf, key, E));
+    imdb_backup_info b0, b1, b2, bx, ri;
+    OK(imdb_backup_full(p, f0, key, &b0, E));
+    CHECK(imdb_backup_incremental(p, f0, fx, key, &bx, E) == IMDB_ERR_STATE && access(fx, F_OK) != 0); /* nothing new */
+    imdb_db *db = open_db(p);
+    CHECK(db);
+    if (!db) return;
+    for (int64_t i = 1000; i < 1010; i++) OK(ins1(db, i, 1, i, "inc one"));
+    imdb_close(db);
+    OK(imdb_backup_incremental(p, f0, f1, key, &b1, E));
+    CHECK(b1.incremental && b1.prev_seq == b0.last_seq && b1.first_seq == b0.last_seq + 1 && b1.last_seq == b0.last_seq + 10);
+    db = open_db(p);
+    CHECK(db);
+    if (!db) return;
+    OK(imdb_checkpoint(db, E)); /* a publish inside an incremental's commits */
+    for (int64_t i = 2000; i < 2005; i++) OK(ins1(db, i, 2, i, "inc two"));
+    uint8_t vt_p[32], vt_r[32];
+    OK(imdb_view_token(db, vt_p, E));
+    uint64_t last = db->seq;
+    imdb_close(db);
+    OK(imdb_backup_incremental(p, f1, f2, key, &b2, E));
+    CHECK(b2.prev_seq == b1.last_seq && b2.last_seq == last);
+    /* another database's full backup as the previous one: refused */
+    CHECK(make_source(q, root.pk, &seq, head) == 0);
+    OK(imdb_backup_full(q, fo, key, &bx, E));
+    CHECK(imdb_backup_incremental(p, fo, fx, key, &bx, E) == IMDB_ERR_INVALID && access(fx, F_OK) != 0);
+    /* a gap: the second incremental without the first */
+    const char *gap[2] = {f0, f2};
+    CHECK(imdb_restore(rg, key, gap, 2, &ri, E) == IMDB_ERR_INVALID && access(rg, F_OK) != 0);
+    const char *chain[3] = {f0, f1, f2};
+    OK(imdb_restore(r, key, chain, 3, &ri, E));
+    CHECK(ri.last_seq == last);
+    db = open_db(r);
+    CHECK(db && db->seq == last);
+    if (!db) return;
+    OK(imdb_view_token(db, vt_r, E));
+    CHECK(!memcmp(vt_p, vt_r, 32));
+    imdb_verify_report vr;
+    memset(&vr, 0, sizeof vr);
+    OK(imdb_verify(db, &vr, E));
+    imdb_close(db);
+    CHECK(audit_ok(r));
+}
+
+/* Point in time: restored through each commit the chain holds, from the full backup's snapshot to the last, the copy
+ * ends at that commit with the source's hash for it (the chain and the state checked on the way); by time, the last
+ * commit made at or before it (a commit's own time, and a microsecond before it); outside the chain refused, and
+ * nothing left behind */
+static void t_backup_point_in_time(void)
+{
+    const char *tmp = test_tmpdir();
+    char p[600], kf[600], f0[600], f1[600], r[640];
+    snprintf(p, sizeof p, "%s/p", tmp);
+    snprintf(kf, sizeof kf, "%s/backup.key", tmp);
+    snprintf(f0, sizeof f0, "%s/full.bak", tmp);
+    snprintf(f1, sizeof f1, "%s/inc.bak", tmp);
+    uint8_t root_seed[IMDB_SEED_LEN], key[IMDB_BACKUP_KEY_LEN], id[32], head[32];
+    test_rand_bytes(root_seed, sizeof root_seed);
+    imdb_signer root;
+    imdb_signer_init(&root, root_seed);
+    uint64_t seq = 0;
+    CHECK(make_source(p, root.pk, &seq, head) == 0);
+    OK(imdb_backup_key_create(kf, id, E));
+    OK(imdb_backup_key_load(kf, key, E));
+    imdb_backup_info b0, b1, ri;
+    OK(imdb_backup_full(p, f0, key, &b0, E));
+    imdb_db *db = open_db(p);
+    CHECK(db);
+    if (!db) return;
+    for (int64_t i = 1000; i < 1006; i++) OK(ins1(db, i, 1, i, "later"));
+    imdb_close(db);
+    OK(imdb_backup_incremental(p, f0, f1, key, &b1, E));
+    imdb_open_opts ro = {.sync = 0, .read_only = true};
+    imdb_db *src = NULL;
+    OK(imdb_open(p, &ro, &src, E));
+    const char *chain[2] = {f0, f1};
+    for (uint64_t n = b0.seed_seq; n <= b1.last_seq; n++) {
+        snprintf(r, sizeof r, "%s/r%llu", tmp, (unsigned long long)n);
+        imdb_restore_opts o = {.until_seq = n};
+        OK(imdb_restore_ex(r, key, chain, 2, &o, &ri, E));
+        const imdb_commit_info *ci = imdb_ci_at(src, n, E);
+        imdb_db *c = open_db(r);
+        CHECK(c && ci && c->seq == n && ri.last_seq == n && !memcmp(c->head, ci->hash, 32) && !memcmp(ri.last_hash, ci->hash, 32));
+        if (c) imdb_close(c);
+    }
+    /* by time: commit k's own time restores through k, a microsecond less through k - 1 */
+    uint64_t k = b1.last_seq - 2;
+    const imdb_commit_info *ck = imdb_ci_at(src, k, E);
+    CHECK(ck);
+    if (ck) {
+        uint64_t tk = ck->time_us;
+        for (int d = 0; d < 2; d++) {
+            snprintf(r, sizeof r, "%s/t%d", tmp, d);
+            imdb_restore_opts o = {.until_time = tk - (uint64_t)d};
+            OK(imdb_restore_ex(r, key, chain, 2, &o, &ri, E));
+            CHECK(ri.last_seq == k - (uint64_t)d);
+        }
+    }
+    /* outside the chain: before the snapshot, past the last, before the first commit's time, both at once */
+    imdb_restore_opts bad[4] = {{.until_seq = b0.seed_seq - 1}, {.until_seq = b1.last_seq + 1}, {.until_time = 1},
+                                {.until_seq = b1.last_seq, .until_time = 1}};
+    for (int i = 0; i < 4; i++) {
+        snprintf(r, sizeof r, "%s/bad%d", tmp, i);
+        imdb_err_clear(E);
+        CHECK(imdb_restore_ex(r, key, chain, 2, &bad[i], &ri, E) == IMDB_ERR_INVALID && access(r, F_OK) != 0);
+        char t[680];
+        snprintf(t, sizeof t, "%s.tmp", r);
+        CHECK(access(t, F_OK) != 0);
+    }
+    imdb_close(src);
+}
+
+
+/* An incremental whose source is not the previous backup's history: two copies of one database (the same identity)
+ * that went on apart. The backup of one, then an incremental of the other after it: the other's next commit does not
+ * name the backup's last as the one before it, so the incremental is refused by name and no file is left */
+static void t_backup_incremental_history(void)
+{
+    const char *tmp = test_tmpdir();
+    char a[600], b[600], kf[600], fa[600], fb[600];
+    snprintf(a, sizeof a, "%s/a", tmp);
+    snprintf(b, sizeof b, "%s/b", tmp);
+    snprintf(kf, sizeof kf, "%s/backup.key", tmp);
+    snprintf(fa, sizeof fa, "%s/a.bak", tmp);
+    snprintf(fb, sizeof fb, "%s/b-after-a.bak", tmp);
+    uint8_t root_seed[IMDB_SEED_LEN], key[IMDB_BACKUP_KEY_LEN], id[32], head[32];
+    test_rand_bytes(root_seed, sizeof root_seed);
+    imdb_signer root;
+    imdb_signer_init(&root, root_seed);
+    uint64_t seq = 0;
+    CHECK(make_source(a, root.pk, &seq, head) == 0);
+    CHECK(copy_tree(a, b) == 0);
+    OK(imdb_backup_key_create(kf, id, E));
+    OK(imdb_backup_key_load(kf, key, E));
+    for (int side = 0; side < 2; side++) { /* a: two more commits; b: four others */
+        imdb_db *db = open_db(side ? b : a);
+        CHECK(db);
+        if (!db) return;
+        for (int64_t i = 0; i < (side ? 4 : 2); i++) OK(ins1(db, 5000 + i, side, i, side ? "b's own" : "a's own"));
+        imdb_close(db);
+    }
+    imdb_backup_info ba, bb;
+    OK(imdb_backup_full(a, fa, key, &ba, E));
+    imdb_err_clear(E);
+    CHECK(imdb_backup_incremental(b, fa, fb, key, &bb, E) == IMDB_ERR_STATE && strstr(g_e.msg, "another history"));
+    CHECK(access(fb, F_OK) != 0);
+    char t[640];
+    snprintf(t, sizeof t, "%s.tmp", fb);
+    CHECK(access(t, F_OK) != 0);
+}
+
+
+static int64_t sql_i64(imdb_db *db, const char *sql)
+{
+    imdb_session s;
+    imdb_session_init(&s, db);
+    imdb_result r;
+    imdb_err_clear(&g_e);
+    int64_t v = INT64_MIN;
+    if (imdb_exec_one(&s, sql, strlen(sql), NULL, 0, &r, &g_e) == 0) {
+        if (r.nrows == 1 && !r.cells[0].null) v = r.cells[0].wide ? (int64_t)r.cells[0].i128 : r.cells[0].v.i;
+        imdb_result_free(&r);
+    }
+    imdb_session_close(&s);
+    return v;
+}
+
+typedef struct live_ctx {
+    volatile uint64_t *seq; /* the writer's last commit, in memory both processes share */
+    uint64_t at_hook;
+    int calls;
+} live_ctx;
+
+static void live_between(void *ctx) /* between the seed and the log: 200 more commits land while the backup runs */
+{
+    live_ctx *c = ctx;
+    c->calls++;
+    c->at_hook = __atomic_load_n(c->seq, __ATOMIC_ACQUIRE);
+    for (int spin = 0; spin < 60000 && __atomic_load_n(c->seq, __ATOMIC_ACQUIRE) < c->at_hook + 200; spin++) {
+        struct timespec ts = {0, 1000000L};
+        nanosleep(&ts, NULL);
+    }
+}
+
+/* A backup of a database another process writes to throughout (the database operating, P0): the writer commits a row
+ * a commit and publishes every 400, from before the backup starts until after it ends; the hook between the backup's
+ * parts waits for 200 more of its commits, so the log part reads a log that grew after the seed was taken and goes
+ * on growing under it. The copy is the source at the backup's last commit: that commit the source's own at that
+ * sequence, its rows the source's AS OF it, VERIFY passing; the 200 are in it, and what came after the backup is not */
+static void t_backup_live_writer(void)
+{
+    const char *tmp = test_tmpdir();
+    char p[600], out[600], r[600], kf[600];
+    snprintf(p, sizeof p, "%s/p", tmp);
+    snprintf(out, sizeof out, "%s/live.bak", tmp);
+    snprintf(r, sizeof r, "%s/restored", tmp);
+    snprintf(kf, sizeof kf, "%s/backup.key", tmp);
+    uint8_t root_seed[IMDB_SEED_LEN], key[IMDB_BACKUP_KEY_LEN], id[32], head[32];
+    test_rand_bytes(root_seed, sizeof root_seed);
+    imdb_signer root;
+    imdb_signer_init(&root, root_seed);
+    uint64_t seq = 0;
+    CHECK(make_source(p, root.pk, &seq, head) == 0);
+    OK(imdb_backup_key_create(kf, id, E));
+    OK(imdb_backup_key_load(kf, key, E));
+    void *map = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    CHECK(map != MAP_FAILED);
+    if (map == MAP_FAILED) return;
+    volatile uint64_t *shared = map;
+    *shared = 0;
+    int ready[2], stop[2];
+    CHECK(pipe(ready) == 0 && pipe(stop) == 0);
+    CHECK(fcntl(stop[0], F_SETFL, O_NONBLOCK) == 0);
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) { /* the writer: commits until told to stop, then 50 more the backup must not hold */
+        imdb_db *w = open_db(p);
+        if (!w) _exit(2);
+        char c = 1;
+        int64_t i = 100000, after = -1;
+        for (;; i++) {
+            if (ins1(w, i, 3, i, "live")) _exit(4);
+            if (i % 400 == 0 && imdb_checkpoint(w, E)) _exit(5);
+            __atomic_store_n(shared, w->seq, __ATOMIC_RELEASE);
+            if (i == 100020 && write(ready[1], &c, 1) != 1) _exit(3); /* 20 commits in: the backup may start */
+            if (after < 0 && read(stop[0], &c, 1) == 1) after = i;
+            if (after >= 0 && i >= after + 50) break;
+            if (i > 2000000) _exit(6); /* never told: the parent is gone */
+        }
+        imdb_close(w);
+        _exit(0);
+    }
+    char c = 0;
+    CHECK(read(ready[0], &c, 1) == 1);
+    uint64_t at_start = __atomic_load_n(shared, __ATOMIC_ACQUIRE);
+    live_ctx lc = {.seq = shared};
+    imdb_backup_test_between(live_between, &lc);
+    imdb_backup_info bi;
+    int rc = imdb_backup_full(p, out, key, &bi, E);
+    imdb_backup_test_between(NULL, NULL);
+    uint64_t at_end = __atomic_load_n(shared, __ATOMIC_ACQUIRE);
+    CHECK(write(stop[1], &c, 1) == 1);
+    int st = 0;
+    CHECK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    close(ready[0]);
+    close(ready[1]);
+    close(stop[0]);
+    close(stop[1]);
+    munmap(map, 4096);
+    OK_RC(rc);
+    /* the seed taken at or after the start, the hook once, the 200 in the backup, nothing past the backup's end */
+    CHECK(lc.calls >= 1 && lc.at_hook >= at_start && bi.last_seq >= lc.at_hook + 200 && bi.last_seq <= at_end);
+    imdb_db *src = open_db(p);
+    CHECK(src);
+    if (!src) return;
+    CHECK(src->seq >= bi.last_seq + 50);
+    const imdb_commit_info *ci = imdb_ci_at(src, bi.last_seq, E);
+    CHECK(ci && memcmp(ci->hash, bi.last_hash, 32) == 0); /* the source's own commit at that sequence */
+    char q[160];
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM txns AS OF %llu", (unsigned long long)bi.last_seq);
+    int64_t n_src = sql_i64(src, q);
+    snprintf(q, sizeof q, "SELECT SUM(amount) FROM txns AS OF %llu", (unsigned long long)bi.last_seq);
+    int64_t sum_src = sql_i64(src, q);
+    imdb_close(src);
+    const char *files[1] = {out};
+    imdb_backup_info ri;
+    OK(imdb_restore(r, key, files, 1, &ri, E));
+    imdb_db *db = open_db(r);
+    CHECK(db);
+    if (!db) return;
+    CHECK(db->seq == bi.last_seq && memcmp(db->head, bi.last_hash, 32) == 0);
+    CHECK(n_src >= 200 && sql_i64(db, "SELECT COUNT(*) FROM txns") == n_src);
+    CHECK(sql_i64(db, "SELECT SUM(amount) FROM txns") == sum_src);
+    imdb_verify_report vr;
+    OK(imdb_verify(db, &vr, E));
+    imdb_close(db);
+}
+
 const test_case backup_tests[] = {
     {"backup_xchacha_openssl", t_backup_xchacha_openssl},
     {"backup_key_file", t_backup_key_file},
@@ -512,5 +820,9 @@ const test_case backup_tests[] = {
     {"backup_damage", t_backup_damage},
     {"backup_chunks_moved", t_backup_chunks_moved},
     {"backup_verify", t_backup_verify},
+    {"backup_incremental", t_backup_incremental},
+    {"backup_point_in_time", t_backup_point_in_time},
+    {"backup_incremental_history", t_backup_incremental_history},
+    {"backup_live_writer", t_backup_live_writer},
 };
 const size_t backup_ntests = sizeof backup_tests / sizeof backup_tests[0];

@@ -57,12 +57,16 @@ static int usage(void)
           "                                             (its bytes saved to FILE first) and lower DURABLE to match\n"
           "  imagedb root-key FILE                      make an offline root key (secret, 0400) and print its public key\n"
           "  imagedb backup-key FILE                    make a backup key (secret, 0400) and print its id\n"
-          "  imagedb backup <dir> --key FILE --out FILE a full backup, encrypted: the last published snapshot and the\n"
-          "                                             commits after it, while the database runs\n"
+          "  imagedb backup <dir> --key FILE --out FILE [--after PREV]\n"
+          "                                             a full backup, encrypted: the last published snapshot and the\n"
+          "                                             commits after it, while the database runs; with --after, an\n"
+          "                                             incremental one: the commits after backup PREV's last\n"
           "  imagedb backup-verify --key FILE --scratch DIR BACKUP...\n"
           "                                             a test restore under DIR, VERIFY on it, then removed\n"
-          "  imagedb restore <new-dir> --key FILE BACKUP...\n"
-          "                                             a read-only copy; imagedb promote makes it writable\n"
+          "  imagedb restore <new-dir> --key FILE [--until N | --until-time TS] BACKUP...\n"
+          "                                             a read-only copy (a full backup, then its incrementals in\n"
+          "                                             order), through commit N or the last at or before TS; imagedb\n"
+          "                                             promote makes it writable\n"
           "  imagedb rotate-key <dir>                   a new writer key, signed into the log by the current one\n"
           "  imagedb promote <replica-dir> --root-key FILE (--anchor FILE [--abandon] | --old-writer-stopped)\n"
           "                                             make the replica the writer of the next epoch, certified\n"
@@ -691,16 +695,19 @@ int main(int argc, char **argv)
         printf("%s\n", hex);
         return 0;
     }
-    if (strcmp(cmd, "backup") == 0 && argc == 7) {
-        const char *keyf = NULL, *out = NULL;
+    if (strcmp(cmd, "backup") == 0 && (argc == 7 || argc == 9)) {
+        const char *keyf = NULL, *out = NULL, *after = NULL;
         for (int i = 3; i + 1 < argc; i += 2) {
             if (strcmp(argv[i], "--key") == 0) keyf = argv[i + 1];
             else if (strcmp(argv[i], "--out") == 0) out = argv[i + 1];
+            else if (strcmp(argv[i], "--after") == 0) after = argv[i + 1];
+            else return usage();
         }
         if (!keyf || !out) return usage();
         uint8_t key[IMDB_BACKUP_KEY_LEN];
         imdb_backup_info bi;
-        int rc = imdb_backup_key_load(keyf, key, &e) || imdb_backup_full(argv[2], out, key, &bi, &e);
+        int rc = imdb_backup_key_load(keyf, key, &e) ||
+                 (after ? imdb_backup_incremental(argv[2], after, out, key, &bi, &e) : imdb_backup_full(argv[2], out, key, &bi, &e));
         imdb_wipe(key, sizeof key);
         if (rc) {
             print_err("backup", &e);
@@ -715,8 +722,24 @@ int main(int argc, char **argv)
     if (strcmp(cmd, "restore") == 0 && argc >= 6 && strcmp(argv[3], "--key") == 0) {
         uint8_t key[IMDB_BACKUP_KEY_LEN];
         imdb_backup_info bi;
+        imdb_restore_opts ro = {0, 0};
+        int first = 5;
+        if (argc >= 8 && strcmp(argv[5], "--until") == 0) {
+            int64_t v;
+            if (imdb_parse_int64(argv[6], strlen(argv[6]), &v, &e) || v < 1) return usage();
+            ro.until_seq = (uint64_t)v;
+            first = 7;
+        } else if (argc >= 8 && strcmp(argv[5], "--until-time") == 0) {
+            int64_t t;
+            if (imdb_parse_timestamp(argv[6], strlen(argv[6]), &t, &e) || t < 1) {
+                print_err("restore", &e);
+                return 1;
+            }
+            ro.until_time = (uint64_t)t;
+            first = 7;
+        }
         int rc = imdb_backup_key_load(argv[4], key, &e) ||
-                 imdb_restore(argv[2], key, (const char *const *)argv + 5, (size_t)(argc - 5), &bi, &e);
+                 imdb_restore_ex(argv[2], key, (const char *const *)argv + first, (size_t)(argc - first), &ro, &bi, &e);
         imdb_wipe(key, sizeof key);
         if (rc) {
             print_err("restore", &e);

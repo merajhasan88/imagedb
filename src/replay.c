@@ -1518,6 +1518,7 @@ static int apply_check(imdb_db *db, uint64_t *applied, imdb_apply_opts *o, imdb_
         o->truncated = false;
         o->has_session = false;
         o->seeded = 0;
+        o->stopped = false;
     }
     if (db->read_only) return imdb_fail(e, IMDB_ERR_STATE, "database opened read-only");
     if (!db->replica) return imdb_fail(e, IMDB_ERR_STATE, "apply is only allowed on a replica");
@@ -1586,6 +1587,14 @@ static int apply_from(imdb_db *db, const apply_src *src, uint64_t *applied, imdb
         /* every byte of s.frame is authenticated; decode it strictly anyway */
         imdb_commit_rec c;
         rc = imdb_frame_decode_body(s.frame.p + IMDB_FRAME_HDR, s.frame.len - IMDB_FRAME_HDR, &c, e);
+        if (!rc && o && ((o->until_seq && c.seq > o->until_seq) || (o->until_time && c.time_us > o->until_time))) {
+            /* point-in-time: the copy ends at the commit before this one, as at a stream's end (its state checked) */
+            imdb_commit_free(&c);
+            o->stopped = true;
+            if (*applied && (rc = imdb_check_state(db, e))) db->failed = true;
+            if (!rc && o->applied && since) rc = ack_point(db, o, e);
+            break;
+        }
         if (!rc) {
             /* the stream reader verified the signature and every row against its commitment */
             c.sig_ok = true;

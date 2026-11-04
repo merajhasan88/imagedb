@@ -1895,6 +1895,82 @@ static const char *check_restore(const char *run)
     return copy_equal(run, dst, backup_seq(run));
 }
 
+
+/* backup_incr (P0 backup slice 2): the restore scenario's full backup, then two commits after it; the child takes the
+ * incremental after the full one */
+static void setup_backup_incr(const char *base)
+{
+    setup_backup_common(base, true);
+    imdb_db *db = child_open(dir_in(base, "p"), 1);
+    if (!db) return;
+    if (ins1(db, 6, 7, 600, "after-the-full-backup") || ins1(db, 7, 9, 700, "after-the-full-backup-too")) {
+        imdb_close(db);
+        return;
+    }
+    imdb_close(db);
+    spit(dir_in(base, "incr_ready"), (const uint8_t *)"1", 1);
+}
+
+static const char *backup_incr_base_ok(const char *base)
+{
+    return restore_base_ok(base) ? restore_base_ok(base)
+           : access(dir_in(base, "incr_ready"), F_OK) == 0 ? NULL : "the setup made no commit after the backup";
+}
+
+static int run_backup_incr(const char *run)
+{
+    uint8_t key[IMDB_BACKUP_KEY_LEN];
+    imdb_backup_info bi;
+    imdb_err e = {0};
+    char full[700], out[700];
+    snprintf(full, sizeof full, "%s/full.bak", run);
+    snprintf(out, sizeof out, "%s/inc.bak", run);
+    if (imdb_backup_key_load(dir_in(run, "backup.key"), key, &e)) return 0;
+    (void)imdb_backup_incremental(dir_in(run, "p"), full, out, key, &bi, &e);
+    return 0;
+}
+
+/* Whatever the fault left: a complete incremental under the name, or none, with inc.bak.tmp only after a crash (a
+ * failure removes its own; a crash's the next one refuses: removed here, and the incremental run again). Either way
+ * the full backup and the incremental restore, as a chain, to the primary. */
+static const char *check_backup_incr(const char *run)
+{
+    char full[700], out[700], tmp[720], dst[700], pp[700];
+    snprintf(full, sizeof full, "%s/full.bak", run);
+    snprintf(out, sizeof out, "%s/inc.bak", run);
+    snprintf(tmp, sizeof tmp, "%s/inc.bak.tmp", run);
+    snprintf(dst, sizeof dst, "%s/incr-copy", run);
+    snprintf(pp, sizeof pp, "%s/p", run);
+    uint8_t key[IMDB_BACKUP_KEY_LEN];
+    imdb_backup_info bi;
+    imdb_err e = {0};
+    if (imdb_backup_key_load(dir_in(run, "backup.key"), key, &e)) {
+        snprintf(g_why, sizeof g_why, "the backup key does not load: %s", e.msg);
+        return g_why;
+    }
+    if (access(out, F_OK) != 0) {
+        if (access(tmp, F_OK) == 0 && g_action != A_CRASH) {
+            snprintf(g_why, sizeof g_why, "an incremental that failed without a crash left inc.bak.tmp");
+            return g_why;
+        }
+        unlink(tmp);
+        if (imdb_backup_incremental(pp, full, out, key, &bi, &e)) {
+            snprintf(g_why, sizeof g_why, "the incremental, run again after the fault, fails: %s", e.msg);
+            return g_why;
+        }
+    }
+    if (imdb_backup_check(out, key, &bi, &e)) {
+        snprintf(g_why, sizeof g_why, "an incremental under its name fails its check: %s", e.msg);
+        return g_why;
+    }
+    const char *files[2] = {full, out};
+    if (imdb_restore(dst, key, files, 2, &bi, &e)) {
+        snprintf(g_why, sizeof g_why, "the full backup and the incremental do not restore: %s", e.msg);
+        return g_why;
+    }
+    return copy_equal(run, dst, bi.last_seq);
+}
+
 /* Whatever a fault or a crash left: once the replica holds epoch 1, the ledger refuses the copy that
  * epoch (a second epoch-1 writer key would fork the history: the review of 2026-10-26, F2 and F3).
  * Before that, the copy may take it or be refused (a reservation that outlived a failed promotion). */
@@ -2044,6 +2120,7 @@ static const char *check_run(const fscen *s, const char *run, const frun *r)
     if (!why && strcmp(s->name, "replica_seed") == 0) why = check_seed(run);
     if (!why && strcmp(s->name, "backup") == 0) why = check_backup(run);
     if (!why && strcmp(s->name, "restore") == 0) why = check_restore(run);
+    if (!why && strcmp(s->name, "backup_incr") == 0) why = check_backup_incr(run);
     return why;
 }
 
@@ -2268,6 +2345,7 @@ static const fscen kScen[] = {
     {"replica_seed", setup_seed, run_seed, false, NULL, seed_base_ok, false, false, false},
     {"backup", setup_backup, run_backup, false, NULL, backup_base_ok, false, false, false},
     {"restore", setup_restore, run_restore, false, NULL, restore_base_ok, false, false, false},
+    {"backup_incr", setup_backup_incr, run_backup_incr, false, NULL, backup_incr_base_ok, false, false, false},
 };
 
 static void t_fault_commits(void) { fault_scenario(&kScen[0]); }
@@ -2299,6 +2377,7 @@ static void t_fault_retire(void) { fault_scenario(&kScen[25]); }
 static void t_fault_replica_seed(void) { fault_scenario(&kScen[26]); }
 static void t_fault_backup(void) { fault_scenario(&kScen[27]); }
 static void t_fault_restore(void) { fault_scenario(&kScen[28]); }
+static void t_fault_backup_incr(void) { fault_scenario(&kScen[29]); }
 
 const test_case fault_tests[] = {
     {"fault_commits", t_fault_commits},     {"fault_nosync", t_fault_nosync}, {"fault_checkpoint", t_fault_checkpoint},
@@ -2325,5 +2404,6 @@ const test_case fault_tests[] = {
     {"fault_replica_seed", t_fault_replica_seed},
     {"fault_backup", t_fault_backup},
     {"fault_restore", t_fault_restore},
+    {"fault_backup_incr", t_fault_backup_incr},
 };
 const size_t fault_ntests = sizeof fault_tests / sizeof *fault_tests;

@@ -671,6 +671,9 @@ typedef struct imdb_apply_opts {
     bool has_session; /* out */
     uint8_t nonce[16]; /* out */
     uint64_t seeded; /* out: the stream was a seed, taken at this commit (seed.h): the handle is stale, reopen */
+    uint64_t until_seq, until_time; /* point-in-time (a restore's --until, P0 backup slice 2): apply stops before a commit
+                                     * past this one, or one made after this time (microseconds; commit times rise); 0: none */
+    bool stopped; /* out: it stopped there, as at a stream's end (the state checked, a point made) */
 } imdb_apply_opts;
 int imdb_apply_stream_ex(imdb_db *db, int fd, uint64_t *applied, imdb_apply_opts *o, imdb_err *e);
 /* imdb_apply_stream_ex from a caller's source (stream.h; its end is the stream's): a source cannot tell whether more is

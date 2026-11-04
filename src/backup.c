@@ -669,8 +669,8 @@ static int open_copy(const char *path, imdb_db **db, imdb_err *e)
 
 static int remove_tree_at(int pfd, const char *name, int depth, imdb_err *e);
 
-int imdb_restore(const char *dest, const uint8_t key[IMDB_BACKUP_KEY_LEN], const char *const *files, size_t nfiles,
-                 imdb_backup_info *info, imdb_err *e)
+int imdb_restore_ex(const char *dest, const uint8_t key[IMDB_BACKUP_KEY_LEN], const char *const *files, size_t nfiles,
+                    const imdb_restore_opts *ro, imdb_backup_info *info, imdb_err *e)
 {
     memset(info, 0, sizeof *info);
     if (nfiles == 0 || nfiles > IMDB_MAX_BACKUP_FILES)
@@ -691,6 +691,14 @@ int imdb_restore(const char *dest, const uint8_t key[IMDB_BACKUP_KEY_LEN], const
             rc = imdb_fail(e, IMDB_ERR_INVALID, "restore: %s does not follow %s (another database, or a gap)", files[i],
                            files[i - 1]);
     }
+    uint64_t until = ro ? ro->until_seq : 0, until_t = ro ? ro->until_time : 0;
+    if (!rc && until && ro->until_time)
+        rc = imdb_fail(e, IMDB_ERR_INVALID, "restore: --until or --until-time, not both");
+    if (!rc && until && (until > in[nfiles - 1].last_seq || until < (in[0].seed_seq ? in[0].seed_seq : 1)))
+        rc = imdb_fail(e, IMDB_ERR_INVALID, "restore: commit %llu is not in these backups (they hold %llu to %llu)",
+                       (unsigned long long)until, (unsigned long long)(in[0].seed_seq ? in[0].seed_seq : 1),
+                       (unsigned long long)in[nfiles - 1].last_seq);
+    bool stopped = false; /* the point in time reached: the rest of the files is not read (each was checked whole) */
     char tmp[IMDB_MAX_PATH], tname[IMDB_MAX_NAME + 1];
     const char *base = NULL;
     int dfd = -1;
@@ -708,18 +716,21 @@ int imdb_restore(const char *dest, const uint8_t key[IMDB_BACKUP_KEY_LEN], const
     bool made = !rc; /* past the checks: whatever is at tname from here on, this call made */
     if (!rc) rc = imdb_init_replica(tmp, &in[0].id, e);
     if (!rc) rc = open_copy(tmp, &db, e);
-    for (size_t i = 0; !rc && i < nfiles; i++) {
+    for (size_t i = 0; !rc && !stopped && i < nfiles; i++) {
         bk_reader r;
         imdb_backup_info pro, sum;
         rc = reader_open(&r, files[i], key, &pro, e);
-        for (uint32_t p = 0; !rc && p < in[i].parts; p++) {
+        for (uint32_t p = 0; !rc && !stopped && p < in[i].parts; p++) {
             imdb_apply_opts ao;
             memset(&ao, 0, sizeof ao);
             ao.applied = no_point; /* its points make the copy durable now and then: the log synced, the lake published */
             ao.every = IMDB_RESTORE_EVERY;
+            ao.until_seq = until;
+            ao.until_time = until_t;
             uint64_t applied = 0;
             rc = imdb_apply_source(db, bk_read, &r, &applied, &ao, e);
-            if (!rc) rc = part_done(&r, e);
+            stopped = !rc && ao.stopped;
+            if (!rc && !stopped) rc = part_done(&r, e);
             if (!rc && ao.seeded) { /* the handle is stale after a seed (seed.h): reopen */
                 int c = imdb_close(db);
                 db = NULL;
@@ -728,17 +739,27 @@ int imdb_restore(const char *dest, const uint8_t key[IMDB_BACKUP_KEY_LEN], const
             }
         }
         sum = pro;
-        if (!rc) rc = read_summary(&r, &sum, e);
+        if (!rc && !stopped) rc = read_summary(&r, &sum, e);
         /* the file applied is the one checked: the same summary (a file replaced meanwhile is refused) */
-        if (!rc && (sum.parts != in[i].parts || sum.last_seq != in[i].last_seq || sum.seed_seq != in[i].seed_seq ||
+        if (!rc && !stopped && (sum.parts != in[i].parts || sum.last_seq != in[i].last_seq || sum.seed_seq != in[i].seed_seq ||
                     sum.chunks != in[i].chunks || memcmp(sum.last_hash, in[i].last_hash, 32) != 0))
             rc = imdb_fail(e, IMDB_ERR_STATE, "restore: %s changed while it was restored", files[i]);
         reader_close(&r);
     }
     const imdb_backup_info *last = &in[nfiles - 1];
-    if (!rc && (db->seq != last->last_seq || (last->last_seq && memcmp(db->head, last->last_hash, 32) != 0)))
+    if (!rc && (until || until_t)) { /* point-in-time: the asked commit, or the last at or before the asked time */
+        if (until && db->seq != until)
+            rc = imdb_fail(e, IMDB_ERR_INVALID, "restore: the copy ends at commit %llu, not the asked %llu",
+                           (unsigned long long)db->seq, (unsigned long long)until);
+        else if (!until && (db->seq == 0 || db->last_time > until_t))
+            rc = imdb_fail(e, IMDB_ERR_INVALID, "restore: no commit at or before the asked time in these backups (the "
+                           "copy would begin at commit %llu)", (unsigned long long)db->seq);
+    } else if (!rc && (db->seq != last->last_seq || (last->last_seq && memcmp(db->head, last->last_hash, 32) != 0)))
         rc = imdb_fail(e, IMDB_ERR_VERIFY, "restore: the copy ends at commit %llu, its backup at %llu",
                        (unsigned long long)db->seq, (unsigned long long)last->last_seq);
+    uint64_t db_seq = db ? db->seq : 0; /* where the copy ends, for info: the asked point, or the backups' last */
+    uint8_t db_head[32] = {0};
+    if (db) memcpy(db_head, db->head, 32);
     if (db && imdb_close(db) && !rc) rc = imdb_fail(e, IMDB_ERR_IO, "restore: the copy could not be made durable");
     if (!rc && imdb_io_renameat(dfd, tname, dfd, base) != 0)
         rc = imdb_fail(e, IMDB_ERR_IO, "restore: rename %s to %s: %s", tmp, dest, strerror(errno));
@@ -752,8 +773,152 @@ int imdb_restore(const char *dest, const uint8_t key[IMDB_BACKUP_KEY_LEN], const
         }
     }
     if (dfd >= 0) close(dfd);
-    if (!rc) *info = *last;
+    if (!rc) {
+        *info = *last;
+        info->last_seq = db_seq;
+        memcpy(info->last_hash, db_head, 32);
+    }
     imdb_free(in);
+    return rc;
+}
+
+int imdb_restore(const char *dest, const uint8_t key[IMDB_BACKUP_KEY_LEN], const char *const *files, size_t nfiles,
+                 imdb_backup_info *info, imdb_err *e)
+{
+    return imdb_restore_ex(dest, key, files, nfiles, NULL, info, e);
+}
+
+/* ---- incremental backups (P0 backup slice 2) ------------------------------------------------------------------- */
+
+/* The sink an incremental's stream passes through: the first frame's bytes are kept, so the backup can check that it
+ * continues the previous backup's history (its sequence, and its link to the commit before it) before the file is
+ * named; the restore would refuse a gap or another history later, the backup says so now */
+typedef struct link_sink {
+    imdb_sink next;
+    uint8_t head[IMDB_FRAME_HDR + IMDB_BODY_DESC + IMDB_BODY_EXT + 64];
+    size_t have;
+} link_sink;
+
+static int link_write(void *ctx, const void *p, size_t n, imdb_err *e)
+{
+    link_sink *l = ctx;
+    if (l->have < sizeof l->head) {
+        size_t take = n < sizeof l->head - l->have ? n : sizeof l->head - l->have;
+        memcpy(l->head + l->have, p, take);
+        l->have += take;
+    }
+    return l->next.write(l->next.ctx, p, n, e);
+}
+
+/* the first frame's commit and the hash it names as the one before it (the header: version, algorithm, seq, time,
+ * prev), when the kept bytes hold them */
+static bool link_of(const link_sink *l, uint64_t *seq, const uint8_t **prev)
+{
+    if (l->have < IMDB_FRAME_HDR + IMDB_BODY_DESC || imdb_get_le32(l->head) != IMDB_FRAME_MAGIC) return false;
+    size_t at = IMDB_FRAME_HDR + imdb_body_desc_len(l->head + IMDB_FRAME_HDR) + 18;
+    if (l->have < at + 32) return false;
+    *seq = imdb_frame_seq(l->head);
+    *prev = l->head + at;
+    return true;
+}
+
+static int write_incremental(int fd, const char *src, const uint8_t key[IMDB_BACKUP_KEY_LEN], imdb_backup_info *info,
+                             imdb_err *e)
+{
+    bk_writer w;
+    memset(&w, 0, sizeof w);
+    w.fd = fd;
+    w.key = key;
+    int rc = IMDB_OK;
+    if (!(w.plain = imdb_alloc(IMDB_BACKUP_CHUNK, e)) ||
+        !(w.sealed = imdb_alloc(IMDB_BACKUP_CHUNK_HDR + IMDB_BACKUP_CHUNK + IMDB_BACKUP_TAG, e)))
+        rc = e->code;
+    uint8_t pro[IMDB_BACKUP_PROLOGUE], key_id[32];
+    if (!rc) rc = imdb_random(w.prefix, sizeof w.prefix, e);
+    if (!rc) {
+        imdb_backup_key_id(key, key_id);
+        prologue_encode(pro, info, w.prefix, key_id);
+        imdb_sha256(pro, sizeof pro, w.ph);
+        rc = imdb_write_all(fd, pro, sizeof pro, e);
+    }
+    link_sink l;
+    memset(&l, 0, sizeof l);
+    l.next = (imdb_sink){bk_write, &w};
+    imdb_sink sink = {link_write, &l};
+    imdb_ship_result r;
+    memset(&r, 0, sizeof r);
+    if (!rc) rc = imdb_ship_to(src, info->prev_seq, &sink, NULL, &r, e);
+    uint64_t fseq = 0;
+    const uint8_t *fprev = NULL;
+    if ((rc && r.cut) || (!rc && r.seeded)) {
+        imdb_err_clear(e);
+        rc = imdb_fail(e, IMDB_ERR_STATE, "backup: the source's log no longer holds commit %llu (retired): take a full backup",
+                       (unsigned long long)(info->prev_seq + 1));
+    } else if (!rc && !r.last_seq) {
+        rc = imdb_fail(e, IMDB_ERR_STATE, "backup: nothing was committed after the previous backup's commit %llu: no "
+                       "backup written", (unsigned long long)info->prev_seq);
+    } else if (!rc && (!link_of(&l, &fseq, &fprev) || fseq != info->prev_seq + 1 || memcmp(fprev, info->prev_hash, 32) != 0)) {
+        rc = imdb_fail(e, IMDB_ERR_STATE, "backup: the source's commit %llu is not the previous backup's (another history)",
+                       (unsigned long long)info->prev_seq);
+    }
+    if (!rc) rc = end_part(&w, e);
+    if (!rc) {
+        info->parts = w.parts;
+        info->first_seq = info->prev_seq + 1;
+        info->last_seq = r.last_seq;
+        memcpy(info->last_hash, r.last_hash, 32);
+        info->chunks = w.index;
+        info->payload_bytes = w.payload;
+        summary_encode(w.plain, info);
+        w.have = IMDB_BACKUP_SUMMARY;
+        rc = seal(&w, IMDB_BACKUP_SUMMARY, IMDB_BACKUP_END_FILE, e);
+    }
+    writer_free(&w);
+    return rc;
+}
+
+int imdb_backup_incremental(const char *src, const char *prev, const char *out, const uint8_t key[IMDB_BACKUP_KEY_LEN],
+                            imdb_backup_info *info, imdb_err *e)
+{
+    memset(info, 0, sizeof *info);
+    imdb_backup_info pi;
+    if (imdb_backup_check(prev, key, &pi, e)) return e->code;
+    if (!pi.last_seq) return imdb_fail(e, IMDB_ERR_STATE, "backup: %s holds no commit: take a full backup", prev);
+    imdb_identity id;
+    bool replica = false;
+    if (imdb_identity_read(src, &id, &replica, e)) return e->code;
+    if (!same_identity(&id, &pi.id)) return imdb_fail(e, IMDB_ERR_INVALID, "backup: %s is a backup of another database", prev);
+    const char *base;
+    int dfd = imdb_open_parent(out, &base, e);
+    if (dfd < 0) return e->code;
+    char tmp[IMDB_MAX_NAME + 1];
+    int rc = IMDB_OK;
+    struct stat st;
+    if (strlen(base) + 4 > IMDB_MAX_NAME) rc = imdb_fail(e, IMDB_ERR_INVALID, "backup: the file name is too long");
+    else snprintf(tmp, sizeof tmp, "%s.tmp", base);
+    if (!rc && imdb_io_fstatat(dfd, base, &st, AT_SYMLINK_NOFOLLOW) == 0)
+        rc = imdb_fail(e, IMDB_ERR_STATE, "backup: %s exists", out);
+    int fd = -1;
+    if (!rc && (fd = imdb_io_openat(dfd, tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600)) < 0)
+        rc = errno == EEXIST ? imdb_fail(e, IMDB_ERR_STATE, "backup: %s.tmp exists (an interrupted backup's): remove it", out)
+                             : imdb_fail(e, IMDB_ERR_IO, "backup: create %s.tmp: %s", out, strerror(errno));
+    if (!rc) {
+        info->id = id;
+        info->incremental = true;
+        info->prev_seq = pi.last_seq;
+        memcpy(info->prev_hash, pi.last_hash, 32);
+        rc = write_incremental(fd, src, key, info, e);
+        /* the whole file durable before its name says it is complete */
+        if (!rc && imdb_io_fsync(fd) != 0) rc = imdb_fail(e, IMDB_ERR_IO, "backup: fsync %s.tmp: %s", out, strerror(errno));
+        close(fd);
+        if (rc) (void)imdb_io_unlinkat(dfd, tmp, 0); /* this attempt's own file (a crash leaves it: refused next time) */
+        if (!rc && imdb_io_renameat(dfd, tmp, dfd, base) != 0) {
+            rc = imdb_fail(e, IMDB_ERR_IO, "backup: rename to %s: %s", out, strerror(errno));
+            (void)imdb_io_unlinkat(dfd, tmp, 0);
+        }
+        if (!rc) rc = imdb_sync_dir(dfd, e);
+    }
+    close(dfd);
     return rc;
 }
 
