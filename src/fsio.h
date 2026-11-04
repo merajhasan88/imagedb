@@ -27,6 +27,8 @@ ssize_t imdb_io_pread(int fd, void *p, size_t n, off_t off);
 ssize_t imdb_io_write(int fd, const void *p, size_t n);
 ssize_t imdb_io_pwrite(int fd, const void *p, size_t n, off_t off);
 int imdb_io_fsync(int fd);
+/* P1 M1: a copy of the process's sync counts and latencies (every imdb_io_fsync and imdb_io_fdatasync) */
+void imdb_io_sync_stats(imdb_hist *out);
 int imdb_io_fdatasync(int fd);
 int imdb_io_ftruncate(int fd, off_t len);
 int imdb_io_renameat(int olddirfd, const char *oldname, int newdirfd, const char *newname);

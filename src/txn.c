@@ -46,6 +46,7 @@ static void unlink_txn(imdb_db *db, imdb_txn *x)
 void imdb_txn_begin(imdb_db *db, imdb_txn *x, uint8_t iso)
 {
     memset(x, 0, sizeof *x);
+    x->begin_ns = x->last_ns = imdb_mono_ns(); /* SHOW TRANSACTIONS' ages, the C API's too (R4 restamps at BEGIN) */
     x->open = true;
     x->iso = iso;
     x->next = db->txns;
@@ -224,6 +225,7 @@ static void close_txn(imdb_db *db, imdb_txn *x)
 void imdb_txn_rollback(imdb_db *db, imdb_txn *x)
 {
     if (!x->open) return;
+    db->stats.rollbacks++; /* P1 M1: ROLLBACK, a doomed or expired COMMIT, a session closed with it open */
     if (db->active == x) {
         imdb_rollback(db);
         db->active = NULL;

@@ -353,6 +353,36 @@ rewrite, the lake publication and the GC have all finished. It cannot reach
 backups, exported results, disconnected replicas, freed device blocks or what
 a client holds.
 
+## Monitoring
+
+`SHOW STATS` gives what a copy has done since its open, one `name value` row each,
+always the same rows: statements by class (read, write, transaction, ddl,
+physical, show, other) with their p50, p99 and largest latency in
+microseconds; failures by kind (conflict, limit, cancelled, other); commits
+and their latency (a replica's applied commits apart: `commits.applied`),
+rollbacks, the log's bytes; the segment cache's hits and
+loads; each CHECKPOINT, COMPACT, EXPIRE, RETIRE and eviction's count and time;
+the open's time and the commits it replayed; the open transactions and the
+oldest's age; the bytes on disk of the log and the lake; the running
+statement and how long it has run. Syncs (`process.syncs.*`) are the process's,
+every database it opened. Latencies are read from buckets four to an octave:
+a quantile is at most a quarter above the true one. `SHOW TRANSACTIONS` lists
+every open transaction: its state (active, parked, doomed, begun), isolation,
+age, time since its last statement, writes and locks.
+
+`--stats FILE` (on `sql`, `apply` and `follow`) has the copy write the same rows
+to FILE, outside the data directory, with its pid, time, commit and whether its
+handle failed, at most once a second (a replica's apply too) and at its close,
+and at once when its handle fails: rewritten in place,
+never synced, a CRC on its last line; a FILE that is not an export is left as
+it is (the copy keeps no export and says why). `imagedb stats FILE` prints it with its
+age. `imagedb health DIR [--stats FILE] [--max-statement-s N]` checks the
+directory without opening it (META, DURABLE, no replica incident recorded) and
+the export: exit 0 healthy, 1 a statement running past N seconds (60) or an
+unreadable export, 2 the handle failed (reopen it), 3 the directory damaged or
+a replica incident recorded. An idle copy writes no export until its next
+statement: an old export with nothing running is idle, not hung.
+
 ## Supported scope
 
 One process and principal, one engine thread with worker parallelism, many

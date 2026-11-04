@@ -1892,9 +1892,11 @@ static int physical_commit_body(imdb_db *db, uint8_t kind, uint32_t table, uint6
 /* one operation (stage 3c-1): the segment cache trims when the outermost ends */
 static int physical_commit(imdb_db *db, uint8_t kind, uint32_t table, uint64_t purge_before, imdb_err *e)
 {
+    uint64_t t0 = imdb_mono_ns(); /* P1 M1: each kind's count and time, done or refused alike */
     imdb_op_enter(db);
     int rc = physical_commit_body(db, kind, table, purge_before, e);
     imdb_op_leave(db);
+    imdb_stats_maint(db, kind == IMDB_OP_CHECKPOINT ? IMDB_MT_CHECKPOINT : kind == IMDB_OP_COMPACT ? IMDB_MT_COMPACT : IMDB_MT_RETIRE, t0);
     return rc;
 }
 
@@ -2282,6 +2284,7 @@ imdb_segimg *imdb_seg_pin_slow(const imdb_table *t, imdb_segment *g, imdb_err *e
     imdb_segimg *gi = __atomic_load_n(&g->img_, __ATOMIC_ACQUIRE);
     imdb_segcache *c = t ? t->segcache : NULL;
     if (gi) {
+        if (c) __atomic_fetch_add(&c->db->stats.seg_hits, 1, __ATOMIC_RELAXED); /* P1 M1: an operation's first pin, resident */
         if (c && __atomic_load_n(&g->touched, __ATOMIC_RELAXED) != c->clock) /* the clock moves between operations */
             __atomic_store_n(&g->touched, c->clock, __ATOMIC_RELAXED);
         return gi;

@@ -1,6 +1,7 @@
 /* imagedb command-line tool. */
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -52,6 +53,8 @@ static int usage(void)
           "                                             allowlist a replica's key for acknowledgements\n"
           "  imagedb verify <dir> [--anchor FILE]       re-verify log, chain, signatures, digests, erasure, lake\n"
           "  imagedb info <dir>                         head, digest, tables, lake\n"
+          "  imagedb stats <file>                       a running copy's export (--stats FILE on sql, apply, follow)\n"
+          "  imagedb health <dir> [--stats FILE] [--max-statement-s N]   0 healthy; 1 slow or unreadable; 2 failed; 3 damaged\n"
           "  imagedb recover <dir> [--discard-tail --save FILE]\n"
           "                                             inspect a damaged end of the log; with --discard-tail, cut it\n"
           "                                             (its bytes saved to FILE first) and lower DURABLE to match\n"
@@ -85,6 +88,7 @@ static void print_err(const char *what, const imdb_err *e)
 static uint64_t g_mem_limit; /* --mem-limit (db.h: the memory budget), for the command's open */
 static uint64_t g_mem_window; /* --mem-window (db.h: the memory window, stage 3b; 0: the default) */
 static uint64_t g_seg_cache; /* --seg-cache (db.h: the segment cache, stage 3c-1; 0: the default) */
+static const char *g_stats_path; /* --stats FILE (P1 M1: the stats export), for the command's open */
 
 /* SECONDS: decimal digits, no leading zero, at most a century; or none: no version leaves memory */
 static bool parse_window(const char *s, uint64_t *out)
@@ -136,7 +140,7 @@ static imdb_db *open_anchored(const char *dir, bool ro, int sync, const char *an
 {
     imdb_open_opts o = {.sync = sync, .read_only = ro, .anchor = anchor, .accept_rollback = accept_rollback,
                         .durable_ack = durable_ack, .mem_limit = g_mem_limit, .mem_window_us = g_mem_window,
-                        .seg_cache_bytes = g_seg_cache};
+                        .seg_cache_bytes = g_seg_cache, .stats_path = g_stats_path};
     imdb_db *db;
     imdb_err e = {0};
     if (imdb_open(dir, &o, &db, &e)) {
@@ -332,6 +336,7 @@ static int cmd_sql(int argc, char **argv)
         else if (strcmp(argv[i], "--nosync") == 0) sync = 0;
         else if (strcmp(argv[i], "--lake-sync") == 0) lake_sync = true;
         else if (strcmp(argv[i], "--anchor") == 0 && i + 1 < argc) anchor = argv[++i];
+        else if (strcmp(argv[i], "--stats") == 0 && i + 1 < argc) g_stats_path = argv[++i];
         else if (strcmp(argv[i], "--accept-rollback") == 0) accept_rollback = true;
         else if (strcmp(argv[i], "--durable-ack") == 0) durable_ack = true;
         else if (strcmp(argv[i], "--mem-limit") == 0 && i + 1 < argc) {
@@ -492,9 +497,13 @@ static int cmd_follow(int argc, char **argv)
     int dd = 3; /* where "--" is, past the options */
     while (dd + 1 < argc && strcmp(argv[dd], "--") != 0) {
         if (strcmp(argv[dd], "--mem-limit") == 0 && parse_size(argv[dd + 1], &g_mem_limit)) dd += 2;
+        else if (strcmp(argv[dd], "--stats") == 0) {
+            g_stats_path = argv[dd + 1];
+            dd += 2;
+        }
         else if (strcmp(argv[dd], "--mem-window") == 0 && parse_window(argv[dd + 1], &g_mem_window)) dd += 2;
         else if (strcmp(argv[dd], "--seg-cache") == 0 && parse_seg_cache(argv[dd + 1], &g_seg_cache)) dd += 2;
-        else if (strcmp(argv[dd], "--mem-limit") != 0 && strcmp(argv[dd], "--mem-window") != 0 &&
+        else if (strcmp(argv[dd], "--mem-limit") != 0 && strcmp(argv[dd], "--mem-window") != 0 && strcmp(argv[dd], "--stats") != 0 &&
                  strcmp(argv[dd], "--seg-cache") != 0)
             return usage();
         else {
@@ -644,6 +653,114 @@ static void print_info(imdb_db *db)
     const imdb_kernels *k = imdb_kern();
     printf("kernels    crc32c=%s lthash=%s expand=%s expand2=%s sha256x8=%s utf8=%s filter=%s sum=%s\n", k->crc32c_name,
            k->lthash_name, k->expand_name, k->expand2_name, k->sha8_name, k->utf8_name, k->filter_name, k->sum_name);
+}
+
+static uint64_t wall_us(void) /* the export's age: its time_us against this clock */
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
+/* P1 M1: the stats export (--stats FILE) read whole and checked by its CRC32C, the copy a writer was rewriting read
+ * again (it is rewritten in place, never fsynced): 0, or 1 torn or malformed, 2 missing */
+static int read_stats(const char *path, char *buf, size_t cap, size_t *len)
+{
+    for (int attempt = 0; attempt < 5; attempt++) {
+        if (attempt) {
+            struct timespec ts = {0, 20 * 1000000L};
+            nanosleep(&ts, NULL);
+        }
+        imdb_err e = {0};
+        const char *base = NULL;
+        int pfd = imdb_open_parent(path, &base, &e);
+        int fd = pfd < 0 ? -1 : openat(pfd, base, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        int err = errno;
+        if (pfd >= 0) close(pfd);
+        if (fd < 0) return err == ENOENT ? 2 : 1;
+        ssize_t n = read(fd, buf, cap - 1);
+        close(fd);
+        if (n <= 0) continue;
+        buf[n] = 0;
+        char *last = n >= 2 ? memrchr(buf, '\n', (size_t)n - 1) : NULL; /* the CRC line is the last */
+        size_t body = last ? (size_t)(last + 1 - buf) : 0;
+        unsigned crc;
+        if (last && sscanf(last + 1, "crc32c %8x\n", &crc) == 1 && imdb_kern()->crc32c(0, buf, body) == crc &&
+            strncmp(buf, "imagedb.stats 1\n", 16) == 0) {
+            *len = body;
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* a value from read_stats' lines (INT64_MIN: absent) */
+static long long stats_value(const char *buf, const char *name)
+{
+    size_t n = strlen(name);
+    for (const char *p = buf; p && *p; p = strchr(p, '\n') ? strchr(p, '\n') + 1 : NULL)
+        if (strncmp(p, name, n) == 0 && p[n] == ' ') return strtoll(p + n + 1, NULL, 10);
+    return LLONG_MIN;
+}
+
+static char g_stats_buf[IMDB_STATS_EXPORT_MAX + 64];
+
+/* imagedb stats FILE: the export's rows, its age last */
+static int cmd_stats(const char *path)
+{
+    size_t len = 0;
+    int r = read_stats(path, g_stats_buf, sizeof g_stats_buf, &len);
+    if (r) {
+        fprintf(stderr, "imagedb: stats: %s: %s\n", path, r == 2 ? "no such file" : "torn or not an export (read 5 times)");
+        return r;
+    }
+    fwrite(g_stats_buf, 1, len, stdout);
+    long long t = stats_value(g_stats_buf, "time_us");
+    unsigned long long now = wall_us();
+    printf("age.s %lld\n", t > 0 && now > (unsigned long long)t ? (long long)((now - (unsigned long long)t) / 1000000u) : 0);
+    return 0;
+}
+
+/* imagedb health DIR [--stats FILE] [--max-statement-s N]: 0 healthy; 1 a statement running longer than N seconds (60)
+ * or the export unreadable; 2 the writer's handle failed (reopen it); 3 the directory damaged or unreadable, or a
+ * replica incident recorded. Cheap: no open, no replay (META, DURABLE, replicas/; then the export) */
+static int cmd_health(int argc, char **argv)
+{
+    const char *stats = NULL;
+    long long max_s = 60;
+    for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "--stats") == 0 && i + 1 < argc) stats = argv[++i];
+        else if (strcmp(argv[i], "--max-statement-s") == 0 && i + 1 < argc) max_s = atoll(argv[++i]);
+        else return usage();
+    }
+    imdb_err e = {0};
+    if (imdb_health_dir(argv[2], &e)) {
+        printf("unhealthy: %s\n", e.msg);
+        return 3;
+    }
+    if (!stats) {
+        printf("healthy: META, DURABLE and replicas/ checked (no export given)\n");
+        return 0;
+    }
+    size_t len = 0;
+    int r = read_stats(stats, g_stats_buf, sizeof g_stats_buf, &len);
+    if (r) {
+        printf("unknown: the export %s is %s\n", stats, r == 2 ? "missing" : "torn or not an export");
+        return 1;
+    }
+    long long t = stats_value(g_stats_buf, "time_us"), now = (long long)wall_us();
+    long long age = t > 0 && now > t ? (now - t) / 1000000 : 0;
+    if (stats_value(g_stats_buf, "failed") == 1) {
+        printf("failed: the writer's handle stopped (reopen it; the export is %lld s old)\n", age);
+        return 2;
+    }
+    long long run = stats_value(g_stats_buf, "statement.running_ms");
+    if (stats_value(g_stats_buf, "statement.running") == 1 && run / 1000 + age > max_s) {
+        printf("slow: a statement has run %lld s (more than %lld)\n", run / 1000 + age, max_s);
+        return 1;
+    }
+    printf("healthy: the export is %lld s old, commit %lld\n", age, stats_value(g_stats_buf, "commit"));
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -951,6 +1068,7 @@ int main(int argc, char **argv)
         for (int i = 3; i < argc; i++) {
             if (strcmp(argv[i], "--durable-ack") == 0) durable_ack = true;
             else if (strcmp(argv[i], "--mem-limit") == 0 && i + 1 < argc && parse_size(argv[i + 1], &g_mem_limit)) i++;
+            else if (strcmp(argv[i], "--stats") == 0 && i + 1 < argc) g_stats_path = argv[++i];
             else if (strcmp(argv[i], "--mem-window") == 0 && i + 1 < argc && parse_window(argv[i + 1], &g_mem_window)) i++;
             else if (strcmp(argv[i], "--seg-cache") == 0 && i + 1 < argc && parse_seg_cache(argv[i + 1], &g_seg_cache)) i++;
             else return usage();
@@ -1040,6 +1158,8 @@ int main(int argc, char **argv)
                "  imagedb recover %s --discard-tail --save FILE\n", argv[2]);
         return 1;
     }
+    if (strcmp(cmd, "stats") == 0 && argc == 3) return cmd_stats(argv[2]); /* P1 M1 */
+    if (strcmp(cmd, "health") == 0 && argc >= 3) return cmd_health(argc, argv);
     if (strcmp(cmd, "info") == 0 && argc == 3) {
         imdb_db *db = open_or_die(argv[2], true, 0);
         if (!db) return 1;

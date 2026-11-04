@@ -5,6 +5,7 @@
 
 #include "cpu.h"
 #include "db_internal.h"
+#include "fsio.h"
 #include "fsum.h"
 #include "lake.h"
 #include "oidx.h"
@@ -157,6 +158,7 @@ static uint64_t mono_ns(void)
 static int xcheck(xctx *x, imdb_err *e)
 {
     x->next_check = x->ticks + TICK_ROWS;
+    imdb_stats_tick(x->db, false); /* P1 M1: a long statement still reports (at most once a second) */
     if (!x->checks) return IMDB_OK;
     if (atomic_load_explicit(&x->ss->cancel, memory_order_relaxed))
         return imdb_fail(e, IMDB_ERR_CANCELLED, "statement cancelled");
@@ -3339,6 +3341,21 @@ static void retention_text(uint64_t us, char *out, size_t n)
     snprintf(out, n, "%llu MICROSECONDS", (unsigned long long)us); /* the C API takes any count above a second */
 }
 
+typedef struct stat_rows {
+    imdb_result *r;
+    imdb_err *e;
+} stat_rows;
+
+static int stat_row(void *ctx, const char *name, int64_t v) /* SHOW STATS: a row of imdb_stats_each's */
+{
+    stat_rows *s = ctx;
+    imdb_cell *row = res_row(s->r, s->e);
+    if (!row) return s->e->code;
+    res_put_str(s->r, &row[0], name);
+    res_put_int(s->r, &row[1], v);
+    return 0;
+}
+
 static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
 {
     imdb_db *db = x->db;
@@ -3437,6 +3454,38 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
         res_put_str(r, &row[5], db->lake_seq ? h : "");
         imdb_hex(tok, 32, h);
         res_put_str(r, &row[6], h);
+        return res_finish(r, e);
+    }
+    if (st->kind == ST_SHOW_STATS) { /* P1 M1: what this copy has done since its open: imdb_stats_each's rows (db.c) */
+        res_cols(r, 2);
+        res_name(r, 0, "name");
+        res_name(r, 1, "value");
+        stat_rows sr = {r, e};
+        int rc = imdb_stats_each(db, stat_row, &sr, true);
+        if (rc) return rc;
+        snprintf(r->status, sizeof r->status, "since the open; process.* counts every database this process opened");
+        return res_finish(r, e);
+    }
+    if (st->kind == ST_SHOW_TRANSACTIONS) { /* P1 M1: this copy's open transactions, every session's (db->txns) */
+        uint64_t now = mono_ns();
+        uint32_t n = 0;
+        static const char *const names[7] = {"state", "isolation", "age_ms", "idle_ms", "writes", "locks", "mine"};
+        res_cols(r, 7);
+        for (int i = 0; i < 7; i++) res_name(r, i, names[i]);
+        for (const imdb_txn *t = db->txns; t; t = t->next) {
+            if (!t->open) continue;
+            imdb_cell *row = res_row(r, e);
+            if (!row) return e->code;
+            n++;
+            res_put_str(r, &row[0], t->doomed ? "doomed" : db->active == t ? "active" : t->started ? "parked" : "begun");
+            res_put_str(r, &row[1], t->iso == IMDB_ISO_READ_COMMITTED ? "read committed" : "snapshot");
+            res_put_int(r, &row[2], (int64_t)((now - t->begin_ns) / 1000000u));
+            res_put_int(r, &row[3], (int64_t)((now - t->last_ns) / 1000000u));
+            res_put_int(r, &row[4], (int64_t)(db->active == t ? db->ntx : t->nops));
+            res_put_int(r, &row[5], (int64_t)t->nlocks);
+            res_put_int(r, &row[6], t == &x->ss->txn ? 1 : 0);
+        }
+        snprintf(r->status, sizeof r->status, "%u open", n);
         return res_finish(r, e);
     }
     if (st->kind == ST_SHOW_MEMORY) { /* what the database holds, by kind, against its budget (db.h) */
@@ -3853,6 +3902,24 @@ static bool is_write(uint8_t k)
 
 /* A read statement's workspace (P0 R2): what SET statement_memory says, else a quarter of the memory budget, at most
  * IMDB_MAX_RESULT_BYTES (the result cap before R2, which this replaces: the result is part of the workspace) */
+/* P1 M1: a statement's class in SHOW STATS */
+static int stmt_class(int kind)
+{
+    switch (kind) {
+    case ST_SELECT: return IMDB_SC_READ;
+    case ST_INSERT: case ST_UPDATE: case ST_DELETE: return IMDB_SC_WRITE;
+    case ST_BEGIN: case ST_COMMIT: case ST_ROLLBACK: case ST_SAVEPOINT: case ST_ROLLBACK_TO: case ST_RELEASE:
+    case ST_SET_TXN: return IMDB_SC_TXN;
+    case ST_CREATE: case ST_CREATE_INDEX: case ST_DROP_INDEX: case ST_DROP_TABLE: case ST_ALTER_RETENTION:
+        return IMDB_SC_DDL;
+    case ST_CHECKPOINT: case ST_COMPACT: case ST_ERASE_SUBJECT: case ST_ERASE_WHERE: case ST_VERIFY: return IMDB_SC_PHYSICAL;
+    case ST_SHOW_TABLES: case ST_SHOW_DIGEST: case ST_SHOW_HISTORY: case ST_SHOW_LOG: case ST_SHOW_LAKE:
+    case ST_SHOW_IDENTITY: case ST_SHOW_REPLICAS: case ST_SHOW_REPLICATION: case ST_SHOW_ERASURE: case ST_SHOW_MEMORY:
+    case ST_SHOW_INDEXES: case ST_SHOW_RETENTION: case ST_SHOW_STATS: case ST_SHOW_TRANSACTIONS: return IMDB_SC_SHOW;
+    default: return IMDB_SC_OTHER;
+    }
+}
+
 static uint64_t workspace_of(const imdb_session *ss)
 {
     if (ss->stmt_memory) return ss->stmt_memory;
@@ -3883,6 +3950,7 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
         /* in-memory state may be half-installed: no answers until reopen + replay */
         imdb_sql_stmt_free(st);
         imdb_free(st);
+        imdb_stats_tick(db, !db->stats_said_failed); /* P1 M1: a monitor learns the handle failed */
         return imdb_fail(e, IMDB_ERR_STATE, "database is in a failed state; reopen it to recover");
     }
     if ((db->pending_auth || db->lake_unverified) && st->kind != ST_VERIFY) {
@@ -3919,6 +3987,8 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
         }
     }
     imdb_txn_timeouts(db, now_ns, &ss->txn);
+    db->stmt_start_ns = now_ns; /* P1 M1: long-running work, as the export shows it */
+    imdb_stats_tick(db, false);
     imdb_savepoint sp = {0, 0};
     bool physical = st->kind == ST_CHECKPOINT || st->kind == ST_COMPACT || st->kind == ST_ERASE_SUBJECT ||
                     st->kind == ST_ERASE_WHERE || st->kind == ST_VERIFY;
@@ -3969,7 +4039,8 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
                                            st->kind == ST_SHOW_IDENTITY || st->kind == ST_SHOW_REPLICAS ||
                                            st->kind == ST_SHOW_REPLICATION || st->kind == ST_SHOW_ERASURE ||
                                            st->kind == ST_SHOW_MEMORY || st->kind == ST_SHOW_INDEXES ||
-                                           st->kind == ST_SHOW_RETENTION);
+                                           st->kind == ST_SHOW_RETENTION || st->kind == ST_SHOW_STATS ||
+                                           st->kind == ST_SHOW_TRANSACTIONS);
     if (ceiling) imdb_heap_ceiling_set(imdb_heap_bytes() + workspace_of(ss), workspace_of(ss));
     switch (st->kind) {
     case ST_EMPTY: break;
@@ -4156,7 +4227,9 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
     case ST_SHOW_REPLICAS:
     case ST_SHOW_REPLICATION:
     case ST_SHOW_ERASURE:
-    case ST_SHOW_MEMORY: rc = exec_show(&x, st, r, e); break;
+    case ST_SHOW_MEMORY:
+    case ST_SHOW_STATS:
+    case ST_SHOW_TRANSACTIONS: rc = exec_show(&x, st, r, e); break;
     case ST_SET:
         if (strcmp(st->set_name, "cross_check") == 0) {
             if (strcmp(st->set_value, "on") == 0 || strcmp(st->set_value, "1") == 0 || strcmp(st->set_value, "true") == 0) ss->cross_check = true;
@@ -4274,9 +4347,22 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
         }
     }
 done:
+    { /* P1 M1: the statement's class, time and outcome (from the point it starts to run) */
+        int k = stmt_class(st->kind);
+        db->stats.stmts[k]++;
+        imdb_hist_add(&db->stats.stmt_lat[k], (mono_ns() - now_ns) / 1000u);
+        if (rc)
+            db->stats.fails[rc == IMDB_ERR_CONFLICT ? IMDB_SF_CONFLICT : rc == IMDB_ERR_LIMIT ? IMDB_SF_LIMIT
+                            : rc == IMDB_ERR_CANCELLED ? IMDB_SF_CANCELLED : IMDB_SF_OTHER]++;
+    }
     ss->rows_tested = x.tested; /* D8 #4: the first plan's count, for the caller and the tests */
     if (ss->txn.open) ss->txn.last_ns = mono_ns(); /* R4: idle from here */
     if (ceiling) imdb_heap_ceiling_set(0, 0);
+    /* P1 M1: the end is exported at once when an export during the statement said it runs (else an idle copy would
+     * show it running until its next statement), or when the handle failed and no export has said so yet */
+    bool said_running = db->stmt_start_ns && db->stats_last_ns >= db->stmt_start_ns;
+    db->stmt_start_ns = 0;
+    imdb_stats_tick(db, said_running || (db->failed && !db->stats_said_failed));
     if (rc) imdb_result_free(r);
     xfree(&x);
     imdb_sql_stmt_free(st);

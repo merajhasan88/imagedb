@@ -2603,6 +2603,7 @@ void imdb_index_after_retire(imdb_db *db, imdb_table *t)
 int imdb_evict(imdb_db *db, uint64_t floor, imdb_err *e)
 {
     if (floor <= db->mem_floor || db->in_txn || db->active || db->failed) return IMDB_OK;
+    uint64_t t0 = imdb_mono_ns(); /* P1 M1: a pass that moves the floor */
     int rc = IMDB_OK;
     for (uint32_t i = 0; i < db->nt; i++) {
         imdb_err e2 = {0};
@@ -2612,6 +2613,7 @@ int imdb_evict(imdb_db *db, uint64_t floor, imdb_err *e)
     db->mem_floor = floor;
     imdb_ci_retire(db, floor); /* the commit index too: an older commit is read from its segment (imdb_ci_at) */
     db->ended_pass = 0;
+    imdb_stats_maint(db, IMDB_MT_EVICT, t0);
     return rc;
 }
 
@@ -3565,6 +3567,7 @@ int imdb_log_append(imdb_db *db, const uint8_t *frame, size_t len, imdb_err *e)
     int rc = db->log_tagged ? log_put_tagged(db, frame, len, e) : log_put_untagged(db, frame, len, e);
     if (rc) return rc;
     db->log_size += len;
+    db->stats.log_bytes += len; /* P1 M1 */
     if (!db->sync && !db->unsynced_from) db->unsynced_from = imdb_frame_seq(frame);
     /* the watermark moves only now: a shipper never sees a frame that could still be truncated */
     imdb_err e2 = {0};
@@ -3674,6 +3677,7 @@ static void expire(imdb_db *db)
         due = t->retention_us != IMDB_RETAIN_FOREVER && expiry_point(db, now, t->retention_us, db->seq) > t->horizon;
     }
     if (!due) return;
+    uint64_t t0 = imdb_mono_ns(); /* P1 M1: a pass that expires something, its commit included */
     imdb_err e2 = {0};
     int rc = imdb_begin(db, &e2);
     for (uint32_t i = 0; i < db->nt && !rc; i++) { /* by table: one op each */
@@ -3687,6 +3691,7 @@ static void expire(imdb_db *db)
         rc = imdb_commit(db, &e2);
     }
     if (rc) snprintf(db->warning, sizeof db->warning, "automatic expiry failed (%s)", e2.msg);
+    imdb_stats_maint(db, IMDB_MT_EXPIRE, t0);
 }
 
 /* Retirement (primary only, between transactions, after expiry): the boundary is the lowest horizon less one,
@@ -4052,8 +4057,13 @@ out:
 /* one operation (stage 3c-1): the segment cache trims when the outermost ends */
 int imdb_commit(imdb_db *db, imdb_err *e)
 {
+    uint64_t t0 = imdb_mono_ns();
     imdb_op_enter(db);
     int rc = commit_body(db, e);
+    if (!rc) { /* P1 M1 */
+        db->stats.commits++;
+        imdb_hist_add(&db->stats.commit_lat, (imdb_mono_ns() - t0) / 1000u);
+    }
     imdb_op_leave(db);
     return rc;
 }
@@ -4098,6 +4108,11 @@ void imdb_reset_state(imdb_db *db)
 int imdb_close(imdb_db *db)
 {
     if (!db) return IMDB_OK;
+    if (db->stats_fd >= 0) { /* P1 M1: the export's last word, then its file closed */
+        imdb_stats_tick(db, true);
+        close(db->stats_fd);
+        db->stats_fd = -1;
+    }
     int rc = IMDB_OK;
     while (db->txns) imdb_txn_rollback(db, db->txns); /* sessions should be closed first; their writes are discarded */
     if (db->in_txn) imdb_rollback(db);
@@ -4147,6 +4162,7 @@ int imdb_close(imdb_db *db)
 
 int imdb_open(const char *path, const imdb_open_opts *o, imdb_db **out, imdb_err *e)
 {
+    uint64_t open_t0 = imdb_mono_ns(); /* P1 M1: the open's length (SHOW STATS) */
     *out = NULL;
     if (o && (o->txn_bytes > IMDB_MAX_TXN_BYTES || o->txn_ops > IMDB_MAX_OPS_PER_COMMIT ||
               o->txn_locks > IMDB_MAX_TXN_LOCKS))
@@ -4161,6 +4177,7 @@ int imdb_open(const char *path, const imdb_open_opts *o, imdb_db **out, imdb_err
         return imdb_fail(e, IMDB_ERR_NOMEM, "cannot make the segment cache's lock");
     }
     db->dirfd = db->logfd = db->lockfd = db->logdirfd = db->durfd = db->anchorfd = db->anchor_lockfd = -1;
+    db->stats_fd = -1; /* P1 M1: 0 is a file descriptor */
     db->ci_first = 1;
     db->pin_max_lag = IMDB_PIN_MAX_LAG;
     db->sync = o ? o->sync : 1;
@@ -4295,6 +4312,35 @@ int imdb_open(const char *path, const imdb_open_opts *o, imdb_db **out, imdb_err
     }
     db->segcache.streaming = false; /* the open's end: from here an image leaves only as its operation ends */
     imdb_op_leave(db);
+    db->stats.opened_us = imdb_now_us(); /* P1 M1 */
+    db->stats.open_ns = imdb_mono_ns() - open_t0;
+    db->stats.open_replayed = db->seq > db->lake_seq ? db->seq - db->lake_seq : 0; /* past its snapshot, or all */
+    if (o && o->stats_path) { /* P1 M1: the export, an operator's path (as the anchor): advisory, never the open's failure */
+        const char *base = NULL;
+        imdb_err se = {0};
+        int pfd = imdb_open_parent(o->stats_path, &base, &se);
+        db->stats_fd = pfd < 0 ? -1 : imdb_io_openat(pfd, base, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0644);
+        bool foreign = false;
+        char head[16];
+        ssize_t hn = db->stats_fd < 0 ? 0 : imdb_io_pread(db->stats_fd, head, sizeof head, 0);
+        if (hn > 0 && (hn < (ssize_t)sizeof head || memcmp(head, "imagedb.stats 1\n", sizeof head) != 0)) {
+            close(db->stats_fd); /* another file at FILE (a typo, say): never overwritten */
+            db->stats_fd = -1;
+            foreign = true;
+        }
+        if (pfd >= 0) close(pfd);
+        if (db->stats_fd < 0) {
+            db->stats_errors++;
+            if (foreign)
+                imdb_warn(db, "the stats export %s holds something else (not an export): it is left as it is, none is kept",
+                          o->stats_path);
+            else
+                imdb_warn(db, "the stats export %s cannot be written (%s): none is kept", o->stats_path,
+                          pfd < 0 ? se.msg : strerror(errno));
+        } else {
+            imdb_stats_tick(db, true);
+        }
+    }
     *out = db;
     return IMDB_OK;
 fail:
@@ -4581,4 +4627,196 @@ int imdb_mem_admit(imdb_db *db, uint64_t growth, imdb_err *e)
                      "memory budget: this write needs %llu more bytes at a growth step (%llu held, budget %llu): "
                      "nothing was written; reopen with a larger budget, or hold less (SHOW MEMORY)",
                      (unsigned long long)growth, (unsigned long long)r.total, (unsigned long long)r.limit);
+}
+
+/* ---- P1 M1: bytes on disk ---------------------------------------------------------------------------------------- */
+
+int imdb_disk_bytes(imdb_db *db, uint64_t *log, uint64_t *lake, imdb_err *e)
+{
+    static const char *const dirs[2] = {"log", "objects"};
+    uint64_t *out[2] = {log, lake};
+    for (int i = 0; i < 2; i++) {
+        *out[i] = 0;
+        int fd = imdb_io_openat(db->dirfd, dirs[i], O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (fd < 0) {
+            if (errno == ENOENT) continue;
+            return imdb_fail(e, IMDB_ERR_IO, "%s/: %s", dirs[i], strerror(errno));
+        }
+        DIR *d = imdb_io_fdopendir(fd);
+        if (!d) {
+            close(fd);
+            return imdb_fail(e, IMDB_ERR_IO, "%s/: cannot list the directory", dirs[i]);
+        }
+        for (struct dirent *de; (de = imdb_io_readdir(d));) {
+            struct stat st;
+            if (de->d_name[0] == '.') continue;
+            if (imdb_io_fstatat(fd, de->d_name, &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(st.st_mode))
+                *out[i] += (uint64_t)st.st_size;
+        }
+        closedir(d);
+    }
+    return IMDB_OK;
+}
+
+/* ---- P1 M1: the rows, the export, the directory's health ----------------------------------------------------------- */
+
+int imdb_stats_each(imdb_db *db, imdb_stat_fn fn, void *ctx, bool walk_disk)
+{
+    static const char *const cls[IMDB_SC_N] = {"read", "write", "transaction", "ddl", "physical", "show", "other"};
+    static const char *const fl[IMDB_SF_N] = {"conflict", "limit", "cancelled", "other"};
+    static const char *const mt[IMDB_MT_N] = {"checkpoint", "compact", "expire", "retire", "evict"};
+    const imdb_stats *s = &db->stats;
+    imdb_hist syncs;
+    imdb_io_sync_stats(&syncs);
+    uint64_t log_b = db->stats_log_b, lake_b = db->stats_lake_b, now = imdb_mono_ns(), wall = imdb_now_us(), oldest = 0, open = 0;
+    bool disk = db->stats_disk_ok;
+    if (walk_disk) {
+        imdb_err de = {0};
+        disk = imdb_disk_bytes(db, &log_b, &lake_b, &de) == 0;
+    }
+    for (const imdb_txn *t = db->txns; t; t = t->next) {
+        if (!t->open) continue;
+        open++;
+        if (now - t->begin_ns > oldest) oldest = now - t->begin_ns;
+    }
+    char nm[64];
+    int rc;
+#define STAT(n_, v_)                                                                                                   \
+    do {                                                                                                               \
+        if ((rc = fn(ctx, (n_), (int64_t)(v_)))) return rc;                                                            \
+    } while (0)
+    STAT("open.ms", s->open_ns / 1000000u);
+    STAT("open.replayed_commits", s->open_replayed);
+    STAT("uptime.s", wall > s->opened_us ? (wall - s->opened_us) / 1000000u : 0);
+    STAT("statement.running", db->stmt_start_ns ? 1 : 0);
+    STAT("statement.running_ms", db->stmt_start_ns ? (now - db->stmt_start_ns) / 1000000u : 0);
+    for (int i = 0; i < IMDB_SC_N; i++) {
+        snprintf(nm, sizeof nm, "statements.%s", cls[i]);
+        STAT(nm, s->stmts[i]);
+        snprintf(nm, sizeof nm, "statements.%s.p50_us", cls[i]);
+        STAT(nm, imdb_hist_quantile(&s->stmt_lat[i], 500));
+        snprintf(nm, sizeof nm, "statements.%s.p99_us", cls[i]);
+        STAT(nm, imdb_hist_quantile(&s->stmt_lat[i], 990));
+        snprintf(nm, sizeof nm, "statements.%s.max_us", cls[i]);
+        STAT(nm, s->stmt_lat[i].max_us);
+    }
+    for (int i = 0; i < IMDB_SF_N; i++) {
+        snprintf(nm, sizeof nm, "failures.%s", fl[i]);
+        STAT(nm, s->fails[i]);
+    }
+    STAT("commits", s->commits);
+    STAT("commits.p50_us", imdb_hist_quantile(&s->commit_lat, 500));
+    STAT("commits.p99_us", imdb_hist_quantile(&s->commit_lat, 990));
+    STAT("commits.max_us", s->commit_lat.max_us);
+    STAT("commits.applied", s->applied);
+    STAT("rollbacks", s->rollbacks);
+    STAT("log.bytes_appended", s->log_bytes);
+    STAT("process.syncs", syncs.n);
+    STAT("process.syncs.p50_us", imdb_hist_quantile(&syncs, 500));
+    STAT("process.syncs.p99_us", imdb_hist_quantile(&syncs, 990));
+    STAT("process.syncs.max_us", syncs.max_us);
+    STAT("segments.hits", __atomic_load_n(&s->seg_hits, __ATOMIC_RELAXED));
+    STAT("segments.loads", db->segcache.loads);
+    STAT("segments.load_bytes", db->segcache.load_bytes);
+    for (int i = 0; i < IMDB_MT_N; i++) {
+        snprintf(nm, sizeof nm, "%s.count", mt[i]);
+        STAT(nm, s->maint_n[i]);
+        snprintf(nm, sizeof nm, "%s.total_ms", mt[i]);
+        STAT(nm, s->maint_ns[i] / 1000000u);
+        snprintf(nm, sizeof nm, "%s.max_ms", mt[i]);
+        STAT(nm, s->maint_max_ns[i] / 1000000u);
+        snprintf(nm, sizeof nm, "%s.last_ms", mt[i]);
+        STAT(nm, s->maint_last_ns[i] / 1000000u);
+    }
+    STAT("transactions.open", open);
+    STAT("transactions.oldest_ms", oldest / 1000000u);
+    STAT("disk.log_bytes", disk ? (int64_t)log_b : -1);
+    STAT("disk.lake_bytes", disk ? (int64_t)lake_b : -1);
+    STAT("export.writes", db->stats_exports);
+    STAT("export.errors", db->stats_errors);
+#undef STAT
+    return 0;
+}
+
+typedef struct stats_out {
+    char *p;
+    size_t cap, len;
+    bool full;
+} stats_out;
+
+static void out_line(stats_out *o, const char *name, int64_t v)
+{
+    if (o->full) return;
+    int n = snprintf(o->p + o->len, o->cap - o->len, "%s %lld\n", name, (long long)v);
+    if (n < 0 || (size_t)n >= o->cap - o->len) o->full = true;
+    else o->len += (size_t)n;
+}
+
+static int stats_out_row(void *ctx, const char *name, int64_t v)
+{
+    out_line(ctx, name, v);
+    return 0;
+}
+
+void imdb_stats_tick(imdb_db *db, bool force)
+{
+    if (db->stats_fd < 0) return;
+    uint64_t now = imdb_mono_ns();
+    if (!force && db->stats_last_ns && now - db->stats_last_ns < 1000000000u) return;
+    db->stats_last_ns = now;
+    if (!db->stats_disk_ns || now - db->stats_disk_ns >= 60ull * 1000000000u) { /* a directory walk, once a minute */
+        imdb_err de = {0};
+        db->stats_disk_ok = imdb_disk_bytes(db, &db->stats_log_b, &db->stats_lake_b, &de) == 0;
+        db->stats_disk_ns = now;
+    }
+    stats_out o = {db->stats_buf, sizeof db->stats_buf - 32, 0, false}; /* room kept for the CRC line */
+    out_line(&o, "imagedb.stats", 1);
+    out_line(&o, "pid", (int64_t)getpid());
+    out_line(&o, "time_us", (int64_t)imdb_now_us());
+    out_line(&o, "commit", (int64_t)db->seq);
+    out_line(&o, "failed", db->failed ? 1 : 0);
+    out_line(&o, "read_only", db->read_only ? 1 : 0);
+    out_line(&o, "replica", db->replica ? 1 : 0);
+    (void)imdb_stats_each(db, stats_out_row, &o, false);
+    if (o.full) {
+        db->stats_errors++;
+        return;
+    }
+    int n = snprintf(o.p + o.len, sizeof db->stats_buf - o.len, "crc32c %08x\n", imdb_kern()->crc32c(0, o.p, o.len));
+    if (n < 0 || (size_t)n >= sizeof db->stats_buf - o.len) {
+        db->stats_errors++;
+        return;
+    }
+    o.len += (size_t)n;
+    imdb_err we = {0};
+    if (imdb_pwrite_all(db->stats_fd, o.p, o.len, 0, &we) || imdb_io_ftruncate(db->stats_fd, (off_t)o.len) != 0)
+        db->stats_errors++;
+    else {
+        db->stats_exports++;
+        if (db->failed) db->stats_said_failed = true; /* the monitor knows */
+    }
+}
+
+int imdb_health_dir(const char *path, imdb_err *e)
+{
+    int dfd = imdb_io_open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    if (dfd < 0) return imdb_fail(e, IMDB_ERR_IO, "%s: %s", path, strerror(errno));
+    imdb_identity id;
+    bool replica = false, present = false;
+    imdb_durable w;
+    int rc = read_meta(dfd, &id, &replica, e);
+    if (!rc) rc = imdb_durable_read(dfd, &w, &present, e);
+    if (!rc) { /* an incident a primary recorded about one of its replicas: another history, ahead, or gone back */
+        int rfd = imdb_io_openat(dfd, "replicas", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        DIR *d = rfd >= 0 ? imdb_io_fdopendir(rfd) : NULL;
+        if (rfd >= 0 && !d) close(rfd);
+        for (struct dirent *de; !rc && d && (de = imdb_io_readdir(d));) {
+            size_t n = strlen(de->d_name);
+            if (n > 9 && strcmp(de->d_name + n - 9, ".diverged") == 0)
+                rc = imdb_fail(e, IMDB_ERR_VERIFY, "replicas/%s: an incident is recorded (SHOW REPLICAS)", de->d_name);
+        }
+        if (d) closedir(d);
+    }
+    close(dfd);
+    return rc;
 }

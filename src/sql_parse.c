@@ -1034,6 +1034,8 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
         else if (kw(&p, "replicas")) st->kind = ST_SHOW_REPLICAS;
         else if (kw(&p, "replication")) st->kind = ST_SHOW_REPLICATION;
         else if (kw(&p, "memory")) st->kind = ST_SHOW_MEMORY;
+        else if (kw(&p, "stats")) st->kind = ST_SHOW_STATS;
+        else if (kw(&p, "transactions")) st->kind = ST_SHOW_TRANSACTIONS;
         else if (kw(&p, "erasure")) { /* AT n: through commit n (the default: the current commit) */
             st->kind = ST_SHOW_ERASURE;
             if (kw(&p, "at") && !(rc = uint_lit(&p, &st->n)) && st->n == 0) rc = fail_at(&p, "a commit number from 1");

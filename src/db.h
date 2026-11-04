@@ -259,6 +259,24 @@ typedef struct imdb_identity {
     uint8_t digest_alg;       /* IMDB_DIGEST_ALG_* (log.h): every commit names it, every digest is computed by it */
 } imdb_identity;
 
+/* P1 M1: what a copy has done since its open, for SHOW STATS and the export (--stats FILE). Per copy, in memory,
+ * never logged and never derived: nothing a replica recomputes reads it. Statements by class and their latency;
+ * failures by kind; commits (imdb_commit), rollbacks, the log's bytes; the segment cache's hits (first pins of an
+ * image already in memory in an operation; its misses are segcache.loads); each maintenance op's count and time;
+ * the open's. Moved on the engine thread but seg_hits (the workers' pins: atomic). */
+enum { IMDB_SC_READ, IMDB_SC_WRITE, IMDB_SC_TXN, IMDB_SC_DDL, IMDB_SC_PHYSICAL, IMDB_SC_SHOW, IMDB_SC_OTHER, IMDB_SC_N };
+enum { IMDB_SF_CONFLICT, IMDB_SF_LIMIT, IMDB_SF_CANCELLED, IMDB_SF_OTHER, IMDB_SF_N };
+enum { IMDB_MT_CHECKPOINT, IMDB_MT_COMPACT, IMDB_MT_EXPIRE, IMDB_MT_RETIRE, IMDB_MT_EVICT, IMDB_MT_N };
+typedef struct imdb_stats {
+    uint64_t stmts[IMDB_SC_N], fails[IMDB_SF_N];
+    imdb_hist stmt_lat[IMDB_SC_N];
+    uint64_t commits, rollbacks, log_bytes, applied; /* applied: a replica's commits taken from a stream (apply) */
+    imdb_hist commit_lat;
+    uint64_t seg_hits;
+    uint64_t maint_n[IMDB_MT_N], maint_ns[IMDB_MT_N], maint_max_ns[IMDB_MT_N], maint_last_ns[IMDB_MT_N];
+    uint64_t opened_us, open_ns, open_replayed; /* the open's wall time, its length, the commits it replayed */
+} imdb_stats;
+
 typedef struct imdb_db {
     char *path;
     int dirfd, logfd, lockfd;
@@ -317,6 +335,14 @@ typedef struct imdb_db {
     uint64_t ended_pass;      /* versions ended since the last eviction pass: its trigger */
     bool evict_eager;         /* every publish evicts to its own commit (IMDB_EVICT=eager: the matrix's third unit pass) */
     imdb_segcache segcache;   /* stage 3c-1: the lake's segment images in memory, under a budget */
+    imdb_stats stats;         /* P1 M1: counters and latencies since the open (SHOW STATS) */
+    int stats_fd;             /* P1 M1: the export's file (imdb_open_opts.stats_path; -1: none) */
+    uint64_t stats_last_ns, stats_exports, stats_errors; /* the last export, the writes and the failures */
+    uint64_t stats_disk_ns, stats_log_b, stats_lake_b;   /* the export's walk of log/ and objects/, once a minute */
+    bool stats_disk_ok;
+    bool stats_said_failed;   /* an export has said the handle failed: until then a failed handle exports at once */
+    uint64_t stmt_start_ns;   /* the running statement's start (0: none): long-running work in the export */
+    char stats_buf[IMDB_STATS_EXPORT_MAX];
     uint64_t checkpoint_bytes; /* primary: auto-CHECKPOINT past this segment size (0 = off) */
     bool lake_sync;           /* primary: CHECKPOINT after every commit that changed data (imdb_open_opts) */
     bool strict;              /* durable_ack with sync: every DURABLE record fsynced before its commit returns */
@@ -383,6 +409,7 @@ typedef struct imdb_open_opts {
     bool full_replay;         /* replay the whole log instead of starting from the lake snapshot */
     bool lake_sync;           /* publish the lake after every commit that changed data (a CHECKPOINT each: priced) */
     const char *anchor;       /* the external anchor file (log.h), outside the data directory; NULL: none */
+    const char *stats_path;   /* P1 M1: the stats export (--stats FILE), outside the data directory; NULL: none */
     bool accept_rollback;     /* an anchor newer than the log: continue from the log and rewrite the anchor */
     bool durable_ack;         /* fsync DURABLE before each durable commit returns (log.h: strict): a damaged frame past
                                  it is then provably unacknowledged and recovery may drop it; +1 device flush
@@ -825,5 +852,29 @@ int imdb_redact_log(imdb_db *db, imdb_err *e);
 /* Records that the payload written by commit seq must be redacted. */
 int imdb_redact_note(imdb_db *db, uint64_t seq, imdb_err *e);
 int imdb_sync_dir(int dirfd, imdb_err *e);
+/* P1 M1: the bytes of log/'s and objects/'s regular files (SHOW STATS: storage on disk) */
+int imdb_disk_bytes(imdb_db *db, uint64_t *log, uint64_t *lake, imdb_err *e);
+
+/* P1 M1: every SHOW STATS row, in order, the export's too (one list, so the two never differ): fn's nonzero stops the
+ * walk and is returned. walk_disk: list log/ and objects/ now (SHOW STATS), else the export's last walk */
+typedef int (*imdb_stat_fn)(void *ctx, const char *name, int64_t value);
+int imdb_stats_each(imdb_db *db, imdb_stat_fn fn, void *ctx, bool walk_disk);
+/* P1 M1: the export (imdb_open_opts.stats_path): every row as `name value` lines with the writer's pid and time and a
+ * CRC32C last, rewritten in place, never fsynced, advisory (a reader takes a torn copy by its CRC and reads again); at
+ * most once a second unless force; from a fixed buffer; never an error: a failed write is counted and tried again */
+void imdb_stats_tick(imdb_db *db, bool force);
+/* P1 M1: a data directory's cheap health (imagedb health): META and DURABLE read and checked, and no replica incident
+ * recorded (replicas/NAME.diverged); no open, no replay */
+int imdb_health_dir(const char *path, imdb_err *e);
+
+/* P1 M1: a maintenance op of kind k that began at t0 (imdb_mono_ns) has ended: its count and time */
+static inline void imdb_stats_maint(imdb_db *db, int k, uint64_t t0)
+{
+    uint64_t d = imdb_mono_ns() - t0;
+    db->stats.maint_n[k]++;
+    db->stats.maint_ns[k] += d;
+    db->stats.maint_last_ns[k] = d;
+    if (d > db->stats.maint_max_ns[k]) db->stats.maint_max_ns[k] = d;
+}
 
 #endif

@@ -1639,6 +1639,8 @@ static int apply_from(imdb_db *db, const apply_src *src, uint64_t *applied, imdb
         }
         if (rc) break;
         (*applied)++;
+        db->stats.applied++; /* P1 M1: a replica's commits, and its export (apply, follow) */
+        imdb_stats_tick(db, false);
         if (db->needs_redaction && (rc = imdb_redact_log(db, e))) {
             db->failed = true;
             break;

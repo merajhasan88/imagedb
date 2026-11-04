@@ -215,6 +215,23 @@ void imdb_hex(const uint8_t *in, size_t n, char *out /* 2n+1 */);
 /* Strict: exactly 2n lowercase hex digits. */
 bool imdb_unhex(const char *in, size_t inlen, uint8_t *out, size_t n);
 
+/* CLOCK_MONOTONIC in nanoseconds: the statement timers, the stats' latencies */
+uint64_t imdb_mono_ns(void);
+
+/* P1 M1: a latency histogram, log-linear in microseconds (four buckets an octave, so a quantile read from it is
+ * within 25% of the true one, and never below it: each bucket answers its upper bound). Per copy, never derived. */
+#define IMDB_HIST_N 160
+typedef struct imdb_hist {
+    uint64_t n, sum_us, max_us;
+    uint64_t b[IMDB_HIST_N];
+} imdb_hist;
+unsigned imdb_hist_bucket(uint64_t us);
+uint64_t imdb_hist_upper(unsigned i);
+void imdb_hist_add(imdb_hist *h, uint64_t us);        /* one thread */
+void imdb_hist_add_atomic(imdb_hist *h, uint64_t us); /* any thread (relaxed: counters, not order) */
+/* the q-th permille value's bucket bound, never above the largest seen; 0 when empty (copies taken by relaxed loads) */
+uint64_t imdb_hist_quantile(const imdb_hist *h, unsigned permille);
+
 /* Constant-time comparison for MACs. */
 bool imdb_ct_eq(const void *a, const void *b, size_t n);
 

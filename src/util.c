@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/random.h>
+#include <time.h>
 
 #include "fsio.h"
 
@@ -446,4 +447,62 @@ bool imdb_ct_eq(const void *a, const void *b, size_t n)
     uint8_t acc = 0;
     for (size_t i = 0; i < n; i++) acc |= (uint8_t)(x[i] ^ y[i]);
     return acc == 0;
+}
+
+uint64_t imdb_mono_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+}
+
+/* below 4 us one bucket a microsecond; from there four an octave: [4,5) [5,6) [6,7) [7,8), [8,10) [10,12) .. */
+unsigned imdb_hist_bucket(uint64_t us)
+{
+    if (us < 4) return (unsigned)us;
+    unsigned e = 63u - (unsigned)__builtin_clzll(us); /* 2.. */
+    unsigned i = 4u * (e - 1u) + (unsigned)((us >> (e - 2u)) & 3u);
+    return i < IMDB_HIST_N ? i : IMDB_HIST_N - 1;
+}
+
+uint64_t imdb_hist_upper(unsigned i)
+{
+    if (i < 4) return i;
+    unsigned e = i / 4u + 1u, sub = i % 4u;
+    return ((uint64_t)(5u + sub) << (e - 2u)) - 1u;
+}
+
+void imdb_hist_add(imdb_hist *h, uint64_t us)
+{
+    h->n++;
+    h->sum_us += us;
+    if (us > h->max_us) h->max_us = us;
+    h->b[imdb_hist_bucket(us)]++;
+}
+
+void imdb_hist_add_atomic(imdb_hist *h, uint64_t us)
+{
+    __atomic_fetch_add(&h->n, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&h->sum_us, us, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&h->b[imdb_hist_bucket(us)], 1, __ATOMIC_RELAXED);
+    uint64_t m = __atomic_load_n(&h->max_us, __ATOMIC_RELAXED);
+    while (us > m && !__atomic_compare_exchange_n(&h->max_us, &m, us, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+    }
+}
+
+uint64_t imdb_hist_quantile(const imdb_hist *h, unsigned permille)
+{
+    uint64_t n = __atomic_load_n(&h->n, __ATOMIC_RELAXED);
+    if (!n) return 0;
+    uint64_t want = (n * permille + 999u) / 1000u, seen = 0; /* the ceil: the 990th permille of 100 is the 99th */
+    if (!want) want = 1;
+    uint64_t max = __atomic_load_n(&h->max_us, __ATOMIC_RELAXED);
+    for (unsigned i = 0; i < IMDB_HIST_N; i++) {
+        seen += __atomic_load_n(&h->b[i], __ATOMIC_RELAXED);
+        if (seen >= want) {
+            uint64_t u = imdb_hist_upper(i);
+            return u < max ? u : max;
+        }
+    }
+    return max;
 }

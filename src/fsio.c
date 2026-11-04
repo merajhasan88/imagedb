@@ -128,24 +128,44 @@ ssize_t imdb_io_pwrite(int fd, const void *p, size_t n, off_t off)
     return r;
 }
 
+/* P1 M1: every fsync and fdatasync this process makes, counted and timed (any thread; the hooked calls too, after
+ * the hook lets them through): SHOW STATS gives them as the process's */
+static imdb_hist g_syncs;
+void imdb_io_sync_stats(imdb_hist *out)
+{
+    memset(out, 0, sizeof *out);
+    out->n = __atomic_load_n(&g_syncs.n, __ATOMIC_RELAXED);
+    out->sum_us = __atomic_load_n(&g_syncs.sum_us, __ATOMIC_RELAXED);
+    out->max_us = __atomic_load_n(&g_syncs.max_us, __ATOMIC_RELAXED);
+    for (unsigned i = 0; i < IMDB_HIST_N; i++) out->b[i] = __atomic_load_n(&g_syncs.b[i], __ATOMIC_RELAXED);
+}
+
+static int timed_sync(int fd, bool data)
+{
+    uint64_t t0 = imdb_mono_ns();
+    int r = data ? fdatasync(fd) : fsync(fd);
+    imdb_hist_add_atomic(&g_syncs, (imdb_mono_ns() - t0) / 1000u);
+    return r;
+}
+
 int imdb_io_fsync(int fd)
 {
-    if (!HOOKED) return fsync(fd);
+    if (!HOOKED) return timed_sync(fd, false);
     imdb_io_call c = call_of(IMDB_IO_FSYNC);
     c.fd = fd;
     if (io_before(&c) < 0) return -1;
-    int r = fsync(fd);
+    int r = timed_sync(fd, false);
     io_after(&c, r);
     return r;
 }
 
 int imdb_io_fdatasync(int fd)
 {
-    if (!HOOKED) return fdatasync(fd);
+    if (!HOOKED) return timed_sync(fd, true);
     imdb_io_call c = call_of(IMDB_IO_FDATASYNC);
     c.fd = fd;
     if (io_before(&c) < 0) return -1;
-    int r = fdatasync(fd);
+    int r = timed_sync(fd, true);
     io_after(&c, r);
     return r;
 }

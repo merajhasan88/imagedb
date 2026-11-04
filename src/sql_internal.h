@@ -78,6 +78,7 @@ enum {
     ST_SAVEPOINT, ST_ROLLBACK_TO, ST_RELEASE, ST_SET_TXN,
     ST_CREATE_INDEX, ST_DROP_INDEX, ST_SHOW_INDEXES, ST_DROP_TABLE,
     ST_ALTER_RETENTION, ST_SHOW_RETENTION,
+    ST_SHOW_STATS, ST_SHOW_TRANSACTIONS, /* P1 M1 */
 };
 
 /* isolation levels as written (the executor maps them; SERIALIZABLE is refused for now) */
