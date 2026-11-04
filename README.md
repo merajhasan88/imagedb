@@ -269,7 +269,8 @@ build/imagedb promote /data/p2 --root-key /offline/root.key --old-writer-stopped
   the snapshot's seed.
 - `restore` reads every file whole first (a damaged one is refused before anything is written), then applies the
   backup as a replica applies a stream, every commit's signature, chain and digest checked, into DEST.tmp, makes it
-  durable and renames it to DEST. A crash leaves DEST.tmp: remove it and restore again.
+  durable and renames it to DEST. A restore that fails removes DEST.tmp; a crash leaves it: remove it and restore
+  again.
 - **The copy** is a replica seeded at the snapshot's commit S, holding the database as it was at the backup's last
   commit (the same view token). Its history starts at S: VERIFY and the auditor start there, and `AS OF` an earlier
   commit is refused on it ("commit N is in no log segment"), where the source, which holds its whole log, answers.

@@ -667,6 +667,8 @@ static int open_copy(const char *path, imdb_db **db, imdb_err *e)
     return imdb_open(path, &o, db, e);
 }
 
+static int remove_tree_at(int pfd, const char *name, int depth, imdb_err *e);
+
 int imdb_restore(const char *dest, const uint8_t key[IMDB_BACKUP_KEY_LEN], const char *const *files, size_t nfiles,
                  imdb_backup_info *info, imdb_err *e)
 {
@@ -703,6 +705,7 @@ int imdb_restore(const char *dest, const uint8_t key[IMDB_BACKUP_KEY_LEN], const
         else if (imdb_io_fstatat(dfd, tname, &st, AT_SYMLINK_NOFOLLOW) == 0)
             rc = imdb_fail(e, IMDB_ERR_STATE, "restore: %s exists (an interrupted restore's): remove it", tmp);
     }
+    bool made = !rc; /* past the checks: whatever is at tname from here on, this call made */
     if (!rc) rc = imdb_init_replica(tmp, &in[0].id, e);
     if (!rc) rc = open_copy(tmp, &db, e);
     for (size_t i = 0; !rc && i < nfiles; i++) {
@@ -740,6 +743,14 @@ int imdb_restore(const char *dest, const uint8_t key[IMDB_BACKUP_KEY_LEN], const
     if (!rc && imdb_io_renameat(dfd, tname, dfd, base) != 0)
         rc = imdb_fail(e, IMDB_ERR_IO, "restore: rename %s to %s: %s", tmp, dest, strerror(errno));
     if (!rc) rc = imdb_sync_dir(dfd, e);
+    if (rc && made) { /* a failure, not a crash: the copy is this call's own, so it goes, and a restore run again (once
+                     * there is room) needs no operator; a crash's DEST.tmp stays for one, as the next restore says */
+        imdb_err er = {0};
+        if (remove_tree_at(dfd, tname, 0, &er) || imdb_sync_dir(dfd, &er)) {
+            size_t l = strlen(e->msg); /* the failure stays the error: the cleanup's own is told beside it */
+            snprintf(e->msg + l, sizeof e->msg - l, " (and %s is left: %s; remove it)", tmp, er.msg);
+        }
+    }
     if (dfd >= 0) close(dfd);
     if (!rc) *info = *last;
     imdb_free(in);

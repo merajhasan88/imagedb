@@ -1858,8 +1858,11 @@ static const char *check_backup(const char *run)
     return copy_equal(run, dst, bi.last_seq);
 }
 
-/* Whatever the fault left: a complete copy under the name, or none (then at most restored.tmp, which the next restore
- * refuses until it is removed: removed here, and the restore run again). Either way the copy is the primary. */
+static int g_action = A_COUNT; /* the run being checked: its fault's action (A_COUNT: the unfaulted run) */
+
+/* Whatever the fault left: a complete copy under the name, or none, with restored.tmp only after a crash (a restore
+ * that fails removes the copy it made: P0 R3; a crash's the next restore refuses until it is removed: removed here,
+ * and the restore run again). Either way the copy is the primary. */
 static const char *check_restore(const char *run)
 {
     char kf[700], in[700], dst[700], tmp[700];
@@ -1875,6 +1878,10 @@ static const char *check_restore(const char *run)
         return g_why;
     }
     if (access(dst, F_OK) != 0) {
+        if (access(tmp, F_OK) == 0 && g_action != A_CRASH) {
+            snprintf(g_why, sizeof g_why, "a restore that failed without a crash left restored.tmp");
+            return g_why;
+        }
         if (access(tmp, F_OK) == 0) { /* rm_one keeps the root it walks: emptied, then removed */
             nftw(tmp, rm_one, 16, FTW_DEPTH | FTW_PHYS);
             rmdir(tmp);
@@ -2110,7 +2117,9 @@ static bool fault_points(const fscen *s, const char *base, const char *run, unsi
             int hit = 0;
             for (size_t i = 0; i < r.nrecs; i++)
                 if (r.recs[i].kind == R_NOTE) hit = (int)r.recs[i].seq;
+            g_action = action;
             const char *why = check_run(s, run, &r);
+            g_action = A_COUNT;
             free(r.recs);
             if (why) {
                 char m[1400];
