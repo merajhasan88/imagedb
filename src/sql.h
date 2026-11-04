@@ -25,6 +25,8 @@
 #ifndef IMDB_SQL_H
 #define IMDB_SQL_H
 
+#include <stdatomic.h>
+
 #include "db.h"
 
 /* IMDB_PATH_ROWS, the lake read row by row, is no SET access_path's: below the memory floor it cross-checks the scan */
@@ -58,6 +60,9 @@ typedef struct imdb_session {
     int join_plan;           /* SET join_plan: IMDB_JOIN_AUTO, IMDB_JOIN_HASH or IMDB_JOIN_INDEX */
     imdb_txn txn;            /* BEGIN ... COMMIT (db.h: session transactions) */
     uint64_t cross_checks_run;
+    uint32_t stmt_timeout_ms; /* SET statement_timeout = ms: a statement running longer is cancelled (0: none) */
+    atomic_bool cancel;       /* imdb_session_cancel: the running statement stops at its next check (cleared at
+                               * each statement's start, so a request between statements is dropped) */
 } imdb_session;
 
 typedef struct imdb_cell {
@@ -90,6 +95,11 @@ typedef struct imdb_result {
 void imdb_session_init(imdb_session *s, imdb_db *db);
 /* Rolls back an open transaction. Close every session before imdb_close. */
 void imdb_session_close(imdb_session *s);
+/* Cancels the statement running in s (R1): any thread, and a signal handler (one lock-free atomic store). It fails
+ * with IMDB_ERR_CANCELLED at its next check, every few thousand rows its read paths, joins and row loops pass, and its
+ * statement savepoint undoes what it wrote. COMMIT, CREATE TABLE, CREATE INDEX, DROP INDEX, ALTER, CHECKPOINT, COMPACT,
+ * ERASE and VERIFY run to their end. */
+void imdb_session_cancel(imdb_session *s);
 void imdb_result_init(imdb_result *r);
 void imdb_result_free(imdb_result *r);
 

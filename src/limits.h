@@ -64,6 +64,7 @@
 #define IMDB_MAX_REPLICAS       256u         /* allowlisted replicas per primary (replicas/) */
 #define IMDB_MAX_SYNC_REPLICAS  64u          /* SET sync_replicas                     */
 #define IMDB_MAX_SYNC_TIMEOUT_MS 3600000u    /* SET sync_timeout_ms (an hour)         */
+#define IMDB_MAX_STATEMENT_TIMEOUT_MS 86400000u /* SET statement_timeout (a day; 0: none) */
 #define IMDB_MAX_UNACKED        (1u << 20)   /* commits ship --acks sends past the last acknowledgement */
 #define IMDB_MAX_EPOCHS         4096u        /* writer epochs (key rotations and promotions) per database */
 #define IMDB_MAX_PINNED         8u           /* older lake generations GC keeps for readers that pin them */

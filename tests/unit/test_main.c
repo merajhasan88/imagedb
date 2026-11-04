@@ -94,6 +94,7 @@ int main(int argc, char **argv)
         {"segcache", segcache_tests, &segcache_ntests},
         {"backup", backup_tests, &backup_ntests},
         {"expr", expr_tests, &expr_ntests},
+        {"cancel", cancel_tests, &cancel_ntests},
     };
     int failed = 0, run = 0;
     for (size_t g = 0; g < sizeof groups / sizeof *groups; g++) {

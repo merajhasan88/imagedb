@@ -18,7 +18,12 @@ void imdb_session_init(imdb_session *s, imdb_db *db)
 {
     memset(s, 0, sizeof *s);
     s->db = db;
+    atomic_init(&s->cancel, false);
 }
+
+_Static_assert(ATOMIC_BOOL_LOCK_FREE == 2, "the cancel flag is set from a signal handler: it must be lock-free");
+
+void imdb_session_cancel(imdb_session *s) { atomic_store_explicit(&s->cancel, true, memory_order_relaxed); }
 
 void imdb_session_close(imdb_session *s)
 {
@@ -131,7 +136,41 @@ typedef struct xctx {
     imdb_xnode *xn;   /* the statement's trees bound (xbind), parallel to st->ex; NULL until one is */
     const sql_stmt *st;
     bool fb[IMDB_MAX_PREDICATES]; /* WHERE's plain conjuncts that fell back to residuals (falls_back) */
+    uint64_t ticks, next_check;   /* rows passed, and the count at the next check (R1: xcheck) */
+    uint64_t deadline_ns;         /* CLOCK_MONOTONIC: the statement's timeout; 0: none */
+    bool checks;                  /* false for what runs to its end: COMMIT and the physical statements */
 } xctx;
+
+enum { TICK_ROWS = 4096 }; /* rows between two looks at the clock and the cancel flag: tens of microseconds of work */
+
+static uint64_t mono_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+}
+
+/* R1: the session cancelled the statement, or its deadline passed. A timeout depends on time, so on the machine and on
+ * where versions live; nothing derived depends on it: a cancelled statement fails like any failed one, and leaves
+ * nothing behind (its savepoint undoes its writes) */
+static int xcheck(xctx *x, imdb_err *e)
+{
+    x->next_check = x->ticks + TICK_ROWS;
+    if (!x->checks) return IMDB_OK;
+    if (atomic_load_explicit(&x->ss->cancel, memory_order_relaxed))
+        return imdb_fail(e, IMDB_ERR_CANCELLED, "statement cancelled");
+    if (x->deadline_ns && mono_ns() >= x->deadline_ns)
+        return imdb_fail(e, IMDB_ERR_CANCELLED, "statement timeout: it ran past %u ms (SET statement_timeout)",
+                         x->ss->stmt_timeout_ms);
+    return IMDB_OK;
+}
+
+/* n more rows passed (examined, tested, joined or written): an error once the statement must stop */
+static inline int xtick(xctx *x, uint64_t n, imdb_err *e)
+{
+    x->ticks += n;
+    return x->ticks < x->next_check ? IMDB_OK : xcheck(x, e);
+}
 
 static void *xalloc(xctx *x, size_t n, imdb_err *e)
 {
@@ -750,6 +789,14 @@ typedef struct sink {
     xacc *gxa;
 } sink;
 
+/* xtick for a sink's loop: its error set, so the path stops there (every path loop tests k->err) */
+static inline bool ktick(sink *k, uint64_t n)
+{
+    int rc = xtick(k->x, n, k->e);
+    if (rc) k->err = rc;
+    return rc != 0;
+}
+
 /* every tree aggregate of a row: its argument computed, then accumulated */
 static int xa_row(sink *k, xacc *acc, const imdb_value *vals)
 {
@@ -1019,6 +1066,7 @@ static int path_store(xctx *x, const qspec *q, sink *k, imdb_err *e)
     imdb_value vals[IMDB_MAX_COLS];
     walk_pin wp = {UINT32_MAX, NULL};
     for (uint64_t vid = imdb_v_next(t, 0); vid < t->nver && !k->err; vid = imdb_v_next(t, vid + 1)) {
+        if (ktick(k, 1)) break;
         const imdb_version *v = imdb_vh(t, vid); /* held: the walk has its entry */
         if (!visible_q(q, v)) continue;
         if (walk_values(t, v, &wp, vals, e)) return e->code;
@@ -1043,6 +1091,7 @@ static int path_index(xctx *x, const qspec *q, sink *k, imdb_err *e)
         walk_pin wp = {UINT32_MAX, NULL};
         const imdb_vlist *l = imdb_subject_versions(t, &q->p[q->subj_pred].a);
         for (uint32_t i = 0; l && i < l->n && !k->err; i++) {
+            if (ktick(k, 1)) break;
             uint64_t vid = l->v[i];
             const imdb_version *v = imdb_vh(t, vid); /* held: the walk has its entry */
             if (!visible_q(q, v)) continue;
@@ -1094,6 +1143,7 @@ typedef struct octx {
 static int ord_fetch(octx *o, uint64_t vid)
 {
     imdb_table *t = o->q->t;
+    if (ktick(o->k, 1)) return o->k->err;
     if (vid >= t->nver || !visible_q(o->q, imdb_vh(t, vid))) return IMDB_OK;
     if (fetch_row(o->x, t, vid, o->vals, o->e)) return o->e->code;
     if (preds_ok(o->q, o->vals)) sink_row(o->k, vid, o->vals);
@@ -1112,6 +1162,7 @@ static int ord_only_visit(void *ctx, const uint64_t *key, uint64_t vid)
 {
     octx *o = ctx;
     imdb_table *t = o->q->t;
+    if (ktick(o->k, 1)) return o->k->err;
     if (vid >= t->nver || !visible_q(o->q, imdb_vh(t, vid))) return IMDB_OK;
     const imdb_index *ix = o->q->ord_idx;
     for (uint8_t c = 0; c < ix->d.ncols; c++)
@@ -1217,6 +1268,7 @@ static int path_scan(xctx *x, const qspec *q, sink *k, imdb_err *e)
         uint32_t n = g->nrows;
         if (!n) continue;
         if (!q->all_versions && seg_skipped(q, g)) continue;
+        if (ktick(k, n)) break; /* the kernels filter the whole segment */
         const imdb_segimg *gi = imdb_seg_pin(t, g, e); /* only a segment the zone maps did not skip */
         if (!gi) {
             rc = e->code;
@@ -1303,6 +1355,7 @@ static int path_scan(xctx *x, const qspec *q, sink *k, imdb_err *e)
         for (size_t w = 0; w < words && !k->err; w++) {
             uint64_t m = bits[w];
             while (m) {
+                if (ktick(k, 1)) break;
                 uint32_t r = (uint32_t)(w * 64 + (uint64_t)__builtin_ctzll(m));
                 m &= m - 1;
                 uint64_t vid = gi->vid[r];
@@ -1316,6 +1369,7 @@ static int path_scan(xctx *x, const qspec *q, sink *k, imdb_err *e)
     if (rc || k->err) return rc ? rc : k->err;
     /* memtable rows (not yet in a segment) */
     for (uint64_t vid = t->mem_first; vid < t->nver && !k->err; vid++) {
+        if (ktick(k, 1)) break;
         const imdb_version *v = imdb_vh(t, vid); /* held: the walk has its entry */
         if (!visible_q(q, v)) continue;
         if (imdb_version_values_v(t, v, vals, e)) return e->code;
@@ -1336,6 +1390,7 @@ static int path_rows(xctx *x, const qspec *q, sink *k, imdb_err *e)
         const imdb_segimg *gi = imdb_seg_pin(t, g, e);
         if (!gi) return e->code;
         for (uint32_t r = 0; r < g->nrows && !k->err; r++) {
+            if (ktick(k, 1)) break;
             if (gi->flags[r]) continue; /* a stub or a tombstone: no values (visible_q's rule) */
             if (!q->all_versions && (gi->begin[r] > q->snap || gi->end[r] <= q->snap || (q->pend && gi->end[r] == q->pend)))
                 continue;
@@ -1344,6 +1399,7 @@ static int path_rows(xctx *x, const qspec *q, sink *k, imdb_err *e)
         }
     }
     for (uint64_t vid = t->mem_first; vid < t->nver && !k->err; vid++) { /* the memtable: always held */
+        if (ktick(k, 1)) break;
         const imdb_version *v = imdb_vh(t, vid); /* held: the walk has its entry */
         if (!visible_q(q, v)) continue;
         if (imdb_version_values_v(t, v, vals, e)) return e->code;
@@ -1898,7 +1954,7 @@ static int materialize(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb
         if (plain_order(st)) { /* the primary key's order, the first LIMIT rows */
             uint64_t lim = st->has_limit && st->limit < k->nvids ? st->limit : k->nvids;
             for (uint64_t i = 0; i < lim && !rc; i++)
-                if (!(rc = fetch_row(x, t, kv[i].vid, vals, e))) rc = put_row(x, st, k, vals, nc, r, e);
+                if (!(rc = xtick(x, 1, e)) && !(rc = fetch_row(x, t, kv[i].vid, vals, e))) rc = put_row(x, st, k, vals, nc, r, e);
             imdb_free(kv);
             return rc ? rc : res_finish(r, e);
         }
@@ -1912,12 +1968,13 @@ static int materialize(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb
         for (uint64_t i = 0; !rc && i < n; i++) ord[i] = i;
         if (!rc && st->norder && !(keys = order_keys_alloc(r, st, n, e))) rc = e->code;
         for (uint64_t i = 0; !rc && keys && i < n; i++) {
-            if ((rc = fetch_row(x, t, kv[i].vid, vals, e))) break;
+            if ((rc = xtick(x, 1, e)) || (rc = fetch_row(x, t, kv[i].vid, vals, e))) break;
             for (uint8_t o = 0; !rc && o < st->norder; o++) rc = order_key(x, st, k, o, vals, &keys[i * st->norder + o], e);
         }
         if (!rc && keys) {
             ordctx c = {st, keys};
             qsort_r(ord, n, sizeof *ord, cmp_order, &c);
+            rc = xcheck(x, e); /* a sort runs to its end (the result cap bounds it): the check after it */
         }
         if (!rc) rc = window_init(&w, st, e);
         for (uint64_t j = 0; !rc && j < n && w.left; j++) {
@@ -1926,7 +1983,7 @@ static int materialize(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb
                 continue;
             }
             size_t tl = r->text.len;
-            if (!(rc = fetch_row(x, t, kv[ord[j]].vid, vals, e)) && !(rc = put_row(x, st, k, vals, nc, r, e)))
+            if (!(rc = xtick(x, 1, e)) && !(rc = fetch_row(x, t, kv[ord[j]].vid, vals, e)) && !(rc = put_row(x, st, k, vals, nc, r, e)))
                 rc = window_take(&w, r, tl, e);
         }
         window_free(&w);
@@ -2428,6 +2485,7 @@ static void join_probe_row(sink *k, uint64_t vid, const imdb_value *vals)
         if (li) l = &j->lists[*li];
     }
     for (uint32_t i = 0; l && i < l->n && !k->err; i++) {
+        if (ktick(k, 1)) break; /* a key of many matches: each pair */
         uint64_t o = l->v[i], bvid = j->ent[o];
         const imdb_value *other = join_kept(j, o);
         if (j->matched) j->matched[o] = 1;
@@ -2795,7 +2853,7 @@ static int join_materialize(xctx *x, const sql_stmt *st, jctx *j, sink *k, imdb_
     if (plain_order(st)) { /* side 0's key, then side 1's: the first LIMIT pairs */
         uint64_t lim = st->has_limit && st->limit < j->npairs ? st->limit : j->npairs;
         for (uint64_t i = 0; i < lim && !rc; i++)
-            if (!(rc = join_pair(x, j, &kv[i], cv, e))) rc = put_row(x, st, k, cv, nc, r, e);
+            if (!(rc = xtick(x, 1, e)) && !(rc = join_pair(x, j, &kv[i], cv, e))) rc = put_row(x, st, k, cv, nc, r, e);
         imdb_free(kv);
         return rc ? rc : res_finish(r, e);
     }
@@ -2810,12 +2868,13 @@ static int join_materialize(xctx *x, const sql_stmt *st, jctx *j, sink *k, imdb_
         (join_charge(j, (n ? n : 1) * st->norder * sizeof(imdb_xval), e) || !(keys = order_keys_alloc(r, st, n, e))))
         rc = e->code;
     for (uint64_t i = 0; !rc && keys && i < n; i++) {
-        if ((rc = join_pair(x, j, &kv[i], cv, e))) break;
+        if ((rc = xtick(x, 1, e)) || (rc = join_pair(x, j, &kv[i], cv, e))) break;
         for (uint8_t o = 0; !rc && o < st->norder; o++) rc = order_key(x, st, k, o, cv, &keys[i * st->norder + o], e);
     }
     if (!rc && keys) {
         ordctx c = {st, keys};
         qsort_r(ord, n, sizeof *ord, cmp_order, &c);
+        rc = xcheck(x, e); /* a sort runs to its end: the check after it */
     }
     if (!rc) rc = window_init(&w, st, e);
     for (uint64_t jx = 0; !rc && jx < n && w.left; jx++) {
@@ -2824,7 +2883,7 @@ static int join_materialize(xctx *x, const sql_stmt *st, jctx *j, sink *k, imdb_
             continue;
         }
         size_t tl = r->text.len;
-        if (!(rc = join_pair(x, j, &kv[ord[jx]], cv, e)) && !(rc = put_row(x, st, k, cv, nc, r, e)))
+        if (!(rc = xtick(x, 1, e)) && !(rc = join_pair(x, j, &kv[ord[jx]], cv, e)) && !(rc = put_row(x, st, k, cv, nc, r, e)))
             rc = window_take(&w, r, tl, e);
     }
     window_free(&w);
@@ -3156,7 +3215,7 @@ static int exec_update(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
     int rc = IMDB_OK;
     imdb_value vals[IMDB_MAX_COLS];
     for (uint64_t i = 0; i < n && !rc; i++) {
-        if ((rc = fetch_row(x, t, vids[i], vals, e))) break;
+        if ((rc = xtick(x, 64, e)) || (rc = fetch_row(x, t, vids[i], vals, e))) break; /* a write weighs more than a read */
         for (uint16_t c = 0; c < t->s.ncols && !rc; c++) rc = xpin(x, &vals[c], e);
         for (uint16_t k = 0; k < st->nset && trees && !rc; k++) { /* every tree before any column changes: SET a = b,
                                                                     * b = a swaps them */
@@ -3183,7 +3242,8 @@ static int exec_delete(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
     uint64_t *vids, n;
     if (select_vids(x, st, t, false, &vids, &n, e)) return e->code;
     int rc = IMDB_OK;
-    for (uint64_t i = 0; i < n && !rc; i++) rc = imdb_delete(x->db, t, vids[i], e);
+    for (uint64_t i = 0; i < n && !rc; i++)
+        if (!(rc = xtick(x, 64, e))) rc = imdb_delete(x->db, t, vids[i], e);
     imdb_free(vids);
     if (!rc) snprintf(r->status, sizeof r->status, "DELETE %llu", (unsigned long long)n);
     return rc;
@@ -3776,6 +3836,14 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
     bool control = st->kind == ST_BEGIN || st->kind == ST_COMMIT || st->kind == ST_ROLLBACK || st->kind == ST_SET ||
                    st->kind == ST_EMPTY || st->kind == ST_SAVEPOINT || st->kind == ST_ROLLBACK_TO ||
                    st->kind == ST_RELEASE || st->kind == ST_SET_TXN;
+    /* R1: a cancel asked for before this statement is dropped; what runs to its end (COMMIT, the statements that commit
+     * on their own, the physical ones) is never checked, so neither a cancel nor the deadline cuts a logged op part
+     * way */
+    atomic_store_explicit(&ss->cancel, false, memory_order_relaxed);
+    x.checks = !physical && st->kind != ST_COMMIT && st->kind != ST_CREATE && st->kind != ST_CREATE_INDEX &&
+               st->kind != ST_DROP_INDEX && st->kind != ST_ALTER_RETENTION; /* each commits on its own */
+    x.next_check = TICK_ROWS;
+    if (x.checks && ss->stmt_timeout_ms) x.deadline_ns = mono_ns() + (uint64_t)ss->stmt_timeout_ms * 1000000u;
     if (txn && (st->kind == ST_CREATE || st->kind == ST_CREATE_INDEX || st->kind == ST_DROP_INDEX ||
                 st->kind == ST_ALTER_RETENTION)) {
         rc = imdb_fail(e, IMDB_ERR_STATE, "%s commits on its own: run it outside the transaction",
@@ -4008,13 +4076,20 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
                                k ? IMDB_MAX_SYNC_REPLICAS : IMDB_MAX_SYNC_TIMEOUT_MS);
             else if (k) ss->sync_replicas = (uint32_t)v;
             else ss->sync_wait_ms = (uint32_t)v;
+        } else if (strcmp(st->set_name, "statement_timeout") == 0) { /* R1: milliseconds; 0: none */
+            int64_t v;
+            imdb_err ep = {0}; /* the range is the message, whatever the literal was */
+            if (imdb_parse_int64(st->set_value, strlen(st->set_value), &v, &ep) || v < 0 || v > IMDB_MAX_STATEMENT_TIMEOUT_MS)
+                rc = imdb_fail(e, IMDB_ERR_INVALID, "statement_timeout is 0 (none) to %u milliseconds",
+                               IMDB_MAX_STATEMENT_TIMEOUT_MS);
+            else ss->stmt_timeout_ms = (uint32_t)v;
         } else if (strcmp(st->set_name, "min_commit") == 0) {
             int64_t v;
             if (imdb_parse_int64(st->set_value, strlen(st->set_value), &v, e) || v < 0)
                 rc = imdb_fail(e, IMDB_ERR_INVALID, "min_commit is a commit number (0: no requirement)");
             else ss->min_commit = (uint64_t)v;
         } else {
-            rc = imdb_fail(e, IMDB_ERR_NOTFOUND, "unknown setting %s (cross_check, access_path, join_plan, identity, min_commit, sync_replicas, sync_timeout_ms)",
+            rc = imdb_fail(e, IMDB_ERR_NOTFOUND, "unknown setting %s (cross_check, access_path, join_plan, identity, min_commit, statement_timeout, sync_replicas, sync_timeout_ms)",
                            st->set_name);
         }
         if (!rc) snprintf(r->status, sizeof r->status, "SET %s = %s", st->set_name, st->set_value);

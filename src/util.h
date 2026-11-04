@@ -33,6 +33,7 @@ enum {
     IMDB_ERR_UNSUPPORTED = -12,
     IMDB_ERR_HISTORY = -13,    /* requested history was purged               */
     IMDB_ERR_CONFLICT = -14,   /* a concurrent commit won: retry the transaction */
+    IMDB_ERR_CANCELLED = -15,  /* the statement was cancelled or ran past its timeout: nothing it did stays */
 };
 
 typedef struct imdb_err {

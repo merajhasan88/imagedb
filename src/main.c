@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -159,6 +160,18 @@ static double now_s(void)
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
+/* the session whose statement runs (run_stmt): SIGINT cancels that statement (R1). An atomic pointer and the session's
+ * atomic flag, both lock-free: the handler does nothing a signal handler may not */
+static _Atomic(imdb_session *) g_cancel_ss;
+_Static_assert(ATOMIC_POINTER_LOCK_FREE == 2, "the handler reads this pointer: it must be lock-free");
+
+static void on_cancel(int sig)
+{
+    (void)sig;
+    imdb_session *ss = atomic_load_explicit(&g_cancel_ss, memory_order_relaxed);
+    if (ss) imdb_session_cancel(ss);
+}
+
 static int run_stmt(void *arg, const char *sql, size_t len)
 {
     runner *rn = arg;
@@ -166,13 +179,24 @@ static int run_stmt(void *arg, const char *sql, size_t len)
     imdb_err e = {0};
     char before[512];
     snprintf(before, sizeof before, "%s", rn->ss->db->warning);
+    /* Ctrl-C while a statement runs cancels it; at the prompt and between statements it does what it always did */
+    struct sigaction sa, old;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_cancel;
+    sa.sa_flags = SA_RESTART; /* a COMMIT blocked in flock (a receipt, the anchor) or a read goes on: never an EINTR */
+    sigemptyset(&sa.sa_mask);
+    atomic_store_explicit(&g_cancel_ss, rn->ss, memory_order_relaxed);
+    sigaction(SIGINT, &sa, &old);
     double t0 = now_s();
     int rc = imdb_exec_one(rn->ss, sql, len, NULL, 0, &r, &e);
     double dt = now_s() - t0;
+    sigaction(SIGINT, &old, NULL);
+    atomic_store_explicit(&g_cancel_ss, NULL, memory_order_relaxed);
     if (rc) {
         print_err("error", &e);
         rn->failures++;
-        return rn->stop_on_error ? rc : 0;
+        /* a cancel stops what remains of the input too: Ctrl-C asked for the run to stop, not for its next statement */
+        return rn->stop_on_error || rc == IMDB_ERR_CANCELLED ? rc : 0;
     }
     imdb_buf out;
     imdb_buf_init(&out);

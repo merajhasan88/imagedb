@@ -87,6 +87,12 @@ CHECKPOINT, COMPACT ... PURGE and ERASE are never refused, and an open always
 succeeds. `SHOW MEMORY` shows what it holds by kind. A query result is capped at
 1 GiB (a quarter of the budget when one is set): add LIMIT.
 
+`SET statement_timeout = MS` stops any statement of the session that runs longer
+(0, the default, is none), and Ctrl-C in `imagedb sql` stops the running statement:
+either fails it with "cancelled", and nothing it did stays (its writes are undone;
+a transaction goes on). COMMIT, CREATE, DROP INDEX, ALTER, CHECKPOINT, COMPACT, ERASE and VERIFY always run
+to their end. From C, `imdb_session_cancel` does the same from another thread.
+
 `--retain-history COMMITS` purges history older than the last COMMITS commits
 automatically, on the primary, with a logged COMPACT ... PURGE that replicas
 replay. It runs once a table has ended at least as many versions as it holds
