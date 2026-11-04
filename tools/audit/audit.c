@@ -3792,8 +3792,93 @@ static int cmd_frames(const char *dir)
     return rc;
 }
 
+/* ---- the format's canonical vectors -------------------------------------------------------------------------- */
+
+/* `imagedb-audit vectors`: the vectors tests/unit/t_vectors.c publishes, derived here by the auditor's own code from
+ * the same fixed inputs, the commit header encoded by hand from design.md §3 (the engine's encoder is not used), so
+ * the unit test compares two derivations that share no code */
+static void pvec(const char *name, const uint8_t *b, size_t n)
+{
+    printf("%s ", name);
+    for (size_t i = 0; i < n; i++) printf("%02x", b[i]);
+    printf("\n");
+}
+
+static int cmd_vectors(void)
+{
+    uint8_t c[3][32], d[32];
+    for (int i = 0; i < 3; i++) {
+        char s[32];
+        int n = snprintf(s, sizeof s, "imagedb vector %d", i + 1);
+        a_sha256(s, (size_t)n, c[i]);
+    }
+    for (uint8_t alg = 1; alg <= 2; alg++) {
+        char nm[48];
+        lt el, acc;
+        uint8_t lanes[2 * LANES];
+        memset(&el, 0, sizeof el);
+        memset(&acc, 0, sizeof acc);
+        lt_add(alg, &el, c[0]);
+        lt_bytes(&el, lanes);
+        a_sha256(lanes, sizeof lanes, d);
+        snprintf(nm, sizeof nm, "alg%u.element.c1", alg);
+        pvec(nm, d, 32);
+        lt_digest(alg, &acc, d);
+        snprintf(nm, sizeof nm, "alg%u.digest.empty", alg);
+        pvec(nm, d, 32);
+        lt_add(alg, &acc, c[0]);
+        lt_digest(alg, &acc, d);
+        snprintf(nm, sizeof nm, "alg%u.digest.c1", alg);
+        pvec(nm, d, 32);
+        lt_add(alg, &acc, c[1]);
+        lt_add(alg, &acc, c[2]);
+        lt_digest(alg, &acc, d);
+        snprintf(nm, sizeof nm, "alg%u.digest.c1c2c3", alg);
+        pvec(nm, d, 32);
+        lt_sub(alg, &acc, c[1]);
+        lt_digest(alg, &acc, d);
+        snprintf(nm, sizeof nm, "alg%u.digest.c1c3", alg);
+        pvec(nm, d, 32);
+    }
+    uint8_t salt[16], g[24], gen[32];
+    for (int i = 0; i < 16; i++) salt[i] = (uint8_t)i;
+    row_commit(7, salt, (const uint8_t *)"imagedb", 7, d);
+    pvec("row", d, 32);
+    memcpy(g, "IMDBGEN1", 8);
+    for (int i = 0; i < 16; i++) g[8 + i] = (uint8_t)(0x10 + i);
+    a_sha256(g, sizeof g, gen);
+    pvec("genesis", gen, 32);
+    /* the header: u8 version 2 | u8 digest algorithm 2 | u64 seq 5 | u64 time | prev[32] | u32 nops 1 |
+     * op 16: u8 16, u32 table 0, u64 retention | the digest of {c_1} by algorithm 2 (99 bytes) */
+    uint8_t h[99], tag_h[8 + 99], hash[32], msg[52];
+    lt one;
+    memset(&one, 0, sizeof one);
+    lt_add(2, &one, c[0]);
+    h[0] = 2;
+    h[1] = 2;
+    put64(h + 2, 5);
+    put64(h + 10, 1700000000000000ull);
+    memcpy(h + 18, gen, 32);
+    put32(h + 50, 1);
+    h[54] = 16;
+    put32(h + 55, 0);
+    put64(h + 59, 86400000000ull);
+    lt_digest(2, &one, h + 67);
+    memcpy(tag_h, "IMDBCHN2", 8);
+    memcpy(tag_h + 8, h, sizeof h);
+    a_sha256(tag_h, sizeof tag_h, hash);
+    pvec("commit", hash, 32);
+    memcpy(msg, "IMDBSIG2", 8);
+    put64(msg + 8, 5);
+    put32(msg + 16, (uint32_t)sizeof h);
+    memcpy(msg + 20, hash, 32);
+    pvec("sigmsg", msg, sizeof msg);
+    return fflush(stdout) == 0 ? 0 : fail("vectors: stdout");
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "vectors") == 0) return cmd_vectors() ? 1 : 0;
     if (argc < 3 || (strcmp(argv[1], "verify") != 0 && strcmp(argv[1], "count") != 0 && strcmp(argv[1], "digest") != 0 &&
                       strcmp(argv[1], "identity") != 0 && strcmp(argv[1], "frames") != 0)) {
         fputs("usage: imagedb-audit verify   <dir> [--anchor FILE]\n"
@@ -3801,6 +3886,7 @@ int main(int argc, char **argv)
               "       imagedb-audit digest   <dir> <table> [col=value]... [--as-of N | --lake]\n"
               "       imagedb-audit identity <dir> [--as-of N | --lake]\n"
               "       imagedb-audit frames   <dir>   (each log segment's frames: their bytes and SHA-256)\n"
+              "       imagedb-audit vectors          (the format's canonical vectors, by the auditor's own code)\n"
               "  (count, digest and identity answer at the latest durable commit unless told otherwise)\n",
               stderr);
         return 2;

@@ -94,6 +94,7 @@ int main(int argc, char **argv)
         {"segcache", segcache_tests, &segcache_ntests},
         {"relay", relay_tests, &relay_ntests},
         {"conc", conc_tests, &conc_ntests},
+        {"vectors", vectors_tests, &vectors_ntests},
         {"backup", backup_tests, &backup_ntests},
         {"expr", expr_tests, &expr_ntests},
         {"cancel", cancel_tests, &cancel_ntests},

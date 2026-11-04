@@ -463,6 +463,7 @@ make fuzz-run    # libFuzzer, 60 s per decoder, seeds from a real database
 make bench       # kernels and engine; sync=0, so commit times are not durable latency
 make whole       # root, a quiet machine: imagedb, SQLite and PostgreSQL at equal durability (docs/bench-2026-10-24.md)
 make oracle      # build/oracle: imagedb's answers against reference engines (tests/oracle)
+build/test_unit vectors   # the format's canonical vectors (fixed inputs), and build/imagedb-audit vectors derives them again
 bash tests/oracle/run.sh build/oracle --seeds 1-100   # root, docker: SQLite, PostgreSQL, MySQL, MariaDB, SQL Server
 build/test_unit review                                 # the regressions of the 2026-10-21 review
 build/test_unit round3                                 # the regressions of the 2026-10-22 review
