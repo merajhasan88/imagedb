@@ -70,6 +70,9 @@ static void t_parser_accepts(void)
         "ERASE SUBJECT 'alice'", "ERASE FROM t WHERE s = 'pii'", "VERIFY", "SHOW TABLES", "SHOW DIGEST",
         "SHOW DIGEST t SUBJECT 2", "SHOW HISTORY t 1", "SHOW LOG 3", "SHOW LAKE", "SET cross_check = on",
         "SELECT * FROM t WHERE id = $1", ";", "",
+        "SELECT * FROM t WHERE a = 1 OR b = 2", "SELECT * FROM t WHERE NOT id = 1", /* OR and NOT since 1c */
+        "SELECT * FROM t WHERE (a = 1 OR NOT b < 2) AND c BETWEEN 1 AND 2 AND d",
+        "SELECT DISTINCT a, b FROM t ORDER BY a DESC NULLS LAST, 2 LIMIT 3 OFFSET 1", "SELECT * FROM t OFFSET 2 LIMIT 1", /* 1d */
     };
     for (size_t i = 0; i < sizeof ok / sizeof *ok; i++) {
         sql_stmt st;
@@ -84,23 +87,21 @@ static void t_parser_accepts(void)
 static void t_parser_rejects(void)
 {
     const char *bad[] = {
-        "SELECT * FROM t WHERE a = 1 OR b = 2",         /* no OR */
         "SELECT * FROM t; DROP TABLE t",                  /* one statement per call */
         "SELECT * FROM \"t\"",                            /* no quoted identifiers */
         "SELECT * FROM t WHERE s = 'unterminated",
         "SELECT * FROM t WHERE id = 1.2.3",
-        "SELECT * FROM t ORDER BY id",
         "CREATE TABLE t (x REAL PRIMARY KEY)",
         "CREATE TABLE t (x INT64)",                       /* no primary key */
         "CREATE TABLE t (x INT64 PRIMARY KEY, y INT64 PRIMARY KEY)",
         "CREATE TABLE select (x INT64 PRIMARY KEY)",       /* reserved word */
-        "INSERT INTO t VALUES (1, -NULL)",                /* a sign needs a number */
+        "INSERT INTO t VALUES (1, -)",                    /* a sign needs an operand (-NULL parses: refused bound) */
         "INSERT INTO t VALUES (1, 2), (3)",               /* ragged rows */
         "SELECT * FROM t WHERE id = $0",
         "SELECT * FROM t WHERE id = $999",
-        "SELECT * FROM t WHERE NOT id = 1",
         "SELEC * FROM t",
         "SELECT * FROM t WHERE id = 1 extra",
+        "SELECT * FROM t ORDER BY", "SELECT * FROM t ORDER BY a NULLS", "SELECT * FROM t LIMIT 1 LIMIT 2",
         "SELECT * FROM t \x01",
         "SELECT * FROM t WHERE s = 'a\xff'",              /* invalid UTF-8 */
     };
@@ -173,7 +174,11 @@ static void t_binding_exact(void)
     CHECK(q("SELECT COUNT(*) FROM t", &r) == 0 && cell_i(&r, 0, 0) == 1);
     imdb_result_free(&r);
     /* comparisons are exact; literals beyond the column precision still compare */
-    CHECK(q("SELECT COUNT(*) FROM t WHERE a > 1234.559 AND a < 99999999.00", &r) == IMDB_ERR_INVALID); /* 3 decimals */
+    /* a literal of more decimals than the column: compared exactly (a residual, 1b), no longer refused */
+    CHECK(q("SELECT COUNT(*) FROM t WHERE a > 1234.559 AND a < 99999999.00", &r) == 0 && cell_i(&r, 0, 0) == 1);
+    imdb_result_free(&r);
+    CHECK(q("SELECT COUNT(*) FROM t WHERE a > 1234.561", &r) == 0 && cell_i(&r, 0, 0) == 0);
+    imdb_result_free(&r);
     CHECK(q("SELECT COUNT(*) FROM t WHERE a > 1234.55 AND a < 99999999.00", &r) == 0 && cell_i(&r, 0, 0) == 1);
     imdb_result_free(&r);
     /* parameters bind with exact types; there is no escaping API to misuse */

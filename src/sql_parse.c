@@ -139,6 +139,8 @@ int imdb_sql_lex(const char *s, size_t n, sql_tok **out, uint32_t *ntok, imdb_er
             case '=': tk->kind = TK_EQ; break;
             case '-': tk->kind = TK_MINUS; break;
             case '+': tk->kind = TK_PLUS; break;
+            case '/': tk->kind = TK_SLASH; break;
+            case '%': tk->kind = TK_PERCENT; break;
             case '.': tk->kind = TK_DOT; break; /* a.col (a number's point is lexed with the number) */
             case '<':
                 if (i + 1 < n && s[i + 1] == '=') tk->kind = TK_LE, tk->len = 2;
@@ -179,6 +181,7 @@ typedef struct parser {
     const sql_tok *t;
     uint32_t n, i;
     imdb_err *e;
+    sql_stmt *st;            /* its expression nodes */
 } parser;
 
 static const char *const kReserved[] = {
@@ -339,39 +342,284 @@ static int uint_lit(parser *p, uint64_t *out)
     return IMDB_OK;
 }
 
+/* ---- expressions (docs/plan-p0.md 1b) ----------------------------------------------------------------------------
+ *   bexpr   := b_and (OR b_and)*                     one ladder, PostgreSQL's (1c): (a + 1) > 2 and (a > 1 OR b < 2)
+ *   b_and   := b_not (AND b_not)*                   both parse through '(' bexpr ')'
+ *   b_not   := NOT b_not | b_cmp
+ *   b_cmp   := aexpr [(= | != | < | <= | > | >=) aexpr | BETWEEN aexpr AND aexpr | IS [NOT] NULL]   (not chained)
+ *   aexpr   := term (('+' | '-') term)*
+ *   term    := unary (('*' | '/' | '%') unary)*
+ *   unary   := ('-' | '+') unary | primary          a sign right before a number is the literal's (INT64_MIN parses)
+ *   primary := literal | $n | [qual.]col | '(' bexpr ')' | COUNT '(' '*' ')' | (COUNT | SUM | MIN | MAX) '(' bexpr ')'
+ * Nodes go into the statement's pool; both the recursion and a tree's height stop at IMDB_MAX_EXPR_DEPTH, so neither
+ * the parser nor the evaluator can be driven deep. Which trees may hold columns or aggregates is the binder's rule. */
+
+static int bexpr(parser *p, uint16_t *out, unsigned depth);
+
+static int ex_new(parser *p, uint8_t op, uint16_t l, uint16_t r, uint16_t *out)
+{
+    sql_stmt *st = p->st;
+    if (st->nex + 1u >= IMDB_MAX_EXPR_NODES)
+        return imdb_fail(p->e, IMDB_ERR_LIMIT, "expressions of more than %u terms in one statement", IMDB_MAX_EXPR_NODES - 1);
+    if (st->nex + 2u > st->capex) {
+        uint16_t nc = st->capex ? (uint16_t)(st->capex * 2) : 16;
+        sql_expr *ne = imdb_realloc_array(st->ex, st->capex, nc, sizeof *ne, p->e);
+        if (!ne) return p->e->code;
+        st->ex = ne;
+        st->capex = nc;
+    }
+    uint16_t k = ++st->nex;
+    sql_expr *x = &st->ex[k];
+    memset(x, 0, sizeof *x);
+    x->op = op;
+    x->l = l;
+    x->r = r;
+    unsigned hl = l ? st->ex[l].h : 0u, hr = r ? st->ex[r].h : 0u, h = hl > hr ? hl : hr;
+    if (h + 1 > IMDB_MAX_EXPR_DEPTH)
+        return imdb_fail(p->e, IMDB_ERR_LIMIT, "an expression nested deeper than %u", IMDB_MAX_EXPR_DEPTH);
+    x->h = (uint8_t)(h + 1);
+    *out = k;
+    return IMDB_OK;
+}
+
+static int too_deep(parser *p)
+{
+    return imdb_fail(p->e, IMDB_ERR_LIMIT, "an expression nested deeper than %u", IMDB_MAX_EXPR_DEPTH);
+}
+
+static int primary(parser *p, uint16_t *out, unsigned depth)
+{
+    if (depth > IMDB_MAX_EXPR_DEPTH) return too_deep(p);
+    if (tok(p, TK_LP)) {
+        if (bexpr(p, out, depth + 1)) return p->e->code; /* (a + 1) and (a > 1 OR b < 2) alike */
+        return expect(p, TK_RP, ")");
+    }
+    uint8_t agg = tok_is_kw(p, p->i, "count") ? AGG_COUNT : tok_is_kw(p, p->i, "sum") ? AGG_SUM
+                : tok_is_kw(p, p->i, "min")   ? AGG_MIN   : tok_is_kw(p, p->i, "max") ? AGG_MAX
+                : tok_is_kw(p, p->i, "avg")   ? AGG_AVG   : AGG_NONE;
+    if (agg && p->t[p->i + 1].kind == TK_LP) { /* p->i is an identifier, not the end: p->i + 1 is a token */
+        p->i += 2;
+        uint16_t a = 0;
+        if (agg == AGG_COUNT && tok(p, TK_STAR)) agg = AGG_COUNT_STAR;
+        else if (bexpr(p, &a, depth + 1)) return p->e->code;
+        if (expect(p, TK_RP, ")") || ex_new(p, EX_AGG, a, 0, out)) return p->e->code;
+        p->st->ex[*out].agg = agg;
+        return IMDB_OK;
+    }
+    const sql_tok *t = &p->t[p->i];
+    if (t->kind == TK_IDENT && !tok_is_kw(p, p->i, "true") && !tok_is_kw(p, p->i, "false") && !tok_is_kw(p, p->i, "null") &&
+        !(tok_is_kw(p, p->i, "timestamp") && p->t[p->i + 1].kind == TK_STR)) {
+        char qual[IMDB_MAX_IDENT + 1], col[IMDB_MAX_IDENT + 1];
+        if (qident(p, qual, col) || ex_new(p, EX_COL, 0, 0, out)) return p->e->code;
+        memcpy(p->st->ex[*out].qual, qual, sizeof qual);
+        memcpy(p->st->ex[*out].col, col, sizeof col);
+        return IMDB_OK;
+    }
+    sql_lit l;
+    if (literal(p, &l) || ex_new(p, EX_LIT, 0, 0, out)) return p->e->code;
+    p->st->ex[*out].lit = l;
+    return IMDB_OK;
+}
+
+static int unary(parser *p, uint16_t *out, unsigned depth)
+{
+    if (depth > IMDB_MAX_EXPR_DEPTH) return too_deep(p);
+    uint8_t k = p->t[p->i].kind;
+    if (k == TK_MINUS || k == TK_PLUS) {
+        uint8_t nk = p->t[p->i + 1].kind; /* the sign is not the end: p->i + 1 is a token */
+        if (nk == TK_INT || nk == TK_DEC || nk == TK_FLOAT) return primary(p, out, depth); /* the literal's sign */
+        p->i++;
+        uint16_t a;
+        if (unary(p, &a, depth + 1)) return p->e->code;
+        if (k == TK_PLUS) {
+            *out = a;
+            return IMDB_OK;
+        }
+        return ex_new(p, EX_NEG, a, 0, out);
+    }
+    return primary(p, out, depth);
+}
+
+static int term(parser *p, uint16_t *out, unsigned depth)
+{
+    if (unary(p, out, depth)) return p->e->code;
+    for (;;) {
+        uint8_t k = p->t[p->i].kind;
+        uint8_t op = k == TK_STAR ? EX_MUL : k == TK_SLASH ? EX_DIV : k == TK_PERCENT ? EX_MOD : 0;
+        if (!op) return IMDB_OK;
+        p->i++;
+        uint16_t r;
+        if (unary(p, &r, depth) || ex_new(p, op, *out, r, out)) return p->e->code;
+    }
+}
+
+static int aexpr(parser *p, uint16_t *out, unsigned depth)
+{
+    if (depth > IMDB_MAX_EXPR_DEPTH) return too_deep(p);
+    if (term(p, out, depth)) return p->e->code;
+    for (;;) {
+        uint8_t k = p->t[p->i].kind;
+        uint8_t op = k == TK_PLUS ? EX_ADD : k == TK_MINUS ? EX_SUB : 0;
+        if (!op) return IMDB_OK;
+        p->i++;
+        uint16_t r;
+        if (term(p, &r, depth) || ex_new(p, op, *out, r, out)) return p->e->code;
+    }
+}
+
+/* bcmp: one comparison, or the operand alone (a BOOL, or no condition: the binder's to say) */
+static int b_cmp(parser *p, uint16_t *out, unsigned depth)
+{
+    if (aexpr(p, out, depth)) return p->e->code;
+    uint8_t op = 0;
+    uint16_t r = 0, x3 = 0;
+    if (kw(p, "is")) {
+        op = kw(p, "not") ? CMP_NOTNULL : CMP_ISNULL;
+        if (expect_kw(p, "null")) return p->e->code;
+    } else if (kw(p, "between")) { /* its AND is its own, not a conjunction's */
+        op = CMP_BETWEEN;
+        if (aexpr(p, &r, depth) || expect_kw(p, "and") || aexpr(p, &x3, depth)) return p->e->code;
+    } else {
+        switch (p->t[p->i].kind) {
+        case TK_EQ: op = CMP_EQ; break;
+        case TK_NE: op = CMP_NE; break;
+        case TK_LT: op = CMP_LT; break;
+        case TK_LE: op = CMP_LE; break;
+        case TK_GT: op = CMP_GT; break;
+        case TK_GE: op = CMP_GE; break;
+        default: return IMDB_OK;
+        }
+        p->i++;
+        if (aexpr(p, &r, depth)) return p->e->code;
+    }
+    uint16_t k;
+    if (ex_new(p, EX_CMP, *out, r, &k)) return p->e->code;
+    sql_expr *x = &p->st->ex[k];
+    x->cmp = op;
+    if (x3) {
+        x->x3 = x3;
+        if (p->st->ex[x3].h + 1u > x->h) x->h = (uint8_t)(p->st->ex[x3].h + 1u);
+        if (x->h > IMDB_MAX_EXPR_DEPTH) return too_deep(p);
+    }
+    *out = k;
+    return IMDB_OK;
+}
+
+static int b_not(parser *p, uint16_t *out, unsigned depth)
+{
+    if (depth > IMDB_MAX_EXPR_DEPTH) return too_deep(p);
+    if (kw(p, "not")) {
+        uint16_t a;
+        if (b_not(p, &a, depth + 1)) return p->e->code;
+        return ex_new(p, EX_NOT, a, 0, out);
+    }
+    return b_cmp(p, out, depth);
+}
+
+static int b_and(parser *p, uint16_t *out, unsigned depth)
+{
+    if (b_not(p, out, depth)) return p->e->code;
+    while (kw(p, "and")) {
+        uint16_t r;
+        if (b_not(p, &r, depth) || ex_new(p, EX_AND, *out, r, out)) return p->e->code;
+    }
+    return IMDB_OK;
+}
+
+static int bexpr(parser *p, uint16_t *out, unsigned depth)
+{
+    if (depth > IMDB_MAX_EXPR_DEPTH) return too_deep(p);
+    if (b_and(p, out, depth)) return p->e->code;
+    while (kw(p, "or")) {
+        uint16_t r;
+        if (b_and(p, &r, depth) || ex_new(p, EX_OR, *out, r, out)) return p->e->code;
+    }
+    return IMDB_OK;
+}
+
+/* a value where a literal stood (SET, VALUES): a literal alone takes no node (a 100,000-row VALUES of literals takes
+ * none), anything else is the tree */
+static int value(parser *p, sql_lit *l)
+{
+    const sql_tok *t = &p->t[p->i];
+    uint8_t k0 = t->kind, k1 = k0 == TK_EOF ? TK_EOF : p->t[p->i + 1].kind;
+    bool lit = k0 == TK_INT || k0 == TK_DEC || k0 == TK_FLOAT || k0 == TK_STR || k0 == TK_PARAM ||
+               ((k0 == TK_MINUS || k0 == TK_PLUS) && (k1 == TK_INT || k1 == TK_DEC || k1 == TK_FLOAT)) ||
+               tok_is_kw(p, p->i, "true") || tok_is_kw(p, p->i, "false") || tok_is_kw(p, p->i, "null") ||
+               (tok_is_kw(p, p->i, "timestamp") && k1 == TK_STR);
+    uint32_t at = p->i;
+    if (lit) {
+        if (literal(p, l)) return p->e->code;
+        uint8_t nk = p->t[p->i].kind; /* the value ends here: a comma, a parenthesis, the end, or SET's WHERE */
+        if (nk == TK_COMMA || nk == TK_RP || nk == TK_SEMI || nk == TK_EOF || tok_is_kw(p, p->i, "where")) return IMDB_OK;
+        p->i = at; /* the literal begins an expression */
+    }
+    uint16_t k;
+    if (bexpr(p, &k, 0)) return p->e->code;
+    if (p->st->ex[k].op == EX_LIT) {
+        *l = p->st->ex[k].lit;
+        return IMDB_OK;
+    }
+    memset(l, 0, sizeof *l);
+    l->kind = LIT_EXPR;
+    l->ex = k;
+    return IMDB_OK;
+}
+
+bool imdb_sql_has_agg(const sql_stmt *st, uint16_t k)
+{
+    if (!k) return false;
+    const sql_expr *x = &st->ex[k];
+    return x->op == EX_AGG || imdb_sql_has_agg(st, x->l) || imdb_sql_has_agg(st, x->r) ||
+           imdb_sql_has_agg(st, x->x3); /* height-bounded */
+}
+
+static uint8_t mirror(uint8_t op)
+{
+    return op == CMP_LT ? CMP_GT : op == CMP_LE ? CMP_GE : op == CMP_GT ? CMP_LT : op == CMP_GE ? CMP_LE : op;
+}
+
+/* one conjunct of WHERE's tree, its top-level ANDs split left to right: today's col op literal where it is one (a
+ * constant op a column flipped into it: an index serves it), keeping its comparison node (nl) for falls_back; any
+ * other (an OR, a NOT, a comparison of trees, a BOOL) a residual tree (lx) */
+static int conjunct(parser *p, sql_stmt *st, uint16_t k)
+{
+    const sql_expr *x = &st->ex[k];
+    if (x->op == EX_AND) /* the height bounds the recursion */
+        return conjunct(p, st, x->l) ? p->e->code : conjunct(p, st, x->r);
+    if (st->nwhere >= IMDB_MAX_PREDICATES)
+        return imdb_fail(p->e, IMDB_ERR_LIMIT, "WHERE has more than %u conditions", IMDB_MAX_PREDICATES);
+    sql_cmp *c = &st->where[st->nwhere++];
+    memset(c, 0, sizeof *c);
+    if (x->op == EX_CMP) {
+        const sql_expr *L = &st->ex[x->l], *R = x->r ? &st->ex[x->r] : NULL, *X3 = x->x3 ? &st->ex[x->x3] : NULL;
+        if (L->op == EX_COL && (!R || R->op == EX_LIT) && (!X3 || X3->op == EX_LIT)) { /* today's form */
+            c->nl = k;
+            c->op = x->cmp;
+            memcpy(c->qual, L->qual, sizeof c->qual);
+            memcpy(c->col, L->col, sizeof c->col);
+            if (R) c->a = R->lit;
+            if (X3) c->b = X3->lit;
+            return IMDB_OK;
+        }
+        if (L->op == EX_LIT && R && R->op == EX_COL && x->cmp != CMP_BETWEEN) { /* 5 < a: a > 5 */
+            c->nl = k;
+            c->op = mirror(x->cmp);
+            memcpy(c->qual, R->qual, sizeof c->qual);
+            memcpy(c->col, R->col, sizeof c->col);
+            c->a = L->lit;
+            return IMDB_OK;
+        }
+    }
+    c->lx = k;
+    return IMDB_OK;
+}
+
 static int preds(parser *p, sql_stmt *st)
 {
-    do {
-        if (st->nwhere >= IMDB_MAX_PREDICATES)
-            return imdb_fail(p->e, IMDB_ERR_LIMIT, "WHERE has more than %u conditions", IMDB_MAX_PREDICATES);
-        sql_cmp *c = &st->where[st->nwhere];
-        if (kw(p, "not")) return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "NOT is not supported; use != or a range");
-        if (qident(p, c->qual, c->col)) return p->e->code;
-        uint8_t k = p->t[p->i].kind;
-        if (kw(p, "is")) {
-            c->op = kw(p, "not") ? CMP_NOTNULL : CMP_ISNULL;
-            if (expect_kw(p, "null")) return p->e->code;
-        } else if (kw(p, "between")) {
-            c->op = CMP_BETWEEN;
-            if (literal(p, &c->a) || expect_kw(p, "and") || literal(p, &c->b)) return p->e->code;
-        } else {
-            switch (k) {
-            case TK_EQ: c->op = CMP_EQ; break;
-            case TK_NE: c->op = CMP_NE; break;
-            case TK_LT: c->op = CMP_LT; break;
-            case TK_LE: c->op = CMP_LE; break;
-            case TK_GT: c->op = CMP_GT; break;
-            case TK_GE: c->op = CMP_GE; break;
-            default: return fail_at(p, "a comparison (= != < <= > >= BETWEEN IS)");
-            }
-            p->i++;
-            if (literal(p, &c->a)) return p->e->code;
-        }
-        st->nwhere++;
-        if (tok_is_kw(p, p->i, "or"))
-            return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "OR is not supported; conditions are joined with AND");
-    } while (kw(p, "and"));
-    return IMDB_OK;
+    uint16_t k;
+    if (bexpr(p, &k, 0)) return p->e->code;
+    return conjunct(p, st, k);
 }
 
 static int col_type(parser *p, imdb_column *c)
@@ -518,7 +766,7 @@ static int parse_insert(parser *p, sql_stmt *st)
                 st->vals = nv;
                 cap = ncap;
             }
-            if (literal(p, &st->vals[at])) return p->e->code;
+            if (value(p, &st->vals[at])) return p->e->code;
             w++;
         } while (tok(p, TK_COMMA));
         if (expect(p, TK_RP, ")")) return p->e->code;
@@ -554,26 +802,30 @@ static int isolation(parser *p, sql_stmt *st)
 static int parse_select(parser *p, sql_stmt *st)
 {
     st->kind = ST_SELECT;
+    st->distinct = kw(p, "distinct");
     if (tok(p, TK_STAR)) {
         st->star = true;
     } else {
         do {
             if (st->nitems >= IMDB_MAX_COLS) return imdb_fail(p->e, IMDB_ERR_LIMIT, "too many select items");
             sql_item *it = &st->items[st->nitems];
-            uint8_t agg = 0;
-            if (tok_is_kw(p, p->i, "count")) agg = AGG_COUNT;
-            else if (tok_is_kw(p, p->i, "sum")) agg = AGG_SUM;
-            else if (tok_is_kw(p, p->i, "min")) agg = AGG_MIN;
-            else if (tok_is_kw(p, p->i, "max")) agg = AGG_MAX;
-            if (agg) {
-                p->i++;
-                if (expect(p, TK_LP, "(")) return p->e->code;
-                if (agg == AGG_COUNT && tok(p, TK_STAR)) agg = AGG_COUNT_STAR;
-                else if (qident(p, it->qual, it->col)) return p->e->code;
-                if (expect(p, TK_RP, ")")) return p->e->code;
-                it->agg = agg;
-            } else if (qident(p, it->qual, it->col)) {
-                return p->e->code;
+            uint32_t from = p->t[p->i].off - (p->t[p->i].kind == TK_STR); /* a string token's span: inside its quotes */
+            uint16_t k;
+            if (bexpr(p, &k, 0)) return p->e->code;
+            it->off = from;
+            it->len = p->t[p->i - 1].off + p->t[p->i - 1].len + (p->t[p->i - 1].kind == TK_STR) - from;
+            const sql_expr *x = &st->ex[k], *a = x->op == EX_AGG && x->l ? &st->ex[x->l] : NULL;
+            if (x->op == EX_COL) { /* today's shapes: a column, an aggregate of a column, COUNT(*) */
+                memcpy(it->qual, x->qual, sizeof it->qual);
+                memcpy(it->col, x->col, sizeof it->col);
+            } else if (x->op == EX_AGG && x->agg != AGG_AVG && (!a || a->op == EX_COL)) { /* AVG: a tree's slot */
+                it->agg = x->agg;
+                if (a) {
+                    memcpy(it->qual, a->qual, sizeof it->qual);
+                    memcpy(it->col, a->col, sizeof it->col);
+                }
+            } else {
+                it->expr = k;
             }
             st->nitems++;
         } while (tok(p, TK_COMMA));
@@ -615,18 +867,51 @@ static int parse_select(parser *p, sql_stmt *st)
         if (expect_kw(p, "by") || qident(p, st->group_qual, st->group_col)) return p->e->code;
         st->has_group = true;
     }
-    if (tok_is_kw(p, p->i, "order"))
-        return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED,
-                         "ORDER BY is not supported: rows are always returned in primary-key order, groups in key order");
-    if (kw(p, "limit")) {
-        st->has_limit = true;
-        if (uint_lit(p, &st->limit)) return p->e->code;
+    if (kw(p, "having")) { /* 1e: a condition over the groups (or the one aggregate row) */
+        if (bexpr(p, &st->having, 0)) return p->e->code;
+    }
+    if (kw(p, "order")) { /* 1d: key [ASC | DESC] [NULLS FIRST | LAST], ...; a bare integer is an item's position */
+        if (expect_kw(p, "by")) return p->e->code;
+        do {
+            if (st->norder >= IMDB_MAX_ORDER)
+                return imdb_fail(p->e, IMDB_ERR_LIMIT, "ORDER BY has more than %u keys", IMDB_MAX_ORDER);
+            uint8_t o = st->norder;
+            const sql_tok *t = &p->t[p->i];
+            uint8_t nk = t->kind == TK_EOF ? TK_EOF : p->t[p->i + 1].kind;
+            if (t->kind == TK_INT && (nk == TK_COMMA || nk == TK_EOF || nk == TK_SEMI || nk == TK_IDENT)) {
+                uint64_t pos;
+                if (uint_lit(p, &pos)) return p->e->code;
+                if (pos < 1 || pos > IMDB_MAX_COLS) return imdb_fail(p->e, IMDB_ERR_INVALID, "ORDER BY %llu: no such item",
+                                                                       (unsigned long long)pos);
+                st->ord_pos[o] = (uint16_t)pos;
+            } else if (bexpr(p, &st->ord_ex[o], 0)) {
+                return p->e->code;
+            }
+            st->ord_desc[o] = kw(p, "desc");
+            if (!st->ord_desc[o]) kw(p, "asc");
+            st->ord_nulls_first[o] = st->ord_desc[o]; /* PostgreSQL's default: NULLs as the largest */
+            if (kw(p, "nulls")) {
+                if (kw(p, "first")) st->ord_nulls_first[o] = true;
+                else if (kw(p, "last")) st->ord_nulls_first[o] = false;
+                else return fail_at(p, "FIRST or LAST after NULLS");
+            }
+            st->norder++;
+        } while (tok(p, TK_COMMA));
+    }
+    for (int k = 0; k < 2; k++) { /* LIMIT n and OFFSET n, in either order, each once */
+        if (!st->has_limit && kw(p, "limit")) {
+            st->has_limit = true;
+            if (uint_lit(p, &st->limit)) return p->e->code;
+        } else if (!st->has_offset && kw(p, "offset")) {
+            st->has_offset = true;
+            if (uint_lit(p, &st->offset)) return p->e->code;
+        }
     }
     if (kw(p, "for")) {
         if (expect_kw(p, "update")) return p->e->code;
         st->for_update = true;
-        bool agg = st->has_group;
-        for (uint16_t i = 0; i < st->nitems; i++) agg = agg || st->items[i].agg != AGG_NONE;
+        bool agg = st->has_group || st->having;
+        for (uint16_t i = 0; i < st->nitems; i++) agg = agg || st->items[i].agg != AGG_NONE || imdb_sql_has_agg(st, st->items[i].expr);
         if (agg || st->has_asof || st->has_join)
             return imdb_fail(p->e, IMDB_ERR_INVALID, "FOR UPDATE locks rows: not with aggregates, GROUP BY, AS OF or a join");
     }
@@ -637,6 +922,9 @@ void imdb_sql_stmt_free(sql_stmt *st)
 {
     imdb_free(st->vals);
     st->vals = NULL;
+    imdb_free(st->ex);
+    st->ex = NULL;
+    st->nex = st->capex = 0;
 }
 
 int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
@@ -645,7 +933,7 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
     sql_tok *t;
     uint32_t nt;
     if (imdb_sql_lex(s, n, &t, &nt, e)) return e->code;
-    parser p = {s, t, nt, 0, e};
+    parser p = {s, t, nt, 0, e, st};
     int rc = IMDB_OK;
     if (nt == 0 || (nt == 1 && t[0].kind == TK_SEMI)) {
         st->kind = ST_EMPTY;
@@ -678,7 +966,7 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
                     break;
                 }
                 if ((rc = ident(&p, st->set_cols[st->nset])) || (rc = expect(&p, TK_EQ, "=")) ||
-                    (rc = literal(&p, &st->set_vals[st->nset])))
+                    (rc = value(&p, &st->set_vals[st->nset])))
                     break;
                 st->nset++;
             } while (tok(&p, TK_COMMA));

@@ -299,7 +299,44 @@ possible.
 
 Types: INT64, DECIMAL, TEXT, BOOL, TIMESTAMP, finite FLOAT64 (exact SUM,
 rounded once) and nullable non-key columns. Comparisons with NULL, including
-NULL parameters, are refused: use IS NULL / IS NOT NULL. The
+NULL parameters, are refused: use IS NULL / IS NOT NULL.
+
+Arithmetic: `+ - * / %`, unary minus and parentheses in SELECT lists, WHERE,
+UPDATE ... SET and VALUES, aggregates included:
+
+```sql
+UPDATE accounts SET balance = balance - 100 WHERE id = 7;
+SELECT region, SUM(qty * price), SUM(qty) * 1.0 / COUNT(*) FROM sales GROUP BY region;
+SELECT id FROM t WHERE a + b > 10;
+```
+
+Every operation is checked: an INT64 overflow, a zero divisor or a DECIMAL past
+38 digits is an error, never a wrapped or silently rounded value. INT64 `/`
+truncates toward zero; a DECIMAL quotient keeps six more decimal places than
+its operands, rounded half away from zero; an INT64 joins a FLOAT64 expression
+only when exact (|v| ≤ 2^53). A computed value stored into a DECIMAL column is
+rounded to its scale; a literal that would round is refused. design.md §5
+("Expressions") has the rules.
+
+Conditions: `AND`, `OR`, `NOT` and parentheses, with SQL's three-valued logic
+(a comparison with a NULL is unknown, and WHERE keeps only what is true);
+comparisons may be SELECT items or a BOOL column's value. Within a condition,
+AND and OR are evaluated left to right and stop once decided, so
+`a = 0 OR 10 / a > 1` does not divide by zero. design.md §5 ("Conditions").
+
+Order: `ORDER BY` expressions or item positions, `ASC`/`DESC` and `NULLS
+FIRST`/`LAST` (NULLs last for ascending keys by default, as in PostgreSQL),
+`OFFSET` and `LIMIT`, and `SELECT DISTINCT`. Without ORDER BY rows come in
+primary-key order (groups in their key's order); with it, that order breaks
+ties, so every result's order is total. design.md §5 ("Order").
+
+Aggregates: `COUNT`, `SUM`, `MIN`, `MAX` and `AVG`, of columns or expressions,
+and `HAVING` over the groups (or over the one aggregate row). `AVG(a)` of an
+INT64 is a DECIMAL with six decimal places, rounded half away from zero, while
+`SUM(a) / COUNT(*)` stays an INT64 division and truncates; of a DECIMAL it keeps
+six more places than the column. design.md §5 ("Aggregates").
+
+The
 lake format is imagedb's own; Parquet, other platforms and the desktop client
 are deferred (deferred.md).
 
@@ -363,7 +400,7 @@ SELECT c.id FROM customers AS c LEFT JOIN orders AS o ON c.id = o.cust WHERE o.i
 - Both tables are read at one snapshot (AS OF too). Each uses its own index or
   scan for its own WHERE predicates; under LEFT a predicate on the second table
   applies after the join, so the third query lists the customers without orders.
-- Rows come in the first table's primary-key order, then the second's, a
+- Without ORDER BY, rows come in the first table's primary-key order, then the second's, a
   NULL-extended row last. Aggregates and GROUP BY work as on one table.
 - Two plans. The hash join (path `join(build 2)`) hashes the second table after
   its own predicates and probes it with the first table's rows. The index
@@ -399,6 +436,8 @@ make ct          # constant-time check of Ed25519 signing (clang MemorySanitizer
 make fuzz-run    # libFuzzer, 60 s per decoder, seeds from a real database
 make bench       # kernels and engine; sync=0, so commit times are not durable latency
 make whole       # root, a quiet machine: imagedb, SQLite and PostgreSQL at equal durability (docs/bench-2026-10-24.md)
+make oracle      # build/oracle: imagedb's answers against reference engines (tests/oracle)
+bash tests/oracle/run.sh build/oracle --seeds 1-100   # root, docker: SQLite, PostgreSQL, MySQL, MariaDB, SQL Server
 build/test_unit review                                 # the regressions of the 2026-10-21 review
 build/test_unit round3                                 # the regressions of the 2026-10-22 review
 bash tests/integration/audit_reject.sh build/imagedb   # cases A-Y
@@ -408,7 +447,10 @@ IMDB_CRASH_OK=1 bash tests/crash/power_cut.sh build/imagedb   # root: real power
 ```
 
 The unit tests use OpenSSL as an independent oracle, and the benchmark driver
-(`make whole`) links SQLite and libpq; the engine links none of them. Current
+(`make whole`) links SQLite and libpq; the engine links none of them. The SQL
+oracle (`make oracle`, tests/oracle) runs the same generated statements on imagedb and on SQLite,
+PostgreSQL, MySQL, MariaDB and SQL Server (the four servers in private containers) and compares every
+answer after normalisation; it links their client libraries, the engine does not. Current
 review results and unavailable validation targets are recorded in
 docs/review-2026-10-22.md. Earlier full matrix runs
 in the plan documents (not published: below) apply to their frozen source versions, not automatically

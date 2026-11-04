@@ -79,9 +79,23 @@ for q in "SELECT COUNT(*), SUM(amount) FROM txns AS OF 3 WHERE user_id = 42 AND 
          "SELECT a.id, b.s FROM t AS a LEFT OUTER JOIN m AS b ON a.id = b.id AS OF 4 WHERE a.u = 42 AND b.s IS NULL LIMIT 3" \
          "SELECT x.u, COUNT(*), MAX(y.s) FROM t AS x INNER JOIN t AS y ON x.u = y.u GROUP BY x.u" \
          "SELECT * FROM t WITH (NOLOCK) JOIN m ON t.id = m.id" "SELECT * FROM t RIGHT JOIN m ON t.id = m.id" \
-         "SET join_plan = index" "SET join_plan = hash" "SET join_plan = nested"; do
+         "SET join_plan = index" "SET join_plan = hash" "SET join_plan = nested" \
+         "UPDATE acct SET balance = balance - 100, n = -(n % 7) WHERE id = 7 AND balance * 2 >= 1.5e0 + \$1" \
+         "SELECT g, SUM(qty * price) / COUNT(*), MAX(a - b) * 1.0, -9223372036854775808 / -1 FROM s GROUP BY g" \
+         "INSERT INTO t VALUES (1 + 2 * 3, (4 - 5) / 6, 0.0000000000000000000000000000000000001 * 10, -(-(1)))" \
+         "SELECT ((((a)))) + 1, b * 2 - c / 3 FROM t WHERE a + b IS NOT NULL AND 7 = id AND g <= -1.25 AND a BETWEEN b * 2 AND c / 3" \
+         "SELECT a > 1 OR NOT k, NOT (b BETWEEN 1 AND 2) FROM t WHERE (a = 0 OR 10 / a > 1) AND NOT (k OR b IS NULL) OR TRUE" \
+         "SELECT DISTINCT g, a * 2 FROM t WHERE a > 0 ORDER BY 2 DESC NULLS FIRST, g ASC NULLS LAST LIMIT 5 OFFSET 2" \
+         "SELECT g, AVG(price), COUNT(*) FROM s GROUP BY g HAVING AVG(qty) > 1.5 OR NOT COUNT(*) < 2 ORDER BY SUM(qty) OFFSET 1" \
+         "SELECT AVG(f) FROM t HAVING COUNT(*) BETWEEN 1 AND 10 OFFSET 0 LIMIT 0"; do
   printf '%s' "$q" > "$OUT/sql/q$i"; i=$((i+1))
 done
+# expr seeds (fuzz_expr.c): type a, type b, scale a, scale b, 16 bytes each, op, a column's type, precision, scale,
+# then a DECIMAL literal's text: INT64_MIN / -1; two 38-digit DECIMALs added; a FLOAT64 by an INT64 past 2^53
+mkdir -p "$OUT/expr"
+printf '\0\0\0\0\0\0\0\0\0\0\0\200\0\0\0\0\0\0\0\0\377\377\377\377\377\377\377\377\377\377\377\377\377\377\377\377\3\0\5\2-12.345' > "$OUT/expr/min-div"
+printf '\1\1\46\46\377\377\377\377\377\377\377\377\377\377\377\377\377\377\377\177\377\377\377\377\377\377\377\377\377\377\377\377\377\377\377\177\0\1\21\2.5' > "$OUT/expr/dec-add"
+printf '\2\100\0\0\0\0\0\0\0\0\360\77\0\0\0\0\0\0\0\0\1\0\0\0\0\0\40\0\0\0\0\0\0\0\0\0\2\2\5\1-0' > "$OUT/expr/flt-int"
 printf '2026-10-20 13:45:00.123456' > "$OUT/codec/ts"; printf -- '-922337203685477.5808' > "$OUT/codec/dec"
 printf '1.7976931348623157e308' > "$OUT/codec/f64max"; printf -- '-4.9e-324' > "$OUT/codec/f64sub"
 printf 'caf\xc3\xa9 \xf0\x9f\x98\x80 \xed\x9f\xbf' > "$OUT/codec/utf8"

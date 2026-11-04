@@ -18,8 +18,11 @@
 #define IMDB_MAX_TOKENS         (1u << 18)   /* tokens in one SQL statement          */
 #define IMDB_MAX_INSERT_ROWS    100000u      /* rows in one INSERT ... VALUES        */
 #define IMDB_MAX_PREDICATES     32u          /* AND-ed comparisons in a WHERE        */
+#define IMDB_MAX_ORDER          16u          /* ORDER BY keys (1d)                   */
 #define IMDB_MAX_PARAMS         256u         /* $n bound parameters                  */
 #define IMDB_MAX_NUMERIC        128u         /* bytes in one numeric literal          */
+#define IMDB_MAX_EXPR_NODES     16384u       /* terms in one statement's expressions (1b; a literal value takes none) */
+#define IMDB_MAX_EXPR_DEPTH     64u          /* an expression's height: the parser's and evaluator's recursion */
 #define IMDB_MAX_OPS_PER_COMMIT (1u << 20)   /* ops in one commit record             */
 #define IMDB_MAX_TXN_BYTES      (768u << 20) /* row bytes one transaction may write (fits a frame) */
 #define IMDB_MAX_TXN_LOCKS      (1u << 20)   /* rows one transaction may select FOR UPDATE */

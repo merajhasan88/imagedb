@@ -15,7 +15,7 @@ NOASM   ?=
 WARN    = -Wall -Wextra -Werror -Wformat=2 -Werror=format-security -Wvla -Wshadow \
           -Wpointer-arith -Wstrict-prototypes -Wmissing-prototypes -Wundef -Wcast-qual \
           -Wimplicit-fallthrough -Wno-unused-parameter
-CFLAGS_BASE = -std=c11 -D_GNU_SOURCE -g -fno-common -fno-strict-overflow -pthread $(WARN)
+CFLAGS_BASE = -std=c11 -D_GNU_SOURCE -g -fno-common -fno-strict-overflow -ffp-contract=off -pthread $(WARN)
 
 ifeq ($(SAN),1)
   BUILD   = build-san
@@ -50,7 +50,7 @@ TSRC    = $(wildcard tests/unit/*.c)
 TOBJ    = $(TSRC:tests/unit/%.c=$(BUILD)/tobj/%.o) $(BUILD)/tobj/acrypto.o $(BUILD)/tobj/afsum.o
 TBIN    = $(BUILD)/test_unit
 
-.PHONY: all lint test unit san tsan ct fuzz fuzz-run bench whole index-sum mem-split join-cost clean integration faults soak
+.PHONY: all lint test unit san tsan ct fuzz fuzz-run bench whole index-sum mem-split join-cost clean integration faults soak oracle
 
 AUDIT   = $(BUILD)/imagedb-audit
 ASRC    = tools/audit/audit.c tools/audit/acrypto.c tools/audit/afsum.c
@@ -174,7 +174,7 @@ san: lint
 
 FUZZ_TARGETS = $(patsubst fuzz/%.c,build-fuzz/%,$(wildcard fuzz/fuzz_*.c))
 FUZZ_ASM     = $(ASMSRC:asm/%.asm=build-fuzz/asm/%.o)
-FUZZ_FLAGS   = -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined \
+FUZZ_FLAGS   = -std=c11 -D_GNU_SOURCE -g -O1 -ffp-contract=off -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined \
                -DIMDB_HAVE_ASM -DIMDB_FUZZ -DIMDB_FE_CHECKS -DIMDB_STORE_CHECKS -Wall -Wextra -Werror -Wno-unused-parameter
 fuzz: $(FUZZ_TARGETS)
 
@@ -189,7 +189,7 @@ build-fuzz/%: fuzz/%.c fuzz/fuzz_common.h $(SRC) $(HDR) $(FUZZ_ASM)
 FUZZ_SECONDS ?= 60
 fuzz-run: fuzz $(BIN) $(FORGE)
 	bash fuzz/make_corpus.sh $(BIN) build-fuzz/corpus
-	@for t in frame stream segment manifest sql codec ed25519 tseg backup; do \
+	@for t in frame stream segment manifest sql codec ed25519 tseg backup expr; do \
 	  mkdir -p build-fuzz/work/$$t; \
 	  if ! $(SANRUN) build-fuzz/fuzz_$$t -max_total_time=$(FUZZ_SECONDS) -print_final_stats=1 -rss_limit_mb=2048 \
 	       -artifact_prefix=build-fuzz/crash-$$t- build-fuzz/work/$$t build-fuzz/corpus/$$t \
@@ -248,6 +248,15 @@ whole: $(WHOLE) $(PROBE) $(DEVSTALL)
 
 # all ten: the five above, then PostgreSQL in a container, MySQL, MariaDB, SQL Server, DuckDB (docker)
 whole-ext: $(WHOLE_EXT) $(PROBE) $(DEVSTALL)
+
+# The SQL oracle (tests/oracle, P0): imagedb against SQLite in process and, through tests/oracle/run.sh, PostgreSQL,
+# MySQL, MariaDB and SQL Server in private containers, every answer compared. Test-only: it links their clients (the
+# user's yes, 2026-11-01); the engine links none of them.
+ORACLE = $(BUILD)/oracle
+$(ORACLE): tests/oracle/oracle.c $(LIB) $(HDR)
+	$(CC) $(CFLAGS) -Wno-missing-prototypes -I /usr/include/postgresql -isystem /usr/include/mysql \
+	  tests/oracle/oracle.c $(LIB) -o $@ $(LDFLAGS) -lsqlite3 -lpq -lmysqlclient -lodbc
+oracle: $(ORACLE)
 	sh bench/whole.sh $(WHOLE_EXT)
 
 # CREATE INDEX measured (docs/bench-2026-10-23.md, the addendum): build/index_sum DIR, a new DIR
@@ -278,7 +287,7 @@ KERNEL_SRC = src/cpu.c src/sha256.c src/sha256x8.c src/chacha20x8.c src/vendor/m
 
 # Data-race check (clang ThreadSanitizer; not part of the four-configuration matrix):
 # the whole unit suite with the C kernels, plus the pool tests on their own.
-TSAN_FLAGS = -std=c11 -D_GNU_SOURCE -g -O1 -fsanitize=thread -fno-omit-frame-pointer -pthread -Wno-deprecated-declarations
+TSAN_FLAGS = -std=c11 -D_GNU_SOURCE -g -O1 -ffp-contract=off -fsanitize=thread -fno-omit-frame-pointer -pthread -Wno-deprecated-declarations
 tsan:
 	mkdir -p build-tsan
 	clang $(TSAN_FLAGS) $(filter-out src/main.c,$(wildcard src/*.c)) $(wildcard src/vendor/monocypher/*.c) \

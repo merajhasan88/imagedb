@@ -9,6 +9,7 @@
 #include "lake.h"
 #include "oidx.h"
 #include "repl.h"
+#include "sha256.h"
 #include "sql_internal.h"
 
 /* ---- results ---------------------------------------------------------------- */
@@ -127,6 +128,9 @@ typedef struct xctx {
     void **allocs;
     uint32_t nallocs, capallocs;
     imdb_salts salts; /* the statement's (db.h): wiped by xfree, the one exit */
+    imdb_xnode *xn;   /* the statement's trees bound (xbind), parallel to st->ex; NULL until one is */
+    const sql_stmt *st;
+    bool fb[IMDB_MAX_PREDICATES]; /* WHERE's plain conjuncts that fell back to residuals (falls_back) */
 } xctx;
 
 static void *xalloc(xctx *x, size_t n, imdb_err *e)
@@ -163,16 +167,19 @@ static int xpin(xctx *x, imdb_value *v, imdb_err *e)
 
 /* ---- binding literals ----------------------------------------------------------- */
 
+static int bind_const_tree(xctx *x, const sql_stmt *st, uint16_t k, const imdb_column *c, imdb_value *out, imdb_err *e);
+
 static int bind_lit(xctx *x, const sql_lit *l, const imdb_column *c, bool compare, imdb_value *out, imdb_err *e)
 {
     memset(out, 0, sizeof *out);
     out->type = c->type;
     out->scale = c->scale;
+    if (l->kind == LIT_EXPR) return bind_const_tree(x, x->st, l->ex, c, out, e); /* VALUES (1 + 2): computed, assigned */
     if (l->kind == LIT_PARAM) {
-        if (l->param > x->nparams) return imdb_fail(e, IMDB_ERR_INVALID, "parameter $%u was not supplied", l->param);
+        if (l->param > x->nparams) return imdb_fail(e, IMDB_ERR_INVALID, "parameter $%u was not supplied", (unsigned)l->param);
         const imdb_value *pv = &x->params[l->param - 1];
         if (pv->type != c->type || (c->type == IMDB_T_DECIMAL && pv->scale != c->scale))
-            return imdb_fail(e, IMDB_ERR_INVALID, "parameter $%u does not have the type of column %s", l->param, c->name);
+            return imdb_fail(e, IMDB_ERR_INVALID, "parameter $%u does not have the type of column %s", (unsigned)l->param, c->name);
         *out = *pv;
     } else {
         char num[IMDB_MAX_NUMERIC + 2];
@@ -229,6 +236,222 @@ static int bind_lit(xctx *x, const sql_lit *l, const imdb_column *c, bool compar
     }
     if (compare && c->type == IMDB_T_DECIMAL) return IMDB_OK; /* ranges may exceed the column precision */
     return imdb_value_check(c, out, e);
+}
+
+/* ---- expressions: binding (docs/plan-p0.md 1b; sql_expr.c computes) ------------------------------------------
+ * Each tree is bound once per statement: its columns resolved, its constants converted, every node's type fixed by
+ * the rules in sql_expr.c, so no row decides a type. Where a tree stands decides what it may read: VALUES takes
+ * constants, SET and WHERE a row's columns, a SELECT list aggregates too (and, grouped, a column outside one only
+ * if it is the GROUP BY column). */
+
+typedef struct xscope {
+    const sql_stmt *st;
+    const imdb_schema *s;    /* the row's columns: one table's, or a join's combined */
+    imdb_table *t;           /* one table's statement (one_col) */
+    imdb_table *const *jt;   /* a join's two (join_col), else NULL */
+    uint16_t nc0;            /* a join: side 0's columns, before side 1's */
+    bool cols, aggs;         /* columns may be read; aggregates may stand */
+    int group_col;           /* grouped: the only column outside an aggregate, else -1 */
+    bool in_agg;
+    uint16_t nslot;          /* aggregates bound so far: each one's accumulator */
+    uint16_t *agg_nodes;     /* a SELECT list's: slot -> its EX_AGG node (IMDB_MAX_COLS of them) */
+} xscope;
+
+static int one_col(const sql_stmt *st, const imdb_table *t, const char *qual, const char *name, imdb_err *e);
+static int join_col(const sql_stmt *st, imdb_table *const t[2], const char *qual, const char *name, int *side, int *col,
+                    imdb_err *e);
+
+static int xnodes(xctx *x, const sql_stmt *st, imdb_err *e)
+{
+    if (!x->xn && !(x->xn = xalloc(x, ((size_t)st->nex + 1) * sizeof *x->xn, e))) return e->code;
+    return IMDB_OK;
+}
+
+/* a literal in a tree: typed by what it is written as (an integer INT64, a point DECIMAL at its scale, an exponent
+ * FLOAT64), not by a column; $n by the value supplied */
+static int bind_xlit(xctx *x, const sql_lit *l, imdb_xval *v, imdb_err *e)
+{
+    memset(v, 0, sizeof *v);
+    if (l->kind == LIT_PARAM) {
+        if (l->param > x->nparams) return imdb_fail(e, IMDB_ERR_INVALID, "parameter $%u was not supplied", (unsigned)l->param);
+        const imdb_value *pv = &x->params[l->param - 1];
+        if (pv->type < IMDB_T_INT64 || pv->type > IMDB_T_FLOAT64 || (pv->type == IMDB_T_DECIMAL && pv->scale > 18))
+            return imdb_fail(e, IMDB_ERR_INVALID, "parameter $%u: not a value of a column type", (unsigned)l->param);
+        imdb_x_from_value(pv, v); /* a NULL keeps its type: NULL + 1 is NULL */
+        return IMDB_OK;
+    }
+    char num[IMDB_MAX_NUMERIC + 2];
+    const char *txt = x->sql + l->off;
+    size_t tl = l->len;
+    if (l->kind == LIT_INT || l->kind == LIT_DEC || l->kind == LIT_FLOAT) {
+        if (tl + 2 > sizeof num) return imdb_fail(e, IMDB_ERR_LIMIT, "numeric literal too long");
+        num[0] = '-';
+        memcpy(num + 1, txt, tl);
+        txt = l->neg ? num : num + 1;
+        tl += l->neg;
+    }
+    int64_t i;
+    switch (l->kind) {
+    case LIT_INT:
+        if (imdb_parse_int64(txt, tl, &i, e)) return e->code;
+        v->type = IMDB_T_INT64;
+        v->i = i;
+        return IMDB_OK;
+    case LIT_DEC: return imdb_x_parse_decimal(txt, tl, v, e);
+    case LIT_FLOAT:
+        if (imdb_parse_float64(txt, tl, &i, e)) return e->code;
+        v->type = IMDB_T_FLOAT64;
+        v->f = imdb_f64_value(i);
+        return IMDB_OK;
+    case LIT_BOOL:
+        v->type = IMDB_T_BOOL;
+        v->i = l->bval;
+        return IMDB_OK;
+    case LIT_TS:
+        if (imdb_parse_timestamp(txt, tl, &i, e)) return e->code;
+        v->type = IMDB_T_TIMESTAMP;
+        v->i = i;
+        return IMDB_OK;
+    case LIT_STR: {
+        uint8_t *buf = xalloc(x, tl, e);
+        if (!buf) return e->code;
+        size_t k = 0;
+        for (size_t j = 0; j < tl; j++) {
+            buf[k++] = (uint8_t)txt[j];
+            if (txt[j] == '\'') j++; /* '' -> ' */
+        }
+        v->type = IMDB_T_TEXT;
+        v->s = buf;
+        v->len = (uint32_t)k;
+        return IMDB_OK;
+    }
+    default: /* LIT_NULL: as a comparison with NULL is refused */
+        return imdb_fail(e, IMDB_ERR_INVALID, "NULL cannot be an operand: the result would always be unknown (use IS NULL)");
+    }
+}
+
+/* node k, if a string literal, read again as a TIMESTAMP (a malformed one is the parse's error) */
+static int ts_lit(xctx *x, const sql_stmt *st, uint16_t k, imdb_err *e)
+{
+    const sql_expr *n = &st->ex[k];
+    if (n->op != EX_LIT || n->lit.kind != LIT_STR) return IMDB_OK;
+    int64_t us;
+    if (imdb_parse_timestamp(x->sql + n->lit.off, n->lit.len, &us, e)) return e->code;
+    imdb_xnode *b = &x->xn[k];
+    memset(&b->k, 0, sizeof b->k);
+    b->k.type = b->type = IMDB_T_TIMESTAMP;
+    b->k.i = us;
+    return IMDB_OK;
+}
+
+static int xbind(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
+{
+    const sql_expr *n = &sc->st->ex[k];
+    imdb_xnode *b = &x->xn[k];
+    switch (n->op) {
+    case EX_LIT:
+        if (bind_xlit(x, &n->lit, &b->k, e)) return e->code;
+        b->type = b->k.type;
+        b->scale = b->k.scale;
+        return IMDB_OK;
+    case EX_COL: {
+        if (!sc->cols) return imdb_fail(e, IMDB_ERR_INVALID, "column %s cannot be read here: VALUES takes constants", n->col);
+        int c, side;
+        if (sc->jt) {
+            if (join_col(sc->st, sc->jt, n->qual, n->col, &side, &c, e)) return e->code;
+            c = side ? sc->nc0 + c : c;
+        } else if ((c = one_col(sc->st, sc->t, n->qual, n->col, e)) < 0) {
+            return c;
+        }
+        if (sc->group_col >= 0 && !sc->in_agg && c != sc->group_col)
+            return imdb_fail(e, IMDB_ERR_INVALID, "column %s must be the GROUP BY column or inside an aggregate", n->col);
+        b->col = (int16_t)c;
+        b->type = sc->s->cols[c].type;
+        b->scale = sc->s->cols[c].scale;
+        return IMDB_OK;
+    }
+    case EX_AGG: {
+        if (!sc->aggs || sc->in_agg)
+            return imdb_fail(e, IMDB_ERR_INVALID, sc->in_agg ? "an aggregate inside an aggregate"
+                                                            : "an aggregate stands only in a SELECT list");
+        b->type = IMDB_T_INT64; /* COUNT */
+        if (n->l) {
+            sc->in_agg = true;
+            int rc = xbind(x, sc, n->l, e);
+            sc->in_agg = false;
+            if (rc) return rc;
+            const imdb_xnode *a = &x->xn[n->l];
+            bool num = a->type == IMDB_T_INT64 || a->type == IMDB_T_DECIMAL || a->type == IMDB_T_FLOAT64;
+            if ((n->agg == AGG_SUM || n->agg == AGG_AVG) && !num)
+                return imdb_fail(e, IMDB_ERR_INVALID, n->agg == AGG_SUM ? "SUM needs an INT64, DECIMAL or FLOAT64 value"
+                                                                      : "AVG needs an INT64, DECIMAL or FLOAT64 value");
+            if (n->agg != AGG_COUNT) b->type = a->type, b->scale = a->scale;
+            if (n->agg == AGG_AVG && a->type != IMDB_T_FLOAT64) { /* 1e: SUM / COUNT by the division rule: six more places */
+                unsigned s = (a->type == IMDB_T_DECIMAL ? a->scale : 0u) + 6u;
+                if (s > IMDB_X_MAX_SCALE)
+                    return imdb_fail(e, IMDB_ERR_LIMIT, "AVG of a DECIMAL past %u decimal places", IMDB_X_MAX_SCALE - 6);
+                b->type = IMDB_T_DECIMAL;
+                b->scale = (uint8_t)s;
+            }
+        }
+        if (sc->nslot >= IMDB_MAX_COLS)
+            return imdb_fail(e, IMDB_ERR_LIMIT, "more than %u aggregates in expressions of one SELECT list", IMDB_MAX_COLS);
+        if (sc->agg_nodes) sc->agg_nodes[sc->nslot] = k;
+        b->slot = sc->nslot++;
+        return IMDB_OK;
+    }
+    case EX_NEG:
+        if (xbind(x, sc, n->l, e)) return e->code;
+        b->type = x->xn[n->l].type;
+        b->scale = x->xn[n->l].scale;
+        if (b->type != IMDB_T_INT64 && b->type != IMDB_T_DECIMAL && b->type != IMDB_T_FLOAT64)
+            return imdb_fail(e, IMDB_ERR_INVALID, "arithmetic takes INT64, DECIMAL and FLOAT64 values");
+        return IMDB_OK;
+    case EX_CMP: { /* a BOOL (1c): the operands comparable (two numbers, or one type), never converted */
+        b->type = IMDB_T_BOOL;
+        if (xbind(x, sc, n->l, e)) return e->code;
+        if (n->cmp == CMP_ISNULL || n->cmp == CMP_NOTNULL) return IMDB_OK;
+        uint16_t ops[2] = {n->r, n->x3};
+        for (int i = 0; i < (n->cmp == CMP_BETWEEN ? 2 : 1); i++) {
+            if (xbind(x, sc, ops[i], e)) return e->code;
+            /* a string literal against a TIMESTAMP is a timestamp, as against a TIMESTAMP column in today's form
+             * (ts >= '2026-01-01' OR k): read as one, never compared as text */
+            if (x->xn[n->l].type == IMDB_T_TIMESTAMP && ts_lit(x, sc->st, ops[i], e)) return e->code;
+            if (x->xn[ops[i]].type == IMDB_T_TIMESTAMP && ts_lit(x, sc->st, n->l, e)) return e->code;
+            uint8_t ta = x->xn[n->l].type, tb = x->xn[ops[i]].type;
+            if (!imdb_x_comparable(ta, tb))
+                return imdb_fail(e, IMDB_ERR_INVALID, "a comparison of %s with %s: values are not converted",
+                                 imdb_type_name(ta), imdb_type_name(tb));
+            if (ta == IMDB_T_BOOL && n->cmp != CMP_EQ && n->cmp != CMP_NE) /* as a BOOL column's own predicates */
+                return imdb_fail(e, IMDB_ERR_INVALID, "BOOL values support only = and !=");
+        }
+        return IMDB_OK;
+    }
+    case EX_AND:
+    case EX_OR:
+    case EX_NOT:
+        b->type = IMDB_T_BOOL;
+        for (int i = 0; i < (n->op == EX_NOT ? 1 : 2); i++) {
+            uint16_t o = i ? n->r : n->l;
+            if (xbind(x, sc, o, e)) return e->code;
+            if (x->xn[o].type != IMDB_T_BOOL)
+                return imdb_fail(e, IMDB_ERR_INVALID, "AND, OR and NOT take conditions: comparisons, IS NULL or BOOL values");
+        }
+        return IMDB_OK;
+    default:
+        if (xbind(x, sc, n->l, e) || xbind(x, sc, n->r, e)) return e->code;
+        return imdb_x_type(n->op, x->xn[n->l].type, x->xn[n->l].scale, x->xn[n->r].type, x->xn[n->r].scale, &b->type,
+                           &b->scale, e);
+    }
+}
+
+/* a tree of constants (VALUES) bound, computed and stored by assignment into column c */
+static int bind_const_tree(xctx *x, const sql_stmt *st, uint16_t k, const imdb_column *c, imdb_value *out, imdb_err *e)
+{
+    xscope sc = {.st = st, .group_col = -1};
+    imdb_xval v;
+    if (xnodes(x, st, e) || xbind(x, &sc, k, e) || imdb_x_eval(st, x->xn, k, NULL, NULL, &v, e)) return e->code;
+    return imdb_x_assign(c, &v, out, e);
 }
 
 /* ---- predicates ------------------------------------------------------------------ */
@@ -359,13 +582,22 @@ static int bind_pred(xctx *x, const sql_cmp *c, int col, bool post, qspec *q, im
     return IMDB_OK;
 }
 
+static bool falls_back(const sql_cmp *c, const imdb_column *cd);
+
 static int bind_preds(xctx *x, const sql_stmt *st, qspec *q, imdb_err *e)
 {
     q->pk_pred = q->subj_pred = q->ord_pred = -1;
     for (uint16_t i = 0; i < st->nwhere; i++) {
+        if (st->where[i].lx) continue; /* a tree's: the sink's (bind_resid) */
         int col = one_col(st, q->t, st->where[i].qual, st->where[i].col, e);
         if (col < 0) return col;
-        if (bind_pred(x, &st->where[i], col, false, q, e)) return e->code;
+        uint16_t np = q->np;
+        if (bind_pred(x, &st->where[i], col, false, q, e)) {
+            if (!falls_back(&st->where[i], &q->t->s.cols[col])) return e->code;
+            q->np = np; /* the literal is another numeric kind: a residual (bind_resid) */
+            x->fb[i] = true;
+            imdb_err_clear(e);
+        }
     }
     choose_ordered(q, -1);
     return IMDB_OK;
@@ -410,6 +642,77 @@ typedef struct agg_acc {
     imdb_value mn, mx;
 } agg_acc;
 
+/* an aggregate inside a tree item (an EX_AGG node's slot): its argument is a tree, its values expression values */
+typedef struct xacc {
+    uint64_t count;
+    __int128 sum;            /* INT64, DECIMAL at the argument's scale: checked under 10^38 */
+    imdb_fsum fsum;          /* FLOAT64, exact */
+    bool has;
+    imdb_xval mn, mx;        /* never a pointer into a row: a tree's TEXT is a literal's or a parameter's */
+} xacc;
+
+static int xacc_add(xacc *a, uint8_t agg, const imdb_xval *v, imdb_err *e)
+{
+    if (agg == AGG_COUNT_STAR) {
+        a->count++;
+        return IMDB_OK;
+    }
+    if (v->null) return IMDB_OK;
+    a->count++;
+    bool sum = agg == AGG_SUM || agg == AGG_AVG; /* AVG: the same sum, divided at the end (1e) */
+    if (sum && v->type == IMDB_T_FLOAT64) {
+        if (imdb_fsum_add(&a->fsum, imdb_f64_key(v->f), e)) return e->code;
+    } else if (sum) {
+        const __int128 lim = (__int128)10000000000000000000ull * 10000000000000000000ull; /* 10^38 */
+        if (__builtin_add_overflow(a->sum, v->i, &a->sum) || a->sum >= lim || a->sum <= -lim)
+            return imdb_fail(e, IMDB_ERR_LIMIT, agg == AGG_AVG ? "an AVG's sum of more than 38 digits" : "a SUM of more than 38 digits");
+    } else if (agg == AGG_MIN || agg == AGG_MAX) {
+        if (!a->has || imdb_x_cmp(v, &a->mn) < 0) a->mn = *v;
+        if (!a->has || imdb_x_cmp(v, &a->mx) > 0) a->mx = *v;
+    }
+    a->has = true;
+    return IMDB_OK;
+}
+
+/* an accumulator's final value, typed as the node was bound (an AVG's sum by its argument's type, ta and sa) */
+static int xacc_value(xacc *a, uint8_t agg, const imdb_xnode *b, uint8_t ta, uint8_t sa, imdb_xval *out, imdb_err *e)
+{
+    memset(out, 0, sizeof *out);
+    out->type = b->type;
+    out->scale = b->scale;
+    if (agg == AGG_COUNT_STAR || agg == AGG_COUNT) {
+        out->i = (__int128)a->count;
+        return IMDB_OK;
+    }
+    if (!a->has) {
+        out->null = true;
+        return IMDB_OK;
+    }
+    if (agg == AGG_AVG) { /* SUM / COUNT once, by the division rule (sql_expr.c): DECIMAL six places past, or FLOAT64 */
+        imdb_xval s = {.type = ta, .scale = sa}, n = {.type = IMDB_T_INT64, .i = (__int128)a->count};
+        if (ta == IMDB_T_FLOAT64) {
+            int64_t key;
+            if (imdb_fsum_result(&a->fsum, &key, e)) return e->code;
+            s.f = imdb_f64_value(key);
+        } else {
+            s.i = a->sum;
+        }
+        return imdb_x_arith(EX_DIV, &s, &n, b->type, b->scale, out, e);
+    }
+    if (agg != AGG_SUM) {
+        *out = agg == AGG_MIN ? a->mn : a->mx;
+        return IMDB_OK;
+    }
+    if (b->type != IMDB_T_FLOAT64) {
+        out->i = a->sum;
+        return IMDB_OK;
+    }
+    int64_t key;
+    if (imdb_fsum_result(&a->fsum, &key, e)) return e->code;
+    out->f = imdb_f64_value(key);
+    return IMDB_OK;
+}
+
 typedef struct group {
     imdb_value key;
 } group;
@@ -437,7 +740,87 @@ typedef struct sink {
     int err;
     imdb_err *e;
     struct jctx *j;          /* SINK_JBUILD, SINK_JPROBE, SINK_JOUTER, SINK_JINNER: the join they feed */
+    uint16_t resid[IMDB_MAX_PREDICATES]; /* WHERE's tree conjuncts (st->where), tested on every row fed: the one door */
+    uint16_t nresid;
+    bool trees;              /* a SELECT item is a tree: no path that answers without the rows (fast_aggregate,
+                              * ordered_only) */
+    uint16_t nxa;            /* the trees' aggregates: slot s is node xa_node[s], its accumulator xa[s] (grouped: */
+    uint16_t xa_node[IMDB_MAX_COLS]; /* gxa[g * nxa + s]) */
+    xacc *xa;                /* allocated only when a tree holds one (xalloc): a sink lives on the caller's stack */
+    xacc *gxa;
 } sink;
+
+/* every tree aggregate of a row: its argument computed, then accumulated */
+static int xa_row(sink *k, xacc *acc, const imdb_value *vals)
+{
+    const sql_stmt *st = k->st;
+    for (uint16_t s = 0; s < k->nxa; s++) {
+        const sql_expr *n = &st->ex[k->xa_node[s]];
+        imdb_xval v = {.null = false};
+        if (n->agg != AGG_COUNT_STAR && imdb_x_eval(st, k->x->xn, n->l, vals, NULL, &v, k->e)) return k->e->code;
+        if (xacc_add(&acc[s], n->agg, &v, k->e)) return k->e->code;
+    }
+    return IMDB_OK;
+}
+
+/* a residual's boolean tree: a tree conjunct's own, or today's form's comparison node when it fell back */
+static uint16_t cmp_root(const sql_cmp *c) { return c->lx ? c->lx : c->nl; }
+
+/* col op literal whose literal is a number of another kind than its numeric column's (1.25 for an INT64, 1.005 for a
+ * DECIMAL of scale 2, 2.5e0 for either): compared exactly as a tree, as col + 0 op 1.25 is (a residual: no index
+ * serves it), where binding the literal to the column's type would refuse it. Nothing is converted. */
+static bool falls_back(const sql_cmp *c, const imdb_column *cd)
+{
+    bool num_a = c->a.kind == LIT_INT || c->a.kind == LIT_DEC || c->a.kind == LIT_FLOAT;
+    bool num_b = c->op != CMP_BETWEEN || c->b.kind == LIT_INT || c->b.kind == LIT_DEC || c->b.kind == LIT_FLOAT;
+    return !c->lx && c->nl && c->op != CMP_ISNULL && c->op != CMP_NOTNULL && num_a && num_b &&
+           (cd->type == IMDB_T_INT64 || cd->type == IMDB_T_DECIMAL || cd->type == IMDB_T_FLOAT64);
+}
+
+/* WHERE's residual conjuncts ri[0..n) on a row: *ok when every one is TRUE (FALSE and UNKNOWN are not), in WHERE's
+ * order, each tree three-valued and left to right (sql_expr.c). A row reaches them only past every bound predicate,
+ * on any path, and the tree fixes what is computed, so whether an operation fails (a zero divisor) never depends on
+ * the plan. */
+static int resid_ok(const xctx *x, const sql_stmt *st, const uint16_t *ri, uint16_t n, const imdb_value *row, bool *ok,
+                    imdb_err *e)
+{
+    *ok = false;
+    for (uint16_t i = 0; i < n; i++) {
+        imdb_xval v;
+        if (imdb_x_eval(st, x->xn, cmp_root(&st->where[ri[i]]), row, NULL, &v, e)) return e->code;
+        if (!imdb_x_true(&v)) return IMDB_OK;
+    }
+    *ok = true;
+    return IMDB_OK;
+}
+
+/* WHERE's residual conjuncts bound to the row a scope reads (each a condition), their indexes into out */
+static int bind_resid(xctx *x, xscope *sc, uint16_t *out, uint16_t *n, imdb_err *e)
+{
+    const sql_stmt *st = sc->st;
+    *n = 0;
+    for (uint16_t i = 0; i < st->nwhere; i++) {
+        const sql_cmp *c = &st->where[i];
+        if (!c->lx && !x->fb[i]) continue;
+        uint16_t k = cmp_root(c);
+        if (xnodes(x, st, e) || xbind(x, sc, k, e)) return e->code;
+        if (x->xn[k].type != IMDB_T_BOOL)
+            return imdb_fail(e, IMDB_ERR_INVALID, "WHERE takes a condition: a comparison, IS NULL, AND, OR, NOT or a BOOL");
+        out[(*n)++] = i;
+    }
+    return IMDB_OK;
+}
+
+/* the columns a tree reads, marked in use[c - off] for c in [off, off + n) */
+static void x_cols(const sql_stmt *st, const imdb_xnode *xn, uint16_t k, bool *use, int off, int n)
+{
+    if (!k) return;
+    const sql_expr *x = &st->ex[k];
+    if (x->op == EX_COL && xn[k].col >= off && xn[k].col < off + n) use[xn[k].col - off] = true;
+    x_cols(st, xn, x->l, use, off, n); /* height-bounded */
+    x_cols(st, xn, x->r, use, off, n);
+    x_cols(st, xn, x->x3, use, off, n);
+}
 
 static void join_build_row(sink *k, uint64_t vid, const imdb_value *vals);
 static void join_probe_row(sink *k, uint64_t vid, const imdb_value *vals);
@@ -465,6 +848,14 @@ static int acc_add(agg_acc *a, uint8_t agg, const imdb_value *v, imdb_err *e)
 static void sink_row(sink *k, uint64_t vid, const imdb_value *vals)
 {
     if (k->err) return;
+    if (k->nresid) {
+        bool ok;
+        if (resid_ok(k->x, k->st, k->resid, k->nresid, vals, &ok, k->e)) {
+            k->err = k->e->code;
+            return;
+        }
+        if (!ok) return;
+    }
     switch (k->mode) {
     case SINK_VIDS:
         if (k->nvids == k->capvids) {
@@ -481,12 +872,14 @@ static void sink_row(sink *k, uint64_t vid, const imdb_value *vals)
         return;
     case SINK_AGG:
         for (uint16_t i = 0; i < k->st->nitems; i++) {
+            if (k->st->items[i].expr) continue; /* a tree: its aggregates are slots (xa_row) */
             int c = k->item_col[i];
             if (acc_add(&k->acc[i], k->st->items[i].agg, c >= 0 ? &vals[c] : NULL, k->e)) {
                 k->err = k->e->code;
                 return;
             }
         }
+        if (k->nxa && xa_row(k, k->xa, vals)) k->err = k->e->code;
         return;
     case SINK_JBUILD: join_build_row(k, vid, vals); return;
     case SINK_JPROBE: join_probe_row(k, vid, vals); return;
@@ -528,11 +921,20 @@ static void sink_row(sink *k, uint64_t vid, const imdb_value *vals)
                     return;
                 }
                 k->gacc = na;
+                if (k->nxa) {
+                    xacc *nx = imdb_realloc_array(k->gxa, k->capgroups * k->nxa, nc * k->nxa, sizeof *nx, k->e);
+                    if (!nx) {
+                        k->err = k->e->code;
+                        return;
+                    }
+                    k->gxa = nx;
+                }
                 k->capgroups = nc;
             }
             g = k->ngroups++;
             memset(&k->groups[g], 0, sizeof k->groups[g]);
             memset(&k->gacc[g * ni], 0, sizeof *k->gacc * ni);
+            if (k->nxa) memset(&k->gxa[g * k->nxa], 0, sizeof *k->gxa * k->nxa);
             k->groups[g].key = *key;
             if (key->null) {
                 k->has_null_group = true;
@@ -550,6 +952,7 @@ static void sink_row(sink *k, uint64_t vid, const imdb_value *vals)
                 return;
             }
         }
+        if (k->nxa && xa_row(k, &k->gxa[g * k->nxa], vals)) k->err = k->e->code;
         return;
     }
     }
@@ -568,9 +971,12 @@ static void sink_free(sink *k)
 {
     for (uint16_t i = 0; i < IMDB_MAX_COLS; i++) imdb_fsum_free(&k->acc[i].fsum);
     for (uint64_t i = 0; k->gacc && k->st && i < k->ngroups * k->st->nitems; i++) imdb_fsum_free(&k->gacc[i].fsum);
+    for (uint16_t s = 0; k->xa && s < k->nxa; s++) imdb_fsum_free(&k->xa[s].fsum); /* xa itself: the statement's */
+    for (uint64_t i = 0; k->gxa && i < k->ngroups * k->nxa; i++) imdb_fsum_free(&k->gxa[i].fsum);
     imdb_free(k->vids);
     imdb_free(k->groups);
     imdb_free(k->gacc);
+    imdb_free(k->gxa);
     if (k->gmap.slots) imdb_hmap_free(&k->gmap);
 }
 
@@ -743,7 +1149,7 @@ static bool s_is_f64(const imdb_table *t, int col) { return t->s.cols[col].type 
 
 static bool fast_aggregate(const sink *k)
 {
-    if (k->mode != SINK_AGG) return false;
+    if (k->mode != SINK_AGG || k->nresid || k->trees) return false;
     for (uint16_t i = 0; i < k->st->nitems; i++) {
         uint8_t a = k->st->items[i].agg;
         if (a == AGG_SUM || a == AGG_COUNT || a == AGG_COUNT_STAR) continue;
@@ -769,7 +1175,7 @@ static bool in_key(const imdb_table *t, const imdb_index *ix, int col)
  * from the key. */
 static bool ordered_only(const qspec *q, const sink *k)
 {
-    if (q->ord_pred < 0 || q->all_versions) return false;
+    if (q->ord_pred < 0 || q->all_versions || k->nresid || k->trees) return false; /* a tree reads the row */
     const imdb_table *t = q->t;
     const imdb_index *ix = q->ord_idx;
     if (k->mode != SINK_AGG && !(k->mode == SINK_GROUP && in_key(t, ix, k->gcol))) return false;
@@ -1053,6 +1459,135 @@ static int cmp_u64(const void *a, const void *b)
     return x < y ? -1 : x > y;
 }
 
+/* ---- ORDER BY, OFFSET, DISTINCT (P0 1d) --------------------------------------------------------------------------
+ * Rows are first in the default order (the primary key's; groups by their key; a join's pairs by both keys), then
+ * sorted by ORDER BY's keys, the default order breaking every tie, so any order is total and no plan changes it. */
+
+typedef struct ordctx {
+    const sql_stmt *st;
+    const imdb_xval *keys;   /* rows x st->norder, row i's in the default order's place i */
+} ordctx;
+
+static int cmp_order(const void *pa, const void *pb, void *arg)
+{
+    const ordctx *c = arg;
+    uint64_t a = *(const uint64_t *)pa, b = *(const uint64_t *)pb, nk = c->st->norder;
+    for (uint8_t o = 0; o < nk; o++) {
+        const imdb_xval *x = &c->keys[a * nk + o], *y = &c->keys[b * nk + o];
+        if (x->null || y->null) {
+            if (x->null == y->null) continue;
+            int r = x->null ? 1 : -1; /* NULLs last, or first: whatever the direction */
+            return c->st->ord_nulls_first[o] ? -r : r;
+        }
+        int r = imdb_x_cmp(x, y); /* one type per key (bound), or two numbers */
+        if (r) return c->st->ord_desc[o] ? -r : r;
+    }
+    return a < b ? -1 : a > b;
+}
+
+/* a built cell as a value (TEXT points into r's text: read only once every row is built) */
+static void cell_x(const imdb_result *r, const imdb_cell *c, imdb_xval *v)
+{
+    memset(v, 0, sizeof *v);
+    v->type = c->v.type;
+    v->scale = c->v.scale;
+    v->null = c->null;
+    if (c->null) return;
+    if (c->wide) v->i = c->i128;
+    else if (c->v.type == IMDB_T_FLOAT64) v->f = imdb_f64_value(c->v.i);
+    else if (c->v.type == IMDB_T_TEXT) v->s = r->text.p + c->v.i, v->len = c->v.len;
+    else v->i = c->v.i;
+}
+
+/* a built row's identity for DISTINCT: SHA-256 of its cells (NULL, type, scale, the value as __int128 or its bytes) */
+static void row_digest(const imdb_result *r, const imdb_cell *row, uint8_t out[IMDB_HASH_LEN])
+{
+    imdb_sha256_ctx h;
+    imdb_sha256_init(&h);
+    for (uint16_t i = 0; i < r->ncols; i++) {
+        const imdb_cell *c = &row[i];
+        uint8_t tag[3] = {c->null, c->v.type, c->v.scale};
+        imdb_sha256_update(&h, tag, sizeof tag);
+        if (c->null) continue;
+        if (c->v.type == IMDB_T_TEXT) {
+            uint32_t n = c->v.len;
+            imdb_sha256_update(&h, &n, sizeof n);
+            imdb_sha256_update(&h, r->text.p + c->v.i, n);
+        } else {
+            __int128 v = c->wide ? c->i128 : (__int128)c->v.i; /* a FLOAT64's key: one per value (-0.0 is 0.0) */
+            imdb_sha256_update(&h, &v, sizeof v);
+        }
+    }
+    imdb_sha256_final(&h, out);
+}
+
+/* the rows a result keeps once ordered: OFFSET's skipped, DISTINCT's repeats taken back, LIMIT's end */
+typedef struct window {
+    uint64_t skip, left;     /* OFFSET still to skip; LIMIT still to keep (UINT64_MAX: none) */
+    bool distinct;
+    imdb_hmap seen;          /* DISTINCT: the kept rows' digests */
+} window;
+
+static int window_init(window *w, const sql_stmt *st, imdb_err *e)
+{
+    memset(w, 0, sizeof *w);
+    w->skip = st->has_offset ? st->offset : 0;
+    w->left = st->has_limit ? st->limit : UINT64_MAX;
+    w->distinct = st->distinct;
+    return w->distinct ? imdb_hmap_init(&w->seen, IMDB_T_TEXT, e) : IMDB_OK;
+}
+
+static void window_free(window *w)
+{
+    if (w->seen.slots) imdb_hmap_free(&w->seen);
+}
+
+/* the row just put at r's end, whose text began at tl: kept, or taken back with its text */
+static int window_take(window *w, imdb_result *r, size_t tl, imdb_err *e)
+{
+    if (w->distinct) {
+        uint8_t d[IMDB_HASH_LEN];
+        row_digest(r, &r->cells[(r->nrows - 1) * r->ncols], d);
+        imdb_value key = {.type = IMDB_T_TEXT, .s = d, .len = sizeof d};
+        if (imdb_hmap_get(&w->seen, &key)) goto back;
+        if (imdb_hmap_put(&w->seen, &key, 0, e)) return e->code;
+    }
+    if (w->skip) {
+        w->skip--;
+        goto back;
+    }
+    w->left--;
+    return IMDB_OK;
+back:
+    r->nrows--;
+    r->text.len = tl;
+    return IMDB_OK;
+}
+
+/* a row statement's ORDER BY key o on a row (a table's, or a join's combined): its tree, or the item at its position */
+static int order_key(xctx *x, const sql_stmt *st, const sink *k, uint8_t o, const imdb_value *vals, imdb_xval *out,
+                     imdb_err *e)
+{
+    if (!st->ord_pos[o]) return imdb_x_eval(st, x->xn, st->ord_ex[o], vals, NULL, out, e);
+    uint16_t p = (uint16_t)(st->ord_pos[o] - 1);
+    if (st->star) imdb_x_from_value(&vals[p], out);
+    else if (st->items[p].expr) return imdb_x_eval(st, x->xn, st->items[p].expr, vals, NULL, out, e);
+    else imdb_x_from_value(&vals[k->item_col[p]], out);
+    return IMDB_OK;
+}
+
+/* the sort's keys, n rows x nk keys, under the result's cap as a join's working set is (join_charge) */
+static imdb_xval *order_keys_alloc(const imdb_result *r, const sql_stmt *st, uint64_t n, imdb_err *e)
+{
+    uint64_t cap = r->byte_cap ? r->byte_cap : IMDB_MAX_RESULT_BYTES;
+    if (n && (uint64_t)st->norder * sizeof(imdb_xval) > cap / n) {
+        imdb_fail(e, IMDB_ERR_LIMIT, "ORDER BY over %llu rows: the sort's keys pass the result's cap of %llu bytes; narrow it",
+                  (unsigned long long)n, (unsigned long long)cap);
+        return NULL;
+    }
+    return imdb_alloc_array(n ? n * st->norder : 1, sizeof(imdb_xval), e);
+}
+
 static int put_agg(imdb_result *r, imdb_cell *c, agg_acc *a, uint8_t agg, const imdb_column *col, imdb_err *e)
 {
     switch (agg) {
@@ -1087,6 +1622,83 @@ static int put_agg(imdb_result *r, imdb_cell *c, agg_acc *a, uint8_t agg, const 
     return IMDB_OK;
 }
 
+/* the tree reads a column outside any aggregate */
+static bool ex_reads(const sql_stmt *st, uint16_t k)
+{
+    if (!k) return false;
+    const sql_expr *x = &st->ex[k];
+    if (x->op == EX_COL) return true;
+    if (x->op == EX_AGG) return false;
+    return ex_reads(st, x->l) || ex_reads(st, x->r) || ex_reads(st, x->x3); /* height-bounded */
+}
+
+/* a tree item bound into the statement's sink: its aggregates become slots (xa_row); an aggregate item when it
+ * holds one, a plain one when it reads a column outside one (grouped: the GROUP BY column alone, xbind's rule); a
+ * tree of constants is neither and stands beside either */
+static int bind_item(xctx *x, sink *k, xscope *si, uint16_t root, bool *any_agg, bool *any_plain, imdb_err *e)
+{
+    k->trees = true;
+    if (xnodes(x, si->st, e) || xbind(x, si, root, e)) return e->code;
+    if (imdb_sql_has_agg(si->st, root)) *any_agg = true;
+    else if (ex_reads(si->st, root)) *any_plain = true;
+    return IMDB_OK;
+}
+
+/* under DISTINCT, an ORDER BY tree must be a select item: a bare column the list names (or any, under SELECT *) */
+static bool distinct_key(const sql_stmt *st, uint16_t k)
+{
+    const sql_expr *n = &st->ex[k];
+    if (n->op != EX_COL) return false;
+    if (st->star) return true;
+    for (uint16_t i = 0; i < st->nitems; i++) {
+        const sql_item *it = &st->items[i];
+        if (!it->expr && it->agg == AGG_NONE && !strcmp(it->col, n->col) &&
+            (!it->qual[0] || !n->qual[0] || !strcmp(it->qual, n->qual)))
+            return true;
+    }
+    return false;
+}
+
+/* ORDER BY's keys bound with the SELECT list's scope (a key may hold aggregates where an item may, and its columns
+ * count as an item's do); a position within the list (nout items, or the columns under SELECT *) */
+static int bind_order(xctx *x, const sql_stmt *st, sink *k, xscope *si, uint16_t nout, bool *any_agg, bool *any_plain,
+                      imdb_err *e);
+
+static int alloc_xa(xctx *x, sink *k, const xscope *si, imdb_err *e)
+{
+    k->nxa = si->nslot;
+    if (k->nxa && !(k->xa = xalloc(x, k->nxa * sizeof *k->xa, e))) return e->code;
+    return IMDB_OK;
+}
+
+static int bind_order(xctx *x, const sql_stmt *st, sink *k, xscope *si, uint16_t nout, bool *any_agg, bool *any_plain,
+                      imdb_err *e)
+{
+    for (uint8_t o = 0; o < st->norder; o++) {
+        if (st->ord_pos[o]) {
+            if (st->ord_pos[o] > nout)
+                return imdb_fail(e, IMDB_ERR_INVALID, "ORDER BY %u: the SELECT list has %u items", (unsigned)st->ord_pos[o],
+                                 (unsigned)nout);
+            continue;
+        }
+        if (st->distinct && !distinct_key(st, st->ord_ex[o]))
+            return imdb_fail(e, IMDB_ERR_INVALID, "with DISTINCT, ORDER BY names select items: a position, or a column the list names");
+        if (bind_item(x, k, si, st->ord_ex[o], any_agg, any_plain, e)) return e->code;
+    }
+    return IMDB_OK;
+}
+
+/* HAVING (1e): a condition with the SELECT list's scope (aggregates, and the GROUP BY column outside them), applied to
+ * each group, or to the one aggregate row, before DISTINCT, ORDER BY and the window (materialize) */
+static int bind_having(xctx *x, const sql_stmt *st, sink *k, xscope *si, bool *any_agg, bool *any_plain, imdb_err *e)
+{
+    if (!st->having) return IMDB_OK;
+    if (bind_item(x, k, si, st->having, any_agg, any_plain, e)) return e->code;
+    if (x->xn[st->having].type != IMDB_T_BOOL)
+        return imdb_fail(e, IMDB_ERR_INVALID, "HAVING takes a condition: a comparison, IS NULL, AND, OR, NOT or a BOOL");
+    return IMDB_OK;
+}
+
 static int plan_select(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb_err *e)
 {
     memset(k, 0, sizeof *k);
@@ -1094,10 +1706,23 @@ static int plan_select(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb
     k->st = st;
     k->t = t;
     k->e = e;
-    bool any_agg = false, any_plain = false;
+    if (st->has_group) {
+        k->gcol = one_col(st, t, st->group_qual, st->group_col, e);
+        if (k->gcol < 0) return k->gcol;
+        if (st->star) return imdb_fail(e, IMDB_ERR_INVALID, "SELECT * cannot be grouped");
+    }
+    xscope sc = {.st = st, .s = &t->s, .t = t, .cols = true, .group_col = -1};
+    if (bind_resid(x, &sc, k->resid, &k->nresid, e)) return e->code;
+    xscope si = {.st = st, .s = &t->s, .t = t, .cols = true, .aggs = true, .group_col = st->has_group ? k->gcol : -1,
+                 .agg_nodes = k->xa_node};
+    bool any_agg = false, any_plain = st->star; /* every column of *, plain: an aggregate in HAVING or ORDER BY is mixing */
     for (uint16_t i = 0; i < st->nitems; i++) {
         const sql_item *it = &st->items[i];
         k->item_col[i] = -1;
+        if (it->expr) { /* a tree: per row (materialize), or over its aggregates' slots */
+            if (bind_item(x, k, &si, it->expr, &any_agg, &any_plain, e)) return e->code;
+            continue;
+        }
         if (it->agg == AGG_COUNT_STAR) {
             any_agg = true;
             continue;
@@ -1116,10 +1741,11 @@ static int plan_select(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb
                 return imdb_fail(e, IMDB_ERR_INVALID, "SUM needs an INT64, DECIMAL or FLOAT64 column");
         }
     }
+    if (bind_having(x, st, k, &si, &any_agg, &any_plain, e) ||
+        bind_order(x, st, k, &si, st->star ? t->s.ncols : st->nitems, &any_agg, &any_plain, e))
+        return e->code;
+    if (alloc_xa(x, k, &si, e)) return e->code;
     if (st->has_group) {
-        k->gcol = one_col(st, t, st->group_qual, st->group_col, e);
-        if (k->gcol < 0) return k->gcol;
-        if (st->star) return imdb_fail(e, IMDB_ERR_INVALID, "SELECT * cannot be grouped");
         k->mode = SINK_GROUP;
         uint8_t kt = t->s.cols[k->gcol].type == IMDB_T_TEXT ? IMDB_T_TEXT : IMDB_T_INT64;
         if (imdb_hmap_init(&k->gmap, kt, e)) return e->code;
@@ -1128,17 +1754,138 @@ static int plan_select(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb
         k->mode = SINK_AGG;
     } else {
         k->mode = SINK_VIDS;
+        if (st->having) return imdb_fail(e, IMDB_ERR_INVALID, "HAVING needs GROUP BY or an aggregate");
     }
     return IMDB_OK;
 }
 
 /* Turns a sink into a result set (sorted, deterministic). */
+/* a computed value into a cell: a DECIMAL always wide (its scale may pass 18), FLOAT64 as its key */
+static void res_put_x(imdb_result *r, imdb_cell *c, const imdb_xval *v)
+{
+    imdb_value iv = {.type = v->type, .scale = v->scale, .null = v->null};
+    if (!v->null && (v->type == IMDB_T_DECIMAL || (v->type == IMDB_T_INT64 && (v->i < INT64_MIN || v->i > INT64_MAX)))) {
+        c->wide = true;
+        c->i128 = v->i;
+        c->v.type = v->type;
+        c->v.scale = v->scale;
+        return;
+    }
+    if (v->type == IMDB_T_FLOAT64) iv.i = imdb_f64_key(v->f);
+    else if (v->type == IMDB_T_TEXT) iv.s = v->s, iv.len = v->len;
+    else iv.i = (int64_t)v->i;
+    res_put(r, c, &iv);
+}
+
+/* a result column's name: a column's, or a tree item's text (whitespace folded, cut at a character's end) */
+static void item_name(const xctx *x, const sql_item *it, char *out, size_t n)
+{
+    if (!it->expr) {
+        snprintf(out, n, "%s", it->col);
+        return;
+    }
+    size_t k = 0, bad;
+    for (uint32_t i = 0; i < it->len && k + 1 < n; i++) {
+        char c = x->sql[it->off + i];
+        if ((unsigned char)c < 0x20) c = ' ';
+        if (c != ' ' || (k && out[k - 1] != ' ')) out[k++] = c;
+    }
+    while (k && out[k - 1] == ' ') k--;
+    while (k && !imdb_utf8_valid((const uint8_t *)out, k, &bad)) k--; /* a character the cut split */
+    out[k] = 0;
+}
+
+/* the trees' aggregates' final values (acc: the statement's, or one group's) */
+static int xa_values(sink *k, xacc *acc, imdb_xval *sv, imdb_err *e)
+{
+    for (uint16_t s = 0; s < k->nxa; s++) {
+        uint16_t node = k->xa_node[s];
+        uint16_t l = k->st->ex[node].l; /* the argument (none for COUNT(*)) */
+        uint8_t ta = l ? k->x->xn[l].type : 0, sa = l ? k->x->xn[l].scale : 0;
+        if (xacc_value(&acc[s], k->st->ex[node].agg, &k->x->xn[node], ta, sa, &sv[s], e)) return e->code;
+    }
+    return IMDB_OK;
+}
+
+/* a row statement's output row from a row's values (a table's, or a join's combined): only the rows the result keeps
+ * are computed, so past LIMIT no item fails */
+static int put_row(xctx *x, const sql_stmt *st, const sink *k, const imdb_value *vals, uint16_t nc, imdb_result *r,
+                   imdb_err *e)
+{
+    imdb_cell *row = res_row(r, e);
+    if (!row) return e->code;
+    for (uint16_t c = 0; c < nc; c++) {
+        if (st->star || !st->items[c].expr) {
+            res_put(r, &row[c], &vals[st->star ? c : k->item_col[c]]);
+            continue;
+        }
+        imdb_xval v;
+        if (imdb_x_eval(st, x->xn, st->items[c].expr, vals, NULL, &v, e)) return e->code;
+        res_put_x(r, &row[c], &v);
+    }
+    return IMDB_OK;
+}
+
+static bool plain_order(const sql_stmt *st) { return !st->norder && !st->distinct && !st->has_offset && !st->having; }
+
+/* rows built in the default order (rows[0..n)), now ordered, deduplicated and cut to OFFSET and LIMIT: the cells
+ * rebuilt in that order (grouped statements, whose rows are few: IMDB_MAX_GROUPS) */
+static int reorder_rows(const sql_stmt *st, imdb_xval *keys, imdb_result *r, imdb_err *e)
+{
+    uint64_t n = r->nrows, *ord = imdb_alloc_array(n ? n : 1, sizeof *ord, e), *keep = NULL;
+    if (!ord) return e->code;
+    for (uint64_t i = 0; i < n; i++) ord[i] = i;
+    for (uint64_t i = 0; i < n && keys; i++) /* positional keys: the built cells, the text whole now */
+        for (uint8_t o = 0; o < st->norder; o++)
+            if (st->ord_pos[o]) cell_x(r, &r->cells[i * r->ncols + st->ord_pos[o] - 1], &keys[i * st->norder + o]);
+    if (st->norder) {
+        ordctx c = {st, keys};
+        qsort_r(ord, n, sizeof *ord, cmp_order, &c);
+    }
+    window w;
+    int rc = window_init(&w, st, e);
+    imdb_cell *cells = NULL;
+    uint64_t nk = 0;
+    if (!rc && !(keep = imdb_alloc_array(n ? n : 1, sizeof *keep, e))) rc = e->code;
+    for (uint64_t j = 0; !rc && j < n && w.left; j++) {
+        if (w.distinct) {
+            uint8_t d[IMDB_HASH_LEN];
+            row_digest(r, &r->cells[ord[j] * r->ncols], d);
+            imdb_value key = {.type = IMDB_T_TEXT, .s = d, .len = sizeof d};
+            if (imdb_hmap_get(&w.seen, &key)) continue;
+            if ((rc = imdb_hmap_put(&w.seen, &key, 0, e))) break;
+        }
+        if (w.skip) {
+            w.skip--;
+            continue;
+        }
+        keep[nk++] = ord[j];
+        w.left--;
+    }
+    if (!rc && !(cells = imdb_alloc_array(nk ? nk * r->ncols : 1, sizeof *cells, e))) rc = e->code;
+    for (uint64_t j = 0; !rc && j < nk; j++) memcpy(&cells[j * r->ncols], &r->cells[keep[j] * r->ncols], r->ncols * sizeof *cells);
+    if (!rc) {
+        imdb_free(r->cells);
+        r->cells = cells;
+        r->nrows = r->caprows = nk;
+    }
+    window_free(&w);
+    imdb_free(keep);
+    imdb_free(ord);
+    return rc;
+}
+
 static int materialize(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb_result *r, imdb_err *e)
 {
     if (k->mode == SINK_VIDS) {
         uint16_t nc = st->star ? t->s.ncols : st->nitems;
         res_cols(r, nc);
-        for (uint16_t i = 0; i < nc; i++) res_name(r, i, st->star ? t->s.cols[i].name : st->items[i].col);
+        for (uint16_t i = 0; i < nc; i++) {
+            char nm[IMDB_MAX_IDENT + 8];
+            if (st->star) snprintf(nm, sizeof nm, "%s", t->s.cols[i].name);
+            else item_name(x, &st->items[i], nm, sizeof nm);
+            res_name(r, i, nm);
+        }
         keyed *kv = imdb_alloc_array(k->nvids ? k->nvids : 1, sizeof *kv, e);
         if (!kv) return e->code;
         for (uint64_t i = 0; i < k->nvids; i++) {
@@ -1146,39 +1893,83 @@ static int materialize(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb
             kv[i].vid = k->vids[i];
         }
         qsort(kv, k->nvids, sizeof *kv, cmp_keyed);
-        uint64_t lim = st->has_limit && st->limit < k->nvids ? st->limit : k->nvids;
         imdb_value vals[IMDB_MAX_COLS];
-        for (uint64_t i = 0; i < lim; i++) {
-            if (fetch_row(x, t, kv[i].vid, vals, e)) {
-                imdb_free(kv);
-                return e->code;
-            }
-            imdb_cell *row = res_row(r, e);
-            if (!row) {
-                imdb_free(kv);
-                return e->code;
-            }
-            for (uint16_t c = 0; c < nc; c++) res_put(r, &row[c], &vals[st->star ? c : k->item_col[c]]);
+        int rc = IMDB_OK;
+        if (plain_order(st)) { /* the primary key's order, the first LIMIT rows */
+            uint64_t lim = st->has_limit && st->limit < k->nvids ? st->limit : k->nvids;
+            for (uint64_t i = 0; i < lim && !rc; i++)
+                if (!(rc = fetch_row(x, t, kv[i].vid, vals, e))) rc = put_row(x, st, k, vals, nc, r, e);
+            imdb_free(kv);
+            return rc ? rc : res_finish(r, e);
         }
+        /* ORDER BY's keys for every matching row (a key that fails fails the statement: the matching set is every
+         * plan's), sorted with the primary key's order breaking ties; then OFFSET, DISTINCT and LIMIT */
+        uint64_t n = k->nvids, *ord = imdb_alloc_array(n ? n : 1, sizeof *ord, e);
+        imdb_xval *keys = NULL;
+        window w;
+        memset(&w, 0, sizeof w);
+        if (!ord) rc = e->code;
+        for (uint64_t i = 0; !rc && i < n; i++) ord[i] = i;
+        if (!rc && st->norder && !(keys = order_keys_alloc(r, st, n, e))) rc = e->code;
+        for (uint64_t i = 0; !rc && keys && i < n; i++) {
+            if ((rc = fetch_row(x, t, kv[i].vid, vals, e))) break;
+            for (uint8_t o = 0; !rc && o < st->norder; o++) rc = order_key(x, st, k, o, vals, &keys[i * st->norder + o], e);
+        }
+        if (!rc && keys) {
+            ordctx c = {st, keys};
+            qsort_r(ord, n, sizeof *ord, cmp_order, &c);
+        }
+        if (!rc) rc = window_init(&w, st, e);
+        for (uint64_t j = 0; !rc && j < n && w.left; j++) {
+            if (!w.distinct && w.skip) { /* OFFSET without DISTINCT: skipped unread */
+                w.skip--;
+                continue;
+            }
+            size_t tl = r->text.len;
+            if (!(rc = fetch_row(x, t, kv[ord[j]].vid, vals, e)) && !(rc = put_row(x, st, k, vals, nc, r, e)))
+                rc = window_take(&w, r, tl, e);
+        }
+        window_free(&w);
+        imdb_free(keys);
+        imdb_free(ord);
         imdb_free(kv);
-        return res_finish(r, e);
+        return rc ? rc : res_finish(r, e);
     }
     res_cols(r, st->nitems);
     for (uint16_t i = 0; i < st->nitems; i++) {
         const sql_item *it = &st->items[i];
-        static const char *const an[] = {"", "count", "count", "sum", "min", "max"};
+        static const char *const an[] = {"", "count", "count", "sum", "min", "max", "avg"};
         char nm[IMDB_MAX_IDENT + 8];
-        if (it->agg == AGG_NONE) snprintf(nm, sizeof nm, "%s", it->col);
+        const sql_expr *ax = it->expr ? &st->ex[it->expr] : NULL; /* AVG(a): avg_a, as SUM(a) is sum_a */
+        if (ax && ax->op == EX_AGG && ax->agg == AGG_AVG && ax->l && st->ex[ax->l].op == EX_COL)
+            snprintf(nm, sizeof nm, "avg_%s", st->ex[ax->l].col);
+        else if (it->expr) item_name(x, it, nm, sizeof nm);
+        else if (it->agg == AGG_NONE) snprintf(nm, sizeof nm, "%s", it->col);
         else if (it->agg == AGG_COUNT_STAR) snprintf(nm, sizeof nm, "count");
         else snprintf(nm, sizeof nm, "%s_%s", an[it->agg], it->col);
         res_name(r, i, nm);
     }
+    imdb_xval sv[IMDB_MAX_COLS], v;
     if (k->mode == SINK_AGG) {
+        if (xa_values(k, k->xa, sv, e)) return e->code;
+        if (st->having) { /* 1e: the one row, kept when its condition is TRUE */
+            if (imdb_x_eval(st, x->xn, st->having, NULL, sv, &v, e)) return e->code;
+            if (!imdb_x_true(&v)) return res_finish(r, e);
+        }
         imdb_cell *row = res_row(r, e);
         if (!row) return e->code;
         for (uint16_t i = 0; i < st->nitems; i++) {
+            if (st->items[i].expr) { /* over the slots: no column outside an aggregate (plan_select) */
+                if (imdb_x_eval(st, x->xn, st->items[i].expr, NULL, sv, &v, e)) return e->code;
+                res_put_x(r, &row[i], &v);
+                continue;
+            }
             int c = k->item_col[i];
             if (put_agg(r, &row[i], &k->acc[i], st->items[i].agg, c >= 0 ? &t->s.cols[c] : &t->s.cols[0], e)) return e->code;
+        }
+        if ((st->has_limit && st->limit == 0) || (st->has_offset && st->offset > 0)) { /* the one row, cut (1d) */
+            r->nrows = 0;
+            r->text.len = 0;
         }
         return res_finish(r, e);
     }
@@ -1186,25 +1977,48 @@ static int materialize(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb
     if (!order) return e->code;
     for (uint64_t g = 0; g < k->ngroups; g++) order[g] = g;
     qsort_r(order, k->ngroups, sizeof *order, cmp_group_idx, k->groups);
-    uint64_t lim = st->has_limit && st->limit < k->ngroups ? st->limit : k->ngroups;
-    for (uint64_t gi = 0; gi < lim; gi++) {
+    bool plain = plain_order(st); /* else every group's row is built, then ordered and cut (reorder_rows) */
+    uint64_t lim = plain && st->has_limit && st->limit < k->ngroups ? st->limit : k->ngroups;
+    imdb_xval *keys = NULL;
+    if (st->norder && !(keys = order_keys_alloc(r, st, lim, e))) {
+        imdb_free(order);
+        return e->code;
+    }
+    imdb_value grow[IMDB_MAX_COLS]; /* a group's row: its key; a tree reads no other column outside an aggregate */
+    memset(grow, 0, sizeof grow);
+    int xrc = IMDB_OK;
+    uint64_t nr = 0; /* the rows built: a group HAVING drops has none, so a key's index is its row's */
+    for (uint64_t gi = 0; gi < lim && !xrc; gi++) {
         uint64_t g = order[gi];
+        if ((xrc = xa_values(k, k->nxa ? &k->gxa[g * k->nxa] : NULL, sv, e))) break;
+        grow[k->gcol] = k->groups[g].key;
+        if (st->having) { /* 1e: before the row, so an item's error on a dropped group is never raised */
+            if ((xrc = imdb_x_eval(st, x->xn, st->having, grow, sv, &v, e))) break;
+            if (!imdb_x_true(&v)) continue;
+        }
         imdb_cell *row = res_row(r, e);
         if (!row) {
-            imdb_free(order);
-            return e->code;
+            xrc = e->code;
+            break;
         }
-        for (uint16_t i = 0; i < st->nitems; i++) {
+        uint64_t ri = nr++;
+        for (uint16_t i = 0; i < st->nitems && !xrc; i++) {
+            if (!st->items[i].expr) continue;
+            if (!(xrc = imdb_x_eval(st, x->xn, st->items[i].expr, grow, sv, &v, e))) res_put_x(r, &row[i], &v);
+        }
+        for (uint8_t o = 0; o < st->norder && !xrc; o++) /* a key's tree over the group (positional keys: the cells) */
+            if (!st->ord_pos[o]) xrc = imdb_x_eval(st, x->xn, st->ord_ex[o], grow, sv, &keys[ri * st->norder + o], e);
+        for (uint16_t i = 0; i < st->nitems && !xrc; i++) {
+            if (st->items[i].expr) continue;
             int c = k->item_col[i];
             if (st->items[i].agg == AGG_NONE) res_put(r, &row[i], &k->groups[g].key);
-            else if (put_agg(r, &row[i], &k->gacc[g * st->nitems + i], st->items[i].agg, c >= 0 ? &t->s.cols[c] : &t->s.cols[0], e)) {
-                imdb_free(order);
-                return e->code;
-            }
+            else xrc = put_agg(r, &row[i], &k->gacc[g * st->nitems + i], st->items[i].agg, c >= 0 ? &t->s.cols[c] : &t->s.cols[0], e);
         }
     }
+    if (!xrc && !plain) xrc = reorder_rows(st, keys, r, e);
+    imdb_free(keys);
     imdb_free(order);
-    return res_finish(r, e);
+    return xrc ? xrc : res_finish(r, e);
 }
 
 static bool cells_equal(const imdb_cell *a, const imdb_cell *b)
@@ -1352,6 +2166,8 @@ typedef struct jctx {
     uint64_t (*pairs)[2];
     uint64_t npairs, cappairs;
     uint64_t budget, used;       /* the build side and the pairs count against the result's cap */
+    uint16_t resid[IMDB_MAX_PREDICATES]; /* WHERE's tree conjuncts, on the joined row (join_emit), any plan's */
+    uint16_t nresid;
 } jctx;
 
 enum { JOIN_CHUNK = 1u << 16 }; /* more than IMDB_MAX_TEXT: a chunk holds any value whole */
@@ -1409,11 +2225,20 @@ static void join_need(jctx *j)
 {
     bool use[IMDB_MAX_COLS] = {false};
     int off = j->build ? j->nc[0] : 0, n = j->nc[j->build];
+    const sql_stmt *st = j->x->st;
     if (!j->rows) {
         const sink *k = j->out;
-        for (uint16_t i = 0; i < k->st->nitems; i++)
+        for (uint16_t i = 0; i < k->st->nitems; i++) {
             if (k->item_col[i] >= off && k->item_col[i] < off + n) use[k->item_col[i] - off] = true;
+            x_cols(st, j->x->xn, st->items[i].expr, use, off, n);
+        }
         if (k->mode == SINK_GROUP && k->gcol >= off && k->gcol < off + n) use[k->gcol - off] = true;
+        x_cols(st, j->x->xn, st->having, use, off, n); /* HAVING's aggregates (1e) and ORDER BY's (1d) read it too */
+        for (uint8_t o = 0; o < st->norder; o++)
+            if (!st->ord_pos[o]) x_cols(st, j->x->xn, st->ord_ex[o], use, off, n);
+    }
+    for (uint16_t i = 0; i < j->nresid; i++) { /* the trees in WHERE read the joined row, kept pairs' too */
+        x_cols(st, j->x->xn, cmp_root(&st->where[j->resid[i]]), use, off, n);
     }
     for (uint16_t i = 0; j->build == 1 && i < j->post.np; i++) use[j->post.p[i].col] = true;
     j->nneed = 0;
@@ -1461,10 +2286,20 @@ static void join_emit(sink *k, uint64_t va, uint64_t vb, const imdb_value *a, co
 {
     jctx *j = k->j;
     if (j->post.never || (j->post.np && !preds_ok(&j->post, b))) return;
-    if (!j->rows) {
-        imdb_value cv[IMDB_MAX_COLS];
+    imdb_value cv[IMDB_MAX_COLS];
+    if (!j->rows || j->nresid) {
         memcpy(cv, a, j->nc[0] * sizeof *cv);
         memcpy(cv + j->nc[0], b, j->nc[1] * sizeof *cv);
+    }
+    if (j->nresid) { /* WHERE's trees, after the join as SQL says, for kept pairs as for aggregates */
+        bool ok;
+        if (resid_ok(j->x, j->x->st, j->resid, j->nresid, cv, &ok, k->e)) { /* a side's sink has no st */
+            k->err = k->e->code;
+            return;
+        }
+        if (!ok) return;
+    }
+    if (!j->rows) {
         sink_row(j->out, 0, cv);
         if (j->out->err) k->err = j->out->err;
         return;
@@ -1862,10 +2697,16 @@ static int plan_join_sink(xctx *x, const sql_stmt *st, jctx *j, sink *k, imdb_er
         if (join_col(st, j->t, st->group_qual, st->group_col, &side, &c, e)) return e->code;
         gcol = side ? j->nc[0] + c : c;
     }
-    bool any_agg = false, any_plain = false;
+    bool any_agg = false, any_plain = st->star; /* every column of *, plain: an aggregate in HAVING or ORDER BY is mixing */
+    xscope si = {.st = st, .s = &j->ct->s, .jt = j->t, .nc0 = j->nc[0], .cols = true, .aggs = true, .group_col = gcol,
+                 .agg_nodes = k->xa_node};
     for (uint16_t i = 0; i < st->nitems; i++) {
         const sql_item *it = &st->items[i];
         k->item_col[i] = -1;
+        if (it->expr) { /* a tree: per row (materialize), or over its aggregates' slots */
+            if (bind_item(x, k, &si, it->expr, &any_agg, &any_plain, e)) return e->code;
+            continue;
+        }
         if (it->agg == AGG_COUNT_STAR) {
             any_agg = true;
             continue;
@@ -1884,6 +2725,10 @@ static int plan_join_sink(xctx *x, const sql_stmt *st, jctx *j, sink *k, imdb_er
                 return imdb_fail(e, IMDB_ERR_INVALID, "SUM needs an INT64, DECIMAL or FLOAT64 column");
         }
     }
+    if (bind_having(x, st, k, &si, &any_agg, &any_plain, e) ||
+        bind_order(x, st, k, &si, st->star ? (uint16_t)(j->nc[0] + j->nc[1]) : st->nitems, &any_agg, &any_plain, e))
+        return e->code;
+    if (alloc_xa(x, k, &si, e)) return e->code;
     if (st->has_group) {
         if (st->star) return imdb_fail(e, IMDB_ERR_INVALID, "SELECT * cannot be grouped");
         k->mode = SINK_GROUP;
@@ -1895,6 +2740,7 @@ static int plan_join_sink(xctx *x, const sql_stmt *st, jctx *j, sink *k, imdb_er
         k->mode = SINK_AGG;
     } else {
         k->mode = SINK_VIDS;
+        if (st->having) return imdb_fail(e, IMDB_ERR_INVALID, "HAVING needs GROUP BY or an aggregate");
     }
     return IMDB_OK;
 }
@@ -1914,12 +2760,26 @@ static int cmp_jkeyed(const void *a, const void *b)
     return x->vb == IMDB_NONE ? 0 : imdb_value_cmp(&x->kb, &y->kb);
 }
 
+/* pair i's joined row into cv: side 0's columns, then side 1's (NULL-extended where nothing matched) */
+static int join_pair(xctx *x, jctx *j, const jkeyed *p, imdb_value *cv, imdb_err *e)
+{
+    if (fetch_row(x, j->t[0], p->va, cv, e)) return e->code;
+    if (p->vb == IMDB_NONE) memcpy(cv + j->nc[0], j->nulls, j->nc[1] * sizeof *cv);
+    else if (fetch_row(x, j->t[1], p->vb, cv + j->nc[0], e)) return e->code;
+    return IMDB_OK;
+}
+
 static int join_materialize(xctx *x, const sql_stmt *st, jctx *j, sink *k, imdb_result *r, imdb_err *e)
 {
     if (!j->rows) return materialize(x, st, j->ct, k, r, e);
     uint16_t nc = st->star ? (uint16_t)(j->nc[0] + j->nc[1]) : st->nitems;
     res_cols(r, nc);
-    for (uint16_t i = 0; i < nc; i++) res_name(r, i, st->star ? j->ct->s.cols[i].name : st->items[i].col);
+    for (uint16_t i = 0; i < nc; i++) {
+        char nm[IMDB_MAX_IDENT + 8];
+        if (st->star) snprintf(nm, sizeof nm, "%s", j->ct->s.cols[i].name);
+        else item_name(x, &st->items[i], nm, sizeof nm);
+        res_name(r, i, nm);
+    }
     if (join_charge(j, (j->npairs ? j->npairs : 1) * sizeof(jkeyed), e)) return e->code; /* the sort's keys too */
     jkeyed *kv = imdb_alloc_array(j->npairs ? j->npairs : 1, sizeof *kv, e);
     if (!kv) return e->code;
@@ -1930,17 +2790,46 @@ static int join_materialize(xctx *x, const sql_stmt *st, jctx *j, sink *k, imdb_
         if (kv[i].vb != IMDB_NONE) imdb_version_key(j->t[1], kv[i].vb, j->t[1]->s.pk, &kv[i].kb);
     }
     qsort(kv, j->npairs, sizeof *kv, cmp_jkeyed);
-    uint64_t lim = st->has_limit && st->limit < j->npairs ? st->limit : j->npairs;
     int rc = IMDB_OK;
     imdb_value cv[IMDB_MAX_COLS];
-    for (uint64_t i = 0; i < lim && !rc; i++) {
-        if (fetch_row(x, j->t[0], kv[i].va, cv, e)) rc = e->code;
-        else if (kv[i].vb == IMDB_NONE) memcpy(cv + j->nc[0], j->nulls, j->nc[1] * sizeof *cv);
-        else if (fetch_row(x, j->t[1], kv[i].vb, cv + j->nc[0], e)) rc = e->code;
-        imdb_cell *row = rc ? NULL : res_row(r, e);
-        if (!rc && !row) rc = e->code;
-        for (uint16_t c = 0; !rc && c < nc; c++) res_put(r, &row[c], &cv[st->star ? c : k->item_col[c]]);
+    if (plain_order(st)) { /* side 0's key, then side 1's: the first LIMIT pairs */
+        uint64_t lim = st->has_limit && st->limit < j->npairs ? st->limit : j->npairs;
+        for (uint64_t i = 0; i < lim && !rc; i++)
+            if (!(rc = join_pair(x, j, &kv[i], cv, e))) rc = put_row(x, st, k, cv, nc, r, e);
+        imdb_free(kv);
+        return rc ? rc : res_finish(r, e);
     }
+    /* ORDER BY's keys for every joined row, the pairs' order breaking ties; then OFFSET, DISTINCT and LIMIT */
+    uint64_t n = j->npairs, *ord = imdb_alloc_array(n ? n : 1, sizeof *ord, e);
+    imdb_xval *keys = NULL;
+    window w;
+    memset(&w, 0, sizeof w);
+    if (!ord) rc = e->code;
+    for (uint64_t i = 0; !rc && i < n; i++) ord[i] = i;
+    if (!rc && st->norder &&
+        (join_charge(j, (n ? n : 1) * st->norder * sizeof(imdb_xval), e) || !(keys = order_keys_alloc(r, st, n, e))))
+        rc = e->code;
+    for (uint64_t i = 0; !rc && keys && i < n; i++) {
+        if ((rc = join_pair(x, j, &kv[i], cv, e))) break;
+        for (uint8_t o = 0; !rc && o < st->norder; o++) rc = order_key(x, st, k, o, cv, &keys[i * st->norder + o], e);
+    }
+    if (!rc && keys) {
+        ordctx c = {st, keys};
+        qsort_r(ord, n, sizeof *ord, cmp_order, &c);
+    }
+    if (!rc) rc = window_init(&w, st, e);
+    for (uint64_t jx = 0; !rc && jx < n && w.left; jx++) {
+        if (!w.distinct && w.skip) {
+            w.skip--;
+            continue;
+        }
+        size_t tl = r->text.len;
+        if (!(rc = join_pair(x, j, &kv[ord[jx]], cv, e)) && !(rc = put_row(x, st, k, cv, nc, r, e)))
+            rc = window_take(&w, r, tl, e);
+    }
+    window_free(&w);
+    imdb_free(keys);
+    imdb_free(ord);
     imdb_free(kv);
     return rc ? rc : res_finish(r, e);
 }
@@ -2025,10 +2914,22 @@ static int exec_join(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
     /* WHERE: each predicate to its side; LEFT keeps side 1's for after the join, as SQL says */
     for (uint16_t i = 0; !rc && i < st->nwhere; i++) {
         int side = 0, col = 0;
+        if (st->where[i].lx) continue; /* a tree's: on the joined row (join_emit) */
         if (join_col(st, t, st->where[i].qual, st->where[i].col, &side, &col, e)) rc = e->code;
-        else if (j->left && side == 1) rc = bind_pred(x, &st->where[i], col, true, &j->post, e);
-        else rc = bind_pred(x, &st->where[i], col, false, &q[side], e);
+        else {
+            qspec *bq = j->left && side == 1 ? &j->post : &q[side];
+            uint16_t np = bq->np;
+            rc = bind_pred(x, &st->where[i], col, j->left && side == 1, bq, e);
+            if (rc && falls_back(&st->where[i], &t[side]->s.cols[col])) { /* a residual on the joined row */
+                bq->np = np;
+                x->fb[i] = true;
+                imdb_err_clear(e);
+                rc = IMDB_OK;
+            }
+        }
     }
+    xscope sc = {.st = st, .s = &j->ct->s, .jt = t, .nc0 = j->nc[0], .cols = true, .group_col = -1};
+    if (!rc && bind_resid(x, &sc, j->resid, &j->nresid, e)) rc = e->code;
     if (!rc) {
         choose_ordered(&q[0], -1);
         choose_ordered(&q[1], -1);
@@ -2145,6 +3046,8 @@ static int select_vids(xctx *x, const sql_stmt *st, imdb_table *t, bool all_vers
     k.st = st;
     k.t = t;
     k.e = e;
+    xscope sc = {.st = st, .s = &t->s, .t = t, .cols = true, .group_col = -1};
+    if (bind_resid(x, &sc, k.resid, &k.nresid, e)) return e->code;
     int p1 = choose_path(x->ss, &q, &k);
     int rc = run_path(x, p1, &q, &k, e);
     if (rc) {
@@ -2160,6 +3063,8 @@ static int select_vids(xctx *x, const sql_stmt *st, imdb_table *t, bool all_vers
         k2.st = st;
         k2.t = t;
         k2.e = e;
+        memcpy(k2.resid, k.resid, sizeof k.resid);
+        k2.nresid = k.nresid;
         int p2 = below_floor(x->db, &q) ? IMDB_PATH_ROWS : p1 == IMDB_PATH_SCAN ? IMDB_PATH_STORE : IMDB_PATH_SCAN;
         rc = run_path(x, p2, &q, &k2, e);
         if (!rc && k2.nvids) qsort(k2.vids, k2.nvids, sizeof *k2.vids, cmp_u64);
@@ -2231,11 +3136,20 @@ static int exec_update(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
     if (!t) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", st->table);
     int cols[IMDB_MAX_COLS];
     imdb_value newv[IMDB_MAX_COLS];
+    bool trees = false;
+    xscope sc = {.st = st, .s = &t->s, .t = t, .cols = true, .group_col = -1};
     for (uint16_t i = 0; i < st->nset; i++) {
         cols[i] = imdb_schema_col(&t->s, st->set_cols[i]);
         if (cols[i] < 0) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no column %s in table %s", st->set_cols[i], t->s.name);
         if (cols[i] == t->s.pk) return imdb_fail(e, IMDB_ERR_INVALID, "UPDATE cannot change the primary key (use DELETE + INSERT)");
-        if (bind_lit(x, &st->set_vals[i], &t->s.cols[cols[i]], false, &newv[i], e)) return e->code;
+        for (uint16_t j = 0; j < i; j++)
+            if (cols[j] == cols[i]) return imdb_fail(e, IMDB_ERR_INVALID, "column %s is set twice", st->set_cols[i]);
+        if (st->set_vals[i].kind == LIT_EXPR) { /* computed per row, from the row's old values */
+            if (xnodes(x, st, e) || xbind(x, &sc, st->set_vals[i].ex, e)) return e->code;
+            trees = true;
+        } else if (bind_lit(x, &st->set_vals[i], &t->s.cols[cols[i]], false, &newv[i], e)) {
+            return e->code;
+        }
     }
     uint64_t *vids, n;
     if (select_vids(x, st, t, false, &vids, &n, e)) return e->code;
@@ -2244,6 +3158,14 @@ static int exec_update(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
     for (uint64_t i = 0; i < n && !rc; i++) {
         if ((rc = fetch_row(x, t, vids[i], vals, e))) break;
         for (uint16_t c = 0; c < t->s.ncols && !rc; c++) rc = xpin(x, &vals[c], e);
+        for (uint16_t k = 0; k < st->nset && trees && !rc; k++) { /* every tree before any column changes: SET a = b,
+                                                                    * b = a swaps them */
+            imdb_xval v;
+            if (st->set_vals[k].kind != LIT_EXPR) continue;
+            if ((rc = imdb_x_eval(st, x->xn, st->set_vals[k].ex, vals, NULL, &v, e))) break;
+            rc = imdb_x_assign(&t->s.cols[cols[k]], &v, &newv[k], e);
+        }
+        if (rc) break;
         for (uint16_t k = 0; k < st->nset; k++) vals[cols[k]] = newv[k];
         uint8_t salt[16];
         if (!rc && !(rc = imdb_salt_next(&x->salts, salt, e))) rc = imdb_update_salt(x->db, t, vids[i], vals, salt, e);
@@ -2823,7 +3745,7 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
         imdb_free(st);
         return imdb_fail(e, IMDB_ERR_LIMIT, "too many parameters");
     }
-    xctx x = {.ss = ss, .db = ss->db, .sql = sql, .params = params, .nparams = nparams};
+    xctx x = {.ss = ss, .db = ss->db, .sql = sql, .params = params, .nparams = nparams, .st = st};
     imdb_db *db = ss->db;
     uint64_t seq_before = db->seq;
     if (db->failed) {
