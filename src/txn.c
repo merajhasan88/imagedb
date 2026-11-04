@@ -452,3 +452,41 @@ int imdb_txn_release(imdb_db *db, imdb_txn *x, const char *name, imdb_err *e)
     x->nsps = (uint32_t)k;
     return IMDB_OK;
 }
+
+bool imdb_txn_expired(const imdb_txn *x, uint64_t now_ns, char *why, size_t n)
+{
+    if (!x->open) return false;
+    if (x->timeout_ms && now_ns - x->begin_ns > (uint64_t)x->timeout_ms * 1000000u) {
+        snprintf(why, n, "transaction timeout: it ran past %u ms (SET transaction_timeout)", x->timeout_ms);
+        return true;
+    }
+    if (x->idle_ms && now_ns - x->last_ns > (uint64_t)x->idle_ms * 1000000u) {
+        snprintf(why, n, "idle in transaction for more than %u ms (SET idle_in_transaction_timeout)", x->idle_ms);
+        return true;
+    }
+    return false;
+}
+
+void imdb_txn_expire(imdb_db *db, imdb_txn *x, const char *why)
+{
+    if (!x->doomed) {
+        snprintf(x->doom, sizeof x->doom, "%s; roll back", why);
+        x->doomed = true;
+    }
+    if (db->active == x) { /* its pending versions leave the store, as a rollback takes them */
+        imdb_rollback(db);
+        db->active = NULL;
+    }
+    release_ops(x); /* parked: the saved copies */
+    imdb_free(x->locks);
+    x->locks = NULL;
+    x->nlocks = x->caplocks = 0;
+}
+
+void imdb_txn_timeouts(imdb_db *db, uint64_t now_ns, const imdb_txn *self)
+{
+    for (imdb_txn *x = db->txns; x; x = x->next) {
+        char why[160];
+        if (x != self && imdb_txn_expired(x, now_ns, why, sizeof why)) imdb_txn_expire(db, x, why);
+    }
+}

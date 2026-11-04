@@ -4145,6 +4145,7 @@ int imdb_open(const char *path, const imdb_open_opts *o, imdb_db **out, imdb_err
     db->sync = o ? o->sync : 1;
     db->strict = o && o->durable_ack;
     db->mem_limit = o ? o->mem_limit : 0;
+    db->mem_reserve = db->mem_limit ? imdb_query_share(db->mem_limit) : 0;
     db->mem_window_us = o && o->mem_window_us ? o->mem_window_us : IMDB_MEM_WINDOW_US;
     const char *ev = getenv("IMDB_EVICT"); /* the matrix's third unit pass: every publish evicts to itself */
     db->evict_eager = ev && strcmp(ev, "eager") == 0 && db->mem_window_us != UINT64_MAX; /* "none leaves" wins */
@@ -4530,6 +4531,13 @@ void imdb_mem(const imdb_db *db, imdb_mem_report *r)
     }
     r->total = r->versions + r->rows + r->indexes + r->segments + r->commits + r->txns;
     r->limit = db->mem_limit;
+    r->reserve = db->mem_reserve;
+}
+
+uint64_t imdb_query_share(uint64_t mem_limit)
+{
+    uint64_t share = mem_limit / 4;
+    return share && share < IMDB_MAX_RESULT_BYTES ? share : IMDB_MAX_RESULT_BYTES;
 }
 
 int imdb_mem_admit(imdb_db *db, uint64_t growth, imdb_err *e)
@@ -4537,7 +4545,15 @@ int imdb_mem_admit(imdb_db *db, uint64_t growth, imdb_err *e)
     if (!db->mem_limit || !growth) return IMDB_OK;
     imdb_mem_report r;
     imdb_mem(db, &r);
-    if (r.total + growth <= db->mem_limit) return IMDB_OK;
+    uint64_t room = db->mem_limit > db->mem_reserve ? db->mem_limit - db->mem_reserve : 0; /* D8 #2: a query's share */
+    if (r.total + growth <= room) return IMDB_OK;
+    if (db->mem_reserve)
+        return imdb_fail(e, IMDB_ERR_LIMIT,
+                         "memory budget: this write needs %llu more bytes at a growth step (%llu held, budget %llu, of "
+                         "which %llu kept for queries): nothing was written; reopen with a larger budget, or hold less "
+                         "(SHOW MEMORY)",
+                         (unsigned long long)growth, (unsigned long long)r.total, (unsigned long long)r.limit,
+                         (unsigned long long)db->mem_reserve);
     return imdb_fail(e, IMDB_ERR_LIMIT,
                      "memory budget: this write needs %llu more bytes at a growth step (%llu held, budget %llu): "
                      "nothing was written; reopen with a larger budget, or hold less (SHOW MEMORY)",

@@ -74,5 +74,6 @@
 #define IMDB_MAX_RESULT_BYTES   (1ull << 30) /* one statement's result (cells and text); a memory budget tightens it */
 #define IMDB_MIN_STATEMENT_MEMORY (1ull << 20) /* SET statement_memory's least (P0 R2): a read statement's workspace */
 #define IMDB_MAX_STATEMENT_MEMORY (16ull << 30) /* and its most; the default is IMDB_MAX_RESULT_BYTES or a budget's quarter */
+#define IMDB_MAX_STATEMENT_ROW_LIMIT (1ull << 62) /* SET statement_row_limit: rows a statement may test (0: none) */
 
 #endif

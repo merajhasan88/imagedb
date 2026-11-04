@@ -83,7 +83,9 @@ recent commits, and the next open says which.
 
 The database lives in memory (the log and the lake are its durable copies).
 `--mem-limit BYTES` (K, M or G suffix) gives it a budget: a write that would
-grow it past the budget is refused before anything is written, while DELETE,
+grow it past the budget less a query's share (a quarter of the budget, at most
+1 GiB: a query's default limit, below) is refused before anything is written,
+so the database and one query fit in the budget together; DELETE,
 CHECKPOINT, COMPACT ... PURGE and ERASE are never refused, and an open always
 succeeds. `SHOW MEMORY` shows what it holds by kind.
 
@@ -104,6 +106,21 @@ disk.
 either fails it with "cancelled", and nothing it did stays (its writes are undone;
 a transaction goes on). COMMIT, CREATE, DROP TABLE, DROP INDEX, ALTER, CHECKPOINT, COMPACT, ERASE and VERIFY always run
 to their end. From C, `imdb_session_cancel` does the same from another thread.
+
+`SET transaction_timeout = MS` and `SET idle_in_transaction_timeout = MS` (0, the
+default, is none; taken at the next BEGIN) end a transaction that runs longer, or
+sits between its statements longer: its next statement fails ("transaction
+timeout", "idle in transaction") and it can only roll back. Another session's
+statement ends an idle one too and frees what it held at once, so a session that
+never comes back does not keep its writes in memory.
+
+`SET statement_row_limit = N` (0, the default, is none) fails a statement that
+tests more than N rows with a limit error, leaving nothing, as a timeout does.
+A row is tested when it is visible and past the predicates an index or a scan
+applies, before the rest of WHERE; a join's rows are the pairs it forms.
+Every plan and every placement of the versions (memory or the lake) tests the
+same rows, so unlike a timeout the limit trips at the same point on every copy
+and on every run.
 
 History is kept per table. `CREATE TABLE ... RETENTION 30 DAYS` (SECONDS, MINUTES,
 HOURS or DAYS, up to a century; 24 HOURS by default) or `RETENTION FOREVER` says

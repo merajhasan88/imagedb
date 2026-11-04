@@ -137,6 +137,7 @@ typedef struct xctx {
     const sql_stmt *st;
     bool fb[IMDB_MAX_PREDICATES]; /* WHERE's plain conjuncts that fell back to residuals (falls_back) */
     uint64_t ticks, next_check;   /* rows passed, and the count at the next check (R1: xcheck) */
+    uint64_t tested, row_limit;   /* rows tested and SET statement_row_limit (D8 #4: xtested) */
     uint64_t deadline_ns;         /* CLOCK_MONOTONIC: the statement's timeout; 0: none */
     bool checks;                  /* false for what runs to its end: COMMIT and the physical statements */
 } xctx;
@@ -163,6 +164,19 @@ static int xcheck(xctx *x, imdb_err *e)
         return imdb_fail(e, IMDB_ERR_CANCELLED, "statement timeout: it ran past %u ms (SET statement_timeout)",
                          x->ss->stmt_timeout_ms);
     return IMDB_OK;
+}
+
+/* D8 #4, the work limit: n more rows tested, each a row reaching a table's sink (visible, past every bound predicate,
+ * before WHERE's trees), a pair a join forms (both sides past their predicates, or a LEFT row without a match), or a
+ * match the fast aggregate sums without a sink. Every path and every placement of the versions tests the same rows
+ * (eviction is invisible: so is this limit), and each plan counts from zero (cross_check's second too). Unlike the
+ * deadline it depends on nothing but the statement and the data, so it trips at the same row on every copy. */
+static int xtested(xctx *x, uint64_t n, imdb_err *e)
+{
+    x->tested += n;
+    if (!x->row_limit || x->tested <= x->row_limit || !x->checks) return IMDB_OK;
+    return imdb_fail(e, IMDB_ERR_LIMIT, "statement row limit: it tested more than %llu rows (SET statement_row_limit); "
+                                        "narrow it", (unsigned long long)x->row_limit);
 }
 
 /* n more rows passed (examined, tested, joined or written): an error once the statement must stop */
@@ -779,6 +793,7 @@ typedef struct sink {
     int err;
     imdb_err *e;
     struct jctx *j;          /* SINK_JBUILD, SINK_JPROBE, SINK_JOUTER, SINK_JINNER: the join they feed */
+    bool joined;             /* a join's output: its rows are pairs, tested where the join forms them (xtested) */
     uint16_t resid[IMDB_MAX_PREDICATES]; /* WHERE's tree conjuncts (st->where), tested on every row fed: the one door */
     uint16_t nresid;
     bool trees;              /* a SELECT item is a tree: no path that answers without the rows (fast_aggregate,
@@ -895,6 +910,10 @@ static int acc_add(agg_acc *a, uint8_t agg, const imdb_value *v, imdb_err *e)
 static void sink_row(sink *k, uint64_t vid, const imdb_value *vals)
 {
     if (k->err) return;
+    if (k->mode < SINK_JBUILD && !k->joined && k->x && xtested(k->x, 1, k->e)) { /* a join side's rows are not: its pairs are */
+        k->err = k->e->code;
+        return;
+    }
     if (k->nresid) {
         bool ok;
         if (resid_ok(k->x, k->st, k->resid, k->nresid, vals, &ok, k->e)) {
@@ -1327,6 +1346,9 @@ static int path_scan(xctx *x, const qspec *q, sink *k, imdb_err *e)
             }
         }
         if (fast) {
+            uint64_t matched = 0; /* what the sink would have been given: the rows past visibility and the predicates */
+            for (size_t w = 0; w < words; w++) matched += (uint64_t)__builtin_popcountll(bits[w]);
+            if ((rc = xtested(x, matched, e))) break;
             for (uint16_t i = 0; i < k->st->nitems && !rc; i++) {
                 agg_acc *a = &k->acc[i];
                 uint8_t ag = k->st->items[i].agg;
@@ -2366,6 +2388,10 @@ static const imdb_value *join_kept(jctx *j, uint64_t o)
 static void join_emit(sink *k, uint64_t va, uint64_t vb, const imdb_value *a, const imdb_value *b)
 {
     jctx *j = k->j;
+    if (xtested(j->x, 1, k->e)) { /* every pair formed: the same pairs under every plan */
+        k->err = k->e->code;
+        return;
+    }
     if (j->post.never || (j->post.np && !preds_ok(&j->post, b))) return;
     imdb_value cv[IMDB_MAX_COLS];
     if (!j->rows || j->nresid) {
@@ -2923,6 +2949,7 @@ static int join_run(xctx *x, const sql_stmt *st, jctx *j, qspec q[2], const jpla
     sink k;
     int rc = plan_join_sink(x, st, j, &k, e);
     j->out = &k;
+    k.joined = true;
     j->rows = k.mode == SINK_VIDS;
     j->budget = r->byte_cap ? r->byte_cap : IMDB_MAX_RESULT_BYTES;
     if (!rc)
@@ -3043,7 +3070,10 @@ static int exec_join(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
         imdb_result r2;
         imdb_result_init(&r2);
         r2.byte_cap = r->byte_cap;
+        uint64_t first = x->tested; /* the second plan counts from zero (xtested) */
+        x->tested = 0;
         rc = join_run(x, st, j, q, &m, &r2, e);
+        x->tested = first;
         if (!rc && !results_equal(r, &r2))
             rc = imdb_fail(e, IMDB_ERR_VERIFY, "cross-check FAILED: %s returned %llu rows, %s returned %llu rows (or values differ)",
                            n1, (unsigned long long)r->nrows, n2, (unsigned long long)r2.nrows);
@@ -3093,11 +3123,14 @@ static int exec_select(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
                                                   : IMDB_PATH_STORE;
     imdb_result r2;
     imdb_result_init(&r2);
+    uint64_t first = x->tested; /* the second plan counts from zero (xtested) */
+    x->tested = 0;
     rc = plan_select(x, st, t, &k, e);
     if (!rc) rc = run_path(x, p2, &q, &k, e);
     if (!rc) rc = sink_pin(&k);
     if (!rc) rc = materialize(x, st, t, &k, &r2, e);
     sink_free(&k);
+    x->tested = first;
     if (!rc && !results_equal(r, &r2))
         rc = imdb_fail(e, IMDB_ERR_VERIFY, "cross-check FAILED: %s returned %llu rows, %s returned %llu rows (or values differ)",
                        path_name(p1, &q), (unsigned long long)r->nrows, path_name(p2, &q), (unsigned long long)r2.nrows);
@@ -3147,7 +3180,10 @@ static int select_vids(xctx *x, const sql_stmt *st, imdb_table *t, bool all_vers
         memcpy(k2.resid, k.resid, sizeof k.resid);
         k2.nresid = k.nresid;
         int p2 = below_floor(x->db, &q) ? IMDB_PATH_ROWS : p1 == IMDB_PATH_SCAN ? IMDB_PATH_STORE : IMDB_PATH_SCAN;
+        uint64_t first = x->tested; /* the second plan counts from zero (xtested) */
+        x->tested = 0;
         rc = run_path(x, p2, &q, &k2, e);
+        x->tested = first;
         if (!rc && k2.nvids) qsort(k2.vids, k2.nvids, sizeof *k2.vids, cmp_u64);
         if (!rc && (k.nvids != k2.nvids || (k.nvids && memcmp(k.vids, k2.vids, k.nvids * sizeof *k.vids) != 0)))
             rc = imdb_fail(e, IMDB_ERR_VERIFY, "cross-check FAILED selecting rows to change: %s and %s disagree",
@@ -3417,7 +3453,11 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
             res_put_str(r, &row[0], kinds[i]);
             res_put_int(r, &row[1], (int64_t)v[i]);
         }
-        if (m.limit)
+        if (m.limit && m.reserve) /* D8 #2: writes leave a query's share of the budget free */
+            snprintf(r->status, sizeof r->status, "%llu bytes held, budget %llu, %llu of it kept for queries%s",
+                     (unsigned long long)m.total, (unsigned long long)m.limit, (unsigned long long)m.reserve,
+                     m.total + m.reserve > m.limit ? ": writes that grow are refused" : "");
+        else if (m.limit)
             snprintf(r->status, sizeof r->status, "%llu bytes held, budget %llu%s", (unsigned long long)m.total,
                      (unsigned long long)m.limit, m.total > m.limit ? ": over it, writes that grow are refused" : "");
         else snprintf(r->status, sizeof r->status, "%llu bytes held, no budget", (unsigned long long)m.total);
@@ -3816,8 +3856,7 @@ static bool is_write(uint8_t k)
 static uint64_t workspace_of(const imdb_session *ss)
 {
     if (ss->stmt_memory) return ss->stmt_memory;
-    uint64_t share = ss->db->mem_limit / 4;
-    return share && share < IMDB_MAX_RESULT_BYTES ? share : IMDB_MAX_RESULT_BYTES;
+    return imdb_query_share(ss->db->mem_limit); /* D8 #2: the share the budget keeps from writes (db.h) */
 }
 
 static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const imdb_value *params, uint32_t nparams,
@@ -3837,7 +3876,7 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
         imdb_free(st);
         return imdb_fail(e, IMDB_ERR_LIMIT, "too many parameters");
     }
-    xctx x = {.ss = ss, .db = ss->db, .sql = sql, .params = params, .nparams = nparams, .st = st};
+    xctx x = {.ss = ss, .db = ss->db, .sql = sql, .params = params, .nparams = nparams, .st = st, .row_limit = ss->row_limit};
     imdb_db *db = ss->db;
     uint64_t seq_before = db->seq;
     if (db->failed) {
@@ -3862,6 +3901,24 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
         return rc;
     }
     bool autocommit = false, txn = ss->txn.open, ceiling = false; /* ceiling: R2's, below */
+    /* R4: a transaction past its SET transaction_timeout, or idle past its SET idle_in_transaction_timeout, can only
+     * roll back: this statement fails (cancelled) unless it is the ROLLBACK, and what the transaction holds goes now;
+     * every other session's transaction past its limits, active or parked, goes the same way, whether or not its session
+     * ever comes back (imdb_txn_expire) */
+    uint64_t now_ns = mono_ns();
+    if (txn && st->kind != ST_ROLLBACK && !ss->txn.doomed) {
+        char why[200];
+        if (imdb_txn_expired(&ss->txn, now_ns, why, sizeof why)) {
+            imdb_txn_expire(db, &ss->txn, why);
+            bool ends = st->kind == ST_COMMIT; /* a COMMIT ends it either way, as a doomed COMMIT does */
+            if (ends) imdb_txn_rollback(db, &ss->txn);
+            imdb_sql_stmt_free(st);
+            imdb_free(st);
+            if (ends) return imdb_fail(e, IMDB_ERR_CANCELLED, "%s; the transaction rolled back", why);
+            return imdb_fail(e, IMDB_ERR_CANCELLED, "%s; roll back", why);
+        }
+    }
+    imdb_txn_timeouts(db, now_ns, &ss->txn);
     imdb_savepoint sp = {0, 0};
     bool physical = st->kind == ST_CHECKPOINT || st->kind == ST_COMPACT || st->kind == ST_ERASE_SUBJECT ||
                     st->kind == ST_ERASE_WHERE || st->kind == ST_VERIFY;
@@ -3965,6 +4022,9 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
         }
         if ((rc = check_iso(st, e))) break;
         imdb_txn_begin(db, &ss->txn, st->iso == SQL_ISO_READ_COMMITTED ? IMDB_ISO_READ_COMMITTED : IMDB_ISO_SNAPSHOT);
+        ss->txn.begin_ns = ss->txn.last_ns = now_ns; /* R4 */
+        ss->txn.timeout_ms = ss->txn_timeout_ms;
+        ss->txn.idle_ms = ss->idle_timeout_ms;
         snprintf(r->status, sizeof r->status, "BEGIN");
         break;
     case ST_SET_TXN:
@@ -4137,6 +4197,20 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
                 rc = imdb_fail(e, IMDB_ERR_INVALID, "statement_memory is 0 (the default) or %llu to %llu bytes",
                                (unsigned long long)IMDB_MIN_STATEMENT_MEMORY, (unsigned long long)IMDB_MAX_STATEMENT_MEMORY);
             else ss->stmt_memory = (uint64_t)v;
+        } else if (strcmp(st->set_name, "statement_row_limit") == 0) { /* D8 #4: rows tested; 0: none */
+            int64_t v;
+            imdb_err ep = {0};
+            if (imdb_parse_int64(st->set_value, strlen(st->set_value), &v, &ep) || v < 0 || (uint64_t)v > IMDB_MAX_STATEMENT_ROW_LIMIT)
+                rc = imdb_fail(e, IMDB_ERR_INVALID, "statement_row_limit is 0 (none) to %llu rows", (unsigned long long)IMDB_MAX_STATEMENT_ROW_LIMIT);
+            else ss->row_limit = (uint64_t)v;
+        } else if (strcmp(st->set_name, "transaction_timeout") == 0 || strcmp(st->set_name, "idle_in_transaction_timeout") == 0) {
+            bool idle = st->set_name[0] == 'i'; /* R4: milliseconds; 0: none; at the next BEGIN */
+            int64_t v;
+            imdb_err ep = {0}; /* the range is the message, whatever the literal was */
+            if (imdb_parse_int64(st->set_value, strlen(st->set_value), &v, &ep) || v < 0 || v > IMDB_MAX_STATEMENT_TIMEOUT_MS)
+                rc = imdb_fail(e, IMDB_ERR_INVALID, "%s is 0 (none) to %u milliseconds", st->set_name, IMDB_MAX_STATEMENT_TIMEOUT_MS);
+            else if (idle) ss->idle_timeout_ms = (uint32_t)v;
+            else ss->txn_timeout_ms = (uint32_t)v;
         } else if (strcmp(st->set_name, "statement_timeout") == 0) { /* R1: milliseconds; 0: none */
             int64_t v;
             imdb_err ep = {0}; /* the range is the message, whatever the literal was */
@@ -4150,7 +4224,7 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
                 rc = imdb_fail(e, IMDB_ERR_INVALID, "min_commit is a commit number (0: no requirement)");
             else ss->min_commit = (uint64_t)v;
         } else {
-            rc = imdb_fail(e, IMDB_ERR_NOTFOUND, "unknown setting %s (cross_check, access_path, join_plan, identity, min_commit, statement_memory, statement_timeout, sync_replicas, sync_timeout_ms)",
+            rc = imdb_fail(e, IMDB_ERR_NOTFOUND, "unknown setting %s (cross_check, access_path, join_plan, identity, min_commit, idle_in_transaction_timeout, statement_memory, statement_row_limit, statement_timeout, sync_replicas, transaction_timeout, sync_timeout_ms)",
                            st->set_name);
         }
         if (!rc) snprintf(r->status, sizeof r->status, "SET %s = %s", st->set_name, st->set_value);
@@ -4200,6 +4274,8 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
         }
     }
 done:
+    ss->rows_tested = x.tested; /* D8 #4: the first plan's count, for the caller and the tests */
+    if (ss->txn.open) ss->txn.last_ns = mono_ns(); /* R4: idle from here */
     if (ceiling) imdb_heap_ceiling_set(0, 0);
     if (rc) imdb_result_free(r);
     xfree(&x);

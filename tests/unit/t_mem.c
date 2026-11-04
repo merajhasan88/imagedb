@@ -21,7 +21,9 @@ static imdb_db *open_budget(const char *dir, uint64_t limit)
     imdb_open_opts o = {.sync = 1, .mem_limit = limit, .mem_window_us = UINT64_MAX}; /* the accounting: all held */
     imdb_db *db = NULL;
     imdb_err_clear(E);
-    return imdb_open(dir, &o, &db, E) ? NULL : db;
+    if (imdb_open(dir, &o, &db, E)) return NULL;
+    db->mem_reserve = 0; /* these check the admission's own arithmetic; t_mem_reserve checks the share kept for queries */
+    return db;
 }
 
 static int verify_db(imdb_db *db)
@@ -618,6 +620,45 @@ static void t_mem_heap_counter(void)
     CHECK(!d && e.code == IMDB_ERR_NOMEM && imdb_heap_bytes() == h0);
 }
 
+
+/* D8 #2: a database opened with a budget keeps a query's default workspace (a quarter of it) from writes: inserts
+ * are refused once the store would pass the budget less that share, so the store and one query fit in it together */
+static void t_mem_reserve(void)
+{
+    const char *dir = test_tmpdir();
+    OK(imdb_init(dir, false, NULL, E));
+    imdb_db *db = open_budget(dir, 0);
+    CHECK(db);
+    if (!db) return;
+    OK(make_table(db, E));
+    uint64_t budget = held(db) + (1u << 20);
+    imdb_close(db);
+    imdb_open_opts o = {.sync = 1, .mem_limit = budget, .mem_window_us = UINT64_MAX};
+    db = NULL;
+    OK(imdb_open(dir, &o, &db, E));
+    CHECK(db->mem_reserve == budget / 4 && db->mem_reserve == imdb_query_share(budget));
+    int64_t id = 1;
+    int rc = IMDB_OK;
+    uint64_t before = 0;
+    for (; id < 1000000; id++) {
+        before = db->seq;
+        if ((rc = ins1(db, id, id % 5, 100, "a row with some text in it"))) break;
+    }
+    CHECK(rc == IMDB_ERR_LIMIT && strstr(g_e.msg, "kept for queries") && strstr(g_e.msg, "nothing was written"));
+    CHECK(db->seq == before && id > 100 && held(db) + db->mem_reserve <= budget); /* stopped short of the share */
+    imdb_session s;
+    imdb_session_init(&s, db);
+    imdb_result r;
+    OK(run(&s, "SHOW MEMORY", &r));
+    CHECK(strstr(r.status, "kept for queries") && !strstr(r.status, "refused")); /* short of the room: nothing over it */
+    imdb_result_free(&r);
+    OK(run(&s, "SELECT COUNT(*) FROM txns", &r)); /* reads run in the share */
+    CHECK(r.nrows == 1 && r.cells[0].v.i == id - 1);
+    imdb_result_free(&r);
+    imdb_session_close(&s);
+    imdb_close(db);
+}
+
 const test_case mem_tests[] = {
     {"mem_vstore_chunks", t_mem_vstore_chunks},
     {"mem_vstore_held", t_mem_vstore_held},
@@ -625,6 +666,7 @@ const test_case mem_tests[] = {
     {"mem_vstore_refused", t_mem_vstore_refused},
     {"mem_heap_counter", t_mem_heap_counter},
     {"mem_admission", t_mem_admission},
+    {"mem_reserve", t_mem_reserve},
     {"mem_result_cap", t_mem_result_cap},
     {"mem_replica", t_mem_replica},
     {"mem_park", t_mem_park},

@@ -305,6 +305,7 @@ typedef struct imdb_db {
     bool no_auto_retire;      /* tests that RETIRE by hand turn the policy off for their handle */
     uint64_t pin_max_lag;     /* IMDB_PIN_MAX_LAG (tests lower it) */
     uint64_t mem_limit;       /* the memory budget (imdb_open_opts.mem_limit; 0: none) */
+    uint64_t mem_reserve;     /* D8 #2: the budget's part kept from writes for a query (imdb_query_share; 0: none) */
     uint64_t mem_window_us;   /* stage 3b: a version ended within it stays in memory (imdb_open_opts.mem_window_us) */
     uint64_t mem_floor;       /* every version ended past it is held; one ended at or before it may be the lake's alone,
                                  so a read below it goes to the lake (sql_exec.c); it only rises, and is never logged */
@@ -529,10 +530,21 @@ typedef struct imdb_txn {
     uint32_t nlocks, caplocks;
     imdb_txn_sp *sps;
     uint32_t nsps, capsps;
+    uint64_t begin_ns, last_ns; /* R4: its BEGIN and the end of its last statement (CLOCK_MONOTONIC) */
+    uint32_t timeout_ms, idle_ms; /* SET transaction_timeout and idle_in_transaction_timeout at its BEGIN (0: none) */
     char doom[512];            /* why it can only roll back */
 } imdb_txn;
 
 void imdb_txn_begin(imdb_db *db, imdb_txn *x, uint8_t iso);
+/* R4: x is past its transaction timeout, or idle past its limit, at now_ns (why says which; doomed or not) */
+bool imdb_txn_expired(const imdb_txn *x, uint64_t now_ns, char *why, size_t n);
+/* R4: x can only roll back (doomed with why, unless it already was), and what it holds goes now: the active one's
+ * pending versions are undone, a parked one's saved writes and its locks freed; it stays open, so its session's next
+ * statement fails and only ROLLBACK ends it */
+void imdb_txn_expire(imdb_db *db, imdb_txn *x, const char *why);
+/* R4: imdb_txn_expire for every open transaction but self past its limits: what a session that never comes back
+ * held goes at any session's next statement */
+void imdb_txn_timeouts(imdb_db *db, uint64_t now_ns, const imdb_txn *self);
 /* Before each statement of x: takes the statement's snapshot and, for a write
  * (or a read of its own saved writes), makes x the active transaction.
  * IMDB_ERR_CONFLICT when x is doomed or a replay of its writes fails. */
@@ -710,12 +722,16 @@ uint64_t imdb_cleanup_seq(imdb_db *db);
  * state stays consistent), until the budget is raised. Results have their own cap
  * (IMDB_MAX_RESULT_BYTES, a quarter of the budget when there is one). */
 typedef struct imdb_mem_report {
-    uint64_t versions, rows, indexes, segments, commits, txns, total, limit;
+    uint64_t versions, rows, indexes, segments, commits, txns, total, limit, reserve; /* reserve: db->mem_reserve */
     /* the segment cache (stage 3c-1): its images' bytes (in segments), its budget, the images loaded since the open and
      * the object bytes read for them */
     uint64_t seg_images, seg_budget, seg_loads, seg_load_bytes;
 } imdb_mem_report;
 void imdb_mem(const imdb_db *db, imdb_mem_report *r);
+/* D8 #2: a query's default workspace (SET statement_memory 0): a quarter of the budget, at most IMDB_MAX_RESULT_BYTES (that,
+ * without a budget). With a budget, writes leave as much of it free (db->mem_reserve: imdb_mem_admit refuses a write
+ * past the budget less it), so the store and one query's workspace fit in the budget together */
+uint64_t imdb_query_share(uint64_t mem_limit);
 
 /* ---- the memory window (stage 3b) --------------------------------------------------------------
  * A copy keeps in memory every version live, ended within its window (imdb_open_opts.mem_window_us), or not yet in a

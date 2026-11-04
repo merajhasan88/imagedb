@@ -7,6 +7,8 @@
 #include <time.h>
 
 #include "../../src/sql.h"
+#include <stdlib.h>
+
 #include "thelp.h"
 
 static imdb_session g_ss;
@@ -381,10 +383,358 @@ static void t_cancel_thread(void)
     done(db);
 }
 
+
+static int64_t one_i64_s(imdb_session *s, const char *sql)
+{
+    imdb_result r;
+    imdb_err_clear(&g_e);
+    if (imdb_exec_one(s, sql, strlen(sql), NULL, 0, &r, &g_e)) return INT64_MIN;
+    const imdb_cell *c = r.nrows == 1 ? &r.cells[0] : NULL;
+    int64_t v = !c || c->null ? INT64_MIN : c->wide ? (int64_t)c->i128 : c->v.i; /* SUM: wide */
+    imdb_result_free(&r);
+    return v;
+}
+
+/* ---- R4: transaction and idle-in-transaction timeouts ---------------------------------------------------------- */
+
+static void sleep_ms(int ms)
+{
+    struct timespec ts = {ms / 1000, (long)(ms % 1000) * 1000000L};
+    while (nanosleep(&ts, &ts) != 0) {
+    }
+}
+
+static int srun(imdb_session *s, const char *sql)
+{
+    imdb_result r;
+    imdb_err_clear(&g_e);
+    int rc = imdb_exec_one(s, sql, strlen(sql), NULL, 0, &r, &g_e);
+    if (!rc) imdb_result_free(&r);
+    return rc;
+}
+
+static imdb_db *small_db(imdb_session *s)
+{
+    const char *dir = test_tmpdir();
+    imdb_err e = {0};
+    if (imdb_init(dir, false, NULL, &e)) return NULL;
+    imdb_db *db = open_db(dir);
+    if (!db) return NULL;
+    imdb_session_init(s, db);
+    if (srun(s, "CREATE TABLE t (id INT64 PRIMARY KEY, v INT64)") || srun(s, "INSERT INTO t VALUES (1, 1)")) return db;
+    return db;
+}
+
+/* SET transaction_timeout: a transaction older than it fails its next statement (cancelled), can then only roll back,
+ * and its writes never commit; one that ends within it commits. Margins of 150 ms or more either way, for loaded and
+ * sanitizer runs */
+static void t_txn_timeout(void)
+{
+    imdb_session s;
+    imdb_db *db = small_db(&s);
+    CHECK(db);
+    if (!db) return;
+    CHECK(srun(&s, "SET transaction_timeout = 300") == 0);
+    CHECK(srun(&s, "BEGIN") == 0 && srun(&s, "INSERT INTO t VALUES (2, 2)") == 0);
+    sleep_ms(450);
+    CHECK(srun(&s, "SELECT COUNT(*) FROM t") == IMDB_ERR_CANCELLED && strstr(g_e.msg, "transaction timeout"));
+    CHECK(s.txn.open && s.txn.doomed && db->active == NULL); /* still open: only ROLLBACK ends it; its writes gone */
+    CHECK(srun(&s, "INSERT INTO t VALUES (3, 3)") == IMDB_ERR_CONFLICT && strstr(g_e.msg, "transaction timeout"));
+    CHECK(srun(&s, "SAVEPOINT a") == IMDB_ERR_CONFLICT);
+    CHECK(srun(&s, "COMMIT") == IMDB_ERR_CONFLICT); /* a doomed COMMIT rolls back */
+    CHECK(!s.txn.open);
+    CHECK(srun(&s, "BEGIN") == 0 && srun(&s, "INSERT INTO t VALUES (5, 5)") == 0); /* a COMMIT the first statement past */
+    sleep_ms(450);
+    CHECK(srun(&s, "COMMIT") == IMDB_ERR_CANCELLED && strstr(g_e.msg, "rolled back"));
+    CHECK(!s.txn.open && db->active == NULL);
+    CHECK(srun(&s, "SET transaction_timeout = 0") == 0); /* the quick one is about the rule, not the disk's speed */
+    CHECK(srun(&s, "BEGIN") == 0 && srun(&s, "INSERT INTO t VALUES (4, 4)") == 0 && srun(&s, "COMMIT") == 0);
+    CHECK(one_i64_s(&s, "SELECT COUNT(*) FROM t") == 2); /* 1 and 4: nothing of the timed-out ones */
+    CHECK(srun(&s, "SET transaction_timeout = 86400001") == IMDB_ERR_INVALID);
+    CHECK(srun(&s, "SET idle_in_transaction_timeout = -1") != 0 && s.idle_timeout_ms == 0); /* a syntax error */
+    imdb_session_close(&s);
+    imdb_close(db);
+}
+
+/* SET idle_in_transaction_timeout: statements closer together than it keep a transaction alive however long it runs;
+ * a pause longer than it makes the next statement fail (cancelled), and the transaction can only roll back */
+static void t_txn_idle_timeout(void)
+{
+    imdb_session s;
+    imdb_db *db = small_db(&s);
+    CHECK(db);
+    if (!db) return;
+    CHECK(srun(&s, "SET idle_in_transaction_timeout = 300") == 0);
+    CHECK(srun(&s, "BEGIN") == 0);
+    for (int i = 0; i < 8; i++) { /* 8 statements 60 ms apart: 480 ms in all, never idle 300 */
+        char q[64];
+        snprintf(q, sizeof q, "INSERT INTO t VALUES (%d, %d)", 10 + i, i);
+        CHECK(srun(&s, q) == 0);
+        sleep_ms(60);
+    }
+    sleep_ms(450);
+    CHECK(srun(&s, "SELECT COUNT(*) FROM t") == IMDB_ERR_CANCELLED && strstr(g_e.msg, "idle in transaction"));
+    CHECK(srun(&s, "ROLLBACK") == 0 && !s.txn.open);
+    CHECK(one_i64_s(&s, "SELECT COUNT(*) FROM t") == 1);
+    imdb_session_close(&s);
+    imdb_close(db);
+}
+
+static void insert_many(imdb_session *s, int from, int n)
+{
+    imdb_buf q;
+    imdb_buf_init(&q);
+    imdb_buf_put_str(&q, "INSERT INTO t VALUES ");
+    for (int i = 0; i < n; i++) imdb_buf_printf(&q, "%s(%d, %d)", i ? ", " : "", from + i, i);
+    OK(imdb_buf_check(&q, &g_e));
+    imdb_result r;
+    imdb_err_clear(&g_e);
+    CHECK(imdb_exec_one(s, (const char *)q.p, q.len, NULL, 0, &r, &g_e) == 0);
+    imdb_result_free(&r);
+    imdb_buf_free(&q);
+}
+
+/* Another session's statement ends a parked transaction idle past its limit and frees its saved writes at once: the
+ * memory an abandoned session held comes back without it; its own next statement then fails as doomed */
+static void t_txn_idle_sweep(void)
+{
+    imdb_session a, b;
+    imdb_db *db = small_db(&a);
+    CHECK(db);
+    if (!db) return;
+    imdb_session_init(&b, db);
+    CHECK(srun(&a, "SET idle_in_transaction_timeout = 200") == 0);
+    CHECK(srun(&a, "BEGIN") == 0);
+    insert_many(&a, 100, 3000);
+    CHECK(srun(&b, "INSERT INTO t VALUES (99999, 0)") == 0); /* a's writes parked: saved, undone in the store */
+    CHECK(a.txn.nops == 3000);
+    uint64_t held = imdb_heap_bytes();
+    sleep_ms(350);
+    CHECK(srun(&b, "SELECT COUNT(*) FROM t") == 0); /* b's statement: a is past its limit, doomed, its copies freed */
+    CHECK(a.txn.doomed && a.txn.nops == 0 && imdb_heap_bytes() + 3000 * 16 < held);
+    CHECK(srun(&a, "SELECT COUNT(*) FROM t") == IMDB_ERR_CONFLICT && strstr(g_e.msg, "idle in transaction"));
+    CHECK(srun(&a, "ROLLBACK") == 0 && !a.txn.open);
+    CHECK(one_i64_s(&b, "SELECT COUNT(*) FROM t") == 2);
+    imdb_session_close(&a);
+    imdb_session_close(&b);
+    imdb_close(db);
+}
+
+/* The same for the active transaction: its pending versions leave the store at another session's next statement, a
+ * read that never switches transactions; the table holds again only what it held before the BEGIN */
+static void t_txn_idle_sweep_active(void)
+{
+    imdb_session a, b;
+    imdb_db *db = small_db(&a);
+    CHECK(db);
+    if (!db) return;
+    imdb_session_init(&b, db);
+    const imdb_table *t = imdb_table_by_name(db, "t");
+    CHECK(t);
+    if (!t) return;
+    uint64_t before = t->nver;
+    CHECK(srun(&a, "SET idle_in_transaction_timeout = 200") == 0);
+    CHECK(srun(&a, "BEGIN") == 0);
+    insert_many(&a, 100, 3000);
+    CHECK(db->active == &a.txn && t->nver == before + 3000);
+    CHECK(one_i64_s(&b, "SELECT COUNT(*) FROM t") == 1); /* within the limit: nothing happens to a */
+    CHECK(db->active == &a.txn && !a.txn.doomed);
+    sleep_ms(350);
+    CHECK(one_i64_s(&b, "SELECT COUNT(*) FROM t") == 1);
+    CHECK(a.txn.doomed && a.txn.open && db->active == NULL && t->nver == before);
+    CHECK(srun(&a, "INSERT INTO t VALUES (5, 5)") == IMDB_ERR_CONFLICT && strstr(g_e.msg, "idle in transaction"));
+    CHECK(srun(&a, "ROLLBACK") == 0 && !a.txn.open);
+    CHECK(srun(&a, "INSERT INTO t VALUES (100, 1)") == 0); /* a key the expired one held is free */
+    CHECK(one_i64_s(&b, "SELECT COUNT(*) FROM t") == 2);
+    imdb_session_close(&a);
+    imdb_session_close(&b);
+    imdb_close(db);
+}
+
+
+/* ---- D8 #4: the work limit (SET statement_row_limit) ------------------------------------------------------------ */
+
+/* t: 3,000 rows published (CHECKPOINT), 300 of them updated after and 200 more inserted, so a read meets segments,
+ * ended versions in them and the memtable; u: the keys 0..9 and two that match nothing */
+static imdb_db *wl_db(imdb_session *s, uint64_t *before_update)
+{
+    const char *dir = test_tmpdir();
+    imdb_err e = {0};
+    if (imdb_init(dir, false, NULL, &e)) return NULL;
+    imdb_db *db = open_db(dir);
+    if (!db) return NULL;
+    imdb_session_init(s, db);
+    int rc = srun(s, "CREATE TABLE t (id INT64 PRIMARY KEY, g INT64, v INT64)");
+    if (!rc) rc = srun(s, "CREATE INDEX t_g ON t (g)");
+    for (int b = 0; !rc && b < 30; b++) {
+        imdb_buf q;
+        imdb_buf_init(&q);
+        imdb_buf_put_str(&q, "INSERT INTO t VALUES ");
+        for (int i = 1; i <= 100; i++) imdb_buf_printf(&q, "%s(%d, %d, %d)", i > 1 ? ", " : "", b * 100 + i, (b * 100 + i) % 50, b * 100 + i);
+        imdb_result r;
+        rc = imdb_buf_check(&q, &e) ? e.code : imdb_exec_one(s, (const char *)q.p, q.len, NULL, 0, &r, &g_e);
+        if (!rc) imdb_result_free(&r);
+        imdb_buf_free(&q);
+    }
+    if (!rc) rc = srun(s, "CHECKPOINT");
+    *before_update = db->seq;
+    if (!rc) rc = srun(s, "UPDATE t SET v = v + 1 WHERE id <= 300");
+    for (int i = 3001; !rc && i <= 3200; i++) {
+        char q[96];
+        snprintf(q, sizeof q, "INSERT INTO t VALUES (%d, %d, %d)", i, i % 50, i);
+        rc = srun(s, q);
+    }
+    if (!rc) rc = srun(s, "CREATE TABLE u (k INT64 PRIMARY KEY, w INT64)");
+    if (!rc) rc = srun(s, "INSERT INTO u VALUES (0, 0), (1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (7, 7), (8, 8), (9, 9), "
+                          "(100, 100), (101, 101)");
+    if (rc) test_fail(__FILE__, __LINE__, "the work limit's database: its setup failed");
+    return db;
+}
+
+/* q tests `want` rows on the session's current path: it passes at a limit of want and fails at want - 1, with nothing
+ * changed (the view token); the limit off again after */
+static void wl_expect(imdb_session *s, const char *q, uint64_t want, const char *label)
+{
+    char m[300];
+    uint8_t v0[32], v1[32];
+    OK(imdb_view_token(s->db, v0, E));
+    CHECK(srun(s, "SET statement_row_limit = 0") == 0);
+    int rc = srun(s, q);
+    if (rc || s->rows_tested != want) {
+        snprintf(m, sizeof m, "%s: rc %d, %llu rows tested, %llu wanted: %s", label, rc, (unsigned long long)s->rows_tested,
+                 (unsigned long long)want, q);
+        test_fail(__FILE__, __LINE__, m);
+        return;
+    }
+    char set[80];
+    snprintf(set, sizeof set, "SET statement_row_limit = %llu", (unsigned long long)want);
+    CHECK(srun(s, set) == 0);
+    CHECK(srun(s, q) == 0);
+    if (want > 1) { /* a limit of 0 is none */
+        snprintf(set, sizeof set, "SET statement_row_limit = %llu", (unsigned long long)(want - 1));
+        CHECK(srun(s, set) == 0);
+        rc = srun(s, q);
+        if (rc != IMDB_ERR_LIMIT || !strstr(g_e.msg, "statement row limit")) {
+            snprintf(m, sizeof m, "%s: at a limit of %llu rc %d (%s): %s", label, (unsigned long long)(want - 1), rc, g_e.msg, q);
+            test_fail(__FILE__, __LINE__, m);
+        }
+    }
+    CHECK(srun(s, "SET statement_row_limit = 0") == 0);
+    OK(imdb_view_token(s->db, v1, E));
+    CHECK(memcmp(v0, v1, 32) == 0);
+}
+
+/* Every path and placement tests the same rows: a statement's count is a function of the statement and the data
+ * (the matrix runs this in the eager and the tiny modes too, where the lake answers what memory does here) */
+static void t_row_limit_paths(void)
+{
+    imdb_session s;
+    uint64_t before = 0;
+    imdb_db *db = wl_db(&s, &before);
+    CHECK(db);
+    if (!db) return;
+    static const char *const paths[] = {"auto", "scan", "store", "ordered", "index"};
+    char asof[160];
+    snprintf(asof, sizeof asof, "SELECT COUNT(*) FROM t AS OF %llu WHERE g = 7", (unsigned long long)before);
+    for (size_t p = 0; p < sizeof paths / sizeof *paths; p++) {
+        char set[64];
+        snprintf(set, sizeof set, "SET access_path = %s", paths[p]);
+        CHECK(srun(&s, set) == 0);
+        wl_expect(&s, "SELECT COUNT(*) FROM t WHERE g = 7", 64, paths[p]);           /* 7, 57, .. 3157 */
+        wl_expect(&s, "SELECT id, v FROM t WHERE g = 7", 64, paths[p]);
+        wl_expect(&s, "SELECT COUNT(*), SUM(v) FROM t WHERE g = 7", 64, paths[p]);
+        wl_expect(&s, "SELECT COUNT(*) FROM t WHERE g = 7 AND v + 0 > 1000", 64, paths[p]); /* a tree: after the 64 */
+        wl_expect(&s, "SELECT COUNT(*) FROM t WHERE v >= 2001", 1200, paths[p]);
+        wl_expect(&s, "SELECT g, COUNT(*) FROM t WHERE g < 5 GROUP BY g", 320, paths[p]);
+        wl_expect(&s, "SELECT v FROM t WHERE id = 42", 1, paths[p]);
+        wl_expect(&s, "SELECT COUNT(*) FROM t WHERE g = 7 AND g = 8", 0, paths[p]);  /* never: nothing tested */
+        wl_expect(&s, asof, 60, paths[p]);                                          /* 7 .. 2957 */
+    }
+    /* a second publish: under IMDB_EVICT=eager the floor passes `before`, the versions the UPDATE ended leave memory,
+     * and the AS OF read is the lake's alone (below_floor); elsewhere memory answers it: the same count either way */
+    CHECK(srun(&s, "CHECKPOINT") == 0);
+    for (size_t p = 0; p < sizeof paths / sizeof *paths; p++) {
+        char set[64];
+        snprintf(set, sizeof set, "SET access_path = %s", paths[p]);
+        CHECK(srun(&s, set) == 0);
+        wl_expect(&s, asof, 60, paths[p]);
+        wl_expect(&s, "SELECT COUNT(*) FROM t WHERE g = 7", 64, paths[p]);
+        wl_expect(&s, "SELECT COUNT(*) FROM t WHERE v >= 2001", 1200, paths[p]);
+    }
+    if (getenv("IMDB_EVICT") && strcmp(getenv("IMDB_EVICT"), "eager") == 0) CHECK(db->mem_floor > before);
+    CHECK(srun(&s, "SET access_path = auto") == 0);
+    CHECK(srun(&s, "SET cross_check = on") == 0); /* each plan counts from zero: the limit is each one's */
+    uint64_t runs = s.cross_checks_run;
+    wl_expect(&s, "SELECT COUNT(*) FROM t WHERE g = 7", 64, "cross_check");
+    CHECK(s.cross_checks_run > runs);
+    CHECK(srun(&s, "SET cross_check = off") == 0);
+    CHECK(srun(&s, "SET statement_row_limit = 4611686018427387905") == IMDB_ERR_INVALID);
+    imdb_session_close(&s);
+    imdb_close(db);
+}
+
+/* A join tests the pairs it forms, the same under the hash and the index plan; a LEFT row without a match is one */
+static void t_row_limit_join(void)
+{
+    imdb_session s;
+    uint64_t before = 0;
+    imdb_db *db = wl_db(&s, &before);
+    CHECK(db);
+    if (!db) return;
+    static const char *const plans[] = {"auto", "hash", "index"};
+    for (size_t p = 0; p < sizeof plans / sizeof *plans; p++) {
+        char set[64];
+        snprintf(set, sizeof set, "SET join_plan = %s", plans[p]);
+        CHECK(srun(&s, set) == 0);
+        wl_expect(&s, "SELECT COUNT(*) FROM t JOIN u ON t.g = u.k", 640, plans[p]); /* g 0..9: 64 rows each */
+        wl_expect(&s, "SELECT t.id, u.w FROM t JOIN u ON t.g = u.k WHERE u.k = 3", 64, plans[p]);
+        wl_expect(&s, "SELECT COUNT(*) FROM u LEFT JOIN t ON u.k = t.g", 642, plans[p]); /* 100 and 101 unmatched */
+    }
+    CHECK(srun(&s, "SET join_plan = auto") == 0);
+    imdb_session_close(&s);
+    imdb_close(db);
+}
+
+/* A write past the limit is undone like any failed statement: in autocommit nothing commits; in a transaction the
+ * statement goes and the transaction goes on */
+static void t_row_limit_write(void)
+{
+    imdb_session s;
+    uint64_t before = 0;
+    imdb_db *db = wl_db(&s, &before);
+    CHECK(db);
+    if (!db) return;
+    uint8_t v0[32], v1[32];
+    OK(imdb_view_token(db, v0, E));
+    CHECK(srun(&s, "SET statement_row_limit = 63") == 0);
+    CHECK(srun(&s, "UPDATE t SET v = v + 1 WHERE g = 7") == IMDB_ERR_LIMIT);
+    CHECK(srun(&s, "DELETE FROM t WHERE g = 7") == IMDB_ERR_LIMIT);
+    OK(imdb_view_token(db, v1, E));
+    CHECK(memcmp(v0, v1, 32) == 0);
+    CHECK(srun(&s, "BEGIN") == 0);
+    CHECK(srun(&s, "UPDATE t SET v = 0 WHERE id = 1") == 0);
+    CHECK(srun(&s, "UPDATE t SET v = v + 1 WHERE g = 7") == IMDB_ERR_LIMIT);
+    CHECK(s.txn.open && !s.txn.doomed);
+    CHECK(srun(&s, "COMMIT") == 0);
+    CHECK(srun(&s, "SET statement_row_limit = 0") == 0);
+    CHECK(one_i64_s(&s, "SELECT v FROM t WHERE id = 1") == 0);
+    int64_t sum = one_i64_s(&s, "SELECT SUM(v) FROM t WHERE g = 7");
+    CHECK(sum == 101254); /* untouched: the 64 ids, the six <= 300 one more */
+    imdb_session_close(&s);
+    imdb_close(db);
+}
+
 const test_case cancel_tests[] = {
     {"cancel_timeout_paths", t_timeout_paths},
     {"cancel_timeout_writes", t_timeout_writes},
     {"cancel_timeout_write_phase", t_timeout_write_phase},
     {"cancel_thread", t_cancel_thread},
+    {"cancel_txn_timeout", t_txn_timeout},
+    {"cancel_txn_idle_timeout", t_txn_idle_timeout},
+    {"cancel_txn_idle_sweep", t_txn_idle_sweep},
+    {"cancel_txn_idle_sweep_active", t_txn_idle_sweep_active},
+    {"cancel_row_limit_paths", t_row_limit_paths},
+    {"cancel_row_limit_join", t_row_limit_join},
+    {"cancel_row_limit_write", t_row_limit_write},
 };
 const size_t cancel_ntests = sizeof cancel_tests / sizeof *cancel_tests;

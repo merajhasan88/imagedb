@@ -60,7 +60,11 @@ typedef struct imdb_session {
     int join_plan;           /* SET join_plan: IMDB_JOIN_AUTO, IMDB_JOIN_HASH or IMDB_JOIN_INDEX */
     imdb_txn txn;            /* BEGIN ... COMMIT (db.h: session transactions) */
     uint64_t cross_checks_run;
+    uint64_t row_limit;       /* SET statement_row_limit = n: a statement testing more rows fails (D8 #4; 0: none) */
+    uint64_t rows_tested;     /* the last statement's rows tested (its first plan's; the work limit's count) */
     uint32_t stmt_timeout_ms; /* SET statement_timeout = ms: a statement running longer is cancelled (0: none) */
+    uint32_t txn_timeout_ms;  /* SET transaction_timeout = ms: a transaction older can only roll back (R4; 0: none) */
+    uint32_t idle_timeout_ms; /* SET idle_in_transaction_timeout = ms: one idle longer, the same (R4; 0: none) */
     uint64_t stmt_memory;     /* SET statement_memory = bytes: a read statement's workspace ceiling (P0 R2; 0: the default,
                                * a quarter of the memory budget or IMDB_MAX_RESULT_BYTES) */
     atomic_bool cancel;       /* imdb_session_cancel: the running statement stops at its next check (cleared at
