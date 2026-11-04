@@ -319,8 +319,9 @@ a client holds.
 One process and principal, one engine thread with worker parallelism, many
 interleaved sessions. SNAPSHOT and READ COMMITTED transactions, statement
 rollback, savepoints, `WITH (NOLOCK)` and optimistic `SELECT ... FOR UPDATE`
-(first committer wins). SERIALIZABLE is refused; snapshot write skew is
-possible.
+(first committer wins, without fairness: a long transaction can lose every
+round to short ones writing the same row, so retry with backoff). SERIALIZABLE
+is refused; snapshot write skew is possible.
 
 Types: INT64, DECIMAL, TEXT, BOOL, TIMESTAMP, finite FLOAT64 (exact SUM,
 rounded once) and nullable non-key columns. Comparisons with NULL, including
