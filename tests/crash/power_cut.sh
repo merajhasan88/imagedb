@@ -107,6 +107,12 @@ for i in $(seq 11 14); do step sql "$D" -c "UPDATE t SET memo = 'changed-$i' WHE
 step sql "$D" -c "ERASE SUBJECT 1;"
 for i in $(seq 15 18); do step sql "$D" -c "INSERT INTO t VALUES ($i, 2, 'late-$i');"; done
 step sql "$D" -c "DELETE FROM t WHERE id = 15;" -c "CHECKPOINT;"
+# DROP TABLE (P0 1f): a table made, written, dropped and its name taken again, then a publish (the manifest's
+# tombstone), so the replayed states hold op 19 at every point and a snapshot with a dropped table
+step sql "$D" -c "CREATE TABLE gone (id INT64 PRIMARY KEY, v INT64);"
+for i in 1 2 3; do step sql "$D" -c "INSERT INTO gone VALUES ($i, $i);"; done
+step sql "$D" -c "DROP TABLE gone;"
+step sql "$D" -c "CREATE TABLE gone (id INT64 PRIMARY KEY, w TEXT);" -c "INSERT INTO gone VALUES (1, 'reused');" -c "CHECKPOINT;"
 
 # A persistent writer (persist_writer.c): one open, many commits, each acknowledgement recorded
 # and marked before the next commit starts. Then the same with --durable-ack, after a mark: from
