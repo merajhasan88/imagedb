@@ -664,6 +664,125 @@ static void t_segcache_hmap_prune(void)
                 }
 }
 
+
+/* ---- 3c-2: the open streams ------------------------------------------------------------------------------------- */
+
+static imdb_db *sopen(const char *dir, uint64_t budget, bool ro)
+{
+    imdb_open_opts o = {.sync = 0, .mem_window_us = UINT64_MAX, .seg_cache_bytes = budget, .read_only = ro};
+    imdb_db *db = NULL;
+    imdb_err_clear(E);
+    return imdb_open(dir, &o, &db, E) ? NULL : db;
+}
+
+/* the most segments one chunk of 2^16 vids overlaps: phase 2 holds those while it counts the chunk's rows */
+static uint64_t chunk_span(const imdb_table *t)
+{
+    uint64_t most = 0;
+    for (uint64_t k = 0; k <= (t->nver >> IMDB_VCHUNK_BITS); k++) {
+        uint64_t lo = k << IMDB_VCHUNK_BITS, hi = lo + (1u << IMDB_VCHUNK_BITS) - 1, n = 0;
+        for (uint32_t s = 0; s < t->nseg; s++) n += t->seg[s]->vid_first <= hi && t->seg[s]->vid_last >= lo;
+        if (n > most) most = n;
+    }
+    return most;
+}
+
+
+/* An open holds what it keeps, the budget and the images in hand, not the whole lake (3c-2): ten segments of 9,000
+ * rows (a 300-byte TEXT each), a unique and an ordered index, and a tail of updates, deletes and inserts after the
+ * last publish (in one segment: a replayed commit holds the segments it touches until it ends, as it did when it ran),
+ * which the open replays. Opened with every image kept and with a budget of one byte, writable and
+ * read-only: the same view token and answers each time, and the streaming opens' peak within the images one chunk
+ * of 2^16 versions spans (phase 2 counts a chunk's rows before it places them) and two more, against the whole lake's
+ * when every image is kept; each segment read a bounded number of times */
+static void t_segcache_open_streams(void)
+{
+    const char *dir = test_tmpdir();
+    OK(imdb_init(dir, false, NULL, E));
+    imdb_db *db = sopen(dir, UINT64_MAX, false);
+    CHECK(db);
+    if (!db) return;
+    imdb_session s;
+    imdb_session_init(&s, db);
+    OK(ex(&s, "CREATE TABLE t (id INT64 PRIMARY KEY, a INT64 NOT NULL, s TEXT)"));
+    OK(ex(&s, "CREATE UNIQUE INDEX t_a ON t (a)"));
+    OK(ex(&s, "CREATE INDEX t_s ON t (s)"));
+    imdb_buf b;
+    imdb_buf_init(&b);
+    for (int seg = 0; seg < 10; seg++) {
+        for (int part = 0; part < 3; part++) {
+            b.len = 0;
+            imdb_buf_put_str(&b, "INSERT INTO t VALUES ");
+            for (int i = 0; i < 3000; i++) {
+                int id = seg * 9000 + part * 3000 + i + 1;
+                imdb_buf_printf(&b, "%s(%d, %d, '%0300d')", i ? ", " : "", id, 1000000 - id, id);
+            }
+            OK(imdb_buf_check(&b, E));
+            imdb_result r;
+            imdb_err_clear(E);
+            OK(imdb_exec_one(&s, (const char *)b.p, b.len, NULL, 0, &r, E));
+            imdb_result_free(&r);
+        }
+        OK(ex(&s, "CHECKPOINT"));
+    }
+    imdb_buf_free(&b);
+    OK(ex(&s, "UPDATE t SET a = a + 2000000 WHERE id % 97 = 0 AND id < 9000")); /* the tail: one segment's versions ended */
+    OK(ex(&s, "DELETE FROM t WHERE id % 89 = 0 AND id > 81000"));
+    OK(ex(&s, "INSERT INTO t VALUES (100001, 1, 'tail'), (100002, 2, 'tail')"));
+    imdb_session_close(&s);
+    imdb_close(db);
+    static const char *const q[] = {"SELECT COUNT(*), SUM(a) FROM t", "SELECT id FROM t WHERE a = 1000000 - 4500",
+                                    "SELECT COUNT(*) FROM t WHERE s >= '000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000045000'",
+                                    "SELECT id FROM t WHERE id = 89", "SELECT COUNT(*) FROM t WHERE a > 2000000"};
+    uint8_t tok[3][32];
+    imdb_buf ans[3];
+    uint64_t peak[3] = {0}, loads[3] = {0}, largest = 0, nseg = 0, span = 0;
+    for (int run = 0; run < 3; run++) { /* every image kept; a budget of one byte; the same, read-only */
+        db = sopen(dir, run ? 1 : UINT64_MAX, run == 2);
+        CHECK(db);
+        if (!db) return;
+        peak[run] = db->segcache.peak;
+        loads[run] = db->segcache.loads;
+        if (run == 0) /* every image resident: the largest, as the cache counts it */
+            for (uint32_t k = 0; k < db->t[0]->nseg; k++)
+                if (imdb_seg_image_bytes(db->t[0]->seg[k]) > largest) largest = imdb_seg_image_bytes(db->t[0]->seg[k]);
+        nseg = db->t[0]->nseg;
+        span = chunk_span(db->t[0]);
+        OK(imdb_view_token(db, tok[run], E));
+        imdb_buf_init(&ans[run]);
+        imdb_session_init(&s, db);
+        imdb_buf o;
+        imdb_buf_init(&o);
+        for (size_t i = 0; i < sizeof q / sizeof *q; i++) {
+            outcome(&s, q[i], &o);
+            imdb_buf_put(&ans[run], o.p, o.len);
+        }
+        imdb_buf_free(&o);
+        imdb_session_close(&s);
+        imdb_verify_report vr;
+        memset(&vr, 0, sizeof vr);
+        OK(imdb_verify(db, &vr, E));
+        imdb_close(db);
+    }
+    if (getenv("IMDB_SEGCACHE_DEBUG")) fprintf(stderr, "    peaks %llu %llu %llu, largest image bound %llu, loads %llu %llu %llu, segments %llu\n", (unsigned long long)peak[0],
+            (unsigned long long)peak[1], (unsigned long long)peak[2], (unsigned long long)largest, (unsigned long long)loads[0],
+            (unsigned long long)loads[1], (unsigned long long)loads[2], (unsigned long long)nseg);
+    CHECK(nseg == 10);
+    for (int run = 1; run < 3; run++) {
+        CHECK(!memcmp(tok[0], tok[run], 32));
+        CHECK(ans[0].len == ans[run].len && !memcmp(ans[0].p, ans[run].p, ans[0].len));
+        /* the segments one chunk spans while phase 2 counts it, the one in hand and the replayed commit's one */
+        CHECK(peak[run] <= (span + 2) * largest);
+        CHECK(peak[run] < peak[0] * 9 / 10 + 1);
+        CHECK(loads[run] <= 6 * nseg); /* phase 2, the reindex, the unique and the ordered builds, the replay */
+    }
+    if (peak[1] > (span + 2) * largest || loads[1] > 6 * nseg)
+        fprintf(stderr, "    peaks %llu %llu %llu, largest image bound %llu, loads %llu %llu\n", (unsigned long long)peak[0],
+                (unsigned long long)peak[1], (unsigned long long)peak[2], (unsigned long long)largest,
+                (unsigned long long)loads[1], (unsigned long long)loads[2]);
+    for (int run = 0; run < 3; run++) imdb_buf_free(&ans[run]);
+}
+
 const test_case segcache_tests[] = {
     {"segcache_reload_ends", t_segcache_reload_ends},
     {"segcache_lru", t_segcache_lru},
@@ -674,5 +793,6 @@ const test_case segcache_tests[] = {
     {"segcache_evict_loads", t_segcache_evict_loads},
     {"segcache_retire_loads", t_segcache_retire_loads},
     {"segcache_hmap_prune", t_segcache_hmap_prune},
+    {"segcache_open_streams", t_segcache_open_streams},
 };
 const size_t segcache_ntests = sizeof segcache_tests / sizeof *segcache_tests;

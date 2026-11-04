@@ -817,6 +817,17 @@ int imdb_index_version(imdb_table *t, uint64_t vid, imdb_undo *u, imdb_err *e)
     return IMDB_OK;
 }
 
+/* 3c-2: in a vid-ordered walk, the segment of the version at hand (NULL: the memtable's); the walk has left the one
+ * before for good (segments hold ascending vid ranges), so it may go while the open streams (lake.c). Each walk below
+ * copies what it keeps (the maps own their keys, the ordered runs their words): no pointer into it outlives the step. */
+static void walk_leave(imdb_table *t, uint64_t vid, imdb_segment **prev)
+{
+    const imdb_version *v = imdb_vh(t, vid);
+    imdb_segment *g = (v->flags & IMDB_V_SEG) && v->seg < t->nseg ? t->seg[v->seg] : NULL;
+    if (*prev && g != *prev) imdb_seg_release_one(*prev);
+    *prev = g;
+}
+
 int imdb_table_reindex(imdb_table *t, imdb_err *e)
 {
     imdb_hmap_free(&t->pk);
@@ -829,8 +840,10 @@ int imdb_table_reindex(imdb_table *t, imdb_err *e)
         (t->s.subject >= 0 && imdb_hmap_init(&t->subj, t->s.cols[t->s.subject].type, e)))
         return e->code;
     int rc = IMDB_OK;
+    imdb_segment *prev = NULL;
     for (uint64_t vid = imdb_v_next(t, 0); vid < t->nver && !rc; vid = imdb_v_next(t, vid + 1)) {
         imdb_version *v = imdb_vh(t, vid);
+        walk_leave(t, vid, &prev);
         v->pk_prev = IMDB_NONE;
         if (!(v->flags & (IMDB_V_STUB | IMDB_V_PURGED))) {
             rc = index_key_subject(t, vid, NULL, e);
@@ -839,6 +852,7 @@ int imdb_table_reindex(imdb_table *t, imdb_err *e)
             if (imdb_seg_value(t, v, t->s.subject, &sv) == IMDB_OK) rc = imdb_index_subject(t, vid, &sv, NULL, e);
         }
     }
+    if (prev) imdb_seg_release_one(prev);
     return rc;
 }
 
@@ -2085,8 +2099,10 @@ static int unique_build_into(imdb_table *t, const imdb_index *ix, imdb_uidx *u, 
     imdb_buf b;
     imdb_buf_init(&b);
     int rc = IMDB_OK;
+    imdb_segment *prev = NULL;
     for (uint64_t vid = imdb_v_next(t, 0); vid < t->nver && !rc; vid = imdb_v_next(t, vid + 1)) {
         const imdb_version *v = imdb_vh(t, vid);
+        walk_leave(t, vid, &prev);
         imdb_value vals[IMDB_MAX_INDEX_COLS], k;
         if (v->end != IMDB_LIVE || !ukey_vals_version(t, vid, ix, vals)) continue;
         if ((rc = ukey(ix, vals, &b, &k, e))) break;
@@ -2096,6 +2112,7 @@ static int unique_build_into(imdb_table *t, const imdb_index *ix, imdb_uidx *u, 
             rc = imdb_hmap_put(&u->map, &k, vid, e);
     }
     imdb_buf_wipe_free(&b);
+    if (prev) imdb_seg_release_one(prev);
     return rc;
 }
 
@@ -2262,9 +2279,13 @@ static int oidx_build_from(imdb_table *t, const imdb_index *ix, uint64_t floor, 
     uint64_t *all = imdb_alloc_array(held ? held : 1, imdb_oidx_entry_bytes(ix->d.ncols), e);
     if (!all) return e->code;
     uint64_t n = 0;
-    for (uint64_t vid = imdb_v_next(t, 0); vid < t->idx_upto; vid = imdb_v_next(t, vid + 1))
+    imdb_segment *prev = NULL;
+    for (uint64_t vid = imdb_v_next(t, 0); vid < t->idx_upto; vid = imdb_v_next(t, vid + 1)) {
+        walk_leave(t, vid, &prev);
         if (!evictable(imdb_vh(t, vid), floor) && imdb_index_version_key(t, vid, ix, all + n * w))
             all[n++ * w + ix->d.ncols] = vid;
+    }
+    if (prev) imdb_seg_release_one(prev);
     return imdb_oidx_build(ox, all, n, e); /* takes all over */
 }
 
@@ -4158,6 +4179,7 @@ int imdb_open(const char *path, const imdb_open_opts *o, imdb_db **out, imdb_err
                                                                                       : IMDB_SEG_CACHE_BYTES;
     db->segcache.db = db;
     imdb_op_enter(db); /* the open is one operation: its end trims the snapshot's images to the budget */
+    db->segcache.streaming = true; /* 3c-2: the open's passes let go of what they have left (lake.c) */
     db->full_replay = o && o->full_replay;
     db->lake_sync = o && o->lake_sync;
     db->floor_stride = !o || !o->floor_stride ? IMDB_FLOOR_STRIDE : o->floor_stride;
@@ -4271,6 +4293,7 @@ int imdb_open(const char *path, const imdb_open_opts *o, imdb_db **out, imdb_err
         if (imdb_log_cut(db, &ce)) imdb_warn(db, "the log below commit %llu could not all be removed (%s)",
                                              (unsigned long long)db->log_floor + 1, ce.msg);
     }
+    db->segcache.streaming = false; /* the open's end: from here an image leaves only as its operation ends */
     imdb_op_leave(db);
     *out = db;
     return IMDB_OK;

@@ -107,6 +107,12 @@ static void seg_img_drop(imdb_segment *g)
     seg_img_free(gi);
 }
 
+/* the bytes g's image holds while resident (0 when it is not): tests bound an open's peak by them */
+uint64_t imdb_seg_image_bytes(const imdb_segment *g)
+{
+    return g->img_ ? seg_img_bytes(g, g->img_) : 0;
+}
+
 /* g's image becomes the table's: charged to its cache (a trim may then drop it, once g is ondisk) */
 static void seg_charge(imdb_segcache *c, imdb_segment *g)
 {
@@ -114,6 +120,7 @@ static void seg_charge(imdb_segcache *c, imdb_segment *g)
     g->cache = c;
     g->touched = c->clock;
     c->resident += seg_img_bytes(g, g->img_);
+    if (c->resident > c->peak) c->peak = c->resident;
 }
 
 void imdb_segment_free(imdb_segment *g)
@@ -2226,7 +2233,8 @@ static int seg_load_body(imdb_segcache *c, const imdb_table *t, imdb_segment *g,
             if (!rc) {
                 if (memcmp(sh, g->hash, 32) != 0) rc = imdb_fail(e, IMDB_ERR_STATE, "lake: a deletion vector names another segment");
                 for (uint32_t i = 0; !rc && i < n; i++) /* published, so never past this copy's commit */
-                    if (ents[i].end > c->db->seq) rc = imdb_fail(e, IMDB_ERR_STATE, "lake: a deletion vector records a later end");
+                    if (ents[i].end > (c->snap_seq > c->db->seq ? c->snap_seq : c->db->seq)) /* a seeded copy: seq is its floor */
+                        rc = imdb_fail(e, IMDB_ERR_STATE, "lake: a deletion vector records a later end");
                     else gi->end[ents[i].row] = ents[i].end;
                 imdb_free(ents);
             }
@@ -2252,6 +2260,7 @@ static int seg_load_body(imdb_segcache *c, const imdb_table *t, imdb_segment *g,
     c->loads++;
     c->load_bytes += read;
     c->resident += seg_img_bytes(g, gi);
+    if (c->resident > c->peak) c->peak = c->resident;
     __atomic_store_n(&g->touched, c->clock, __ATOMIC_RELAXED);
     __atomic_store_n(&g->img_, gi, __ATOMIC_RELEASE);
     *out = gi;
@@ -2360,6 +2369,25 @@ static void seg_trim(imdb_db *db)
     qsort(v, m, sizeof *v, cmp_trim);
     for (size_t i = 0; i < m && c->resident > c->budget; i++) seg_img_drop(db->t[v[i].ti]->seg[v[i].k]);
     imdb_free(v);
+}
+
+/* The open's streaming (3c-2): a pass that has finished with g lets its image go while the cache is over its budget, so
+ * an open holds what it keeps, the budget and the images in hand, not the whole lake. Only while the open streams (the
+ * flag), only on the engine thread with no parallel loop running, and only for an image no pointer of the caller's
+ * still reads: the passes call it for a segment their walk has left (vid order: none comes back to it in that pass). */
+void imdb_seg_release_one(imdb_segment *g)
+{
+    imdb_segcache *c = g ? g->cache : NULL;
+    if (c && c->streaming && c->resident > c->budget && seg_droppable(c, g)) seg_img_drop(g);
+}
+
+/* Between the open's replayed commits: no pointer into an image is held, so the cache trims as at an operation's end */
+void imdb_seg_trim_streaming(imdb_db *db)
+{
+    if (!db->segcache.streaming) return;
+    seg_trim(db);
+    db->segcache.clock++; /* the open is one operation, one stamp: each commit's pins outrank the last's, so the trim
+                           * drops the least recently used, not the lowest-numbered segments */
 }
 
 void imdb_op_enter(imdb_db *db)
@@ -2528,6 +2556,7 @@ static int load_table(imdb_db *db, int ofd, const imdb_manifest_tab *mt, uint32_
         }
         seg_marks(g, gi); /* the published ends: the replay of the log past the snapshot keeps them (imdb_seg_set_end) */
         g->ondisk = g->seg_ondisk = true; /* the segment and its deletion vector were read from objects/ */
+        imdb_seg_release_one(g); /* 3c-2: its marks and descriptor stand; phase 2 reads it again if it left */
     }
     /* The rows are authenticated (each segment by its name, the manifest by the log's hash of it): every version
      * they hold, once, in vid order: each segment's vids ascend (imdb_segment_parse) and each segment's first is past
@@ -2575,6 +2604,7 @@ static int load_table(imdb_db *db, int ofd, const imdb_manifest_tab *mt, uint32_
                 break;
             }
             if (si >= g->nrows) {
+                imdb_seg_release_one(g); /* wholly behind the cursor: placed (3c-2) */
                 sk++;
                 si = 0;
                 continue;
@@ -2603,6 +2633,7 @@ static int load_table(imdb_db *db, int ofd, const imdb_manifest_tab *mt, uint32_
         }
     }
     while (!rc && sk < t->nseg && si >= t->seg[sk]->nrows) {
+        imdb_seg_release_one(t->seg[sk]);
         sk++;
         si = 0;
     }
@@ -2690,7 +2721,9 @@ int imdb_lake_load_snapshot(imdb_db *db, uint64_t *seq, bool *moved, imdb_err *e
         rc = imdb_fail(e, IMDB_ERR_STATE, "snapshot: manifest disagrees with commit %llu", (unsigned long long)S);
     if (!rc && !all_zero(m.prev_manifest, 32)) rc = read_obj(ofd, m.prev_manifest, ".man", &pb, &pl, e);
     db->mem_floor = imdb_window_floor(db, S); /* stage 3b: the store takes no row ended at or before it */
+    db->segcache.snap_seq = S; /* a segment the open read again: its vector's ends are bounded by S (db->seq is 0) */
     for (uint32_t ti = 0; !rc && ti < m.nt; ti++) rc = load_table(db, ofd, &m.t[ti], ti, S, m.boundary, e);
+    db->segcache.snap_seq = 0;
     if (!rc) {
         imdb_lthash sum;
         imdb_lthash_zero(&sum);

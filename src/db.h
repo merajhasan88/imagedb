@@ -112,6 +112,11 @@ typedef struct imdb_segcache {
     uint64_t loads, load_bytes; /* images loaded since the open and the object bytes read for them (SHOW MEMORY) */
     uint64_t clock;           /* outermost operations begun: a pin stamps its segment with it, a trim drops the oldest first */
     uint32_t depth;           /* operations open: a trim only when the outermost ends */
+    bool streaming;           /* the open (3c-2): its passes release each image they have finished while over the budget
+                                 (imdb_seg_release_one), and its replay trims between commits */
+    uint64_t peak;            /* the most resident has been (since the open: tests and SHOW MEMORY's judge) */
+    uint64_t snap_seq;        /* a snapshot load's commit S while it runs (db->seq is still 0 then): a reload's bound for its
+                                 deletion vector's ends (3c-2: the open's passes read a segment again) */
     struct imdb_db *db;       /* the database it belongs to: a load opens its objects/ */
     pthread_mutex_t lock;     /* loads by imdb_par_for's workers, and the counters they move */
 } imdb_segcache;

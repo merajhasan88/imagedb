@@ -731,6 +731,7 @@ static int replay_segment(imdb_db *db, size_t si, bool ro, imdb_err *e)
             imdb_commit_pre pre = {.payloads_checked = f->payloads_ok, .deltas = f->deltas, .digest_ok = f->digest_ok,
                                    .nd = f->nd, .tab = f->tab, .delta = f->delta};
             if (!rc) rc = imdb_apply_commit(db, &f->c, &pre, e);
+            if (!rc) imdb_seg_trim_streaming(db); /* 3c-2: an open's replay holds no image between commits */
             for (uint32_t k = 0; k < f->c.nops; k++) ended |= imdb_op_publishes_manifest(f->c.ops[k].code);
             if (rc) break;
             off += f->len;

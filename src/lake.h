@@ -110,6 +110,11 @@ typedef struct imdb_segment {
 
 /* The rest of imdb_seg_pin (lake.c): the stamp of a segment first pinned in this operation, or the load. */
 imdb_segimg *imdb_seg_pin_slow(const imdb_table *t, imdb_segment *g, imdb_err *e);
+/* The open streams (3c-2, lake.c): a pass lets go of a segment it has left while the cache is over its budget; the
+ * replay trims between commits. No-ops outside the open. */
+void imdb_seg_release_one(imdb_segment *g);
+void imdb_seg_trim_streaming(imdb_db *db);
+uint64_t imdb_seg_image_bytes(const imdb_segment *g); /* a resident image's bytes, else 0 */
 /* Segment g's image, pinned for the current operation (t: g's table; NULL for a segment parsed apart from any table,
  * as VERIFY's and a seed's checks parse them, always resident). NULL with e set when it cannot be had. Inline: a walk
  * pins at every row, and the common case (in memory, pinned already in this operation) is two loads and a compare. */
