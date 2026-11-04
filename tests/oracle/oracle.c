@@ -2115,7 +2115,7 @@ static void reset_all(unsigned seed)
 
 static int cmp_rows(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
 
-static long g_mismatches, g_compared, g_checkpoints, g_reopens;
+static long g_mismatches, g_compared, g_checkpoints, g_reopens, g_drops;
 
 static void show_rows(const res *r, size_t from)
 {
@@ -2188,6 +2188,31 @@ static bool excused(int d, const char *msg)
     return false;
 }
 
+/* imagedb refused, under LIMIT or OFFSET, what engine d answered: imagedb computes every group's and row's items before
+ * the window (design.md, Expressions: whether an operation fails never depends on the plan), while a reference
+ * streaming sorted groups may stop at its LIMIT before the failing one (PostgreSQL, seed 5 of the 2026-11-05 run:
+ * SUM(-d) / AVG(g * -11) over GROUP BY g with g = 0 past the window). Excused only when d, asked the same statement
+ * without LIMIT and OFFSET, refuses it for the same class of reason, so the claim is checked every time; never
+ * inside a transaction, where a failed statement would abort PostgreSQL's */
+static long g_excused_window;
+static bool excused_window(int d, const stmt *q, const char *base_msg)
+{
+    if (!(q->limit || q->offset) || g_in_txn || !err_class(base_msg)) return false;
+    stmt q2 = *q;
+    q2.limit = 0;
+    q2.offset = 0;
+    static sb t2;
+    static res o2;
+    int ty[MAXC + 8];
+    int nty = out_types(&q2, ty);
+    print_stmt(&t2, d, &q2);
+    exec_eng(&g_eng[d], t2.p, true, ty, nty, &o2);
+    bool same = o2.err && err_class(o2.msg) == err_class(base_msg);
+    res_clear(&o2);
+    if (same) g_excused_window++;
+    return same;
+}
+
 /* the reverse: engine d refused what imagedb answered, as d does wrongly. MySQL 8.4.13 refuses INT64_MIN DIV n though the
  * quotient is an INT64 ("BIGINT value is out of range"; MariaDB 12.3.3 answers it; reproduced alone, 2026-11-04);
  * an INT64_MIN DIV -1 that imagedb wrongly answered would still be caught: PostgreSQL is compared first */
@@ -2221,7 +2246,8 @@ static int run_stmt(unsigned seed, int step, const stmt *q, bool state)
         const res *o = &out[d];
         const char *why = NULL;
         size_t at = 0;
-        if ((base->err && !o->err && excused(d, base->msg)) || (!base->err && o->err && excused_other(d, o->msg, text[d].p))) {
+        if ((base->err && !o->err && (excused(d, base->msg) || excused_window(d, q, base->msg))) ||
+            (!base->err && o->err && excused_other(d, o->msg, text[d].p))) {
             g_excused++;
             if (g_verbose) fprintf(stderr, "  excused (%s): %s\n    imagedb: %s\n    %s: %s\n", DNAME[d], text[d].p,
                                    base->err ? base->msg : "answered", DNAME[d], o->err ? o->msg : "answered");
@@ -2276,6 +2302,35 @@ static int check_state(unsigned seed, int step)
 
 /* ---- the driver ---------------------------------------------------------------------------------------------------- */
 
+/* DROP TABLE (P0 1f) against the references: between statements (no transaction open), u dropped on every engine,
+ * made again by its dialect's DDL with its index, and refilled; what follows reads the new u (on imagedb the name
+ * resolves to the table live at the read's snapshot, the dropped one kept as history), compared like any table */
+static int drop_u_again(unsigned seed, int *step)
+{
+    for (int d = 0; d < ND; d++) {
+        eng *e = &g_eng[d];
+        if (!e->on) continue;
+        must(e, "DROP TABLE u");
+        must(e, ddl(d, 1));
+        must(e, "CREATE INDEX u_tid ON u (tid)");
+    }
+    g_drops++;
+    if (g_verbose) fprintf(stderr, "  [%u.%d] (DROP TABLE u on every engine, made again)\n", seed, *step);
+    if (check_state(seed, *step)) return -1;
+    stmt q;
+    int n = (int)rr(5, 30);
+    for (int i = 0; i < n; i += 8) {
+        memset(&q, 0, sizeof q);
+        q.kind = Q_INSERT;
+        q.tab = 1;
+        q.gcol = -1;
+        q.nrow = n - i < 8 ? n - i : 8;
+        for (int r = 0; r < q.nrow; r++) gen_row(1, q.row[r]);
+        if (run_stmt(seed, (*step)++, &q, false)) return -1;
+    }
+    return check_state(seed, *step);
+}
+
 static int run_seed(unsigned seed, int steps)
 {
     g_rng = 0x9E3779B97F4A7C15ull ^ ((uint64_t)seed * 0xBF58476D1CE4E5B9ull);
@@ -2309,6 +2364,7 @@ static int run_seed(unsigned seed, int steps)
             if (g_verbose) fprintf(stderr, "  [%u.%d] (imagedb alone: %s)\n", seed, step, cp ? "CHECKPOINT" : "a reopen");
             if (check_state(seed, step)) return -1;
         }
+        if (chance(2) && drop_u_again(seed, &step)) return -1; /* about one step in fifty */
         int r = (int)(rnd() % 100);
         if (r < 70) {
             gen_select(&q);
@@ -2402,6 +2458,9 @@ int main(int argc, char **argv)
     printf("oracle: %ld refusals excused%s as the dialects compute them (a zero divisor: NULL in MySQL, MariaDB and "
            "SQLite; an INT64 overflow: REAL in SQLite; INT64 past 2^53 in FLOAT64: rounded by all; MySQL's INT64_MIN DIV n; SQL Server's INT64_MIN %% -1); %ld both refused "
            "for another reason\n", g_excused, g_eng[D_PG].on ? "" : " (UNGUARDED: PostgreSQL was not run)", g_class_diff);
+    printf("oracle: DROP TABLE u made again %ld times on every engine\n", g_drops);
+    printf("oracle: %ld refusals under LIMIT/OFFSET excused: the reference refused the same statement without them\n",
+           g_excused_window);
     printf("oracle: imagedb alone: %ld CHECKPOINTs, %ld reopens; the paths it answered by:\n", g_checkpoints, g_reopens);
     for (int i = 0; i < g_npaths; i++) printf("  %7ld  %s\n", g_paths[i].n, g_paths[i].path);
     return g_mismatches ? 1 : 0;
