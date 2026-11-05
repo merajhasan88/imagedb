@@ -382,7 +382,9 @@ loads; each CHECKPOINT, COMPACT, EXPIRE, RETIRE and eviction's count and time;
 the open's time and the commits it replayed; the open transactions and the
 oldest's age; the bytes on disk of the log and the lake; the running
 statement and how long it has run. Syncs (`process.syncs.*`) are the process's,
-every database it opened. Latencies are read from buckets four to an octave:
+every database it opened. A statement's latency runs from the end of its parse to
+its own end: the parse is not in it, swapping its session's transaction in is.
+Latencies are read from buckets four to an octave:
 a quantile is at most a quarter above the true one. `SHOW TRANSACTIONS` lists
 every open transaction: its state (active, parked, doomed, begun), isolation,
 age, time since its last statement, writes and locks.

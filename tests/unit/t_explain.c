@@ -229,7 +229,7 @@ static void t_explain_join(void)
 }
 
 /* UPDATE and DELETE: the path that finds the rows to change, as the write reports it; nothing written by EXPLAIN, in a
- * transaction or not; a FOR UPDATE's locks not taken */
+ * transaction or not, and against an autocommitted write; a FOR UPDATE's locks not taken */
 static void t_explain_dml(void)
 {
     uint64_t before_cp = 0;
@@ -267,6 +267,9 @@ static void t_explain_dml(void)
     }
     CHECK(locks[0] == 0 && locks[1] == 1);
     CHECK(run(&g_s, "ROLLBACK") == 0);
+    /* outside a transaction too: the run autocommits (a commit of its own), EXPLAIN plans without one */
+    same_path(&g_s, "UPDATE t SET a = a WHERE id = 20001");
+    same_path(&g_s, "DELETE FROM t WHERE id = 20001");
     /* a write reports its path to the CLI too */
     imdb_err_clear(&g_e);
     CHECK(imdb_exec_one(&g_s, q[0], strlen(q[0]), NULL, 0, &r, &g_e) == 0);
