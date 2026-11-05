@@ -7,7 +7,7 @@
 enum {
     TK_EOF = 0, TK_IDENT, TK_INT, TK_DEC, TK_STR, TK_PARAM, TK_FLOAT,
     TK_LP, TK_RP, TK_COMMA, TK_SEMI, TK_STAR, TK_EQ, TK_NE, TK_LT, TK_LE, TK_GT, TK_GE, TK_MINUS, TK_PLUS, TK_DOT,
-    TK_SLASH, TK_PERCENT,
+    TK_SLASH, TK_PERCENT, TK_CONCAT, /* || (P2 S1) */
 };
 
 typedef struct sql_tok {
@@ -33,21 +33,34 @@ typedef struct sql_lit {
  * structures, so the planner and the read paths see what they saw; only the rest carries a tree. */
 /* EX_CMP: l cmp r (BETWEEN: l BETWEEN r AND x3; IS [NOT] NULL: l alone), a BOOL, NULL when unknown; EX_AND, EX_OR,
  * EX_NOT: three-valued, left to right, AND stopping at FALSE and OR at TRUE (1c) */
-enum { EX_LIT = 1, EX_COL, EX_NEG, EX_ADD, EX_SUB, EX_MUL, EX_DIV, EX_MOD, EX_AGG, EX_CMP, EX_AND, EX_OR, EX_NOT };
+/* P2 S1: EX_FN a function of its arguments (l: a list, nargs of them); EX_CASE (l: the operand of a simple CASE, else
+ * 0; r: a list of EX_WHEN, each l WHEN and r THEN; x3: ELSE, else 0); EX_CAST (l to ctype, cscale). A list is a
+ * balanced tree of EX_LIST nodes (l, r) over its elements, in order, so its depth grows as log2 of its length and every
+ * walker that follows l, r and x3 reaches each element within the height bound; a list of one is its element alone. */
+enum { EX_LIT = 1, EX_COL, EX_NEG, EX_ADD, EX_SUB, EX_MUL, EX_DIV, EX_MOD, EX_AGG, EX_CMP, EX_AND, EX_OR, EX_NOT,
+       EX_FN, EX_LIST, EX_CASE, EX_WHEN, EX_CAST };
 
 typedef struct sql_expr {
     uint8_t op;
     uint8_t agg;             /* EX_AGG: AGG_COUNT_STAR (no operand), AGG_COUNT, AGG_SUM, AGG_MIN, AGG_MAX, AGG_AVG */
     uint8_t h;               /* height: at most IMDB_MAX_EXPR_DEPTH */
     uint16_t l, r;           /* operands (EX_NEG, EX_NOT, EX_AGG: l only) */
-    uint8_t cmp;             /* EX_CMP: CMP_EQ .. CMP_NOTNULL */
-    uint16_t x3;             /* EX_CMP BETWEEN: its upper bound */
+    uint8_t cmp;             /* EX_CMP: CMP_EQ .. CMP_NOTLIKE */
+    uint16_t x3;             /* EX_CMP BETWEEN: its upper bound; LIKE: its ESCAPE, else 0; EX_CASE: its ELSE */
+    uint8_t fn, nargs;       /* EX_FN (P2 S1): FN_*, and its arguments' count */
+    uint8_t ctype, cscale, cprec; /* EX_CAST (P2 S1): the target type, scale and precision (a DECIMAL's) */
     sql_lit lit;             /* EX_LIT */
     char qual[IMDB_MAX_IDENT + 1]; /* EX_COL: a.col's a, or "" */
     char col[IMDB_MAX_IDENT + 1];
 } sql_expr;
 
-enum { CMP_EQ = 1, CMP_NE, CMP_LT, CMP_LE, CMP_GT, CMP_GE, CMP_BETWEEN, CMP_ISNULL, CMP_NOTNULL };
+/* CMP_IN, CMP_NOTIN: l [NOT] IN (r: a list), three-valued; CMP_LIKE, CMP_NOTLIKE (P2 S1) */
+enum { CMP_EQ = 1, CMP_NE, CMP_LT, CMP_LE, CMP_GT, CMP_GE, CMP_BETWEEN, CMP_ISNULL, CMP_NOTNULL, CMP_IN, CMP_NOTIN,
+       CMP_LIKE, CMP_NOTLIKE };
+
+/* P2 S1: the functions, each with one definition (design.md §5, Functions) */
+enum { FN_ABS = 1, FN_SIGN, FN_ROUND, FN_CEIL, FN_FLOOR, FN_MOD, FN_LENGTH, FN_SUBSTR, FN_TRIM, FN_LTRIM, FN_RTRIM,
+       FN_POSITION, FN_COALESCE, FN_NULLIF, FN_LOWER, FN_UPPER, FN_REPLACE, FN_CONCAT };
 
 /* col op a (BETWEEN: a AND b), today's form, whose literals bind to the column (an index may serve it); or with lx a
  * residual: a boolean tree (1c), tested on every row that passed the bound conjuncts, kept when TRUE */
@@ -68,6 +81,7 @@ typedef struct sql_item {
     char qual[IMDB_MAX_IDENT + 1];
     char col[IMDB_MAX_IDENT + 1];
     uint16_t expr;           /* a tree (agg, qual and col unused), else 0 */
+    char alias[IMDB_MAX_IDENT + 1]; /* P2 S1: expr AS name, the result column's name; "" for none */
     uint32_t off, len;       /* the item's text: a tree's result column is named by it */
 } sql_item;
 
@@ -111,6 +125,7 @@ typedef struct sql_stmt {
     sql_cmp where[IMDB_MAX_PREDICATES];
     uint16_t nwhere;
     bool star;                                  /* SELECT */
+    bool no_from;                               /* P2 S1: SELECT of expressions alone: one row, no table */
     sql_item items[IMDB_MAX_COLS];
     uint16_t nitems;
     bool has_group;
@@ -191,8 +206,80 @@ int imdb_x_assign(const imdb_column *c, const imdb_xval *v, imdb_value *out, imd
 int imdb_x_parse_decimal(const char *s, size_t n, imdb_xval *out, imdb_err *e);
 /* a value that is a BOOL and TRUE: what WHERE keeps (FALSE and UNKNOWN, a NULL, are not) */
 bool imdb_x_true(const imdb_xval *v);
-/* the tree at k on a row (columns by the bound col) and the aggregates' final values (slots) */
+/* P2 S1: the statement's memory for computed TEXT (LOWER, ||, CAST to TEXT ...): chunks charged to the heap's counter (a
+ * read statement's ceiling sees them), freed when the statement ends, so a computed value lives as long as a row's TEXT
+ * does; the executor resets it to a mark where no value outlives its row (a WHERE residual, an output row copied,
+ * an UPDATE's row encoded) */
+typedef struct imdb_xchunk {
+    struct imdb_xchunk *next;
+    size_t used, cap;
+    uint8_t data[];
+} imdb_xchunk;
+typedef struct imdb_xarena {
+    imdb_xchunk *head;
+} imdb_xarena;
+typedef struct imdb_xmark {
+    imdb_xchunk *head;
+    size_t used;
+} imdb_xmark;
+uint8_t *imdb_xarena_alloc(imdb_xarena *a, size_t n, imdb_err *e);
+imdb_xmark imdb_xarena_mark(const imdb_xarena *a);
+void imdb_xarena_reset(imdb_xarena *a, imdb_xmark m);
+void imdb_xarena_free(imdb_xarena *a);
+
+/* P2 S1: what an evaluation may need of its statement: the statement's cancel and deadline (xcheck), asked every
+ * 2^16 steps of a function whose work grows with its operands (LIKE), so no single value outlasts a timeout */
+typedef struct imdb_xenv {
+    int (*check)(void *ctx, imdb_err *e);
+    void *ctx;
+    uint32_t steps;
+    imdb_xarena *arena;      /* computed TEXT (NULL: none can be computed: an internal error if needed) */
+} imdb_xenv;
+/* the tree at k on a row (columns by the bound col) and the aggregates' final values (slots); env may be NULL (no
+ * cancellation: constants) */
 int imdb_x_eval(const sql_stmt *st, const imdb_xnode *xn, uint16_t k, const imdb_value *row, const imdb_xval *slots,
-                imdb_xval *out, imdb_err *e);
+                imdb_xenv *env, imdb_xval *out, imdb_err *e);
+/* P2 S1: a function's result type from its arguments' (fn: FN_*), or the error a wrong call is */
+int imdb_x_fn_type(uint8_t fn, uint8_t nargs, const uint8_t *ta, const uint8_t *sa, const imdb_xval *const *kv,
+                   uint8_t *rt, uint8_t *rs, imdb_err *e); /* kv[i]: argument i's constant, or NULL */
+/* P2 S1: the type CASE's results and COALESCE's arguments share (t, s), widened by one more (t2, s2): one type, or
+ * INT64 and DECIMAL as a DECIMAL at the larger scale (exact); 0, an untyped NULL, takes the others'; what names the form */
+int imdb_x_unify(uint8_t *t, uint8_t *s, uint8_t t2, uint8_t s2, const char *what, imdb_err *e);
+/* P2 S1: v (of a type CASE or COALESCE unified) as their type rt at scale rs: exact */
+int imdb_x_widen(imdb_xval *v, uint8_t rt, uint8_t rs, imdb_err *e);
+
+/* P2 S1: an in-order walk of a list (the parser's balanced EX_LIST tree): its next element, 0 at its end; the stack
+ * holds a list's depth (log2 of IMDB_MAX_EXPR_NODES at most, 14) */
+typedef struct imdb_xlist {
+    const sql_stmt *st;
+    uint16_t stack[32];
+    int n;
+} imdb_xlist;
+static inline void imdb_xlist_start(imdb_xlist *it, const sql_stmt *st, uint16_t k)
+{
+    it->st = st;
+    it->n = 0;
+    if (k) it->stack[it->n++] = k;
+}
+static inline uint16_t imdb_xlist_next(imdb_xlist *it)
+{
+    while (it->n > 0) {
+        uint16_t k = it->stack[--it->n];
+        const sql_expr *x = &it->st->ex[k];
+        if (x->op != EX_LIST) return k;
+        if (it->n > 29) return 0; /* deeper than a balanced list of IMDB_MAX_EXPR_NODES: never built */
+        it->stack[it->n++] = x->r;
+        it->stack[it->n++] = x->l;
+    }
+    return 0;
+}
+/* P2 S1: the function on its arguments' values (COALESCE and NULLIF are the evaluator's: they evaluate lazily) */
+int imdb_x_fn(uint8_t fn, const imdb_xval *a, uint8_t nargs, uint8_t rt, uint8_t rs, imdb_xenv *env, imdb_xval *out,
+              imdb_err *e);
+/* P2 S1: v converted to column c's type by CAST's rule (design.md §5, CAST): exact or refused, never rounded */
+int imdb_x_cast(const imdb_xval *v, const imdb_column *c, imdb_xenv *env, imdb_xval *out, imdb_err *e);
+/* P2 S1: s LIKE p with the escape character esc (0: none): -1 when p ends in an unfinished escape */
+int imdb_x_like(const uint8_t *s, uint32_t n, const uint8_t *p, uint32_t m, uint32_t esc, imdb_xenv *env, bool *match,
+                imdb_err *e);
 
 #endif

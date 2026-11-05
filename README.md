@@ -552,6 +552,34 @@ INT64 is a DECIMAL with six decimal places, rounded half away from zero, while
 `SUM(a) / COUNT(*)` stays an INT64 division and truncates; of a DECIMAL it keeps
 six more places than the column. design.md §5 ("Aggregates").
 
+Functions and forms, wherever a value stands:
+
+```sql
+SELECT id, UPPER(TRIM(name)) AS who, COALESCE(nick, '-'),
+       CASE WHEN qty > 10 THEN 'bulk' ELSE 'unit' END, ROUND(price * 1.07, 2)
+FROM orders WHERE status IN ('open', 'held') AND name LIKE 'A%' ORDER BY who;
+SELECT CAST('42' AS INT64), 'a' || CAST(7 AS TEXT), LENGTH('héllo');   -- no FROM: one row
+```
+
+- Numbers: `ABS`, `SIGN`, `ROUND(x [, places])`, `CEIL`/`CEILING`, `FLOOR`,
+  `MOD` (as `%`). ROUND rounds half away from zero; a FLOAT64 rounds to an
+  integer only.
+- Text, in characters (UTF-8 code points), never bytes: `LENGTH`
+  (`CHAR_LENGTH`), `SUBSTR`/`SUBSTRING(s, start [, len])`, `POSITION(a IN b)`,
+  `TRIM`/`LTRIM`/`RTRIM` (spaces), `REPLACE`, `LOWER`/`UPPER` (ASCII letters
+  only for now) and `||` (TEXT only: CAST a number first).
+- `CASE` (searched and simple), `COALESCE` and `NULLIF`; `x [NOT] IN (list)`
+  with three-valued logic; `[NOT] LIKE` (`%`, `_` one character, case-sensitive;
+  no default escape: write `ESCAPE '!'`); `NOT BETWEEN`.
+- `CAST(x AS type)` is exact or refused: a DECIMAL to fewer places rounds half
+  away from zero, but a fraction cast to INT64 is an error (ROUND, FLOOR or CEIL
+  it first), and a TEXT converts only when it is a valid literal of the type.
+- A select item may be named, `expr AS name` (or `expr name`), and ORDER BY may
+  use the name. `SELECT` without `FROM` computes one row.
+- New reserved words: `CASE WHEN THEN ELSE END CAST IN LIKE ESCAPE`.
+- IN and LIKE are tested on each row read: no index serves them yet.
+  design.md §5 ("Functions, CASE, CAST, IN, LIKE").
+
 The
 lake format is imagedb's own; Parquet, other platforms and the desktop client
 are deferred (deferred.md).

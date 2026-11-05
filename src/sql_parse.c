@@ -151,6 +151,14 @@ int imdb_sql_lex(const char *s, size_t n, sql_tok **out, uint32_t *ntok, imdb_er
                 if (i + 1 < n && s[i + 1] == '=') tk->kind = TK_GE, tk->len = 2;
                 else tk->kind = TK_GT;
                 break;
+            case '|': /* P2 S1: || alone */
+                if (i + 1 < n && s[i + 1] == '|') {
+                    tk->kind = TK_CONCAT;
+                    tk->len = 2;
+                    break;
+                }
+                imdb_free(t);
+                return imdb_fail(e, IMDB_ERR_SYNTAX, "unexpected character at offset %zu", i);
             case '!':
                 if (i + 1 < n && s[i + 1] == '=') {
                     tk->kind = TK_NE;
@@ -188,6 +196,7 @@ static const char *const kReserved[] = {
     "select", "from", "where", "insert", "into", "values", "update", "set", "delete", "create", "table",
     "and", "or", "not", "between", "as", "of", "group", "by", "order", "limit", "true", "false", "null",
     "primary", "key", "subject", "erase", "count", "sum", "min", "max", "begin", "commit", "rollback", "is",
+    "case", "when", "then", "else", "end", "cast", "in", "like", "escape", /* P2 S1 */
 };
 
 static bool tok_is_kw(const parser *p, uint32_t at, const char *kw)
@@ -355,6 +364,8 @@ static int uint_lit(parser *p, uint64_t *out)
  * the parser nor the evaluator can be driven deep. Which trees may hold columns or aggregates is the binder's rule. */
 
 static int bexpr(parser *p, uint16_t *out, unsigned depth);
+static int aexpr(parser *p, uint16_t *out, unsigned depth);
+static int col_type(parser *p, imdb_column *c);
 
 static int ex_new(parser *p, uint8_t op, uint16_t l, uint16_t r, uint16_t *out)
 {
@@ -387,6 +398,139 @@ static int too_deep(parser *p)
     return imdb_fail(p->e, IMDB_ERR_LIMIT, "an expression nested deeper than %u", IMDB_MAX_EXPR_DEPTH);
 }
 
+/* ---- P2 S1: lists, functions, CASE, CAST ------------------------------------------------------------------------- */
+
+/* the n elements of el as a balanced EX_LIST tree, in order (one element is itself): its depth is log2(n), so the
+ * walkers that follow l, r and x3 stay within the height bound whatever a list's length */
+static int list_build_n(parser *p, const uint16_t *el, uint32_t n, uint16_t *out);
+static int list_build(parser *p, const uint16_t *el, uint32_t n, uint16_t *out)
+{
+    if (!n) return fail_at(p, "a value"); /* never from the parser's callers: they hold one at least */
+    return list_build_n(p, el, n, out);
+}
+
+static int list_build_n(parser *p, const uint16_t *el, uint32_t n, uint16_t *out)
+{
+    if (n == 1) {
+        *out = el[0];
+        return IMDB_OK;
+    }
+    uint16_t a, b;
+    if (list_build_n(p, el, n / 2, &a) || list_build_n(p, el + n / 2, n - n / 2, &b)) return p->e->code;
+    return ex_new(p, EX_LIST, a, b, out);
+}
+
+static int list_push(parser *p, uint16_t **el, uint32_t *n, uint32_t *cap, uint16_t k)
+{
+    if (*n == *cap) {
+        uint32_t nc = *cap ? *cap * 2 : 8;
+        uint16_t *ne = imdb_realloc_array(*el, *cap, nc, sizeof *ne, p->e);
+        if (!ne) return p->e->code;
+        *el = ne;
+        *cap = nc;
+    }
+    (*el)[(*n)++] = k;
+    return IMDB_OK;
+}
+
+/* expressions separated by commas up to ")" (eaten), one at least, as a balanced list; their count in *n */
+static int expr_list(parser *p, unsigned depth, uint16_t *out, uint32_t *n)
+{
+    uint16_t *el = NULL, k;
+    uint32_t cnt = 0, cap = 0;
+    int rc = IMDB_OK;
+    do {
+        if ((rc = bexpr(p, &k, depth + 1)) || (rc = list_push(p, &el, &cnt, &cap, k))) break;
+    } while (tok(p, TK_COMMA));
+    if (!rc) rc = expect(p, TK_RP, ")");
+    if (!rc) rc = list_build(p, el, cnt, out);
+    imdb_free(el);
+    *n = cnt;
+    return rc;
+}
+
+/* the function a name calls (an identifier followed by "("), 0 for none: its column keeps the name otherwise */
+static uint8_t fn_named(const parser *p, uint32_t at)
+{
+    static const struct {
+        const char *name;
+        uint8_t fn;
+    } k[] = {{"abs", FN_ABS},           {"sign", FN_SIGN},         {"round", FN_ROUND},
+             {"ceil", FN_CEIL},         {"ceiling", FN_CEIL},      {"floor", FN_FLOOR},
+             {"mod", FN_MOD},           {"length", FN_LENGTH},     {"char_length", FN_LENGTH},
+             {"character_length", FN_LENGTH}, {"substr", FN_SUBSTR}, {"substring", FN_SUBSTR},
+             {"trim", FN_TRIM},         {"ltrim", FN_LTRIM},       {"rtrim", FN_RTRIM},
+             {"position", FN_POSITION}, {"coalesce", FN_COALESCE}, {"nullif", FN_NULLIF},
+             {"lower", FN_LOWER},       {"upper", FN_UPPER},       {"replace", FN_REPLACE}};
+    for (size_t i = 0; i < sizeof k / sizeof *k; i++)
+        if (tok_is_kw(p, at, k[i].name)) return k[i].fn;
+    return 0;
+}
+
+/* name(args): POSITION(a IN b) in the standard's form, the others with commas; the binder checks the arguments */
+static int fn_call(parser *p, uint8_t fn, uint16_t *out, unsigned depth)
+{
+    p->i += 2; /* the name and its ( */
+    uint16_t args;
+    uint32_t n;
+    if (fn == FN_POSITION) {
+        uint16_t el[2];
+        if (aexpr(p, &el[0], depth + 1) || expect_kw(p, "in") || aexpr(p, &el[1], depth + 1) || expect(p, TK_RP, ")") ||
+            list_build(p, el, 2, &args))
+            return p->e->code;
+        n = 2;
+    } else if (expr_list(p, depth, &args, &n)) {
+        return p->e->code;
+    }
+    if (n > 255) return imdb_fail(p->e, IMDB_ERR_LIMIT, "a function call of more than 255 arguments");
+    if (ex_new(p, EX_FN, args, 0, out)) return p->e->code;
+    p->st->ex[*out].fn = fn;
+    p->st->ex[*out].nargs = (uint8_t)n;
+    return IMDB_OK;
+}
+
+/* CASE [operand] WHEN a THEN b ... [ELSE c] END (CASE eaten) */
+static int case_expr(parser *p, uint16_t *out, unsigned depth)
+{
+    uint16_t operand = 0, els = 0, whens = 0, *w = NULL;
+    uint32_t n = 0, cap = 0;
+    int rc = IMDB_OK;
+    if (!tok_is_kw(p, p->i, "when")) rc = bexpr(p, &operand, depth + 1);
+    while (!rc && kw(p, "when")) {
+        uint16_t c, v, k;
+        if ((rc = bexpr(p, &c, depth + 1)) || (rc = expect_kw(p, "then")) || (rc = bexpr(p, &v, depth + 1)) ||
+            (rc = ex_new(p, EX_WHEN, c, v, &k)))
+            break;
+        rc = list_push(p, &w, &n, &cap, k);
+    }
+    if (!rc && !n) rc = fail_at(p, "WHEN");
+    if (!rc && kw(p, "else")) rc = bexpr(p, &els, depth + 1);
+    if (!rc) rc = expect_kw(p, "end");
+    if (!rc) rc = list_build(p, w, n, &whens);
+    imdb_free(w);
+    if (rc || ex_new(p, EX_CASE, operand, whens, out)) return p->e->code;
+    sql_expr *x = &p->st->ex[*out];
+    x->x3 = els;
+    if (els && p->st->ex[els].h + 1u > x->h) x->h = (uint8_t)(p->st->ex[els].h + 1u);
+    return x->h > IMDB_MAX_EXPR_DEPTH ? too_deep(p) : IMDB_OK;
+}
+
+/* CAST(x AS type) (CAST eaten): the type as a column's */
+static int cast_expr(parser *p, uint16_t *out, unsigned depth)
+{
+    uint16_t a;
+    imdb_column c;
+    memset(&c, 0, sizeof c);
+    if (expect(p, TK_LP, "(") || bexpr(p, &a, depth + 1) || expect_kw(p, "as") || col_type(p, &c) ||
+        expect(p, TK_RP, ")") || ex_new(p, EX_CAST, a, 0, out))
+        return p->e->code;
+    sql_expr *x = &p->st->ex[*out];
+    x->ctype = c.type;
+    x->cscale = c.scale;
+    x->cprec = c.precision;
+    return IMDB_OK;
+}
+
 static int primary(parser *p, uint16_t *out, unsigned depth)
 {
     if (depth > IMDB_MAX_EXPR_DEPTH) return too_deep(p);
@@ -405,6 +549,12 @@ static int primary(parser *p, uint16_t *out, unsigned depth)
         if (expect(p, TK_RP, ")") || ex_new(p, EX_AGG, a, 0, out)) return p->e->code;
         p->st->ex[*out].agg = agg;
         return IMDB_OK;
+    }
+    if (kw(p, "case")) return case_expr(p, out, depth); /* P2 S1 */
+    if (kw(p, "cast")) return cast_expr(p, out, depth);
+    if (p->t[p->i].kind == TK_IDENT && p->t[p->i + 1].kind == TK_LP) { /* an identifier is not the end: i + 1 exists */
+        uint8_t fn = fn_named(p, p->i);
+        if (fn) return fn_call(p, fn, out, depth);
     }
     const sql_tok *t = &p->t[p->i];
     if (t->kind == TK_IDENT && !tok_is_kw(p, p->i, "true") && !tok_is_kw(p, p->i, "false") && !tok_is_kw(p, p->i, "null") &&
@@ -467,18 +617,45 @@ static int aexpr(parser *p, uint16_t *out, unsigned depth)
     }
 }
 
+/* P2 S1: a || b || ...: below + and -, above the comparisons (as PostgreSQL ranks it), each a two-argument CONCAT */
+static int cexpr(parser *p, uint16_t *out, unsigned depth)
+{
+    if (aexpr(p, out, depth)) return p->e->code;
+    while (tok(p, TK_CONCAT)) {
+        uint16_t el[2] = {*out, 0}, args;
+        if (aexpr(p, &el[1], depth) || list_build(p, el, 2, &args) || ex_new(p, EX_FN, args, 0, out)) return p->e->code;
+        p->st->ex[*out].fn = FN_CONCAT;
+        p->st->ex[*out].nargs = 2;
+    }
+    return IMDB_OK;
+}
+
 /* bcmp: one comparison, or the operand alone (a BOOL, or no condition: the binder's to say) */
 static int b_cmp(parser *p, uint16_t *out, unsigned depth)
 {
-    if (aexpr(p, out, depth)) return p->e->code;
+    if (cexpr(p, out, depth)) return p->e->code;
     uint8_t op = 0;
     uint16_t r = 0, x3 = 0;
-    if (kw(p, "is")) {
+    /* P2 S1: a NOT before IN, LIKE or BETWEEN is theirs (x NOT IN (...)); one before anything else is b_not's */
+    bool neg = tok_is_kw(p, p->i, "not") && (tok_is_kw(p, p->i + 1, "in") || tok_is_kw(p, p->i + 1, "like") ||
+                                             tok_is_kw(p, p->i + 1, "between"));
+    if (neg) p->i++;
+    if (kw(p, "in")) { /* P2 S1: a list of values; a subquery is S4's */
+        uint32_t n;
+        if (expect(p, TK_LP, "(")) return p->e->code;
+        if (tok_is_kw(p, p->i, "select"))
+            return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "IN (SELECT ...): subqueries are not supported yet");
+        if (expr_list(p, depth, &r, &n)) return p->e->code;
+        op = neg ? CMP_NOTIN : CMP_IN;
+    } else if (kw(p, "like")) { /* P2 S1 */
+        op = neg ? CMP_NOTLIKE : CMP_LIKE;
+        if (cexpr(p, &r, depth) || (kw(p, "escape") && cexpr(p, &x3, depth))) return p->e->code;
+    } else if (kw(p, "is")) {
         op = kw(p, "not") ? CMP_NOTNULL : CMP_ISNULL;
         if (expect_kw(p, "null")) return p->e->code;
     } else if (kw(p, "between")) { /* its AND is its own, not a conjunction's */
         op = CMP_BETWEEN;
-        if (aexpr(p, &r, depth) || expect_kw(p, "and") || aexpr(p, &x3, depth)) return p->e->code;
+        if (cexpr(p, &r, depth) || expect_kw(p, "and") || cexpr(p, &x3, depth)) return p->e->code;
     } else {
         switch (p->t[p->i].kind) {
         case TK_EQ: op = CMP_EQ; break;
@@ -490,7 +667,7 @@ static int b_cmp(parser *p, uint16_t *out, unsigned depth)
         default: return IMDB_OK;
         }
         p->i++;
-        if (aexpr(p, &r, depth)) return p->e->code;
+        if (cexpr(p, &r, depth)) return p->e->code;
     }
     uint16_t k;
     if (ex_new(p, EX_CMP, *out, r, &k)) return p->e->code;
@@ -501,6 +678,7 @@ static int b_cmp(parser *p, uint16_t *out, unsigned depth)
         if (p->st->ex[x3].h + 1u > x->h) x->h = (uint8_t)(p->st->ex[x3].h + 1u);
         if (x->h > IMDB_MAX_EXPR_DEPTH) return too_deep(p);
     }
+    if (neg && op == CMP_BETWEEN) return ex_new(p, EX_NOT, k, 0, out); /* P2 S1: NOT BETWEEN, as NOT (BETWEEN) */
     *out = k;
     return IMDB_OK;
 }
@@ -591,7 +769,7 @@ static int conjunct(parser *p, sql_stmt *st, uint16_t k)
         return imdb_fail(p->e, IMDB_ERR_LIMIT, "WHERE has more than %u conditions", IMDB_MAX_PREDICATES);
     sql_cmp *c = &st->where[st->nwhere++];
     memset(c, 0, sizeof *c);
-    if (x->op == EX_CMP) {
+    if (x->op == EX_CMP && x->cmp <= CMP_NOTNULL) { /* P2 S1: IN and LIKE are residuals: no index serves them yet */
         const sql_expr *L = &st->ex[x->l], *R = x->r ? &st->ex[x->r] : NULL, *X3 = x->x3 ? &st->ex[x->x3] : NULL;
         if (L->op == EX_COL && (!R || R->op == EX_LIT) && (!X3 || X3->op == EX_LIT)) { /* today's form */
             c->nl = k;
@@ -814,6 +992,9 @@ static int parse_select(parser *p, sql_stmt *st)
             if (bexpr(p, &k, 0)) return p->e->code;
             it->off = from;
             it->len = p->t[p->i - 1].off + p->t[p->i - 1].len + (p->t[p->i - 1].kind == TK_STR) - from;
+            if (kw(p, "as") ? ident(p, it->alias) /* P2 S1: an alias, with AS or without it */
+                              : p->t[p->i].kind == TK_IDENT && !is_reserved(p, p->i) && ident(p, it->alias))
+                return p->e->code;
             const sql_expr *x = &st->ex[k], *a = x->op == EX_AGG && x->l ? &st->ex[x->l] : NULL;
             if (x->op == EX_COL) { /* today's shapes: a column, an aggregate of a column, COUNT(*) */
                 memcpy(it->qual, x->qual, sizeof it->qual);
@@ -829,6 +1010,15 @@ static int parse_select(parser *p, sql_stmt *st)
             }
             st->nitems++;
         } while (tok(p, TK_COMMA));
+    }
+    if (!st->star && !tok_is_kw(p, p->i, "from")) { /* P2 S1: SELECT of expressions alone: one row, no table */
+        st->no_from = true;
+        static const char *const cl[] = {"where", "group", "having", "order", "limit", "offset", "for"};
+        for (size_t c = 0; c < sizeof cl / sizeof *cl; c++)
+            if (tok_is_kw(p, p->i, cl[c]))
+                return imdb_fail(p->e, IMDB_ERR_INVALID, "a SELECT without FROM computes one row: no WHERE, GROUP BY, HAVING, ORDER "
+                                                       "BY, LIMIT, OFFSET or FOR UPDATE");
+        return IMDB_OK;
     }
     if (expect_kw(p, "from") || ident(p, st->table) || alias(p, st->alias)) return p->e->code;
     if (kw(p, "with")) {
@@ -887,6 +1077,14 @@ static int parse_select(parser *p, sql_stmt *st)
             } else if (bexpr(p, &st->ord_ex[o], 0)) {
                 return p->e->code;
             }
+            if (st->ord_ex[o] && st->ex[st->ord_ex[o]].op == EX_COL && !st->ex[st->ord_ex[o]].qual[0]) /* P2 S1: an alias
+                * names its item (PostgreSQL: an output column before an input one) */
+                for (uint16_t i = 0; i < st->nitems; i++)
+                    if (st->items[i].alias[0] && !strcmp(st->items[i].alias, st->ex[st->ord_ex[o]].col)) {
+                        st->ord_pos[o] = (uint16_t)(i + 1);
+                        st->ord_ex[o] = 0;
+                        break;
+                    }
             st->ord_desc[o] = kw(p, "desc");
             if (!st->ord_desc[o]) kw(p, "asc");
             st->ord_nulls_first[o] = st->ord_desc[o]; /* PostgreSQL's default: NULLs as the largest */

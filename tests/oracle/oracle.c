@@ -7,7 +7,8 @@
  * 2026-11-01); the engine links none of them. Nothing any engine answers is kept beyond this run's own output (SQL
  * Server's licence).
  *   oracle [--engines imagedb,sqlite,pg,mysql,mariadb,mssql] [--seeds A-B] [--steps N] [--dir DIR] [--keep-going]
- *          [--no-expr] [--ping] [-v]   (--no-expr: 1a's generator, without arithmetic expressions, draw for draw)
+ *          [--no-expr] [--no-fns] [--ping] [-v]   (--no-expr: 1a's generator, without arithmetic expressions, draw for draw;
+ *          --no-fns: the generator before P2 S1's functions, CASE, CAST, IN, LIKE and ||, draw for draw)
  * The servers, from the environment: ORACLE_PG (a libpq conninfo), ORACLE_MYSQL and ORACLE_MARIADB ("socket user
  * password database"), ORACLE_ODBC (an ODBC connection string, out of ps). */
 #include <errno.h>
@@ -190,7 +191,11 @@ typedef struct pred {
 
 /* an expression's node (1b): imagedb's result type and scale kept with it, which every engine's answer is read as */
 /* 1c: X_CMP, X_AND, X_OR, X_NOT conditions; X_PRED a plain predicate under one (the statement's xp[col]) */
-enum { X_COL, X_INT, X_DEC, X_NEG, X_ADD, X_SUB, X_MUL, X_DIV, X_MOD, X_AGG, X_CMP, X_AND, X_OR, X_NOT, X_PRED };
+/* P2 S1: X_FN a function (fn: XF_*, its arguments l, r, x3; a1, a2 its constants), X_CASE (WHEN l THEN r ELSE x3),
+ * X_IN (l IN the X_LIST chain r: each its element l, the next r; fn 1: NOT IN), X_LIKE (l LIKE s ESCAPE '!'; fn 1:
+ * NOT LIKE), X_CAST (l as ty, sc), X_TXT (the text s), X_NULL, X_VAL (a column's value: i, f, s by ty) */
+enum { X_COL, X_INT, X_DEC, X_NEG, X_ADD, X_SUB, X_MUL, X_DIV, X_MOD, X_AGG, X_CMP, X_AND, X_OR, X_NOT, X_PRED,
+       X_FN, X_CASE, X_IN, X_LIST, X_LIKE, X_CAST, X_TXT, X_NULL, X_VAL };
 typedef struct xnode {
     int op;
     int tab, col; /* X_COL */
@@ -201,6 +206,9 @@ typedef struct xnode {
     bool scaled;  /* X_DEC in a SET of d: SQLite's scaled integer (elsewhere a REAL: every literal there is dyadic) */
     int l, r;
     int x3;       /* X_CMP BETWEEN: the upper bound (fn: the comparison, OP_EQ .. OP_NOTNULL) */
+    int64_t a1, a2; /* P2 S1: ROUND's places (-1: none), SUBSTR's start and length (-1: none) */
+    double f;     /* X_VAL of a FLOAT64 */
+    char s[136];  /* X_TXT, X_VAL of a TEXT, X_LIKE's pattern */
 } xnode;
 
 typedef struct stmt {
@@ -218,7 +226,7 @@ typedef struct stmt {
     val sval[3];
     int nset;
     int sx[3];         /* a SET's tree (index + 1), else its value sval */
-    xnode xe[192];
+    xnode xe[512];     /* P2 S1: 512 (FNROOM keeps 120 free beyond every function form) */
     pred xp[8];        /* plain predicates under conditions (X_PRED): TEXT, TIMESTAMP, BOOL, DECIMAL against literals */
     int nxp;
     int nxe;
@@ -231,6 +239,7 @@ typedef struct stmt {
     bool distinct;
     int offset;        /* OFFSET n; 0: none (OFFSET 0 is never drawn) */
     int hv;            /* HAVING (1e): a condition's tree (index + 1), else 0 */
+    bool fns;          /* P2 S1: it holds a function, CASE, CAST, IN, LIKE or || (counted when compared) */
 } stmt;
 
 static int64_t g_next_id;          /* the next new key of t, of u */
@@ -290,14 +299,27 @@ static void gen_pred(int tab, pred *p)
 }
 
 static bool g_expr = true; /* --no-expr: 1a's generator, draw for draw */
+static bool g_fns = true;  /* --no-fns: the generator before P2 S1, draw for draw */
 static bool g_in_txn;      /* generating a transaction's statements: no tree that may fail (PostgreSQL aborts the
                             * whole transaction at an error) */
 #define TY(t, s) ((t) | ((s) << 8)) /* a column's type, a DECIMAL's scale with it */
 #define TYT(ty) ((ty) & 0xff)
 #define TYS(ty) ((ty) >> 8)
 #define XN(q, k) (&(q)->xe[(k) - 1])
-#define XROOM(q) ((q)->nxe + 24 <= (int)(sizeof (q)->xe / sizeof (q)->xe[0])) /* a tree comparison: at most ~18 */
-#define XCOND_ROOM(q) ((q)->nxe + 60 <= (int)(sizeof (q)->xe / sizeof (q)->xe[0]))
+/* the reserves of the forms before P2 S1 are against 192 nodes, the array's size then, so --no-fns draws as before */
+#define XROOM(q) ((q)->nxe + 24 <= 192) /* a tree comparison: at most ~18 */
+#define XCOND_ROOM(q) ((q)->nxe + 60 <= 192)
+#define FNROOM(q) ((q)->nxe + 120 <= (int)(sizeof (q)->xe / sizeof (q)->xe[0])) /* P2 S1: a form at most ~25 */
+enum { XF_ABS = 1, XF_SIGN, XF_ROUND, XF_CEIL, XF_FLOOR, XF_MOD, XF_LENGTH, XF_SUBSTR, XF_TRIM, XF_LTRIM, XF_RTRIM,
+       XF_POSITION, XF_COALESCE, XF_NULLIF, XF_LOWER, XF_UPPER, XF_REPLACE, XF_CONCAT };
+static int gen_fint(stmt *q, int depth, bool fail);
+static int gen_fdec(stmt *q, int depth, bool fail);
+static int gen_fflt(stmt *q, int depth);
+static int gen_fcmp(stmt *q);
+static int gen_xtxt(stmt *q, int depth);
+static int gen_ftagg(stmt *q);
+static void fn_mark(stmt *q, int k);
+static bool txt_computed(const stmt *q, int k);
 static int gen_xcond(stmt *q, int depth, bool dml);
 static void gen_xpred(stmt *q, pred *p, bool dml);
 static void xmark(stmt *q, int k);
@@ -414,6 +436,7 @@ static int gen_xint(stmt *q, int depth, bool fail)
         }
         return xlit_int(q, chance(80) ? rr(-20, 20) : rr(-1000000, 1000000));
     }
+    if (g_fns && q->kind == Q_SELECT && FNROOM(q) && chance(14)) return gen_fint(q, depth, fail); /* P2 S1 */
     int r = (int)rr(0, 99);
     if (r < 10) return xnew(q, X_NEG, gen_xint(q, depth - 1, fail), 0);
     int op = r < 40 ? X_ADD : r < 60 ? X_SUB : r < 80 ? X_MUL : r < 90 ? X_DIV : X_MOD;
@@ -436,6 +459,7 @@ static int gen_xdec(stmt *q, int depth, bool fail)
         int s = (int)rr(1, 2);
         return xlit_dec(q, rr(-999, 999), s);
     }
+    if (g_fns && q->kind == Q_SELECT && FNROOM(q) && chance(14)) return gen_fdec(q, depth, fail); /* P2 S1 */
     int r = (int)rr(0, 99);
     if (r < 8) return xnew(q, X_NEG, gen_xdec(q, depth - 1, fail), 0);
     int op = r < 38 ? X_ADD : r < 58 ? X_SUB : r < 80 ? X_MUL : r < 92 ? X_DIV : X_MOD;
@@ -459,6 +483,7 @@ static int gen_xflt(stmt *q, int depth)
         static const int64_t Q[] = {25, 50, 75, 125, 250, -25, -50, -75, -125, -250};
         return xlit_dec(q, Q[rnd() % 10], 2);
     }
+    if (g_fns && q->kind == Q_SELECT && FNROOM(q) && chance(14)) return gen_fflt(q, depth); /* P2 S1 */
     int r = (int)rr(0, 99);
     if (r < 10) return xnew(q, X_NEG, gen_xflt(q, depth - 1), 0);
     if (r < 25) return xnew(q, X_DIV, gen_xflt(q, depth - 1), xlit_int(q, chance(50) ? 2 : 4));
@@ -479,6 +504,8 @@ static bool lite_ok(const stmt *q, int k, bool under_flt)
 {
     if (!k) return true;
     const xnode *n = XN(q, k);
+    if (n->op == X_IN && XN(q, n->l)->op == X_COL && XN(q, n->l)->ty == CT_DEC) return true; /* P2 S1: d IN (values):
+                                                                                           * its scaled integers */
     if (n->ty == CT_DEC && !(n->op == X_DEC && under_flt)) return false;
     return lite_ok(q, n->l, n->ty == CT_FLT) && lite_ok(q, n->r, n->ty == CT_FLT) && lite_ok(q, n->x3, n->ty == CT_FLT);
 }
@@ -498,7 +525,7 @@ static bool ms_ok(const stmt *q, int k)
 {
     if (!k) return true;
     const xnode *n = XN(q, k);
-    if (n->ty == CT_DEC && (n->op == X_DIV || n->op == X_MOD)) return false;
+    if (n->ty == CT_DEC && (n->op == X_DIV || n->op == X_MOD || (n->op == X_FN && n->fn == XF_MOD))) return false;
     if (n->op == X_AGG && n->fn == F_AVG && n->ty == CT_DEC) return false; /* its AVG: an INT64's an INT64, a
                                                                           * DECIMAL's at max(s, 6) places */
     if (n->ty == CT_DEC && n->op >= X_ADD && n->op <= X_MOD && (dec_sum(q, n->l) || dec_sum(q, n->r))) return false;
@@ -511,7 +538,7 @@ static bool ma_ok(const stmt *q, int k)
 {
     if (!k) return true;
     const xnode *n = XN(q, k);
-    if (n->ty == CT_DEC && n->op == X_MOD) return false;
+    if (n->ty == CT_DEC && (n->op == X_MOD || (n->op == X_FN && n->fn == XF_MOD))) return false;
     return ma_ok(q, n->l) && ma_ok(q, n->r) && ma_ok(q, n->x3);
 }
 
@@ -543,6 +570,7 @@ static void xmark(stmt *q, int k)
     if (!ms_ok(q, k)) q->skip |= 1u << D_MS;
     if (!ma_ok(q, k)) q->skip |= 1u << D_MA;
     if (!my_ok(q, k)) q->skip |= 1u << D_MY;
+    fn_mark(q, k); /* P2 S1 */
 }
 
 /* a tree predicate put to engines: its trees, and its own comparison (MySQL's index defect, my_pair_ok) */
@@ -632,10 +660,366 @@ static int xbool(stmt *q, int op, int l, int r)
     return k;
 }
 
+/* ---- P2 S1: functions, CASE, CAST, IN, LIKE and || ----------------------------------------------------------------- *
+ * Drawn in SELECTs only (a dialect that computes one otherwise is skipped there, where a DML statement is put to every
+ * engine), never under --no-fns (the generator before them, draw for draw), each form only within FNROOM: its children
+ * one level shallower, a CASE's condition a column's (gen_fcond), so a form holds at most ~25 nodes. Definitions pinned
+ * to what the engines agree on (docs/plan-p2.md, S1): SUBSTR from 1; a needle and REPLACE's pattern never empty; LIKE
+ * always with ESCAPE '!' and never '['; ROUND of a FLOAT64, LOWER and UPPER compared with SQLite alone (fn_mark: the
+ * servers round a double's half to even, and map case past ASCII); a CAST to INT64 only of an integral value; no
+ * FLOAT64 cast to TEXT (SQLite writes 3.0); a CASE's or COALESCE's FLOAT64 branches each a FLOAT64 (imagedb converts
+ * no value). A computed TEXT is printed under the column's binary collation (put_x: a constant one would be ordered by
+ * the server's default), and compared nowhere in SQL Server (its = pads a trailing space away). */
+
+static int xfn(stmt *q, int fn, int l, int r, int ty, int sc)
+{
+    int k = xnew(q, X_FN, l, r);
+    xnode *n = XN(q, k);
+    n->fn = fn;
+    n->ty = ty;
+    n->sc = sc;
+    n->a1 = n->a2 = -1;
+    q->fns = true;
+    return k;
+}
+
+static int xtxt(stmt *q, const char *s)
+{
+    int k = xnew(q, X_TXT, 0, 0);
+    snprintf(XN(q, k)->s, sizeof XN(q, k)->s, "%s", s);
+    XN(q, k)->ty = CT_TXT;
+    return k;
+}
+
+static int xcast(stmt *q, int l, int ty, int sc)
+{
+    int k = xnew(q, X_CAST, l, 0);
+    XN(q, k)->ty = ty;
+    XN(q, k)->sc = sc;
+    q->fns = true;
+    return k;
+}
+
+/* a CASE's or COALESCE's branches unified as imagedb does (INT64 and DECIMAL: a DECIMAL at the larger scale) */
+static void unify2(const xnode *a, const xnode *b, int *ty, int *sc)
+{
+    *ty = a->ty == b->ty ? a->ty : CT_DEC;
+    *sc = (a->ty == CT_DEC ? a->sc : 0) > (b->ty == CT_DEC ? b->sc : 0) ? (a->ty == CT_DEC ? a->sc : 0)
+                                                                         : (b->ty == CT_DEC ? b->sc : 0);
+    if (*ty != CT_DEC) *sc = 0;
+}
+
+static int as_flt(stmt *q, int k) { return XN(q, k)->ty == CT_FLT ? k : xcast(q, k, CT_FLT, 0); }
+
+/* a CASE's condition: a column's plain predicate, or an INT64 column or literal against a literal (no tree: FNROOM) */
+static int gen_fcond(stmt *q)
+{
+    if (q->nxp < (int)(sizeof q->xp / sizeof q->xp[0]) && chance(50)) {
+        gen_pred(q->join && chance(40) ? 1 : q->tab, &q->xp[q->nxp]);
+        int k = xbool(q, X_PRED, 0, 0);
+        XN(q, k)->col = q->nxp++;
+        return k;
+    }
+    int c = gen_xint(q, 0, false);
+    int k = xbool(q, X_CMP, c, xlit_int(q, rr(-20, 20)));
+    XN(q, k)->fn = (int)rr(OP_EQ, OP_GE);
+    return k;
+}
+
+static int xcase(stmt *q, int then, int els)
+{
+    int k = xnew(q, X_CASE, gen_fcond(q), then);
+    xnode *n = XN(q, k);
+    n->x3 = els;
+    if (els) unify2(XN(q, then), XN(q, els), &n->ty, &n->sc);
+    else n->ty = XN(q, then)->ty, n->sc = XN(q, then)->sc;
+    q->fns = true;
+    return k;
+}
+
+/* a TEXT tree: s (t's or u's), a literal or an INT64 cast; SUBSTR, TRIM, LTRIM, RTRIM, LOWER, UPPER, REPLACE, ||,
+ * COALESCE, NULLIF and CASE over them */
+static int gen_xtxt(stmt *q, int depth)
+{
+    if (depth <= 0 || chance(30)) {
+        int r = (int)rr(0, 99);
+        if (r < 60) {
+            int tab = q->join ? (chance(40) ? 1 : 0) : q->tab;
+            return xcol(q, tab, tab ? 3 : 6);
+        }
+        if (r < 85) {
+            char s[64];
+            gen_text(s, sizeof s);
+            return xtxt(q, s);
+        }
+        return xcast(q, gen_xint(q, 0, false), CT_TXT, 0);
+    }
+    int r = (int)rr(0, 99), x = gen_xtxt(q, depth - 1), k;
+    if (r < 18) {
+        k = xfn(q, XF_SUBSTR, x, 0, CT_TXT, 0);
+        XN(q, k)->a1 = rr(1, 4);
+        XN(q, k)->a2 = chance(70) ? rr(0, 4) : -1;
+        return k;
+    }
+    if (r < 30) return xfn(q, (int)rr(XF_TRIM, XF_RTRIM), x, 0, CT_TXT, 0);
+    if (r < 40) return xfn(q, chance(50) ? XF_LOWER : XF_UPPER, x, 0, CT_TXT, 0);
+    if (r < 52) {
+        char to[64];
+        gen_text(to, 16);
+        k = xfn(q, XF_REPLACE, x, xtxt(q, PIECES[rnd() % NPIECES]), CT_TXT, 0);
+        XN(q, k)->x3 = xtxt(q, to);
+        return k;
+    }
+    if (r < 72) return xfn(q, XF_CONCAT, x, gen_xtxt(q, depth - 1), CT_TXT, 0);
+    if (r < 80) {
+        char s[64];
+        gen_text(s, sizeof s);
+        return xfn(q, XF_COALESCE, x, xtxt(q, s), CT_TXT, 0);
+    }
+    if (r < 86) return xfn(q, XF_NULLIF, x, xtxt(q, PIECES[rnd() % NPIECES]), CT_TXT, 0);
+    return xcase(q, x, chance(70) ? gen_xtxt(q, depth - 1) : 0);
+}
+
+/* a needle: one or two pieces, never empty */
+static int gen_needle(stmt *q)
+{
+    char s[32];
+    snprintf(s, sizeof s, "%s%s", PIECES[rnd() % NPIECES], chance(30) ? PIECES[rnd() % NPIECES] : "");
+    return xtxt(q, s);
+}
+
+/* an INT64 function form: ABS, SIGN, CEIL, FLOOR, ROUND, MOD, LENGTH, POSITION, CASE, COALESCE, NULLIF, CASTs */
+static int gen_fint(stmt *q, int depth, bool fail)
+{
+    int r = (int)rr(0, 99), k;
+    if (r < 10) return xfn(q, XF_ABS, gen_xint(q, depth - 1, fail), 0, CT_INT, 0);
+    if (r < 18) return xfn(q, XF_SIGN, gen_xany(q, depth - 1, fail), 0, CT_INT, 0);
+    if (r < 26) {
+        int fn = chance(50) ? XF_CEIL : XF_FLOOR;
+        return xfn(q, fn, gen_xint(q, depth - 1, fail), 0, CT_INT, 0);
+    }
+    if (r < 31) return xfn(q, XF_ROUND, gen_xint(q, depth - 1, fail), 0, CT_INT, 0);
+    if (r < 38) { /* MOD: the remainder's rules (xnew's X_MOD), named as a function */
+        int a = gen_xint(q, depth - 1, fail);
+        k = xnew(q, X_MOD, a, xlit_int(q, nonzero(-9, 9)));
+        XN(q, k)->op = X_FN;
+        XN(q, k)->fn = XF_MOD;
+        q->fns = true;
+        return k;
+    }
+    if (r < 52) return xfn(q, XF_LENGTH, gen_xtxt(q, depth - 1), 0, CT_INT, 0);
+    if (r < 60) {
+        int nd = gen_needle(q);
+        return xfn(q, XF_POSITION, nd, gen_xtxt(q, depth - 1), CT_INT, 0);
+    }
+    if (r < 74) {
+        int t = gen_xint(q, depth - 1, fail);
+        return xcase(q, t, chance(75) ? gen_xint(q, depth - 1, fail) : 0);
+    }
+    if (r < 82) {
+        int a = gen_xint(q, depth - 1, fail);
+        return xfn(q, XF_COALESCE, a, gen_xint(q, depth - 1, fail), CT_INT, 0);
+    }
+    if (r < 88) {
+        int a = gen_xint(q, depth - 1, fail);
+        return xfn(q, XF_NULLIF, a, gen_xint(q, 0, false), CT_INT, 0);
+    }
+    if (r < 94) return xcast(q, xcast(q, gen_xint(q, depth - 1, fail), CT_TXT, 0), CT_INT, 0); /* both ways, exact */
+    /* an integral value of another kind: FLOOR or CEIL of a FLOAT64, ROUND or FLOOR of a DECIMAL */
+    if (chance(50)) {
+        int fn = chance(50) ? XF_FLOOR : XF_CEIL;
+        return xcast(q, xfn(q, fn, as_flt(q, gen_xflt(q, depth - 1)), 0, CT_FLT, 0), CT_INT, 0);
+    }
+    int d = gen_xdec(q, depth - 1, false);
+    k = xfn(q, chance(50) ? XF_ROUND : XF_FLOOR, d, 0, XN(q, d)->ty, 0);
+    return xcast(q, k, CT_INT, 0);
+}
+
+/* a DECIMAL function form: ABS, ROUND (places), CEIL, FLOOR, MOD, CASE, COALESCE, NULLIF, CASTs to DECIMAL(18, s) */
+static int gen_fdec(stmt *q, int depth, bool fail)
+{
+    int r = (int)rr(0, 99), x, k;
+    if (r < 12) {
+        x = gen_xdec(q, depth - 1, fail);
+        return xfn(q, XF_ABS, x, 0, XN(q, x)->ty, XN(q, x)->sc);
+    }
+    if (r < 30) {
+        x = gen_xdec(q, depth - 1, fail);
+        const xnode *a = XN(q, x);
+        if (a->ty != CT_DEC) return xfn(q, XF_ROUND, x, 0, a->ty, 0); /* an INT64's places would print .00 in PostgreSQL */
+        int64_t pl = rr(0, 3);
+        k = xfn(q, XF_ROUND, x, 0, CT_DEC, a->sc < pl ? a->sc : (int)pl);
+        XN(q, k)->a1 = pl;
+        return k;
+    }
+    if (r < 42) {
+        x = gen_xdec(q, depth - 1, fail);
+        return xfn(q, chance(50) ? XF_CEIL : XF_FLOOR, x, 0, XN(q, x)->ty, 0);
+    }
+    if (r < 50) {
+        int a = gen_xdec(q, depth - 1, fail);
+        k = xnew(q, X_MOD, a, xlit_dec(q, nonzero(-999, 999), 2));
+        XN(q, k)->op = X_FN;
+        XN(q, k)->fn = XF_MOD;
+        q->fns = true;
+        return k;
+    }
+    if (r < 64) {
+        int t = gen_xdec(q, depth - 1, fail);
+        return xcase(q, t, chance(75) ? gen_xdec(q, depth - 1, fail) : 0);
+    }
+    if (r < 74) {
+        int a = gen_xdec(q, depth - 1, fail), b = gen_xdec(q, depth - 1, fail), ty, sc;
+        unify2(XN(q, a), XN(q, b), &ty, &sc);
+        return xfn(q, XF_COALESCE, a, b, ty, sc);
+    }
+    if (r < 80) {
+        x = gen_xdec(q, depth - 1, fail);
+        return xfn(q, XF_NULLIF, x, gen_xdec(q, 0, false), XN(q, x)->ty, XN(q, x)->sc);
+    }
+    if (r < 87) return xcast(q, gen_xint(q, depth - 1, false), CT_DEC, 2);  /* |x| < 10^9: DECIMAL(18,2) holds it */
+    if (r < 94) return xcast(q, gen_xdec(q, depth - 1, false), CT_DEC, 1); /* fewer places: half away from zero */
+    return xcast(q, as_flt(q, gen_xflt(q, depth > 1 ? 1 : 0)), CT_DEC, 4);   /* a dyadic value, exact at 4 places */
+}
+
+/* a FLOAT64 function form: ABS, CEIL, FLOOR, ROUND, a CAST of an INT64, CASE and COALESCE (FLOAT64 branches) */
+static int gen_fflt(stmt *q, int depth)
+{
+    int r = (int)rr(0, 99);
+    if (r < 15) return xfn(q, XF_ABS, as_flt(q, gen_xflt(q, depth - 1)), 0, CT_FLT, 0);
+    if (r < 40) {
+        int fn = chance(50) ? XF_CEIL : XF_FLOOR;
+        return xfn(q, fn, as_flt(q, gen_xflt(q, depth - 1)), 0, CT_FLT, 0);
+    }
+    if (r < 55) return xfn(q, XF_ROUND, as_flt(q, gen_xflt(q, depth - 1)), 0, CT_FLT, 0);
+    if (r < 70) return xcast(q, gen_xint(q, depth - 1, false), CT_FLT, 0);
+    if (r < 88) {
+        int t = as_flt(q, gen_xflt(q, depth - 1));
+        return xcase(q, t, chance(75) ? as_flt(q, gen_xflt(q, depth - 1)) : 0);
+    }
+    int a = as_flt(q, gen_xflt(q, depth - 1));
+    return xfn(q, XF_COALESCE, a, as_flt(q, gen_xflt(q, depth - 1)), CT_FLT, 0);
+}
+
+static int xval(stmt *q, int ty, const val *v)
+{
+    int k = xnew(q, X_VAL, 0, 0);
+    xnode *n = XN(q, k);
+    n->ty = ty;
+    n->sc = ty == CT_DEC ? 2 : 0;
+    n->i = v->i;
+    n->f = v->f;
+    snprintf(n->s, sizeof n->s, "%s", v->s);
+    return k;
+}
+
+/* x IN (...) and NOT IN: a column of any type against its own values (a NULL among them sometimes), or an INT64 tree
+ * against integers */
+static int gen_in(stmt *q)
+{
+    int tab = q->join ? (chance(40) ? 1 : 0) : q->tab, col = -1, l;
+    if (chance(70)) {
+        col = (int)(rnd() % (uint64_t)ncols(tab));
+        l = xcol(q, tab, col);
+    } else {
+        l = gen_xint(q, 1, false);
+    }
+    int k = xbool(q, X_IN, l, 0), prev = 0, n = (int)rr(1, 5);
+    XN(q, k)->fn = chance(30);
+    for (int i = 0; i < n; i++) {
+        int e;
+        if (chance(10)) {
+            e = xnew(q, X_NULL, 0, 0);
+            XN(q, e)->ty = XN(q, l)->ty;
+        } else if (col >= 0) {
+            val v;
+            pred_val(tab, col, &v);
+            e = xval(q, XN(q, l)->ty, &v);
+        } else {
+            e = xlit_int(q, rr(-20, 20));
+        }
+        int li = xnew(q, X_LIST, e, 0);
+        if (prev) XN(q, prev)->r = li;
+        else XN(q, k)->r = li;
+        prev = li;
+    }
+    q->fns = true;
+    return k;
+}
+
+/* s LIKE / NOT LIKE a pattern made from one of its values: characters kept, replaced by _, a run by %; its own %, _
+ * and ! escaped by ! (always ESCAPE '!': PostgreSQL's default escape is a backslash, imagedb has none) */
+static int gen_like(stmt *q)
+{
+    int tab = q->join ? (chance(40) ? 1 : 0) : q->tab, c = tab ? 3 : 6;
+    int l = chance(80) ? xcol(q, tab, c) : gen_xtxt(q, 1);
+    val v;
+    pred_val(tab, c, &v);
+    char pat[136];
+    size_t n = 0;
+    if (chance(30)) pat[n++] = '%';
+    for (const unsigned char *p = (const unsigned char *)v.s; *p && n + 8 < sizeof pat;) {
+        size_t cl = *p < 0x80 ? 1 : *p < 0xE0 ? 2 : *p < 0xF0 ? 3 : 4;
+        int r = (int)rr(0, 99);
+        if (r < 15) {
+            pat[n++] = '_';
+        } else if (r < 25) {
+            if (!n || pat[n - 1] != '%') pat[n++] = '%';
+        } else {
+            if (*p == '%' || *p == '_' || *p == '!') pat[n++] = '!';
+            memcpy(pat + n, p, cl);
+            n += cl;
+        }
+        p += cl;
+    }
+    if (chance(30) && (!n || pat[n - 1] != '%')) pat[n++] = '%';
+    pat[n] = 0;
+    int k = xbool(q, X_LIKE, l, 0);
+    snprintf(XN(q, k)->s, sizeof XN(q, k)->s, "%s", pat);
+    XN(q, k)->fn = chance(25);
+    q->fns = true;
+    return k;
+}
+
+/* a condition of S1's: IN, LIKE, or a TEXT tree (never a bare literal) against a literal, or IS [NOT] NULL */
+static int gen_fcmp(stmt *q)
+{
+    int r = (int)rr(0, 99);
+    if (r < 40) return gen_in(q);
+    if (r < 75) return gen_like(q);
+    int l = gen_xtxt(q, 1);
+    if (XN(q, l)->op == X_TXT) l = xcol(q, q->join ? 0 : q->tab, q->join || !q->tab ? 6 : 3);
+    int k = xbool(q, X_CMP, l, 0);
+    if (chance(15)) {
+        XN(q, k)->fn = chance(50) ? OP_ISNULL : OP_NOTNULL;
+        return k;
+    }
+    val v;
+    int tab = q->join ? 0 : q->tab;
+    pred_val(tab, tab ? 3 : 6, &v);
+    XN(q, k)->r = xtxt(q, v.s);
+    XN(q, k)->fn = (int)rr(OP_EQ, OP_GE);
+    q->fns = true;
+    return k;
+}
+
+/* MIN, MAX or COUNT of a TEXT tree (an item of its own: never in HAVING's arithmetic) */
+static int gen_ftagg(stmt *q)
+{
+    int x = gen_xtxt(q, 1);
+    int k = xnew(q, X_AGG, x, 0);
+    xnode *n = XN(q, k);
+    n->fn = (int[]){F_COUNT, F_MIN, F_MAX}[rnd() % 3];
+    n->ty = n->fn == F_COUNT ? CT_INT : CT_TXT;
+    q->fns = true;
+    return k;
+}
+
 /* a comparison of two numbers (DML: INT64 or FLOAT64, what SQLite computes alike), IS [NOT] NULL, or t's BOOL k */
 static int gen_xcmp(stmt *q, bool dml)
 {
     int r = (int)rr(0, 99);
+    if (g_fns && !dml && q->kind == Q_SELECT && FNROOM(q) && chance(20)) return gen_fcmp(q); /* P2 S1 */
     if ((q->tab == 0 || q->join) && r < 10) return xcol(q, 0, 7); /* k as a condition (SQL Server: k = 1) */
     if (r >= 70 && q->nxp < (int)(sizeof q->xp / sizeof q->xp[0])) { /* a plain predicate: TEXT, TIMESTAMP, BOOL, DECIMAL
                                                                         * against literals of the column's type */
@@ -729,7 +1113,9 @@ static void gen_xselect(stmt *q)
         int n = (int)rr(1, 3);
         for (int i = 0; i < n; i++) {
             int k;
-            if (XCOND_ROOM(q) && chance(20)) { /* a condition as an item: a BOOL (SQL Server has none: its BIT is no value of
+            if (g_fns && FNROOM(q) && chance(20)) { /* P2 S1: a TEXT tree */
+                k = gen_xtxt(q, 2);
+            } else if (XCOND_ROOM(q) && chance(20)) { /* a condition as an item: a BOOL (SQL Server has none: its BIT is no value of
                                                 * a comparison) */
                 k = gen_xcond(q, 1, false);
                 q->skip |= 1u << D_MS;
@@ -745,7 +1131,8 @@ static void gen_xselect(stmt *q)
             if (chance(30)) q->it[q->nit++] = (item){F_COL, 0, 0, xnew(q, X_MUL, xcol(q, 0, 1), xlit_int(q, rr(2, 9)))};
         }
         int n = (int)rr(1, 3);
-        for (int i = 0; i < n; i++) q->it[q->nit++] = (item){F_COL, 0, 0, gen_xaggtree(q, !g_in_txn)};
+        for (int i = 0; i < n; i++) /* P2 S1: an aggregate of a TEXT tree sometimes (an item alone: never in arithmetic) */
+            q->it[q->nit++] = (item){F_COL, 0, 0, g_fns && FNROOM(q) && chance(12) ? gen_ftagg(q) : gen_xaggtree(q, !g_in_txn)};
         if (XCOND_ROOM(q) && chance(q->gcol >= 0 ? 40 : 15)) q->hv = gen_hcond(q, chance(30) ? 2 : 1); /* 1e */
     }
     if (q->gcol >= 0) { /* grouped: every group's row is built before any cut (1d), so a window is safe here */
@@ -759,6 +1146,8 @@ static void gen_xselect(stmt *q)
     for (int i = 0; i < q->nit; i++) xmark(q, q->it[i].ex);
     xmark(q, q->hv);
     if (q->hv && q->gcol < 0) q->skip |= 1u << D_SQLITE; /* SQLite before 3.39 (3.37.2 here) refuses HAVING without GROUP BY */
+    for (int i = 0; i < q->nord; i++) /* P2 S1: SQL Server orders a computed TEXT with a trailing space padded away */
+        if (q->ord[i].pos && q->it[q->ord[i].pos - 1].ex && txt_computed(q, q->it[q->ord[i].pos - 1].ex)) q->skip |= 1u << D_MS;
     for (int i = 0; i < q->npr; i++) xmark_pred(q, &q->pr[i]);
 }
 
@@ -857,11 +1246,67 @@ static void gen_order(stmt *q, bool window, bool distinct_ok)
     if (window && chance(30)) q->offset = (int)rr(1, 12);
 }
 
+/* P2 S1: a SELECT of its forms: rows of t, u or their join (TEXT trees, INT64, FLOAT64 and DECIMAL function forms) or
+ * aggregates of them (grouped by g sometimes), under its conditions (IN, LIKE, TEXT comparisons), ordered sometimes;
+ * rows whose items may fail are never cut (gen_xselect's rule) */
+static void gen_fselect(stmt *q)
+{
+    q->tab = chance(75) ? 0 : 1;
+    q->join = q->tab == 0 && chance(25) ? (int)rr(1, 2) : 0;
+    bool agg = chance(35);
+    if (agg && q->tab == 0 && chance(40)) {
+        q->gcol = 1;
+        q->it[q->nit++] = (item){F_COL, 0, 1, 0};
+    } else if (!agg) {
+        q->it[q->nit++] = (item){F_COL, q->tab, 0, 0};
+    }
+    int n = (int)rr(1, 3);
+    for (int i = 0; i < n && FNROOM(q); i++) {
+        int r = (int)rr(0, 99), k;
+        if (agg && r < 40) {
+            k = gen_ftagg(q);
+        } else {
+            bool fl = !agg && !g_in_txn; /* an aggregate's operand never fails: a SUM of x would pass INT64 (gen_xagg's rule) */
+            k = r < 45 ? gen_xtxt(q, 2) : r < 75 ? gen_fint(q, 2, fl) : r < 88 ? gen_fflt(q, 2) : gen_fdec(q, 2, fl);
+            if (agg) { /* COUNT, MIN, MAX of any; SUM of a number */
+                const xnode *a = XN(q, k);
+                int fn = a->ty == CT_TXT ? (int[]){F_COUNT, F_MIN, F_MAX}[rnd() % 3] : (int)rr(F_COUNT, F_MAX);
+                int g = xnew(q, X_AGG, k, 0);
+                XN(q, g)->fn = fn;
+                XN(q, g)->ty = fn == F_COUNT ? CT_INT : XN(q, k)->ty;
+                XN(q, g)->sc = fn == F_COUNT ? 0 : XN(q, k)->sc;
+                k = g;
+            }
+        }
+        q->it[q->nit++] = (item){F_COL, 0, 0, k};
+    }
+    int np = (int)rr(0, 2);
+    for (int i = 0; i < np && FNROOM(q); i++) {
+        memset(&q->pr[q->npr], 0, sizeof q->pr[0]);
+        q->pr[q->npr++].bt = gen_fcmp(q);
+    }
+    if (agg && q->gcol < 0) {
+        /* one row: no order */
+    } else if (agg) {
+        gen_order(q, true, false);
+    } else {
+        gen_order(q, false, false);
+    }
+    for (int i = 0; i < q->nit; i++) xmark(q, q->it[i].ex);
+    for (int i = 0; i < q->npr; i++) xmark(q, q->pr[i].bt);
+    for (int i = 0; i < q->nord; i++) /* SQL Server orders a computed TEXT with a trailing space padded away */
+        if (q->ord[i].pos && q->it[q->ord[i].pos - 1].ex && txt_computed(q, q->it[q->ord[i].pos - 1].ex)) q->skip |= 1u << D_MS;
+}
+
 static void gen_select(stmt *q)
 {
     memset(q, 0, sizeof *q);
     q->kind = Q_SELECT;
     q->gcol = -1;
+    if (g_fns && chance(12)) { /* P2 S1 */
+        gen_fselect(q);
+        return;
+    }
     if (g_expr && chance(30)) {
         gen_xselect(q);
         return;
@@ -1094,6 +1539,187 @@ static void put_scaled(sb *b, __int128 x, int s)
     }
 }
 
+/* ---- P2 S1's forms in each dialect ----------------------------------------------------------------------------------- */
+
+static void put_x(sb *b, int d, const stmt *q, int k, int pty);
+
+static void put_txt(sb *b, const char *s)
+{
+    sb_str(b, "'");
+    for (const char *p = s; *p; p++) sb_put(b, *p == '\'' ? "''" : p, *p == '\'' ? 2 : 1);
+    sb_str(b, "'");
+}
+
+/* name(x[, y[, z]]) */
+static void put_call(sb *b, int d, const stmt *q, const char *name, int x, int y, int z)
+{
+    sb_printf(b, "%s(", name);
+    put_x(b, d, q, x, -1);
+    if (y) sb_str(b, ", "), put_x(b, d, q, y, -1);
+    if (z) sb_str(b, ", "), put_x(b, d, q, z, -1);
+    sb_str(b, ")");
+}
+
+/* x, cast to NUMERIC in PostgreSQL where it is an INT64 (its CEIL, FLOOR, ROUND and SIGN of a bigint are a double's) */
+static void put_num_arg(sb *b, int d, const stmt *q, int x)
+{
+    if (d == D_PG && XN(q, x)->ty == CT_INT) {
+        sb_str(b, "CAST(");
+        put_x(b, d, q, x, -1);
+        sb_str(b, " AS NUMERIC)");
+        return;
+    }
+    put_x(b, d, q, x, -1);
+}
+
+static void put_fn(sb *b, int d, const stmt *q, const xnode *n)
+{
+    const xnode *a = n->l ? XN(q, n->l) : NULL;
+    switch (n->fn) {
+    case XF_ABS: put_call(b, d, q, "ABS", n->l, 0, 0); return;
+    case XF_SIGN: /* SQL Server's SIGN of a DECIMAL is a DECIMAL (1.00) */
+        sb_str(b, d == D_MS ? "CAST(SIGN(" : "SIGN(");
+        put_num_arg(b, d, q, n->l);
+        sb_str(b, d == D_MS ? ") AS BIGINT)" : ")");
+        return;
+    case XF_CEIL:
+    case XF_FLOOR:
+        sb_str(b, n->fn == XF_FLOOR ? "FLOOR(" : d == D_MS ? "CEILING(" : "CEIL(");
+        put_num_arg(b, d, q, n->l);
+        sb_str(b, ")");
+        return;
+    case XF_ROUND: /* SQL Server's needs its places */
+        if (d == D_SQLITE && a->ty == CT_INT) { /* SQLite's round is a REAL, inexact past 2^53: an INT64's is itself */
+            sb_str(b, "(");
+            put_x(b, d, q, n->l, -1);
+            sb_str(b, ")");
+            return;
+        }
+        sb_str(b, "ROUND(");
+        put_num_arg(b, d, q, n->l);
+        if (n->a1 >= 0 && d != D_SQLITE) sb_printf(b, ", %" PRId64, n->a1);
+        else if (d == D_MS || (d == D_PG && a->ty == CT_DEC) || ((d == D_MY || d == D_MA) && a->ty == CT_DEC)) sb_str(b, ", 0");
+        sb_str(b, ")");
+        return;
+    case XF_MOD:
+        if (d == D_SQLITE || d == D_MS) {
+            sb_str(b, "(");
+            put_x(b, d, q, n->l, n->ty);
+            sb_str(b, " % ");
+            put_x(b, d, q, n->r, n->ty);
+            sb_str(b, ")");
+            return;
+        }
+        put_call(b, d, q, "MOD", n->l, n->r, 0);
+        return;
+    case XF_LENGTH:
+        if (d == D_MS) { /* LEN drops trailing spaces */
+            sb_str(b, "(LEN(");
+            put_x(b, d, q, n->l, -1);
+            sb_str(b, " + 'x') - 1)");
+            return;
+        }
+        put_call(b, d, q, d == D_IMDB || d == D_SQLITE ? "LENGTH" : "CHAR_LENGTH", n->l, 0, 0);
+        return;
+    case XF_SUBSTR:
+        sb_str(b, d == D_MY || d == D_MA || d == D_MS ? "SUBSTRING(" : "SUBSTR(");
+        put_x(b, d, q, n->l, -1);
+        sb_printf(b, ", %" PRId64, n->a1);
+        if (n->a2 >= 0) sb_printf(b, ", %" PRId64, n->a2);
+        else if (d == D_MS) sb_str(b, ", 100000"); /* its SUBSTRING has no two-argument form */
+        sb_str(b, ")");
+        return;
+    case XF_TRIM: put_call(b, d, q, "TRIM", n->l, 0, 0); return;
+    case XF_LTRIM: put_call(b, d, q, "LTRIM", n->l, 0, 0); return;
+    case XF_RTRIM: put_call(b, d, q, "RTRIM", n->l, 0, 0); return;
+    case XF_POSITION: /* POSITION(needle IN text) */
+        if (d == D_SQLITE) put_call(b, d, q, "instr", n->r, n->l, 0);
+        else if (d == D_MY || d == D_MA) put_call(b, d, q, "LOCATE", n->l, n->r, 0);
+        else if (d == D_MS) put_call(b, d, q, "CHARINDEX", n->l, n->r, 0);
+        else {
+            sb_str(b, "POSITION(");
+            put_x(b, d, q, n->l, -1);
+            sb_str(b, " IN ");
+            put_x(b, d, q, n->r, -1);
+            sb_str(b, ")");
+        }
+        return;
+    case XF_COALESCE: put_call(b, d, q, "COALESCE", n->l, n->r, 0); return;
+    case XF_NULLIF: put_call(b, d, q, "NULLIF", n->l, n->r, 0); return;
+    case XF_LOWER: put_call(b, d, q, "LOWER", n->l, 0, 0); return;
+    case XF_UPPER: put_call(b, d, q, "UPPER", n->l, 0, 0); return;
+    case XF_REPLACE: put_call(b, d, q, "REPLACE", n->l, n->r, n->x3); return;
+    case XF_CONCAT:
+        if (d == D_MY || d == D_MA) { /* their || is OR */
+            put_call(b, d, q, "CONCAT", n->l, n->r, 0);
+            return;
+        }
+        sb_str(b, "(");
+        put_x(b, d, q, n->l, -1);
+        sb_str(b, d == D_MS ? " + " : " || ");
+        put_x(b, d, q, n->r, -1);
+        sb_str(b, ")");
+        return;
+    }
+}
+
+static void put_cast(sb *b, int d, const stmt *q, const xnode *n)
+{
+    sb_str(b, "CAST(");
+    put_x(b, d, q, n->l, -1);
+    switch (n->ty) {
+    case CT_INT:
+        sb_str(b, d == D_IMDB ? " AS INT64)" : d == D_SQLITE ? " AS INTEGER)" : d == D_MY || d == D_MA ? " AS SIGNED)" : " AS BIGINT)");
+        return;
+    case CT_FLT:
+        sb_str(b, d == D_IMDB     ? " AS FLOAT64)"
+                  : d == D_SQLITE ? " AS REAL)"
+                  : d == D_PG     ? " AS DOUBLE PRECISION)"
+                  : d == D_MS     ? " AS FLOAT(53))"
+                                  : " AS DOUBLE)");
+        return;
+    case CT_DEC: sb_printf(b, " AS %s(18,%d))", d == D_PG ? "NUMERIC" : "DECIMAL", n->sc); return;
+    default:
+        sb_str(b, d == D_MY || d == D_MA ? " AS CHAR CHARACTER SET utf8mb4)" : d == D_MS ? " AS VARCHAR(40))" : " AS TEXT)");
+        return;
+    }
+}
+
+/* a computed TEXT under the columns' binary collation (a constant one would take the server's default) */
+static const char *bin_coll(int d)
+{
+    return d == D_PG   ? " COLLATE \"C\""
+           : d == D_MY ? " COLLATE utf8mb4_0900_bin"
+           : d == D_MA ? " COLLATE utf8mb4_nopad_bin"
+           : d == D_MS ? " COLLATE Latin1_General_100_BIN2_UTF8"
+                       : NULL;
+}
+
+/* P2 S1: the engines a statement's forms are not put to: ROUND of a FLOAT64, LOWER and UPPER past SQLite (the
+ * servers round half to even, map case past ASCII); a computed TEXT compared, NULLIF'd or ordered by MIN or MAX in SQL
+ * Server (its comparison pads a trailing space away) */
+static bool txt_computed(const stmt *q, int k)
+{
+    const xnode *n = XN(q, k);
+    return n->ty == CT_TXT && n->op != X_COL && n->op != X_TXT && n->op != X_VAL;
+}
+
+static void fn_mark(stmt *q, int k)
+{
+    if (!k) return;
+    const xnode *n = XN(q, k);
+    const unsigned servers = 1u << D_PG | 1u << D_MY | 1u << D_MA | 1u << D_MS;
+    if (n->op == X_FN && n->fn == XF_ROUND && XN(q, n->l)->ty == CT_FLT) q->skip |= servers;
+    if (n->op == X_FN && (n->fn == XF_LOWER || n->fn == XF_UPPER)) q->skip |= servers;
+    if ((n->op == X_CMP || n->op == X_LIKE || n->op == X_IN || (n->op == X_FN && n->fn == XF_NULLIF) ||
+         (n->op == X_AGG && (n->fn == F_MIN || n->fn == F_MAX))) &&
+        n->l && txt_computed(q, n->l))
+        q->skip |= 1u << D_MS;
+    fn_mark(q, n->l);
+    fn_mark(q, n->r);
+    fn_mark(q, n->x3);
+}
+
 /* a tree in dialect d, fully parenthesised (so "a - -5" never prints "--", a comment). Integer literals are BIGINT
  * in PostgreSQL and SQL Server (their bare literals are 32-bit); an INT64 / is DIV in MySQL and MariaDB, div() in
  * PostgreSQL where an operand is its numeric SUM; a DECIMAL quotient is rounded at imagedb's scale from one computed
@@ -1104,7 +1730,65 @@ static void put_pred(sb *b, int d, const stmt *q, const pred *p);
 static void put_x(sb *b, int d, const stmt *q, int k, int pty)
 {
     const xnode *n = XN(q, k);
+    if ((n->op == X_FN || n->op == X_CASE || n->op == X_CAST) && n->ty == CT_TXT && bin_coll(d)) { /* P2 S1 */
+        sb_str(b, "(");
+        if (n->op == X_FN) put_fn(b, d, q, n);
+        else if (n->op == X_CAST) put_cast(b, d, q, n);
+        else {
+            sb_str(b, "CASE WHEN ");
+            put_x(b, d, q, n->l, -1);
+            sb_str(b, " THEN ");
+            put_x(b, d, q, n->r, -1);
+            if (n->x3) sb_str(b, " ELSE "), put_x(b, d, q, n->x3, -1);
+            sb_str(b, " END");
+        }
+        sb_str(b, bin_coll(d));
+        sb_str(b, ")");
+        return;
+    }
     switch (n->op) {
+    case X_FN: put_fn(b, d, q, n); return;
+    case X_CAST: put_cast(b, d, q, n); return;
+    case X_CASE:
+        sb_str(b, "(CASE WHEN ");
+        put_x(b, d, q, n->l, -1);
+        sb_str(b, " THEN ");
+        put_x(b, d, q, n->r, n->ty);
+        if (n->x3) sb_str(b, " ELSE "), put_x(b, d, q, n->x3, n->ty);
+        sb_str(b, " END)");
+        return;
+    case X_TXT: put_txt(b, n->s); return;
+    case X_NULL: sb_str(b, "NULL"); return;
+    case X_VAL: {
+        val v;
+        memset(&v, 0, sizeof v);
+        v.i = n->i;
+        v.f = n->f;
+        snprintf(v.s, sizeof v.s, "%s", n->s);
+        put_lit(b, d, n->ty, &v);
+        return;
+    }
+    case X_LIST: return; /* its elements: printed by their X_IN */
+    case X_IN: {
+        const xnode *o = XN(q, n->l);
+        sb_str(b, "(");
+        if (o->op == X_COL) put_col(b, q, o->tab, o->col); /* SQL Server's BIT bare: k IN (1, 0) */
+        else put_x(b, d, q, n->l, -1);
+        sb_str(b, n->fn ? " NOT IN (" : " IN (");
+        for (int li = n->r, first = 1; li; li = XN(q, li)->r, first = 0) {
+            if (!first) sb_str(b, ", ");
+            put_x(b, d, q, XN(q, li)->l, -1);
+        }
+        sb_str(b, "))");
+        return;
+    }
+    case X_LIKE:
+        sb_str(b, "(");
+        put_x(b, d, q, n->l, -1);
+        sb_str(b, n->fn ? " NOT LIKE " : " LIKE ");
+        put_txt(b, n->s);
+        sb_str(b, " ESCAPE '!')");
+        return;
     case X_COL:
         if (d == D_MS && cols(n->tab)[n->col].t == CT_BOOL) { /* T-SQL has no bare boolean: its BIT, as a condition */
             sb_str(b, "(");
@@ -2131,6 +2815,7 @@ static void reset_all(unsigned seed)
         } else if (d == D_SQLITE) {
             if (e->lite) sqlite3_close(e->lite);
             if (sqlite3_open(":memory:", &e->lite) != SQLITE_OK) exit(2);
+            must(e, "PRAGMA case_sensitive_like = ON"); /* P2 S1: LIKE as the others compare it (binary collations) */
         } else {
             /* a seed stopped by a mismatch (--keep-going) may have left a transaction open, or aborted (PostgreSQL) */
             res rb;
@@ -2158,6 +2843,7 @@ static void reset_all(unsigned seed)
 static int cmp_rows(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
 
 static long g_mismatches, g_compared, g_checkpoints, g_reopens, g_drops;
+static long g_fn_compared; /* P2 S1: comparisons of statements holding its forms */
 
 static void show_rows(const res *r, size_t from)
 {
@@ -2285,6 +2971,7 @@ static int run_stmt(unsigned seed, int step, const stmt *q, bool state)
     for (int d = 1; d < ND; d++) {
         if (!g_eng[d].on || (q->skip & (1u << d))) continue;
         g_compared++;
+        if (q->fns) g_fn_compared++;
         const res *o = &out[d];
         const char *why = NULL;
         size_t at = 0;
@@ -2452,10 +3139,11 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--dir") && i + 1 < argc) snprintf(g_root, sizeof g_root, "%s", argv[++i]);
         else if (!strcmp(argv[i], "--keep-going")) keep_going = true;
         else if (!strcmp(argv[i], "--no-expr")) g_expr = false;
+        else if (!strcmp(argv[i], "--no-fns")) g_fns = false;
         else if (!strcmp(argv[i], "--ping")) ping = true; /* connect to every engine named, then stop (run.sh waits on it) */
         else if (!strcmp(argv[i], "-v")) g_verbose = true;
         else {
-            fprintf(stderr, "usage: oracle [--engines LIST] [--seeds A-B] [--steps N] [--dir DIR] [--keep-going] [--no-expr] [--ping] [-v]\n");
+            fprintf(stderr, "usage: oracle [--engines LIST] [--seeds A-B] [--steps N] [--dir DIR] [--keep-going] [--no-expr] [--no-fns] [--ping] [-v]\n");
             return 2;
         }
     }
@@ -2507,5 +3195,10 @@ int main(int argc, char **argv)
     printf("oracle: imagedb alone: %ld CHECKPOINTs, %ld reopens; the paths it answered by:\n", g_checkpoints, g_reopens);
     for (int i = 0; i < g_npaths; i++) printf("  %7ld  %s\n", g_paths[i].n, g_paths[i].path);
     printf("oracle: EXPLAIN checked against the run on %ld SELECTs, %ld disagreements\n", g_explained, g_explain_bad);
+    bool servers = g_eng[D_PG].on || g_eng[D_MY].on || g_eng[D_MA].on || g_eng[D_MS].on;
+    printf("oracle: %ld comparisons of statements with P2 S1's forms (functions, CASE, CAST, IN, LIKE, ||); ROUND of a "
+           "FLOAT64, LOWER and UPPER compared with SQLite alone%s\n", g_fn_compared,
+           servers ? "" : " (UNGUARDED: no server engine was run, so a CAST to DECIMAL, the DECIMAL functions and SQL "
+                     "Server's, MySQL's and PostgreSQL's spellings were compared with nothing)");
     return g_mismatches ? 1 : 0;
 }

@@ -142,6 +142,8 @@ typedef struct xctx {
     uint64_t tested, row_limit;   /* rows tested and SET statement_row_limit (D8 #4: xtested) */
     uint64_t deadline_ns;         /* CLOCK_MONOTONIC: the statement's timeout; 0: none */
     bool checks;                  /* false for what runs to its end: COMMIT and the physical statements */
+    imdb_xenv env;                /* P2 S1: the evaluator's view of the statement (xenv_check) */
+    imdb_xarena arena;            /* P2 S1: computed TEXT, freed by xfree (the one exit) */
     char vpath[80];               /* select_vids' path: an UPDATE's or DELETE's result's (P1 Q1) */
 } xctx;
 
@@ -168,6 +170,12 @@ static int xcheck(xctx *x, imdb_err *e)
         return imdb_fail(e, IMDB_ERR_CANCELLED, "statement timeout: it ran past %u ms (SET statement_timeout)",
                          x->ss->stmt_timeout_ms);
     return IMDB_OK;
+}
+
+/* P2 S1: xcheck for the evaluator (imdb_xenv), which knows no xctx */
+static int xenv_check(void *ctx, imdb_err *e)
+{
+    return xcheck((xctx *)ctx, e);
 }
 
 /* D8 #4, the work limit: n more rows tested, each a row reaching a table's sink (visible, past every bound predicate,
@@ -209,6 +217,7 @@ static void xfree(xctx *x)
     for (uint32_t i = 0; i < x->nallocs; i++) imdb_free(x->allocs[i]);
     imdb_free(x->allocs);
     imdb_salts_wipe(&x->salts);
+    imdb_xarena_free(&x->arena); /* P2 S1 */
 }
 
 /* Copies a TEXT value into context-owned memory (stable across writes). */
@@ -401,6 +410,118 @@ static int ts_lit(xctx *x, const sql_stmt *st, uint16_t k, imdb_err *e)
     return IMDB_OK;
 }
 
+static int xbind(xctx *x, xscope *sc, uint16_t k, imdb_err *e);
+
+/* P2 S1: a value where a NULL literal may stand (CASE's results, COALESCE's and NULLIF's second argument, an IN
+ * list's values, CAST's operand): untyped (0) until its siblings type it; anywhere else a NULL operand stays refused */
+static int xbind_v(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
+{
+    const sql_expr *n = &sc->st->ex[k];
+    if (n->op == EX_LIT && n->lit.kind == LIT_NULL) {
+        imdb_xnode *b = &x->xn[k];
+        memset(&b->k, 0, sizeof b->k);
+        b->k.null = true;
+        b->type = b->scale = 0;
+        return IMDB_OK;
+    }
+    return xbind(x, sc, k, e);
+}
+
+/* P2 S1: an untyped NULL at k takes the type its siblings unified to */
+static void x_type_null(xctx *x, uint16_t k, uint8_t t, uint8_t s)
+{
+    imdb_xnode *b = &x->xn[k];
+    if (b->type) return;
+    b->type = b->k.type = t;
+    b->scale = b->k.scale = s;
+}
+
+/* P2 S1: values that must share one type (CASE's results, COALESCE's arguments): a string literal beside a TIMESTAMP is
+ * a timestamp (as in a comparison), then each unified; the untyped NULLs take the result */
+static int x_unify_all(xctx *x, const sql_stmt *st, const uint16_t *v, unsigned n, const char *what, uint8_t *rt,
+                       uint8_t *rs, imdb_err *e)
+{
+    bool ts = false;
+    for (unsigned i = 0; i < n; i++) ts |= x->xn[v[i]].type == IMDB_T_TIMESTAMP;
+    for (unsigned i = 0; ts && i < n; i++)
+        if (ts_lit(x, st, v[i], e)) return e->code;
+    *rt = *rs = 0;
+    for (unsigned i = 0; i < n; i++)
+        if (imdb_x_unify(rt, rs, x->xn[v[i]].type, x->xn[v[i]].scale, what, e)) return e->code;
+    if (!*rt) return imdb_fail(e, IMDB_ERR_INVALID, "%s NULL alone has no type", what);
+    for (unsigned i = 0; i < n; i++) x_type_null(x, v[i], *rt, *rs);
+    return IMDB_OK;
+}
+
+/* P2 S1: a function call, CASE or CAST bound: its arguments, then its result's type */
+static int xbind_s1(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
+{
+    const sql_stmt *st = sc->st;
+    const sql_expr *n = &st->ex[k];
+    imdb_xnode *b = &x->xn[k];
+    imdb_xlist it;
+    if (n->op == EX_CAST) {
+        if (xbind_v(x, sc, n->l, e)) return e->code;
+        const imdb_xnode *a = &x->xn[n->l];
+        bool num = a->type == IMDB_T_INT64 || a->type == IMDB_T_DECIMAL || a->type == IMDB_T_FLOAT64;
+        bool to_num = n->ctype == IMDB_T_INT64 || n->ctype == IMDB_T_DECIMAL || n->ctype == IMDB_T_FLOAT64;
+        if (a->type && a->type != IMDB_T_TEXT && n->ctype != IMDB_T_TEXT && a->type != n->ctype && !(num && to_num))
+            return imdb_fail(e, IMDB_ERR_INVALID, "CAST of %s to %s is not defined", imdb_type_name(a->type),
+                             imdb_type_name(n->ctype));
+        x_type_null(x, n->l, n->ctype, n->cscale);
+        b->type = n->ctype;
+        b->scale = n->ctype == IMDB_T_DECIMAL ? n->cscale : 0;
+        return IMDB_OK;
+    }
+    uint16_t v[256];
+    unsigned nv = 0;
+    if (n->op == EX_CASE) {
+        if (n->l && xbind(x, sc, n->l, e)) return e->code;
+        imdb_xlist_start(&it, st, n->r);
+        for (uint16_t w = imdb_xlist_next(&it); w; w = imdb_xlist_next(&it)) {
+            const sql_expr *wx = &st->ex[w];
+            if (xbind(x, sc, wx->l, e)) return e->code;
+            if (!n->l && x->xn[wx->l].type != IMDB_T_BOOL)
+                return imdb_fail(e, IMDB_ERR_INVALID, "CASE WHEN takes a condition");
+            if (n->l) { /* a simple CASE compares its operand with each WHEN, as = does */
+                if (x->xn[n->l].type == IMDB_T_TIMESTAMP && ts_lit(x, st, wx->l, e)) return e->code;
+                if (!imdb_x_comparable(x->xn[n->l].type, x->xn[wx->l].type))
+                    return imdb_fail(e, IMDB_ERR_INVALID, "a CASE of %s compared with %s: values are not converted",
+                                     imdb_type_name(x->xn[n->l].type), imdb_type_name(x->xn[wx->l].type));
+            }
+            if (xbind_v(x, sc, wx->r, e)) return e->code;
+            if (nv >= sizeof v / sizeof *v) return imdb_fail(e, IMDB_ERR_LIMIT, "a CASE of more than %zu results", sizeof v / sizeof *v);
+            v[nv++] = wx->r;
+        }
+        if (n->x3) {
+            if (xbind_v(x, sc, n->x3, e)) return e->code;
+            if (nv >= sizeof v / sizeof *v) return imdb_fail(e, IMDB_ERR_LIMIT, "a CASE of more than %zu results", sizeof v / sizeof *v);
+            v[nv++] = n->x3;
+        }
+        return x_unify_all(x, st, v, nv, "a CASE of", &b->type, &b->scale, e);
+    }
+    /* EX_FN */
+    uint8_t ta[256], sa[256];
+    const imdb_xval *kv[256];
+    imdb_xlist_start(&it, st, n->l);
+    for (uint16_t a = imdb_xlist_next(&it); a; a = imdb_xlist_next(&it)) {
+        bool nul = n->fn == FN_COALESCE || (n->fn == FN_NULLIF && nv == 1);
+        if (nv >= 255) return imdb_fail(e, IMDB_ERR_LIMIT, "a function call of more than 255 arguments");
+        if (nul ? xbind_v(x, sc, a, e) : xbind(x, sc, a, e)) return e->code;
+        v[nv++] = a;
+    }
+    if (n->fn == FN_COALESCE) return x_unify_all(x, st, v, nv, "COALESCE of", &b->type, &b->scale, e);
+    if (n->fn == FN_NULLIF && nv == 2 && x->xn[v[0]].type == IMDB_T_TIMESTAMP && ts_lit(x, st, v[1], e)) return e->code;
+    for (unsigned i = 0; i < nv; i++) {
+        ta[i] = x->xn[v[i]].type;
+        sa[i] = x->xn[v[i]].scale;
+        kv[i] = st->ex[v[i]].op == EX_LIT ? &x->xn[v[i]].k : NULL;
+    }
+    if (imdb_x_fn_type(n->fn, (uint8_t)nv, ta, sa, kv, &b->type, &b->scale, e)) return e->code;
+    if (n->fn == FN_NULLIF) x_type_null(x, v[1], b->type, b->scale);
+    return IMDB_OK;
+}
+
 static int xbind(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
 {
     const sql_expr *n = &sc->st->ex[k];
@@ -464,10 +585,34 @@ static int xbind(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
         if (b->type != IMDB_T_INT64 && b->type != IMDB_T_DECIMAL && b->type != IMDB_T_FLOAT64)
             return imdb_fail(e, IMDB_ERR_INVALID, "arithmetic takes INT64, DECIMAL and FLOAT64 values");
         return IMDB_OK;
+    case EX_FN: /* P2 S1 */
+    case EX_CASE:
+    case EX_CAST: return xbind_s1(x, sc, k, e);
     case EX_CMP: { /* a BOOL (1c): the operands comparable (two numbers, or one type), never converted */
         b->type = IMDB_T_BOOL;
         if (xbind(x, sc, n->l, e)) return e->code;
         if (n->cmp == CMP_ISNULL || n->cmp == CMP_NOTNULL) return IMDB_OK;
+        if (n->cmp == CMP_IN || n->cmp == CMP_NOTIN) { /* P2 S1: each value comparable with the operand */
+            imdb_xlist it;
+            imdb_xlist_start(&it, sc->st, n->r);
+            for (uint16_t a = imdb_xlist_next(&it); a; a = imdb_xlist_next(&it)) {
+                if (xbind_v(x, sc, a, e)) return e->code;
+                if (x->xn[n->l].type == IMDB_T_TIMESTAMP && ts_lit(x, sc->st, a, e)) return e->code;
+                uint8_t ta = x->xn[n->l].type, tb = x->xn[a].type;
+                if (tb && !imdb_x_comparable(ta, tb))
+                    return imdb_fail(e, IMDB_ERR_INVALID, "IN compares %s with %s: values are not converted",
+                                     imdb_type_name(ta), imdb_type_name(tb));
+                x_type_null(x, a, ta, x->xn[n->l].scale);
+            }
+            return IMDB_OK;
+        }
+        if (n->cmp == CMP_LIKE || n->cmp == CMP_NOTLIKE) { /* P2 S1 */
+            if (xbind(x, sc, n->r, e) || (n->x3 && xbind(x, sc, n->x3, e))) return e->code;
+            if (x->xn[n->l].type != IMDB_T_TEXT || x->xn[n->r].type != IMDB_T_TEXT ||
+                (n->x3 && x->xn[n->x3].type != IMDB_T_TEXT))
+                return imdb_fail(e, IMDB_ERR_INVALID, "LIKE takes TEXT values");
+            return IMDB_OK;
+        }
         uint16_t ops[2] = {n->r, n->x3};
         for (int i = 0; i < (n->cmp == CMP_BETWEEN ? 2 : 1); i++) {
             if (xbind(x, sc, ops[i], e)) return e->code;
@@ -507,7 +652,7 @@ static int bind_const_tree(xctx *x, const sql_stmt *st, uint16_t k, const imdb_c
 {
     xscope sc = {.st = st, .group_col = -1};
     imdb_xval v;
-    if (xnodes(x, st, e) || xbind(x, &sc, k, e) || imdb_x_eval(st, x->xn, k, NULL, NULL, &v, e)) return e->code;
+    if (xnodes(x, st, e) || xbind(x, &sc, k, e) || imdb_x_eval(st, x->xn, k, NULL, NULL, &x->env, &v, e)) return e->code;
     return imdb_x_assign(c, &v, out, e);
 }
 
@@ -705,8 +850,37 @@ typedef struct xacc {
     __int128 sum;            /* INT64, DECIMAL at the argument's scale: checked under 10^38 */
     imdb_fsum fsum;          /* FLOAT64, exact */
     bool has;
-    imdb_xval mn, mx;        /* never a pointer into a row: a tree's TEXT is a literal's or a parameter's */
+    imdb_xval mn, mx;        /* a TEXT extreme points into mnb / mxb, the accumulator's own copy: the row's value, or the
+                              * arena's computed one (P2 S1), may be gone at the next row */
+    uint8_t *mnb, *mxb;
+    uint32_t mncap, mxcap;
 } xacc;
+
+/* P2 S1: a TEXT extreme copied into its own buffer (grown, never shrunk), so no row or arena outlives it */
+static int xacc_own(imdb_xval *x, uint8_t **buf, uint32_t *cap, imdb_err *e)
+{
+    if (x->type != IMDB_T_TEXT || x->null) return IMDB_OK;
+    if (!*buf || x->len > *cap) { /* an empty extreme too: its pointer is never NULL (memcmp, memcpy) */
+        uint32_t nc = x->len > 2 * *cap ? x->len : 2 * *cap;
+        uint8_t *nb = imdb_alloc(nc ? nc : 1, e);
+        if (!nb) return e->code;
+        imdb_free(*buf);
+        *buf = nb;
+        *cap = nc;
+    }
+    if (x->len) memcpy(*buf, x->s, x->len);
+    x->s = *buf;
+    return IMDB_OK;
+}
+
+static void xacc_free(xacc *a)
+{
+    imdb_fsum_free(&a->fsum);
+    imdb_free(a->mnb);
+    imdb_free(a->mxb);
+    a->mnb = a->mxb = NULL;
+    a->mncap = a->mxcap = 0;
+}
 
 static int xacc_add(xacc *a, uint8_t agg, const imdb_xval *v, imdb_err *e)
 {
@@ -724,8 +898,14 @@ static int xacc_add(xacc *a, uint8_t agg, const imdb_xval *v, imdb_err *e)
         if (__builtin_add_overflow(a->sum, v->i, &a->sum) || a->sum >= lim || a->sum <= -lim)
             return imdb_fail(e, IMDB_ERR_LIMIT, agg == AGG_AVG ? "an AVG's sum of more than 38 digits" : "a SUM of more than 38 digits");
     } else if (agg == AGG_MIN || agg == AGG_MAX) {
-        if (!a->has || imdb_x_cmp(v, &a->mn) < 0) a->mn = *v;
-        if (!a->has || imdb_x_cmp(v, &a->mx) > 0) a->mx = *v;
+        if (!a->has || imdb_x_cmp(v, &a->mn) < 0) {
+            a->mn = *v;
+            if (xacc_own(&a->mn, &a->mnb, &a->mncap, e)) return e->code;
+        }
+        if (!a->has || imdb_x_cmp(v, &a->mx) > 0) {
+            a->mx = *v;
+            if (xacc_own(&a->mx, &a->mxb, &a->mxcap, e)) return e->code;
+        }
     }
     a->has = true;
     return IMDB_OK;
@@ -820,12 +1000,14 @@ static inline bool ktick(sink *k, uint64_t n)
 static int xa_row(sink *k, xacc *acc, const imdb_value *vals)
 {
     const sql_stmt *st = k->st;
+    imdb_xmark m = imdb_xarena_mark(&k->x->arena); /* P2 S1: an accumulator keeps no computed TEXT (xacc_own) */
     for (uint16_t s = 0; s < k->nxa; s++) {
         const sql_expr *n = &st->ex[k->xa_node[s]];
         imdb_xval v = {.null = false};
-        if (n->agg != AGG_COUNT_STAR && imdb_x_eval(st, k->x->xn, n->l, vals, NULL, &v, k->e)) return k->e->code;
+        if (n->agg != AGG_COUNT_STAR && imdb_x_eval(st, k->x->xn, n->l, vals, NULL, &k->x->env, &v, k->e)) return k->e->code;
         if (xacc_add(&acc[s], n->agg, &v, k->e)) return k->e->code;
     }
+    imdb_xarena_reset(&k->x->arena, m);
     return IMDB_OK;
 }
 
@@ -847,14 +1029,18 @@ static bool falls_back(const sql_cmp *c, const imdb_column *cd)
  * order, each tree three-valued and left to right (sql_expr.c). A row reaches them only past every bound predicate,
  * on any path, and the tree fixes what is computed, so whether an operation fails (a zero divisor) never depends on
  * the plan. */
-static int resid_ok(const xctx *x, const sql_stmt *st, const uint16_t *ri, uint16_t n, const imdb_value *row, bool *ok,
+static int resid_ok(xctx *x, const sql_stmt *st, const uint16_t *ri, uint16_t n, const imdb_value *row, bool *ok,
                     imdb_err *e)
 {
     *ok = false;
+    imdb_xmark m = imdb_xarena_mark(&x->arena); /* P2 S1: a condition keeps no computed TEXT */
     for (uint16_t i = 0; i < n; i++) {
         imdb_xval v;
-        if (imdb_x_eval(st, x->xn, cmp_root(&st->where[ri[i]]), row, NULL, &v, e)) return e->code;
-        if (!imdb_x_true(&v)) return IMDB_OK;
+        int rc = imdb_x_eval(st, x->xn, cmp_root(&st->where[ri[i]]), row, NULL, &x->env, &v, e);
+        bool t = !rc && imdb_x_true(&v);
+        imdb_xarena_reset(&x->arena, m);
+        if (rc) return rc;
+        if (!t) return IMDB_OK;
     }
     *ok = true;
     return IMDB_OK;
@@ -1041,8 +1227,8 @@ static void sink_free(sink *k)
 {
     for (uint16_t i = 0; i < IMDB_MAX_COLS; i++) imdb_fsum_free(&k->acc[i].fsum);
     for (uint64_t i = 0; k->gacc && k->st && i < k->ngroups * k->st->nitems; i++) imdb_fsum_free(&k->gacc[i].fsum);
-    for (uint16_t s = 0; k->xa && s < k->nxa; s++) imdb_fsum_free(&k->xa[s].fsum); /* xa itself: the statement's */
-    for (uint64_t i = 0; k->gxa && i < k->ngroups * k->nxa; i++) imdb_fsum_free(&k->gxa[i].fsum);
+    for (uint16_t s = 0; k->xa && s < k->nxa; s++) xacc_free(&k->xa[s]); /* xa itself: the statement's */
+    for (uint64_t i = 0; k->gxa && i < k->ngroups * k->nxa; i++) xacc_free(&k->gxa[i]);
     imdb_free(k->vids);
     imdb_free(k->groups);
     imdb_free(k->gacc);
@@ -1707,10 +1893,10 @@ back:
 static int order_key(xctx *x, const sql_stmt *st, const sink *k, uint8_t o, const imdb_value *vals, imdb_xval *out,
                      imdb_err *e)
 {
-    if (!st->ord_pos[o]) return imdb_x_eval(st, x->xn, st->ord_ex[o], vals, NULL, out, e);
+    if (!st->ord_pos[o]) return imdb_x_eval(st, x->xn, st->ord_ex[o], vals, NULL, &x->env, out, e);
     uint16_t p = (uint16_t)(st->ord_pos[o] - 1);
     if (st->star) imdb_x_from_value(&vals[p], out);
-    else if (st->items[p].expr) return imdb_x_eval(st, x->xn, st->items[p].expr, vals, NULL, out, e);
+    else if (st->items[p].expr) return imdb_x_eval(st, x->xn, st->items[p].expr, vals, NULL, &x->env, out, e);
     else imdb_x_from_value(&vals[k->item_col[p]], out);
     return IMDB_OK;
 }
@@ -1919,6 +2105,10 @@ static void res_put_x(imdb_result *r, imdb_cell *c, const imdb_xval *v)
 /* a result column's name: a column's, or a tree item's text (whitespace folded, cut at a character's end) */
 static void item_name(const xctx *x, const sql_item *it, char *out, size_t n)
 {
+    if (it->alias[0]) { /* P2 S1 */
+        snprintf(out, n, "%s", it->alias);
+        return;
+    }
     if (!it->expr) {
         snprintf(out, n, "%s", it->col);
         return;
@@ -1951,6 +2141,7 @@ static int xa_values(sink *k, xacc *acc, imdb_xval *sv, imdb_err *e)
 static int put_row(xctx *x, const sql_stmt *st, const sink *k, const imdb_value *vals, uint16_t nc, imdb_result *r,
                    imdb_err *e)
 {
+    imdb_xmark m = imdb_xarena_mark(&x->arena); /* P2 S1: each value is copied into the result */
     imdb_cell *row = res_row(r, e);
     if (!row) return e->code;
     for (uint16_t c = 0; c < nc; c++) {
@@ -1959,9 +2150,10 @@ static int put_row(xctx *x, const sql_stmt *st, const sink *k, const imdb_value 
             continue;
         }
         imdb_xval v;
-        if (imdb_x_eval(st, x->xn, st->items[c].expr, vals, NULL, &v, e)) return e->code;
+        if (imdb_x_eval(st, x->xn, st->items[c].expr, vals, NULL, &x->env, &v, e)) return e->code;
         res_put_x(r, &row[c], &v);
     }
+    imdb_xarena_reset(&x->arena, m);
     return IMDB_OK;
 }
 
@@ -2087,20 +2279,21 @@ static int materialize(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb
         else if (it->agg == AGG_NONE) snprintf(nm, sizeof nm, "%s", it->col);
         else if (it->agg == AGG_COUNT_STAR) snprintf(nm, sizeof nm, "count");
         else snprintf(nm, sizeof nm, "%s_%s", an[it->agg], it->col);
+        if (it->alias[0]) snprintf(nm, sizeof nm, "%s", it->alias); /* P2 S1 */
         res_name(r, i, nm);
     }
     imdb_xval sv[IMDB_MAX_COLS], v;
     if (k->mode == SINK_AGG) {
         if (xa_values(k, k->xa, sv, e)) return e->code;
         if (st->having) { /* 1e: the one row, kept when its condition is TRUE */
-            if (imdb_x_eval(st, x->xn, st->having, NULL, sv, &v, e)) return e->code;
+            if (imdb_x_eval(st, x->xn, st->having, NULL, sv, &x->env, &v, e)) return e->code;
             if (!imdb_x_true(&v)) return res_finish(r, e);
         }
         imdb_cell *row = res_row(r, e);
         if (!row) return e->code;
         for (uint16_t i = 0; i < st->nitems; i++) {
             if (st->items[i].expr) { /* over the slots: no column outside an aggregate (plan_select) */
-                if (imdb_x_eval(st, x->xn, st->items[i].expr, NULL, sv, &v, e)) return e->code;
+                if (imdb_x_eval(st, x->xn, st->items[i].expr, NULL, sv, &x->env, &v, e)) return e->code;
                 res_put_x(r, &row[i], &v);
                 continue;
             }
@@ -2133,7 +2326,7 @@ static int materialize(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb
         if ((xrc = xa_values(k, k->nxa ? &k->gxa[g * k->nxa] : NULL, sv, e))) break;
         grow[k->gcol] = k->groups[g].key;
         if (st->having) { /* 1e: before the row, so an item's error on a dropped group is never raised */
-            if ((xrc = imdb_x_eval(st, x->xn, st->having, grow, sv, &v, e))) break;
+            if ((xrc = imdb_x_eval(st, x->xn, st->having, grow, sv, &x->env, &v, e))) break;
             if (!imdb_x_true(&v)) continue;
         }
         imdb_cell *row = res_row(r, e);
@@ -2144,10 +2337,10 @@ static int materialize(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb
         uint64_t ri = nr++;
         for (uint16_t i = 0; i < st->nitems && !xrc; i++) {
             if (!st->items[i].expr) continue;
-            if (!(xrc = imdb_x_eval(st, x->xn, st->items[i].expr, grow, sv, &v, e))) res_put_x(r, &row[i], &v);
+            if (!(xrc = imdb_x_eval(st, x->xn, st->items[i].expr, grow, sv, &x->env, &v, e))) res_put_x(r, &row[i], &v);
         }
         for (uint8_t o = 0; o < st->norder && !xrc; o++) /* a key's tree over the group (positional keys: the cells) */
-            if (!st->ord_pos[o]) xrc = imdb_x_eval(st, x->xn, st->ord_ex[o], grow, sv, &keys[ri * st->norder + o], e);
+            if (!st->ord_pos[o]) xrc = imdb_x_eval(st, x->xn, st->ord_ex[o], grow, sv, &x->env, &keys[ri * st->norder + o], e);
         for (uint16_t i = 0; i < st->nitems && !xrc; i++) {
             if (st->items[i].expr) continue;
             int c = k->item_col[i];
@@ -3354,8 +3547,46 @@ static int exec_join(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, im
     return rc;
 }
 
+/* P2 S1: SELECT of expressions alone (no FROM): one row of constants, nothing read */
+static int exec_select_const(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, imdb_err *e)
+{
+    xscope sc = {.st = st, .group_col = -1}; /* .cols false: no column can be read */
+    if (xnodes(x, st, e)) return e->code;
+    for (uint16_t i = 0; i < st->nitems; i++) {
+        const sql_item *it = &st->items[i];
+        if (!it->expr || imdb_sql_has_agg(st, it->expr))
+            return imdb_fail(e, IMDB_ERR_INVALID, "an aggregate or a column needs FROM");
+        if (ex_reads(st, it->expr)) return imdb_fail(e, IMDB_ERR_INVALID, "a column needs FROM");
+        if (xbind_v(x, &sc, it->expr, e)) return e->code;
+        x_type_null(x, it->expr, IMDB_T_TEXT, 0); /* SELECT NULL: a TEXT NULL, as PostgreSQL types an unknown one */
+    }
+    if (xp) {
+        xp_add(xp, "path", "constant");
+        xp_add(xp, "why", "no FROM: the expressions alone, computed once");
+        xp_add(xp, "estimate", "no row read");
+        xp_add(xp, "output", "one row");
+        return IMDB_OK;
+    }
+    if (res_cols(r, st->nitems)) return imdb_fail(e, IMDB_ERR_NOMEM, "a result's columns");
+    imdb_cell *row = NULL;
+    for (uint16_t i = 0; i < st->nitems; i++) {
+        char nm[sizeof r->names[0]];
+        item_name(x, &st->items[i], nm, sizeof nm);
+        res_name(r, i, nm);
+    }
+    if (!(row = res_row(r, e))) return e->code;
+    for (uint16_t i = 0; i < st->nitems; i++) {
+        imdb_xval v;
+        if (imdb_x_eval(st, x->xn, st->items[i].expr, NULL, NULL, &x->env, &v, e)) return e->code;
+        res_put_x(r, &row[i], &v);
+    }
+    snprintf(r->path, sizeof r->path, "constant");
+    return res_finish(r, e);
+}
+
 static int exec_select(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, imdb_err *e)
 {
+    if (st->no_from) return exec_select_const(x, st, r, xp, e); /* P2 S1 */
     if (st->has_join) return exec_join(x, st, r, xp, e);
     imdb_table *t;
     if (read_table(x, st, st->table, &t, e)) return e->code;
@@ -3553,13 +3784,14 @@ static int exec_update(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, 
     int rc = IMDB_OK;
     imdb_value vals[IMDB_MAX_COLS];
     for (uint64_t i = 0; i < n && !rc; i++) {
+        imdb_xmark m = imdb_xarena_mark(&x->arena); /* P2 S1: the row is encoded before the next one */
         if ((rc = xtick(x, 64, e)) || (rc = fetch_row(x, t, vids[i], vals, e))) break; /* a write weighs more than a read */
         for (uint16_t c = 0; c < t->s.ncols && !rc; c++) rc = xpin(x, &vals[c], e);
         for (uint16_t k = 0; k < st->nset && trees && !rc; k++) { /* every tree before any column changes: SET a = b,
                                                                     * b = a swaps them */
             imdb_xval v;
             if (st->set_vals[k].kind != LIT_EXPR) continue;
-            if ((rc = imdb_x_eval(st, x->xn, st->set_vals[k].ex, vals, NULL, &v, e))) break;
+            if ((rc = imdb_x_eval(st, x->xn, st->set_vals[k].ex, vals, NULL, &x->env, &v, e))) break;
             rc = imdb_x_assign(&t->s.cols[cols[k]], &v, &newv[k], e);
         }
         if (rc) break;
@@ -3567,6 +3799,7 @@ static int exec_update(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, 
         uint8_t salt[16];
         if (!rc && !(rc = imdb_salt_next(&x->salts, salt, e))) rc = imdb_update_salt(x->db, t, vids[i], vals, salt, e);
         imdb_wipe(salt, sizeof salt);
+        imdb_xarena_reset(&x->arena, m);
     }
     imdb_free(vids);
     if (!rc) snprintf(r->status, sizeof r->status, "UPDATE %llu", (unsigned long long)n);
@@ -4256,6 +4489,9 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
         return imdb_fail(e, IMDB_ERR_LIMIT, "too many parameters");
     }
     xctx x = {.ss = ss, .db = ss->db, .sql = sql, .params = params, .nparams = nparams, .st = st, .row_limit = ss->row_limit};
+    x.env.check = xenv_check; /* P2 S1 */
+    x.env.ctx = &x;
+    x.env.arena = &x.arena;
     imdb_db *db = ss->db;
     uint64_t seq_before = db->seq;
     if (db->failed) {
