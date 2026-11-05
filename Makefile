@@ -50,7 +50,7 @@ TSRC    = $(wildcard tests/unit/*.c)
 TOBJ    = $(TSRC:tests/unit/%.c=$(BUILD)/tobj/%.o) $(BUILD)/tobj/acrypto.o $(BUILD)/tobj/afsum.o
 TBIN    = $(BUILD)/test_unit
 
-.PHONY: all lint test unit san tsan ct fuzz fuzz-run bench whole index-sum mem-split join-cost clean integration faults soak oracle install uninstall
+.PHONY: all lint test unit san tsan ct fuzz fuzz-run bench whole index-sum mem-split join-cost workload clean integration faults soak oracle install uninstall
 
 AUDIT   = $(BUILD)/imagedb-audit
 ASRC    = tools/audit/audit.c tools/audit/acrypto.c tools/audit/afsum.c
@@ -299,6 +299,13 @@ $(JCOST): bench/join_cost.c $(LIB) $(HDR)
 	$(CC) $(CFLAGS) -Wno-missing-prototypes bench/join_cost.c $(LIB) -o $@ $(LDFLAGS)
 
 join-cost: $(JCOST)
+
+# Q2 (P1): interleaved sessions, a scaling series, the checkpoint's stall (docs/plan-p1.md): build/workload MODE ...
+WORKLOAD = $(BUILD)/workload
+$(WORKLOAD): bench/workload.c $(LIB) $(HDR)
+	$(CC) $(CFLAGS) -Wno-missing-prototypes bench/workload.c $(LIB) -o $@ $(LDFLAGS)
+
+workload: $(WORKLOAD)
 
 # cpu.c and every file its dispatch table names (the C kernels and the references): the two links
 # that list their sources by hand (the tsan pool driver, make ct) take it whole, so a new kernel
