@@ -99,6 +99,8 @@ int imdb_pwrite_all(int fd, const void *p, size_t n, int64_t off, imdb_err *e);
 int imdb_read_all(int fd, void *p, size_t n, size_t *got, imdb_err *e);
 /* Reads a whole regular file (not a symlink, not a device) of at most max bytes. */
 int imdb_read_file_at(int dirfd, const char *name, uint8_t **out, size_t *len, size_t max, imdb_err *e);
+/* Same checked read, directly into the SIMD-aligned allocation owned by a segment image. */
+int imdb_read_file_aligned_at(int dirfd, const char *name, uint8_t **out, size_t *len, size_t max, imdb_err *e);
 /* Atomically replaces dirfd/name with the given bytes. */
 int imdb_write_file_atomic(int dirfd, const char *name, const void *p, size_t n, int mode, imdb_err *e);
 /* Creates dirfd/name exclusively; fails if it exists. */

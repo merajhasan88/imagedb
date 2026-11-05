@@ -2164,7 +2164,11 @@ static int read_obj(int ofd, const uint8_t h[32], const char *ext, uint8_t **out
 {
     char name[80];
     obj_name(h, ext, name);
-    if (imdb_read_file_at(ofd, name, out, len, IMDB_MAX_OBJECT, e)) return e->code;
+    /* A segment parser takes ownership of this buffer. Read directly into its
+     * final aligned allocation, avoiding a second full segment, copy and wipe. */
+    int rc = !strcmp(ext, ".seg") ? imdb_read_file_aligned_at(ofd, name, out, len, IMDB_MAX_OBJECT, e)
+                                 : imdb_read_file_at(ofd, name, out, len, IMDB_MAX_OBJECT, e);
+    if (rc) return rc;
     uint8_t got[32];
     imdb_sha256(*out, *len, got);
     if (memcmp(got, h, 32) != 0) {
@@ -2207,17 +2211,11 @@ static int seg_load_body(imdb_segcache *c, const imdb_table *t, imdb_segment *g,
         return imdb_fail(e, IMDB_ERR_STATE, "lake: a segment's image left memory before its objects were written");
     int ofd = open_objects(c->db, e);
     if (ofd < 0) return e->code;
-    uint8_t *sb = NULL, *al = NULL;
+    uint8_t *sb = NULL;
     size_t sl = 0;
     imdb_segment *tmp = NULL;
     int rc = read_obj(ofd, g->hash, ".seg", &sb, &sl, e);
-    if (!rc && !(al = imdb_alloc_aligned(1, sl, e))) rc = e->code;
-    if (!rc) memcpy(al, sb, sl);
-    if (sb) {
-        imdb_wipe(sb, sl);
-        imdb_free(sb);
-    }
-    if (!rc && (rc = imdb_segment_parse(&t->s, al, sl, g->hash, &tmp, e))) imdb_free(al); /* read_obj checked it */
+    if (!rc && (rc = imdb_segment_parse(&t->s, sb, sl, g->hash, &tmp, e))) imdb_free(sb); /* read_obj checked it */
     if (!rc && (tmp->nrows != g->nrows || tmp->table != g->table || tmp->vid_first != g->vid_first ||
                 tmp->vid_last != g->vid_last))
         rc = imdb_fail(e, IMDB_ERR_STATE, "lake: a segment read again differs from its descriptor");
@@ -2519,17 +2517,9 @@ static int load_table(imdb_db *db, int ofd, const imdb_manifest_tab *mt, uint32_
         uint8_t *sb;
         size_t sl;
         if (read_obj(ofd, mt->seg[k].seg, ".seg", &sb, &sl, e)) return e->code;
-        uint8_t *al = imdb_alloc_aligned(1, sl, e);
-        if (!al) {
-            imdb_free(sb);
-            return e->code;
-        }
-        memcpy(al, sb, sl);
-        imdb_wipe(sb, sl);
-        imdb_free(sb);
         imdb_segment *g;
-        if (imdb_segment_parse(&t->s, al, sl, mt->seg[k].seg, &g, e)) { /* read_obj checked the name */
-            imdb_free(al);
+        if (imdb_segment_parse(&t->s, sb, sl, mt->seg[k].seg, &g, e)) { /* read_obj checked the name */
+            imdb_free(sb);
             return e->code;
         }
         g->pos = t->nseg; /* its place in the list (plan_install keeps it) */

@@ -142,6 +142,7 @@ typedef struct xctx {
     uint32_t nparams;
     void **allocs;
     uint32_t nallocs, capallocs;
+    imdb_buf row_text; /* reusable copies of one UPDATE/upsert row's TEXT, stable through its write */
     imdb_salts salts; /* the statement's (db.h): wiped by xfree, the one exit */
     imdb_xnode *xn;   /* the statement's trees bound (xbind), parallel to st->ex; NULL until one is */
     const sql_stmt *st;
@@ -251,6 +252,7 @@ static void xfree(xctx *x)
     for (uint8_t i = 0; i < x->nown; i++) imdb_result_free(&x->own[i].r); /* P2 S4: before the allocations they sit in */
     for (uint32_t i = 0; i < x->nallocs; i++) imdb_free(x->allocs[i]);
     imdb_free(x->allocs);
+    imdb_buf_wipe_free(&x->row_text);
     imdb_salts_wipe(&x->salts);
     imdb_xarena_free(&x->arena); /* P2 S1 */
 }
@@ -267,6 +269,27 @@ static int xpin(xctx *x, imdb_value *v, imdb_err *e)
 }
 
 /* ---- binding literals ----------------------------------------------------------- */
+
+/* A write encodes its row before the next one. Keep just that row's TEXT copies,
+ * rather than retaining every old TEXT in x->allocs until the statement ends.
+ * Reserve once before assigning pointers: growth must not invalidate an earlier column. */
+static int xpin_row(xctx *x, imdb_value *v, uint16_t n, imdb_err *e)
+{
+    imdb_buf *b = &x->row_text;
+    size_t total = 0;
+    for (uint16_t c = 0; c < n; c++)
+        if (v[c].type == IMDB_T_TEXT && !v[c].null && imdb_add_ovf(total, v[c].len, &total))
+            return imdb_fail(e, IMDB_ERR_LIMIT, "row TEXT size overflow");
+    b->len = 0;
+    if (!imdb_buf_reserve(b, total)) return imdb_buf_check(b, e);
+    for (uint16_t c = 0; c < n; c++) {
+        if (v[c].type != IMDB_T_TEXT || v[c].null || !v[c].len) continue;
+        memcpy(b->p + b->len, v[c].s, v[c].len);
+        v[c].s = b->p + b->len;
+        b->len += v[c].len;
+    }
+    return IMDB_OK;
+}
 
 static int bind_const_tree(xctx *x, const sql_stmt *st, uint16_t k, const imdb_column *c, imdb_value *out, imdb_err *e);
 
@@ -743,12 +766,20 @@ static int bind_outer(xctx *x, const xscope *sc, uint16_t k, imdb_err *e)
 {
     int rc = e->code;
     if (rc != IMDB_ERR_NOTFOUND || !x->up) return rc;
+    const sql_expr *n = &sc->st->ex[k];
+    /* A qualified local name hides the outer range variable as a whole. A missing
+     * column of that local table is an error, not permission to search outside. */
+    if (n->qual[0]) {
+        const sql_stmt *st = sc->st;
+        if (sc->jt && (!strcmp(n->qual, st->alias[0] ? st->alias : st->table) ||
+                       !strcmp(n->qual, st->alias2[0] ? st->alias2 : st->table2))) return rc;
+        if (!sc->jt && sc->t && !strcmp(n->qual, st->alias[0] ? st->alias : sc->t->s.name)) return rc;
+    }
     if (!x->upscope) {
         x->deferred = true;
         return rc;
     }
     const xscope *os = x->upscope;
-    const sql_expr *n = &sc->st->ex[k];
     imdb_err e2 = {0};
     int c = -1, side = 0;
     if (os->jt) {
@@ -1206,6 +1237,7 @@ static bool corr_pred(xctx *x, const sql_stmt *st, uint16_t i, qspec *q)
         op = FLIP[op];
         if (ci < 0) return false;
     }
+    if (out->qual[0] && !strcmp(out->qual, st->alias[0] ? st->alias : q->t->s.name)) return false;
     const xscope *os = x->upscope;
     int c = -1, side = 0;
     if (os->jt) {
@@ -5462,6 +5494,10 @@ static int win_compute(xctx *x, const sql_stmt *st, const witem *v, const imdb_r
                         added = fs;
                     }
                     for (; !rc && added <= fe; added++) {
+                        /* A moving frame can visit millions of values between two
+                         * output rows. Charge this work to cancellation too; the
+                         * plan-independent rows_tested contract stays unchanged. */
+                        if ((rc = xtick(x, 1, e))) break;
                         if (v->vcol != UINT16_MAX) rval(R, srt[added], v->vcol, &a);
                         rc = xacc_add(&acc, n->agg, &a, e);
                     }
@@ -5887,7 +5923,7 @@ static int exec_update(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, 
     for (uint64_t i = 0; i < n && !rc; i++) {
         imdb_xmark m = imdb_xarena_mark(&x->arena); /* P2 S1: the row is encoded before the next one */
         if ((rc = xtick(x, 64, e)) || (rc = fetch_row(x, t, vids[i], vals, e))) break; /* a write weighs more than a read */
-        for (uint16_t c = 0; c < t->s.ncols && !rc; c++) rc = xpin(x, &vals[c], e);
+        rc = xpin_row(x, vals, t->s.ncols, e);
         for (uint16_t k = 0; k < st->nset && trees && !rc; k++) { /* every tree before any column changes: SET a = b,
                                                                     * b = a swaps them */
             imdb_xval v;

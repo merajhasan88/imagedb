@@ -82,6 +82,8 @@ int main(int argc, char **argv)
         {"txn", txn_tests, &txn_ntests},
         {"review", review_tests, &review_ntests},
         {"review26", review26_tests, &review26_ntests},
+        {"reviewmem", reviewmem_tests, &reviewmem_ntests},
+        {"review1105", review1105_tests, &review1105_ntests},
         {"fault", fault_tests, &fault_ntests},
         {"repl", repl_tests, &repl_ntests},
         {"writer", writer_tests, &writer_ntests},

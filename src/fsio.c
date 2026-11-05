@@ -324,7 +324,7 @@ int imdb_read_all(int fd, void *p, size_t n, size_t *got, imdb_err *e)
     return IMDB_OK;
 }
 
-int imdb_read_file_at(int dirfd, const char *name, uint8_t **out, size_t *len, size_t max, imdb_err *e)
+static int read_file_at(int dirfd, const char *name, uint8_t **out, size_t *len, size_t max, bool aligned, imdb_err *e)
 {
     *out = NULL;
     *len = 0;
@@ -348,7 +348,7 @@ int imdb_read_file_at(int dirfd, const char *name, uint8_t **out, size_t *len, s
         return imdb_fail(e, IMDB_ERR_LIMIT, "%s: file larger than %zu bytes", name, max);
     }
     size_t n = (size_t)st.st_size;
-    uint8_t *buf = imdb_alloc(n ? n : 1, e);
+    uint8_t *buf = aligned ? imdb_alloc_aligned(1, n ? n : 1, e) : imdb_alloc(n ? n : 1, e);
     if (!buf) {
         close(fd);
         return e->code;
@@ -363,6 +363,16 @@ int imdb_read_file_at(int dirfd, const char *name, uint8_t **out, size_t *len, s
     *out = buf;
     *len = got; /* a concurrently growing file is read up to its size at fstat */
     return IMDB_OK;
+}
+
+int imdb_read_file_at(int dirfd, const char *name, uint8_t **out, size_t *len, size_t max, imdb_err *e)
+{
+    return read_file_at(dirfd, name, out, len, max, false, e);
+}
+
+int imdb_read_file_aligned_at(int dirfd, const char *name, uint8_t **out, size_t *len, size_t max, imdb_err *e)
+{
+    return read_file_at(dirfd, name, out, len, max, true, e);
 }
 
 int imdb_sync_dir(int dirfd, imdb_err *e)

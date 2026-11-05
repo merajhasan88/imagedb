@@ -967,9 +967,12 @@ int imdb_backup_verify(const char *scratch, const uint8_t key[IMDB_BACKUP_KEY_LE
     imdb_hex(rnd, sizeof rnd, hex);
     snprintf(name, sizeof name, "imagedb-verify-%s", hex);
     snprintf(tname, sizeof tname, "%s.tmp", name);
-    if (strlen(scratch) + 1 + strlen(name) + 5 > sizeof path)
+    size_t sn = strlen(scratch), nn = strlen(name);
+    if (sn > sizeof path - nn - 6) /* slash, NUL and room for restore's .tmp */
         return imdb_fail(e, IMDB_ERR_INVALID, "backup-verify: the scratch path is too long");
-    snprintf(path, sizeof path, "%s/%s", scratch, name);
+    memcpy(path, scratch, sn);
+    path[sn] = '/';
+    memcpy(path + sn + 1, name, nn + 1);
     int rc = imdb_restore(path, key, files, nfiles, info, e);
     if (!rc) {
         imdb_db *db = NULL;
