@@ -925,7 +925,9 @@ static void t_retain_retire_chunks(void)
     imdb_session s;
     imdb_session_init(&s, db);
     db->no_auto_retire = true;
-    OK(ex(&s, "CREATE TABLE a (id INT64 PRIMARY KEY, v INT64) RETENTION 10 SECONDS"));
+    /* an hour, the clock moved two: 70,000 rows and two CHECKPOINTs take about 11 s in the SAN build without SIMD on one
+     * thread, past a 10 s window on the real clock before the test moved it (S9's chain, 2026-11-05) */
+    OK(ex(&s, "CREATE TABLE a (id INT64 PRIMARY KEY, v INT64) RETENTION 1 HOUR"));
     char *q = malloc(32 * 1000 + 64);
     CHECK(q != NULL);
     if (!q) return;
@@ -942,7 +944,7 @@ static void t_retain_retire_chunks(void)
     uint64_t s2 = db->seq + 1;
     OK(ex(&s, "INSERT INTO a VALUES (100000, 1)"));
     OK(ex(&s, "CHECKPOINT"));
-    imdb_clock_offset(15 * SEC_US);
+    imdb_clock_offset(2 * 3600 * SEC_US);
     OK(ex(&s, "SELECT COUNT(*) FROM a"));
     imdb_table *t = imdb_table_by_name(db, "a");
     CHECK(t->horizon == s2 && t->nchunk == 2 && t->ch[0] && t->ch[1]);
