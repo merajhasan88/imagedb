@@ -130,6 +130,8 @@ typedef struct xrset { /* P2 S4: a nested SELECT's rows, read as a table by its 
     char name[IMDB_MAX_IDENT + 1];
     imdb_table *t; /* its pseudo table: a schema alone */
     imdb_result r;
+    bool deferred; /* P2 S4b: an expression's, which read a column of its enclosing statement before that one had
+                    * bound: decided at the bind (bind_corr), then computed per row */
 } xrset;
 
 typedef struct xctx {
@@ -156,6 +158,22 @@ typedef struct xctx {
     const xrset *vis[IMDB_MAX_SUBQUERIES * IMDB_MAX_SUBQUERY_DEPTH]; /* the row sets it reads by name: its own and
                                                                      * an outer statement's */
     uint8_t nvis;
+    /* P2 S4b: correlated subqueries. A nested SELECT of an expression runs with up, the statement directly around it;
+     * upscope, the scope that statement bound the expression in (NULL during its rset_prepare, which runs this one
+     * first: a name not found then defers it); upv, the row of it this run computes for (NULL in the bind-only
+     * pass: its columns are typed NULLs). A derived table or a CTE has no up (LATERAL is a later step). */
+    const struct xctx *up;
+    const struct xscope *upscope;
+    const imdb_value *upv;
+    bool deferred;                /* a name was not found while upscope was NULL */
+    bool probe;                   /* the bind-only pass: binds, types the result, runs nothing */
+    bool asp[IMDB_MAX_PREDICATES]; /* WHERE's conjuncts made plain predicates from a value around it (corr_pred) */
+    bool corr_rowonly;            /* a correlated subquery stands outside an aggregate in the SELECT list or ORDER
+                                   * BY: it needs each row, so the statement must return plain rows */
+    uint16_t noref;               /* the enclosing row's columns this run read, in order of first use */
+    uint16_t oref[2 * IMDB_MAX_COLS];
+    struct xcorr *corr;           /* this statement's correlated subqueries, one per nested SELECT (NULL: none) */
+    imdb_result *probe_r;         /* the bind-only pass's result: its columns typed, no row (probe_types) */
 } xctx;
 
 enum { TICK_ROWS = 4096 }; /* rows between two looks at the clock and the cancel flag: tens of microseconds of work */
@@ -188,6 +206,8 @@ static int xenv_check(void *ctx, imdb_err *e)
 {
     return xcheck((xctx *)ctx, e);
 }
+
+static int xenv_subq(void *ctx, uint16_t k, const imdb_value *row, imdb_xval *out, const imdb_xset **set, imdb_err *e);
 
 /* D8 #4, the work limit: n more rows tested, each a row reaching a table's sink (visible, past every bound predicate,
  * before WHERE's trees), a pair a join forms (both sides past their predicates, or a LEFT row without a match), or a
@@ -223,8 +243,11 @@ static void *xalloc(xctx *x, size_t n, imdb_err *e)
     return p;
 }
 
+static void corr_free(xctx *x);
+
 static void xfree(xctx *x)
 {
+    corr_free(x); /* P2 S4b: the memos, before the block they sit in */
     for (uint8_t i = 0; i < x->nown; i++) imdb_result_free(&x->own[i].r); /* P2 S4: before the allocations they sit in */
     for (uint32_t i = 0; i < x->nallocs; i++) imdb_free(x->allocs[i]);
     imdb_free(x->allocs);
@@ -337,7 +360,34 @@ typedef struct xscope {
                               * group from its slot (IMDB_X_GSLOT0 + j) */
     const uint16_t *gk;
     uint8_t in_key;          /* inside such a subtree: its columns stand */
+    bool no_corr;            /* P2 S4b: a correlated subquery is refused here (UPDATE's SET: computed among the writes) */
 } xscope;
+
+/* P2 S4b: a correlated subquery of a statement: what its bind-only pass found (the enclosing row's columns it reads,
+ * its result's one column), the scope it was bound in (the row's layout when it is computed), and its memo: one answer
+ * per distinct tuple of those columns' values, for the statement's run */
+typedef struct xcorr {
+    bool bound;                   /* its bind-only pass ran (cross_check's second plan binds again: reused) */
+    uint8_t ctype, cscale;        /* a value's or IN's column */
+    uint16_t ncols;               /* its result's columns (one, but for EXISTS) */
+    uint16_t noref;
+    uint16_t oref[2 * IMDB_MAX_COLS]; /* the enclosing row's columns it reads: the memo's key */
+    xscope scope;
+    imdb_hmap memo;               /* the encoded tuple -> EXISTS' 0 or 1, or a pointer to the statement's copy of a
+                                   * value (imdb_xval) or of IN's set (imdb_xset) */
+    imdb_buf kenc;
+} xcorr;
+
+enum { NEST_TABLE, NEST_FIRST, NEST_PROBE, NEST_ROW }; /* P2 S4b: run_nested's runs */
+
+static void corr_free(xctx *x)
+{
+    for (uint8_t i = 0; x->corr && x->st && i < x->st->nsub; i++)
+        if (x->corr[i].bound) {
+            imdb_hmap_free(&x->corr[i].memo);
+            imdb_buf_free(&x->corr[i].kenc);
+        }
+}
 
 static int one_col(const sql_stmt *st, const imdb_table *t, const char *qual, const char *name, imdb_err *e);
 static int join_col(const sql_stmt *st, imdb_table *const t[2], const char *qual, const char *name, int *side, int *col,
@@ -567,11 +617,62 @@ static const imdb_result *sub_result(const xctx *x, uint8_t k, imdb_err *e)
 
 static int cmp_xval(const void *a, const void *b) { return imdb_x_cmp(a, b); }
 
+static struct xplain *xp_scratch(imdb_err *e); /* P2 S4b: the bind-only pass's collector, its rows discarded */
+static int run_nested(xctx *x, const sql_stmt *in, imdb_result *r, uint8_t mode, const xscope *sc, const imdb_value *upv,
+                      xcorr *cr, bool *deferred, imdb_err *e);
+
+/* P2 S4b: a deferred subquery (rset_prepare: it read a column of this statement before this statement had bound), now
+ * that the scope it stands in is known: its bind-only pass resolves every name or fails as it always would (no data
+ * decides), types its result and records the columns of this statement's row it reads; from then on it is computed
+ * per row (xenv_subq). Where no row is there to compute it on it is refused: UPDATE's SET (computed among the writes,
+ * it would read the statement's own); outside an aggregate in a SELECT list, ORDER BY or HAVING the statement must
+ * return plain rows (corr_rowonly, checked where the sink's mode is known) */
+static int bind_corr(xctx *x, const xscope *sc, uint8_t sub, xcorr **out, imdb_err *e)
+{
+    if (sc->no_corr)
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED,
+                         "a correlated subquery in UPDATE's SET: a later step (computed among the writes, it would read them)");
+    if (sc->aggs && !sc->in_agg) x->corr_rowonly = true;
+    if (!x->corr && !(x->corr = xalloc(x, (size_t)sc->st->nsub * sizeof *x->corr, e))) return e->code;
+    xcorr *c = &x->corr[sub];
+    if (!c->bound) {
+        imdb_result r;
+        imdb_result_init(&r);
+        int rc = run_nested(x, sc->st->sub[sub], &r, NEST_PROBE, sc, NULL, c, NULL, e);
+        c->ncols = r.ncols;
+        c->ctype = r.ctype[0];
+        c->cscale = r.cscale[0];
+        imdb_result_free(&r);
+        if (rc) return rc;
+        c->scope = *sc;
+        if (imdb_hmap_init(&c->memo, IMDB_T_TEXT, e)) return e->code;
+        imdb_buf_init(&c->kenc);
+        c->bound = true;
+    }
+    *out = c;
+    return IMDB_OK;
+}
+
 /* x [NOT] IN (SELECT ...): one column, comparable with x; its values sorted (TEXT pointing into the result, which
  * lives as long as the statement) */
-static int bind_inset(xctx *x, const sql_stmt *st, uint16_t k, imdb_err *e)
+static int bind_inset(xctx *x, const xscope *sc, uint16_t k, imdb_err *e)
 {
+    const sql_stmt *st = sc->st;
     const sql_expr *n = &st->ex[k], *q = &st->ex[n->r];
+    if (q->sub < x->nown && x->own[q->sub].deferred) { /* P2 S4b: correlated: its set on each row (xenv_subq) */
+        xcorr *c;
+        if (bind_corr(x, sc, q->sub, &c, e)) return e->code;
+        if (c->ncols != 1) return imdb_fail(e, IMDB_ERR_INVALID, "IN (SELECT ...) takes one column");
+        uint8_t ta = x->xn[n->l].type;
+        if (!ta) return imdb_fail(e, IMDB_ERR_INVALID, "NULL cannot be an operand: the result would always be unknown (use IS NULL)");
+        if (!imdb_x_comparable(ta, c->ctype))
+            return imdb_fail(e, IMDB_ERR_INVALID, "IN compares %s with %s: values are not converted", imdb_type_name(ta),
+                             imdb_type_name(c->ctype));
+        x->xn[n->r].corr = 1;
+        x->xn[n->r].type = c->ctype;
+        x->xn[n->r].scale = c->cscale;
+        return IMDB_OK;
+    }
     const imdb_result *r = sub_result(x, q->sub, e);
     if (!r) return e->code;
     if (r->ncols != 1) return imdb_fail(e, IMDB_ERR_INVALID, "IN (SELECT ...) takes one column");
@@ -596,10 +697,25 @@ static int bind_inset(xctx *x, const sql_stmt *st, uint16_t k, imdb_err *e)
 }
 
 /* a subquery as a value (one column, at most one row: none is NULL) or EXISTS (a BOOL), a constant */
-static int bind_subq(xctx *x, const sql_stmt *st, uint16_t k, imdb_err *e)
+static int bind_subq(xctx *x, const xscope *sc, uint16_t k, imdb_err *e)
 {
+    const sql_stmt *st = sc->st;
     const sql_expr *n = &st->ex[k];
     imdb_xnode *b = &x->xn[k];
+    if (n->sub < x->nown && x->own[n->sub].deferred) { /* P2 S4b: correlated: computed on each row (xenv_subq) */
+        xcorr *c;
+        if (bind_corr(x, sc, n->sub, &c, e)) return e->code;
+        b->corr = 1;
+        if (n->subk == 1) {
+            b->type = IMDB_T_BOOL;
+            return IMDB_OK;
+        }
+        if (n->subk != 0) return imdb_fail(e, IMDB_ERR_STATE, "IN's subquery read outside IN");
+        if (c->ncols != 1) return imdb_fail(e, IMDB_ERR_INVALID, "a subquery as a value returns one column");
+        b->type = c->ctype;
+        b->scale = c->cscale;
+        return IMDB_OK;
+    }
     const imdb_result *r = sub_result(x, n->sub, e);
     if (!r) return e->code;
     if (n->subk == 1) {
@@ -617,6 +733,58 @@ static int bind_subq(xctx *x, const sql_stmt *st, uint16_t k, imdb_err *e)
     return IMDB_OK;
 }
 
+/* P2 S4b: a column the statement's own tables do not have, looked up in the statement directly around it (a
+ * correlated subquery's outer reference): found, it is a constant for this run, the enclosing row's value (a typed
+ * NULL in the bind-only pass), and its column joins the run's oref, the memo's key. Before the enclosing statement
+ * has bound (its rset_prepare runs this one first) the run is deferred, the error standing until bind_corr decides
+ * it; a name that scope does not have either keeps the statement's own error (a table two levels out is a later
+ * step: nested_unresolved says so). Binding is the same on every run, so what it decides never depends on data. */
+static int bind_outer(xctx *x, const xscope *sc, uint16_t k, imdb_err *e)
+{
+    int rc = e->code;
+    if (rc != IMDB_ERR_NOTFOUND || !x->up) return rc;
+    if (!x->upscope) {
+        x->deferred = true;
+        return rc;
+    }
+    const xscope *os = x->upscope;
+    const sql_expr *n = &sc->st->ex[k];
+    imdb_err e2 = {0};
+    int c = -1, side = 0;
+    if (os->jt) {
+        if (join_col(os->st, os->jt, n->qual, n->col, &side, &c, &e2)) c = -1;
+        else c = side ? os->nc0 + c : c;
+    } else if (os->t && os->cols) {
+        c = one_col(os->st, os->t, n->qual, n->col, &e2);
+    }
+    if (c < 0) {
+        /* the qualifier names a table there: its error (no such column) is the one to give */
+        const sql_stmt *o = os->st;
+        bool named = n->qual[0] && (os->jt ? !strcmp(n->qual, o->alias[0] ? o->alias : o->table) ||
+                                                 !strcmp(n->qual, o->alias2[0] ? o->alias2 : o->table2)
+                                           : !strcmp(n->qual, o->alias[0] ? o->alias : os->t->s.name));
+        if (!e2.code || (e2.code == IMDB_ERR_NOTFOUND && !named)) return rc;
+        imdb_err_clear(e); /* there, but ambiguous there: that scope's own error */
+        return imdb_fail(e, e2.code, "%s", e2.msg);
+    }
+    imdb_err_clear(e);
+    imdb_xnode *b = &x->xn[k];
+    b->outer = 1;
+    b->col = -1;
+    b->type = os->s->cols[c].type;
+    b->scale = os->s->cols[c].scale;
+    if (x->upv) imdb_x_from_value(&x->upv[c], &b->k);
+    else b->k = (imdb_xval){.type = b->type, .scale = b->scale, .null = true};
+    uint16_t i = 0;
+    while (i < x->noref && x->oref[i] != c) i++;
+    if (i == x->noref) {
+        if (x->noref >= sizeof x->oref / sizeof *x->oref)
+            return imdb_fail(e, IMDB_ERR_LIMIT, "a nested SELECT reads more than %u columns around it", 2 * IMDB_MAX_COLS);
+        x->oref[x->noref++] = (uint16_t)c;
+    }
+    return IMDB_OK;
+}
+
 static int xbind_node(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
 {
     const sql_expr *n = &sc->st->ex[k];
@@ -631,10 +799,10 @@ static int xbind_node(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
         if (!sc->cols) return imdb_fail(e, IMDB_ERR_INVALID, "column %s cannot be read here: VALUES takes constants", n->col);
         int c, side;
         if (sc->jt) {
-            if (join_col(sc->st, sc->jt, n->qual, n->col, &side, &c, e)) return e->code;
+            if (join_col(sc->st, sc->jt, n->qual, n->col, &side, &c, e)) return bind_outer(x, sc, k, e); /* P2 S4b */
             c = side ? sc->nc0 + c : c;
         } else if ((c = one_col(sc->st, sc->t, n->qual, n->col, e)) < 0) {
-            return c;
+            return bind_outer(x, sc, k, e); /* P2 S4b: a column of the statement around this one, or the error */
         }
         if (sc->group_col >= 0 && !sc->in_agg && c != sc->group_col)
             return imdb_fail(e, IMDB_ERR_INVALID, "column %s must be the GROUP BY column or inside an aggregate", n->col);
@@ -690,7 +858,7 @@ static int xbind_node(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
         if (b->type != IMDB_T_INT64 && b->type != IMDB_T_DECIMAL && b->type != IMDB_T_FLOAT64)
             return imdb_fail(e, IMDB_ERR_INVALID, "arithmetic takes INT64, DECIMAL and FLOAT64 values");
         return IMDB_OK;
-    case EX_SUBQ: return bind_subq(x, sc->st, k, e); /* P2 S4 */
+    case EX_SUBQ: return bind_subq(x, sc, k, e); /* P2 S4 */
     case EX_FN: /* P2 S1 */
     case EX_CASE:
     case EX_CAST: return xbind_s1(x, sc, k, e);
@@ -698,7 +866,7 @@ static int xbind_node(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
         b->type = IMDB_T_BOOL;
         if (xbind(x, sc, n->l, e)) return e->code;
         if (n->cmp == CMP_ISNULL || n->cmp == CMP_NOTNULL) return IMDB_OK;
-        if ((n->cmp == CMP_IN || n->cmp == CMP_NOTIN) && sc->st->ex[n->r].op == EX_SUBQ) return bind_inset(x, sc->st, k, e);
+        if ((n->cmp == CMP_IN || n->cmp == CMP_NOTIN) && sc->st->ex[n->r].op == EX_SUBQ) return bind_inset(x, sc, k, e);
         if (n->cmp == CMP_IN || n->cmp == CMP_NOTIN) { /* P2 S1: each value comparable with the operand */
             imdb_xlist it;
             imdb_xlist_start(&it, sc->st, n->r);
@@ -941,12 +1109,84 @@ static int bind_pred(xctx *x, const sql_cmp *c, int col, bool post, qspec *q, im
 
 static bool falls_back(const sql_cmp *c, const imdb_column *cd);
 
+/* P2 S4b: a WHERE conjunct `inner op outer` (two columns: one of this statement's table, one of the statement around
+ * it) on a run for a row, whose value is then known: a plain predicate, so the run takes the primary key, the subject
+ * or an index as it would for a literal (each run of a correlated subquery a lookup, not a scan). Only where the two
+ * types are one (a DECIMAL at one scale) and the comparison is plain; anything else stays a residual, as the
+ * bind-only pass leaves every one (its binding records the outer column, the memo's key, and decides every error). */
+static bool corr_pred(xctx *x, const sql_stmt *st, uint16_t i, qspec *q)
+{
+    static const uint8_t FLIP[] = {0, CMP_EQ, CMP_NE, CMP_GT, CMP_GE, CMP_LT, CMP_LE}; /* a op b is b FLIP[op] a */
+    const sql_expr *n = &st->ex[st->where[i].lx];
+    if (n->op != EX_CMP || n->cmp < CMP_EQ || n->cmp > CMP_GE || !n->l || !n->r) return false;
+    const sql_expr *in = &st->ex[n->l], *out = &st->ex[n->r];
+    if (in->op != EX_COL || out->op != EX_COL) return false;
+    uint8_t op = n->cmp;
+    imdb_err e2 = {0};
+    int ci = one_col(st, q->t, in->qual, in->col, &e2), co = one_col(st, q->t, out->qual, out->col, &e2);
+    if (ci >= 0 && co >= 0) return false; /* both this table's */
+    if (ci < 0) {                         /* the column of this table on the right */
+        const sql_expr *s = in;
+        in = out;
+        out = s;
+        ci = co;
+        op = FLIP[op];
+        if (ci < 0) return false;
+    }
+    const xscope *os = x->upscope;
+    int c = -1, side = 0;
+    if (os->jt) {
+        if (join_col(os->st, os->jt, out->qual, out->col, &side, &c, &e2)) return false;
+        c = side ? os->nc0 + c : c;
+    } else if (!os->t || !os->cols || (c = one_col(os->st, os->t, out->qual, out->col, &e2)) < 0) {
+        return false;
+    }
+    const imdb_column *cd = &q->t->s.cols[ci], *od = &os->s->cols[c];
+    if (od->type != cd->type || (cd->type == IMDB_T_DECIMAL && od->scale != cd->scale)) return false;
+    if (cd->type == IMDB_T_BOOL && op != CMP_EQ && op != CMP_NE) return false;
+    if (q->np >= IMDB_MAX_PREDICATES) return false;
+    x->asp[i] = true;
+    const imdb_value *v = &x->upv[c];
+    if (v->null) { /* a comparison with NULL: UNKNOWN on every row */
+        q->never = true;
+        return true;
+    }
+    bpred *b = &q->p[q->np++];
+    memset(b, 0, sizeof *b);
+    b->col = (uint16_t)ci;
+    b->type = cd->type;
+    b->op = op;
+    b->a = *v;
+    if (cd->type != IMDB_T_TEXT) {
+        b->lo = INT64_MIN;
+        b->hi = INT64_MAX;
+        switch (op) {
+        case CMP_EQ: b->lo = b->hi = v->i; break;
+        case CMP_NE: b->lo = b->hi = v->i; b->neg = true; break;
+        case CMP_LT: if (v->i == INT64_MIN) q->never = true; else b->hi = v->i - 1; break;
+        case CMP_LE: b->hi = v->i; break;
+        case CMP_GT: if (v->i == INT64_MAX) q->never = true; else b->lo = v->i + 1; break;
+        case CMP_GE: b->lo = v->i; break;
+        }
+    }
+    if (op == CMP_EQ && ci == q->t->s.pk && q->pk_pred < 0) q->pk_pred = q->np - 1;
+    if (op == CMP_EQ && ci == q->t->s.subject && q->subj_pred < 0) q->subj_pred = q->np - 1;
+    return true;
+}
+
 static int bind_preds(xctx *x, const sql_stmt *st, qspec *q, imdb_err *e)
 {
     q->pk_pred = q->subj_pred = q->ord_pred = -1;
     for (uint16_t i = 0; i < st->nwhere; i++) {
+        if (st->where[i].lx && x->upv && corr_pred(x, st, i, q)) continue; /* P2 S4b: inner op outer, on a run for a row */
         if (st->where[i].lx) continue; /* a tree's: the sink's (bind_resid) */
         int col = one_col(st, q->t, st->where[i].qual, st->where[i].col, e);
+        if (col == IMDB_ERR_NOTFOUND && x->up && st->where[i].nl) { /* P2 S4b: perhaps a column around it: a residual
+                                                                    * through its comparison node (bind_outer decides) */
+            x->fb[i] = true;
+            imdb_err_clear(e);
+            continue;
+        }
         if (col < 0) return col;
         uint16_t np = q->np;
         if (bind_pred(x, &st->where[i], col, false, q, e)) {
@@ -1259,6 +1499,7 @@ static int bind_resid(xctx *x, xscope *sc, uint16_t *out, uint16_t *n, imdb_err 
     for (uint16_t i = 0; i < st->nwhere; i++) {
         const sql_cmp *c = &st->where[i];
         if (!c->lx && !x->fb[i]) continue;
+        if (x->asp[i]) continue; /* P2 S4b: made a plain predicate (corr_pred) */
         uint16_t k = cmp_root(c);
         if (xnodes(x, st, e) || xbind(x, sc, k, e)) return e->code;
         if (x->xn[k].type != IMDB_T_BOOL)
@@ -1269,14 +1510,19 @@ static int bind_resid(xctx *x, xscope *sc, uint16_t *out, uint16_t *n, imdb_err 
 }
 
 /* the columns a tree reads, marked in use[c - off] for c in [off, off + n) */
-static void x_cols(const sql_stmt *st, const imdb_xnode *xn, uint16_t k, bool *use, int off, int n)
+static void x_cols(const sql_stmt *st, const xctx *xc, uint16_t k, bool *use, int off, int n)
 {
     if (!k) return;
     const sql_expr *x = &st->ex[k];
-    if (x->op == EX_COL && xn[k].col >= off && xn[k].col < off + n) use[xn[k].col - off] = true;
-    x_cols(st, xn, x->l, use, off, n); /* height-bounded */
-    x_cols(st, xn, x->r, use, off, n);
-    x_cols(st, xn, x->x3, use, off, n);
+    if (x->op == EX_COL && xc->xn[k].col >= off && xc->xn[k].col < off + n) use[xc->xn[k].col - off] = true;
+    if (x->op == EX_SUBQ && xc->xn[k].corr && xc->corr) { /* P2 S4b: the columns of this row it reads */
+        const xcorr *c = &xc->corr[x->sub];
+        for (uint16_t i = 0; i < c->noref; i++)
+            if (c->oref[i] >= off && c->oref[i] < off + n) use[c->oref[i] - off] = true;
+    }
+    x_cols(st, xc, x->l, use, off, n); /* height-bounded */
+    x_cols(st, xc, x->r, use, off, n);
+    x_cols(st, xc, x->x3, use, off, n);
 }
 
 static void join_build_row(sink *k, uint64_t vid, const imdb_value *vals);
@@ -1603,10 +1849,12 @@ struct xplain;
 static int exec_select(xctx *x, const sql_stmt *st, imdb_result *r, struct xplain *xp, imdb_err *e);
 static uint64_t workspace_of(const imdb_session *ss);
 
-/* P2 S4: a nested SELECT that qualifies a column by a table of a statement around it is a correlated subquery, which
- * is not supported: told so here, in the one place every nested run returns through (a deeper one's, at each level
- * out), rather than by "no table NAME in this statement" (its own statement's words, taken apart: one format) */
-static int nested_unresolved(const xctx *x, int rc, imdb_err *e)
+/* P2 S4: "no table NAME in this statement" from a nested SELECT, NAME a table of x's statement (the one around it),
+ * told apart here, the one place every nested run returns through (a deeper one's at each level out; its own
+ * statement's words taken apart: one format). A derived table or a CTE reads only its own tables (LATERAL is a later
+ * step); an expression's nested SELECT reads the statement directly around it from its conditions and expressions
+ * (P2 S4b), so a name still not found is a bare item's or an aggregate's column, or a statement's further out */
+static int nested_unresolved(const xctx *x, int rc, uint8_t mode, imdb_err *e)
 {
     static const char pre[] = "no table ", post[] = " in this statement";
     size_t n = strlen(e->msg), lp = sizeof pre - 1, lq = sizeof post - 1;
@@ -1621,36 +1869,67 @@ static int nested_unresolved(const xctx *x, int rc, imdb_err *e)
     for (int i = 0; i < 4; i++)
         if (nm[i][0] && !strcmp(nm[i], name)) {
             imdb_err_clear(e); /* imdb_fail keeps a first error: this one replaces it */
+            if (mode == NEST_TABLE)
+                return imdb_fail(e, IMDB_ERR_UNSUPPORTED,
+                                 "%s is a table of the statement around this derived table or WITH, which reads only its "
+                                 "own: LATERAL is a later step",
+                                 name);
             return imdb_fail(e, IMDB_ERR_UNSUPPORTED,
-                             "%s is a table of the statement around this nested SELECT, which reads only its own: "
-                             "correlated subqueries are a later step",
+                             "%s is a table of a statement around this nested SELECT: its conditions and expressions read "
+                             "the one directly around it; a bare item's or an aggregate's column, or a statement further "
+                             "out, is a later step",
                              name);
         }
     return rc;
 }
 
-/* one nested SELECT inside x's statement (its own trees, arena and allocations; the outer's row sets visible) */
-static int run_nested(xctx *x, const sql_stmt *in, imdb_result *r, imdb_err *e)
+/* one nested SELECT inside x's statement: its own trees, arena and allocations; the outer's row sets visible (P2 S4).
+ * P2 S4b: NEST_TABLE (a derived table's or a CTE's) sees no statement around it; the others are an expression's, which
+ * may read the columns of x's statement: NEST_FIRST from rset_prepare, before x has bound (a name not found there
+ * defers it: *deferred), NEST_PROBE the bind-only pass in x's scope sc (every name resolved or refused, the result
+ * typed, the columns around it it reads into cr; it runs only its own nested SELECTs that read nothing around them),
+ * NEST_ROW a run for x's row upv */
+static int run_nested(xctx *x, const sql_stmt *in, imdb_result *r, uint8_t mode, const xscope *sc, const imdb_value *upv,
+                      xcorr *cr, bool *deferred, imdb_err *e)
 {
     xctx s = {.ss = x->ss, .db = x->db, .sql = x->sql, .params = x->params, .nparams = x->nparams, .st = in,
               .row_limit = x->row_limit, .deadline_ns = x->deadline_ns, .checks = x->checks, .ticks = x->ticks,
               .next_check = x->next_check, .tested = x->tested};
     s.env.check = xenv_check;
+    s.env.subq = xenv_subq;
     s.env.ctx = &s;
     s.env.arena = &s.arena;
     memcpy(s.vis, x->vis, x->nvis * sizeof *s.vis);
     s.nvis = x->nvis;
+    if (mode != NEST_TABLE) {
+        s.up = x;
+        s.upscope = sc;
+        s.upv = upv;
+        s.probe = mode == NEST_PROBE;
+        if (s.probe) s.probe_r = r;
+    }
+    struct xplain *xp = NULL;
+    if (s.probe && !(xp = xp_scratch(e))) return e->code;
     r->byte_cap = workspace_of(x->ss);
-    int rc = exec_select(&s, in, r, NULL, e);
+    int rc = exec_select(&s, in, r, xp, e);
+    imdb_free(xp);
+    if (!rc && cr) {
+        cr->noref = s.noref;
+        memcpy(cr->oref, s.oref, s.noref * sizeof *s.oref);
+    }
+    bool def = rc && s.deferred;
+    if (deferred) *deferred = def;
     x->ticks = s.ticks;
     x->next_check = s.next_check;
     x->tested = s.tested;
     xfree(&s);
-    if (rc) rc = nested_unresolved(x, rc, e);
+    if (rc && !def) rc = nested_unresolved(x, rc, mode, e);
     return rc;
 }
 
-/* a statement's nested SELECTs, in order (a later one may read an earlier one, as WITH says) */
+/* a statement's nested SELECTs, in order (a later one may read an earlier one, as WITH says). P2 S4b: an expression's
+ * that reads a column of this statement is deferred; bind_corr decides it once this statement has bound the
+ * expression, and it is computed per row */
 static int rset_prepare(xctx *x, const sql_stmt *st, imdb_err *e)
 {
     if (st->has_asof) return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "AS OF with a nested SELECT: a later step");
@@ -1661,10 +1940,100 @@ static int rset_prepare(xctx *x, const sql_stmt *st, imdb_err *e)
         imdb_result_init(&rs->r);
         x->nown = (uint8_t)(i + 1); /* xfree frees its result, whatever happens next */
         snprintf(rs->name, sizeof rs->name, "%s", st->sub_name[i]);
-        if (run_nested(x, st->sub[i], &rs->r, e) || rset_table(x, rs, e)) return e->code;
+        bool def = false;
+        if (run_nested(x, st->sub[i], &rs->r, st->sub_name[i][0] ? NEST_TABLE : NEST_FIRST, NULL, NULL, NULL, &def, e)) {
+            if (!def) return e->code;
+            imdb_err_clear(e); /* P2 S4b: correlated, it seems: bind_corr decides */
+            imdb_result_free(&rs->r);
+            imdb_result_init(&rs->r);
+            rs->deferred = true;
+            continue;
+        }
+        if (rset_table(x, rs, e)) return e->code;
         if (x->nvis >= sizeof x->vis / sizeof *x->vis) return imdb_fail(e, IMDB_ERR_LIMIT, "too many row sets in one statement");
         x->vis[x->nvis++] = rs;
     }
+    return IMDB_OK;
+}
+
+
+/* P2 S4b: one run's answer, kept for the statement (its TEXT copied into one block): EXISTS 0 or 1; a value (no row:
+ * NULL; two refused, as the uncorrelated one is); IN's values sorted, a NULL noted */
+static int corr_answer(xctx *x, const sql_expr *n, const xcorr *c, const imdb_result *r, uint64_t *a, imdb_err *e)
+{
+    if (n->subk == 1) {
+        *a = r->nrows > 0;
+        return IMDB_OK;
+    }
+    if (r->ncols != 1) return imdb_fail(e, IMDB_ERR_STATE, "a correlated subquery's columns differ between its runs");
+    if (n->subk == 0 && r->nrows > 1) return imdb_fail(e, IMDB_ERR_INVALID, "a subquery as a value returned more than one row");
+    size_t tb = 0;
+    for (uint64_t i = 0; i < r->nrows; i++)
+        if (c->ctype == IMDB_T_TEXT && !r->cells[i].null && !r->cells[i].v.null) tb += r->cells[i].v.len;
+    uint8_t *tp = tb ? xalloc(x, tb, e) : NULL;
+    if (tb && !tp) return e->code;
+    imdb_xset *s = xalloc(x, sizeof *s, e);
+    if (!s || !(s->v = xalloc(x, (r->nrows ? r->nrows : 1) * sizeof *s->v, e))) return e->code;
+    for (uint64_t i = 0; i < r->nrows; i++) {
+        imdb_xval v;
+        cell_xval(&r->cells[i], c->ctype, c->cscale, &v);
+        if (v.null) {
+            s->has_null = true;
+            continue;
+        }
+        if (v.type == IMDB_T_TEXT && v.len) { /* past the result: the statement's own copy */
+            memcpy(tp, v.s, v.len);
+            v.s = tp;
+            tp += v.len;
+        }
+        s->v[s->n++] = v;
+    }
+    if (n->subk == 0) { /* a value: the set's one element, or NULL */
+        if (!s->n) s->v[0] = (imdb_xval){.type = c->ctype, .scale = c->cscale, .null = true};
+        *a = (uint64_t)(uintptr_t)&s->v[0];
+        return IMDB_OK;
+    }
+    qsort(s->v, s->n, sizeof *s->v, cmp_xval);
+    *a = (uint64_t)(uintptr_t)s;
+    return IMDB_OK;
+}
+
+/* P2 S4b: the evaluator's env->subq: a correlated subquery on a row, its answer for the tuple of the row's values it
+ * reads, from the memo or by one run for that tuple (its rows tested, cancel and timeout the statement's). The values
+ * of levels further out are fixed for this statement's run, so the tuple is this row's alone. */
+static int xenv_subq(void *ctx, uint16_t k, const imdb_value *row, imdb_xval *out, const imdb_xset **set, imdb_err *e)
+{
+    xctx *x = ctx;
+    const sql_expr *n = &x->st->ex[k];
+    xcorr *c = x->corr && n->sub < x->st->nsub ? &x->corr[n->sub] : NULL;
+    if (!c || !c->bound || !row) return imdb_fail(e, IMDB_ERR_STATE, "a correlated subquery computed without its row");
+    c->kenc.len = 0;
+    imdb_buf_put_u8(&c->kenc, 1); /* never empty: a subquery reading no column of this row has one answer */
+    for (uint16_t i = 0; i < c->noref; i++) {
+        imdb_xval v;
+        imdb_x_from_value(&row[c->oref[i]], &v);
+        key_enc(&c->kenc, &v);
+    }
+    if (imdb_buf_check(&c->kenc, e)) return e->code;
+    imdb_value ek = {.type = IMDB_T_TEXT, .s = c->kenc.p, .len = (uint32_t)c->kenc.len};
+    uint64_t a = 0, *hit = imdb_hmap_get(&c->memo, &ek);
+    if (hit) {
+        x->ss->corr_hits++;
+        a = *hit;
+    } else {
+        x->ss->corr_runs++;
+        imdb_result r;
+        imdb_result_init(&r);
+        int rc = run_nested(x, x->st->sub[n->sub], &r, NEST_ROW, &c->scope, row, NULL, NULL, e);
+        if (!rc) rc = corr_answer(x, n, c, &r, &a, e);
+        imdb_result_free(&r);
+        if (rc) return rc;
+        if (imdb_hmap_put(&c->memo, &ek, a, e)) return e->code;
+    }
+    if (n->subk == 1) *out = (imdb_xval){.type = IMDB_T_BOOL, .i = (int64_t)a};
+    else if (n->subk == 0) *out = *(const imdb_xval *)(uintptr_t)a;
+    else if (set) *set = (const imdb_xset *)(uintptr_t)a;
+    else return imdb_fail(e, IMDB_ERR_STATE, "IN's correlated set read as a value");
     return IMDB_OK;
 }
 
@@ -2111,6 +2480,8 @@ typedef struct xplain {
     char item[XP_ROWS][XP_ITEM];
     char detail[XP_ROWS][XP_DETAIL];
 } xplain;
+
+static struct xplain *xp_scratch(imdb_err *e) { return imdb_alloc(sizeof(xplain), e); }
 
 static void xp_add(xplain *xp, const char *item, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
 static void xp_add(xplain *xp, const char *item, const char *fmt, ...)
@@ -2567,6 +2938,9 @@ static int plan_select(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb
         k->mode = SINK_VIDS;
         if (st->having) return imdb_fail(e, IMDB_ERR_INVALID, "HAVING needs GROUP BY or an aggregate");
     }
+    if (x->corr_rowonly && k->mode != SINK_VIDS) /* P2 S4b: computed on each row: over a group there is none */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "a correlated subquery with GROUP BY or an aggregate stands in WHERE or "
+                                                  "in an aggregate's argument: elsewhere, a later step");
     return IMDB_OK;
 }
 
@@ -2731,6 +3105,13 @@ static void col_types(const xctx *x, const sql_stmt *st, const sink *k, const im
         r->ctype[i] = ty;
         r->cscale[i] = sc;
     }
+}
+
+/* P2 S4b: the bind-only pass's result: its columns' count and types, no row */
+static void probe_types(const xctx *x, const sql_stmt *st, const sink *k, const imdb_schema *s, imdb_result *r)
+{
+    col_types(x, st, k, s, r);
+    r->ncols = st->star ? s->ncols : st->nitems;
 }
 
 static int materialize(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb_result *r, imdb_err *e)
@@ -3186,20 +3567,20 @@ static void join_need(jctx *j)
         const sink *k = j->out;
         for (uint16_t i = 0; i < k->st->nitems; i++) {
             if (k->item_col[i] >= off && k->item_col[i] < off + n) use[k->item_col[i] - off] = true;
-            x_cols(st, j->x->xn, st->items[i].expr, use, off, n);
+            x_cols(st, j->x, st->items[i].expr, use, off, n);
         }
         if (k->mode == SINK_GROUP && k->gcol >= off && k->gcol < off + n) use[k->gcol - off] = true;
-        for (uint8_t g = 0; g < k->ngk; g++) x_cols(st, j->x->xn, k->gk_ex[g], use, off, n); /* P2 S2: every key's columns */
-        x_cols(st, j->x->xn, st->having, use, off, n); /* HAVING's aggregates (1e) and ORDER BY's (1d) read it too */
+        for (uint8_t g = 0; g < k->ngk; g++) x_cols(st, j->x, k->gk_ex[g], use, off, n); /* P2 S2: every key's columns */
+        x_cols(st, j->x, st->having, use, off, n); /* HAVING's aggregates (1e) and ORDER BY's (1d) read it too */
         for (uint8_t o = 0; o < st->norder; o++)
-            if (!st->ord_pos[o]) x_cols(st, j->x->xn, st->ord_ex[o], use, off, n);
+            if (!st->ord_pos[o]) x_cols(st, j->x, st->ord_ex[o], use, off, n);
     }
     for (uint16_t i = 0; i < j->nresid; i++) { /* the trees in WHERE read the joined row, kept pairs' too */
-        x_cols(st, j->x->xn, cmp_root(&st->where[j->resid[i]]), use, off, n);
+        x_cols(st, j->x, cmp_root(&st->where[j->resid[i]]), use, off, n);
     }
     for (uint16_t i = 0; j->build == 1 && i < j->post.np; i++) use[j->post.p[i].col] = true;
     for (uint16_t i = 0; j->build == 0 && i < j->post0.np; i++) use[j->post0.p[i].col] = true; /* P2 S3 */
-    for (uint16_t i = 0; i < j->nonc; i++) x_cols(st, j->x->xn, j->onc[i], use, off, n); /* ON's other conditions */
+    for (uint16_t i = 0; i < j->nonc; i++) x_cols(st, j->x, j->onc[i], use, off, n); /* ON's other conditions */
     for (uint8_t i = 1; i < j->nkey; i++) use[j->keys[j->build][i]] = true; /* its pairs past the first (join_on) */
     j->nneed = 0;
     for (int c = 0; c < n; c++)
@@ -3799,6 +4180,9 @@ static int plan_join_sink(xctx *x, const sql_stmt *st, jctx *j, sink *k, imdb_er
         k->mode = SINK_VIDS;
         if (st->having) return imdb_fail(e, IMDB_ERR_INVALID, "HAVING needs GROUP BY or an aggregate");
     }
+    if (x->corr_rowonly && k->mode != SINK_VIDS) /* P2 S4b: computed on each row: over a group there is none */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "a correlated subquery with GROUP BY or an aggregate stands in WHERE or "
+                                                  "in an aggregate's argument: elsewhere, a later step");
     return IMDB_OK;
 }
 
@@ -4008,6 +4392,7 @@ static int xp_join(xctx *x, const sql_stmt *st, jctx *j, qspec q[2], const jplan
         sink_free(&k);
         return rc;
     }
+    if (x->probe_r) probe_types(x, st, &k, &j->ct->s, x->probe_r); /* P2 S4b: the bind-only pass */
     const imdb_schema *s0 = &j->t[0]->s, *s1 = &j->t[1]->s;
     static const char *const KIND[] = {"JOIN", "JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN", "CROSS JOIN"};
     char jd[XP_DETAIL]; /* P2 S3: every kind, its key pairs, its other conditions */
@@ -4236,7 +4621,14 @@ static int exec_join(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, im
     for (uint16_t i = 0; !rc && i < st->nwhere; i++) {
         int side = 0, col = 0;
         if (st->where[i].lx) continue; /* a tree's: on the joined row (join_emit) */
-        if (join_col(st, t, st->where[i].qual, st->where[i].col, &side, &col, e)) rc = e->code;
+        if (join_col(st, t, st->where[i].qual, st->where[i].col, &side, &col, e)) {
+            rc = e->code;
+            if (rc == IMDB_ERR_NOTFOUND && x->up && st->where[i].nl) { /* P2 S4b: as bind_preds: bind_outer decides */
+                x->fb[i] = true;
+                imdb_err_clear(e);
+                rc = IMDB_OK;
+            }
+        }
         else {
             bool late = (side == 1 && j->keep[0]) || (side == 0 && j->keep[1]); /* a NULL-extended side's: after the join */
             qspec *bq = late ? (side ? &j->post : &j->post0) : &q[side];
@@ -4334,6 +4726,7 @@ static int exec_select_const(xctx *x, const sql_stmt *st, imdb_result *r, xplain
         x_type_null(x, it->expr, IMDB_T_TEXT, 0); /* SELECT NULL: a TEXT NULL, as PostgreSQL types an unknown one */
     }
     if (xp) {
+        if (x->probe_r) probe_types(x, st, NULL, NULL, x->probe_r); /* P2 S4b: the bind-only pass */
         xp_add(xp, "path", "constant");
         xp_add(xp, "why", "no FROM: the expressions alone, computed once");
         xp_add(xp, "estimate", "no row read");
@@ -4366,9 +4759,15 @@ static void xp_nested(const xctx *x, const sql_stmt *st, xplain *xp)
     d[0] = 0;
     xcat(d, sizeof d, &n, "%u nested SELECT%s, run first (its rows are what the rest is planned over; EXPLAIN reads them):",
          st->nsub, st->nsub == 1 ? "" : "s");
-    for (uint8_t i = 0; i < x->nown; i++)
+    for (uint8_t i = 0; i < x->nown; i++) {
+        if (x->own[i].deferred) { /* P2 S4b */
+            xcat(d, sizeof d, &n, "%s (a correlated one) run per distinct value of the row's columns it reads, not by EXPLAIN",
+                 i ? ";" : "");
+            continue;
+        }
         xcat(d, sizeof d, &n, "%s %s%s%llu row%s", i ? ";" : "", x->own[i].name[0] ? x->own[i].name : "(a value)",
              x->own[i].name[0] ? " " : " ", (unsigned long long)x->own[i].r.nrows, x->own[i].r.nrows == 1 ? "" : "s");
+    }
     xp_add(xp, "nested", "%s", d);
 }
 
@@ -4397,6 +4796,7 @@ static int exec_select(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, 
     if (nested) p1 = IMDB_PATH_NESTED;
     if (xp) { /* P1 Q1: the plan, not run */
         if (!rc) xp_single(x, st, &q, &k, p1, xp);
+        if (!rc && x->probe_r) probe_types(x, st, &k, &t->s, x->probe_r); /* P2 S4b: the bind-only pass */
         sink_free(&k);
         return rc;
     }
@@ -4566,7 +4966,7 @@ static int exec_update(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, 
     int cols[IMDB_MAX_COLS];
     imdb_value newv[IMDB_MAX_COLS];
     bool trees = false;
-    xscope sc = {.st = st, .s = &t->s, .t = t, .cols = true, .group_col = -1};
+    xscope sc = {.st = st, .s = &t->s, .t = t, .cols = true, .group_col = -1, .no_corr = true}; /* P2 S4b */
     for (uint16_t i = 0; i < st->nset; i++) {
         cols[i] = imdb_schema_col(&t->s, st->set_cols[i]);
         if (cols[i] < 0) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no column %s in table %s", st->set_cols[i], t->s.name);
@@ -5295,7 +5695,9 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
         return imdb_fail(e, IMDB_ERR_LIMIT, "too many parameters");
     }
     xctx x = {.ss = ss, .db = ss->db, .sql = sql, .params = params, .nparams = nparams, .st = st, .row_limit = ss->row_limit};
+    ss->corr_runs = ss->corr_hits = 0; /* P2 S4b */
     x.env.check = xenv_check; /* P2 S1 */
+    x.env.subq = xenv_subq; /* P2 S4b */
     x.env.ctx = &x;
     x.env.arena = &x.arena;
     imdb_db *db = ss->db;

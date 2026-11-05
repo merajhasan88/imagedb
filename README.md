@@ -712,6 +712,7 @@ Subqueries and derived tables:
 ```sql
 SELECT name FROM customers WHERE id IN (SELECT cust FROM orders WHERE amount > 100);
 SELECT id FROM orders WHERE amount > (SELECT AVG(amount) FROM orders);
+SELECT c.name FROM customers AS c WHERE NOT EXISTS (SELECT 1 FROM orders AS o WHERE o.cust = c.id);
 WITH big AS (SELECT cust, SUM(amount) AS total FROM orders GROUP BY cust)
   SELECT c.name, b.total FROM big AS b JOIN customers AS c ON c.id = b.cust;
 ```
@@ -729,12 +730,23 @@ WITH big AS (SELECT cust, SUM(amount) AS total FROM orders GROUP BY cust)
   no row is NULL, with two rows an error. `x IN (SELECT ...)` is UNKNOWN when
   x is NULL, or when nothing matches and the set holds a NULL, so `NOT IN`
   over a set with a NULL keeps no row, as in SQL.
-- At most 8 nested SELECTs in a statement, nested 4 deep. Not yet: correlated
-  subqueries (a nested SELECT naming a table of the statement around it is
-  refused with that reason), LATERAL, `ANY` and `ALL`, AS OF with a nested
+- A correlated subquery reads the columns of the statement directly around
+  it from its conditions and expressions (`o.cust = c.id` above): it is
+  computed on each row, once per distinct set of the outer values it reads
+  (the answers kept for the statement, under its memory ceiling), and a
+  comparison of its table's column with an outer column is a lookup when an
+  index serves the column. It stands in WHERE (of SELECT, UPDATE and
+  DELETE), a SELECT list or ORDER BY returning plain rows, or an aggregate's
+  argument; elsewhere (UPDATE's SET, HAVING, a grouped list) it is refused
+  with the reason. Its names and types are checked when the statement is
+  bound, so such an error never depends on the data (a value subquery that
+  returns two rows for some row is that run's error, as in SQL).
+- At most 8 nested SELECTs in a statement, nested 4 deep. Not yet: a
+  reference two statements out, LATERAL, `ANY` and `ALL`, AS OF with a nested
   SELECT, FOR UPDATE of a derived table.
-- EXPLAIN runs a statement's nested SELECTs (the rest is planned over their
-  rows) and lists each with its row count; nothing else runs.
+- EXPLAIN runs a statement's uncorrelated nested SELECTs (the rest is planned
+  over their rows) and lists each with its row count; a correlated one is named,
+  not run; nothing else runs.
 
 ## Validation
 

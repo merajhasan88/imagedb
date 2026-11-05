@@ -97,6 +97,8 @@ for q in "SELECT COUNT(*), SUM(amount) FROM txns AS OF 3 WHERE user_id = 42 AND 
          "UPDATE t SET g = (SELECT MAX(g) FROM t) WHERE id NOT IN (SELECT tid FROM u)" "INSERT INTO t VALUES ((SELECT MAX(id) FROM t) + 1, 'x')" \
          "DELETE FROM t WHERE g = (SELECT MIN(g) FROM (SELECT g FROM t) AS q)" "EXPLAIN SELECT COUNT(*) FROM (SELECT id FROM t) AS q" \
          "SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM t) AS a) AS b) AS c) AS d" \
+         "SELECT c.id FROM c WHERE NOT EXISTS (SELECT 1 FROM o WHERE o.cust = c.id AND o.v > (SELECT MAX(v) FROM o AS p WHERE p.cust = o.cust))" \
+         "SELECT id, (SELECT COUNT(*) FROM u WHERE u.tid = t.id) FROM t WHERE g IN (SELECT v FROM u AS ci WHERE ci.tid = t.id)" \
          "SELECT AVG(f) FROM t HAVING COUNT(*) BETWEEN 1 AND 10 OFFSET 0 LIMIT 0"; do
   printf '%s' "$q" > "$OUT/sql/q$i"; i=$((i+1))
 done

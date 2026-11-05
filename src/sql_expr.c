@@ -1013,8 +1013,17 @@ int imdb_x_eval(const sql_stmt *st, const imdb_xnode *xn, uint16_t k, const imdb
     }
     switch (x->op) {
     case EX_LIT: *out = b->k; return IMDB_OK;
-    case EX_SUBQ: *out = b->k; return IMDB_OK; /* P2 S4: a subquery's value or EXISTS, computed once */
-    case EX_COL: imdb_x_from_value(&row[b->col], out); return IMDB_OK;
+    case EX_SUBQ: /* P2 S4: a subquery's value or EXISTS, computed once; P2 S4b: a correlated one's, per row */
+        if (!b->corr) {
+            *out = b->k;
+            return IMDB_OK;
+        }
+        if (!env || !env->subq) return imdb_fail(e, IMDB_ERR_STATE, "a correlated subquery computed without its statement");
+        return env->subq(env->ctx, k, row, out, NULL, e);
+    case EX_COL:
+        if (b->outer) *out = b->k; /* P2 S4b: a column of a statement around this one, fixed for the run */
+        else imdb_x_from_value(&row[b->col], out);
+        return IMDB_OK;
     case EX_AGG: *out = slots[b->slot]; return IMDB_OK;
     case EX_NEG:
         if (imdb_x_eval(st, xn, x->l, row, slots, env, &l, e)) return e->code; /* the height bounds the recursion */
@@ -1048,6 +1057,11 @@ int imdb_x_eval(const sql_stmt *st, const imdb_xnode *xn, uint16_t k, const imdb
         if (x->cmp == CMP_IN || x->cmp == CMP_NOTIN) { /* P2 S1: TRUE at a match, else UNKNOWN past a NULL, else FALSE */
             if (st->ex[x->r].op == EX_SUBQ) { /* P2 S4: a subquery's values, sorted: an empty set is FALSE, even for NULL */
                 const imdb_xset *s = xn[x->r].set;
+                if (xn[x->r].corr) { /* P2 S4b: the set for this row */
+                    if (!env || !env->subq)
+                        return imdb_fail(e, IMDB_ERR_STATE, "a correlated subquery computed without its statement");
+                    if (env->subq(env->ctx, x->r, row, NULL, &s, e)) return e->code;
+                }
                 int t = 0;
                 if (!s) return imdb_fail(e, IMDB_ERR_STATE, "IN's subquery unbound");
                 if (s->n || s->has_null) {

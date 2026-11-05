@@ -208,6 +208,8 @@ typedef struct xnode {
     int l, r;
     int x3;       /* X_CMP BETWEEN: the upper bound (fn: the comparison, OP_EQ .. OP_NOTNULL) */
     int64_t a1, a2; /* P2 S1: ROUND's places (-1: none), SUBSTR's start and length (-1: none) */
+    int qual;     /* P2 S4b: an X_COL of a correlated subquery's table, by its alias ci (1), or of the statement
+                   * around it, by its name (2); an X_SUBQ that is correlated (1: FROM its table AS ci) */
     double f;     /* X_VAL of a FLOAT64 */
     char s[136];  /* X_TXT, X_VAL of a TEXT, X_LIKE's pattern */
     bool dist;    /* P2 S2: X_AGG over its DISTINCT values (a FILTER (WHERE c): x3) */
@@ -247,6 +249,7 @@ typedef struct stmt {
     int jx;            /* P2 S3: the join's other ON condition (a tree), else 0; join 3 RIGHT, 4 FULL, 5 CROSS */
     bool jkey2, jusing, jn3; /* ON's second key pair, t.s = u.s; USING (s) for ON; P2 S3's (counted when compared) */
     bool subq;         /* P2 S4: a subquery, a derived table or a CTE (counted when compared) */
+    bool corr;         /* P2 S4b: a correlated subquery (counted when compared) */
     int dsel;          /* P2 S4: 1 FROM (SELECT dc FROM t [WHERE dpred]) AS x, 2 WITH x AS (...) SELECT ... FROM x */
     int dc[4], ndc;
     pred dpred;
@@ -316,6 +319,7 @@ static bool g_fns = true;  /* --no-fns: the generator before P2 S1, draw for dra
  * build); --no-fns and --no-expr reproduce the generators before P2 S1 and before 1a. */
 static bool g_in_txn;      /* generating a transaction's statements: no tree that may fail (PostgreSQL aborts the
                             * whole transaction at an error) */
+static bool g_corr_ok;     /* P2 S4b: generating a SELECT's WHERE, where a subquery may be correlated */
 #define TY(t, s) ((t) | ((s) << 8)) /* a column's type, a DECIMAL's scale with it */
 #define TYT(ty) ((ty) & 0xff)
 #define TYS(ty) ((ty) >> 8)
@@ -337,21 +341,33 @@ static void fn_mark(stmt *q, int k);
 static bool txt_computed(const stmt *q, int k);
 static int gen_xcond(stmt *q, int depth, bool dml);
 static void gen_xpred(stmt *q, pred *p, bool dml);
-static void xmark(stmt *q, int k);
 static void gen_order(stmt *q, bool window, bool distinct_ok);
 static bool x_const(const stmt *q, int k);
 static void xmark_pred(stmt *q, const pred *p);
+
+static int gen_subq_cond(stmt *q); /* P2 S4 */
+static void xmark(stmt *q, int k);
 
 static void gen_preds(stmt *q, int max, bool two_tables)
 {
     q->npr = (int)rr(0, max);
     for (int i = 0; i < q->npr; i++) {
+        if (g_fns && q->kind == Q_SELECT && FNROOM(q) && chance(10)) { /* P2 S4, S4b: a subquery condition, maybe correlated */
+            memset(&q->pr[i], 0, sizeof q->pr[i]);
+            g_corr_ok = true;
+            q->pr[i].bt = gen_subq_cond(q);
+            g_corr_ok = false;
+            xmark(q, q->pr[i].bt);
+            continue;
+        }
         if (g_expr && XROOM(q) && chance(15)) { /* a comparison of trees (DML: what SQLite computes alike) */
             gen_xpred(q, &q->pr[i], q->kind != Q_SELECT);
             if (q->kind == Q_SELECT) xmark_pred(q, &q->pr[i]);
         } else if (g_expr && XCOND_ROOM(q) && chance(14)) { /* 1c: AND, OR, NOT (DML: what SQLite computes alike) */
             memset(&q->pr[i], 0, sizeof q->pr[i]);
+            g_corr_ok = q->kind == Q_SELECT; /* P2 S4b: WHERE */
             q->pr[i].bt = gen_xcond(q, 2, q->kind != Q_SELECT);
+            g_corr_ok = false;
             if (q->kind == Q_SELECT) xmark(q, q->pr[i].bt);
         } else {
             gen_pred(two_tables && chance(40) ? 1 : q->tab, &q->pr[i]);
@@ -1017,6 +1033,40 @@ static int gen_subq_where(stmt *q, int tab, int avoid)
  * another column rarely holds x: half the INs read x's own column (every x found, a NULL in the set when the filter is
  * on another column), and half the EXISTS look for c = (SELECT MAX(c) ...), one row or a few (the mutants' finding:
  * EXISTS of exactly one row, NOT IN over a NULL and the set's search were each caught in 0 to 2 seeds of 30) */
+/* P2 S4b: the columns of a correlated subquery's own table, by its alias ci (a nested subquery's are its own) */
+static void corr_mark(stmt *q, int k)
+{
+    if (!k) return;
+    xnode *n = XN(q, k);
+    if (n->op == X_SUBQ) return;
+    if (n->op == X_COL) n->qual = 1;
+    corr_mark(q, n->l); /* height-bounded */
+    corr_mark(q, n->r);
+    corr_mark(q, n->x3);
+}
+
+/* P2 S4b: subquery sq made correlated with the statement around it (WHERE only: g_corr_ok): its table aliased ci, a
+ * comparison of one of its columns with one of the outer table's, by name (mostly ci.tid = t.id, which matches: u's tid
+ * is often a t id), either side first, sometimes the outer one in a tree (the mutants: a comparison only ever written
+ * inner first, and bare, left imagedb's flip and its constant outer values untested), ANDed to its WHERE */
+static void corr_add(stmt *q, int sq, int otab)
+{
+    int itab = XN(q, sq)->tab, ic, oc;
+    if (itab == 1 && otab == 0 && chance(60)) ic = 1, oc = 0;
+    else ic = (int)rr(0, 2), oc = (int)rr(0, 2);
+    corr_mark(q, XN(q, sq)->x3);
+    int a = xcol(q, itab, ic), o = xcol(q, otab, oc);
+    XN(q, a)->qual = 1;
+    XN(q, o)->qual = 2;
+    if (chance(50)) o = xnew(q, X_ADD, o, xlit_int(q, rr(-2, 2))); /* in a tree: a residual on each run (imagedb takes a
+                                                                    * bare outer column as a plain predicate) */
+    int k = chance(50) ? xbool(q, X_CMP, a, o) : xbool(q, X_CMP, o, a); /* either side first */
+    XN(q, k)->fn = chance(50) ? OP_EQ : (int)rr(OP_EQ, OP_GE);
+    XN(q, sq)->x3 = XN(q, sq)->x3 ? xbool(q, X_AND, XN(q, sq)->x3, k) : k;
+    XN(q, sq)->qual = 1;
+    q->corr = true;
+}
+
 static int gen_subq_cond(stmt *q)
 {
     int otab = q->join ? (chance(40) ? 1 : 0) : q->tab, itab = chance(70) ? 1 : 0, r = (int)rr(0, 99);
@@ -1031,6 +1081,7 @@ static int gen_subq_cond(stmt *q)
         XN(q, sq)->fn = 0;
         XN(q, sq)->ty = text ? CT_TXT : CT_INT;
         if (chance(60)) XN(q, sq)->x3 = gen_subq_where(q, itab, ic);
+        if (g_corr_ok && chance(70)) corr_add(q, sq, otab); /* P2 S4b */
         int k = xbool(q, X_IN, xcol(q, otab, oc), sq);
         XN(q, k)->fn = chance(45); /* NOT IN */
         return k;
@@ -1054,12 +1105,14 @@ static int gen_subq_cond(stmt *q)
         } else {
             XN(q, sq)->x3 = gen_subq_where(q, itab, -1);
         }
+        if (g_corr_ok && chance(70)) corr_add(q, sq, otab); /* P2 S4b */
         return chance(30) ? xbool(q, X_NOT, sq, 0) : sq;
     }
     XN(q, sq)->fn = 2; /* a value: MAX, MIN, COUNT(*) */
     XN(q, sq)->i = (int[]){F_MAX, F_MIN, F_COUNT_STAR}[rnd() % 3];
     XN(q, sq)->ty = CT_INT;
     if (chance(60)) XN(q, sq)->x3 = gen_subq_where(q, itab, -1);
+    if (g_corr_ok && chance(70)) corr_add(q, sq, otab); /* P2 S4b */
     int k = xbool(q, X_CMP, xcol(q, otab, oc), sq);
     XN(q, k)->fn = (int)rr(OP_EQ, OP_GE);
     return k;
@@ -1090,7 +1143,7 @@ static void gen_dselect(stmt *q)
 /* a condition of S1's: IN, LIKE, or a TEXT tree (never a bare literal) against a literal, or IS [NOT] NULL */
 static int gen_fcmp(stmt *q)
 {
-    if (chance(25)) return gen_subq_cond(q); /* P2 S4 */
+    if (chance(g_corr_ok ? 40 : 25)) return gen_subq_cond(q); /* P2 S4; in a WHERE, P2 S4b's correlated forms too */
     int r = (int)rr(0, 99);
     if (r < 40) return gen_in(q);
     if (r < 75) return gen_like(q);
@@ -1390,7 +1443,9 @@ static void gen_fselect(stmt *q)
     int np = (int)rr(0, 2);
     for (int i = 0; i < np && FNROOM(q); i++) {
         memset(&q->pr[q->npr], 0, sizeof q->pr[0]);
+        g_corr_ok = true; /* P2 S4b: WHERE */
         q->pr[q->npr++].bt = gen_fcmp(q);
+        g_corr_ok = false;
     }
     if (agg && q->gcol < 0) {
         /* one row: no order */
@@ -1970,10 +2025,12 @@ static void put_x(sb *b, int d, const stmt *q, int k, int pty)
     case X_SUBQ: { /* P2 S4: (SELECT y FROM w [WHERE c]), EXISTS (SELECT 1 ...), (SELECT MAX(y) ...) */
         static const char *const AG[] = {"", "COUNT", "COUNT", "SUM", "MIN", "MAX", "AVG"};
         sb_str(b, n->fn == 1 ? "(EXISTS (SELECT 1" : "(SELECT ");
-        if (n->fn == 0) put_col(b, q, n->tab, n->col);
+        if (n->fn == 0 && n->qual) sb_printf(b, "ci.%s", cols(n->tab)[n->col].name); /* P2 S4b */
+        else if (n->fn == 0) put_col(b, q, n->tab, n->col);
         else if (n->fn == 2 && n->i == F_COUNT_STAR) sb_str(b, "COUNT(*)");
+        else if (n->fn == 2 && n->qual) sb_printf(b, "%s(ci.%s)", AG[n->i], cols(n->tab)[n->col].name);
         else if (n->fn == 2) sb_printf(b, "%s(", AG[n->i]), put_col(b, q, n->tab, n->col), sb_str(b, ")");
-        sb_printf(b, " FROM %s", tname(n->tab));
+        sb_printf(b, n->qual ? " FROM %s AS ci" : " FROM %s", tname(n->tab));
         if (n->x3) sb_str(b, " WHERE "), put_x(b, d, q, n->x3, -1);
         sb_str(b, n->fn == 1 ? "))" : ")");
         return;
@@ -2008,6 +2065,10 @@ static void put_x(sb *b, int d, const stmt *q, int k, int pty)
         sb_str(b, " ESCAPE '!')");
         return;
     case X_COL:
+        if (n->qual) { /* P2 S4b: a correlated subquery's own column by its alias, or the outer table's by name */
+            sb_printf(b, "%s.%s", n->qual == 1 ? "ci" : tname(n->tab), cols(n->tab)[n->col].name);
+            return;
+        }
         if (d == D_MS && cols(n->tab)[n->col].t == CT_BOOL) { /* T-SQL has no bare boolean: its BIT, as a condition */
             sb_str(b, "(");
             put_col(b, q, n->tab, n->col);
@@ -3207,6 +3268,7 @@ static long g_fn_compared; /* P2 S1: comparisons of statements holding its forms
 static long g_grp_compared; /* P2 S2: comparisons of its grouped form */
 static long g_jn_compared; /* P2 S3: comparisons of its join forms */
 static long g_subq_compared; /* P2 S4: comparisons of statements with a subquery, a derived table or a CTE */
+static long g_corr_compared; /* P2 S4b: comparisons of statements with a correlated subquery */
 
 static void show_rows(const res *r, size_t from)
 {
@@ -3368,6 +3430,7 @@ static int run_stmt(unsigned seed, int step, const stmt *q, bool state)
         if (q->grp) g_grp_compared++;
         if (q->jn3) g_jn_compared++;
         if (q->subq) g_subq_compared++;
+        if (q->corr) g_corr_compared++;
         const res *o = &out[d];
         const char *why = NULL;
         size_t at = 0;
@@ -3600,6 +3663,7 @@ int main(int argc, char **argv)
     printf("oracle: EXPLAIN checked against the run on %ld SELECTs, %ld disagreements\n", g_explained, g_explain_bad);
     bool servers = g_eng[D_PG].on || g_eng[D_MY].on || g_eng[D_MA].on || g_eng[D_MS].on;
     printf("oracle: %ld comparisons of P2 S2's grouped form (several keys and trees, DISTINCT, FILTER)\n", g_grp_compared);
+    printf("oracle: %ld comparisons of P2 S4b's correlated subqueries\n", g_corr_compared);
     printf("oracle: %ld comparisons of P2 S4's subqueries (IN, NOT IN, EXISTS, a value), derived tables and CTEs\n",
            g_subq_compared);
     printf("oracle: %ld comparisons of P2 S3's joins (RIGHT, FULL, CROSS, ON's conditions and key pairs, USING); SQLite's "

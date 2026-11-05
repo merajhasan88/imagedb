@@ -287,12 +287,13 @@ static void t_rset_subq_forms(void)
     EXPECT("SELECT (SELECT id, s FROM t WHERE id = 1)", "ERR returns one column");
     EXPECT("SELECT id FROM t WHERE id IN (SELECT id, s FROM t)", "ERR takes one column");
     EXPECT("SELECT id FROM t WHERE s IN (SELECT id FROM t)", "ERR IN compares TEXT with INT64");
-    /* correlated: a nested SELECT naming a table of a statement around it, at any depth, is told so; another name is not */
-    EXPECT("SELECT id FROM t WHERE id = (SELECT t.id FROM t AS u WHERE u.id = t.id)", "ERR correlated subqueries are a later step");
-    EXPECT("SELECT id FROM t AS o WHERE EXISTS (SELECT 1 FROM t WHERE t.g = o.g)", "ERR o is a table of the statement around");
+    /* P2 S4b: a nested SELECT reads the statement directly around it from its conditions and expressions (t_rset_corr);
+     * a bare item's column of it, a statement further out, SET's and an unknown name are each told so */
+    EXPECT("SELECT id FROM t WHERE id = (SELECT t.id FROM t AS u WHERE u.id = t.id)", "ERR a bare item's or an aggregate's column");
+    EXPECT("SELECT COUNT(*) FROM t AS o WHERE EXISTS (SELECT 1 FROM t WHERE t.g = o.g)", "count\n35\n");
     EXPECT("SELECT id FROM t WHERE id IN (SELECT id FROM t AS a WHERE EXISTS (SELECT 1 FROM t AS b WHERE b.id = a.id AND t.g = 1))",
-           "ERR t is a table of the statement around");
-    EXPECT("UPDATE t SET g = 1 WHERE id IN (SELECT id FROM t AS w WHERE w.d = t.d)", "ERR correlated subqueries are a later step");
+           "ERR a statement further out, is a later step");
+    EXPECT("UPDATE t SET g = (SELECT MAX(w.g) FROM t AS w WHERE w.d = t.d)", "ERR a correlated subquery in UPDATE's SET");
     EXPECT("SELECT id FROM t WHERE id IN (SELECT id FROM t AS w WHERE nosuch.d = 1)", "ERR no table nosuch in this statement");
     CHECK(run("UPDATE t SET g = (SELECT MAX(id) FROM t) WHERE id IN (SELECT id FROM t WHERE id > 38)") == 0);
     EXPECT("SELECT id, g FROM t WHERE id > 37 ORDER BY id", "id,g\n38,1\n39,40\n40,40\n");
@@ -367,6 +368,199 @@ static void t_rset_explain(void)
     done(db);
 }
 
+
+/* two statements answer alike (their bodies: the headers may name columns differently) */
+static void same_body(const char *a, const char *b, int line)
+{
+    csv_to(a, g_out, sizeof g_out);
+    csv_to(b, g_out2, sizeof g_out2);
+    if (!strncmp(g_out, "ERR", 3) || strcmp(body(g_out), body(g_out2)) != 0) {
+        char m[1600];
+        snprintf(m, sizeof m, "%s\n      vs %s\n      got:  %.300s\n      want: %.300s", a, b, g_out, g_out2);
+        test_fail(__FILE__, line, m);
+    }
+}
+#define SAME(a, b) same_body((a), (b), __LINE__)
+
+/* P2 S4b: correlated subqueries (the statement directly around them), each form against an uncorrelated twin or a model
+ * computed here, in memory, cross-checked and in the lake; writes; the memo (the row limit proves it); the memory
+ * ceiling; errors decided before any row; EXPLAIN; every refusal */
+static void t_rset_corr(void)
+{
+    imdb_db *db = open_fresh();
+    CHECK(db != NULL);
+    if (!db) return;
+    enum { N = 300 };
+    CHECK(run("CREATE TABLE t (id INT64 PRIMARY KEY, g INT64, d DECIMAL(9,2), s TEXT, k BOOL)") == 0);
+    CHECK(run("CREATE TABLE u (id INT64 PRIMARY KEY, tid INT64, v INT64, w TEXT)") == 0);
+    CHECK(run("CREATE TABLE z (id INT64 PRIMARY KEY, uid INT64)") == 0);
+    fill(N);
+    imdb_buf b;
+    imdb_buf_init(&b);
+    imdb_buf_put_str(&b, "INSERT INTO u VALUES ");
+    int64_t tid[N + 1], v[N + 1];
+    for (int i = 1; i <= N; i++) {
+        tid[i] = i % 11 ? (i * 7) % (N / 2) : -1; /* -1: NULL */
+        v[i] = (i * 13) % 50 - 10;
+        char ts[16];
+        snprintf(ts, sizeof ts, "%lld", (long long)tid[i]);
+        imdb_buf_printf(&b, "%s(%d, %s, %lld, %s)", i > 1 ? ", " : "", i, tid[i] < 0 ? "NULL" : ts, (long long)v[i],
+                        i % 5 ? (i % 2 ? "'ab'" : "'Cd'") : "NULL");
+    }
+    imdb_buf_put_u8(&b, 0);
+    CHECK(!imdb_buf_check(&b, &g_e) && !run((const char *)b.p));
+    b.len = 0;
+    imdb_buf_put_str(&b, "INSERT INTO z VALUES ");
+    for (int i = 1; i <= N; i++) imdb_buf_printf(&b, "%s(%d, %d)", i > 1 ? ", " : "", i, (i * 3) % N + 1);
+    imdb_buf_put_u8(&b, 0);
+    CHECK(!imdb_buf_check(&b, &g_e) && !run((const char *)b.p));
+    imdb_buf_free(&b);
+    /* a model: for each t row, the u rows whose v exceeds its g (g NULL: none), in t's order */
+    char want[1 << 14];
+    size_t o = (size_t)snprintf(want, sizeof want, "id,c\n");
+    for (int i = 1; i <= N && o < sizeof want; i++) {
+        int g = i % 9 ? (i % 7 == 0 ? -1000 : 1) : 2, c = 0;
+        for (int j = 1; g != -1000 && j <= N; j++) c += v[j] > g;
+        o += (size_t)snprintf(want + o, sizeof want - o, "%d,%d\n", i, c);
+    }
+    for (int pass = 0; pass < 3; pass++) { /* in memory, cross-checked, in the lake */
+        if (pass == 1) CHECK(run("SET cross_check = on") == 0);
+        if (pass == 2) CHECK(run("CHECKPOINT") == 0);
+        SAME("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.tid = t.id) ORDER BY id",
+             "SELECT id FROM t WHERE id IN (SELECT tid FROM u) ORDER BY id");
+        SAME("SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.tid = t.id) ORDER BY id",
+             "SELECT id FROM t WHERE id NOT IN (SELECT tid FROM u WHERE tid IS NOT NULL) ORDER BY id");
+        SAME("SELECT id, (SELECT MAX(v) FROM u WHERE u.tid = t.id) AS m FROM t ORDER BY id",
+             "SELECT t.id, MAX(u.v) FROM t LEFT JOIN u ON u.tid = t.id GROUP BY t.id ORDER BY t.id");
+        SAME("SELECT id, (SELECT COUNT(*) FROM u WHERE u.tid = t.id) AS c FROM t ORDER BY id",
+             "SELECT t.id, COUNT(u.id) FROM t LEFT JOIN u ON u.tid = t.id GROUP BY t.id ORDER BY t.id");
+        SAME("SELECT id FROM t WHERE id IN (SELECT tid FROM u WHERE u.v = t.id % 50 - 10) ORDER BY id",
+             "SELECT DISTINCT t.id FROM t JOIN u ON u.tid = t.id AND u.v = t.id % 50 - 10 ORDER BY t.id");
+        SAME("SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.w = t.s)", /* TEXT, NULLs on both sides */
+             "SELECT COUNT(*) FROM t WHERE s IN (SELECT w FROM u)");
+        SAME("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.tid = t.id AND EXISTS (SELECT 1 FROM z WHERE z.uid = u.id)) "
+             "ORDER BY id", /* each level reads the one directly around it */
+             "SELECT id FROM t WHERE id IN (SELECT tid FROM u WHERE id IN (SELECT uid FROM z)) ORDER BY id");
+        EXPECT("SELECT id, (SELECT COUNT(*) FROM u WHERE u.v > t.g) AS c FROM t ORDER BY id", want);
+        for (int jp = 0; jp < 2; jp++) { /* a join around it, under each plan */
+            CHECK(run(jp ? "SET join_plan = index" : "SET join_plan = hash") == 0);
+            SAME("SELECT t.id, z.id FROM t JOIN z ON z.uid = t.id WHERE EXISTS (SELECT 1 FROM u WHERE u.tid = z.uid AND u.v > 0) "
+                 "ORDER BY t.id, z.id",
+                 "SELECT t.id, z.id FROM t JOIN z ON z.uid = t.id WHERE z.uid IN (SELECT tid FROM u WHERE v > 0) ORDER BY t.id, z.id");
+            SAME("SELECT t.id, (SELECT MIN(v) FROM u WHERE u.tid = z.uid) AS m FROM t LEFT JOIN z ON z.uid = t.id ORDER BY t.id, m",
+                 "SELECT t.id, (SELECT MIN(v) FROM u WHERE u.tid = t.id AND z.uid IS NOT NULL) AS m FROM t LEFT JOIN z ON z.uid = t.id "
+                 "ORDER BY t.id, m"); /* two columns around it: a NULL-extended row's z.uid is NULL */
+        }
+        CHECK(run("SET join_plan = auto") == 0);
+        /* ORDER BY's keys computed per row too, a TEXT one kept past its row */
+        SAME("SELECT id FROM t ORDER BY (SELECT MAX(v) FROM u WHERE u.tid = t.id), id",
+             "SELECT t.id FROM t LEFT JOIN u ON u.tid = t.id GROUP BY t.id ORDER BY MAX(u.v), t.id");
+        SAME("SELECT id, (SELECT MIN(w) FROM u WHERE u.tid = t.id) AS m FROM t ORDER BY m DESC, id",
+             "SELECT t.id, MIN(u.w) FROM t LEFT JOIN u ON u.tid = t.id GROUP BY t.id ORDER BY 2 DESC, t.id");
+        /* a grouped statement's aggregate argument */
+        SAME("SELECT g, SUM((SELECT MAX(v) FROM u WHERE u.tid = t.id)) FROM t GROUP BY g ORDER BY g",
+             "SELECT g, SUM(m) FROM (SELECT t.id, t.g AS g, MAX(u.v) AS m FROM t LEFT JOIN u ON u.tid = t.id GROUP BY t.id, t.g) "
+             "AS q GROUP BY g ORDER BY g");
+        /* a row set around it: a CTE's and a derived table's rows (path_rset's values) */
+        SAME("WITH q AS (SELECT id, s FROM t) SELECT id FROM q WHERE EXISTS (SELECT 1 FROM u WHERE u.tid = q.id AND u.w = q.s) "
+             "ORDER BY id",
+             "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.tid = t.id AND u.w = t.s) ORDER BY id");
+        SAME("SELECT id FROM (SELECT id, g FROM t WHERE g IS NOT NULL) AS q WHERE g < (SELECT COUNT(*) FROM u WHERE u.tid = q.id) "
+             "ORDER BY id",
+             "SELECT id FROM t WHERE g IS NOT NULL AND g < (SELECT COUNT(*) FROM u WHERE u.tid = t.id) ORDER BY id");
+        /* RIGHT and FULL joins around it, its outer column on a NULL-extended side (ON's t.g = 2 leaves most unmatched) */
+        SAME("SELECT t.id, z.id FROM t RIGHT JOIN z ON z.uid = t.id AND t.g = 2 WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.tid = t.id) "
+             "ORDER BY z.id",
+             "SELECT t.id, z.id FROM t RIGHT JOIN z ON z.uid = t.id AND t.g = 2 "
+             "WHERE t.id IS NULL OR t.id NOT IN (SELECT tid FROM u WHERE tid IS NOT NULL) ORDER BY z.id");
+        SAME("SELECT t.id, z.id FROM t FULL JOIN z ON z.uid = t.id AND t.g = 2 WHERE EXISTS (SELECT 1 FROM u WHERE u.tid = z.uid) "
+             "ORDER BY t.id, z.id",
+             "SELECT t.id, z.id FROM t FULL JOIN z ON z.uid = t.id AND t.g = 2 WHERE z.uid IN (SELECT tid FROM u) ORDER BY t.id, z.id");
+        SAME("SELECT COUNT(*), SUM((SELECT MAX(v) FROM u WHERE u.tid = t.id)) FROM t", /* inside an aggregate's argument */
+             "SELECT COUNT(*), SUM(m) FROM (SELECT t.id, MAX(u.v) AS m FROM t LEFT JOIN u ON u.tid = t.id GROUP BY t.id) AS q");
+    }
+    CHECK(run("SET cross_check = off") == 0);
+    /* writes: decided over every row before any is written (select_vids), each as its uncorrelated twin */
+    CHECK(run("BEGIN") == 0 && run("UPDATE t SET k = FALSE WHERE EXISTS (SELECT 1 FROM u WHERE u.tid = t.id AND u.v > 20)") == 0);
+    csv_to("SELECT id FROM t WHERE NOT k ORDER BY id", g_out2, sizeof g_out2);
+    char first[1 << 12];
+    snprintf(first, sizeof first, "%s", g_out2);
+    CHECK(run("ROLLBACK") == 0 && run("BEGIN") == 0);
+    CHECK(run("UPDATE t SET k = FALSE WHERE id IN (SELECT tid FROM u WHERE v > 20)") == 0);
+    csv_to("SELECT id FROM t WHERE NOT k ORDER BY id", g_out2, sizeof g_out2);
+    CHECK(!strcmp(first, g_out2));
+    CHECK(run("ROLLBACK") == 0 && run("BEGIN") == 0);
+    CHECK(run("DELETE FROM u WHERE NOT EXISTS (SELECT 1 FROM t WHERE t.id = u.tid)") == 0);
+    EXPECT("SELECT COUNT(*) FROM u WHERE tid IS NULL", "count\n0\n");
+    CHECK(run("ROLLBACK") == 0);
+    /* the transaction's own writes are what a correlated run reads */
+    CHECK(run("BEGIN") == 0 && run("INSERT INTO u VALUES (100000, 299, 1, 'q')") == 0);
+    EXPECT("SELECT id FROM t WHERE id > 296 AND EXISTS (SELECT 1 FROM u WHERE u.tid = t.id AND u.w = 'q')", "id\n299\n");
+    CHECK(run("ROLLBACK") == 0);
+    /* the memo: one run per distinct tuple of the values read (g: 1, 2 or NULL), so 3 x 300 rows past the outer 300 fit a
+     * limit of 2,000; one per row (id: 300 values) does not */
+    CHECK(run("SET statement_row_limit = 2000") == 0);
+    int nong = 0; /* t rows whose g is not NULL: u holds tids 5 and 6 */
+    for (int i = 1; i <= N; i++) nong += i % 9 == 0 || i % 7 != 0;
+    char cw[32];
+    snprintf(cw, sizeof cw, "count\n%d\n", nong);
+    EXPECT("SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.tid = t.g + 4)", cw);
+    CHECK(g_s.corr_runs == 3 && g_s.corr_hits == N - 3); /* one run each for g 1, 2 and NULL; the rest kept */
+    EXPECT("SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.tid = t.id + 4)", "ERR statement row limit");
+    CHECK(run("SET statement_row_limit = 0") == 0);
+    /* inner op outer is a plain predicate on each run (corr_pred), as a literal would be: a run tests only its matches
+     * (the rows past its predicates, on any path), the primary key's one row; as residuals the 300 runs would test
+     * 90,000 rows. The path a run takes is the planner's, as for a literal (u.tid's index once there is one) */
+    int nin = 0;
+    for (int X = 1; X <= N; X++) {
+        bool f = false;
+        for (int j = 1; j <= N; j++) f |= tid[j] == X;
+        nin += f;
+    }
+    char cin[32];
+    snprintf(cin, sizeof cin, "count\n%d\n", nin);
+    CHECK(run("SET statement_row_limit = 1000") == 0);
+    EXPECT("SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id)", "count\n300\n");
+    CHECK(g_s.corr_runs == N && g_s.corr_hits == 0 && g_s.rows_tested == 2 * N); /* a run per row, a row each */
+    for (int ix = 0; ix < 2; ix++) { /* a scan's predicate, then u.tid's index */
+        if (ix) CHECK(run("CREATE INDEX u_tid ON u (tid)") == 0);
+        EXPECT("SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.tid = t.id)", cin);
+        CHECK(g_s.corr_runs == N && g_s.rows_tested < 1000);
+        EXPECT("SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM u WHERE t.id = u.tid)", cin); /* flipped */
+    }
+    CHECK(run("SET statement_row_limit = 0") == 0);
+    EXPECT("SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM u WHERE t.g > u.v)", cw); /* v reaches -10: every g */
+    /* a correlated IN keeps a set per tuple, charged to the statement: 300 sets of ~270 values past 1 MiB */
+    CHECK(run("SET statement_memory = 1048576") == 0);
+    EXPECT("SELECT COUNT(*) FROM t WHERE id IN (SELECT tid FROM u WHERE u.id <> t.id)", "ERR statement memory");
+    CHECK(run("SET statement_memory = 0") == 0);
+    SAME("SELECT COUNT(*) FROM t WHERE id IN (SELECT tid FROM u WHERE u.id <> t.id)",
+         "SELECT COUNT(DISTINCT t.id) FROM t JOIN u ON u.tid = t.id AND u.id <> t.id");
+    /* errors are decided when the statement binds, before any row: no row needs to reach the subquery */
+    CHECK(run("CREATE TABLE e (id INT64 PRIMARY KEY, g INT64)") == 0);
+    EXPECT("SELECT id FROM e WHERE EXISTS (SELECT 1 FROM u WHERE u.tid = e.nosuch)", "ERR no column nosuch in table e");
+    EXPECT("SELECT id FROM e WHERE EXISTS (SELECT 1 FROM u WHERE u.w = e.g)", "ERR a comparison of TEXT with INT64");
+    EXPECT("SELECT id FROM e WHERE e.g IN (SELECT w FROM u WHERE u.tid = e.id)", "ERR IN compares INT64 with TEXT");
+    EXPECT("SELECT id FROM t WHERE id = (SELECT tid FROM u WHERE u.v = t.g)", "ERR returned more than one row"); /* data's */
+    /* EXPLAIN: binds the correlated subquery (its names), runs nothing, commits and locks nothing */
+    uint8_t t0[32], t1[32];
+    uint64_t seq = db->seq;
+    CHECK(imdb_view_token(db, t0, &g_e) == 0);
+    CHECK(strstr(csv("EXPLAIN DELETE FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.tid = t.id)"), "a correlated one") != NULL);
+    CHECK(g_s.rows_tested == 0 && db->seq == seq && imdb_view_token(db, t1, &g_e) == 0 && !memcmp(t0, t1, sizeof t0));
+    /* refused, each with its reason */
+    EXPECT("UPDATE t SET g = (SELECT MAX(v) FROM u WHERE u.tid = t.id)", "ERR in UPDATE's SET");
+    EXPECT("SELECT g, (SELECT MAX(v) FROM u WHERE u.tid = t.g) FROM t GROUP BY g", "ERR with GROUP BY or an aggregate");
+    EXPECT("SELECT COUNT(*), (SELECT MAX(v) FROM u WHERE u.tid = t.id) FROM t", "ERR with GROUP BY or an aggregate");
+    EXPECT("SELECT g, COUNT(*) FROM t GROUP BY g HAVING EXISTS (SELECT 1 FROM u WHERE u.tid = t.g)", "ERR with GROUP BY");
+    EXPECT("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT tid FROM u WHERE u.tid = t.id) AS q)", "ERR further out");
+    EXPECT("SELECT id FROM t, (SELECT tid FROM u WHERE u.tid = t.id) AS q", "ERR LATERAL is a later step");
+    EXPECT("SELECT id FROM t WHERE EXISTS (SELECT t.g FROM u)", "ERR a bare item's or an aggregate's column");
+    SAME("SELECT t.id FROM t JOIN z ON z.uid = t.id WHERE EXISTS (SELECT 1 FROM u WHERE u.tid = uid) ORDER BY t.id", /* z's, unqualified */
+         "SELECT t.id FROM t JOIN z ON z.uid = t.id WHERE EXISTS (SELECT 1 FROM u WHERE u.tid = z.uid) ORDER BY t.id");
+    done(db);
+}
+
 const test_case rset_tests[] = {
     {"rset_differential", t_rset_differential},
     {"rset_forms", t_rset_forms},
@@ -375,5 +569,6 @@ const test_case rset_tests[] = {
     {"rset_in_model", t_rset_in_model},
     {"rset_subq_forms", t_rset_subq_forms},
     {"rset_explain", t_rset_explain},
+    {"rset_corr", t_rset_corr},
 };
 const size_t rset_ntests = sizeof rset_tests / sizeof *rset_tests;

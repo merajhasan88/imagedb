@@ -210,6 +210,9 @@ typedef struct imdb_xset {
 
 typedef struct imdb_xnode {
     uint8_t type, scale;
+    uint8_t outer;           /* P2 S4b: an EX_COL naming a column of a statement around this one: k, a constant for
+                              * the run (col -1) */
+    uint8_t corr;            /* P2 S4b: an EX_SUBQ that is correlated: computed on each row by env->subq */
     int16_t col;             /* EX_COL: the column in the row the evaluator is given */
     uint16_t slot;           /* EX_AGG: the aggregate's accumulator */
     uint16_t gslot;          /* P2 S2: a GROUP BY key's subtree read over a group: slots[gslot - 1], else 0 */
@@ -264,6 +267,9 @@ typedef struct imdb_xenv {
     void *ctx;
     uint32_t steps;
     imdb_xarena *arena;      /* computed TEXT (NULL: none can be computed: an internal error if needed) */
+    /* P2 S4b: a correlated subquery's value (out), or IN's set (set), on this row: the statement's executor runs it
+     * with the row's values (memoized); NULL where none can be (an internal error if needed) */
+    int (*subq)(void *ctx, uint16_t k, const imdb_value *row, imdb_xval *out, const imdb_xset **set, imdb_err *e);
 } imdb_xenv;
 /* the tree at k on a row (columns by the bound col) and the aggregates' final values (slots); env may be NULL (no
  * cancellation: constants) */
