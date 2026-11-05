@@ -383,6 +383,24 @@ unreadable export, 2 the handle failed (reopen it), 3 the directory damaged or
 a replica incident recorded. An idle copy writes no export until its next
 statement: an old export with nothing running is idle, not hung.
 
+`--events FILE` (on `sql`, `apply` and `follow`) appends one JSON object a line
+to FILE, outside the data directory, each with `time_us` (the wall clock) and
+`ev`: the open and its end (its time, the snapshot's commit, the commits
+replayed) with its progress at most once a second; each CHECKPOINT, COMPACT,
+EXPIRE, RETIRE and eviction with its time; each warning; the handle's failure,
+once, with its reason; slow statements; the close. Lines are appended whole and
+never synced: the log is advisory (a failed append is counted in
+`events.errors`, never an error; a crash can tear the last line, and the next
+open appends after it: a reader skips a line that does not parse). Past 64 MiB,
+FILE becomes FILE.1 (an older FILE.1 replaced, never a file that is not an event log) and a new FILE begins.
+A FILE that is not an event log is left as it is (the copy keeps no log and
+says why). Give each process its own FILE. `SET slow_statement_ms = N` logs
+each of the session's statements that runs N milliseconds or more: its class,
+time, access path, rows tested, outcome and shape, the statement with every
+literal (number, string, TRUE, FALSE) a `?` and its comments dropped, so no
+value reaches the log, cut at 1 KiB. An open that passes two seconds prints
+its progress on stderr: the lake's segments loaded, the commits replayed.
+
 ## Supported scope
 
 One process and principal, one engine thread with worker parallelism, many

@@ -2725,7 +2725,14 @@ int imdb_lake_load_snapshot(imdb_db *db, uint64_t *seq, bool *moved, imdb_err *e
     if (!rc && !all_zero(m.prev_manifest, 32)) rc = read_obj(ofd, m.prev_manifest, ".man", &pb, &pl, e);
     db->mem_floor = imdb_window_floor(db, S); /* stage 3b: the store takes no row ended at or before it */
     db->segcache.snap_seq = S; /* a segment the open read again: its vector's ends are bounded by S (db->seq is 0) */
-    for (uint32_t ti = 0; !rc && ti < m.nt; ti++) rc = load_table(db, ofd, &m.t[ti], ti, S, m.boundary, e);
+    uint64_t nsegs = 0, segs_done = 0; /* P1 M2: the open's progress through the lake, table by table */
+    for (uint32_t ti = 0; ti < m.nt; ti++) nsegs += m.t[ti].nseg;
+    for (uint32_t ti = 0; !rc && ti < m.nt; ti++) {
+        rc = load_table(db, ofd, &m.t[ti], ti, S, m.boundary, e);
+        segs_done += m.t[ti].nseg;
+        if (!rc) imdb_progress(db, "lake", segs_done, nsegs, false);
+    }
+    if (!rc) imdb_progress(db, "lake", nsegs, nsegs, true);
     db->segcache.snap_seq = 0;
     if (!rc) {
         imdb_lthash sum;

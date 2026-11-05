@@ -343,6 +343,17 @@ typedef struct imdb_db {
     bool stats_said_failed;   /* an export has said the handle failed: until then a failed handle exports at once */
     uint64_t stmt_start_ns;   /* the running statement's start (0: none): long-running work in the export */
     char stats_buf[IMDB_STATS_EXPORT_MAX];
+    int events_fd, events_dirfd; /* P1 M2: the event log and its directory (rotation: FILE.1); -1: none */
+    char events_base[256];    /* FILE's name in that directory */
+    uint64_t events_bytes, events_lines, events_errors, events_cap; /* events_cap: tests lower it */
+    bool events_said_failed, ev_open, ev_full;
+    size_t ev_len;
+    pthread_mutex_t events_lock; /* a line is built and appended whole */
+    char events_buf[IMDB_EVENTS_LINE_MAX];
+    void (*progress)(void *ctx, const char *phase, uint64_t done, uint64_t total);
+    void *progress_ctx;
+    uint64_t progress_last_ns; /* the open's start, then the last report */
+    bool progress_said;        /* a report since the last phase ended */
     uint64_t checkpoint_bytes; /* primary: auto-CHECKPOINT past this segment size (0 = off) */
     bool lake_sync;           /* primary: CHECKPOINT after every commit that changed data (imdb_open_opts) */
     bool strict;              /* durable_ack with sync: every DURABLE record fsynced before its commit returns */
@@ -410,6 +421,10 @@ typedef struct imdb_open_opts {
     bool lake_sync;           /* publish the lake after every commit that changed data (a CHECKPOINT each: priced) */
     const char *anchor;       /* the external anchor file (log.h), outside the data directory; NULL: none */
     const char *stats_path;   /* P1 M1: the stats export (--stats FILE), outside the data directory; NULL: none */
+    const char *events_path;  /* P1 M2: the event log (--events FILE), outside the data directory; NULL: none */
+    /* P1 M2: the open's progress, at most once a second: its phase ("lake" segments, "replay" commits), done of total */
+    void (*progress)(void *ctx, const char *phase, uint64_t done, uint64_t total);
+    void *progress_ctx;
     bool accept_rollback;     /* an anchor newer than the log: continue from the log and rewrite the anchor */
     bool durable_ack;         /* fsync DURABLE before each durable commit returns (log.h: strict): a damaged frame past
                                  it is then provably unacknowledged and recovery may drop it; +1 device flush
@@ -867,6 +882,23 @@ void imdb_stats_tick(imdb_db *db, bool force);
  * recorded (replicas/NAME.diverged); no open, no replay */
 int imdb_health_dir(const char *path, imdb_err *e);
 
+/* P1 M2: the event log (imdb_open_opts.events_path): JSON lines, one an event, appended whole under events_lock,
+ * never synced, advisory (a failed append is counted, never an error), FILE.1 past events_cap. An event is begun,
+ * given fields (keys are the engine's own words; strings are escaped: quotes, backslashes, control bytes, and invalid
+ * UTF-8 as U+FFFD, cut between sequences to fit), and ended; with no log they cost a test of events_fd. Never a row
+ * value: engine messages carry none, and a slow statement's text is its shape (imdb_sql_shape). */
+void imdb_event_begin(imdb_db *db, const char *ev);
+void imdb_event_int(imdb_db *db, const char *key, int64_t v);
+void imdb_event_str(imdb_db *db, const char *key, const char *s, size_t n);
+void imdb_event_end(imdb_db *db);
+/* P1 M2: the open's progress (phase, done of total): the opener's callback and an event, at most once a second from the
+ * open's start, and at the end (last) of a phase that reported */
+void imdb_progress(imdb_db *db, const char *phase, uint64_t done, uint64_t total, bool last);
+extern uint64_t imdb_progress_every_ns; /* a second; tests lower it */
+/* P1 M2: the handle failed: its event, once (a statement's end, a refused statement, the close) */
+void imdb_event_failed(imdb_db *db, const char *reason);
+
+void imdb_event_maint(imdb_db *db, int k, uint64_t ns); /* P1 M2: its event (db.c) */
 /* P1 M1: a maintenance op of kind k that began at t0 (imdb_mono_ns) has ended: its count and time */
 static inline void imdb_stats_maint(imdb_db *db, int k, uint64_t t0)
 {
@@ -875,6 +907,7 @@ static inline void imdb_stats_maint(imdb_db *db, int k, uint64_t t0)
     db->stats.maint_ns[k] += d;
     db->stats.maint_last_ns[k] = d;
     if (d > db->stats.maint_max_ns[k]) db->stats.maint_max_ns[k] = d;
+    imdb_event_maint(db, k, d); /* P1 M2 */
 }
 
 #endif

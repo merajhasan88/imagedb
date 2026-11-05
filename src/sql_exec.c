@@ -3903,6 +3903,8 @@ static bool is_write(uint8_t k)
 /* A read statement's workspace (P0 R2): what SET statement_memory says, else a quarter of the memory budget, at most
  * IMDB_MAX_RESULT_BYTES (the result cap before R2, which this replaces: the result is part of the workspace) */
 /* P1 M1: a statement's class in SHOW STATS */
+static const char *const stmt_class_name[IMDB_SC_N] = {"read", "write", "transaction", "ddl", "physical", "show", "other"};
+
 static int stmt_class(int kind)
 {
     switch (kind) {
@@ -3951,6 +3953,7 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
         imdb_sql_stmt_free(st);
         imdb_free(st);
         imdb_stats_tick(db, !db->stats_said_failed); /* P1 M1: a monitor learns the handle failed */
+        imdb_event_failed(db, db->warning); /* P1 M2: the failure's event, if no statement logged it */
         return imdb_fail(e, IMDB_ERR_STATE, "database is in a failed state; reopen it to recover");
     }
     if ((db->pending_auth || db->lake_unverified) && st->kind != ST_VERIFY) {
@@ -4270,6 +4273,12 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
                 rc = imdb_fail(e, IMDB_ERR_INVALID, "statement_memory is 0 (the default) or %llu to %llu bytes",
                                (unsigned long long)IMDB_MIN_STATEMENT_MEMORY, (unsigned long long)IMDB_MAX_STATEMENT_MEMORY);
             else ss->stmt_memory = (uint64_t)v;
+        } else if (strcmp(st->set_name, "slow_statement_ms") == 0) { /* P1 M2: the event log's slow statements */
+            int64_t v;
+            imdb_err ep = {0};
+            if (imdb_parse_int64(st->set_value, strlen(st->set_value), &v, &ep) || v < 0 || v > IMDB_MAX_STATEMENT_TIMEOUT_MS)
+                rc = imdb_fail(e, IMDB_ERR_INVALID, "slow_statement_ms is 0 (none) to %u milliseconds", IMDB_MAX_STATEMENT_TIMEOUT_MS);
+            else ss->slow_ms = (uint32_t)v;
         } else if (strcmp(st->set_name, "statement_row_limit") == 0) { /* D8 #4: rows tested; 0: none */
             int64_t v;
             imdb_err ep = {0};
@@ -4297,7 +4306,7 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
                 rc = imdb_fail(e, IMDB_ERR_INVALID, "min_commit is a commit number (0: no requirement)");
             else ss->min_commit = (uint64_t)v;
         } else {
-            rc = imdb_fail(e, IMDB_ERR_NOTFOUND, "unknown setting %s (cross_check, access_path, join_plan, identity, min_commit, idle_in_transaction_timeout, statement_memory, statement_row_limit, statement_timeout, sync_replicas, transaction_timeout, sync_timeout_ms)",
+            rc = imdb_fail(e, IMDB_ERR_NOTFOUND, "unknown setting %s (cross_check, access_path, join_plan, identity, min_commit, idle_in_transaction_timeout, statement_memory, statement_row_limit, statement_timeout, slow_statement_ms, sync_replicas, transaction_timeout, sync_timeout_ms)",
                            st->set_name);
         }
         if (!rc) snprintf(r->status, sizeof r->status, "SET %s = %s", st->set_name, st->set_value);
@@ -4358,6 +4367,24 @@ done:
     ss->rows_tested = x.tested; /* D8 #4: the first plan's count, for the caller and the tests */
     if (ss->txn.open) ss->txn.last_ns = mono_ns(); /* R4: idle from here */
     if (ceiling) imdb_heap_ceiling_set(0, 0);
+    { /* P1 M2: a slow statement (its shape: no row value) and the handle's failure, once, in the event log */
+        uint64_t us = (mono_ns() - now_ns) / 1000u;
+        if (ss->slow_ms && us >= (uint64_t)ss->slow_ms * 1000u && db->events_fd >= 0) {
+            char shape[1024];
+            imdb_sql_shape(sql, len, shape, sizeof shape);
+            const char *cn = stmt_class_name[stmt_class(st->kind)];
+            imdb_event_begin(db, "slow");
+            imdb_event_str(db, "class", cn, strlen(cn));
+            imdb_event_int(db, "ms", (int64_t)(us / 1000u));
+            imdb_event_str(db, "path", r->path, strlen(r->path));
+            imdb_event_int(db, "rows_tested", (int64_t)x.tested);
+            imdb_event_int(db, "rc", rc);
+            imdb_event_int(db, "cross_check", ss->cross_check ? 1 : 0); /* both plans' time when 1 */
+            imdb_event_str(db, "shape", shape, strlen(shape));
+            imdb_event_end(db);
+        }
+        if (db->failed) imdb_event_failed(db, rc ? e->msg : db->warning);
+    }
     /* P1 M1: the end is exported at once when an export during the statement said it runs (else an idle copy would
      * show it running until its next statement), or when the handle failed and no export has said so yet */
     bool said_running = db->stmt_start_ns && db->stats_last_ns >= db->stmt_start_ns;

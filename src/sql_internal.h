@@ -142,6 +142,8 @@ typedef struct sql_stmt {
 } sql_stmt;
 
 int imdb_sql_lex(const char *s, size_t n, sql_tok **toks, uint32_t *ntok, imdb_err *e);
+/* P1 M2: the shape of statement s for the event log (literals as ?, comments dropped, cut to cap on a token) */
+size_t imdb_sql_shape(const char *s, size_t n, char *out, size_t cap);
 int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e);
 void imdb_sql_stmt_free(sql_stmt *st);
 bool imdb_sql_has_agg(const sql_stmt *st, uint16_t k); /* the tree at k holds an aggregate */

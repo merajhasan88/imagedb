@@ -89,6 +89,7 @@ static uint64_t g_mem_limit; /* --mem-limit (db.h: the memory budget), for the c
 static uint64_t g_mem_window; /* --mem-window (db.h: the memory window, stage 3b; 0: the default) */
 static uint64_t g_seg_cache; /* --seg-cache (db.h: the segment cache, stage 3c-1; 0: the default) */
 static const char *g_stats_path; /* --stats FILE (P1 M1: the stats export), for the command's open */
+static const char *g_events_path; /* --events FILE (P1 M2: the event log), for the command's open */
 
 /* SECONDS: decimal digits, no leading zero, at most a century; or none: no version leaves memory */
 static bool parse_window(const char *s, uint64_t *out)
@@ -135,14 +136,31 @@ static bool parse_seg_cache(const char *s, uint64_t *out)
     return parse_size(s, out);
 }
 
+/* P1 M2: an open past two seconds says how far it has come, on stderr, at most once a second (the engine's rate) */
+static uint64_t g_open_began_ns;
+static void open_progress(void *ctx, const char *phase, uint64_t done, uint64_t total)
+{
+    (void)ctx;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+    if (now - g_open_began_ns < 2000000000u) return;
+    fprintf(stderr, "imagedb: opening: %s %llu of %llu\n", strcmp(phase, "lake") == 0 ? "lake segments" : "commits replayed",
+            (unsigned long long)done, (unsigned long long)total);
+}
+
 static imdb_db *open_anchored(const char *dir, bool ro, int sync, const char *anchor, bool accept_rollback,
                               bool durable_ack)
 {
     imdb_open_opts o = {.sync = sync, .read_only = ro, .anchor = anchor, .accept_rollback = accept_rollback,
                         .durable_ack = durable_ack, .mem_limit = g_mem_limit, .mem_window_us = g_mem_window,
-                        .seg_cache_bytes = g_seg_cache, .stats_path = g_stats_path};
+                        .seg_cache_bytes = g_seg_cache, .stats_path = g_stats_path, .events_path = g_events_path,
+                        .progress = open_progress};
     imdb_db *db;
     imdb_err e = {0};
+    struct timespec t0; /* open_progress prints once the open passes two seconds from here */
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    g_open_began_ns = (uint64_t)t0.tv_sec * 1000000000u + (uint64_t)t0.tv_nsec;
     if (imdb_open(dir, &o, &db, &e)) {
         print_err("open", &e);
         return NULL;
@@ -337,6 +355,7 @@ static int cmd_sql(int argc, char **argv)
         else if (strcmp(argv[i], "--lake-sync") == 0) lake_sync = true;
         else if (strcmp(argv[i], "--anchor") == 0 && i + 1 < argc) anchor = argv[++i];
         else if (strcmp(argv[i], "--stats") == 0 && i + 1 < argc) g_stats_path = argv[++i];
+        else if (strcmp(argv[i], "--events") == 0 && i + 1 < argc) g_events_path = argv[++i];
         else if (strcmp(argv[i], "--accept-rollback") == 0) accept_rollback = true;
         else if (strcmp(argv[i], "--durable-ack") == 0) durable_ack = true;
         else if (strcmp(argv[i], "--mem-limit") == 0 && i + 1 < argc) {
@@ -497,6 +516,10 @@ static int cmd_follow(int argc, char **argv)
     int dd = 3; /* where "--" is, past the options */
     while (dd + 1 < argc && strcmp(argv[dd], "--") != 0) {
         if (strcmp(argv[dd], "--mem-limit") == 0 && parse_size(argv[dd + 1], &g_mem_limit)) dd += 2;
+        else if (strcmp(argv[dd], "--events") == 0) {
+            g_events_path = argv[dd + 1];
+            dd += 2;
+        }
         else if (strcmp(argv[dd], "--stats") == 0) {
             g_stats_path = argv[dd + 1];
             dd += 2;
@@ -504,6 +527,7 @@ static int cmd_follow(int argc, char **argv)
         else if (strcmp(argv[dd], "--mem-window") == 0 && parse_window(argv[dd + 1], &g_mem_window)) dd += 2;
         else if (strcmp(argv[dd], "--seg-cache") == 0 && parse_seg_cache(argv[dd + 1], &g_seg_cache)) dd += 2;
         else if (strcmp(argv[dd], "--mem-limit") != 0 && strcmp(argv[dd], "--mem-window") != 0 && strcmp(argv[dd], "--stats") != 0 &&
+                 strcmp(argv[dd], "--events") != 0 &&
                  strcmp(argv[dd], "--seg-cache") != 0)
             return usage();
         else {
@@ -1069,6 +1093,7 @@ int main(int argc, char **argv)
             if (strcmp(argv[i], "--durable-ack") == 0) durable_ack = true;
             else if (strcmp(argv[i], "--mem-limit") == 0 && i + 1 < argc && parse_size(argv[i + 1], &g_mem_limit)) i++;
             else if (strcmp(argv[i], "--stats") == 0 && i + 1 < argc) g_stats_path = argv[++i];
+            else if (strcmp(argv[i], "--events") == 0 && i + 1 < argc) g_events_path = argv[++i];
             else if (strcmp(argv[i], "--mem-window") == 0 && i + 1 < argc && parse_window(argv[i + 1], &g_mem_window)) i++;
             else if (strcmp(argv[i], "--seg-cache") == 0 && i + 1 < argc && parse_seg_cache(argv[i + 1], &g_seg_cache)) i++;
             else return usage();

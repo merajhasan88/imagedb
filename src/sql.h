@@ -62,6 +62,7 @@ typedef struct imdb_session {
     uint64_t cross_checks_run;
     uint64_t row_limit;       /* SET statement_row_limit = n: a statement testing more rows fails (D8 #4; 0: none) */
     uint64_t rows_tested;     /* the last statement's rows tested (its first plan's; the work limit's count) */
+    uint32_t slow_ms;         /* SET slow_statement_ms = ms: a statement past it is an event in the log (P1 M2; 0: none) */
     uint32_t stmt_timeout_ms; /* SET statement_timeout = ms: a statement running longer is cancelled (0: none) */
     uint32_t txn_timeout_ms;  /* SET transaction_timeout = ms: a transaction older can only roll back (R4; 0: none) */
     uint32_t idle_timeout_ms; /* SET idle_in_transaction_timeout = ms: one idle longer, the same (R4; 0: none) */

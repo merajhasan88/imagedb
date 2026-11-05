@@ -4108,6 +4108,10 @@ void imdb_reset_state(imdb_db *db)
 int imdb_close(imdb_db *db)
 {
     if (!db) return IMDB_OK;
+    if (db->failed) imdb_event_failed(db, db->warning); /* P1 M2: a failure no statement logged */
+    imdb_event_begin(db, "close"); /* P1 M2 */
+    imdb_event_int(db, "commit", (int64_t)db->seq);
+    imdb_event_end(db);
     if (db->stats_fd >= 0) { /* P1 M1: the export's last word, then its file closed */
         imdb_stats_tick(db, true);
         close(db->stats_fd);
@@ -4155,9 +4159,61 @@ int imdb_close(imdb_db *db)
     if (db->anchor_lockfd >= 0) close(db->anchor_lockfd); /* the lease goes last */
     if (db->dirfd >= 0) close(db->dirfd);
     imdb_free(db->path);
+    if (db->events_fd >= 0) close(db->events_fd); /* P1 M2 */
+    if (db->events_dirfd >= 0) close(db->events_dirfd);
+    pthread_mutex_destroy(&db->events_lock);
     pthread_mutex_destroy(&db->segcache.lock);
     imdb_free(db);
     return rc;
+}
+
+/* P1 M2: the event log, an operator's path (as the anchor and the stats export): appended, never overwritten; a FILE
+ * that is neither empty nor events (its first bytes) is left as it is. Never the open's failure. */
+static void events_open(imdb_db *db, const char *path)
+{
+    const char *base = NULL;
+    imdb_err ee = {0};
+    int pfd = imdb_open_parent(path, &base, &ee);
+    bool foreign = false;
+    int fd = -1;
+    int oerr = 0;
+    if (pfd >= 0 && strlen(base) < sizeof db->events_base) {
+        fd = imdb_io_openat(pfd, base, O_RDWR | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0644);
+        oerr = fd < 0 ? errno : 0;
+        char h[11];
+        ssize_t hn = fd < 0 ? 0 : imdb_io_pread(fd, h, sizeof h, 0);
+        if (hn > 0 && (hn < (ssize_t)sizeof h || memcmp(h, "{\"time_us\":", sizeof h) != 0)) {
+            close(fd);
+            fd = -1;
+            foreign = true;
+        }
+    }
+    struct stat st;
+    if (fd >= 0 && imdb_io_fstat(fd, &st) == 0) {
+        db->events_fd = fd;
+        db->events_dirfd = pfd;
+        db->events_bytes = (uint64_t)st.st_size;
+        snprintf(db->events_base, sizeof db->events_base, "%s", base);
+        return;
+    }
+    if (fd >= 0) close(fd);
+    if (pfd >= 0) close(pfd);
+    db->events_errors++;
+    if (foreign) imdb_warn(db, "the event log %s holds something else (not events): it is left as it is, none is kept", path);
+    else
+        imdb_warn(db, "the event log %s cannot be written (%s): none is kept", path,
+                  pfd < 0 ? ee.msg : oerr ? strerror(oerr) : "its name is too long");
+}
+
+/* P1 M2: a maintenance op's event (imdb_stats_maint) */
+void imdb_event_maint(imdb_db *db, int k, uint64_t ns)
+{
+    static const char *const mt[IMDB_MT_N] = {"checkpoint", "compact", "expire", "retire", "evict"};
+    if (db->events_fd < 0 || k < 0 || k >= IMDB_MT_N) return;
+    imdb_event_begin(db, mt[k]);
+    imdb_event_int(db, "ms", (int64_t)(ns / 1000000u));
+    imdb_event_int(db, "commit", (int64_t)db->seq);
+    imdb_event_end(db);
 }
 
 int imdb_open(const char *path, const imdb_open_opts *o, imdb_db **out, imdb_err *e)
@@ -4176,8 +4232,23 @@ int imdb_open(const char *path, const imdb_open_opts *o, imdb_db **out, imdb_err
         imdb_free(db);
         return imdb_fail(e, IMDB_ERR_NOMEM, "cannot make the segment cache's lock");
     }
+    if (pthread_mutex_init(&db->events_lock, NULL) != 0) { /* P1 M2: second; imdb_close destroys it too */
+        pthread_mutex_destroy(&db->segcache.lock);
+        imdb_free(db);
+        return imdb_fail(e, IMDB_ERR_NOMEM, "cannot make the event log's lock");
+    }
     db->dirfd = db->logfd = db->lockfd = db->logdirfd = db->durfd = db->anchorfd = db->anchor_lockfd = -1;
     db->stats_fd = -1; /* P1 M1: 0 is a file descriptor */
+    db->events_fd = db->events_dirfd = -1; /* P1 M2 */
+    db->progress = o ? o->progress : NULL;
+    db->progress_ctx = o ? o->progress_ctx : NULL;
+    db->progress_last_ns = open_t0; /* the first report a second into the open */
+    if (o && o->events_path) events_open(db, o->events_path);
+    imdb_event_begin(db, "open");
+    imdb_event_str(db, "path", path, strlen(path));
+    imdb_event_int(db, "read_only", o && o->read_only);
+    imdb_event_int(db, "pid", (int64_t)getpid());
+    imdb_event_end(db);
     db->ci_first = 1;
     db->pin_max_lag = IMDB_PIN_MAX_LAG;
     db->sync = o ? o->sync : 1;
@@ -4256,6 +4327,10 @@ int imdb_open(const char *path, const imdb_open_opts *o, imdb_db **out, imdb_err
     if ((rc = imdb_lake_open(db, e))) goto fail;
     db->replaying = true;
     rc = imdb_replay(db, ro, e);
+    if (!rc) { /* P1 M2: the replay's end, if it reported */
+        uint64_t k = db->seq > db->snapshot_seq ? db->seq - db->snapshot_seq : db->seq;
+        imdb_progress(db, "replay", k, k, true);
+    }
     db->replaying = false;
     if (rc) goto fail;
     if ((rc = imdb_index_build_all(db, e))) goto fail; /* once, after the replay: one sort each */
@@ -4315,6 +4390,12 @@ int imdb_open(const char *path, const imdb_open_opts *o, imdb_db **out, imdb_err
     db->stats.opened_us = imdb_now_us(); /* P1 M1 */
     db->stats.open_ns = imdb_mono_ns() - open_t0;
     db->stats.open_replayed = db->seq > db->lake_seq ? db->seq - db->lake_seq : 0; /* past its snapshot, or all */
+    imdb_event_begin(db, "opened"); /* P1 M2 */
+    imdb_event_int(db, "ms", (int64_t)(db->stats.open_ns / 1000000u));
+    imdb_event_int(db, "commit", (int64_t)db->seq);
+    imdb_event_int(db, "snapshot", (int64_t)db->lake_seq);
+    imdb_event_int(db, "replayed", (int64_t)db->stats.open_replayed);
+    imdb_event_end(db);
     if (o && o->stats_path) { /* P1 M1: the export, an operator's path (as the anchor): advisory, never the open's failure */
         const char *base = NULL;
         imdb_err se = {0};
@@ -4344,6 +4425,13 @@ int imdb_open(const char *path, const imdb_open_opts *o, imdb_db **out, imdb_err
     *out = db;
     return IMDB_OK;
 fail:
+    imdb_event_begin(db, "open_failed"); /* P1 M2: the open's last word, before its handle goes */
+    imdb_event_str(db, "error", e->msg, strlen(e->msg));
+    imdb_event_end(db);
+    if (db->events_fd >= 0) { /* the log's last line for this handle: no close follows an open that never was */
+        close(db->events_fd);
+        db->events_fd = -1;
+    }
     imdb_close(db);
     return rc;
 }
@@ -4552,6 +4640,9 @@ void imdb_warn(imdb_db *db, const char *fmt, ...)
     vsnprintf(m, sizeof m, fmt, ap);
     va_end(ap);
     if (strstr(db->warning, m)) return;
+    imdb_event_begin(db, "warning"); /* P1 M2: each new warning, once */
+    imdb_event_str(db, "message", m, strlen(m));
+    imdb_event_end(db);
     size_t used = strlen(db->warning);
     snprintf(db->warning + used, sizeof db->warning - used, "%s%s", used ? "; " : "", m);
 }
@@ -4734,6 +4825,8 @@ int imdb_stats_each(imdb_db *db, imdb_stat_fn fn, void *ctx, bool walk_disk)
     STAT("disk.lake_bytes", disk ? (int64_t)lake_b : -1);
     STAT("export.writes", db->stats_exports);
     STAT("export.errors", db->stats_errors);
+    STAT("events.lines", db->events_lines); /* P1 M2 */
+    STAT("events.errors", db->events_errors);
 #undef STAT
     return 0;
 }
@@ -4819,4 +4912,168 @@ int imdb_health_dir(const char *path, imdb_err *e)
     }
     close(dfd);
     return rc;
+}
+
+/* ---- P1 M2: the event log ------------------------------------------------------------------------------------------- */
+
+/* The engine thread logs every event (one engine thread a handle, db.h); the lock keeps a line whole all the same. */
+
+static void ev_raw(imdb_db *db, const char *s, size_t n)
+{
+    if (db->ev_full) return;
+    if (n > sizeof db->events_buf - db->ev_len) {
+        db->ev_full = true;
+        return;
+    }
+    memcpy(db->events_buf + db->ev_len, s, n);
+    db->ev_len += n;
+}
+
+/* a JSON string: quotes and backslashes escaped, bytes below 0x20 as \u00XX, a sequence that is not UTF-8 as �;
+ * cut between characters (with "...") to leave room for the line's end, so the line always parses */
+static void ev_json(imdb_db *db, const char *s, size_t n)
+{
+    ev_raw(db, "\"", 1);
+    const uint8_t *p = (const uint8_t *)s;
+    for (size_t i = 0; i < n && !db->ev_full;) {
+        char t[8];
+        size_t k = 1, tl;
+        uint8_t c = p[i];
+        if (c == '"' || c == '\\') {
+            t[0] = '\\';
+            t[1] = (char)c;
+            tl = 2;
+        } else if (c < 0x20) {
+            tl = (size_t)snprintf(t, sizeof t, "\\u%04x", c);
+        } else if (c < 0x80) {
+            t[0] = (char)c;
+            tl = 1;
+        } else {
+            k = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : 2;
+            size_t bad;
+            if (k <= n - i && imdb_utf8_valid(p + i, k, &bad)) {
+                memcpy(t, p + i, k);
+                tl = k;
+            } else {
+                memcpy(t, "\\ufffd", 6);
+                tl = 6;
+                k = 1;
+            }
+        }
+        if (tl + 8 > sizeof db->events_buf - db->ev_len) { /* room for ...", "}" and "\n" */
+            ev_raw(db, "...", 3);
+            break;
+        }
+        ev_raw(db, t, tl);
+        i += k;
+    }
+    ev_raw(db, "\"", 1);
+}
+
+void imdb_event_begin(imdb_db *db, const char *ev)
+{
+    if (db->events_fd < 0) return;
+    pthread_mutex_lock(&db->events_lock);
+    db->ev_open = true;
+    db->ev_full = false;
+    db->ev_len = 0;
+    char head[64];
+    int k = snprintf(head, sizeof head, "{\"time_us\":%llu,\"ev\":", (unsigned long long)imdb_now_us());
+    ev_raw(db, head, (size_t)k);
+    ev_json(db, ev, strlen(ev));
+}
+
+void imdb_event_int(imdb_db *db, const char *key, int64_t v)
+{
+    if (db->events_fd < 0 || !db->ev_open) return;
+    char t[96];
+    int k = snprintf(t, sizeof t, ",\"%s\":%lld", key, (long long)v);
+    if (k > 0 && (size_t)k < sizeof t) ev_raw(db, t, (size_t)k);
+}
+
+void imdb_event_str(imdb_db *db, const char *key, const char *s, size_t n)
+{
+    if (db->events_fd < 0 || !db->ev_open) return;
+    ev_raw(db, ",\"", 2);
+    ev_raw(db, key, strlen(key));
+    ev_raw(db, "\":", 2);
+    ev_json(db, s, n);
+}
+
+/* name in dirfd is an event log (its first bytes), empty, or missing: one this log may replace */
+static bool events_ours(int dirfd, const char *name)
+{
+    int fd = imdb_io_openat(dirfd, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC, 0);
+    if (fd < 0) return errno == ENOENT;
+    char h[11];
+    ssize_t hn = imdb_io_pread(fd, h, sizeof h, 0);
+    close(fd);
+    return hn == 0 || (hn == (ssize_t)sizeof h && memcmp(h, "{\"time_us\":", sizeof h) == 0);
+}
+
+void imdb_event_end(imdb_db *db)
+{
+    if (db->events_fd < 0 || !db->ev_open) return;
+    db->ev_open = false;
+    ev_raw(db, "}\n", 2);
+    if (db->ev_full) { /* the strings are cut to fit: only a line of too many fields lands here */
+        db->events_errors++;
+        pthread_mutex_unlock(&db->events_lock);
+        return;
+    }
+    uint64_t cap = db->events_cap ? db->events_cap : IMDB_EVENTS_CAP;
+    if (db->events_bytes && db->events_bytes + db->ev_len > cap) { /* FILE becomes FILE.1, a new FILE begins */
+        char old[sizeof db->events_base + 4];
+        snprintf(old, sizeof old, "%s.1", db->events_base);
+        if (events_ours(db->events_dirfd, old) &&
+            imdb_io_renameat(db->events_dirfd, db->events_base, db->events_dirfd, old) == 0) {
+            close(db->events_fd);
+            db->events_fd = imdb_io_openat(db->events_dirfd, db->events_base, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW |
+                                           O_CLOEXEC, 0644);
+            db->events_bytes = 0;
+            if (db->events_fd < 0) { /* no log from here: counted, as any failure */
+                db->events_errors++;
+                pthread_mutex_unlock(&db->events_lock);
+                return;
+            }
+        } else {
+            db->events_errors++; /* FILE.1 is someone else's, or the rename failed: this goes on, past its cap */
+        }
+    }
+    imdb_err we = {0};
+    if (imdb_write_all(db->events_fd, db->events_buf, db->ev_len, &we))
+        db->events_errors++;
+    else {
+        db->events_bytes += db->ev_len;
+        db->events_lines++;
+    }
+    pthread_mutex_unlock(&db->events_lock);
+}
+
+void imdb_event_failed(imdb_db *db, const char *reason)
+{
+    if (db->events_fd < 0 || db->events_said_failed) return;
+    imdb_event_begin(db, "failed");
+    imdb_event_str(db, "reason", reason, strlen(reason));
+    imdb_event_end(db);
+    db->events_said_failed = true;
+}
+
+uint64_t imdb_progress_every_ns = 1000000000u;
+
+void imdb_progress(imdb_db *db, const char *phase, uint64_t done, uint64_t total, bool last)
+{
+    if (!db->progress && db->events_fd < 0) return;
+    uint64_t now = imdb_mono_ns();
+    /* a second since the open began or the last report; a phase's end only when the phase reported (no flood when
+     * DURABLE lags the log, none for a short open) */
+    if (last ? !db->progress_said : now - db->progress_last_ns < imdb_progress_every_ns) return;
+    db->progress_last_ns = now;
+    db->progress_said = done < total; /* short of the end: the phase's end is reported too */
+    if (db->progress) db->progress(db->progress_ctx, phase, done, total);
+    imdb_event_begin(db, "progress");
+    imdb_event_str(db, "phase", phase, strlen(phase));
+    imdb_event_int(db, "done", (int64_t)done);
+    imdb_event_int(db, "total", (int64_t)total);
+    imdb_event_end(db);
 }

@@ -1097,3 +1097,42 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
     if (rc) imdb_sql_stmt_free(st);
     return rc;
 }
+
+/* P1 M2: a statement's shape for the event log: its tokens joined by one space, every number, string and boolean literal a ?,
+ * comments never copied (the lexer skips them: they may hold anything), cut on a token boundary with " ..." to fit cap
+ * (NUL included). No row value is ever in it. A text the lexer refuses is "(not lexed)". */
+size_t imdb_sql_shape(const char *s, size_t n, char *out, size_t cap)
+{
+    if (cap < 5) { /* not even " ..." fits */
+        if (cap) out[0] = 0;
+        return 0;
+    }
+    out[0] = 0;
+    sql_tok *t = NULL;
+    uint32_t nt = 0;
+    imdb_err e = {0};
+    if (imdb_sql_lex(s, n, &t, &nt, &e)) {
+        snprintf(out, cap, "(not lexed)");
+        return strlen(out);
+    }
+    size_t len = 0;
+    for (uint32_t i = 0; i < nt && t[i].kind != TK_EOF; i++) {
+        bool lit = t[i].kind == TK_INT || t[i].kind == TK_DEC || t[i].kind == TK_STR || t[i].kind == TK_FLOAT;
+        if (t[i].kind == TK_IDENT && ((t[i].len == 4 && !strncasecmp(s + t[i].off, "true", 4)) ||
+                                      (t[i].len == 5 && !strncasecmp(s + t[i].off, "false", 5))))
+            lit = true; /* a boolean is a value too (an INSERT's); NULL names none */
+        const char *p = lit ? "?" : s + t[i].off;
+        size_t k = lit ? 1 : t[i].len;
+        if (len + (len ? 1 : 0) + k + 5 > cap) { /* room for " ..." and the NUL */
+            memcpy(out + len, " ...", 4);
+            len += 4;
+            break;
+        }
+        if (len) out[len++] = ' ';
+        memcpy(out + len, p, k);
+        len += k;
+    }
+    out[len] = 0;
+    imdb_free(t);
+    return len;
+}

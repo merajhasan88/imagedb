@@ -76,5 +76,7 @@
 #define IMDB_MAX_STATEMENT_MEMORY (16ull << 30) /* and its most; the default is IMDB_MAX_RESULT_BYTES or a budget's quarter */
 #define IMDB_MAX_STATEMENT_ROW_LIMIT (1ull << 62) /* SET statement_row_limit: rows a statement may test (0: none) */
 #define IMDB_STATS_EXPORT_MAX 16384 /* P1 M1: the stats export's file, whole (a fixed buffer in imdb_db: no allocation) */
+#define IMDB_EVENTS_LINE_MAX 8192  /* P1 M2: one event's line, its strings escaped and cut to fit (a fixed buffer) */
+#define IMDB_EVENTS_CAP (64ull << 20) /* P1 M2: the event log's size before it becomes FILE.1 and a new FILE begins */
 
 #endif
