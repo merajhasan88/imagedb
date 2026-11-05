@@ -50,12 +50,31 @@ TSRC    = $(wildcard tests/unit/*.c)
 TOBJ    = $(TSRC:tests/unit/%.c=$(BUILD)/tobj/%.o) $(BUILD)/tobj/acrypto.o $(BUILD)/tobj/afsum.o
 TBIN    = $(BUILD)/test_unit
 
-.PHONY: all lint test unit san tsan ct fuzz fuzz-run bench whole index-sum mem-split join-cost clean integration faults soak oracle
+.PHONY: all lint test unit san tsan ct fuzz fuzz-run bench whole index-sum mem-split join-cost clean integration faults soak oracle install uninstall
 
 AUDIT   = $(BUILD)/imagedb-audit
 ASRC    = tools/audit/audit.c tools/audit/acrypto.c tools/audit/afsum.c
 
 all: $(BIN) $(AUDIT)
+
+# make install (P1 A1): the CLI and the auditor, the static library, the README and the licence; DESTDIR stages
+# it (a package). A sanitizer build (SAN=1) is never installed.
+PREFIX  ?= /usr/local
+ifneq ($(SAN),)
+install:
+	@echo "make install: not a sanitizer build (SAN=1)"; exit 1
+else
+install: $(BIN) $(AUDIT) $(LIB)
+	install -d $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/lib $(DESTDIR)$(PREFIX)/share/doc/imagedb
+	install -m 0755 $(BIN) $(AUDIT) $(DESTDIR)$(PREFIX)/bin/
+	install -m 0644 $(LIB) $(DESTDIR)$(PREFIX)/lib/
+	install -m 0644 README.md LICENSE $(DESTDIR)$(PREFIX)/share/doc/imagedb/
+endif
+
+uninstall:
+	rm -f $(DESTDIR)$(PREFIX)/bin/imagedb $(DESTDIR)$(PREFIX)/bin/imagedb-audit $(DESTDIR)$(PREFIX)/lib/libimagedb.a
+	rm -f $(DESTDIR)$(PREFIX)/share/doc/imagedb/README.md $(DESTDIR)$(PREFIX)/share/doc/imagedb/LICENSE
+	-rmdir $(DESTDIR)$(PREFIX)/share/doc/imagedb
 
 # The independent verifier shares no code with src/ (see tools/audit/acrypto.h).
 $(AUDIT): $(ASRC) tools/audit/acrypto.h tools/audit/afsum.h | $(BUILD)/obj
@@ -120,6 +139,7 @@ lint:
 	  { echo "raw allocation in src/: use the imdb_alloc* helpers (util.h; the tests fail them at will)"; exit 1; }
 	@! grep -nE '(^|[^_a-zA-Z0-9.>"])free\(' $(filter-out src/util.c src/main.c,$(wildcard src/*.c)) || \
 	  { echo "raw free in src/: use imdb_free (util.h: the heap's counter credits it)"; exit 1; }
+	@sh tools/check_options.sh # every SET, option and IMDB_ variable src/ reads is in the README's table (P1 A1)
 
 # The fault group (t_fault.c) runs in the first pass only: the second repeats the kernels in their
 # C references, which the fault handling does not depend on. The third evicts at every publish (IMDB_EVICT=eager,

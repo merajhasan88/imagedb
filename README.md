@@ -57,6 +57,7 @@ is right.
 ```sh
 make                    # gcc or clang, make, NASM; the engine links only libc and pthread
 make NOASM=1            # without the NASM kernels (make clean when switching)
+make install            # PREFIX=/usr/local, DESTDIR to stage; make uninstall
 build/imagedb init /data/p
 build/imagedb sql /data/p
 build/imagedb sql /data/p -f script.sql   # or piped: each statement runs as it is read, any size
@@ -140,6 +141,22 @@ RETENTION 30 DAYS`). DROP TABLE commits on its own, outside an explicit
 transaction, and a transaction that wrote or locked rows of the table can then
 only roll back. `SHOW TABLES` lists a dropped table with the commit that
 dropped it (`dropped_at`); ERASE SUBJECT still reaches its history.
+
+**Install.** `make install` puts `imagedb` and `imagedb-audit` in `PREFIX/bin`,
+`libimagedb.a` in `PREFIX/lib` and this README and the licence in
+`PREFIX/share/doc/imagedb` (`PREFIX=/usr/local` by default; `DESTDIR` stages
+it, for a package); `make uninstall` removes them. A sanitizer build is never
+installed.
+
+**Platforms.** Linux on x86-64. The kernels are chosen at run time: AVX2 where
+the CPU has it, their C references elsewhere (`IMDB_NO_SIMD=1` forces those;
+the test matrix runs both); `make NOASM=1` builds without NASM. Tested here:
+Linux 6.8 (Ubuntu 22.04) on an Intel Core i7-8550U, gcc 11.4 (the builds) and
+clang 14 (the ThreadSanitizer, MemorySanitizer and fuzz builds), NASM 2.15;
+data directories on ext4 (power cuts replayed through dm-log-writes) and tmpfs.
+Untested: other systems and architectures, other file systems (XFS, btrfs,
+network file systems), a CPU without AVX2 (its code path runs only under
+`IMDB_NO_SIMD=1`), AVX-512 and SHA-NI machines.
 
 ## Durability and recovery
 
@@ -401,6 +418,87 @@ literal (number, string, TRUE, FALSE) a `?` and its comments dropped, so no
 value reaches the log, cut at 1 KiB. An open that passes two seconds prints
 its progress on stderr: the lake's segments loaded, the commits replayed.
 
+## Options and settings
+
+Every command-line option, session setting and environment variable, in one
+place; the sections above say more. `make lint` checks that each one the code
+reads is listed here.
+
+Command-line options (`imagedb` with no arguments prints the commands):
+
+| Option | Commands | What it does | Default |
+|---|---|---|---|
+| `-c SQL` | sql | runs SQL; repeatable | |
+| `-f FILE` | sql | runs a script, each statement as it is read, any size | |
+| `--csv` | sql | prints results as CSV | a table |
+| `--cross-check` | sql | `SET cross_check = on` for the session | off |
+| `--nosync` | sql | commits are not fdatasynced until a clean close | synced |
+| `--lake-sync` | sql | a CHECKPOINT after every change (priced) | off |
+| `--durable-ack` | sql, apply | DURABLE fsynced before each commit returns | off |
+| `--read-only` | sql | opens without writing anything (a replica's reads) | writable |
+| `--anchor FILE` | sql, verify, promote | an external anchor: a log rolled back behind it is refused | none |
+| `--accept-rollback` | sql | continues from a log behind the anchor, rewriting it | off |
+| `--mem-limit BYTES` | sql, apply, follow | the memory budget (K, M or G) | none |
+| `--mem-window SECONDS\|none` | sql, apply, follow | versions ended within it stay in memory | 600 |
+| `--seg-cache BYTES\|all` | sql, apply, follow | the lake's segment images kept in memory | 256 MB |
+| `--stats FILE` | sql, apply, follow | writes the stats export (Monitoring) | none |
+| `--stats FILE` | health | reads that export too | the directory only |
+| `--events FILE` | sql, apply, follow | the event log (Monitoring) | none |
+| `--root KEY` | init | a root key that may certify a promotion | none |
+| `--digest-alg N` | init | the state digest's algorithm, 1 or 2 | `IMDB_DIGEST_ALG`, else 2 |
+| `--identity FILE` | init-replica | a replica from a primary's identity file | |
+| `--after N` | ship | the commits after N | 0 |
+| `--after PREV` | backup | an incremental backup after backup PREV | a full one |
+| `--follow` | ship | keeps shipping new commits | stops at the end |
+| `--acks` | ship | reads the replica's acknowledgements on stdin | off |
+| `--new` | replica-key | a new replica key: a new incarnation | the existing key |
+| `--replace` | replica-add | gives an allowlisted replica a new key | refused |
+| `--max-statement-s N` | health | a statement running longer is unhealthy (exit 1) | 60 |
+| `--discard-tail` | recover | cuts the damaged end of the log | inspect only |
+| `--save FILE` | recover | the cut bytes, saved first | |
+| `--key FILE` | backup, backup-verify, restore | the backup key | |
+| `--out FILE` | backup | the backup's file | |
+| `--scratch DIR` | backup-verify | where the test restore runs | |
+| `--until N` | restore | through commit N | the last |
+| `--until-time TS` | restore | through the last commit at or before TS | the last |
+| `--root-key FILE` | promote | the root key certifying the promotion | |
+| `--abandon` | promote | with `--anchor`: drops old-writer commits past its cut | refused |
+| `--old-writer-stopped` | promote | without an anchor: your word that the old writer is stopped | |
+
+Session settings (`SET name = value`; each session's own, from the next
+statement):
+
+| Setting | Values | Default | What it does |
+|---|---|---|---|
+| `cross_check` | on, off | off | runs each read along a second path too and fails on any difference |
+| `access_path` | auto, index, scan, store, ordered | auto | forces a table's read path (EXPLAIN shows it) |
+| `join_plan` | auto, hash, index | auto | forces a join's plan |
+| `identity` | on, off | off | a read's result also names the database, its head, digest and manifest |
+| `min_commit` | a commit number | 0 (none) | a read on a copy not yet at that commit is refused |
+| `statement_timeout` | 0 to 86,400,000 ms | 0 (none) | cancels a statement that runs longer |
+| `transaction_timeout` | 0 to 86,400,000 ms | 0 (none) | a transaction older than it can only roll back (from the next BEGIN) |
+| `idle_in_transaction_timeout` | 0 to 86,400,000 ms | 0 (none) | a transaction idle that long can only roll back (from the next BEGIN) |
+| `statement_memory` | 0, or 1 MiB to 16 GiB | 0: a quarter of the budget, or 1 GiB | a read statement's hard memory limit |
+| `statement_row_limit` | 0 to 2^62 rows | 0 (none) | the rows a statement may test |
+| `slow_statement_ms` | 0 to 86,400,000 ms | 0 (none) | statements at least that long go to the event log |
+| `sync_replicas` | 0 to 64 | 0 | a commit waits for that many replicas' acknowledgements (a primary's) |
+| `sync_timeout_ms` | 1 to 3,600,000 ms | 10,000 | how long a commit waits for them |
+
+`BEGIN ISOLATION LEVEL SNAPSHOT | REPEATABLE READ | READ COMMITTED | READ
+UNCOMMITTED` (or `SET TRANSACTION ISOLATION LEVEL ...`) chooses a transaction's
+isolation: SNAPSHOT by default; REPEATABLE READ is SNAPSHOT, READ UNCOMMITTED is
+READ COMMITTED (uncommitted data is never visible), SERIALIZABLE is refused.
+
+Environment variables:
+
+| Variable | What it does |
+|---|---|
+| `IMDB_THREADS=N` | the worker pool's size (default: the CPUs the process may use); 1 runs every parallel loop inline |
+| `IMDB_DIGEST_ALG=1\|2` | the digest algorithm of the databases `init` creates (default 2); never read when a database opens |
+| `IMDB_NO_SIMD=1` | the C reference kernels and the reference Ed25519, whatever the CPU |
+| `IMDB_EVICT=eager` | a test mode: every publish evicts what it can (reads below the floor go to the lake) |
+| `IMDB_SEGCACHE=tiny` | a test mode: no segment image is kept between operations |
+
 ## Supported scope
 
 One process and principal, one engine thread with worker parallelism, many
@@ -415,8 +513,7 @@ rounded once) and nullable non-key columns. Comparisons with NULL, including
 NULL parameters, are refused: use IS NULL / IS NOT NULL.
 
 TEXT is UTF-8, validated, without NUL, and compared and ordered byte by byte: there
-are no collations. imagedb runs on Linux on x86-64 (AVX2 kernels, or the portable C
-ones with `make NOASM=1`); other systems are untested.
+are no collations. Platforms: see Build and quickstart.
 
 Arithmetic: `+ - * / %`, unary minus and parentheses in SELECT lists, WHERE,
 UPDATE ... SET and VALUES, aggregates included:
