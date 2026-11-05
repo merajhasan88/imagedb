@@ -50,6 +50,7 @@
 #define IMDB_MAX_ERASE_ENTRIES  (1u << 24)   /* versions named by one ERASE          */
 #define IMDB_MAX_SEGMENTS       65536u       /* live segments per table              */
 #define IMDB_MAX_GROUPS         (1u << 22)   /* groups produced by one GROUP BY      */
+#define IMDB_MAX_GROUP_KEYS     8u           /* GROUP BY keys (P2 S2)                */
 #define IMDB_CHECKPOINT_BYTES   (64ull << 20) /* default auto-CHECKPOINT segment size (primary) */
 #define IMDB_LOG_FILL_CHUNK     (1u << 20)   /* zeros written ahead in a tagged segment at a time (design.md §3) */
 #define IMDB_LOG_FILL_LOW       (256u << 10) /* less fill than this left after an append: the next chunk */

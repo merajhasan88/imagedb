@@ -552,6 +552,19 @@ INT64 is a DECIMAL with six decimal places, rounded half away from zero, while
 `SUM(a) / COUNT(*)` stays an INT64 division and truncates; of a DECIMAL it keeps
 six more places than the column. design.md §5 ("Aggregates").
 
+Grouping: `GROUP BY` takes up to eight keys, each a column or an expression
+(`GROUP BY region, LOWER(name)`); a select item outside an aggregate must be a
+key or built from keys. Aggregates take `DISTINCT` and `FILTER (WHERE ...)`:
+
+```sql
+SELECT region, amount >= 1000 AS large, COUNT(DISTINCT customer),
+       SUM(amount) FILTER (WHERE status = 'paid')
+FROM orders GROUP BY region, amount >= 1000;
+```
+
+Groups come in their keys' order (each ascending, NULL last). A key must read a
+column: `GROUP BY 1` is refused (no positions yet). design.md §5 ("Grouping").
+
 Functions and forms, wherever a value stands:
 
 ```sql

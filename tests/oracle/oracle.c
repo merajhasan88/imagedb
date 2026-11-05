@@ -209,6 +209,7 @@ typedef struct xnode {
     int64_t a1, a2; /* P2 S1: ROUND's places (-1: none), SUBSTR's start and length (-1: none) */
     double f;     /* X_VAL of a FLOAT64 */
     char s[136];  /* X_TXT, X_VAL of a TEXT, X_LIKE's pattern */
+    bool dist;    /* P2 S2: X_AGG over its DISTINCT values (a FILTER (WHERE c): x3) */
 } xnode;
 
 typedef struct stmt {
@@ -240,6 +241,8 @@ typedef struct stmt {
     int offset;        /* OFFSET n; 0: none (OFFSET 0 is never drawn) */
     int hv;            /* HAVING (1e): a condition's tree (index + 1), else 0 */
     bool fns;          /* P2 S1: it holds a function, CASE, CAST, IN, LIKE or || (counted when compared) */
+    int gk[3], ngk;    /* P2 S2: GROUP BY these trees (gcol -1) */
+    bool grp;          /* P2 S2's form (counted when compared) */
 } stmt;
 
 static int64_t g_next_id;          /* the next new key of t, of u */
@@ -506,6 +509,9 @@ static bool lite_ok(const stmt *q, int k, bool under_flt)
     const xnode *n = XN(q, k);
     if (n->op == X_IN && XN(q, n->l)->op == X_COL && XN(q, n->l)->ty == CT_DEC) return true; /* P2 S1: d IN (values):
                                                                                            * its scaled integers */
+    if (n->op == X_AGG && n->fn != F_AVG && n->l && XN(q, n->l)->op == X_COL) /* P2 S2: COUNT, SUM, MIN, MAX of a bare
+                                                                              * column: d's its scaled integers */
+        return lite_ok(q, n->x3, false);
     if (n->ty == CT_DEC && !(n->op == X_DEC && under_flt)) return false;
     return lite_ok(q, n->l, n->ty == CT_FLT) && lite_ok(q, n->r, n->ty == CT_FLT) && lite_ok(q, n->x3, n->ty == CT_FLT);
 }
@@ -1298,11 +1304,73 @@ static void gen_fselect(stmt *q)
         if (q->ord[i].pos && q->it[q->ord[i].pos - 1].ex && txt_computed(q, q->it[q->ord[i].pos - 1].ex)) q->skip |= 1u << D_MS;
 }
 
+/* P2 S2: GROUP BY one to three keys (columns, LOWER(s), a % 3, CAST(g AS TEXT), a CASE), each repeated as an item, and
+ * aggregates with DISTINCT and FILTER (WHERE c) over bare columns (a bare DECIMAL's SUM is SQLite's scaled integer:
+ * lite_ok takes it); no order: compared as a multiset */
+static void gen_gselect(stmt *q)
+{
+    q->tab = 0;
+    q->join = chance(20) ? (int)rr(1, 2) : 0;
+    q->grp = true;
+    q->fns = true;
+    int nk = (int)rr(1, 3);
+    for (int i = 0; i < nk; i++) {
+        int r = (int)rr(0, 99), k;
+        if (r < 50) {
+            int tab = q->join && chance(30) ? 1 : 0;
+            int col = tab ? (int)rr(1, 3) : (int[]){1, 2, 4, 5, 6, 7, 8}[rnd() % 7];
+            k = xcol(q, tab, col);
+            q->it[q->nit++] = (item){F_COL, tab, col, 0};
+        } else {
+            if (r < 65) {
+                k = xfn(q, XF_LOWER, xcol(q, 0, 6), 0, CT_TXT, 0);
+            } else if (r < 80) {
+                k = xnew(q, X_MOD, xcol(q, 0, 2), xlit_int(q, 3));
+            } else if (r < 90) {
+                k = xcast(q, xcol(q, 0, 1), CT_TXT, 0);
+            } else {
+                int col = (int[]){1, 2}[rnd() % 2]; /* g or a: a key reads a column (a constant one is refused) */
+                int lit = xlit_int(q, rr(-3, 6));
+                int c = xbool(q, X_CMP, xcol(q, 0, col), lit);
+                XN(q, c)->fn = (int)rr(OP_EQ, OP_GE);
+                k = xnew(q, X_CASE, c, xtxt(q, "hi"));
+                XN(q, k)->x3 = xtxt(q, "lo");
+                XN(q, k)->ty = CT_TXT;
+            }
+            q->it[q->nit++] = (item){F_COL, 0, 0, k};
+        }
+        q->gk[q->ngk++] = k;
+    }
+    int na = (int)rr(1, 3);
+    for (int i = 0; i < na; i++) {
+        int fn = (int)rr(F_COUNT_STAR, F_MAX), a = 0;
+        if (fn != F_COUNT_STAR) {
+            int tab = q->join && chance(30) ? 1 : 0, col;
+            if (fn == F_SUM) col = tab ? 2 : (int[]){0, 1, 2, 4, 5}[rnd() % 5]; /* id, g, a, d, f; u's v */
+            else col = tab ? (int)rr(1, 3) : (int[]){0, 1, 2, 4, 5, 6, 8}[rnd() % 7]; /* not BOOL (SQL Server's BIT) */
+            a = xcol(q, tab, col);
+        }
+        int k = xnew(q, X_AGG, a, 0);
+        xnode *n = XN(q, k);
+        n->fn = fn;
+        n->ty = fn == F_COUNT_STAR || fn == F_COUNT ? CT_INT : XN(q, a)->ty;
+        n->sc = n->ty == CT_DEC ? XN(q, a)->sc : 0;
+        n->dist = fn != F_COUNT_STAR && chance(40);
+        if (chance(40)) XN(q, k)->x3 = gen_fcond(q); /* FILTER (WHERE c) */
+        q->it[q->nit++] = (item){F_COL, 0, 0, k};
+    }
+    for (int i = 0; i < q->nit; i++) xmark(q, q->it[i].ex);
+}
+
 static void gen_select(stmt *q)
 {
     memset(q, 0, sizeof *q);
     q->kind = Q_SELECT;
     q->gcol = -1;
+    if (g_fns && chance(10)) { /* P2 S2 */
+        gen_gselect(q);
+        return;
+    }
     if (g_fns && chance(12)) { /* P2 S1 */
         gen_fselect(q);
         return;
@@ -1855,8 +1923,29 @@ static void put_x(sb *b, int d, const stmt *q, int k, int pty)
         return;
     case X_AGG: {
         static const char *const FN[] = {"", "COUNT", "COUNT", "SUM", "MIN", "MAX", "AVG"};
+        /* P2 S2: FILTER (WHERE c) native in imagedb, SQLite and PostgreSQL; the others' agg(CASE WHEN c THEN x END),
+         * COUNT(*)'s COUNT(CASE WHEN c THEN 1 END) */
+        bool native = d == D_IMDB || d == D_SQLITE || d == D_PG, rewrite = n->x3 && !native;
         if (n->fn == F_COUNT_STAR) {
+            if (rewrite) {
+                sb_str(b, "COUNT(CASE WHEN ");
+                put_x(b, d, q, n->x3, -1);
+                sb_str(b, " THEN 1 END)");
+                return;
+            }
             sb_str(b, "COUNT(*)");
+            if (n->x3) sb_str(b, " FILTER (WHERE "), put_x(b, d, q, n->x3, -1), sb_str(b, ")");
+            return;
+        }
+        if (n->dist || n->x3) {
+            bool cast = n->fn == F_SUM && n->ty == CT_INT && (d == D_PG || d == D_MY || d == D_MA);
+            if (cast) sb_str(b, "CAST(");
+            sb_printf(b, "%s(%s", FN[n->fn], n->dist ? "DISTINCT " : "");
+            if (rewrite) sb_str(b, "CASE WHEN "), put_x(b, d, q, n->x3, -1), sb_str(b, " THEN ");
+            put_x(b, d, q, n->l, n->ty);
+            sb_str(b, rewrite ? " END)" : ")");
+            if (n->x3 && native) sb_str(b, " FILTER (WHERE "), put_x(b, d, q, n->x3, -1), sb_str(b, ")");
+            if (cast) sb_str(b, d == D_PG ? " AS BIGINT)" : " AS SIGNED)");
             return;
         }
         /* an integer SUM is NUMERIC in PostgreSQL and DECIMAL in MySQL and MariaDB, which never overflow: cast to
@@ -2118,6 +2207,15 @@ static void print_stmt(sb *b, int d, const stmt *q)
     if (q->gcol >= 0) {
         sb_str(b, " GROUP BY ");
         put_col(b, q, 0, q->gcol);
+    }
+    if (q->ngk) { /* P2 S2: each key as its item prints it (a bare column unqualified alike) */
+        sb_str(b, " GROUP BY ");
+        for (int g = 0; g < q->ngk; g++) {
+            const xnode *n = XN(q, q->gk[g]);
+            if (g) sb_str(b, ", ");
+            if (n->op == X_COL) put_col(b, q, n->tab, n->col);
+            else put_x(b, d, q, q->gk[g], -1);
+        }
     }
     if (q->hv) { /* 1e */
         sb_str(b, " HAVING ");
@@ -2844,6 +2942,7 @@ static int cmp_rows(const void *a, const void *b) { return strcmp(*(char *const 
 
 static long g_mismatches, g_compared, g_checkpoints, g_reopens, g_drops;
 static long g_fn_compared; /* P2 S1: comparisons of statements holding its forms */
+static long g_grp_compared; /* P2 S2: comparisons of its grouped form */
 
 static void show_rows(const res *r, size_t from)
 {
@@ -2972,6 +3071,7 @@ static int run_stmt(unsigned seed, int step, const stmt *q, bool state)
         if (!g_eng[d].on || (q->skip & (1u << d))) continue;
         g_compared++;
         if (q->fns) g_fn_compared++;
+        if (q->grp) g_grp_compared++;
         const res *o = &out[d];
         const char *why = NULL;
         size_t at = 0;
@@ -3196,6 +3296,7 @@ int main(int argc, char **argv)
     for (int i = 0; i < g_npaths; i++) printf("  %7ld  %s\n", g_paths[i].n, g_paths[i].path);
     printf("oracle: EXPLAIN checked against the run on %ld SELECTs, %ld disagreements\n", g_explained, g_explain_bad);
     bool servers = g_eng[D_PG].on || g_eng[D_MY].on || g_eng[D_MA].on || g_eng[D_MS].on;
+    printf("oracle: %ld comparisons of P2 S2's grouped form (several keys and trees, DISTINCT, FILTER)\n", g_grp_compared);
     printf("oracle: %ld comparisons of statements with P2 S1's forms (functions, CASE, CAST, IN, LIKE, ||); ROUND of a "
            "FLOAT64, LOWER and UPPER compared with SQLite alone%s\n", g_fn_compared,
            servers ? "" : " (UNGUARDED: no server engine was run, so a CAST to DECIMAL, the DECIMAL functions and SQL "

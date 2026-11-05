@@ -1007,6 +1007,10 @@ int imdb_x_eval(const sql_stmt *st, const imdb_xnode *xn, uint16_t k, const imdb
     const imdb_xnode *b = &xn[k];
     imdb_xval l, r, h;
     imdb_xlist it;
+    if (slots && b->gslot) { /* P2 S2: a GROUP BY key over its group (per row, slots is NULL: it is computed) */
+        *out = slots[b->gslot - 1];
+        return IMDB_OK;
+    }
     switch (x->op) {
     case EX_LIT: *out = b->k; return IMDB_OK;
     case EX_COL: imdb_x_from_value(&row[b->col], out); return IMDB_OK;

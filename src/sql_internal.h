@@ -49,6 +49,7 @@ typedef struct sql_expr {
     uint16_t x3;             /* EX_CMP BETWEEN: its upper bound; LIKE: its ESCAPE, else 0; EX_CASE: its ELSE */
     uint8_t fn, nargs;       /* EX_FN (P2 S1): FN_*, and its arguments' count */
     uint8_t ctype, cscale, cprec; /* EX_CAST (P2 S1): the target type, scale and precision (a DECIMAL's) */
+    bool dist;               /* EX_AGG (P2 S2): agg(DISTINCT x); its FILTER (WHERE c) is x3 */
     sql_lit lit;             /* EX_LIT */
     char qual[IMDB_MAX_IDENT + 1]; /* EX_COL: a.col's a, or "" */
     char col[IMDB_MAX_IDENT + 1];
@@ -130,6 +131,11 @@ typedef struct sql_stmt {
     uint16_t nitems;
     bool has_group;
     uint16_t having;                            /* HAVING: a condition over the groups (1e), else 0 */
+    uint8_t ngroup;                             /* P2 S2: GROUP BY's keys, each a tree (group_ex); group_qual and
+                                                 * group_col name the one key that is a bare column (the path of one
+                                                 * column, unchanged), else group_col is "" */
+    uint16_t group_ex[IMDB_MAX_GROUP_KEYS];
+    uint32_t group_off[IMDB_MAX_GROUP_KEYS], group_len[IMDB_MAX_GROUP_KEYS]; /* each key's text (EXPLAIN) */
     char group_qual[IMDB_MAX_IDENT + 1], group_col[IMDB_MAX_IDENT + 1];
     bool has_asof;
     sql_lit asof;                               /* INT = commit seq, TS/STR = time */
@@ -185,10 +191,12 @@ typedef struct imdb_xnode {
     uint8_t type, scale;
     int16_t col;             /* EX_COL: the column in the row the evaluator is given */
     uint16_t slot;           /* EX_AGG: the aggregate's accumulator */
+    uint16_t gslot;          /* P2 S2: a GROUP BY key's subtree read over a group: slots[gslot - 1], else 0 */
     imdb_xval k;             /* EX_LIT: the constant */
 } imdb_xnode;
 
 #define IMDB_X_MAX_SCALE 38
+#define IMDB_X_GSLOT0 IMDB_MAX_COLS /* P2 S2: GROUP BY key j's slot is IMDB_X_GSLOT0 + j, past every aggregate's */
 /* the result type of a op b (EX_ADD .. EX_MOD), or an error: the bind-time half of every rule */
 int imdb_x_type(uint8_t op, uint8_t ta, uint8_t sa, uint8_t tb, uint8_t sb, uint8_t *rt, uint8_t *rs, imdb_err *e);
 /* a column's value as an expression value (a FLOAT64 key becomes its double) */

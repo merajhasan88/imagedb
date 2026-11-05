@@ -544,10 +544,27 @@ static int primary(parser *p, uint16_t *out, unsigned depth)
     if (agg && p->t[p->i + 1].kind == TK_LP) { /* p->i is an identifier, not the end: p->i + 1 is a token */
         p->i += 2;
         uint16_t a = 0;
-        if (agg == AGG_COUNT && tok(p, TK_STAR)) agg = AGG_COUNT_STAR;
-        else if (bexpr(p, &a, depth + 1)) return p->e->code;
-        if (expect(p, TK_RP, ")") || ex_new(p, EX_AGG, a, 0, out)) return p->e->code;
+        bool dist = kw(p, "distinct"); /* P2 S2: agg(DISTINCT x), agg(ALL x) */
+        if (!dist) kw(p, "all");
+        if (agg == AGG_COUNT && tok(p, TK_STAR)) {
+            if (dist) return imdb_fail(p->e, IMDB_ERR_SYNTAX, "COUNT(DISTINCT *) is not SQL: COUNT(DISTINCT x) counts x's values");
+            agg = AGG_COUNT_STAR;
+        } else if (bexpr(p, &a, depth + 1)) {
+            return p->e->code;
+        }
+        uint16_t f = 0;
+        if (expect(p, TK_RP, ")")) return p->e->code;
+        if (tok_is_kw(p, p->i, "filter") && p->t[p->i + 1].kind == TK_LP) { /* FILTER (WHERE c): rows where c is TRUE */
+            p->i += 2;
+            if (expect_kw(p, "where") || bexpr(p, &f, depth + 1) || expect(p, TK_RP, ")")) return p->e->code;
+        }
+        if (ex_new(p, EX_AGG, a, 0, out)) return p->e->code;
         p->st->ex[*out].agg = agg;
+        p->st->ex[*out].dist = dist;
+        p->st->ex[*out].x3 = f;
+        sql_expr *x = &p->st->ex[*out];
+        if (f && p->st->ex[f].h + 1u > x->h) x->h = (uint8_t)(p->st->ex[f].h + 1u); /* walkers follow x3 too */
+        if (x->h > IMDB_MAX_EXPR_DEPTH) return too_deep(p);
         return IMDB_OK;
     }
     if (kw(p, "case")) return case_expr(p, out, depth); /* P2 S1 */
@@ -999,7 +1016,8 @@ static int parse_select(parser *p, sql_stmt *st)
             if (x->op == EX_COL) { /* today's shapes: a column, an aggregate of a column, COUNT(*) */
                 memcpy(it->qual, x->qual, sizeof it->qual);
                 memcpy(it->col, x->col, sizeof it->col);
-            } else if (x->op == EX_AGG && x->agg != AGG_AVG && (!a || a->op == EX_COL)) { /* AVG: a tree's slot */
+            } else if (x->op == EX_AGG && x->agg != AGG_AVG && !x->dist && !x->x3 && (!a || a->op == EX_COL)) { /* AVG,
+                                                     * DISTINCT and FILTER (P2 S2): a tree's slot */
                 it->agg = x->agg;
                 if (a) {
                     memcpy(it->qual, a->qual, sizeof it->qual);
@@ -1054,7 +1072,22 @@ static int parse_select(parser *p, sql_stmt *st)
     }
     if (kw(p, "where") && preds(p, st)) return p->e->code;
     if (kw(p, "group")) {
-        if (expect_kw(p, "by") || qident(p, st->group_qual, st->group_col)) return p->e->code;
+        if (expect_kw(p, "by")) return p->e->code;
+        do { /* P2 S2: keys are trees; the one bare column keeps group_qual and group_col (the path of one column) */
+            if (st->ngroup >= IMDB_MAX_GROUP_KEYS)
+                return imdb_fail(p->e, IMDB_ERR_LIMIT, "GROUP BY has more than %u keys", IMDB_MAX_GROUP_KEYS);
+            uint8_t g = st->ngroup;
+            uint32_t from = p->t[p->i].off - (p->t[p->i].kind == TK_STR);
+            if (bexpr(p, &st->group_ex[g], 0)) return p->e->code;
+            st->group_off[g] = from;
+            st->group_len[g] = p->t[p->i - 1].off + p->t[p->i - 1].len + (p->t[p->i - 1].kind == TK_STR) - from;
+            st->ngroup++;
+        } while (tok(p, TK_COMMA));
+        const sql_expr *g0 = &st->ex[st->group_ex[0]];
+        if (st->ngroup == 1 && g0->op == EX_COL) {
+            memcpy(st->group_qual, g0->qual, sizeof st->group_qual);
+            memcpy(st->group_col, g0->col, sizeof st->group_col);
+        }
         st->has_group = true;
     }
     if (kw(p, "having")) { /* 1e: a condition over the groups (or the one aggregate row) */

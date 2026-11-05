@@ -99,6 +99,7 @@ int main(int argc, char **argv)
         {"events", events_tests, &events_ntests},
         {"explain", explain_tests, &explain_ntests},
         {"sqlfn", sqlfn_tests, &sqlfn_ntests},
+        {"group", group_tests, &group_ntests},
         {"backup", backup_tests, &backup_ntests},
         {"expr", expr_tests, &expr_ntests},
         {"cancel", cancel_tests, &cancel_ntests},
