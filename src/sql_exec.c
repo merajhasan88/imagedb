@@ -2727,6 +2727,15 @@ typedef struct jctx {
     imdb_table *t[2];
     imdb_table *ct;              /* the combined columns, for the statement's sink and its result */
     int key[2];                  /* the ON column of each side */
+    bool keep[2];                /* P2 S3: the sides whose every row is kept, NULL-extended where nothing matched:
+                                  * LEFT side 0, RIGHT side 1, FULL both (left: keep[0]) */
+    uint8_t nkey;                /* P2 S3: key pairs, keys[s][i] (key[s] is keys[s][0]); 0 (CROSS): one key, every pair */
+    int16_t keys[2][IMDB_MAX_JOIN_KEYS];
+    imdb_buf kbuf;               /* a row's key pairs encoded (nkey > 1) */
+    uint16_t onc[IMDB_MAX_PREDICATES]; /* P2 S3: ON's conditions besides its key pairs, on each candidate pair */
+    uint16_t nonc;
+    imdb_value nulls0[IMDB_MAX_COLS]; /* P2 S3: side 0 NULL-extended (RIGHT, FULL) */
+    qspec post0;                 /* P2 S3: WHERE on side 0 when side 1 is kept, applied to joined rows */
     uint16_t nc[2];
     bool left;
     qspec post;                  /* LEFT: WHERE on side 1, applied to joined rows (np 0: none) */
@@ -2773,6 +2782,55 @@ static bool join_key(const imdb_value *v, imdb_value *k)
     return true;
 }
 
+/* P2 S3: a row's join key: one pair's column as join_key reads it; several pairs encoded together (key_enc; a NULL in
+ * any: no key, as NULL = x is unknown); none (CROSS): one key for every row. 1 a key, 0 none, or an error */
+static int join_rowkey(jctx *j, int side, const imdb_value *vals, imdb_value *k, imdb_err *e)
+{
+    if (j->nkey == 1) return join_key(&vals[j->key[side]], k);
+    if (!j->nkey) {
+        *k = (imdb_value){.type = IMDB_T_INT64};
+        return 1;
+    }
+    j->kbuf.len = 0;
+    for (uint8_t i = 0; i < j->nkey; i++) {
+        const imdb_value *v = &vals[j->keys[side][i]];
+        if (v->null) return 0;
+        imdb_xval xv;
+        imdb_x_from_value(v, &xv);
+        key_enc(&j->kbuf, &xv);
+    }
+    if (imdb_buf_check(&j->kbuf, e)) return e->code;
+    *k = (imdb_value){.type = IMDB_T_TEXT, .s = j->kbuf.p, .len = (uint32_t)j->kbuf.len};
+    return 1;
+}
+
+/* P2 S3: ON's other conditions on a candidate pair (side 0's row a, side 1's b): its key pairs past the first (plan C
+ * probes by that one alone; equal and not NULL), then its other conditions, each TRUE (UNKNOWN fails, as in WHERE) */
+static int join_on(jctx *j, const imdb_value *a, const imdb_value *b, bool *ok, imdb_err *e)
+{
+    *ok = true;
+    for (uint8_t i = 1; i < j->nkey; i++) {
+        const imdb_value *va = &a[j->keys[0][i]], *vb = &b[j->keys[1][i]];
+        if (va->null || vb->null || imdb_value_cmp(va, vb) != 0) {
+            *ok = false;
+            return IMDB_OK;
+        }
+    }
+    if (!j->nonc) return IMDB_OK;
+    imdb_value cv[IMDB_MAX_COLS];
+    memcpy(cv, a, j->nc[0] * sizeof *cv);
+    memcpy(cv + j->nc[0], b, j->nc[1] * sizeof *cv);
+    xctx *x = j->x;
+    imdb_xmark m = imdb_xarena_mark(&x->arena);
+    for (uint16_t i = 0; i < j->nonc && *ok; i++) {
+        imdb_xval v;
+        if (imdb_x_eval(x->st, x->xn, j->onc[i], cv, NULL, &x->env, &v, e)) return e->code;
+        *ok = imdb_x_true(&v);
+    }
+    imdb_xarena_reset(&x->arena, m);
+    return IMDB_OK;
+}
+
 /* The working set's charges count what it uses, not what its arrays have allocated: doubling
  * leaves up to as much again uncounted (imdb_mem and res_row count capacities) */
 static int join_charge(jctx *j, uint64_t bytes, imdb_err *e)
@@ -2800,6 +2858,8 @@ static void join_free(jctx *j)
     }
     imdb_free(j->chunks);
     imdb_wipe(j->brow, sizeof j->brow);
+    if (j->kbuf.p) imdb_wipe(j->kbuf.p, j->kbuf.cap); /* row values */
+    imdb_buf_free(&j->kbuf);
     j->lists = NULL;
     j->ent = NULL;
     j->matched = NULL;
@@ -2835,6 +2895,9 @@ static void join_need(jctx *j)
         x_cols(st, j->x->xn, cmp_root(&st->where[j->resid[i]]), use, off, n);
     }
     for (uint16_t i = 0; j->build == 1 && i < j->post.np; i++) use[j->post.p[i].col] = true;
+    for (uint16_t i = 0; j->build == 0 && i < j->post0.np; i++) use[j->post0.p[i].col] = true; /* P2 S3 */
+    for (uint16_t i = 0; i < j->nonc; i++) x_cols(st, j->x->xn, j->onc[i], use, off, n); /* ON's other conditions */
+    for (uint8_t i = 1; i < j->nkey; i++) use[j->keys[j->build][i]] = true; /* its pairs past the first (join_on) */
     j->nneed = 0;
     for (int c = 0; c < n; c++)
         if (use[c]) j->need[j->nneed++] = (uint16_t)c;
@@ -2884,6 +2947,7 @@ static void join_emit(sink *k, uint64_t va, uint64_t vb, const imdb_value *a, co
         return;
     }
     if (j->post.never || (j->post.np && !preds_ok(&j->post, b))) return;
+    if (j->post0.never || (j->post0.np && !preds_ok(&j->post0, a))) return; /* P2 S3: side 0's under RIGHT, FULL */
     imdb_value cv[IMDB_MAX_COLS];
     if (!j->rows || j->nresid) {
         memcpy(cv, a, j->nc[0] * sizeof *cv);
@@ -2930,8 +2994,13 @@ static void join_build_row(sink *k, uint64_t vid, const imdb_value *vals)
 {
     jctx *j = k->j;
     imdb_value key;
-    bool has_key = join_key(&vals[j->key[j->build]], &key);
-    if (!has_key && !(j->left && j->build == 0)) return;
+    int hk = j->nkey == 1 ? join_key(&vals[j->key[j->build]], &key) : join_rowkey(j, j->build, vals, &key, k->e);
+    if (hk < 0) {
+        k->err = hk;
+        return;
+    }
+    bool has_key = hk > 0;
+    if (!has_key && !j->keep[j->build]) return; /* a kept side's row is kept whatever its key */
     if (j->nent >= IMDB_MAX_JOIN_ROWS) {
         k->err = imdb_fail(k->e, IMDB_ERR_LIMIT, "a join side of more than %u rows: narrow it with WHERE", IMDB_MAX_JOIN_ROWS);
         return;
@@ -3021,19 +3090,37 @@ static void join_probe_row(sink *k, uint64_t vid, const imdb_value *vals)
     int p = 1 - j->build;
     imdb_value key;
     const imdb_vlist *l = NULL;
-    if (join_key(&vals[j->key[p]], &key)) {
+    int hk = j->nkey == 1 ? join_key(&vals[j->key[p]], &key) : join_rowkey(j, p, vals, &key, k->e);
+    if (hk < 0) {
+        k->err = hk;
+        return;
+    }
+    if (hk) {
         uint64_t *li = imdb_hmap_get(&j->map, &key);
         if (li) l = &j->lists[*li];
     }
+    bool any = false;
     for (uint32_t i = 0; l && i < l->n && !k->err; i++) {
         if (ktick(k, 1)) break; /* a key of many matches: each pair */
         uint64_t o = l->v[i], bvid = j->ent[o];
         const imdb_value *other = join_kept(j, o);
+        if (j->nonc) { /* P2 S3: ON's other conditions (the hash key holds every pair) */
+            bool ok;
+            if (join_on(j, p == 0 ? vals : other, p == 0 ? other : vals, &ok, k->e)) {
+                k->err = k->e->code;
+                break;
+            }
+            if (!ok) continue;
+        }
+        any = true;
         if (j->matched) j->matched[o] = 1;
         if (p == 0) join_emit(k, vid, bvid, vals, other);
         else join_emit(k, bvid, vid, other, vals);
     }
-    if (!l && j->left && p == 0) join_emit(k, vid, IMDB_NONE, vals, j->nulls);
+    if (!any && !k->err && j->keep[p]) { /* a kept side's row that nothing matched: NULL-extended */
+        if (p == 0) join_emit(k, vid, IMDB_NONE, vals, j->nulls);
+        else join_emit(k, IMDB_NONE, vid, j->nulls0, vals);
+    }
 }
 
 /* Plan C's probe of side `in`: its own predicates, then ON's equality on its key column, whose value
@@ -3087,13 +3174,24 @@ static void join_outer_row(sink *k, uint64_t vid, const imdb_value *vals)
             return;
         }
     }
-    if (!j->omatched && j->left) join_emit(k, vid, IMDB_NONE, vals, j->nulls); /* LEFT: side 0 is the outer one */
+    if (!j->omatched && j->keep[j->outer]) { /* the kept side is the outer one (join_choose) */
+        if (j->outer == 0) join_emit(k, vid, IMDB_NONE, vals, j->nulls);
+        else join_emit(k, IMDB_NONE, vid, j->nulls0, vals);
+    }
 }
 
 /* plan C: a row the probe found; its read path checked it against the side's predicates and ON */
 static void join_inner_row(sink *k, uint64_t vid, const imdb_value *vals)
 {
     jctx *j = k->j;
+    if (j->nonc || j->nkey > 1) { /* P2 S3: ON's other pairs and conditions (the probe used its first pair) */
+        bool ok;
+        if (join_on(j, j->outer == 0 ? j->ovals : vals, j->outer == 0 ? vals : j->ovals, &ok, k->e)) {
+            k->err = k->e->code;
+            return;
+        }
+        if (!ok) return;
+    }
     j->omatched = true;
     if (j->outer == 0) join_emit(k, j->ovid, vid, j->ovals, vals);
     else join_emit(k, vid, j->ovid, vals, j->ovals);
@@ -3155,7 +3253,8 @@ static int join_hash_plan(jctx *j, qspec q[2], int build, const int path[2], imd
     join_free(j);
     j->build = build;
     join_need(j);
-    uint8_t kt = j->t[build]->s.cols[j->key[build]].type == IMDB_T_TEXT ? IMDB_T_TEXT : IMDB_T_INT64;
+    uint8_t kt = j->nkey != 1 ? (j->nkey ? IMDB_T_TEXT : IMDB_T_INT64) /* P2 S3: encoded pairs; CROSS's one key */
+                              : j->t[build]->s.cols[j->key[build]].type == IMDB_T_TEXT ? IMDB_T_TEXT : IMDB_T_INT64;
     if (imdb_hmap_init(&j->map, kt, e)) return e->code;
     sink kb, kp;
     memset(&kb, 0, sizeof kb);
@@ -3173,13 +3272,14 @@ static int join_hash_plan(jctx *j, qspec q[2], int build, const int path[2], imd
     join_side_paths(x, j, q, false, build, path, j->ran);
     int rc = run_path(x, j->ran[build], &q[build], &kb, e);
     if (!rc) rc = kb.err;
-    if (!rc && j->left && build == 0 && !(j->matched = imdb_alloc_array(j->nent ? j->nent : 1, 1, e))) rc = e->code;
+    if (!rc && j->keep[build] && !(j->matched = imdb_alloc_array(j->nent ? j->nent : 1, 1, e))) rc = e->code;
     if (!rc) rc = run_path(x, j->ran[1 - build], &q[1 - build], &kp, e);
     if (!rc) rc = kp.err;
-    if (!rc && j->left && build == 0) {
+    if (!rc && j->keep[build]) { /* the kept build side's rows nothing matched */
         for (uint64_t o = 0; o < j->nent && !rc; o++) {
             if (j->matched[o]) continue;
-            join_emit(&kp, j->ent[o], IMDB_NONE, join_kept(j, o), j->nulls);
+            if (build == 0) join_emit(&kp, j->ent[o], IMDB_NONE, join_kept(j, o), j->nulls);
+            else join_emit(&kp, IMDB_NONE, j->ent[o], j->nulls0, join_kept(j, o));
             rc = kp.err;
         }
     }
@@ -3267,7 +3367,8 @@ static jplan join_choose(jctx *j, const qspec q[2], bool force, jprice *pr)
         pr->hash = hash;
     }
     int side = -1;
-    for (int outer = 0; outer < (j->left ? 1 : 2); outer++) {
+    for (int outer = 0; outer < 2; outer++) {
+        if (!j->nkey || j->keep[1 - outer]) continue; /* P2 S3: a kept side is the outer one; CROSS and FULL: hash */
         if (!join_probe_setup(j, q, 1 - outer)) continue;
         unsigned __int128 c = (unsigned __int128)n[outer] * join_probe_cost(j);
         if (pr) {
@@ -3312,7 +3413,13 @@ static int join_col(const sql_stmt *st, imdb_table *const t[2], const char *qual
         if (qual[0] && strcmp(qual, nm[s]) != 0) continue;
         int c = imdb_schema_col(&t[s]->s, name);
         if (c < 0) continue;
-        if (found++) return imdb_fail(e, IMDB_ERR_INVALID, "column %s is in both tables: qualify it", name);
+        if (found++) { /* P2 S3: a USING column unqualified is the kept side's (INNER, LEFT: side 0's; RIGHT: side 1's) */
+            bool used = false;
+            for (uint8_t u = 0; u < st->nusing; u++) used |= !strcmp(st->using_col[u], name);
+            if (!used || st->join_kind == SQL_JOIN_FULL)
+                return imdb_fail(e, IMDB_ERR_INVALID, "column %s is in both tables: qualify it", name);
+            if (st->join_kind != SQL_JOIN_RIGHT) return IMDB_OK; /* side 0's, found first */
+        }
         *side = s;
         *col = c;
     }
@@ -3406,7 +3513,8 @@ static int cmp_jkeyed(const void *a, const void *b)
 /* pair i's joined row into cv: side 0's columns, then side 1's (NULL-extended where nothing matched) */
 static int join_pair(xctx *x, jctx *j, const jkeyed *p, imdb_value *cv, imdb_err *e)
 {
-    if (fetch_row(x, j->t[0], p->va, cv, e)) return e->code;
+    if (p->va == IMDB_NONE) memcpy(cv, j->nulls0, j->nc[0] * sizeof *cv); /* P2 S3: RIGHT, FULL */
+    else if (fetch_row(x, j->t[0], p->va, cv, e)) return e->code;
     if (p->vb == IMDB_NONE) memcpy(cv + j->nc[0], j->nulls, j->nc[1] * sizeof *cv);
     else if (fetch_row(x, j->t[1], p->vb, cv + j->nc[0], e)) return e->code;
     return IMDB_OK;
@@ -3429,7 +3537,8 @@ static int join_materialize(xctx *x, const sql_stmt *st, jctx *j, sink *k, imdb_
     for (uint64_t i = 0; i < j->npairs; i++) {
         kv[i].va = j->pairs[i][0];
         kv[i].vb = j->pairs[i][1];
-        imdb_version_key(j->t[0], kv[i].va, j->t[0]->s.pk, &kv[i].ka);
+        if (kv[i].va != IMDB_NONE) imdb_version_key(j->t[0], kv[i].va, j->t[0]->s.pk, &kv[i].ka);
+        else kv[i].ka = (imdb_value){.null = true}; /* P2 S3: after every row of side 0 (NULLS LAST) */
         if (kv[i].vb != IMDB_NONE) imdb_version_key(j->t[1], kv[i].vb, j->t[1]->s.pk, &kv[i].kb);
     }
     qsort(kv, j->npairs, sizeof *kv, cmp_jkeyed);
@@ -3586,8 +3695,17 @@ static int xp_join(xctx *x, const sql_stmt *st, jctx *j, qspec q[2], const jplan
         return rc;
     }
     const imdb_schema *s0 = &j->t[0]->s, *s1 = &j->t[1]->s;
-    xp_add(xp, "join", "%s %s %s, on %s.%s = %s.%s", s0->name, j->left ? "LEFT JOIN" : "JOIN", s1->name, s0->name,
-           s0->cols[j->key[0]].name, s1->name, s1->cols[j->key[1]].name);
+    static const char *const KIND[] = {"JOIN", "JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN", "CROSS JOIN"};
+    char jd[XP_DETAIL]; /* P2 S3: every kind, its key pairs, its other conditions */
+    size_t jn = 0;
+    jd[0] = 0;
+    xcat(jd, sizeof jd, &jn, "%s %s %s", s0->name, KIND[st->join_kind <= SQL_JOIN_CROSS ? st->join_kind : 0], s1->name);
+    for (uint8_t i = 0; i < j->nkey; i++)
+        xcat(jd, sizeof jd, &jn, "%s %s.%s = %s.%s", i ? " and" : ", on", s0->name, s0->cols[j->keys[0][i]].name, s1->name,
+             s1->cols[j->keys[1][i]].name);
+    if (!j->nkey) xcat(jd, sizeof jd, &jn, ", every pair");
+    if (j->nonc) xcat(jd, sizeof jd, &jn, "; %u other condition%s on each pair", j->nonc, j->nonc == 1 ? "" : "s");
+    xp_add(xp, "join", "%s", jd);
     xp_snapshot(x, st, q[0].snap, q[0].pend, xp);
     xp_add(xp, "plan", "%s", pname);
     int jp = x->ss->join_plan;
@@ -3602,6 +3720,8 @@ static int xp_join(xctx *x, const sql_stmt *st, jctx *j, qspec q[2], const jplan
         xp_add(xp, "why", "%s", p->kind == JP_INDEX ? "SET join_plan = index, in the cheaper orientation"
                                                      : "SET join_plan = index, but no index serves a side's key: the hash join");
     else if (p->kind == JP_INDEX) xp_add(xp, "why", "the price: plan C with side %c outer, below the hash join's", side);
+    else if (!j->nkey) xp_add(xp, "why", "a join with no key pair (CROSS): the hash join of every pair"); /* P2 S3 */
+    else if (j->keep[0] && j->keep[1]) xp_add(xp, "why", "FULL keeps both sides' rows: the hash join");
     else if (!pr->has[0] && !pr->has[1]) xp_add(xp, "why", "no index serves a side's key: the hash join");
     else if (pr->hash < COST_FLOOR) xp_add(xp, "why", "the hash join's price is under %u: it is kept", (unsigned)COST_FLOOR);
     else xp_add(xp, "why", "the price: the hash join is the cheapest");
@@ -3613,7 +3733,10 @@ static int xp_join(xctx *x, const sql_stmt *st, jctx *j, qspec q[2], const jplan
              price_u64(pr->hash), (unsigned long long)pr->est[1], (unsigned long long)pr->est[0]);
         for (int o = 0; o < 2; o++) {
             if (pr->has[o]) xcat(d, sizeof d, &n, "; plan C, side %d outer: %llu", o + 1, price_u64(pr->c[o]));
+            else if (!j->nkey) xcat(d, sizeof d, &n, "; plan C, side %d outer: none (no key to probe by)", o + 1);
+            else if (j->keep[0] && j->keep[1]) xcat(d, sizeof d, &n, "; plan C, side %d outer: none (FULL keeps both sides)", o + 1);
             else if (o && j->left) xcat(d, sizeof d, &n, "; plan C, side 2 outer: none (LEFT keeps side 1 outer)");
+            else if (!o && j->keep[1]) xcat(d, sizeof d, &n, "; plan C, side 1 outer: none (RIGHT keeps side 2 outer)");
             else xcat(d, sizeof d, &n, "; plan C, side %d outer: none (no index on side %d's key)", o + 1, 2 - o);
         }
         xp_add(xp, "price", "%s", d);
@@ -3658,10 +3781,57 @@ static int join_run(xctx *x, const sql_stmt *st, jctx *j, qspec q[2], const jpla
     return rc;
 }
 
+/* P2 S3: a key pair (side 0's column c0, side 1's c1): one type, as a key's values are never converted */
+static int join_pair_add(jctx *j, int c0, int c1, imdb_err *e)
+{
+    const imdb_column *k0 = &j->t[0]->s.cols[c0], *k1 = &j->t[1]->s.cols[c1];
+    if (k0->type != k1->type || (k0->type == IMDB_T_DECIMAL && k0->scale != k1->scale))
+        return imdb_fail(e, IMDB_ERR_INVALID, "a join's key compares %s with %s: values are not converted",
+                         imdb_type_name(k0->type), imdb_type_name(k1->type));
+    if (j->nkey >= IMDB_MAX_JOIN_KEYS)
+        return imdb_fail(e, IMDB_ERR_LIMIT, "a join of more than %u key pairs", IMDB_MAX_JOIN_KEYS);
+    j->keys[0][j->nkey] = (int16_t)c0;
+    j->keys[1][j->nkey] = (int16_t)c1;
+    j->nkey++;
+    return IMDB_OK;
+}
+
+/* P2 S3: c = d with a column of each side, of one type: a key pair (1), else 0 (an error: negative) */
+static int join_eq_pair(jctx *j, const sql_stmt *st, uint16_t k, imdb_err *e)
+{
+    const sql_expr *n = &st->ex[k];
+    if (n->op != EX_CMP || n->cmp != CMP_EQ || st->ex[n->l].op != EX_COL || st->ex[n->r].op != EX_COL) return 0;
+    const sql_expr *a = &st->ex[n->l], *b = &st->ex[n->r];
+    int sa, ca, sb, cb;
+    if (join_col(st, j->t, a->qual, a->col, &sa, &ca, e) || join_col(st, j->t, b->qual, b->col, &sb, &cb, e)) return e->code;
+    if (sa == sb) return 0;
+    const imdb_column *x = &j->t[sa]->s.cols[ca], *y = &j->t[sb]->s.cols[cb];
+    if (x->type != y->type || (x->type == IMDB_T_DECIMAL && x->scale != y->scale)) return 0; /* compared as a condition */
+    int rc = sa == 0 ? join_pair_add(j, ca, cb, e) : join_pair_add(j, cb, ca, e);
+    return rc ? rc : 1;
+}
+
+/* P2 S3: ON's conjuncts (its top-level ANDs): each equality of a column of each side a key pair, the rest conditions
+ * on each candidate pair (j->onc, bound later) */
+static int join_on_split(jctx *j, const sql_stmt *st, uint16_t k, imdb_err *e)
+{
+    const sql_expr *n = &st->ex[k];
+    if (n->op == EX_AND) return join_on_split(j, st, n->l, e) || join_on_split(j, st, n->r, e) ? e->code : IMDB_OK;
+    int rc = join_eq_pair(j, st, k, e);
+    if (rc < 0) return rc;
+    if (rc) return IMDB_OK;
+    if (j->nonc >= IMDB_MAX_PREDICATES)
+        return imdb_fail(e, IMDB_ERR_LIMIT, "ON has more than %u conditions", IMDB_MAX_PREDICATES);
+    j->onc[j->nonc++] = k;
+    return IMDB_OK;
+}
+
 static int exec_join(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, imdb_err *e)
 {
     imdb_table *t[2]; /* each at the read point (1f: a table dropped since, for AS OF before the drop) */
     if (read_table(x, st, st->table, &t[0], e) || read_table(x, st, st->table2, &t[1], e)) return e->code;
+    if (st->nusing && st->star) /* P2 S3 */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "SELECT * with USING: name the columns (the merged column of * is a later step)");
     if (strcmp(st->alias[0] ? st->alias : st->table, st->alias2[0] ? st->alias2 : st->table2) == 0)
         return imdb_fail(e, IMDB_ERR_INVALID, "the two sides of a join need two names: give one an alias (AS)");
     if ((unsigned)t[0]->s.ncols + t[1]->s.ncols > IMDB_MAX_COLS)
@@ -3675,6 +3845,8 @@ static int exec_join(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, im
     j->nc[0] = t[0]->s.ncols;
     j->nc[1] = t[1]->s.ncols;
     j->left = st->join_left;
+    j->keep[0] = st->join_kind == SQL_JOIN_LEFT || st->join_kind == SQL_JOIN_FULL; /* P2 S3 */
+    j->keep[1] = st->join_kind == SQL_JOIN_RIGHT || st->join_kind == SQL_JOIN_FULL;
     if (!(j->ct = imdb_alloc(sizeof *j->ct, e))) {
         imdb_free(j);
         return e->code;
@@ -3682,24 +3854,48 @@ static int exec_join(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, im
     j->ct->s.ncols = (uint16_t)(j->nc[0] + j->nc[1]);
     memcpy(j->ct->s.cols, t[0]->s.cols, j->nc[0] * sizeof *t[0]->s.cols);
     memcpy(j->ct->s.cols + j->nc[0], t[1]->s.cols, j->nc[1] * sizeof *t[1]->s.cols);
-    if (j->left) /* side 1's columns are NULL where nothing matched, whatever its table declares */
-        for (uint16_t c = 0; c < j->nc[1]; c++) j->ct->s.cols[j->nc[0] + c].flags |= IMDB_COL_NULLABLE;
+    for (int s = 0; s < 2; s++) /* a side's columns are NULL where the other is kept and nothing matched */
+        if (j->keep[1 - s])
+            for (uint16_t c = 0; c < j->nc[s]; c++) j->ct->s.cols[(s ? j->nc[0] : 0) + c].flags |= IMDB_COL_NULLABLE;
     snprintf(j->ct->s.name, sizeof j->ct->s.name, "%s", t[0]->s.name);
     for (uint16_t c = 0; c < j->nc[1]; c++)
         j->nulls[c] = (imdb_value){.type = t[1]->s.cols[c].type, .scale = t[1]->s.cols[c].scale, .null = true};
-    /* ON: a column of each side, of one type (values are tagged: never converted) */
-    int s0 = 0, c0 = 0, s1 = 0, c1 = 0;
-    if (join_col(st, t, st->on_qual[0], st->on_col[0], &s0, &c0, e) || join_col(st, t, st->on_qual[1], st->on_col[1], &s1, &c1, e))
-        rc = e->code;
-    else if (s0 == s1)
-        rc = imdb_fail(e, IMDB_ERR_INVALID, "a join's ON compares a column of each table");
-    if (!rc) {
-        j->key[s0] = c0;
-        j->key[s1] = c1;
-        const imdb_column *k0 = &t[0]->s.cols[j->key[0]], *k1 = &t[1]->s.cols[j->key[1]];
-        if (k0->type != k1->type || (k0->type == IMDB_T_DECIMAL && k0->scale != k1->scale))
-            rc = imdb_fail(e, IMDB_ERR_INVALID, "a join's ON compares %s with %s: values are not converted",
-                           imdb_type_name(k0->type), imdb_type_name(k1->type));
+    for (uint16_t c = 0; c < j->nc[0]; c++) /* P2 S3 */
+        j->nulls0[c] = (imdb_value){.type = t[0]->s.cols[c].type, .scale = t[0]->s.cols[c].scale, .null = true};
+    /* ON: one equality of a column of each side, of one type (values are tagged: never converted), the path it always
+     * had; P2 S3: else its conjuncts (key pairs and conditions), USING's columns, or none (CROSS) */
+    if (st->on_col[0][0]) {
+        int s0 = 0, c0 = 0, s1 = 0, c1 = 0;
+        if (join_col(st, t, st->on_qual[0], st->on_col[0], &s0, &c0, e) || join_col(st, t, st->on_qual[1], st->on_col[1], &s1, &c1, e))
+            rc = e->code;
+        else if (s0 == s1)
+            rc = imdb_fail(e, IMDB_ERR_INVALID, "a join's ON compares a column of each table");
+        if (!rc) {
+            j->key[s0] = c0;
+            j->key[s1] = c1;
+            const imdb_column *k0 = &t[0]->s.cols[j->key[0]], *k1 = &t[1]->s.cols[j->key[1]];
+            if (k0->type != k1->type || (k0->type == IMDB_T_DECIMAL && k0->scale != k1->scale))
+                rc = imdb_fail(e, IMDB_ERR_INVALID, "a join's ON compares %s with %s: values are not converted",
+                               imdb_type_name(k0->type), imdb_type_name(k1->type));
+        }
+        j->nkey = 1;
+        j->keys[0][0] = (int16_t)j->key[0];
+        j->keys[1][0] = (int16_t)j->key[1];
+    } else if (st->nusing) {
+        for (uint8_t u = 0; !rc && u < st->nusing; u++) {
+            int c0 = imdb_schema_col(&t[0]->s, st->using_col[u]), c1 = imdb_schema_col(&t[1]->s, st->using_col[u]);
+            if (c0 < 0 || c1 < 0) rc = imdb_fail(e, IMDB_ERR_NOTFOUND, "USING (%s): not a column of both tables", st->using_col[u]);
+            else rc = join_pair_add(j, c0, c1, e);
+        }
+    } else if (st->on_ex) {
+        rc = join_on_split(j, st, st->on_ex, e);
+    }
+    for (uint16_t i = 0; !rc && !j->nkey && st->join_kind == SQL_JOIN_CROSS && i < st->nwhere; i++) /* FROM a, b WHERE
+        * a.x = b.y: its equalities of the two sides are the keys (each stays WHERE's, true of every pair) */
+        if (st->where[i].lx && (rc = join_eq_pair(j, st, st->where[i].lx, e)) > 0) rc = IMDB_OK;
+    if (!rc && j->nkey) {
+        j->key[0] = j->keys[0][0];
+        j->key[1] = j->keys[1][0];
     }
     /* one snapshot for both sides, below neither table's purge horizon */
     uint64_t snap = 0, pend = 0;
@@ -3715,15 +3911,19 @@ static int exec_join(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, im
     j->post.t = t[1];
     j->post.snap = snap;
     j->post.pend = pend;
+    j->post0.t = t[0]; /* P2 S3 */
+    j->post0.snap = snap;
+    j->post0.pend = pend;
     /* WHERE: each predicate to its side; LEFT keeps side 1's for after the join, as SQL says */
     for (uint16_t i = 0; !rc && i < st->nwhere; i++) {
         int side = 0, col = 0;
         if (st->where[i].lx) continue; /* a tree's: on the joined row (join_emit) */
         if (join_col(st, t, st->where[i].qual, st->where[i].col, &side, &col, e)) rc = e->code;
         else {
-            qspec *bq = j->left && side == 1 ? &j->post : &q[side];
+            bool late = (side == 1 && j->keep[0]) || (side == 0 && j->keep[1]); /* a NULL-extended side's: after the join */
+            qspec *bq = late ? (side ? &j->post : &j->post0) : &q[side];
             uint16_t np = bq->np;
-            rc = bind_pred(x, &st->where[i], col, j->left && side == 1, bq, e);
+            rc = bind_pred(x, &st->where[i], col, late, bq, e);
             if (rc && falls_back(&st->where[i], &t[side]->s.cols[col])) { /* a residual on the joined row */
                 bq->np = np;
                 x->fb[i] = true;
@@ -3734,6 +3934,11 @@ static int exec_join(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, im
     }
     xscope sc = {.st = st, .s = &j->ct->s, .jt = t, .nc0 = j->nc[0], .cols = true, .group_col = -1};
     if (!rc && bind_resid(x, &sc, j->resid, &j->nresid, e)) rc = e->code;
+    for (uint16_t i = 0; !rc && i < j->nonc; i++) { /* P2 S3: ON's conditions on the joined row */
+        if (xnodes(x, st, e) || xbind(x, &sc, j->onc[i], e)) rc = e->code;
+        else if (x->xn[j->onc[i]].type != IMDB_T_BOOL)
+            rc = imdb_fail(e, IMDB_ERR_INVALID, "ON takes a condition: a comparison, IS NULL, AND, OR, NOT or a BOOL");
+    }
     if (!rc) {
         choose_ordered(&q[0], -1);
         choose_ordered(&q[1], -1);

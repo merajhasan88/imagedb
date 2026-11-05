@@ -528,10 +528,12 @@ static void t_join_refusals(void)
     static const struct {
         const char *q, *msg;
     } bad[] = {
-        {"SELECT * FROM a RIGHT JOIN b ON a.k = b.k", "only INNER and LEFT"},
-        {"SELECT * FROM a FULL JOIN b ON a.k = b.k", "only INNER and LEFT"},
         {"SELECT * FROM a JOIN b ON a.k = b.k JOIN c ON b.k = c.k", "two tables"},
-        {"SELECT * FROM a JOIN b ON a.k = b.k AND a.id = b.id", "one equality"},
+        {"SELECT * FROM a JOIN b USING (k)", "SELECT * with USING"}, /* P2 S3 (RIGHT, FULL and ON's ANDs answer now) */
+        {"SELECT a.id FROM a JOIN b USING (nope)", "not a column of both tables"},
+        {"SELECT a.id FROM a FULL JOIN b USING (k) WHERE k = 1", "in both tables"},
+        {"SELECT a.id FROM a JOIN b ON a.k", "ON takes a condition"},
+        {"SELECT a.id FROM a JOIN b ON a.k = b.k AND b.k", "ON takes a condition"},
         {"SELECT * FROM a JOIN b ON a.k = a.id", "a column of each table"},
         {"SELECT * FROM a JOIN b ON a.k = b.t", "values are not converted"},
         {"SELECT * FROM b AS x JOIN b AS y ON x.d = y.e", "values are not converted"},

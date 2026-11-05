@@ -97,6 +97,9 @@ enum {
     ST_EXPLAIN, /* P1 Q1: the plan of the statement in explained (SELECT, UPDATE or DELETE), which is not run */
 };
 
+/* P2 S3: a join's kind as written (RIGHT keeps side 1's rows, FULL both sides'; CROSS and FROM a, b have no ON) */
+enum { SQL_JOIN_INNER = 1, SQL_JOIN_LEFT, SQL_JOIN_RIGHT, SQL_JOIN_FULL, SQL_JOIN_CROSS };
+
 /* isolation levels as written (the executor maps them; SERIALIZABLE is refused for now) */
 enum { SQL_ISO_SNAPSHOT = 1, SQL_ISO_READ_COMMITTED, SQL_ISO_SERIALIZABLE };
 
@@ -105,7 +108,12 @@ typedef struct sql_stmt {
     char table[IMDB_MAX_IDENT + 1];
     char alias[IMDB_MAX_IDENT + 1];             /* FROM table AS alias, or "" */
     /* SELECT ... FROM table [AS alias] [INNER | LEFT [OUTER]] JOIN table2 [AS alias2] ON x = y */
-    bool has_join, join_left;
+    bool has_join, join_left;                   /* join_left: join_kind is SQL_JOIN_LEFT */
+    uint8_t join_kind;                          /* P2 S3: SQL_JOIN_INNER .. SQL_JOIN_CROSS */
+    uint16_t on_ex;                             /* P2 S3: ON's condition, a tree; on_qual and on_col name its two
+                                                 * columns when it is one equality of columns (that path unchanged) */
+    uint8_t nusing;                             /* P2 S3: USING (columns): each a key pair by its name */
+    char using_col[IMDB_MAX_JOIN_KEYS][IMDB_MAX_IDENT + 1];
     char table2[IMDB_MAX_IDENT + 1], alias2[IMDB_MAX_IDENT + 1];
     char on_qual[2][IMDB_MAX_IDENT + 1], on_col[2][IMDB_MAX_IDENT + 1];
     imdb_schema schema;                         /* CREATE */

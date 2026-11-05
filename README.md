@@ -663,16 +663,26 @@ SELECT c.name, COUNT(*) FROM customers AS c LEFT JOIN orders AS o ON c.id = o.cu
 SELECT c.id FROM customers AS c LEFT JOIN orders AS o ON c.id = o.cust WHERE o.id IS NULL;
 ```
 
-- Two tables, INNER or LEFT [OUTER], on one equality of two columns of one type
-  (a DECIMAL's scale included); a NULL key matches nothing. Qualify a column by
-  its table or its alias (`AS`) when both tables have it. RIGHT, FULL and CROSS
-  joins, a third table, AND or OR in ON (filter in WHERE) and FOR UPDATE are
-  refused, each with its reason.
+- Two tables: `[INNER] JOIN`, `LEFT | RIGHT | FULL [OUTER] JOIN`, `CROSS JOIN`
+  and `FROM a, b` (whose WHERE equalities between the two become the join's
+  keys). ON takes any condition: its equalities of a column of each table
+  (one type, a DECIMAL's scale included) are the keys, up to eight, and the
+  rest decide which pairs match, so under LEFT a row they reject is kept
+  NULL-extended. `USING (c, ...)` names key columns by name (unqualified, one is
+  the first table's, the second's under RIGHT, refused under FULL; `SELECT *` with
+  USING is refused for now). A NULL
+  key matches nothing. Qualify a column by its table or its alias (`AS`) when
+  both tables have it. A third table and FOR UPDATE are refused, each with its
+  reason.
 - Both tables are read at one snapshot (AS OF too). Each uses its own index or
-  scan for its own WHERE predicates; under LEFT a predicate on the second table
-  applies after the join, so the third query lists the customers without orders.
+  scan for its own WHERE predicates; a predicate on a table a join NULL-extends (LEFT's second,
+  RIGHT's first, FULL's both) applies after the join, so the third query lists the customers
+  without orders.
 - Without ORDER BY, rows come in the first table's primary-key order, then the second's, a
-  NULL-extended row last. Aggregates and GROUP BY work as on one table.
+  NULL-extended row last (a row with no first-table match after all the others). Aggregates and
+  GROUP BY work as on one table. FULL and CROSS joins run as the hash join (ON's other
+  conditions run under either plan); a RIGHT join's index join looks up the first table for each
+  row of the second.
 - Two plans. The hash join (path `join(build 2)`) hashes the second table after
   its own predicates and probes it with the first table's rows. The index
   nested-loop join (`join(index 2)`) looks up, for each row of the first

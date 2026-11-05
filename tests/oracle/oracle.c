@@ -243,6 +243,8 @@ typedef struct stmt {
     bool fns;          /* P2 S1: it holds a function, CASE, CAST, IN, LIKE or || (counted when compared) */
     int gk[3], ngk;    /* P2 S2: GROUP BY these trees (gcol -1) */
     bool grp;          /* P2 S2's form (counted when compared) */
+    int jx;            /* P2 S3: the join's other ON condition (a tree), else 0; join 3 RIGHT, 4 FULL, 5 CROSS */
+    bool jkey2, jusing, jn3; /* ON's second key pair, t.s = u.s; USING (s) for ON; P2 S3's (counted when compared) */
 } stmt;
 
 static int64_t g_next_id;          /* the next new key of t, of u */
@@ -321,6 +323,7 @@ static int gen_fflt(stmt *q, int depth);
 static int gen_fcmp(stmt *q);
 static int gen_xtxt(stmt *q, int depth);
 static int gen_ftagg(stmt *q);
+static int gen_jcond(stmt *q);
 static void fn_mark(stmt *q, int k);
 static bool txt_computed(const stmt *q, int k);
 static int gen_xcond(stmt *q, int depth, bool dml);
@@ -1428,6 +1431,13 @@ static void gen_select(stmt *q)
     } else { /* a join, rows or aggregates */
         q->tab = 0;
         q->join = chance(50) ? 1 : 2;
+        if (g_fns && chance(45)) { /* P2 S3: RIGHT, FULL, CROSS; ON's other condition, a second key pair, USING */
+            q->join = (int)rr(3, 5);
+            q->jn3 = true;
+        }
+        if (g_fns && q->join != 5 && chance(30)) q->jx = gen_jcond(q), q->jn3 = true;
+        if (g_fns && q->join != 5 && chance(20)) q->jkey2 = q->jn3 = true;
+        if (g_fns && q->join != 5 && !q->jx && !q->jkey2 && chance(15)) q->jusing = q->jn3 = true;
         if (chance(70)) {
             q->nit = (int)rr(1, 4);
             q->it[0] = (item){F_COL, 0, 0, 0};
@@ -1441,7 +1451,11 @@ static void gen_select(stmt *q)
             q->it[q->nit++] = (item){F_SUM, 1, 2, 0};
         }
         gen_preds(q, 3, true);
-        if (g_expr && q->it[0].fn == F_COL) { /* a join's rows ordered, cut sometimes (1d) */
+        if (q->join == 4) /* P2 S3: FULL: no FULL JOIN in MySQL and MariaDB; SQLite's UNION ALL only for rows */
+            q->skip |= 1u << D_MY | 1u << D_MA | (q->it[0].fn == F_COL ? 0u : 1u << D_SQLITE);
+        if (q->jx) xmark(q, q->jx);
+        if (g_expr && q->it[0].fn == F_COL && q->join <= 2) { /* a join's rows ordered, cut sometimes (1d); RIGHT, FULL and
+                                                          * CROSS rows compared as a multiset (P2 S3) */
             gen_order(q, true, false);
             if (q->nord && chance(30)) q->limit = (int)rr(1, 8);
         }
@@ -1645,16 +1659,20 @@ static void put_fn(sb *b, int d, const stmt *q, const xnode *n)
     const xnode *a = n->l ? XN(q, n->l) : NULL;
     switch (n->fn) {
     case XF_ABS: put_call(b, d, q, "ABS", n->l, 0, 0); return;
-    case XF_SIGN: /* SQL Server's SIGN of a DECIMAL is a DECIMAL (1.00) */
-        sb_str(b, d == D_MS ? "CAST(SIGN(" : "SIGN(");
+    /* SIGN, CEIL, FLOOR and ROUND where imagedb's is an INT64: PostgreSQL's of the NUMERIC put_num_arg makes (or of a
+     * double) is a NUMERIC (a double), cast back, so arithmetic over it is an INT64's (FLOOR(19) / 372 truncates to 0:
+     * seed 69 of the 2026-11-05 five-engine run). SQL Server's SIGN of a DECIMAL is a DECIMAL (1.00): cast too */
+    case XF_SIGN:
+        sb_str(b, d == D_MS || d == D_PG ? "CAST(SIGN(" : "SIGN(");
         put_num_arg(b, d, q, n->l);
-        sb_str(b, d == D_MS ? ") AS BIGINT)" : ")");
+        sb_str(b, d == D_MS || d == D_PG ? ") AS BIGINT)" : ")");
         return;
     case XF_CEIL:
     case XF_FLOOR:
+        if (d == D_PG && n->ty == CT_INT) sb_str(b, "CAST(");
         sb_str(b, n->fn == XF_FLOOR ? "FLOOR(" : d == D_MS ? "CEILING(" : "CEIL(");
         put_num_arg(b, d, q, n->l);
-        sb_str(b, ")");
+        sb_str(b, d == D_PG && n->ty == CT_INT ? ") AS BIGINT)" : ")");
         return;
     case XF_ROUND: /* SQL Server's needs its places */
         if (d == D_SQLITE && a->ty == CT_INT) { /* SQLite's round is a REAL, inexact past 2^53: an INT64's is itself */
@@ -1663,11 +1681,21 @@ static void put_fn(sb *b, int d, const stmt *q, const xnode *n)
             sb_str(b, ")");
             return;
         }
+        if (d == D_PG && n->ty == CT_INT) sb_str(b, "CAST(");
         sb_str(b, "ROUND(");
-        put_num_arg(b, d, q, n->l);
+        if (d == D_MS && a->ty == CT_DEC) { /* its ROUND keeps the argument's precision, so ROUND(-99.7, 0), -100.0, is
+                                             * past numeric(3,1): an overflow (seed 25 of the 2026-11-05 five-engine run).
+                                             * A DECIMAL(1,0) zero added gives it one more integer digit, the most a
+                                             * rounding adds */
+            sb_str(b, "(");
+            put_num_arg(b, d, q, n->l);
+            sb_str(b, " + CAST(0 AS DECIMAL(1,0)))");
+        } else {
+            put_num_arg(b, d, q, n->l);
+        }
         if (n->a1 >= 0 && d != D_SQLITE) sb_printf(b, ", %" PRId64, n->a1);
         else if (d == D_MS || (d == D_PG && a->ty == CT_DEC) || ((d == D_MY || d == D_MA) && a->ty == CT_DEC)) sb_str(b, ", 0");
-        sb_str(b, ")");
+        sb_str(b, d == D_PG && n->ty == CT_INT ? ") AS BIGINT)" : ")");
         return;
     case XF_MOD:
         if (d == D_SQLITE || d == D_MS) {
@@ -2133,15 +2161,10 @@ static bool okey_const(const stmt *q, const struct okey *k)
 
 static void put_okey(sb *b, int d, const stmt *q, const struct okey *k)
 {
-    if (d == D_MS && okey_const(q, k)) { /* a constant is never NULL: no CASE, which SQL Server refuses over one */
-        put_okey_expr(b, d, q, k, false);
-        if (k->desc) sb_str(b, " DESC");
-        return;
-    }
-    if (d == D_MY || d == D_MA || d == D_MS) {
-        sb_str(b, d == D_MS ? "CASE WHEN " : "(");
+    if (d == D_MY || d == D_MA) {
+        sb_str(b, "(");
         put_okey_expr(b, d, q, k, true);
-        sb_str(b, d == D_MS ? " IS NULL THEN 1 ELSE 0 END" : ") IS NULL");
+        sb_str(b, ") IS NULL");
         sb_str(b, k->nf ? " DESC, " : ", ");
         put_okey_expr(b, d, q, k, false);
         if (k->desc) sb_str(b, " DESC");
@@ -2150,6 +2173,73 @@ static void put_okey(sb *b, int d, const stmt *q, const struct okey *k)
     put_okey_expr(b, d, q, k, false);
     sb_str(b, k->desc ? " DESC" : "");
     sb_str(b, k->nf ? " NULLS FIRST" : " NULLS LAST");
+}
+
+/* SQL Server refuses an ORDER BY item that its folding makes a constant: COALESCE(2.32, t.d), CASE WHEN 11 = -6 THEN
+ * t.d END, the CASE WHEN k IS NULL over either, or that CASE over a position whose item folds (seeds 14, 25, 43, 49, 93
+ * of the 2026-11-05 five-engine run). A constant orders nothing, so each item it names is left out and the statement
+ * run again (ms_drop_constants): g_ms_drop holds them, numbered over the list as printed with none left out, and
+ * g_ms_at maps a printed position back to that numbering */
+static unsigned long long g_ms_drop;
+static int g_ms_item, g_ms_at[64], g_ms_nat;
+static long g_ms_dropped;
+
+/* the next ORDER BY item (SQL Server): false when it is one left out, else its comma */
+static bool ms_item(sb *b, bool *first)
+{
+    int i = g_ms_item++;
+    if (i < 64 && (g_ms_drop >> i & 1)) return false;
+    if (!*first) sb_str(b, ", ");
+    *first = false;
+    if (g_ms_nat < 64) g_ms_at[g_ms_nat++] = i;
+    return true;
+}
+
+/* a key in SQL Server's words: NULLs placed by a CASE before it (none over a constant: never NULL, and refused) */
+static void put_okey_ms(sb *b, const stmt *q, const struct okey *k, bool *first)
+{
+    if (!okey_const(q, k) && ms_item(b, first)) {
+        sb_str(b, "CASE WHEN ");
+        put_okey_expr(b, D_MS, q, k, true);
+        sb_str(b, " IS NULL THEN 1 ELSE 0 END");
+        if (k->nf) sb_str(b, " DESC");
+    }
+    if (ms_item(b, first)) {
+        put_okey_expr(b, D_MS, q, k, false);
+        if (k->desc) sb_str(b, " DESC");
+    }
+}
+
+/* the join's FROM: t JOIN | LEFT | RIGHT | FULL | CROSS JOIN u, ON t.id = u.tid [AND t.s = u.s] [AND cond] or USING (s)
+ * (P2 S3; SQL Server has no USING: its ON). swap: u first (SQLite 3.37's RIGHT JOIN, written as the LEFT JOIN it is,
+ * and the second half of its FULL JOIN) */
+static void put_join(sb *b, int d, const stmt *q, int kind, bool swap)
+{
+    static const char *const KW[] = {"", " JOIN ", " LEFT JOIN ", " RIGHT JOIN ", " FULL JOIN ", " CROSS JOIN "};
+    sb_printf(b, " FROM %s%s%s", swap ? "u" : "t", KW[kind], swap ? "t" : "u");
+    if (kind == 5) return;
+    if (q->jusing && d != D_MS) {
+        sb_str(b, " USING (s)");
+        return;
+    }
+    sb_str(b, q->jusing ? " ON t.s = u.s" : " ON t.id = u.tid");
+    if (q->jkey2) sb_str(b, " AND t.s = u.s");
+    if (q->jx) sb_str(b, " AND "), put_x(b, d, q, q->jx, -1);
+}
+
+/* P2 S3: ON's other condition: a column of u against a literal, or a column of each side compared */
+static int gen_jcond(stmt *q)
+{
+    int k;
+    if (chance(50)) {
+        int lit = xlit_int(q, rr(-400, 400));
+        k = xbool(q, X_CMP, xcol(q, 1, 2), lit);
+    } else {
+        int c0 = xcol(q, 0, (int[]){1, 2}[rnd() % 2]);
+        k = xbool(q, X_CMP, c0, xcol(q, 1, 2));
+    }
+    XN(q, k)->fn = (int)rr(OP_EQ, OP_GE);
+    return k;
 }
 
 static void print_stmt(sb *b, int d, const stmt *q)
@@ -2201,9 +2291,24 @@ static void print_stmt(sb *b, int d, const stmt *q)
             sb_str(b, ")");
         }
     }
-    sb_printf(b, " FROM %s", tname(q->tab));
-    if (q->join) sb_str(b, q->join == 1 ? " JOIN u ON t.id = u.tid" : " LEFT JOIN u ON t.id = u.tid");
-    put_where(b, d, q);
+    if (!q->join) sb_printf(b, " FROM %s", tname(q->tab)); /* a join's FROM: put_join (P2 S3) */
+    if (q->join == 4 && d == D_SQLITE) { /* P2 S3: FULL as LEFT JOIN UNION ALL the other side's rows nothing matched */
+        size_t sel = b->n;
+        char *head = malloc(sel + 1);
+        if (!head) exit(3);
+        memcpy(head, b->p, sel + 1);
+        put_join(b, d, q, 2, false);
+        put_where(b, d, q);
+        sb_str(b, " UNION ALL ");
+        sb_put(b, head, sel);
+        free(head);
+        put_join(b, d, q, 2, true);
+        put_where(b, d, q);
+        sb_str(b, q->npr ? " AND t.id IS NULL" : " WHERE t.id IS NULL");
+    } else {
+        if (q->join) put_join(b, d, q, q->join == 3 && d == D_SQLITE ? 2 : q->join, q->join == 3 && d == D_SQLITE);
+            put_where(b, d, q);
+    }
     if (q->gcol >= 0) {
         sb_str(b, " GROUP BY ");
         put_col(b, q, 0, q->gcol);
@@ -2213,7 +2318,9 @@ static void print_stmt(sb *b, int d, const stmt *q)
         for (int g = 0; g < q->ngk; g++) {
             const xnode *n = XN(q, q->gk[g]);
             if (g) sb_str(b, ", ");
-            if (n->op == X_COL) put_col(b, q, n->tab, n->col);
+            if (d == D_MA) sb_printf(b, "%d", g + 1); /* MariaDB matches no item to a key with COLLATE: its position
+                                                       * (gen_group: key g is item g) */
+            else if (n->op == X_COL) put_col(b, q, n->tab, n->col);
             else put_x(b, d, q, q->gk[g], -1);
         }
     }
@@ -2227,12 +2334,17 @@ static void print_stmt(sb *b, int d, const stmt *q)
      * NULLs. Under DISTINCT the keys are every item already (gen_order). */
     bool ordered = q->nord || q->limit || q->offset;
     if (ordered && (d != D_IMDB || q->nord)) {
-        g_qual = d == D_MS;
+        g_qual = d == D_MS || d == D_PG; /* PostgreSQL: a bare name is an output column's first, and it names
+                                          * CAST(id AS TEXT) id too (seed 31 of the 2026-11-05 five-engine run) */
         sb_str(b, " ORDER BY ");
         int seen[8][2], nseen = 0; /* SQL Server refuses a column named twice: a repeated key orders nothing more */
         bool first = true;
+        g_ms_item = g_ms_nat = 0;
         for (int i = 0; i < q->nord; i++) {
-            if (d == D_MS && key_seen(q, &q->ord[i], seen, &nseen)) continue;
+            if (d == D_MS) {
+                if (!key_seen(q, &q->ord[i], seen, &nseen)) put_okey_ms(b, q, &q->ord[i], &first);
+                continue;
+            }
             if (!first) sb_str(b, ", ");
             first = false;
             put_okey(b, d, q, &q->ord[i]);
@@ -2242,12 +2354,23 @@ static void print_stmt(sb *b, int d, const stmt *q)
                                  {1, 0, 0, 0, false, false}};
             for (int i = 0; i < (q->gcol < 0 && q->join ? 2 : 1); i++) {
                 if (d == D_MS && key_seen(q, &tb[i], seen, &nseen)) continue;
+                if (q->gcol < 0 && i == 0) { /* a key: never NULL */
+                    if (d == D_MS && !ms_item(b, &first)) continue;
+                    if (d != D_MS && !first) sb_str(b, ", ");
+                    first = false;
+                    sb_printf(b, "%s.id", tname(tb[0].tab));
+                    continue;
+                }
+                if (d == D_MS) {
+                    put_okey_ms(b, q, &tb[i], &first);
+                    continue;
+                }
                 if (!first) sb_str(b, ", ");
                 first = false;
-                if (q->gcol < 0 && i == 0) sb_printf(b, "%s.id", tname(tb[0].tab)); /* a key: never NULL */
-                else put_okey(b, d, q, &tb[i]);
+                put_okey(b, d, q, &tb[i]);
             }
         }
+        if (d == D_MS && first) sb_str(b, "(SELECT NULL)"); /* every item a constant SQL Server left out */
     }
     g_qual = false;
     if (d == D_MS) { /* its window needs ORDER BY, which every ordered statement has */
@@ -2943,6 +3066,7 @@ static int cmp_rows(const void *a, const void *b) { return strcmp(*(char *const 
 static long g_mismatches, g_compared, g_checkpoints, g_reopens, g_drops;
 static long g_fn_compared; /* P2 S1: comparisons of statements holding its forms */
 static long g_grp_compared; /* P2 S2: comparisons of its grouped form */
+static long g_jn_compared; /* P2 S3: comparisons of its join forms */
 
 static void show_rows(const res *r, size_t from)
 {
@@ -2959,7 +3083,7 @@ static void show_rows(const res *r, size_t from)
  * on the engine that disagreed: which condition the two read differently. */
 static void diagnose(const stmt *q, int d)
 {
-    if (q->kind != Q_SELECT || !q->npr) return;
+    if (q->kind != Q_SELECT || !q->npr || (q->join == 4 && d == D_SQLITE)) return; /* FULL there: two counts */
     stmt c;
     sb text = {0};
     res a = {0}, b = {0};
@@ -2969,6 +3093,9 @@ static void diagnose(const stmt *q, int d)
         c.kind = Q_SELECT;
         c.tab = q->tab;
         c.join = q->join;
+        c.jx = q->jx;
+        c.jkey2 = q->jkey2;
+        c.jusing = q->jusing;
         memcpy(c.xe, q->xe, sizeof q->xe); /* the conditions' trees */
         c.nxe = q->nxe;
         memcpy(c.xp, q->xp, sizeof q->xp);
@@ -3006,9 +3133,13 @@ static int err_class(const char *msg)
     if (strstr(msg, "overflow") || strstr(msg, "out of range") || strstr(msg, "38 digits")) return 2;
     return 0;
 }
-static bool excused(int d, const char *msg)
+static bool excused(int d, const char *msg, const char *text)
 {
     if (strstr(msg, "division by zero")) return d == D_SQLITE || d == D_MY || d == D_MA;
+    /* MariaDB 12.3.3 wraps 0 - x for x = INT64_MIN to INT64_MIN, silently (-x, 1 - x, x - 1, -1 * x and x DIV -1 it
+     * refuses as overflows; reproduced alone, 2026-11-05, seed 6 of that day's five-engine run: AVG((0 - x))). An
+     * INT64 overflow imagedb wrongly raised would still be caught: PostgreSQL is compared first */
+    if (strstr(msg, "INT64 overflow") && d == D_MA && strstr(text, "(0 - ")) return true;
     if (strstr(msg, "INT64 overflow")) return d == D_SQLITE;
     /* imagedb never turns an INT64 past 2^53 into a FLOAT64 (design.md, Expressions); the others round it silently */
     if (strstr(msg, "beyond 2^53")) return true;
@@ -3021,6 +3152,23 @@ static bool excused(int d, const char *msg)
  * SUM(-d) / AVG(g * -11) over GROUP BY g with g = 0 past the window). Excused only when d, asked the same statement
  * without LIMIT and OFFSET, refuses it for the same class of reason, so the claim is checked every time; never
  * inside a transaction, where a failed statement would abort PostgreSQL's */
+/* SQL Server named an ORDER BY item a constant (its folding: g_ms_drop): left out, the statement printed and run again,
+ * once for each it names. Its compile error leaves a transaction as it was (XACT_ABORT OFF) */
+static void ms_drop_constants(const stmt *q, sb *t, bool rows, const int *ty, int nty, res *r)
+{
+    static const char K[] = "A constant expression was encountered in the ORDER BY list, position ";
+    for (int tries = 0; tries < 16 && r->err; tries++) {
+        const char *p = strstr(r->msg, K);
+        int pos = p ? atoi(p + sizeof K - 1) : 0;
+        if (pos < 1 || pos > g_ms_nat || g_ms_at[pos - 1] >= 64) break;
+        g_ms_drop |= 1ull << g_ms_at[pos - 1];
+        g_ms_dropped++;
+        print_stmt(t, D_MS, q);
+        exec_eng(&g_eng[D_MS], t->p, rows, ty, nty, r);
+    }
+    g_ms_drop = 0;
+}
+
 static long g_excused_window;
 static bool excused_window(int d, const stmt *q, const char *base_msg)
 {
@@ -3034,6 +3182,7 @@ static bool excused_window(int d, const stmt *q, const char *base_msg)
     int nty = out_types(&q2, ty);
     print_stmt(&t2, d, &q2);
     exec_eng(&g_eng[d], t2.p, true, ty, nty, &o2);
+    if (d == D_MS) ms_drop_constants(&q2, &t2, true, ty, nty, &o2);
     bool same = o2.err && err_class(o2.msg) == err_class(base_msg);
     res_clear(&o2);
     if (same) g_excused_window++;
@@ -3063,6 +3212,7 @@ static int run_stmt(unsigned seed, int step, const stmt *q, bool state)
         if (!g_eng[d].on || (q->skip & (1u << d))) continue; /* not put to it: its dialect computes it otherwise */
         print_stmt(&text[d], d, q);
         exec_eng(&g_eng[d], text[d].p, rows, ty, nty, &out[d]);
+        if (d == D_MS) ms_drop_constants(q, &text[d], rows, ty, nty, &out[d]);
         if (rows && !ordered && !out[d].err) qsort(out[d].rows, out[d].n, sizeof *out[d].rows, cmp_rows);
     }
     if (g_verbose) fprintf(stderr, "  [%u.%d] %s\n", seed, step, text[D_IMDB].p);
@@ -3072,16 +3222,20 @@ static int run_stmt(unsigned seed, int step, const stmt *q, bool state)
         g_compared++;
         if (q->fns) g_fn_compared++;
         if (q->grp) g_grp_compared++;
+        if (q->jn3) g_jn_compared++;
         const res *o = &out[d];
         const char *why = NULL;
         size_t at = 0;
-        if ((base->err && !o->err && (excused(d, base->msg) || excused_window(d, q, base->msg))) ||
+        if ((base->err && !o->err && (excused(d, base->msg, text[d].p) || excused_window(d, q, base->msg))) ||
             (!base->err && o->err && excused_other(d, o->msg, text[d].p))) {
             g_excused++;
             if (g_verbose) fprintf(stderr, "  excused (%s): %s\n    imagedb: %s\n    %s: %s\n", DNAME[d], text[d].p,
                                    base->err ? base->msg : "answered", DNAME[d], o->err ? o->msg : "answered");
             continue;
         }
+        if (base->err && strstr(base->msg, "syntax error")) /* P2 S3: the generator's fault, never an agreement (two
+                                                          * refusals of a broken statement hid every join once) */
+            why = "imagedb refused it as a syntax error: the oracle wrote it wrong";
         if (base->err && o->err) { /* both refused: for one reason? Rows are computed in other orders, so a
                                   * statement with two ways to fail may meet another first: counted, not failed */
             int cb = err_class(base->msg), co = err_class(o->msg);
@@ -3090,7 +3244,10 @@ static int run_stmt(unsigned seed, int step, const stmt *q, bool state)
                 if (g_verbose) fprintf(stderr, "  both refused, for other reasons (%s): %s | %s\n", DNAME[d], base->msg, o->msg);
             }
         }
-        if (base->err != o->err) why = base->err ? "imagedb refused it, the other answered" : "imagedb answered, the other refused it";
+        if (why) { /* the syntax error above: reported as it is */
+        } else if (base->err != o->err) {
+            why = base->err ? "imagedb refused it, the other answered" : "imagedb answered, the other refused it";
+        }
         else if (!base->err && !rows && base->affected >= 0 && o->affected >= 0 && base->affected != o->affected)
             why = "another count of rows changed";
         else if (!base->err && rows) {
@@ -3292,11 +3449,15 @@ int main(int argc, char **argv)
     printf("oracle: DROP TABLE u made again %ld times on every engine\n", g_drops);
     printf("oracle: %ld refusals under LIMIT/OFFSET excused: the reference refused the same statement without them\n",
            g_excused_window);
+    printf("oracle: %ld ORDER BY items SQL Server called constants, left out (a constant orders nothing)\n", g_ms_dropped);
     printf("oracle: imagedb alone: %ld CHECKPOINTs, %ld reopens; the paths it answered by:\n", g_checkpoints, g_reopens);
     for (int i = 0; i < g_npaths; i++) printf("  %7ld  %s\n", g_paths[i].n, g_paths[i].path);
     printf("oracle: EXPLAIN checked against the run on %ld SELECTs, %ld disagreements\n", g_explained, g_explain_bad);
     bool servers = g_eng[D_PG].on || g_eng[D_MY].on || g_eng[D_MA].on || g_eng[D_MS].on;
     printf("oracle: %ld comparisons of P2 S2's grouped form (several keys and trees, DISTINCT, FILTER)\n", g_grp_compared);
+    printf("oracle: %ld comparisons of P2 S3's joins (RIGHT, FULL, CROSS, ON's conditions and key pairs, USING); SQLite's "
+           "RIGHT JOIN is its LEFT JOIN, its FULL JOIN a LEFT JOIN UNION ALL the anti-join (rows only)%s\n", g_jn_compared,
+           g_eng[D_PG].on || g_eng[D_MS].on ? "" : " (UNGUARDED: FULL JOIN's aggregates, no FULL-capable server run)");
     printf("oracle: %ld comparisons of statements with P2 S1's forms (functions, CASE, CAST, IN, LIKE, ||); ROUND of a "
            "FLOAT64, LOWER and UPPER compared with SQLite alone%s\n", g_fn_compared,
            servers ? "" : " (UNGUARDED: no server engine was run, so a CAST to DECIMAL, the DECIMAL functions and SQL "

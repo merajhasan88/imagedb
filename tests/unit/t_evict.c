@@ -294,8 +294,8 @@ static int64_t sval_of(imdb_session *s, const char *sql) /* a query's one value;
 
 #define SEC_US 1000000ll
 
-/* The policy, on the clock: a 60-second window over 2,000 rows updated 6,000 times across four segments. Nothing
- * leaves memory while every segment is younger than the window; once the clock is two minutes on, the next
+/* The policy, on the clock: an hour's window over 2,000 rows updated 6,000 times across four segments. Nothing
+ * leaves memory while every segment is younger than the window; once the clock is two hours on, the next
  * statement's policy moves the floor to a segment's end, the versions ended by then leave the store, and every
  * answer recorded before (each commit's COUNT and SUM, a key's history) is the same after; VERIFY passes, and the
  * store holds about the live rows and what ended past the floor. */
@@ -303,7 +303,10 @@ static void t_evict_policy(void)
 {
     const char *dir = test_tmpdir();
     OK(imdb_init(dir, false, NULL, E));
-    imdb_open_opts o = {.sync = 0, .mem_window_us = 60 * SEC_US};
+    /* an hour: no run, however slow, passes the window on the real clock before the test moves it (a 60 s one did,
+     * 2026-11-05: a pass on real time during the AS OF reads took an early floor, and the moved clock's found too few
+     * ended since to run) */
+    imdb_open_opts o = {.sync = 0, .mem_window_us = 3600 * SEC_US};
     imdb_db *db = NULL;
     OK(imdb_open(dir, &o, &db, E));
     if (!db) return;
@@ -336,14 +339,23 @@ static void t_evict_policy(void)
         snprintf(sql, sizeof sql, "SELECT SUM(v) FROM t AS OF %llu WHERE id < 100", (unsigned long long)at);
         sum[k] = sval_of(&s, sql);
     }
-    imdb_clock_offset(120 * SEC_US);
+    imdb_clock_offset(7200 * SEC_US);
     OK(ex(&s, "SELECT COUNT(*) FROM t")); /* its maintain runs the policy */
     CHECK(db->mem_floor > 0 && db->mem_floor < db->seq);
-    CHECK(t->nheld < held / 2 && t->nheld >= 2000);
+    if (!(t->nheld < held / 2 && t->nheld >= 2000)) { /* say why, should it fail again */
+        char m[512];
+        int k = snprintf(m, sizeof m, "held %llu of %llu before; floor %llu, seq %llu, lake %llu; segments",
+                         (unsigned long long)t->nheld, (unsigned long long)held, (unsigned long long)db->mem_floor,
+                         (unsigned long long)db->seq, (unsigned long long)db->lake_seq);
+        for (size_t i = 0; i < db->nsegs && k > 0 && (size_t)k < sizeof m - 32; i++)
+            k += snprintf(m + k, sizeof m - (size_t)k, " %llu", (unsigned long long)db->segs[i]);
+        if (k > 0 && (size_t)k < sizeof m - 8) snprintf(m + k, sizeof m - (size_t)k, "; warning: %.200s", db->warning);
+        test_fail(__FILE__, __LINE__, m);
+    }
     imdb_result r;
     OK(imdb_exec_one(&s, "SHOW MEMORY", 11, NULL, 0, &r, E)); /* the status names the window, the floor and what is held */
     char want[160];
-    snprintf(want, sizeof want, "memory window 60 s, floor commit %llu: %llu versions held of ",
+    snprintf(want, sizeof want, "memory window 3600 s, floor commit %llu: %llu versions held of ",
              (unsigned long long)db->mem_floor, (unsigned long long)t->nheld);
     CHECK(strstr(r.status, want) != NULL);
     imdb_result_free(&r);
@@ -371,7 +383,7 @@ static void t_evict_policy(void)
         snprintf(sql, sizeof sql, "UPDATE t SET v = %d WHERE id = %d", 90000 + i, i);
         OK(ex(&s, sql));
     }
-    imdb_clock_offset(240 * SEC_US);
+    imdb_clock_offset(14400 * SEC_US);
     imdb_session_close(&s);
     /* A reopen takes its floor while it loads, before its replay, from the segments' first times up to its snapshot
      * (the smoke of 10-30 found every open's floor 0: the times were read only up to db->seq, 0 until the replay).

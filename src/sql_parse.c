@@ -1043,24 +1043,49 @@ static int parse_select(parser *p, sql_stmt *st)
         if (expect(p, TK_LP, "(") || expect_kw(p, "nolock") || expect(p, TK_RP, ")")) return p->e->code;
         st->nolock = true;
     }
-    if (tok_is_kw(p, p->i, "right") || tok_is_kw(p, p->i, "full") || tok_is_kw(p, p->i, "cross"))
-        return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "only INNER and LEFT joins are supported");
-    if (tok_is_kw(p, p->i, "join") || tok_is_kw(p, p->i, "inner") || tok_is_kw(p, p->i, "left")) {
+    /* P2 S3: [INNER] JOIN, LEFT | RIGHT | FULL [OUTER] JOIN ... ON cond | USING (cols), CROSS JOIN, FROM a, b; two
+     * tables (three or more: a later step) */
+    bool comma = p->t[p->i].kind == TK_COMMA;
+    if (comma || tok_is_kw(p, p->i, "join") || tok_is_kw(p, p->i, "inner") || tok_is_kw(p, p->i, "left") ||
+        tok_is_kw(p, p->i, "right") || tok_is_kw(p, p->i, "full") || tok_is_kw(p, p->i, "cross")) {
         st->has_join = true;
-        if (kw(p, "left")) {
-            st->join_left = true;
-            kw(p, "outer");
+        st->join_kind = SQL_JOIN_INNER;
+        if (comma) {
+            p->i++;
+            st->join_kind = SQL_JOIN_CROSS;
         } else {
-            kw(p, "inner");
+            if (kw(p, "cross")) st->join_kind = SQL_JOIN_CROSS;
+            else if (kw(p, "left")) st->join_kind = SQL_JOIN_LEFT;
+            else if (kw(p, "right")) st->join_kind = SQL_JOIN_RIGHT;
+            else if (kw(p, "full")) st->join_kind = SQL_JOIN_FULL;
+            else kw(p, "inner");
+            if (st->join_kind != SQL_JOIN_INNER && st->join_kind != SQL_JOIN_CROSS) kw(p, "outer");
+            if (expect_kw(p, "join")) return p->e->code;
         }
-        if (expect_kw(p, "join") || ident(p, st->table2) || alias(p, st->alias2) || expect_kw(p, "on") ||
-            qident(p, st->on_qual[0], st->on_col[0]) || expect(p, TK_EQ, "=") || qident(p, st->on_qual[1], st->on_col[1]))
-            return p->e->code;
-        if (tok_is_kw(p, p->i, "and") || tok_is_kw(p, p->i, "or"))
-            return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "a join's ON takes one equality; filter in WHERE");
-        if (tok_is_kw(p, p->i, "join") || tok_is_kw(p, p->i, "inner") || tok_is_kw(p, p->i, "left") ||
-            tok_is_kw(p, p->i, "right") || tok_is_kw(p, p->i, "full") || tok_is_kw(p, p->i, "cross"))
-            return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "a join takes two tables");
+        st->join_left = st->join_kind == SQL_JOIN_LEFT;
+        if (ident(p, st->table2) || alias(p, st->alias2)) return p->e->code;
+        if (st->join_kind != SQL_JOIN_CROSS && kw(p, "using")) {
+            if (expect(p, TK_LP, "(")) return p->e->code;
+            do {
+                if (st->nusing >= IMDB_MAX_JOIN_KEYS)
+                    return imdb_fail(p->e, IMDB_ERR_LIMIT, "USING names more than %u columns", IMDB_MAX_JOIN_KEYS);
+                if (ident(p, st->using_col[st->nusing++])) return p->e->code;
+            } while (tok(p, TK_COMMA));
+            if (expect(p, TK_RP, ")")) return p->e->code;
+        } else if (st->join_kind != SQL_JOIN_CROSS) {
+            if (expect_kw(p, "on") || bexpr(p, &st->on_ex, 0)) return p->e->code;
+            const sql_expr *o = &st->ex[st->on_ex]; /* one equality of two columns: the path it always had */
+            if (o->op == EX_CMP && o->cmp == CMP_EQ && st->ex[o->l].op == EX_COL && st->ex[o->r].op == EX_COL) {
+                memcpy(st->on_qual[0], st->ex[o->l].qual, sizeof st->on_qual[0]);
+                memcpy(st->on_col[0], st->ex[o->l].col, sizeof st->on_col[0]);
+                memcpy(st->on_qual[1], st->ex[o->r].qual, sizeof st->on_qual[1]);
+                memcpy(st->on_col[1], st->ex[o->r].col, sizeof st->on_col[1]);
+            }
+        }
+        if (p->t[p->i].kind == TK_COMMA || tok_is_kw(p, p->i, "join") || tok_is_kw(p, p->i, "inner") ||
+            tok_is_kw(p, p->i, "left") || tok_is_kw(p, p->i, "right") || tok_is_kw(p, p->i, "full") ||
+            tok_is_kw(p, p->i, "cross"))
+            return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "a join takes two tables (three or more: a later step)");
     }
     if (kw(p, "as")) {
         if (expect_kw(p, "of")) return p->e->code;
