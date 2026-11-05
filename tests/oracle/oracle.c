@@ -250,6 +250,19 @@ typedef struct stmt {
     bool jkey2, jusing, jn3; /* ON's second key pair, t.s = u.s; USING (s) for ON; P2 S3's (counted when compared) */
     bool subq;         /* P2 S4: a subquery, a derived table or a CTE (counted when compared) */
     bool corr;         /* P2 S4b: a correlated subquery (counted when compared) */
+    int narm, ncol;    /* P2 S5: a set operation's SELECTs (arm, armop[a] before arm a: 0 UNION, 1 UNION ALL, 2 INTERSECT,
+                        * 3 EXCEPT) of ncol columns; its tail (stail: ORDER BY 1 [DESC] [LIMIT slim] [OFFSET soff]) */
+    struct sarm {
+        int tab, col[2];
+        pred pr;
+        bool has_pr;
+    } arm[3];
+    int armop[3];
+    bool stail, sdesc;
+    int slim, soff;
+    int rec, rk;       /* P2 S5: WITH RECURSIVE: 1 a count to rk, 2 a walk from rstart along u; rall: UNION ALL */
+    int64_t rstart;
+    bool rall;
     int dsel;          /* P2 S4: 1 FROM (SELECT dc FROM t [WHERE dpred]) AS x, 2 WITH x AS (...) SELECT ... FROM x */
     int dc[4], ndc;
     pred dpred;
@@ -1518,11 +1531,60 @@ static void gen_gselect(stmt *q)
     for (int i = 0; i < q->nit; i++) xmark(q, q->it[i].ex);
 }
 
+/* P2 S5: a set operation of two or three SELECTs of matching columns (one INT64, or INT64 and TEXT; under a tail one
+ * id, never NULL, so ORDER BY its position is total everywhere), each over t or u with a predicate sometimes; INTERSECT
+ * chains alone (SQLite gives every operator one precedence, left to right, and takes no parentheses: a chain mixing
+ * INTERSECT with the others means another thing there), UNION, UNION ALL and EXCEPT mixed */
+static void gen_sselect(stmt *q)
+{
+    q->narm = chance(70) ? 2 : 3;
+    q->stail = chance(35);
+    q->ncol = q->stail ? 1 : (int)rr(1, 2);
+    int ty[2] = {q->stail || chance(80) ? CT_INT : CT_TXT, chance(50) ? CT_TXT : CT_INT};
+    bool inter = chance(25);
+    for (int a = 0; a < q->narm; a++) {
+        struct sarm *m = &q->arm[a];
+        m->tab = (int)rr(0, 1);
+        for (int c = 0; c < q->ncol; c++)
+            m->col[c] = q->stail ? 0 : ty[c] == CT_TXT ? (m->tab ? 3 : 6) : m->tab ? (int)rr(0, 2) : (int)rr(0, 3);
+        if (chance(60)) {
+            gen_pred(m->tab, &m->pr);
+            m->has_pr = true;
+        }
+        if (a) q->armop[a] = inter ? 2 : (int[]){0, 1, 3}[rnd() % 3];
+    }
+    if (q->stail) {
+        q->sdesc = chance(50);
+        if (chance(60)) q->slim = (int)rr(1, 8);
+        if (chance(40)) q->soff = (int)rr(1, 4);
+    }
+}
+
+/* P2 S5: WITH RECURSIVE: a count to rk, or a walk from rstart along u (tid -> id) at most six steps deep; under UNION
+ * or UNION ALL (T-SQL takes UNION ALL alone in a recursive WITH); or t's g values (alike rows), each counted up to 6:
+ * UNION drops the base's repeats and the rounds' meetings, UNION ALL keeps them */
+static void gen_rselect(stmt *q)
+{
+    q->rec = (int)rr(1, 3); /* 3: a base of many alike rows whose rounds meet (the mutant: UNION's drop untested) */
+    q->rall = chance(50);
+    if (q->rec == 1) q->rk = (int)rr(1, 60);
+    else q->rstart = g_ntids ? g_tids[rnd() % (uint64_t)g_ntids] : rr(-5, 5);
+    if (!q->rall) q->skip |= 1u << D_MS;
+}
+
 static void gen_select(stmt *q)
 {
     memset(q, 0, sizeof *q);
     q->kind = Q_SELECT;
     q->gcol = -1;
+    if (g_fns && chance(6)) { /* P2 S5: a set operation */
+        gen_sselect(q);
+        return;
+    }
+    if (g_fns && chance(3)) { /* P2 S5: WITH RECURSIVE */
+        gen_rselect(q);
+        return;
+    }
     if (g_fns && chance(8)) { /* P2 S4: a derived table or a CTE */
         gen_dselect(q);
         return;
@@ -2425,6 +2487,49 @@ static int gen_jcond(stmt *q)
     return k;
 }
 
+/* P2 S5: a set operation: its SELECTs, their operators, its tail (ORDER BY the one column's position) */
+static void print_setop(sb *b, int d, const stmt *q)
+{
+    static const char *const OP[] = {"UNION", "UNION ALL", "INTERSECT", "EXCEPT"};
+    for (int a = 0; a < q->narm; a++) {
+        const struct sarm *m = &q->arm[a];
+        if (a) sb_printf(b, " %s ", OP[q->armop[a]]);
+        sb_str(b, "SELECT ");
+        for (int c = 0; c < q->ncol; c++) sb_printf(b, "%s%s", c ? ", " : "", cols(m->tab)[m->col[c]].name);
+        sb_printf(b, " FROM %s", tname(m->tab));
+        if (m->has_pr) {
+            sb_str(b, " WHERE ");
+            put_pred(b, d, q, &m->pr);
+        }
+    }
+    if (!q->stail) return;
+    sb_printf(b, " ORDER BY 1%s", q->sdesc ? " DESC" : "");
+    if (d == D_MS) {
+        sb_printf(b, " OFFSET %d ROWS", q->soff);
+        if (q->slim) sb_printf(b, " FETCH NEXT %d ROWS ONLY", q->slim);
+        return;
+    }
+    if (q->slim) sb_printf(b, " LIMIT %d", q->slim);
+    else if (q->soff && d == D_SQLITE) sb_str(b, " LIMIT -1");
+    else if (q->soff && (d == D_MY || d == D_MA)) sb_str(b, " LIMIT 18446744073709551615");
+    if (q->soff) sb_printf(b, " OFFSET %d", q->soff);
+}
+
+/* P2 S5: WITH RECURSIVE, printed as each dialect writes it (T-SQL: no RECURSIVE) */
+static void print_rec(sb *b, int d, const stmt *q)
+{
+    const char *rk = d == D_MS ? "WITH" : "WITH RECURSIVE", *op = q->rall ? "UNION ALL" : "UNION";
+    if (q->rec == 3)
+        sb_printf(b, "%s r(x) AS (SELECT g FROM t WHERE g IS NOT NULL %s SELECT x + 1 FROM r WHERE x < 6) SELECT COUNT(*), "
+                     "SUM(x) FROM r", rk, op);
+    else if (q->rec == 1)
+        sb_printf(b, "%s n(i) AS (SELECT 1 %s SELECT i + 1 FROM n WHERE i < %d) SELECT COUNT(*), SUM(i) FROM n", rk, op, q->rk);
+    else
+        sb_printf(b, "%s r(x, depth) AS (SELECT %" PRId64 ", 0 %s SELECT u.id, r.depth + 1 FROM r JOIN u ON u.tid = r.x WHERE "
+                     "r.depth < 6) SELECT COUNT(*), SUM(x) FROM r",
+                  rk, q->rstart, op);
+}
+
 static void print_stmt(sb *b, int d, const stmt *q)
 {
     sb_reset(b);
@@ -2456,6 +2561,14 @@ static void print_stmt(sb *b, int d, const stmt *q)
     case Q_DELETE:
         sb_printf(b, "DELETE FROM %s", tname(q->tab));
         put_where(b, d, q);
+        return;
+    }
+    if (q->narm) { /* P2 S5 */
+        print_setop(b, d, q);
+        return;
+    }
+    if (q->rec) {
+        print_rec(b, d, q);
         return;
     }
     if (q->dsel == 2) { /* P2 S4: the CTE first */
@@ -2587,6 +2700,14 @@ static void print_stmt(sb *b, int d, const stmt *q)
 /* the result's column types, as the statement promises them */
 static int out_types(const stmt *q, int *ty)
 {
+    if (q->narm) { /* P2 S5 */
+        for (int c = 0; c < q->ncol; c++) ty[c] = TY(cols(q->arm[0].tab)[q->arm[0].col[c]].t, 0);
+        return q->ncol;
+    }
+    if (q->rec) { /* P2 S5: COUNT(*), SUM */
+        ty[0] = ty[1] = TY(CT_INT, 0);
+        return 2;
+    }
     if (q->star) {
         for (int c = 0; c < ncols(q->tab); c++) ty[c] = TY(cols(q->tab)[c].t, cols(q->tab)[c].t == CT_DEC ? 2 : 0);
         return ncols(q->tab);
@@ -3269,6 +3390,7 @@ static long g_grp_compared; /* P2 S2: comparisons of its grouped form */
 static long g_jn_compared; /* P2 S3: comparisons of its join forms */
 static long g_subq_compared; /* P2 S4: comparisons of statements with a subquery, a derived table or a CTE */
 static long g_corr_compared; /* P2 S4b: comparisons of statements with a correlated subquery */
+static long g_set_compared, g_rec_compared; /* P2 S5: comparisons of set operations, of WITH RECURSIVE */
 
 static void show_rows(const res *r, size_t from)
 {
@@ -3431,6 +3553,8 @@ static int run_stmt(unsigned seed, int step, const stmt *q, bool state)
         if (q->jn3) g_jn_compared++;
         if (q->subq) g_subq_compared++;
         if (q->corr) g_corr_compared++;
+        if (q->narm) g_set_compared++;
+        if (q->rec) g_rec_compared++;
         const res *o = &out[d];
         const char *why = NULL;
         size_t at = 0;
@@ -3663,6 +3787,7 @@ int main(int argc, char **argv)
     printf("oracle: EXPLAIN checked against the run on %ld SELECTs, %ld disagreements\n", g_explained, g_explain_bad);
     bool servers = g_eng[D_PG].on || g_eng[D_MY].on || g_eng[D_MA].on || g_eng[D_MS].on;
     printf("oracle: %ld comparisons of P2 S2's grouped form (several keys and trees, DISTINCT, FILTER)\n", g_grp_compared);
+    printf("oracle: %ld comparisons of P2 S5's set operations, %ld of its WITH RECURSIVE\n", g_set_compared, g_rec_compared);
     printf("oracle: %ld comparisons of P2 S4b's correlated subqueries\n", g_corr_compared);
     printf("oracle: %ld comparisons of P2 S4's subqueries (IN, NOT IN, EXISTS, a value), derived tables and CTEs\n",
            g_subq_compared);

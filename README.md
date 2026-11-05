@@ -748,6 +748,38 @@ WITH big AS (SELECT cust, SUM(amount) AS total FROM orders GROUP BY cust)
   over their rows) and lists each with its row count; a correlated one is named,
   not run; nothing else runs.
 
+Set operations and recursive queries:
+
+```sql
+SELECT id FROM customers UNION SELECT cust FROM orders ORDER BY 1 LIMIT 10;
+SELECT cust FROM orders WHERE amount > 100 INTERSECT SELECT id FROM customers WHERE region = 'eu';
+WITH RECURSIVE chain(id, depth) AS (
+  SELECT id, 0 FROM staff WHERE boss IS NULL
+  UNION ALL
+  SELECT s.id, c.depth + 1 FROM chain AS c JOIN staff AS s ON s.boss = c.id)
+SELECT depth, COUNT(*) FROM chain GROUP BY depth;
+```
+
+- `UNION`, `INTERSECT` and `EXCEPT`, each `[ALL | DISTINCT]`, wherever a query
+  stands (a statement, a derived table, WITH, a subquery); INTERSECT binds
+  tighter; a parenthesized query keeps its own ORDER BY and LIMIT. The whole
+  one's ORDER BY names an output column or its position, then LIMIT and OFFSET.
+- Each column takes one type in every SELECT (INT64 with DECIMAL makes a
+  DECIMAL, so `1` and `1.00` are one row); anything else is refused, an untyped
+  `NULL` included (CAST it). NULLs count as alike. Without ORDER BY the rows come
+  in a fixed order: the first SELECT's, then the second's.
+- `WITH RECURSIVE name [(c1, ...)] AS (base UNION [ALL] step)`: the step reads
+  name as the rows the last round added, until a round adds none. UNION drops a
+  row alike to an earlier one, so a cycle ends; UNION ALL does not, and stops at
+  a limit: 1,000,000 rounds, or the statement's row limit, memory ceiling or
+  timeout. The step reads name once, in its own FROM, with no aggregate,
+  GROUP BY, DISTINCT, ORDER BY or LIMIT (PostgreSQL's rules). A column list
+  renames any WITH's columns.
+- At most 64 SELECTs in one statement's set operations, parenthesized at most
+  32 deep; FOR UPDATE belongs to a statement's top level. Not yet: a set
+  operation whose SELECTs read the statement around it (correlated), more than
+  one base or step in a recursive WITH, SEARCH and CYCLE.
+
 ## Validation
 
 ```sh

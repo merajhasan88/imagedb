@@ -191,6 +191,8 @@ typedef struct parser {
     imdb_err *e;
     sql_stmt *st;            /* its expression nodes */
     uint8_t depth;           /* P2 S4: nested SELECTs around this point */
+    uint16_t narms;          /* P2 S5: the statement's set operations' arms so far (arm_new) */
+    uint8_t parens;          /* P2 S5: parenthesized queries around this point (parse_operand: bounded) */
 } parser;
 
 static int parse_nested(parser *p, sql_stmt *outer, const char *name); /* P2 S4 */
@@ -200,6 +202,7 @@ static const char *const kReserved[] = {
     "and", "or", "not", "between", "as", "of", "group", "by", "order", "limit", "true", "false", "null",
     "primary", "key", "subject", "erase", "count", "sum", "min", "max", "begin", "commit", "rollback", "is",
     "case", "when", "then", "else", "end", "cast", "in", "like", "escape", /* P2 S1 */
+    "union", "intersect", "except", /* P2 S5: never a FROM item's alias */
 };
 
 static bool tok_is_kw(const parser *p, uint32_t at, const char *kw)
@@ -1015,7 +1018,9 @@ static int isolation(parser *p, sql_stmt *st)
 
 /* P2 S4: a nested SELECT, parsed from the same tokens into its own statement (its own expression nodes), named: the
  * row set its outer statement reads as a table of that name; nesting bounded */
-static int parse_select(parser *p, sql_stmt *st);
+static int parse_core(parser *p, sql_stmt *st);
+static int parse_tail(parser *p, sql_stmt *st);
+static int parse_query(parser *p, sql_stmt *st); /* P2 S5 */
 static int parse_nested(parser *p, sql_stmt *outer, const char *name)
 {
     if (outer->nsub >= IMDB_MAX_SUBQUERIES)
@@ -1034,7 +1039,7 @@ static int parse_nested(parser *p, sql_stmt *outer, const char *name)
     sql_stmt *saved = p->st;
     p->st = in;
     p->depth++;
-    int rc = expect_kw(p, "select") ? p->e->code : parse_select(p, in);
+    int rc = parse_query(p, in); /* P2 S5: a set operation too */
     p->depth--;
     p->st = saved;
     return rc;
@@ -1059,7 +1064,7 @@ static int from_item(parser *p, sql_stmt *st, char *table, char *al)
     return IMDB_OK;
 }
 
-static int parse_select(parser *p, sql_stmt *st)
+static int parse_core(parser *p, sql_stmt *st)
 {
     st->kind = ST_SELECT;
     st->distinct = kw(p, "distinct");
@@ -1096,7 +1101,8 @@ static int parse_select(parser *p, sql_stmt *st)
     }
     if (!st->star && !tok_is_kw(p, p->i, "from")) { /* P2 S1: SELECT of expressions alone: one row, no table */
         st->no_from = true;
-        static const char *const cl[] = {"where", "group", "having", "order", "limit", "offset", "for"};
+        static const char *const cl[] = {"where", "group", "having"}; /* its tail: parse_query's (P2 S5: a set
+                                                                          * operation's, after its last SELECT) */
         for (size_t c = 0; c < sizeof cl / sizeof *cl; c++)
             if (tok_is_kw(p, p->i, cl[c]))
                 return imdb_fail(p->e, IMDB_ERR_INVALID, "a SELECT without FROM computes one row: no WHERE, GROUP BY, HAVING, ORDER "
@@ -1183,6 +1189,12 @@ static int parse_select(parser *p, sql_stmt *st)
     if (kw(p, "having")) { /* 1e: a condition over the groups (or the one aggregate row) */
         if (bexpr(p, &st->having, 0)) return p->e->code;
     }
+    return IMDB_OK;
+}
+
+/* a query's tail: ORDER BY, LIMIT and OFFSET (P2 S5: a set operation's too), FOR UPDATE */
+static int parse_tail(parser *p, sql_stmt *st)
+{
     if (kw(p, "order")) { /* 1d: key [ASC | DESC] [NULLS FIRST | LAST], ...; a bare integer is an item's position */
         if (expect_kw(p, "by")) return p->e->code;
         do {
@@ -1191,7 +1203,7 @@ static int parse_select(parser *p, sql_stmt *st)
             uint8_t o = st->norder;
             const sql_tok *t = &p->t[p->i];
             uint8_t nk = t->kind == TK_EOF ? TK_EOF : p->t[p->i + 1].kind;
-            if (t->kind == TK_INT && (nk == TK_COMMA || nk == TK_EOF || nk == TK_SEMI || nk == TK_IDENT)) {
+            if (t->kind == TK_INT && (nk == TK_COMMA || nk == TK_EOF || nk == TK_SEMI || nk == TK_IDENT || nk == TK_RP)) { /* P2 S5: ) too */
                 uint64_t pos;
                 if (uint_lit(p, &pos)) return p->e->code;
                 if (pos < 1 || pos > IMDB_MAX_COLS) return imdb_fail(p->e, IMDB_ERR_INVALID, "ORDER BY %llu: no such item",
@@ -1230,6 +1242,8 @@ static int parse_select(parser *p, sql_stmt *st)
     }
     if (kw(p, "for")) {
         if (expect_kw(p, "update")) return p->e->code;
+        if (p->depth || p->parens) /* P2 S5: a nested SELECT's or an arm's would lock under EXPLAIN, which locks nothing */
+            return imdb_fail(p->e, IMDB_ERR_INVALID, "FOR UPDATE locks a statement's own rows: at its top level only");
         st->for_update = true;
         bool agg = st->has_group || st->having;
         for (uint16_t i = 0; i < st->nitems; i++) agg = agg || st->items[i].agg != AGG_NONE || imdb_sql_has_agg(st, st->items[i].expr);
@@ -1237,6 +1251,136 @@ static int parse_select(parser *p, sql_stmt *st)
             return imdb_fail(p->e, IMDB_ERR_INVALID, "FOR UPDATE locks rows: not with aggregates, GROUP BY, AS OF or a join");
     }
     return IMDB_OK;
+}
+
+
+/* ---- P2 S5: set operations ---------------------------------------------------------------------------------------- */
+
+/* the operator at the current token, consumed with its ALL (DISTINCT, the default) when it is one of level's
+ * (1: INTERSECT; 0: UNION and EXCEPT); else 0 */
+static uint8_t setop_take(parser *p, int level)
+{
+    uint8_t op = tok_is_kw(p, p->i, "union")       ? SQL_SET_UNION
+                 : tok_is_kw(p, p->i, "intersect") ? SQL_SET_INTERSECT
+                 : tok_is_kw(p, p->i, "except")    ? SQL_SET_EXCEPT
+                                                   : 0;
+    if (!op || (level == 1) != (op == SQL_SET_INTERSECT)) return 0;
+    p->i++;
+    if (kw(p, "all")) op |= SQL_SET_ALL;
+    else kw(p, "distinct");
+    return op;
+}
+
+/* a fresh statement for an arm, the statement's arms (every chain's) counted against IMDB_MAX_SETOP_ARMS */
+static int arm_new(parser *p, sql_stmt **out)
+{
+    if (p->narms >= IMDB_MAX_SETOP_ARMS)
+        return imdb_fail(p->e, IMDB_ERR_LIMIT, "set operations of more than %u SELECTs in one statement", IMDB_MAX_SETOP_ARMS);
+    sql_stmt *a = imdb_alloc(sizeof *a, p->e);
+    if (!a) return p->e->code;
+    memset(a, 0, sizeof *a);
+    p->narms++;
+    *out = a;
+    return IMDB_OK;
+}
+
+/* st, which holds one operand, becomes a set operation whose first arm is that operand, moved whole but for its first
+ * keep nested SELECTs (a WITH's, parsed before the query: every arm reads them), which stay st's; the operand's own,
+ * renumbered from 0, go with it (its EX_SUBQ nodes follow) */
+static int setop_open(parser *p, sql_stmt *st, uint8_t keep)
+{
+    sql_stmt *a;
+    if (arm_new(p, &a)) return p->e->code;
+    memcpy(a, st, sizeof *st);
+    memset(st, 0, sizeof *st);
+    st->kind = ST_SELECT;
+    for (uint8_t i = 0; i < keep; i++) {
+        st->sub[i] = a->sub[i];
+        memcpy(st->sub_name[i], a->sub_name[i], sizeof st->sub_name[i]);
+    }
+    st->nsub = keep;
+    uint8_t n = (uint8_t)(a->nsub - keep);
+    for (uint8_t i = 0; i < n; i++) {
+        a->sub[i] = a->sub[i + keep];
+        memcpy(a->sub_name[i], a->sub_name[i + keep], sizeof a->sub_name[i]);
+    }
+    for (uint8_t i = n; i < a->nsub; i++) {
+        a->sub[i] = NULL;
+        a->sub_name[i][0] = 0;
+    }
+    a->nsub = n;
+    for (uint16_t k = 1; keep && k <= a->nex; k++)
+        if (a->ex[k].op == EX_SUBQ) a->ex[k].sub = (uint8_t)(a->ex[k].sub - keep);
+    st->arm[0] = a;
+    st->narm = 1;
+    return IMDB_OK;
+}
+
+static int parse_query(parser *p, sql_stmt *st);
+
+/* one operand: SELECT's core (the query's tail follows its last operand), or a parenthesized query with its own tail */
+static int parse_operand(parser *p, sql_stmt *st)
+{
+    if (tok(p, TK_LP)) { /* bounded: the recursion is the parser's, the text a client's */
+        if (p->parens >= IMDB_MAX_QUERY_PARENS)
+            return imdb_fail(p->e, IMDB_ERR_LIMIT, "queries parenthesized deeper than %u", IMDB_MAX_QUERY_PARENS);
+        p->parens++;
+        int rc = parse_query(p, st) || expect(p, TK_RP, ")") ? p->e->code : IMDB_OK;
+        p->parens--;
+        return rc;
+    }
+    return expect_kw(p, "select") || parse_core(p, st) ? p->e->code : IMDB_OK;
+}
+
+/* operands joined by the operators of one precedence (level 0: UNION and EXCEPT, whose operands are level 1's chains;
+ * 1: INTERSECT, whose operands are parse_operand's) into st: one operand is st itself; more make st their set operation
+ * (setop_open). keep: st's nested SELECTs from before the query (a WITH's) */
+static int parse_chain(parser *p, sql_stmt *st, int level, uint8_t keep)
+{
+    if (level ? parse_operand(p, st) : parse_chain(p, st, 1, keep)) return p->e->code;
+    bool open = false;
+    for (uint8_t op; (op = setop_take(p, level)) != 0;) {
+        if (!open && setop_open(p, st, keep)) return p->e->code;
+        open = true;
+        sql_stmt *b;
+        if (arm_new(p, &b)) return p->e->code;
+        st->armop[st->narm] = op;
+        st->arm[st->narm++] = b;
+        sql_stmt *saved = p->st;
+        p->st = b;
+        int rc = level ? parse_operand(p, b) : parse_chain(p, b, 1, 0);
+        p->st = saved;
+        if (rc) return rc;
+    }
+    return IMDB_OK;
+}
+
+/* a query, its first SELECT keyword not yet read: one SELECT (as before), or a set operation; then the tail. A query
+ * whose last operand was parenthesized with its own tail, followed by another, becomes a set operation of one arm, so
+ * each tail applies in its order. A set operation's ORDER BY names an output column or its position (PostgreSQL's
+ * rule), and it takes no FOR UPDATE */
+static int parse_query(parser *p, sql_stmt *st)
+{
+    sql_stmt *saved = p->st;
+    p->st = st;
+    uint8_t keep = st->nsub;
+    int rc = parse_chain(p, st, 0, keep);
+    bool tail = st->norder || st->has_limit || st->has_offset;
+    if (!rc && tail &&
+        (tok_is_kw(p, p->i, "order") || tok_is_kw(p, p->i, "limit") || tok_is_kw(p, p->i, "offset") || tok_is_kw(p, p->i, "for")))
+        rc = setop_open(p, st, keep);
+    if (!rc) rc = parse_tail(p, st);
+    for (uint8_t o = 0; !rc && st->narm && o < st->norder; o++) {
+        const sql_expr *k = st->ord_ex[o] ? &st->ex[st->ord_ex[o]] : NULL;
+        if (k && (k->op != EX_COL || k->qual[0]))
+            rc = imdb_fail(p->e, IMDB_ERR_INVALID, "a set operation's ORDER BY names an output column or its position");
+    }
+    if (!rc && st->narm && st->for_update) rc = imdb_fail(p->e, IMDB_ERR_INVALID, "FOR UPDATE locks a table's rows: not a set operation's");
+    if (!rc && !st->narm && st->no_from && (st->norder || st->has_limit || st->has_offset || st->for_update))
+        rc = imdb_fail(p->e, IMDB_ERR_INVALID, "a SELECT without FROM computes one row: no WHERE, GROUP BY, HAVING, ORDER BY, "
+                                               "LIMIT, OFFSET or FOR UPDATE");
+    p->st = saved;
+    return rc;
 }
 
 void imdb_sql_stmt_free(sql_stmt *st)
@@ -1248,6 +1392,16 @@ void imdb_sql_stmt_free(sql_stmt *st)
         st->sub[i] = NULL;
     }
     st->nsub = 0;
+    for (uint8_t i = 0; i < st->narm; i++) { /* P2 S5 */
+        if (!st->arm[i]) continue;
+        imdb_sql_stmt_free(st->arm[i]);
+        imdb_free(st->arm[i]);
+        st->arm[i] = NULL;
+    }
+    st->narm = 0;
+    imdb_free(st->cte_col); /* P2 S5 */
+    st->cte_col = NULL;
+    st->cte_ncols = 0;
     imdb_free(st->vals);
     st->vals = NULL;
     imdb_free(st->ex);
@@ -1261,7 +1415,7 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
     sql_tok *t;
     uint32_t nt;
     if (imdb_sql_lex(s, n, &t, &nt, e)) return e->code;
-    parser p = {s, t, nt, 0, e, st, 0};
+    parser p = {s, t, nt, 0, e, st, 0, 0, 0};
     int rc = IMDB_OK;
     if (nt == 0 || (nt == 1 && t[0].kind == TK_SEMI)) {
         st->kind = ST_EMPTY;
@@ -1312,15 +1466,39 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
     } else if (kw(&p, "delete")) {
         st->kind = ST_DELETE;
         if (!(rc = expect_kw(&p, "from")) && !(rc = ident(&p, st->table)) && kw(&p, "where")) rc = preds(&p, st);
-    } else if (kw(&p, "with")) { /* P2 S4: WITH name AS (SELECT ...) [, ...] SELECT ... */
+    } else if (kw(&p, "with")) { /* P2 S4: WITH name AS (SELECT ...) [, ...] SELECT ...; P2 S5: RECURSIVE, (c1, ...) */
+        bool rec = kw(&p, "recursive");
         do {
-            char name[IMDB_MAX_IDENT + 1];
-            if ((rc = ident(&p, name)) || (rc = expect_kw(&p, "as")) || (rc = expect(&p, TK_LP, "(")) ||
-                (rc = parse_nested(&p, st, name)) || (rc = expect(&p, TK_RP, ")")))
+            char name[IMDB_MAX_IDENT + 1], cols[IMDB_MAX_COLS][IMDB_MAX_IDENT + 1];
+            uint8_t nc = 0;
+            if ((rc = ident(&p, name))) break;
+            if (tok(&p, TK_LP)) {
+                do {
+                    if (nc >= IMDB_MAX_COLS) rc = imdb_fail(e, IMDB_ERR_LIMIT, "a WITH names more than %u columns", IMDB_MAX_COLS);
+                    else rc = ident(&p, cols[nc++]);
+                    for (uint8_t i = 0; !rc && i + 1 < nc; i++)
+                        if (!strcmp(cols[i], cols[nc - 1])) rc = imdb_fail(e, IMDB_ERR_INVALID, "a WITH names its column %s twice", cols[i]);
+                } while (!rc && tok(&p, TK_COMMA));
+                if (rc || (rc = expect(&p, TK_RP, ")"))) break;
+            }
+            if ((rc = expect_kw(&p, "as")) || (rc = expect(&p, TK_LP, "(")) || (rc = parse_nested(&p, st, name)) ||
+                (rc = expect(&p, TK_RP, ")")))
                 break;
+            sql_stmt *in = st->sub[st->nsub - 1];
+            in->recursive = rec;
+            if (nc) {
+                if (!(in->cte_col = imdb_alloc((size_t)nc * sizeof *in->cte_col, e))) {
+                    rc = e->code;
+                    break;
+                }
+                memcpy(in->cte_col, cols, (size_t)nc * sizeof *in->cte_col);
+                in->cte_ncols = nc;
+            }
         } while (tok(&p, TK_COMMA));
-        if (!rc && !(rc = expect_kw(&p, "select"))) rc = parse_select(&p, st);
-    } else if (kw(&p, "select")) rc = parse_select(&p, st);
+        if (!rc) rc = parse_query(&p, st); /* P2 S5: a set operation too */
+    } else if (tok_is_kw(&p, p.i, "select") || p.t[p.i].kind == TK_LP) {
+        rc = parse_query(&p, st); /* P2 S5: a set operation too, or a parenthesized query */
+    }
     else if (kw(&p, "begin")) {
         st->kind = ST_BEGIN;
         if (!kw(&p, "transaction")) kw(&p, "work");

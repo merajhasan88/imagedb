@@ -1930,6 +1930,10 @@ static int run_nested(xctx *x, const sql_stmt *in, imdb_result *r, uint8_t mode,
 /* a statement's nested SELECTs, in order (a later one may read an earlier one, as WITH says). P2 S4b: an expression's
  * that reads a column of this statement is deferred; bind_corr decides it once this statement has bound the
  * expression, and it is computed per row */
+static bool cte_self(const sql_stmt *c, const char *name); /* P2 S5 */
+static int cte_rename(const sql_stmt *c, const char *name, imdb_result *r, imdb_err *e);
+static int rset_recursive(xctx *x, const sql_stmt *c, const char *name, xrset *rs, imdb_err *e);
+
 static int rset_prepare(xctx *x, const sql_stmt *st, imdb_err *e)
 {
     if (st->has_asof) return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "AS OF with a nested SELECT: a later step");
@@ -1941,14 +1945,26 @@ static int rset_prepare(xctx *x, const sql_stmt *st, imdb_err *e)
         x->nown = (uint8_t)(i + 1); /* xfree frees its result, whatever happens next */
         snprintf(rs->name, sizeof rs->name, "%s", st->sub_name[i]);
         bool def = false;
-        if (run_nested(x, st->sub[i], &rs->r, st->sub_name[i][0] ? NEST_TABLE : NEST_FIRST, NULL, NULL, NULL, &def, e)) {
-            if (!def) return e->code;
+        int rc = st->sub_name[i][0] && cte_self(st->sub[i], st->sub_name[i]) /* P2 S5 */
+                     ? rset_recursive(x, st->sub[i], st->sub_name[i], rs, e)
+                     : run_nested(x, st->sub[i], &rs->r, st->sub_name[i][0] ? NEST_TABLE : NEST_FIRST, NULL, NULL, NULL, &def, e);
+        if (rc) {
+            if (!def) {
+                char self[IMDB_MAX_IDENT + 16]; /* P2 S5: a WITH reading itself, not RECURSIVE: told how */
+                snprintf(self, sizeof self, "no table %s", st->sub_name[i]);
+                if (st->sub_name[i][0] && e->code == IMDB_ERR_NOTFOUND && !strcmp(e->msg, self)) {
+                    imdb_err_clear(e);
+                    return imdb_fail(e, IMDB_ERR_INVALID, "WITH %s reads itself: write WITH RECURSIVE", st->sub_name[i]);
+                }
+                return e->code;
+            }
             imdb_err_clear(e); /* P2 S4b: correlated, it seems: bind_corr decides */
             imdb_result_free(&rs->r);
             imdb_result_init(&rs->r);
             rs->deferred = true;
             continue;
         }
+        if (st->sub_name[i][0] && cte_rename(st->sub[i], st->sub_name[i], &rs->r, e)) return e->code; /* P2 S5 */
         if (rset_table(x, rs, e)) return e->code;
         if (x->nvis >= sizeof x->vis / sizeof *x->vis) return imdb_fail(e, IMDB_ERR_LIMIT, "too many row sets in one statement");
         x->vis[x->nvis++] = rs;
@@ -4771,8 +4787,449 @@ static void xp_nested(const xctx *x, const sql_stmt *st, xplain *xp)
     xp_add(xp, "nested", "%s", d);
 }
 
+/* ---- P2 S5: set operations ---------------------------------------------------------------------------------------- */
+
+/* "no table NAME in this statement", NAME a table of st's (the statement around), else false */
+static bool names_table_of(const imdb_err *e, const sql_stmt *st)
+{
+    static const char pre[] = "no table ", post[] = " in this statement";
+    size_t n = strlen(e->msg), lp = sizeof pre - 1, lq = sizeof post - 1;
+    if (e->code != IMDB_ERR_NOTFOUND || n <= lp + lq || n - lp - lq > IMDB_MAX_IDENT || strncmp(e->msg, pre, lp) != 0 ||
+        strcmp(e->msg + n - lq, post) != 0)
+        return false;
+    char name[IMDB_MAX_IDENT + 1];
+    memcpy(name, e->msg + lp, n - lp - lq);
+    name[n - lp - lq] = 0;
+    const char *const nm[4] = {st->table, st->alias, st->table2, st->alias2};
+    for (int i = 0; i < 4; i++)
+        if (nm[i][0] && !strcmp(nm[i], name)) return true;
+    return false;
+}
+
+/* one arm's rows: its own tables (and the statement's WITH) alone; one that names a table of the statement around the
+ * set operation is told so (correlated set operations are a later step) */
+static int arm_run(xctx *x, const sql_stmt *a, imdb_result *r, imdb_err *e)
+{
+    imdb_result_init(r);
+    int rc = run_nested(x, a, r, NEST_TABLE, NULL, NULL, NULL, NULL, e);
+    if (rc && x->up && names_table_of(e, x->up->st)) {
+        imdb_err_clear(e);
+        rc = imdb_fail(e, IMDB_ERR_UNSUPPORTED,
+                       "a set operation's SELECTs read only their own tables: correlated set operations are a later step");
+    }
+    return rc;
+}
+
+/* a row of r as values of the unified types ut, us (exact: imdb_x_widen), and their encoding: two rows are one where
+ * their encodings are (NULLs equal, as a set operation takes them) */
+static int setop_row(const imdb_result *r, uint64_t i, const uint8_t *ut, const uint8_t *us, imdb_xval *v, imdb_buf *b,
+                     imdb_err *e)
+{
+    b->len = 0;
+    for (uint16_t c = 0; c < r->ncols; c++) {
+        cell_xval(&r->cells[i * r->ncols + c], r->ctype[c], r->cscale[c], &v[c]);
+        if (imdb_x_widen(&v[c], ut[c], us[c], e)) return e->code;
+        key_enc(b, &v[c]);
+    }
+    imdb_buf_put_u8(b, 0); /* never empty */
+    return imdb_buf_check(b, e);
+}
+
+static int setop_emit(imdb_result *out, const imdb_xval *v, imdb_err *e)
+{
+    imdb_cell *row = res_row(out, e);
+    if (!row) return e->code;
+    for (uint16_t c = 0; c < out->ncols; c++) res_put_x(out, &row[c], &v[c]);
+    return IMDB_OK;
+}
+
+/* acc op b into out: the columns' types unified (one type, or INT64 and DECIMAL as a DECIMAL at the larger scale);
+ * UNION's rows acc's then b's, the first of each alike alone; INTERSECT's and EXCEPT's acc's rows in its order, kept
+ * where b has (or has not) one alike, once (ALL: as many times as acc has, less (or more) b's count) */
+static int setop_fold(xctx *x, uint8_t op, const imdb_result *acc, const imdb_result *b, imdb_result *out, imdb_err *e)
+{
+    if (acc->ncols != b->ncols)
+        return imdb_fail(e, IMDB_ERR_INVALID, "a set operation's SELECTs return %u and %u columns: one count", acc->ncols,
+                         b->ncols);
+    uint16_t n = acc->ncols;
+    uint8_t ut[IMDB_MAX_COLS + 4], us[IMDB_MAX_COLS + 4];
+    for (uint16_t c = 0; c < n; c++) {
+        char what[64];
+        snprintf(what, sizeof what, "a set operation's column %u is", c + 1u);
+        ut[c] = acc->ctype[c];
+        us[c] = acc->cscale[c];
+        if (imdb_x_unify(&ut[c], &us[c], b->ctype[c], b->cscale[c], what, e)) return e->code;
+    }
+    res_cols(out, n);
+    out->byte_cap = workspace_of(x->ss);
+    for (uint16_t c = 0; c < n; c++) {
+        res_name(out, c, acc->names[c]);
+        out->ctype[c] = ut[c];
+        out->cscale[c] = us[c];
+    }
+    bool all = op & SQL_SET_ALL;
+    uint8_t o = op & (uint8_t)~SQL_SET_ALL;
+    imdb_hmap seen, cnt;
+    memset(&seen, 0, sizeof seen);
+    memset(&cnt, 0, sizeof cnt);
+    imdb_buf kb;
+    imdb_buf_init(&kb);
+    imdb_xval v[IMDB_MAX_COLS + 4];
+    int rc = imdb_hmap_init(&seen, IMDB_T_TEXT, e);
+    if (!rc && o != SQL_SET_UNION) rc = imdb_hmap_init(&cnt, IMDB_T_TEXT, e);
+    for (uint64_t i = 0; !rc && o != SQL_SET_UNION && i < b->nrows; i++) { /* b's rows counted */
+        if (++x->ticks >= x->next_check && (rc = xcheck(x, e))) break;
+        if ((rc = setop_row(b, i, ut, us, v, &kb, e))) break;
+        imdb_value k = {.type = IMDB_T_TEXT, .s = kb.p, .len = (uint32_t)kb.len};
+        uint64_t *h = imdb_hmap_get(&cnt, &k);
+        if (h) (*h)++;
+        else rc = imdb_hmap_put(&cnt, &k, 1, e);
+    }
+    for (int side = 0; !rc && side < (o == SQL_SET_UNION ? 2 : 1); side++) {
+        const imdb_result *r = side ? b : acc;
+        for (uint64_t i = 0; !rc && i < r->nrows; i++) {
+            if (++x->ticks >= x->next_check && (rc = xcheck(x, e))) break;
+            if ((rc = setop_row(r, i, ut, us, v, &kb, e))) break;
+            imdb_value k = {.type = IMDB_T_TEXT, .s = kb.p, .len = (uint32_t)kb.len};
+            bool keep = true;
+            if (o != SQL_SET_UNION) {
+                uint64_t *h = imdb_hmap_get(&cnt, &k);
+                bool in = h && *h;
+                if (all && in) (*h)--;
+                keep = o == SQL_SET_INTERSECT ? in : !in;
+            }
+            if (keep && !all) { /* once: the first alike */
+                if (imdb_hmap_get(&seen, &k)) keep = false;
+                else rc = imdb_hmap_put(&seen, &k, 1, e);
+            }
+            if (!rc && keep) rc = setop_emit(out, v, e);
+        }
+    }
+    imdb_hmap_free(&seen);
+    if (o != SQL_SET_UNION) imdb_hmap_free(&cnt);
+    imdb_buf_free(&kb);
+    return rc ? rc : res_finish(out, e);
+}
+
+typedef struct setcmp {
+    const imdb_result *r;
+    const sql_stmt *st;
+    const uint16_t *key;
+} setcmp;
+
+/* ORDER BY over a set operation's rows: each key's column, NULLs where the key puts them; ties in the rows' order */
+static int cmp_setrow(const void *pa, const void *pb, void *ctx)
+{
+    const setcmp *c = ctx;
+    uint64_t i = *(const uint64_t *)pa, j = *(const uint64_t *)pb;
+    for (uint8_t o = 0; o < c->st->norder; o++) {
+        uint16_t k = c->key[o];
+        imdb_xval u, w;
+        cell_xval(&c->r->cells[i * c->r->ncols + k], c->r->ctype[k], c->r->cscale[k], &u);
+        cell_xval(&c->r->cells[j * c->r->ncols + k], c->r->ctype[k], c->r->cscale[k], &w);
+        int d = 0;
+        if (u.null || w.null) d = u.null == w.null ? 0 : (u.null == c->st->ord_nulls_first[o]) ? -1 : 1;
+        else d = c->st->ord_desc[o] ? -imdb_x_cmp(&u, &w) : imdb_x_cmp(&u, &w);
+        if (d) return d;
+    }
+    return i < j ? -1 : i > j;
+}
+
+/* a set operation's tail over its rows: ORDER BY output columns (by position, or by name: one column so named), then
+ * OFFSET and LIMIT */
+static int setop_tail(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
+{
+    if (!st->norder && !st->has_limit && !st->has_offset) return IMDB_OK;
+    uint16_t key[IMDB_MAX_ORDER];
+    for (uint8_t o = 0; o < st->norder; o++) {
+        if (st->ord_pos[o]) {
+            if (st->ord_pos[o] > r->ncols)
+                return imdb_fail(e, IMDB_ERR_INVALID, "ORDER BY %u: the set operation returns %u column%s", st->ord_pos[o], r->ncols,
+                                 r->ncols == 1 ? "" : "s");
+            key[o] = (uint16_t)(st->ord_pos[o] - 1);
+            continue;
+        }
+        const char *name = st->ex[st->ord_ex[o]].col;
+        int found = -1;
+        for (uint16_t c = 0; c < r->ncols; c++)
+            if (!strcmp(r->names[c], name)) {
+                if (found >= 0) return imdb_fail(e, IMDB_ERR_INVALID, "ORDER BY %s: two output columns are named so", name);
+                found = c;
+            }
+        if (found < 0) return imdb_fail(e, IMDB_ERR_NOTFOUND, "ORDER BY %s: no output column of the set operation is named so", name);
+        key[o] = (uint16_t)found;
+    }
+    uint64_t n = r->nrows, from = st->has_offset ? (st->offset < n ? st->offset : n) : 0;
+    uint64_t cnt = n - from;
+    if (st->has_limit && st->limit < cnt) cnt = st->limit;
+    uint64_t *ord = xalloc(x, (n ? n : 1) * sizeof *ord, e);
+    if (!ord) return e->code;
+    for (uint64_t i = 0; i < n; i++) ord[i] = i;
+    setcmp c = {r, st, key};
+    if (st->norder) qsort_r(ord, n, sizeof *ord, cmp_setrow, &c);
+    imdb_cell *nc = cnt ? imdb_alloc_array(cnt * r->ncols, sizeof *nc, e) : NULL;
+    if (cnt && !nc) return e->code;
+    for (uint64_t i = 0; i < cnt; i++) memcpy(&nc[i * r->ncols], &r->cells[ord[from + i] * r->ncols], r->ncols * sizeof *nc);
+    imdb_wipe(r->cells, (size_t)(r->caprows * r->ncols) * sizeof *r->cells);
+    imdb_free(r->cells);
+    r->cells = nc;
+    r->nrows = r->caprows = cnt;
+    return IMDB_OK;
+}
+
+static const char *setop_word(uint8_t op)
+{
+    static const char *const W[] = {"", "union", "intersect", "except"};
+    uint8_t o = op & (uint8_t)~SQL_SET_ALL;
+    return o <= SQL_SET_EXCEPT ? W[o] : "";
+}
+
+/* a set operation: its arms run in order, each into a row set of its own, folded left; then its tail. EXPLAIN runs the
+ * arms (their rows are what the rest is planned over, as a nested SELECT's) and says how they combine */
+/* EXPLAIN's rows for a set operation: its arms ran (their row counts), how they combine, the tail */
+static void xp_setop(const sql_stmt *st, const uint64_t *rows, uint64_t n, const char *path, xplain *xp)
+{
+    char d[XP_DETAIL];
+    size_t k = 0;
+    d[0] = 0;
+    xcat(d, sizeof d, &k, "%u SELECT%s, each run first (EXPLAIN reads them):", st->narm, st->narm == 1 ? "" : "s");
+    for (uint8_t i = 0; i < st->narm; i++)
+        xcat(d, sizeof d, &k, "%s %llu row%s", i ? ";" : "", (unsigned long long)rows[i], rows[i] == 1 ? "" : "s");
+    xp_add(xp, "set", "%s", d);
+    xp_add(xp, "path", "%s", path);
+    xp_add(xp, "output", "%llu row%s%s%s%s", (unsigned long long)n, n == 1 ? "" : "s",
+           st->norder ? ", ORDER BY its output columns" : "", st->has_offset ? ", OFFSET" : "", st->has_limit ? ", LIMIT" : "");
+}
+
+static int exec_setop(xctx *x, const sql_stmt *st, imdb_result *r, struct xplain *xp, imdb_err *e)
+{
+    imdb_result acc, b, out;
+    uint64_t rows[IMDB_MAX_SETOP_ARMS];
+    int rc = arm_run(x, st->arm[0], &acc, e);
+    rows[0] = acc.nrows;
+    for (uint8_t i = 1; !rc && i < st->narm; i++) {
+        if ((rc = arm_run(x, st->arm[i], &b, e))) {
+            imdb_result_free(&b);
+            break;
+        }
+        rows[i] = b.nrows;
+        imdb_result_init(&out);
+        rc = setop_fold(x, st->armop[i], &acc, &b, &out, e);
+        imdb_result_free(&b);
+        imdb_result_free(&acc);
+        acc = out;
+    }
+    if (!rc) rc = setop_tail(x, st, &acc, e);
+    if (rc) {
+        imdb_result_free(&acc);
+        return rc;
+    }
+    bool one = true; /* every operator alike: its name is the path */
+    for (uint8_t i = 2; i < st->narm; i++) one = one && st->armop[i] == st->armop[1];
+    char path[32];
+    snprintf(path, sizeof path, "%s%s", st->narm < 2 ? "ordered" : one ? setop_word(st->armop[1]) : "set operation",
+             st->narm >= 2 && one && (st->armop[1] & SQL_SET_ALL) ? " all" : "");
+    if (xp) {
+        /* the arms ran whole: they cannot read the statement around (arm_run), so no bind-only pass reaches here and
+         * probe_r stays unset; arms that may (correlated set operations) must type it here first */
+        xp_setop(st, rows, acc.nrows, path, xp);
+        imdb_result_free(&acc);
+        return IMDB_OK;
+    }
+    imdb_result_free(r);
+    *r = acc;
+    snprintf(r->path, sizeof r->path, "%s", path);
+    uint64_t snap, pend;
+    read_view(x, &snap, &pend);
+    r->snap = snap;
+    r->has_snap = true;
+    r->snap_own = pend != 0;
+    return read_point(x, r, e);
+}
+
+/* ---- P2 S5: WITH's column lists and WITH RECURSIVE ----------------------------------------------------------------- */
+
+/* st's FROM tables named name (*own), and its nested SELECTs' and arms' (*deep) */
+static void names_count(const sql_stmt *st, const char *name, int *own, int *deep)
+{
+    if (!strcmp(st->table, name)) (*own)++;
+    if (st->table2[0] && !strcmp(st->table2, name)) (*own)++;
+    for (uint8_t i = 0; i < st->nsub; i++) {
+        int o = 0, d = 0;
+        names_count(st->sub[i], name, &o, &d);
+        *deep += o + d;
+    }
+    for (uint8_t i = 0; i < st->narm; i++) {
+        int o = 0, d = 0;
+        names_count(st->arm[i], name, &o, &d);
+        *deep += o + d;
+    }
+}
+
+/* a WITH RECURSIVE's nested SELECT that reads its own name (one that does not is an ordinary WITH's) */
+static bool cte_self(const sql_stmt *c, const char *name)
+{
+    int o = 0, d = 0;
+    if (c->recursive) names_count(c, name, &o, &d);
+    return o + d > 0;
+}
+
+/* a WITH's column list names its rows' columns, one for each */
+static int cte_rename(const sql_stmt *c, const char *name, imdb_result *r, imdb_err *e)
+{
+    if (!c->cte_ncols) return IMDB_OK;
+    if (c->cte_ncols != r->ncols)
+        return imdb_fail(e, IMDB_ERR_INVALID, "WITH %s names %u columns: its SELECT returns %u", name, c->cte_ncols, r->ncols);
+    for (uint16_t i = 0; i < r->ncols; i++) res_name(r, i, c->cte_col[i]);
+    return IMDB_OK;
+}
+
+/* a result of rows typed as `like`'s columns (names, types), none yet */
+static void rec_open(imdb_result *r, const imdb_result *like, uint64_t cap)
+{
+    imdb_result_init(r);
+    res_cols(r, like->ncols);
+    r->byte_cap = cap;
+    for (uint16_t c = 0; c < like->ncols; c++) {
+        res_name(r, c, like->names[c]);
+        r->ctype[c] = like->ctype[c];
+        r->cscale[c] = like->cscale[c];
+    }
+}
+
+/* the rows of n (the base's or a round's) that are new: each converted to the base's types (one of another type the
+ * WITH refused before), UNION's first alike alone across every round (seen), UNION ALL's all; each into all and into
+ * the next round's working rows */
+static int rec_take(xctx *x, const imdb_result *n, imdb_result *all, imdb_result *next, bool keep_all, imdb_hmap *seen,
+                    imdb_buf *kb, imdb_err *e)
+{
+    imdb_xval v[IMDB_MAX_COLS + 4];
+    for (uint64_t i = 0; i < n->nrows; i++) {
+        if (++x->ticks >= x->next_check && xcheck(x, e)) return e->code;
+        if (setop_row(n, i, all->ctype, all->cscale, v, kb, e)) return e->code;
+        if (!keep_all) {
+            imdb_value k = {.type = IMDB_T_TEXT, .s = kb->p, .len = (uint32_t)kb->len};
+            if (imdb_hmap_get(seen, &k)) continue;
+            if (imdb_hmap_put(seen, &k, 1, e)) return e->code;
+        }
+        if (setop_emit(all, v, e) || setop_emit(next, v, e)) return e->code;
+    }
+    return IMDB_OK;
+}
+
+/* WITH RECURSIVE name AS (base UNION [ALL] step): the base's rows, then rounds of the step, which reads name as the
+ * last round's new rows (the working table: one pseudo table, its rows swapped each round), until a round adds none
+ * (UNION drops a row alike to any before, so a cycle ends; UNION ALL's does not), past IMDB_MAX_RECURSION rounds, or
+ * at the statement's limits (rows tested, memory, time). PostgreSQL's rules: one base and one step; the step reads name
+ * once, in its own FROM, and has no aggregate, GROUP BY, DISTINCT, ORDER BY, LIMIT or OFFSET; the base never reads it */
+static int rset_recursive(xctx *x, const sql_stmt *c, const char *name, xrset *rs, imdb_err *e)
+{
+    if (c->narm != 2 || (c->armop[1] & (uint8_t)~SQL_SET_ALL) != SQL_SET_UNION || c->norder || c->has_limit || c->has_offset)
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "WITH RECURSIVE %s is SELECT ... UNION [ALL] SELECT ..., the second reading %s "
+                                                  "(more SELECTs, or a tail: a later step)", name, name);
+    const sql_stmt *base = c->arm[0], *step = c->arm[1];
+    int o = 0, d = 0;
+    names_count(base, name, &o, &d);
+    if (o + d) return imdb_fail(e, IMDB_ERR_INVALID, "WITH RECURSIVE %s: its first SELECT cannot read %s", name, name);
+    names_count(step, name, &o, &d);
+    if (d || o != 1 || step->narm)
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "WITH RECURSIVE %s: its second SELECT reads %s once, in its own FROM", name, name);
+    bool agg = step->has_group || step->having;
+    for (uint16_t i = 0; i < step->nitems; i++) agg = agg || step->items[i].agg != AGG_NONE || imdb_sql_has_agg(step, step->items[i].expr);
+    if (agg || step->distinct || step->norder || step->has_limit || step->has_offset)
+        return imdb_fail(e, IMDB_ERR_INVALID, "WITH RECURSIVE %s: its second SELECT takes no aggregate, GROUP BY, DISTINCT, ORDER "
+                                              "BY, LIMIT or OFFSET", name);
+    bool keep_all = c->armop[1] & SQL_SET_ALL;
+    uint64_t cap = workspace_of(x->ss);
+    imdb_result b, all, wk, n;
+    imdb_result_init(&all);
+    imdb_result_init(&wk);
+    imdb_result_init(&n);
+    imdb_hmap seen;
+    memset(&seen, 0, sizeof seen);
+    imdb_buf kb;
+    imdb_buf_init(&kb);
+    xrset w = {.r = {0}};
+    snprintf(w.name, sizeof w.name, "%s", name);
+    imdb_result_init(&b);
+    int rc = run_nested(x, base, &b, NEST_TABLE, NULL, NULL, NULL, NULL, e);
+    if (!rc) rc = cte_rename(c, name, &b, e);
+    if (!rc) {
+        rec_open(&all, &b, cap);
+        rec_open(&wk, &b, cap);
+        rc = imdb_hmap_init(&seen, IMDB_T_TEXT, e);
+    }
+    if (!rc) rc = rec_take(x, &b, &all, &wk, keep_all, &seen, &kb, e);
+    imdb_result_free(&b);
+    if (!rc) rc = res_finish(&wk, e);
+    if (!rc) { /* the working table: one pseudo table, from the base's columns */
+        w.r = wk;
+        rc = rset_table(x, &w, e);
+        wk = w.r;
+    }
+    for (uint64_t round = 0; !rc && wk.nrows; round++) {
+        if (round >= IMDB_MAX_RECURSION) {
+            rc = imdb_fail(e, IMDB_ERR_LIMIT, "WITH RECURSIVE %s ran %u rounds and was still adding rows: a cycle under UNION ALL? "
+                                              "(UNION drops rows alike)", name, IMDB_MAX_RECURSION);
+            break;
+        }
+        if ((rc = xcheck(x, e))) break;
+        if (x->nvis >= sizeof x->vis / sizeof *x->vis) {
+            rc = imdb_fail(e, IMDB_ERR_LIMIT, "too many row sets in one statement");
+            break;
+        }
+        w.r = wk;
+        x->vis[x->nvis++] = &w; /* the step reads name: this round's working rows */
+        imdb_result_init(&n);
+        rc = run_nested(x, step, &n, NEST_TABLE, NULL, NULL, NULL, NULL, e);
+        x->nvis--;
+        wk = w.r;
+        if (rc) break;
+        if (n.ncols != all.ncols) {
+            rc = imdb_fail(e, IMDB_ERR_INVALID, "WITH RECURSIVE %s: its SELECTs return %u and %u columns", name, all.ncols, n.ncols);
+            break;
+        }
+        for (uint16_t k = 0; k < n.ncols && !rc; k++) { /* the base fixed the columns' types: a round's must fit them */
+            uint8_t t = all.ctype[k], s = all.cscale[k];
+            char what[96];
+            snprintf(what, sizeof what, "WITH RECURSIVE %s's column %u is", name, k + 1u);
+            rc = imdb_x_unify(&t, &s, n.ctype[k], n.cscale[k], what, e);
+            if (!rc && (t != all.ctype[k] || s != all.cscale[k]))
+                rc = imdb_fail(e, IMDB_ERR_INVALID, "WITH RECURSIVE %s: its second SELECT's column %u is wider than its first's: "
+                                                    "CAST it", name, k + 1u);
+        }
+        imdb_result next;
+        rec_open(&next, &all, cap);
+        if (!rc) rc = rec_take(x, &n, &all, &next, keep_all, &seen, &kb, e);
+        imdb_result_free(&n);
+        if (!rc) rc = res_finish(&next, e);
+        imdb_result_free(&wk);
+        wk = next;
+    }
+    imdb_result_free(&wk);
+    imdb_result_free(&n);
+    imdb_hmap_free(&seen);
+    imdb_buf_free(&kb);
+    if (!rc) rc = res_finish(&all, e);
+    if (rc) {
+        imdb_result_free(&all);
+        return rc;
+    }
+    imdb_result_free(&rs->r);
+    rs->r = all;
+    snprintf(rs->r.path, sizeof rs->r.path, "recursive");
+    return IMDB_OK;
+}
+
 static int exec_select(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, imdb_err *e)
 {
+    if (st->narm) { /* P2 S5: a set operation, its WITH's row sets first */
+        if (st->nsub && !x->own) {
+            if (rset_prepare(x, st, e)) return e->code;
+            if (xp) xp_nested(x, st, xp); /* EXPLAIN: the WITH ran */
+        }
+        return exec_setop(x, st, r, xp, e);
+    }
     if (st->nsub && !x->own) { /* P2 S4: its nested SELECTs first, each a row set */
         if (rset_prepare(x, st, e)) return e->code;
         if (xp) xp_nested(x, st, xp); /* EXPLAIN: they ran (their rows are what the rest is planned over) */

@@ -100,6 +100,7 @@ enum {
 
 /* P2 S3: a join's kind as written (RIGHT keeps side 1's rows, FULL both sides'; CROSS and FROM a, b have no ON) */
 enum { SQL_JOIN_INNER = 1, SQL_JOIN_LEFT, SQL_JOIN_RIGHT, SQL_JOIN_FULL, SQL_JOIN_CROSS };
+enum { SQL_SET_UNION = 1, SQL_SET_INTERSECT, SQL_SET_EXCEPT, SQL_SET_ALL = 0x80 }; /* P2 S5: an arm's operator, | ALL */
 
 /* isolation levels as written (the executor maps them; SERIALIZABLE is refused for now) */
 enum { SQL_ISO_SNAPSHOT = 1, SQL_ISO_READ_COMMITTED, SQL_ISO_SERIALIZABLE };
@@ -120,6 +121,17 @@ typedef struct sql_stmt {
     struct sql_stmt *sub[IMDB_MAX_SUBQUERIES];
     char sub_name[IMDB_MAX_SUBQUERIES][IMDB_MAX_IDENT + 1];
     uint8_t nsub;
+    /* P2 S5: a set operation: arm[0] armop[1] arm[1] ..., folded left (an INTERSECT chain inside a UNION or EXCEPT
+     * one is an arm of its own, as a parenthesized query is). The arms are this statement's alone, not sub[]'s: no
+     * nesting level, never a row set. Its tail applies to the combined rows: ORDER BY an output column, LIMIT, OFFSET */
+    struct sql_stmt *arm[IMDB_MAX_SETOP_ARMS];
+    uint8_t armop[IMDB_MAX_SETOP_ARMS];
+    uint8_t narm;
+    /* P2 S5: a WITH's nested SELECT: its column list, WITH name (c1, ...) AS (...) (NULL: its own names), and
+     * RECURSIVE: base UNION [ALL] step, the step reading the name (rset_recursive) */
+    char (*cte_col)[IMDB_MAX_IDENT + 1];
+    uint8_t cte_ncols;
+    bool recursive;
     char table2[IMDB_MAX_IDENT + 1], alias2[IMDB_MAX_IDENT + 1];
     char on_qual[2][IMDB_MAX_IDENT + 1], on_col[2][IMDB_MAX_IDENT + 1];
     imdb_schema schema;                         /* CREATE */
