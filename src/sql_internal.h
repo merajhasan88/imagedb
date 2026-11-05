@@ -38,7 +38,7 @@ typedef struct sql_lit {
  * balanced tree of EX_LIST nodes (l, r) over its elements, in order, so its depth grows as log2 of its length and every
  * walker that follows l, r and x3 reaches each element within the height bound; a list of one is its element alone. */
 enum { EX_LIT = 1, EX_COL, EX_NEG, EX_ADD, EX_SUB, EX_MUL, EX_DIV, EX_MOD, EX_AGG, EX_CMP, EX_AND, EX_OR, EX_NOT,
-       EX_FN, EX_LIST, EX_CASE, EX_WHEN, EX_CAST };
+       EX_FN, EX_LIST, EX_CASE, EX_WHEN, EX_CAST, EX_SUBQ };
 
 typedef struct sql_expr {
     uint8_t op;
@@ -50,6 +50,7 @@ typedef struct sql_expr {
     uint8_t fn, nargs;       /* EX_FN (P2 S1): FN_*, and its arguments' count */
     uint8_t ctype, cscale, cprec; /* EX_CAST (P2 S1): the target type, scale and precision (a DECIMAL's) */
     bool dist;               /* EX_AGG (P2 S2): agg(DISTINCT x); its FILTER (WHERE c) is x3 */
+    uint8_t sub, subk;       /* EX_SUBQ (P2 S4): the statement's sub[sub]; subk 0 a value, 1 EXISTS, 2 IN's values */
     sql_lit lit;             /* EX_LIT */
     char qual[IMDB_MAX_IDENT + 1]; /* EX_COL: a.col's a, or "" */
     char col[IMDB_MAX_IDENT + 1];
@@ -114,6 +115,11 @@ typedef struct sql_stmt {
                                                  * columns when it is one equality of columns (that path unchanged) */
     uint8_t nusing;                             /* P2 S3: USING (columns): each a key pair by its name */
     char using_col[IMDB_MAX_JOIN_KEYS][IMDB_MAX_IDENT + 1];
+    /* P2 S4: nested SELECTs, each run first into a row set the statement reads as a table by its name: FROM (SELECT ...)
+     * AS name, a join's (SELECT ...) AS name, WITH name AS (SELECT ...) */
+    struct sql_stmt *sub[IMDB_MAX_SUBQUERIES];
+    char sub_name[IMDB_MAX_SUBQUERIES][IMDB_MAX_IDENT + 1];
+    uint8_t nsub;
     char table2[IMDB_MAX_IDENT + 1], alias2[IMDB_MAX_IDENT + 1];
     char on_qual[2][IMDB_MAX_IDENT + 1], on_col[2][IMDB_MAX_IDENT + 1];
     imdb_schema schema;                         /* CREATE */
@@ -195,11 +201,19 @@ typedef struct imdb_xval {
 } imdb_xval;
 
 /* st->ex[k] bound: its result's type, its column or constant (an array parallel to st->ex) */
+/* P2 S4: IN (SELECT ...)'s values: the non-NULL ones sorted by imdb_x_cmp (exact across numeric kinds), a NULL seen */
+typedef struct imdb_xset {
+    imdb_xval *v;
+    uint64_t n;
+    bool has_null;
+} imdb_xset;
+
 typedef struct imdb_xnode {
     uint8_t type, scale;
     int16_t col;             /* EX_COL: the column in the row the evaluator is given */
     uint16_t slot;           /* EX_AGG: the aggregate's accumulator */
     uint16_t gslot;          /* P2 S2: a GROUP BY key's subtree read over a group: slots[gslot - 1], else 0 */
+    const imdb_xset *set;    /* P2 S4: an EX_SUBQ of IN's values: the set */
     imdb_xval k;             /* EX_LIT: the constant */
 } imdb_xnode;
 

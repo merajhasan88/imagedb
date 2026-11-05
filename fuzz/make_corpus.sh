@@ -87,6 +87,16 @@ for q in "SELECT COUNT(*), SUM(amount) FROM txns AS OF 3 WHERE user_id = 42 AND 
          "SELECT a > 1 OR NOT k, NOT (b BETWEEN 1 AND 2) FROM t WHERE (a = 0 OR 10 / a > 1) AND NOT (k OR b IS NULL) OR TRUE" \
          "SELECT DISTINCT g, a * 2 FROM t WHERE a > 0 ORDER BY 2 DESC NULLS FIRST, g ASC NULLS LAST LIMIT 5 OFFSET 2" \
          "SELECT g, AVG(price), COUNT(*) FROM s GROUP BY g HAVING AVG(qty) > 1.5 OR NOT COUNT(*) < 2 ORDER BY SUM(qty) OFFSET 1" \
+         "SELECT id, UPPER(TRIM(s)) AS who, COALESCE(s, '-'), CASE WHEN a > 1 THEN 'x' ELSE 'y' END, CAST(a AS TEXT) || 'z' FROM t WHERE s LIKE 'a%' ESCAPE '!' AND g NOT IN (1, 2, 3)" \
+         "SELECT 1 + 2, ROUND(2.5, 1), LENGTH('abc'), CASE g WHEN 1 THEN NULLIF(a, 0) END AS c" \
+         "SELECT g, LOWER(s), COUNT(DISTINCT a), SUM(a) FILTER (WHERE a > 0) FROM t GROUP BY g, LOWER(s) HAVING COUNT(*) > 1" \
+         "SELECT * FROM t FULL OUTER JOIN u USING (id, g)" "SELECT t.id FROM t CROSS JOIN u" \
+         "SELECT t.id FROM t, u WHERE t.id = u.tid AND t.g = u.v" "SELECT t.id FROM t RIGHT JOIN u ON t.id = u.tid AND (t.g > u.v OR u.v IS NULL)" \
+         "WITH a AS (SELECT id, g FROM t WHERE g > 1), b AS (SELECT g, COUNT(*) AS n FROM a GROUP BY g) SELECT * FROM b JOIN (SELECT id AS g FROM u) AS c ON b.g = c.g" \
+         "SELECT id FROM t WHERE id IN (SELECT tid FROM u WHERE EXISTS (SELECT 1 FROM w WHERE w.x = (SELECT MAX(x) FROM w))) AND NOT EXISTS (SELECT 1 FROM u) OR a > (SELECT AVG(a) FROM t)" \
+         "UPDATE t SET g = (SELECT MAX(g) FROM t) WHERE id NOT IN (SELECT tid FROM u)" "INSERT INTO t VALUES ((SELECT MAX(id) FROM t) + 1, 'x')" \
+         "DELETE FROM t WHERE g = (SELECT MIN(g) FROM (SELECT g FROM t) AS q)" "EXPLAIN SELECT COUNT(*) FROM (SELECT id FROM t) AS q" \
+         "SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM t) AS a) AS b) AS c) AS d" \
          "SELECT AVG(f) FROM t HAVING COUNT(*) BETWEEN 1 AND 10 OFFSET 0 LIMIT 0"; do
   printf '%s' "$q" > "$OUT/sql/q$i"; i=$((i+1))
 done

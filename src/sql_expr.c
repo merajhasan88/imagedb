@@ -1013,6 +1013,7 @@ int imdb_x_eval(const sql_stmt *st, const imdb_xnode *xn, uint16_t k, const imdb
     }
     switch (x->op) {
     case EX_LIT: *out = b->k; return IMDB_OK;
+    case EX_SUBQ: *out = b->k; return IMDB_OK; /* P2 S4: a subquery's value or EXISTS, computed once */
     case EX_COL: imdb_x_from_value(&row[b->col], out); return IMDB_OK;
     case EX_AGG: *out = slots[b->slot]; return IMDB_OK;
     case EX_NEG:
@@ -1045,6 +1046,27 @@ int imdb_x_eval(const sql_stmt *st, const imdb_xnode *xn, uint16_t k, const imdb
             return IMDB_OK;
         }
         if (x->cmp == CMP_IN || x->cmp == CMP_NOTIN) { /* P2 S1: TRUE at a match, else UNKNOWN past a NULL, else FALSE */
+            if (st->ex[x->r].op == EX_SUBQ) { /* P2 S4: a subquery's values, sorted: an empty set is FALSE, even for NULL */
+                const imdb_xset *s = xn[x->r].set;
+                int t = 0;
+                if (!s) return imdb_fail(e, IMDB_ERR_STATE, "IN's subquery unbound");
+                if (s->n || s->has_null) {
+                    uint64_t lo = 0, hi = s->n;
+                    while (!l.null && lo < hi) {
+                        uint64_t mid = lo + (hi - lo) / 2;
+                        int c = imdb_x_cmp(&l, &s->v[mid]);
+                        if (!c) {
+                            t = 1;
+                            break;
+                        }
+                        if (c > 0) lo = mid + 1;
+                        else hi = mid;
+                    }
+                    if (t != 1 && (l.null || s->has_null)) t = -1;
+                }
+                truth(out, x->cmp == CMP_IN ? t : t < 0 ? -1 : !t);
+                return IMDB_OK;
+            }
             int t = l.null ? -1 : 0;
             imdb_xlist_start(&it, st, x->r);
             for (uint16_t a = imdb_xlist_next(&it); a && !l.null; a = imdb_xlist_next(&it)) {

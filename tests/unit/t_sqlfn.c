@@ -195,7 +195,7 @@ static void t_sqlfn_cond(void)
     EXPECT("SELECT 'a' LIKE 'a' ESCAPE 'xy'", "ERR a LIKE's ESCAPE is one character");
     EXPECT("SELECT 1 LIKE 1", "ERR LIKE takes TEXT values");
     EXPECT("SELECT 1 = NULL", "ERR NULL cannot be an operand");
-    EXPECT("SELECT id FROM c WHERE id IN (SELECT id FROM c)", "ERR subqueries are not supported yet");
+    EXPECT("SELECT id FROM c WHERE id IN (SELECT id FROM c)", "id\n1\n2\n"); /* P2 S4: answered now (t_rset) */
     done(db);
 }
 

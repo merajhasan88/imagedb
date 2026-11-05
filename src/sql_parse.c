@@ -190,7 +190,10 @@ typedef struct parser {
     uint32_t n, i;
     imdb_err *e;
     sql_stmt *st;            /* its expression nodes */
+    uint8_t depth;           /* P2 S4: nested SELECTs around this point */
 } parser;
+
+static int parse_nested(parser *p, sql_stmt *outer, const char *name); /* P2 S4 */
 
 static const char *const kReserved[] = {
     "select", "from", "where", "insert", "into", "values", "update", "set", "delete", "create", "table",
@@ -531,12 +534,26 @@ static int cast_expr(parser *p, uint16_t *out, unsigned depth)
     return IMDB_OK;
 }
 
+/* P2 S4: (SELECT ...) after its '(', as an expression's operand: a value (subk 0), EXISTS's (1), IN's values (2) */
+static int subq(parser *p, uint8_t kind, uint16_t *out)
+{
+    if (parse_nested(p, p->st, "") || expect(p, TK_RP, ")") || ex_new(p, EX_SUBQ, 0, 0, out)) return p->e->code;
+    p->st->ex[*out].sub = (uint8_t)(p->st->nsub - 1);
+    p->st->ex[*out].subk = kind;
+    return IMDB_OK;
+}
+
 static int primary(parser *p, uint16_t *out, unsigned depth)
 {
     if (depth > IMDB_MAX_EXPR_DEPTH) return too_deep(p);
     if (tok(p, TK_LP)) {
+        if (tok_is_kw(p, p->i, "select")) return subq(p, 0, out); /* P2 S4: a scalar subquery */
         if (bexpr(p, out, depth + 1)) return p->e->code; /* (a + 1) and (a > 1 OR b < 2) alike */
         return expect(p, TK_RP, ")");
+    }
+    if (tok_is_kw(p, p->i, "exists") && p->t[p->i + 1].kind == TK_LP) { /* P2 S4 */
+        p->i += 2;
+        return subq(p, 1, out);
     }
     uint8_t agg = tok_is_kw(p, p->i, "count") ? AGG_COUNT : tok_is_kw(p, p->i, "sum") ? AGG_SUM
                 : tok_is_kw(p, p->i, "min")   ? AGG_MIN   : tok_is_kw(p, p->i, "max") ? AGG_MAX
@@ -660,9 +677,11 @@ static int b_cmp(parser *p, uint16_t *out, unsigned depth)
     if (kw(p, "in")) { /* P2 S1: a list of values; a subquery is S4's */
         uint32_t n;
         if (expect(p, TK_LP, "(")) return p->e->code;
-        if (tok_is_kw(p, p->i, "select"))
-            return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "IN (SELECT ...): subqueries are not supported yet");
-        if (expr_list(p, depth, &r, &n)) return p->e->code;
+        if (tok_is_kw(p, p->i, "select")) { /* P2 S4: IN (SELECT ...) */
+            if (subq(p, 2, &r)) return p->e->code;
+        } else if (expr_list(p, depth, &r, &n)) {
+            return p->e->code;
+        }
         op = neg ? CMP_NOTIN : CMP_IN;
     } else if (kw(p, "like")) { /* P2 S1 */
         op = neg ? CMP_NOTLIKE : CMP_LIKE;
@@ -994,6 +1013,52 @@ static int isolation(parser *p, sql_stmt *st)
     return IMDB_OK;
 }
 
+/* P2 S4: a nested SELECT, parsed from the same tokens into its own statement (its own expression nodes), named: the
+ * row set its outer statement reads as a table of that name; nesting bounded */
+static int parse_select(parser *p, sql_stmt *st);
+static int parse_nested(parser *p, sql_stmt *outer, const char *name)
+{
+    if (outer->nsub >= IMDB_MAX_SUBQUERIES)
+        return imdb_fail(p->e, IMDB_ERR_LIMIT, "more than %u nested SELECTs in one statement", IMDB_MAX_SUBQUERIES);
+    if (p->depth >= IMDB_MAX_SUBQUERY_DEPTH)
+        return imdb_fail(p->e, IMDB_ERR_LIMIT, "SELECTs nested deeper than %u", IMDB_MAX_SUBQUERY_DEPTH);
+    for (uint8_t i = 0; name[0] && i < outer->nsub; i++) /* an expression's (unnamed) never collides */
+        if (!strcmp(outer->sub_name[i], name))
+            return imdb_fail(p->e, IMDB_ERR_INVALID, "two nested SELECTs named %s", name);
+    sql_stmt *in = imdb_alloc(sizeof *in, p->e);
+    if (!in) return p->e->code;
+    memset(in, 0, sizeof *in);
+    uint8_t i = outer->nsub++;
+    outer->sub[i] = in;
+    snprintf(outer->sub_name[i], sizeof outer->sub_name[i], "%s", name);
+    sql_stmt *saved = p->st;
+    p->st = in;
+    p->depth++;
+    int rc = expect_kw(p, "select") ? p->e->code : parse_select(p, in);
+    p->depth--;
+    p->st = saved;
+    return rc;
+}
+
+/* P2 S4: a table where FROM or a join names one: a name, or (SELECT ...) AS name, the name required */
+static int from_item(parser *p, sql_stmt *st, char *table, char *al)
+{
+    if (!tok(p, TK_LP)) return ident(p, table) || alias(p, al) ? p->e->code : IMDB_OK;
+    char name[IMDB_MAX_IDENT + 1];
+    uint16_t at = (uint16_t)st->nsub;
+    if (parse_nested(p, st, "") || expect(p, TK_RP, ")")) return p->e->code;
+    kw(p, "as");
+    if (p->t[p->i].kind != TK_IDENT || is_reserved(p, p->i))
+        return imdb_fail(p->e, IMDB_ERR_SYNTAX, "a nested SELECT in FROM needs a name: (SELECT ...) AS name");
+    if (ident(p, name)) return p->e->code;
+    for (uint8_t i = 0; i < st->nsub; i++)
+        if (i != at && !strcmp(st->sub_name[i], name)) return imdb_fail(p->e, IMDB_ERR_INVALID, "two nested SELECTs named %s", name);
+    snprintf(st->sub_name[at], sizeof st->sub_name[at], "%s", name);
+    snprintf(table, IMDB_MAX_IDENT + 1, "%s", name);
+    al[0] = 0;
+    return IMDB_OK;
+}
+
 static int parse_select(parser *p, sql_stmt *st)
 {
     st->kind = ST_SELECT;
@@ -1038,7 +1103,7 @@ static int parse_select(parser *p, sql_stmt *st)
                                                        "BY, LIMIT, OFFSET or FOR UPDATE");
         return IMDB_OK;
     }
-    if (expect_kw(p, "from") || ident(p, st->table) || alias(p, st->alias)) return p->e->code;
+    if (expect_kw(p, "from") || from_item(p, st, st->table, st->alias)) return p->e->code; /* P2 S4: or (SELECT ...) AS x */
     if (kw(p, "with")) {
         if (expect(p, TK_LP, "(") || expect_kw(p, "nolock") || expect(p, TK_RP, ")")) return p->e->code;
         st->nolock = true;
@@ -1063,7 +1128,7 @@ static int parse_select(parser *p, sql_stmt *st)
             if (expect_kw(p, "join")) return p->e->code;
         }
         st->join_left = st->join_kind == SQL_JOIN_LEFT;
-        if (ident(p, st->table2) || alias(p, st->alias2)) return p->e->code;
+        if (from_item(p, st, st->table2, st->alias2)) return p->e->code;
         if (st->join_kind != SQL_JOIN_CROSS && kw(p, "using")) {
             if (expect(p, TK_LP, "(")) return p->e->code;
             do {
@@ -1176,6 +1241,13 @@ static int parse_select(parser *p, sql_stmt *st)
 
 void imdb_sql_stmt_free(sql_stmt *st)
 {
+    for (uint8_t i = 0; i < st->nsub; i++) { /* P2 S4 */
+        if (!st->sub[i]) continue;
+        imdb_sql_stmt_free(st->sub[i]);
+        imdb_free(st->sub[i]);
+        st->sub[i] = NULL;
+    }
+    st->nsub = 0;
     imdb_free(st->vals);
     st->vals = NULL;
     imdb_free(st->ex);
@@ -1189,7 +1261,7 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
     sql_tok *t;
     uint32_t nt;
     if (imdb_sql_lex(s, n, &t, &nt, e)) return e->code;
-    parser p = {s, t, nt, 0, e, st};
+    parser p = {s, t, nt, 0, e, st, 0};
     int rc = IMDB_OK;
     if (nt == 0 || (nt == 1 && t[0].kind == TK_SEMI)) {
         st->kind = ST_EMPTY;
@@ -1240,6 +1312,14 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
     } else if (kw(&p, "delete")) {
         st->kind = ST_DELETE;
         if (!(rc = expect_kw(&p, "from")) && !(rc = ident(&p, st->table)) && kw(&p, "where")) rc = preds(&p, st);
+    } else if (kw(&p, "with")) { /* P2 S4: WITH name AS (SELECT ...) [, ...] SELECT ... */
+        do {
+            char name[IMDB_MAX_IDENT + 1];
+            if ((rc = ident(&p, name)) || (rc = expect_kw(&p, "as")) || (rc = expect(&p, TK_LP, "(")) ||
+                (rc = parse_nested(&p, st, name)) || (rc = expect(&p, TK_RP, ")")))
+                break;
+        } while (tok(&p, TK_COMMA));
+        if (!rc && !(rc = expect_kw(&p, "select"))) rc = parse_select(&p, st);
     } else if (kw(&p, "select")) rc = parse_select(&p, st);
     else if (kw(&p, "begin")) {
         st->kind = ST_BEGIN;

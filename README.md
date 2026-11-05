@@ -635,7 +635,8 @@ SHOW INDEXES;
   statistics); the segments a scan reads and those its zone maps skip; what
   the statement makes of the rows. A join's: its plan (`join(build N)`,
   `join(index N)`) and why, the prices of the hash join and of each
-  orientation of the index join, each side's path. No row is read, nothing is
+  orientation of the index join, each side's path. No row is read (but a
+  statement's nested SELECTs, which run first: see Subqueries), nothing is
   written or locked. The plan is this copy's: two replicas may explain a
   statement differently (their memory floors differ) and answer it the same.
   An UPDATE or DELETE reports the path that found its rows
@@ -672,8 +673,8 @@ SELECT c.id FROM customers AS c LEFT JOIN orders AS o ON c.id = o.cust WHERE o.i
   the first table's, the second's under RIGHT, refused under FULL; `SELECT *` with
   USING is refused for now). A NULL
   key matches nothing. Qualify a column by its table or its alias (`AS`) when
-  both tables have it. A third table and FOR UPDATE are refused, each with its
-  reason.
+  both tables have it. A third table in one FROM and FOR UPDATE are refused,
+  each with its reason (three tables join through a derived table, below).
 - Both tables are read at one snapshot (AS OF too). Each uses its own index or
   scan for its own WHERE predicates; a predicate on a table a join NULL-extends (LEFT's second,
   RIGHT's first, FULL's both) applies after the join, so the third query lists the customers
@@ -705,6 +706,35 @@ SELECT c.id FROM customers AS c LEFT JOIN orders AS o ON c.id = o.cust WHERE o.i
   result's, and the result its own, so a join holds at most half of a memory
   budget, three quarters under cross_check (the first plan's result is kept
   while the second runs).
+
+Subqueries and derived tables:
+
+```sql
+SELECT name FROM customers WHERE id IN (SELECT cust FROM orders WHERE amount > 100);
+SELECT id FROM orders WHERE amount > (SELECT AVG(amount) FROM orders);
+WITH big AS (SELECT cust, SUM(amount) AS total FROM orders GROUP BY cust)
+  SELECT c.name, b.total FROM big AS b JOIN customers AS c ON c.id = b.cust;
+```
+
+- A SELECT may stand in FROM or as a join's side (`(SELECT ...) AS name`, the
+  name required), before a statement (`WITH name AS (SELECT ...), ...`, a
+  later one reading an earlier one), and in a condition or a value:
+  `x [NOT] IN (SELECT y ...)`, `[NOT] EXISTS (SELECT ...)`, `(SELECT v ...)`,
+  in SELECT, UPDATE, DELETE and INSERT's VALUES. Three tables join through a
+  derived table: `FROM (SELECT ... FROM a JOIN b ON ...) AS ab JOIN c ON ...`.
+- Each nested SELECT runs once, first, at the statement's snapshot (a
+  transaction's own writes included) and under its timeout, row limit and
+  memory ceiling; a write's run before it writes anything. A derived table's
+  path is `nested`: its rows in their order, no index. A value subquery with
+  no row is NULL, with two rows an error. `x IN (SELECT ...)` is UNKNOWN when
+  x is NULL, or when nothing matches and the set holds a NULL, so `NOT IN`
+  over a set with a NULL keeps no row, as in SQL.
+- At most 8 nested SELECTs in a statement, nested 4 deep. Not yet: correlated
+  subqueries (a nested SELECT naming a table of the statement around it is
+  refused with that reason), LATERAL, `ANY` and `ALL`, AS OF with a nested
+  SELECT, FOR UPDATE of a derived table.
+- EXPLAIN runs a statement's nested SELECTs (the rest is planned over their
+  rows) and lists each with its row count; nothing else runs.
 
 ## Validation
 

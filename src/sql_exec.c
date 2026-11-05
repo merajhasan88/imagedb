@@ -126,6 +126,12 @@ static void res_name(imdb_result *r, uint16_t i, const char *n) { snprintf(r->na
 
 /* ---- execution context -------------------------------------------------------- */
 
+typedef struct xrset { /* P2 S4: a nested SELECT's rows, read as a table by its name (rset_prepare) */
+    char name[IMDB_MAX_IDENT + 1];
+    imdb_table *t; /* its pseudo table: a schema alone */
+    imdb_result r;
+} xrset;
+
 typedef struct xctx {
     imdb_session *ss;
     imdb_db *db;
@@ -145,6 +151,11 @@ typedef struct xctx {
     imdb_xenv env;                /* P2 S1: the evaluator's view of the statement (xenv_check) */
     imdb_xarena arena;            /* P2 S1: computed TEXT, freed by xfree (the one exit) */
     char vpath[80];               /* select_vids' path: an UPDATE's or DELETE's result's (P1 Q1) */
+    xrset *own;                   /* P2 S4: the row sets this statement made (xfree frees their results) */
+    uint8_t nown;
+    const xrset *vis[IMDB_MAX_SUBQUERIES * IMDB_MAX_SUBQUERY_DEPTH]; /* the row sets it reads by name: its own and
+                                                                     * an outer statement's */
+    uint8_t nvis;
 } xctx;
 
 enum { TICK_ROWS = 4096 }; /* rows between two looks at the clock and the cancel flag: tens of microseconds of work */
@@ -214,6 +225,7 @@ static void *xalloc(xctx *x, size_t n, imdb_err *e)
 
 static void xfree(xctx *x)
 {
+    for (uint8_t i = 0; i < x->nown; i++) imdb_result_free(&x->own[i].r); /* P2 S4: before the allocations they sit in */
     for (uint32_t i = 0; i < x->nallocs; i++) imdb_free(x->allocs[i]);
     imdb_free(x->allocs);
     imdb_salts_wipe(&x->salts);
@@ -527,6 +539,84 @@ static int xbind_s1(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
     return IMDB_OK;
 }
 
+/* ---- P2 S4: subqueries in expressions, uncorrelated: each computed once, before its statement binds (rset_prepare),
+ * read here as a constant (a value, EXISTS) or a sorted set (IN) ------------------------------------------------- */
+
+/* a result cell as a value of the column's bound type (a wide SUM or DECIMAL whole: values hold 38 digits) */
+static void cell_xval(const imdb_cell *c, uint8_t type, uint8_t scale, imdb_xval *out)
+{
+    if (c->null || c->v.null) {
+        *out = (imdb_xval){.type = type, .scale = scale, .null = true};
+        return;
+    }
+    imdb_x_from_value(&c->v, out);
+    if (c->wide) out->i = c->i128;
+    out->type = type;
+    out->scale = scale;
+}
+
+/* the result of the statement's nested SELECT k, which rset_prepare made */
+static const imdb_result *sub_result(const xctx *x, uint8_t k, imdb_err *e)
+{
+    if (!x->own || k >= x->nown) {
+        imdb_fail(e, IMDB_ERR_STATE, "a subquery this statement has not run");
+        return NULL;
+    }
+    return &x->own[k].r;
+}
+
+static int cmp_xval(const void *a, const void *b) { return imdb_x_cmp(a, b); }
+
+/* x [NOT] IN (SELECT ...): one column, comparable with x; its values sorted (TEXT pointing into the result, which
+ * lives as long as the statement) */
+static int bind_inset(xctx *x, const sql_stmt *st, uint16_t k, imdb_err *e)
+{
+    const sql_expr *n = &st->ex[k], *q = &st->ex[n->r];
+    const imdb_result *r = sub_result(x, q->sub, e);
+    if (!r) return e->code;
+    if (r->ncols != 1) return imdb_fail(e, IMDB_ERR_INVALID, "IN (SELECT ...) takes one column");
+    uint8_t ta = x->xn[n->l].type, tb = r->ctype[0];
+    if (!ta) return imdb_fail(e, IMDB_ERR_INVALID, "NULL cannot be an operand: the result would always be unknown (use IS NULL)");
+    if (!imdb_x_comparable(ta, tb))
+        return imdb_fail(e, IMDB_ERR_INVALID, "IN compares %s with %s: values are not converted", imdb_type_name(ta),
+                         imdb_type_name(tb));
+    imdb_xset *s = xalloc(x, sizeof *s, e);
+    if (!s || !(s->v = xalloc(x, (r->nrows ? r->nrows : 1) * sizeof *s->v, e))) return e->code;
+    for (uint64_t i = 0; i < r->nrows; i++) {
+        imdb_xval v;
+        cell_xval(&r->cells[i], tb, r->cscale[0], &v);
+        if (v.null) s->has_null = true;
+        else s->v[s->n++] = v;
+    }
+    qsort(s->v, s->n, sizeof *s->v, cmp_xval);
+    x->xn[n->r].set = s;
+    x->xn[n->r].type = tb;
+    x->xn[n->r].scale = r->cscale[0];
+    return IMDB_OK;
+}
+
+/* a subquery as a value (one column, at most one row: none is NULL) or EXISTS (a BOOL), a constant */
+static int bind_subq(xctx *x, const sql_stmt *st, uint16_t k, imdb_err *e)
+{
+    const sql_expr *n = &st->ex[k];
+    imdb_xnode *b = &x->xn[k];
+    const imdb_result *r = sub_result(x, n->sub, e);
+    if (!r) return e->code;
+    if (n->subk == 1) {
+        b->type = IMDB_T_BOOL;
+        b->k = (imdb_xval){.type = IMDB_T_BOOL, .i = r->nrows > 0};
+        return IMDB_OK;
+    }
+    if (n->subk != 0) return imdb_fail(e, IMDB_ERR_STATE, "IN's subquery read outside IN");
+    if (r->ncols != 1) return imdb_fail(e, IMDB_ERR_INVALID, "a subquery as a value returns one column");
+    if (r->nrows > 1) return imdb_fail(e, IMDB_ERR_INVALID, "a subquery as a value returned more than one row");
+    b->type = r->ctype[0];
+    b->scale = r->cscale[0];
+    if (r->nrows) cell_xval(&r->cells[0], b->type, b->scale, &b->k);
+    else b->k = (imdb_xval){.type = b->type, .scale = b->scale, .null = true};
+    return IMDB_OK;
+}
+
 static int xbind_node(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
 {
     const sql_expr *n = &sc->st->ex[k];
@@ -600,6 +690,7 @@ static int xbind_node(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
         if (b->type != IMDB_T_INT64 && b->type != IMDB_T_DECIMAL && b->type != IMDB_T_FLOAT64)
             return imdb_fail(e, IMDB_ERR_INVALID, "arithmetic takes INT64, DECIMAL and FLOAT64 values");
         return IMDB_OK;
+    case EX_SUBQ: return bind_subq(x, sc->st, k, e); /* P2 S4 */
     case EX_FN: /* P2 S1 */
     case EX_CASE:
     case EX_CAST: return xbind_s1(x, sc, k, e);
@@ -607,6 +698,7 @@ static int xbind_node(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
         b->type = IMDB_T_BOOL;
         if (xbind(x, sc, n->l, e)) return e->code;
         if (n->cmp == CMP_ISNULL || n->cmp == CMP_NOTNULL) return IMDB_OK;
+        if ((n->cmp == CMP_IN || n->cmp == CMP_NOTIN) && sc->st->ex[n->r].op == EX_SUBQ) return bind_inset(x, sc->st, k, e);
         if (n->cmp == CMP_IN || n->cmp == CMP_NOTIN) { /* P2 S1: each value comparable with the operand */
             imdb_xlist it;
             imdb_xlist_start(&it, sc->st, n->r);
@@ -678,7 +770,7 @@ static bool x_same(const xctx *x, const xscope *sc, uint16_t a, uint16_t b)
     if (a == b) return true;
     if (!a || !b) return false;
     const sql_expr *p = &sc->st->ex[a], *q = &sc->st->ex[b];
-    if (p->op != q->op || p->agg != q->agg || p->cmp != q->cmp || p->fn != q->fn || p->nargs != q->nargs ||
+    if (p->op != q->op || p->agg != q->agg || p->cmp != q->cmp || p->fn != q->fn || p->nargs != q->nargs || p->sub != q->sub ||
         p->ctype != q->ctype || p->cscale != q->cscale || p->cprec != q->cprec || p->dist != q->dist)
         return false;
     if (p->op == EX_LIT)
@@ -743,6 +835,7 @@ typedef struct qspec {
     int16_t ord_eq[IMDB_MAX_INDEX_COLS], ord_rng; /* then a range on the next (ord_rng), or -1 */
     bool all_versions;       /* ERASE: match every non-stub version regardless of snapshot */
     bool ord_only;           /* the ordered index alone answers (ordered_only) */
+    const imdb_result *rset; /* P2 S4: the rows of a nested SELECT when the table is one (path_rset reads them), else NULL */
 } qspec;
 
 /* An ordered index for the bound predicates: equalities on its first columns, then perhaps a
@@ -1411,8 +1504,184 @@ static void sink_free(sink *k)
 
 /* ---- the three read paths --------------------------------------------------------- */
 
+/* ---- P2 S4: row sets -------------------------------------------------------------------------------------------- *
+ * A nested SELECT (FROM (SELECT ...) AS x, a join's, WITH x AS (SELECT ...)) runs inside its statement: the same view
+ * (read_view: one snapshot and pending set; AS OF is refused with one), cancellation, deadline, work limit and memory
+ * ceiling, with its own bound trees and arena, into a result; that result, a row set, is read as a table of its name:
+ * a pseudo table (a schema alone: the result's names and bound types, every column nullable, no key, no index) that
+ * run_path reads by path_rset, fetch_row and row_key by row number. Nothing writes it. */
+
+static const xrset *rset_of(const xctx *x, const imdb_table *t)
+{
+    for (uint8_t i = 0; i < x->nvis; i++)
+        if (x->vis[i]->t == t) return x->vis[i];
+    return NULL;
+}
+
+/* the rows a table of x's statement holds when it is a nested SELECT's, else NULL (a qspec's rset) */
+static const imdb_result *rset_res(const xctx *x, const imdb_table *t)
+{
+    const xrset *rs = x->nvis ? rset_of(x, t) : NULL;
+    return rs ? &rs->r : NULL;
+}
+
+/* row i of a row set as a table row: its cells' values (a computed DECIMAL or a SUM wider than int64 refused: a table
+ * row holds 18 digits) */
+static int rset_row(const xrset *rs, uint64_t i, imdb_value *vals, imdb_err *e)
+{
+    const imdb_result *r = &rs->r;
+    const imdb_schema *s = &rs->t->s;
+    if (i >= r->nrows) return imdb_fail(e, IMDB_ERR_STATE, "a row set's row past its end");
+    for (uint16_t c = 0; c < s->ncols; c++) {
+        const imdb_cell *cl = &r->cells[i * r->ncols + c];
+        imdb_value *v = &vals[c];
+        if (cl->null || cl->v.null) {
+            *v = (imdb_value){.type = s->cols[c].type, .scale = s->cols[c].scale, .null = true};
+            continue;
+        }
+        *v = cl->v;
+        v->type = s->cols[c].type;
+        if (cl->wide) {
+            if (cl->i128 < INT64_MIN || cl->i128 > INT64_MAX)
+                return imdb_fail(e, IMDB_ERR_LIMIT, "a nested SELECT's %s past 18 digits: CAST it, or keep it in the outer SELECT",
+                                 s->cols[c].name);
+            v->i = (int64_t)cl->i128;
+        }
+        if (v->type == IMDB_T_DECIMAL && v->scale != s->cols[c].scale)
+            return imdb_fail(e, IMDB_ERR_STATE, "a row set's DECIMAL at another scale than its column's");
+    }
+    return IMDB_OK;
+}
+
+/* the row set's rows, past the bound predicates, into the sink (row number for vid) */
+static int path_rset(xctx *x, const qspec *q, sink *k, imdb_err *e)
+{
+    const xrset *rs = rset_of(x, q->t);
+    imdb_value vals[IMDB_MAX_COLS];
+    for (uint64_t i = 0; rs && i < rs->r.nrows && !k->err; i++) {
+        if (ktick(k, 1)) break;
+        if (rset_row(rs, i, vals, e)) return e->code;
+        if (q->np && !preds_ok(q, vals)) continue;
+        sink_row(k, i, vals);
+    }
+    return k->err;
+}
+
+/* a pseudo table from the result: its names (distinct, an identifier's length) and types */
+static int rset_table(xctx *x, xrset *rs, imdb_err *e)
+{
+    const imdb_result *r = &rs->r;
+    imdb_table *t = xalloc(x, sizeof *t, e);
+    if (!t) return e->code;
+    imdb_schema *s = &t->s;
+    snprintf(s->name, sizeof s->name, "%s", rs->name);
+    s->ncols = r->ncols;
+    s->pk = r->ncols; /* no column: no key path */
+    s->subject = -1;
+    for (uint16_t c = 0; c < r->ncols; c++) {
+        imdb_column *col = &s->cols[c];
+        size_t nl = strlen(r->names[c]);
+        if (nl > IMDB_MAX_IDENT)
+            return imdb_fail(e, IMDB_ERR_INVALID, "a nested SELECT's column name of more than %u bytes: name it (AS)", IMDB_MAX_IDENT);
+        memcpy(col->name, r->names[c], nl + 1);
+        for (uint16_t d = 0; d < c; d++)
+            if (!strcmp(s->cols[d].name, col->name))
+                return imdb_fail(e, IMDB_ERR_INVALID, "a nested SELECT names two columns %s: name one (AS)", col->name);
+        if (!r->ctype[c]) return imdb_fail(e, IMDB_ERR_STATE, "a nested SELECT's column %s has no type", col->name);
+        col->type = r->ctype[c];
+        col->scale = r->cscale[c];
+        if (col->type == IMDB_T_DECIMAL && col->scale > 18)
+            return imdb_fail(e, IMDB_ERR_LIMIT, "a nested SELECT's DECIMAL %s has more than 18 places: CAST it", col->name);
+        col->precision = col->type == IMDB_T_DECIMAL ? 18 : 0;
+        col->flags = IMDB_COL_NULLABLE;
+    }
+    rs->t = t;
+    return IMDB_OK;
+}
+
+struct xplain;
+static int exec_select(xctx *x, const sql_stmt *st, imdb_result *r, struct xplain *xp, imdb_err *e);
+static uint64_t workspace_of(const imdb_session *ss);
+
+/* P2 S4: a nested SELECT that qualifies a column by a table of a statement around it is a correlated subquery, which
+ * is not supported: told so here, in the one place every nested run returns through (a deeper one's, at each level
+ * out), rather than by "no table NAME in this statement" (its own statement's words, taken apart: one format) */
+static int nested_unresolved(const xctx *x, int rc, imdb_err *e)
+{
+    static const char pre[] = "no table ", post[] = " in this statement";
+    size_t n = strlen(e->msg), lp = sizeof pre - 1, lq = sizeof post - 1;
+    if (e->code != IMDB_ERR_NOTFOUND || n <= lp + lq || n - lp - lq > IMDB_MAX_IDENT || strncmp(e->msg, pre, lp) != 0 ||
+        strcmp(e->msg + n - lq, post) != 0)
+        return rc;
+    char name[IMDB_MAX_IDENT + 1];
+    memcpy(name, e->msg + lp, n - lp - lq);
+    name[n - lp - lq] = 0;
+    const sql_stmt *o = x->st;
+    const char *const nm[4] = {o->table, o->alias, o->table2, o->alias2};
+    for (int i = 0; i < 4; i++)
+        if (nm[i][0] && !strcmp(nm[i], name)) {
+            imdb_err_clear(e); /* imdb_fail keeps a first error: this one replaces it */
+            return imdb_fail(e, IMDB_ERR_UNSUPPORTED,
+                             "%s is a table of the statement around this nested SELECT, which reads only its own: "
+                             "correlated subqueries are a later step",
+                             name);
+        }
+    return rc;
+}
+
+/* one nested SELECT inside x's statement (its own trees, arena and allocations; the outer's row sets visible) */
+static int run_nested(xctx *x, const sql_stmt *in, imdb_result *r, imdb_err *e)
+{
+    xctx s = {.ss = x->ss, .db = x->db, .sql = x->sql, .params = x->params, .nparams = x->nparams, .st = in,
+              .row_limit = x->row_limit, .deadline_ns = x->deadline_ns, .checks = x->checks, .ticks = x->ticks,
+              .next_check = x->next_check, .tested = x->tested};
+    s.env.check = xenv_check;
+    s.env.ctx = &s;
+    s.env.arena = &s.arena;
+    memcpy(s.vis, x->vis, x->nvis * sizeof *s.vis);
+    s.nvis = x->nvis;
+    r->byte_cap = workspace_of(x->ss);
+    int rc = exec_select(&s, in, r, NULL, e);
+    x->ticks = s.ticks;
+    x->next_check = s.next_check;
+    x->tested = s.tested;
+    xfree(&s);
+    if (rc) rc = nested_unresolved(x, rc, e);
+    return rc;
+}
+
+/* a statement's nested SELECTs, in order (a later one may read an earlier one, as WITH says) */
+static int rset_prepare(xctx *x, const sql_stmt *st, imdb_err *e)
+{
+    if (st->has_asof) return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "AS OF with a nested SELECT: a later step");
+    if (!(x->own = xalloc(x, st->nsub * sizeof *x->own, e))) return e->code;
+    for (uint8_t i = 0; i < st->nsub; i++) {
+        if (st->sub[i]->has_asof) return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "AS OF in a nested SELECT: a later step");
+        xrset *rs = &x->own[i];
+        imdb_result_init(&rs->r);
+        x->nown = (uint8_t)(i + 1); /* xfree frees its result, whatever happens next */
+        snprintf(rs->name, sizeof rs->name, "%s", st->sub_name[i]);
+        if (run_nested(x, st->sub[i], &rs->r, e) || rset_table(x, rs, e)) return e->code;
+        if (x->nvis >= sizeof x->vis / sizeof *x->vis) return imdb_fail(e, IMDB_ERR_LIMIT, "too many row sets in one statement");
+        x->vis[x->nvis++] = rs;
+    }
+    return IMDB_OK;
+}
+
+/* the default order's key of a row: its primary key's value, or a row set's row number (P2 S4) */
+static void row_key(const xctx *x, imdb_table *t, uint64_t vid, imdb_value *key)
+{
+    if (x->nvis && rset_of(x, t)) {
+        *key = (imdb_value){.type = IMDB_T_INT64, .i = (int64_t)vid};
+        return;
+    }
+    imdb_version_key(t, vid, t->s.pk, key);
+}
+
 static int fetch_row(xctx *x, imdb_table *t, uint64_t vid, imdb_value *vals, imdb_err *e)
 {
+    const xrset *rs = x->nvis ? rset_of(x, t) : NULL; /* P2 S4 */
+    if (rs) return rset_row(rs, vid, vals, e);
     return imdb_version_values(x->db, t, vid, vals, e);
 }
 
@@ -1803,6 +2072,7 @@ static bool below_floor(const imdb_db *db, const qspec *q)
 static int run_path(xctx *x, int path, const qspec *q, sink *k, imdb_err *e)
 {
     if (q->never) return IMDB_OK;
+    if (q->rset) return path_rset(x, q, k, e); /* P2 S4: a row set's own path */
     if (below_floor(x->db, q) && path != IMDB_PATH_SCAN && path != IMDB_PATH_ROWS) {
 #ifdef IMDB_STORE_CHECKS /* the one choke point: every planner chose the lake for it, so a miss is a bug */
         imdb_v_misuse(q->t, q->snap, "a read below the memory floor was planned through memory");
@@ -1820,6 +2090,7 @@ static int run_path(xctx *x, int path, const qspec *q, sink *k, imdb_err *e)
 
 static const char *path_name(int p, const qspec *q)
 {
+    if (p == IMDB_PATH_NESTED) return "nested"; /* P2 S4 */
     if (p == IMDB_PATH_INDEX) return q->pk_pred >= 0 ? "index(primary key)" : q->subj_pred >= 0 ? "index(subject)" : "store";
     if (p == IMDB_PATH_SCAN) return "scan";
     if (p == IMDB_PATH_ROWS) return "rows";
@@ -2437,6 +2708,31 @@ static int cmp_gkeys(const void *a, const void *b, void *arg)
     return 0;
 }
 
+/* P2 S4: a SELECT result's column types as the statement bound them, which a nested SELECT's pseudo table takes as its
+ * schema (an empty result has no cells to say them): a column's own, a tree's bound type (an untyped NULL's TEXT, as
+ * its cell is), COUNT's INT64, a SUM, MIN or MAX of a column its column's */
+static void col_types(const xctx *x, const sql_stmt *st, const sink *k, const imdb_schema *s, imdb_result *r)
+{
+    uint16_t n = st->star ? s->ncols : st->nitems;
+    for (uint16_t i = 0; i < n && i < IMDB_MAX_COLS; i++) {
+        uint8_t ty = 0, sc = 0;
+        if (st->star) {
+            ty = s->cols[i].type;
+            sc = s->cols[i].scale;
+        } else if (st->items[i].expr) {
+            ty = x->xn[st->items[i].expr].type ? x->xn[st->items[i].expr].type : IMDB_T_TEXT;
+            sc = x->xn[st->items[i].expr].scale;
+        } else if (st->items[i].agg == AGG_COUNT_STAR || st->items[i].agg == AGG_COUNT) {
+            ty = IMDB_T_INT64;
+        } else if (k && k->item_col[i] >= 0) {
+            ty = s->cols[k->item_col[i]].type;
+            sc = s->cols[k->item_col[i]].scale;
+        }
+        r->ctype[i] = ty;
+        r->cscale[i] = sc;
+    }
+}
+
 static int materialize(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb_result *r, imdb_err *e)
 {
     if (k->mode == SINK_VIDS) {
@@ -2448,10 +2744,11 @@ static int materialize(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb
             else item_name(x, &st->items[i], nm, sizeof nm);
             res_name(r, i, nm);
         }
+        col_types(x, st, k, &t->s, r); /* P2 S4 */
         keyed *kv = imdb_alloc_array(k->nvids ? k->nvids : 1, sizeof *kv, e);
         if (!kv) return e->code;
         for (uint64_t i = 0; i < k->nvids; i++) {
-            imdb_version_key(t, k->vids[i], t->s.pk, &kv[i].key);
+            row_key(x, t, k->vids[i], &kv[i].key);
             kv[i].vid = k->vids[i];
         }
         qsort(kv, k->nvids, sizeof *kv, cmp_keyed);
@@ -2513,6 +2810,7 @@ static int materialize(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb
         if (it->alias[0]) snprintf(nm, sizeof nm, "%s", it->alias); /* P2 S1 */
         res_name(r, i, nm);
     }
+    col_types(x, st, k, &t->s, r); /* P2 S4 */
     imdb_xval sv[IMDB_MAX_COLS + IMDB_MAX_GROUP_KEYS], v; /* the aggregates' slots, then the keys' (P2 S2) */
     if (k->mode == SINK_AGG) {
         if (xa_values(k, k->xa, sv, e)) return e->code;
@@ -2663,6 +2961,11 @@ static int resolve_snapshot(xctx *x, const sql_stmt *st, imdb_table *t, uint64_t
  * table answers, with no row, as it always did. */
 static int read_table(xctx *x, const sql_stmt *st, const char *name, imdb_table **out, imdb_err *e)
 {
+    for (int i = (int)x->nvis - 1; i >= 0; i--) /* P2 S4: a row set by its name first, the latest made (WITH shadows) */
+        if (!strcmp(x->vis[i]->name, name)) {
+            *out = x->vis[i]->t;
+            return IMDB_OK;
+        }
     uint64_t snap, pend;
     if (snapshot_of(x, st, &snap, &pend, e)) return e->code;
     imdb_table *t = imdb_table_by_name(x->db, name);
@@ -3208,12 +3511,14 @@ static void join_side_paths(const xctx *x, const jctx *j, const qspec q[2], bool
     memset(&k, 0, sizeof k);
     k.mode = index ? SINK_JOUTER : SINK_JBUILD;
     out[side] = path[side] >= 0 ? path[side] : choose_path(x->ss, &q[side], &k);
+    if (q[side].rset) out[side] = IMDB_PATH_NESTED; /* P2 S4: a row set has the one */
     if (index) {
         out[1 - side] = j->probe_path;
         return;
     }
     k.mode = SINK_JPROBE;
     out[1 - side] = path[1 - side] >= 0 ? path[1 - side] : choose_path(x->ss, &q[1 - side], &k);
+    if (q[1 - side].rset) out[1 - side] = IMDB_PATH_NESTED;
 }
 
 /* plan C: side `outer` read by path (-1: choose_path's), each of its rows probing the other side */
@@ -3311,6 +3616,7 @@ static uint64_t join_est_rows(const qspec *q)
 {
     imdb_table *t = q->t;
     if (q->never) return 0;
+    if (q->rset) return q->rset->nrows; /* P2 S4: it ran: its rows, counted */
     if (q->pk_pred >= 0) return 1;
     if (q->subj_pred >= 0) {
         const imdb_vlist *l = imdb_subject_versions(t, &q->p[q->subj_pred].a);
@@ -3390,6 +3696,7 @@ static jplan join_choose(jctx *j, const qspec q[2], bool force, jprice *pr)
  * row), and the cross-check's join(build 1; scan, scan) */
 static const char *join_path_word(int path)
 {
+    if (path == IMDB_PATH_NESTED) return "nested"; /* P2 S4 */
     return path == IMDB_PATH_SCAN ? "scan" : path == IMDB_PATH_ROWS ? "rows" : "store";
 }
 
@@ -3531,15 +3838,16 @@ static int join_materialize(xctx *x, const sql_stmt *st, jctx *j, sink *k, imdb_
         else item_name(x, &st->items[i], nm, sizeof nm);
         res_name(r, i, nm);
     }
+    col_types(x, st, k, &j->ct->s, r); /* P2 S4 */
     if (join_charge(j, (j->npairs ? j->npairs : 1) * sizeof(jkeyed), e)) return e->code; /* the sort's keys too */
     jkeyed *kv = imdb_alloc_array(j->npairs ? j->npairs : 1, sizeof *kv, e);
     if (!kv) return e->code;
     for (uint64_t i = 0; i < j->npairs; i++) {
         kv[i].va = j->pairs[i][0];
         kv[i].vb = j->pairs[i][1];
-        if (kv[i].va != IMDB_NONE) imdb_version_key(j->t[0], kv[i].va, j->t[0]->s.pk, &kv[i].ka);
+        if (kv[i].va != IMDB_NONE) row_key(x, j->t[0], kv[i].va, &kv[i].ka);
         else kv[i].ka = (imdb_value){.null = true}; /* P2 S3: after every row of side 0 (NULLS LAST) */
-        if (kv[i].vb != IMDB_NONE) imdb_version_key(j->t[1], kv[i].vb, j->t[1]->s.pk, &kv[i].kb);
+        if (kv[i].vb != IMDB_NONE) row_key(x, j->t[1], kv[i].vb, &kv[i].kb);
     }
     qsort(kv, j->npairs, sizeof *kv, cmp_jkeyed);
     int rc = IMDB_OK;
@@ -3631,7 +3939,9 @@ static void xp_single(const xctx *x, const sql_stmt *st, const qspec *q, const s
     xp_add(xp, "path", "%s", path_name(path, q));
     unsigned __int128 po = 0, ps = 0;
     bool ordered = q->ord_pred >= 0 && !q->all_versions;
-    if (q->never) xp_add(xp, "why", "an empty range: no row can match, none is read");
+    const xrset *rs = x->nvis ? rset_of(x, t) : NULL; /* P2 S4 */
+    if (rs) xp_add(xp, "why", "a nested SELECT's rows: no index; read in their order");
+    else if (q->never) xp_add(xp, "why", "an empty range: no row can match, none is read");
     else if (below_floor(x->db, q))
         xp_add(xp, "why", "below this copy's memory floor (commit %llu): the lake answers, by its scan",
                (unsigned long long)x->db->mem_floor);
@@ -3673,8 +3983,12 @@ static void xp_single(const xctx *x, const sql_stmt *st, const qspec *q, const s
     if (all) xp_add(xp, "conditions", "%u: %u by the index, %u tested on each row read", all, by, all - by);
     else xp_add(xp, "conditions", "none: every visible row");
     uint64_t est = join_est_rows(q);
-    xp_add(xp, "estimate", "at most %llu version%s read (an upper bound from the indexes and the store: no statistics)",
-           (unsigned long long)est, est == 1 ? "" : "s");
+    if (rs) /* P2 S4: its rows, counted: it ran */
+        xp_add(xp, "estimate", "%llu row%s, the nested SELECT's (it ran first)", (unsigned long long)rs->r.nrows,
+               rs->r.nrows == 1 ? "" : "s");
+    else
+        xp_add(xp, "estimate", "at most %llu version%s read (an upper bound from the indexes and the store: no statistics)",
+               (unsigned long long)est, est == 1 ? "" : "s");
     if ((path == IMDB_PATH_SCAN || path == IMDB_PATH_ROWS) && !q->never) {
         uint32_t rd = 0;
         for (uint32_t i = 0; i < t->nseg; i++) rd += !seg_skipped(q, t->seg[i]);
@@ -3753,6 +4067,9 @@ static int xp_join(xctx *x, const sql_stmt *st, jctx *j, qspec q[2], const jplan
                                                : (sd == p->side ? "built into the hash" : "probing the hash");
         if (probed)
             xp_add(xp, sd ? "side 2" : "side 1", "%s: %s, %s", j->t[sd]->s.name, path_name(ran[sd], &j->probe), role);
+        else if (q[sd].rset) /* P2 S4: it ran: its rows, counted */
+            xp_add(xp, sd ? "side 2" : "side 1", "%s: nested, %s, %llu row%s (the nested SELECT ran first)", j->t[sd]->s.name, role,
+                   (unsigned long long)q[sd].rset->nrows, q[sd].rset->nrows == 1 ? "" : "s");
         else
             xp_add(xp, sd ? "side 2" : "side 1", "%s: %s, %s, at most %llu versions", j->t[sd]->s.name,
                    path_name(ran[sd], &q[sd]), role, (unsigned long long)join_est_rows(&q[sd]));
@@ -3907,6 +4224,7 @@ static int exec_join(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, im
         q[s].snap = snap;
         q[s].pend = pend;
         q[s].pk_pred = q[s].subj_pred = q[s].ord_pred = -1;
+        q[s].rset = rset_res(x, t[s]); /* P2 S4 */
     }
     j->post.t = t[1];
     j->post.snap = snap;
@@ -3952,7 +4270,7 @@ static int exec_join(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, im
     if (!rc && !below_floor(x->db, &q[0]) && /* below the memory floor: the hash join over the lake (stage 3b) */
         (jp == IMDB_JOIN_INDEX || (jp == IMDB_JOIN_AUTO && x->ss->access_path == IMDB_PATH_AUTO)))
         p = join_choose(j, q, jp == IMDB_JOIN_INDEX, &jpr);
-    char n1[28]; /* the longest name: join(build 1; store, store) */
+    char n1[40]; /* the longest name: join(build 1; nested, nested) (P2 S4) */
     join_plan_name(&p, n1, sizeof n1);
     if (xp) { /* P1 Q1: the plan, not run */
         if (!rc) rc = xp_join(x, st, j, q, &p, &jpr, n1, xp, e);
@@ -3974,8 +4292,11 @@ static int exec_join(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, im
          * read it by scan: no read path or lookup in common with the first plan */
         jplan m = {JP_HASH, 0, {0, 0}};
         for (int s = 0; s < 2; s++) /* below the memory floor the scan's twin is the lake row by row (stage 3b) */
-            m.path[s] = below_floor(x->db, &q[s]) ? IMDB_PATH_ROWS : j->ran[s] == IMDB_PATH_SCAN ? IMDB_PATH_STORE : IMDB_PATH_SCAN;
-        char n2[28];
+            m.path[s] = q[s].rset                  ? IMDB_PATH_NESTED /* P2 S4: a row set has the one */
+                        : below_floor(x->db, &q[s]) ? IMDB_PATH_ROWS
+                        : j->ran[s] == IMDB_PATH_SCAN ? IMDB_PATH_STORE
+                                                     : IMDB_PATH_SCAN;
+        char n2[40];
         join_plan_name(&m, n2, sizeof n2);
         imdb_result r2;
         imdb_result_init(&r2);
@@ -4026,6 +4347,7 @@ static int exec_select_const(xctx *x, const sql_stmt *st, imdb_result *r, xplain
         item_name(x, &st->items[i], nm, sizeof nm);
         res_name(r, i, nm);
     }
+    col_types(x, st, NULL, NULL, r); /* P2 S4: trees alone (a NULL item TEXT) */
     if (!(row = res_row(r, e))) return e->code;
     for (uint16_t i = 0; i < st->nitems; i++) {
         imdb_xval v;
@@ -4036,20 +4358,43 @@ static int exec_select_const(xctx *x, const sql_stmt *st, imdb_result *r, xplain
     return res_finish(r, e);
 }
 
+/* P2 S4: EXPLAIN's row for a statement's nested SELECTs, which it ran before planning the rest */
+static void xp_nested(const xctx *x, const sql_stmt *st, xplain *xp)
+{
+    char d[XP_DETAIL];
+    size_t n = 0;
+    d[0] = 0;
+    xcat(d, sizeof d, &n, "%u nested SELECT%s, run first (its rows are what the rest is planned over; EXPLAIN reads them):",
+         st->nsub, st->nsub == 1 ? "" : "s");
+    for (uint8_t i = 0; i < x->nown; i++)
+        xcat(d, sizeof d, &n, "%s %s%s%llu row%s", i ? ";" : "", x->own[i].name[0] ? x->own[i].name : "(a value)",
+             x->own[i].name[0] ? " " : " ", (unsigned long long)x->own[i].r.nrows, x->own[i].r.nrows == 1 ? "" : "s");
+    xp_add(xp, "nested", "%s", d);
+}
+
 static int exec_select(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, imdb_err *e)
 {
+    if (st->nsub && !x->own) { /* P2 S4: its nested SELECTs first, each a row set */
+        if (rset_prepare(x, st, e)) return e->code;
+        if (xp) xp_nested(x, st, xp); /* EXPLAIN: they ran (their rows are what the rest is planned over) */
+    }
     if (st->no_from) return exec_select_const(x, st, r, xp, e); /* P2 S1 */
     if (st->has_join) return exec_join(x, st, r, xp, e);
     imdb_table *t;
     if (read_table(x, st, st->table, &t, e)) return e->code;
+    if (st->for_update && x->nvis && rset_of(x, t))
+        return imdb_fail(e, IMDB_ERR_INVALID, "FOR UPDATE locks a table's rows: a nested SELECT's have none");
     qspec q;
     memset(&q, 0, sizeof q);
     q.t = t;
+    q.rset = rset_res(x, t); /* P2 S4 */
     if (resolve_snapshot(x, st, t, &q.snap, &q.pend, e) || bind_preds(x, st, &q, e)) return e->code;
     sink k;
     int rc = plan_select(x, st, t, &k, e);
     if (!rc) q.ord_only = ordered_only(&q, &k);
     int p1 = rc ? IMDB_PATH_SCAN : choose_path(x->ss, &q, &k); /* the sink's kind is part of the cost */
+    bool nested = q.rset != NULL; /* P2 S4: a row set's one path; nothing to cross-check it against */
+    if (nested) p1 = IMDB_PATH_NESTED;
     if (xp) { /* P1 Q1: the plan, not run */
         if (!rc) xp_single(x, st, &q, &k, p1, xp);
         sink_free(&k);
@@ -4066,7 +4411,7 @@ static int exec_select(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, 
     r->has_snap = true;
     r->snap_own = q.pend != 0;
     if ((rc = read_point(x, r, e))) return rc;
-    if (!x->ss->cross_check) return IMDB_OK;
+    if (!x->ss->cross_check || nested) return IMDB_OK;
     /* the same query along a different path must give the identical result; a scan the cost rule
      * chose over an index is checked against that index */
     int p2 = below_floor(x->db, &q)              ? IMDB_PATH_ROWS /* the lake alone answers it (stage 3b) */
@@ -4166,6 +4511,7 @@ static int select_vids(xctx *x, const sql_stmt *st, imdb_table *t, bool all_vers
 
 static int exec_insert(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
 {
+    if (st->nsub && !x->own && rset_prepare(x, st, e)) return e->code; /* P2 S4: its subqueries, before any write */
     imdb_table *t = imdb_table_by_name(x->db, st->table);
     if (!t) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", st->table);
     int map[IMDB_MAX_COLS];
@@ -4211,6 +4557,10 @@ static int exec_insert(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
 
 static int exec_update(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, imdb_err *e)
 {
+    if (st->nsub && !x->own) { /* P2 S4: its subqueries, at its snapshot, before any write */
+        if (rset_prepare(x, st, e)) return e->code;
+        if (xp) xp_nested(x, st, xp); /* EXPLAIN: they ran (their rows are what the rest is planned over) */
+    }
     imdb_table *t = imdb_table_by_name(x->db, st->table);
     if (!t) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", st->table);
     int cols[IMDB_MAX_COLS];
@@ -4261,6 +4611,10 @@ static int exec_update(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, 
 
 static int exec_delete(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, imdb_err *e)
 {
+    if (st->nsub && !x->own) { /* P2 S4 */
+        if (rset_prepare(x, st, e)) return e->code;
+        if (xp) xp_nested(x, st, xp); /* EXPLAIN: they ran (their rows are what the rest is planned over) */
+    }
     imdb_table *t = imdb_table_by_name(x->db, st->table);
     if (!t) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", st->table);
     uint64_t *vids, n;

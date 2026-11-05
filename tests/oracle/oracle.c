@@ -195,7 +195,8 @@ typedef struct pred {
  * X_IN (l IN the X_LIST chain r: each its element l, the next r; fn 1: NOT IN), X_LIKE (l LIKE s ESCAPE '!'; fn 1:
  * NOT LIKE), X_CAST (l as ty, sc), X_TXT (the text s), X_NULL, X_VAL (a column's value: i, f, s by ty) */
 enum { X_COL, X_INT, X_DEC, X_NEG, X_ADD, X_SUB, X_MUL, X_DIV, X_MOD, X_AGG, X_CMP, X_AND, X_OR, X_NOT, X_PRED,
-       X_FN, X_CASE, X_IN, X_LIST, X_LIKE, X_CAST, X_TXT, X_NULL, X_VAL };
+       X_FN, X_CASE, X_IN, X_LIST, X_LIKE, X_CAST, X_TXT, X_NULL, X_VAL, X_SUBQ }; /* X_SUBQ (P2 S4): fn 0 IN's, 1 EXISTS, 2 a
+                                                                          * value (agg i); tab, col; WHERE x3 */
 typedef struct xnode {
     int op;
     int tab, col; /* X_COL */
@@ -245,6 +246,11 @@ typedef struct stmt {
     bool grp;          /* P2 S2's form (counted when compared) */
     int jx;            /* P2 S3: the join's other ON condition (a tree), else 0; join 3 RIGHT, 4 FULL, 5 CROSS */
     bool jkey2, jusing, jn3; /* ON's second key pair, t.s = u.s; USING (s) for ON; P2 S3's (counted when compared) */
+    bool subq;         /* P2 S4: a subquery, a derived table or a CTE (counted when compared) */
+    int dsel;          /* P2 S4: 1 FROM (SELECT dc FROM t [WHERE dpred]) AS x, 2 WITH x AS (...) SELECT ... FROM x */
+    int dc[4], ndc;
+    pred dpred;
+    bool has_dpred;
 } stmt;
 
 static int64_t g_next_id;          /* the next new key of t, of u */
@@ -305,6 +311,9 @@ static void gen_pred(int tab, pred *p)
 
 static bool g_expr = true; /* --no-expr: 1a's generator, draw for draw */
 static bool g_fns = true;  /* --no-fns: the generator before P2 S1, draw for draw */
+/* A seed names the same statements only within one stage: each P2 stage (S1 to S4) adds forms to the default
+ * generator's draws, so seed N's statements differ from the stage before's (a mismatch is reproduced on its own
+ * build); --no-fns and --no-expr reproduce the generators before P2 S1 and before 1a. */
 static bool g_in_txn;      /* generating a transaction's statements: no tree that may fail (PostgreSQL aborts the
                             * whole transaction at an error) */
 #define TY(t, s) ((t) | ((s) << 8)) /* a column's type, a DECIMAL's scale with it */
@@ -990,9 +999,98 @@ static int gen_like(stmt *q)
     return k;
 }
 
+/* P2 S4: a condition on one INT64 column of the subquery's table (t: g, a; u: tid, v), never column `avoid`, against a
+ * small literal */
+static int gen_subq_where(stmt *q, int tab, int avoid)
+{
+    int c = (int)rr(1, 2);
+    if (c == avoid) c = 3 - c;
+    int lit = xlit_int(q, rr(-3, 6));
+    int k = xbool(q, X_CMP, xcol(q, tab, c), lit);
+    XN(q, k)->fn = (int)rr(OP_EQ, OP_GE);
+    return k;
+}
+
+/* P2 S4: an uncorrelated subquery in a condition: x [NOT] IN (SELECT y FROM w [WHERE c]), EXISTS (SELECT 1 FROM w
+ * WHERE c), or x op (SELECT MAX(y) | MIN(y) | COUNT(*) FROM w [WHERE c]); x a column of the outer table, y one of w of
+ * x's type (INT64: t's id, g, a, u's id, tid, v; TEXT: their s). The values are random over wide ranges, so a set of
+ * another column rarely holds x: half the INs read x's own column (every x found, a NULL in the set when the filter is
+ * on another column), and half the EXISTS look for c = (SELECT MAX(c) ...), one row or a few (the mutants' finding:
+ * EXISTS of exactly one row, NOT IN over a NULL and the set's search were each caught in 0 to 2 seeds of 30) */
+static int gen_subq_cond(stmt *q)
+{
+    int otab = q->join ? (chance(40) ? 1 : 0) : q->tab, itab = chance(70) ? 1 : 0, r = (int)rr(0, 99);
+    bool text = r < 50 && chance(25);
+    int oc = text ? (otab ? 3 : 6) : (int)rr(0, 2), ic = text ? (itab ? 3 : 6) : (int)rr(0, 2);
+    q->fns = q->subq = true;
+    if (r < 50) { /* IN */
+        if (chance(50)) itab = otab, ic = oc; /* its own column */
+        int sq = xnew(q, X_SUBQ, 0, 0);
+        XN(q, sq)->tab = itab;
+        XN(q, sq)->col = ic;
+        XN(q, sq)->fn = 0;
+        XN(q, sq)->ty = text ? CT_TXT : CT_INT;
+        if (chance(60)) XN(q, sq)->x3 = gen_subq_where(q, itab, ic);
+        int k = xbool(q, X_IN, xcol(q, otab, oc), sq);
+        XN(q, k)->fn = chance(45); /* NOT IN */
+        return k;
+    }
+    int sq = xnew(q, X_SUBQ, 0, 0);
+    XN(q, sq)->tab = itab;
+    XN(q, sq)->col = ic;
+    if (r < 70) { /* EXISTS, under NOT sometimes */
+        XN(q, sq)->fn = 1;
+        XN(q, sq)->ty = CT_BOOL;
+        if (chance(50)) { /* c = | >= (SELECT MAX(c) ...), c = | <= (SELECT MIN(c) ...): a subquery in a subquery */
+            int c = itab ? (int)rr(0, 2) : (chance(50) ? 0 : 2), in = xnew(q, X_SUBQ, 0, 0);
+            XN(q, in)->tab = itab;
+            XN(q, in)->col = c;
+            XN(q, in)->fn = 2;
+            XN(q, in)->i = chance(50) ? F_MAX : F_MIN;
+            XN(q, in)->ty = CT_INT;
+            int k = xbool(q, X_CMP, xcol(q, itab, c), in);
+            XN(q, k)->fn = chance(50) ? OP_EQ : XN(q, in)->i == F_MAX ? OP_GE : OP_LE;
+            XN(q, sq)->x3 = k;
+        } else {
+            XN(q, sq)->x3 = gen_subq_where(q, itab, -1);
+        }
+        return chance(30) ? xbool(q, X_NOT, sq, 0) : sq;
+    }
+    XN(q, sq)->fn = 2; /* a value: MAX, MIN, COUNT(*) */
+    XN(q, sq)->i = (int[]){F_MAX, F_MIN, F_COUNT_STAR}[rnd() % 3];
+    XN(q, sq)->ty = CT_INT;
+    if (chance(60)) XN(q, sq)->x3 = gen_subq_where(q, itab, -1);
+    int k = xbool(q, X_CMP, xcol(q, otab, oc), sq);
+    XN(q, k)->fn = (int)rr(OP_EQ, OP_GE);
+    return k;
+}
+
+/* P2 S4: aggregates over a derived table or a CTE of t (its columns g, a, d, s; a plain predicate inside), with a
+ * plain predicate outside on one of them sometimes: one row, every engine */
+static void gen_dselect(stmt *q)
+{
+    q->tab = 0;
+    q->dsel = chance(50) ? 1 : 2;
+    q->fns = q->subq = true;
+    static const int DC[] = {1, 2, 4, 6};
+    for (int i = 0; i < 4; i++)
+        if (chance(60) || (i == 3 && !q->ndc)) q->dc[q->ndc++] = DC[i];
+    if (chance(70)) { /* inside: any column of t */
+        gen_pred(0, &q->dpred);
+        q->has_dpred = true;
+    }
+    q->it[q->nit++] = (item){F_COUNT_STAR, 0, 0, 0};
+    for (int i = 0; i < q->ndc && q->nit < 4; i++) {
+        int c = q->dc[i], fn = cols(0)[c].t == CT_TXT ? (int)rr(F_MIN, F_MAX) : (int)rr(F_COUNT, F_MAX);
+        q->it[q->nit++] = (item){fn, 0, c, 0};
+    }
+    if (chance(40)) gen_pred_on(0, q->dc[rnd() % (uint64_t)q->ndc], &q->pr[q->npr++]);
+}
+
 /* a condition of S1's: IN, LIKE, or a TEXT tree (never a bare literal) against a literal, or IS [NOT] NULL */
 static int gen_fcmp(stmt *q)
 {
+    if (chance(25)) return gen_subq_cond(q); /* P2 S4 */
     int r = (int)rr(0, 99);
     if (r < 40) return gen_in(q);
     if (r < 75) return gen_like(q);
@@ -1370,6 +1468,10 @@ static void gen_select(stmt *q)
     memset(q, 0, sizeof *q);
     q->kind = Q_SELECT;
     q->gcol = -1;
+    if (g_fns && chance(8)) { /* P2 S4: a derived table or a CTE */
+        gen_dselect(q);
+        return;
+    }
     if (g_fns && chance(10)) { /* P2 S2 */
         gen_gselect(q);
         return;
@@ -1865,8 +1967,28 @@ static void put_x(sb *b, int d, const stmt *q, int k, int pty)
         return;
     }
     case X_LIST: return; /* its elements: printed by their X_IN */
+    case X_SUBQ: { /* P2 S4: (SELECT y FROM w [WHERE c]), EXISTS (SELECT 1 ...), (SELECT MAX(y) ...) */
+        static const char *const AG[] = {"", "COUNT", "COUNT", "SUM", "MIN", "MAX", "AVG"};
+        sb_str(b, n->fn == 1 ? "(EXISTS (SELECT 1" : "(SELECT ");
+        if (n->fn == 0) put_col(b, q, n->tab, n->col);
+        else if (n->fn == 2 && n->i == F_COUNT_STAR) sb_str(b, "COUNT(*)");
+        else if (n->fn == 2) sb_printf(b, "%s(", AG[n->i]), put_col(b, q, n->tab, n->col), sb_str(b, ")");
+        sb_printf(b, " FROM %s", tname(n->tab));
+        if (n->x3) sb_str(b, " WHERE "), put_x(b, d, q, n->x3, -1);
+        sb_str(b, n->fn == 1 ? "))" : ")");
+        return;
+    }
     case X_IN: {
         const xnode *o = XN(q, n->l);
+        if (XN(q, n->r)->op == X_SUBQ) { /* P2 S4 */
+            sb_str(b, "(");
+            if (o->op == X_COL) put_col(b, q, o->tab, o->col);
+            else put_x(b, d, q, n->l, -1);
+            sb_str(b, n->fn ? " NOT IN " : " IN ");
+            put_x(b, d, q, n->r, -1);
+            sb_str(b, ")");
+            return;
+        }
         sb_str(b, "(");
         if (o->op == X_COL) put_col(b, q, o->tab, o->col); /* SQL Server's BIT bare: k IN (1, 0) */
         else put_x(b, d, q, n->l, -1);
@@ -2275,6 +2397,13 @@ static void print_stmt(sb *b, int d, const stmt *q)
         put_where(b, d, q);
         return;
     }
+    if (q->dsel == 2) { /* P2 S4: the CTE first */
+        sb_str(b, "WITH x AS (SELECT ");
+        for (int i = 0; i < q->ndc; i++) sb_printf(b, "%s%s", i ? ", " : "", cols(0)[q->dc[i]].name);
+        sb_str(b, " FROM t");
+        if (q->has_dpred) sb_str(b, " WHERE "), put_pred(b, d, q, &q->dpred);
+        sb_str(b, ") ");
+    }
     sb_str(b, "SELECT ");
     if (q->distinct) sb_str(b, "DISTINCT ");
     if (q->star) sb_str(b, "*");
@@ -2291,7 +2420,17 @@ static void print_stmt(sb *b, int d, const stmt *q)
             sb_str(b, ")");
         }
     }
-    if (!q->join) sb_printf(b, " FROM %s", tname(q->tab)); /* a join's FROM: put_join (P2 S3) */
+    if (q->dsel == 1) { /* P2 S4: a derived table */
+        sb_str(b, " FROM (SELECT ");
+        for (int i = 0; i < q->ndc; i++) sb_printf(b, "%s%s", i ? ", " : "", cols(0)[q->dc[i]].name);
+        sb_str(b, " FROM t");
+        if (q->has_dpred) sb_str(b, " WHERE "), put_pred(b, d, q, &q->dpred);
+        sb_str(b, ") AS x");
+    } else if (q->dsel == 2) {
+        sb_str(b, " FROM x");
+    } else if (!q->join) {
+        sb_printf(b, " FROM %s", tname(q->tab)); /* a join's FROM: put_join (P2 S3) */
+    }
     if (q->join == 4 && d == D_SQLITE) { /* P2 S3: FULL as LEFT JOIN UNION ALL the other side's rows nothing matched */
         size_t sel = b->n;
         char *head = malloc(sel + 1);
@@ -3067,6 +3206,7 @@ static long g_mismatches, g_compared, g_checkpoints, g_reopens, g_drops;
 static long g_fn_compared; /* P2 S1: comparisons of statements holding its forms */
 static long g_grp_compared; /* P2 S2: comparisons of its grouped form */
 static long g_jn_compared; /* P2 S3: comparisons of its join forms */
+static long g_subq_compared; /* P2 S4: comparisons of statements with a subquery, a derived table or a CTE */
 
 static void show_rows(const res *r, size_t from)
 {
@@ -3083,7 +3223,8 @@ static void show_rows(const res *r, size_t from)
  * on the engine that disagreed: which condition the two read differently. */
 static void diagnose(const stmt *q, int d)
 {
-    if (q->kind != Q_SELECT || !q->npr || (q->join == 4 && d == D_SQLITE)) return; /* FULL there: two counts */
+    if (q->kind != Q_SELECT || !q->npr || (q->join == 4 && d == D_SQLITE) || q->dsel) return; /* FULL there: two counts; a
+                                                                                             * derived table: its own FROM */
     stmt c;
     sb text = {0};
     res a = {0}, b = {0};
@@ -3226,6 +3367,7 @@ static int run_stmt(unsigned seed, int step, const stmt *q, bool state)
         if (q->fns) g_fn_compared++;
         if (q->grp) g_grp_compared++;
         if (q->jn3) g_jn_compared++;
+        if (q->subq) g_subq_compared++;
         const res *o = &out[d];
         const char *why = NULL;
         size_t at = 0;
@@ -3458,6 +3600,8 @@ int main(int argc, char **argv)
     printf("oracle: EXPLAIN checked against the run on %ld SELECTs, %ld disagreements\n", g_explained, g_explain_bad);
     bool servers = g_eng[D_PG].on || g_eng[D_MY].on || g_eng[D_MA].on || g_eng[D_MS].on;
     printf("oracle: %ld comparisons of P2 S2's grouped form (several keys and trees, DISTINCT, FILTER)\n", g_grp_compared);
+    printf("oracle: %ld comparisons of P2 S4's subqueries (IN, NOT IN, EXISTS, a value), derived tables and CTEs\n",
+           g_subq_compared);
     printf("oracle: %ld comparisons of P2 S3's joins (RIGHT, FULL, CROSS, ON's conditions and key pairs, USING); SQLite's "
            "RIGHT JOIN is its LEFT JOIN, its FULL JOIN a LEFT JOIN UNION ALL the anti-join (rows only)%s\n", g_jn_compared,
            g_eng[D_PG].on || g_eng[D_MS].on ? "" : " (UNGUARDED: FULL JOIN's aggregates, no FULL-capable server run)");

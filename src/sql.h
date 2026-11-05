@@ -30,7 +30,9 @@
 #include "db.h"
 
 /* IMDB_PATH_ROWS, the lake read row by row, is no SET access_path's: below the memory floor it cross-checks the scan */
-enum { IMDB_PATH_AUTO = 0, IMDB_PATH_INDEX = 1, IMDB_PATH_SCAN = 2, IMDB_PATH_STORE = 3, IMDB_PATH_ORDERED = 4, IMDB_PATH_ROWS = 5 };
+/* IMDB_PATH_NESTED (P2 S4), a nested SELECT's rows read as a table, is no SET access_path's either */
+enum { IMDB_PATH_AUTO = 0, IMDB_PATH_INDEX = 1, IMDB_PATH_SCAN = 2, IMDB_PATH_STORE = 3, IMDB_PATH_ORDERED = 4, IMDB_PATH_ROWS = 5,
+       IMDB_PATH_NESTED = 6 };
 enum { IMDB_JOIN_AUTO = 0, IMDB_JOIN_HASH = 1, IMDB_JOIN_INDEX = 2 };
 
 /* What the session's last commit is known to hold beyond this database (SHOW REPLICATION, and the
@@ -82,11 +84,13 @@ typedef struct imdb_cell {
 typedef struct imdb_result {
     uint16_t ncols;
     char names[IMDB_MAX_COLS + 4][IMDB_MAX_IDENT + 8];
+    uint8_t ctype[IMDB_MAX_COLS + 4], cscale[IMDB_MAX_COLS + 4]; /* P2 S4: a SELECT's column types as its statement bound
+                                                                * them (0: not known), a nested SELECT's schema */
     imdb_cell *cells;        /* nrows * ncols */
     uint64_t nrows, caprows;
     imdb_buf text;           /* backing store for TEXT cells */
     char status[512];        /* e.g. "INSERT 3", "VERIFY ok: ..." */
-    char path[80];           /* access path(s) used */
+    char path[128];          /* access path(s) used (two join plans' names and " = ... (cross-checked)": P2 S4) */
     uint64_t snap;           /* SELECT: the commit it was answered at (compare views at the same one) */
     bool has_snap, snap_own; /* snap is set; it also saw this transaction's own pending writes */
     uint64_t byte_cap;       /* cells and text this result may hold (IMDB_MAX_RESULT_BYTES, less under a budget) */
