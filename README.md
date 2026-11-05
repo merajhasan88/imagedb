@@ -486,6 +486,20 @@ SHOW INDEXES;
 - The one exception: a plain SUM or COUNT over a range that covers much of a
   checkpointed table runs on the vectorised scan (path `scan`) when that is
   estimated to be cheaper. `SET access_path = ordered` forces the index.
+- `EXPLAIN SELECT ...`, `EXPLAIN UPDATE ...` and `EXPLAIN DELETE ...` show the
+  plan without running it, one `item | detail` row each: the table and the
+  snapshot; the path the statement would report and why (an equality, the
+  prices compared, `SET access_path`, a read below this copy's memory floor);
+  the index and how it is used; the conditions it serves and those tested on
+  each row read; an upper bound of the versions read (there are no
+  statistics); the segments a scan reads and those its zone maps skip; what
+  the statement makes of the rows. A join's: its plan (`join(build N)`,
+  `join(index N)`) and why, the prices of the hash join and of each
+  orientation of the index join, each side's path. No row is read, nothing is
+  written or locked. The plan is this copy's: two replicas may explain a
+  statement differently (their memory floors differ) and answer it the same.
+  An UPDATE or DELETE reports the path that found its rows
+  (`UPDATE 3  [index(primary key)]`).
 - Negations (`!=`), `IS NULL` and `IS NOT NULL` are never what chooses an
   index: alone they use the scan, and next to a predicate an index serves they
   are checked on each row it returns. A row whose first indexed column is NULL

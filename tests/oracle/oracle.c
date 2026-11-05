@@ -1703,8 +1703,41 @@ static void tally_path(const char *p)
     }
 }
 
+/* P1 Q1: EXPLAIN's path (a join's plan) for a SELECT about to run, into out; false when EXPLAIN refused it */
+static long g_explained, g_explain_bad;
+static bool explain_path(eng *e, const char *sql, char *out, size_t cap)
+{
+    size_t n = strlen(sql);
+    char *q = malloc(n + 9);
+    out[0] = 0;
+    if (!q) return false;
+    memcpy(q, "EXPLAIN ", 8);
+    memcpy(q + 8, sql, n + 1);
+    imdb_result xr;
+    imdb_result_init(&xr);
+    imdb_err xe = {0};
+    int rc = imdb_exec_one(&e->ses, q, n + 8, NULL, 0, &xr, &xe);
+    free(q);
+    if (rc) {
+        imdb_result_free(&xr);
+        return false;
+    }
+    for (uint64_t i = 0; xr.ncols == 2 && i < xr.nrows; i++) {
+        const imdb_value *it = &xr.cells[2 * i].v, *d = &xr.cells[2 * i + 1].v;
+        if (it->len == 4 && (!memcmp(it->s, "path", 4) || !memcmp(it->s, "plan", 4))) {
+            size_t k = d->len < cap - 1 ? d->len : cap - 1;
+            memcpy(out, d->s, k);
+            out[k] = 0;
+        }
+    }
+    imdb_result_free(&xr);
+    return true;
+}
+
 static void exec_imdb(eng *e, const char *sql, bool rows, const int *ty, int nty, res *r)
 {
+    char xp[128];
+    bool sel = rows && !strncasecmp(sql, "SELECT", 6), xok = sel && explain_path(e, sql, xp, sizeof xp);
     imdb_result ir;
     imdb_result_init(&ir);
     imdb_err er = {0};
@@ -1718,6 +1751,15 @@ static void exec_imdb(eng *e, const char *sql, bool rows, const int *ty, int nty
         if (sscanf(ir.status, "%*s %llu", &n) == 1) r->affected = (long long)n;
         imdb_result_free(&ir);
         return;
+    }
+    if (sel) { /* P1 Q1: what EXPLAIN said is what ran (the text before " = ": cross_check is on) */
+        g_explained++;
+        const char *eq = strstr(ir.path, " = ");
+        size_t pn = eq ? (size_t)(eq - ir.path) : strlen(ir.path);
+        if (!xok || strlen(xp) != pn || memcmp(xp, ir.path, pn) != 0) {
+            g_explain_bad++;
+            printf("EXPLAIN MISMATCH: %s\n  EXPLAIN %s '%s', the run '%s'\n", sql, xok ? "said" : "refused it:", xp, ir.path);
+        }
     }
     tally_path(ir.path);
     if (ir.ncols != nty) res_fail(r, "imagedb answered %u columns, %d expected", ir.ncols, nty);
@@ -2451,6 +2493,7 @@ int main(int argc, char **argv)
         if (e->dbc) SQLDisconnect(e->dbc), SQLFreeHandle(SQL_HANDLE_DBC, e->dbc);
         if (e->env) SQLFreeHandle(SQL_HANDLE_ENV, e->env);
     }
+    g_mismatches += g_explain_bad; /* P1 Q1: an EXPLAIN that disagrees with its run is a mismatch */
     printf("oracle: seeds %u-%u, %ld comparisons, %ld mismatches (", lo, hi, g_compared, g_mismatches);
     for (int d = 1, first = 1; d < ND; d++)
         if (g_eng[d].on) printf("%s%s", first ? "" : ", ", DNAME[d]), first = 0;
@@ -2463,5 +2506,6 @@ int main(int argc, char **argv)
            g_excused_window);
     printf("oracle: imagedb alone: %ld CHECKPOINTs, %ld reopens; the paths it answered by:\n", g_checkpoints, g_reopens);
     for (int i = 0; i < g_npaths; i++) printf("  %7ld  %s\n", g_paths[i].n, g_paths[i].path);
+    printf("oracle: EXPLAIN checked against the run on %ld SELECTs, %ld disagreements\n", g_explained, g_explain_bad);
     return g_mismatches ? 1 : 0;
 }

@@ -940,6 +940,7 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
         imdb_free(t);
         return IMDB_OK;
     }
+    bool explain = kw(&p, "explain"); /* P1 Q1: the plan of what follows, which is not run */
     if (kw(&p, "create")) {
         bool unique = kw(&p, "unique");
         if (unique) rc = expect_kw(&p, "index");
@@ -1092,6 +1093,12 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
     if (!rc) {
         tok(&p, TK_SEMI);
         if (p.t[p.i].kind != TK_EOF) rc = fail_at(&p, "end of statement");
+    }
+    if (!rc && explain) { /* P1 Q1: its own kind, so no test of the inner kind (a write's autocommit, FOR UPDATE's locks) */
+        if (st->kind != ST_SELECT && st->kind != ST_UPDATE && st->kind != ST_DELETE)
+            rc = imdb_fail(e, IMDB_ERR_INVALID, "EXPLAIN explains SELECT, UPDATE and DELETE");
+        st->explained = st->kind;
+        st->kind = ST_EXPLAIN;
     }
     imdb_free(t);
     if (rc) imdb_sql_stmt_free(st);

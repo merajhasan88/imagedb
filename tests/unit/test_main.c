@@ -97,6 +97,7 @@ int main(int argc, char **argv)
         {"vectors", vectors_tests, &vectors_ntests},
         {"stats", stats_tests, &stats_ntests},
         {"events", events_tests, &events_ntests},
+        {"explain", explain_tests, &explain_ntests},
         {"backup", backup_tests, &backup_ntests},
         {"expr", expr_tests, &expr_ntests},
         {"cancel", cancel_tests, &cancel_ntests},

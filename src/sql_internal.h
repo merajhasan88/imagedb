@@ -79,6 +79,7 @@ enum {
     ST_CREATE_INDEX, ST_DROP_INDEX, ST_SHOW_INDEXES, ST_DROP_TABLE,
     ST_ALTER_RETENTION, ST_SHOW_RETENTION,
     ST_SHOW_STATS, ST_SHOW_TRANSACTIONS, /* P1 M1 */
+    ST_EXPLAIN, /* P1 Q1: the plan of the statement in explained (SELECT, UPDATE or DELETE), which is not run */
 };
 
 /* isolation levels as written (the executor maps them; SERIALIZABLE is refused for now) */
@@ -130,6 +131,7 @@ typedef struct sql_stmt {
     uint8_t iso;                                /* BEGIN / SET TRANSACTION ... ISOLATION LEVEL */
     char savepoint[IMDB_MAX_IDENT + 1];         /* SAVEPOINT, ROLLBACK TO, RELEASE */
     bool for_update;                            /* SELECT ... FOR UPDATE */
+    uint8_t explained;                          /* ST_EXPLAIN (P1 Q1): the explained statement's kind */
     bool nolock;                                /* SELECT ... FROM t WITH (NOLOCK): accepted, changes nothing */
     bool distinct;                              /* SELECT DISTINCT (1d) */
     uint8_t norder;                             /* ORDER BY: keys, each a tree (ord_ex) or an item's position (ord_pos) */

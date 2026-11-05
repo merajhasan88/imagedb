@@ -1,4 +1,5 @@
 /* SQL executor: binding, the three read paths, cross-checking, DML, admin. */
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -141,6 +142,7 @@ typedef struct xctx {
     uint64_t tested, row_limit;   /* rows tested and SET statement_row_limit (D8 #4: xtested) */
     uint64_t deadline_ns;         /* CLOCK_MONOTONIC: the statement's timeout; 0: none */
     bool checks;                  /* false for what runs to its end: COMMIT and the physical statements */
+    char vpath[80];               /* select_vids' path: an UPDATE's or DELETE's result's (P1 Q1) */
 } xctx;
 
 enum { TICK_ROWS = 4096 }; /* rows between two looks at the clock and the cancel flag: tens of microseconds of work */
@@ -1467,6 +1469,54 @@ static const char *path_name(int p, const qspec *q)
     return "store";
 }
 
+/* ---- EXPLAIN (P1 Q1) ----------------------------------------------------------------------------------------------
+ * The plan of a SELECT, UPDATE or DELETE as the planner makes it, stopped before any path runs: the same steps (the
+ * table, the snapshot, the predicates bound, the sink planned, the path or the join's plan chosen), then rows of
+ * (item, detail). Nothing is read but what the planner reads (index range counts, zone maps, the store's counts): no
+ * row is tested. The plan is this copy's: its memory floor and store are its own, never logged, so two copies may
+ * explain one statement differently and answer it identically (a result's path may differ the same way). */
+enum { XP_ROWS = 20, XP_ITEM = 16, XP_DETAIL = 768 };
+typedef struct xplain {
+    uint16_t n;
+    char item[XP_ROWS][XP_ITEM];
+    char detail[XP_ROWS][XP_DETAIL];
+} xplain;
+
+static void xp_add(xplain *xp, const char *item, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+static void xp_add(xplain *xp, const char *item, const char *fmt, ...)
+{
+    if (xp->n >= XP_ROWS) return;
+    snprintf(xp->item[xp->n], XP_ITEM, "%s", item);
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(xp->detail[xp->n], XP_DETAIL, fmt, ap);
+    va_end(ap);
+    xp->n++;
+}
+
+/* appends to a detail being built (cut at its end) */
+static void xcat(char *o, size_t cap, size_t *n, const char *fmt, ...) __attribute__((format(printf, 4, 5)));
+static void xcat(char *o, size_t cap, size_t *n, const char *fmt, ...)
+{
+    if (*n + 1 >= cap) return;
+    va_list ap;
+    va_start(ap, fmt);
+    int k = vsnprintf(o + *n, cap - *n, fmt, ap);
+    va_end(ap);
+    if (k > 0) *n = *n + (size_t)k < cap ? *n + (size_t)k : cap - 1;
+}
+
+static unsigned long long price_u64(unsigned __int128 v) /* a price as printed (the planner's fit 64 bits) */
+{
+    return v > UINT64_MAX ? (unsigned long long)UINT64_MAX : (unsigned long long)v;
+}
+
+static const char *access_word(int p) /* SET access_path's value */
+{
+    return p == IMDB_PATH_INDEX ? "index" : p == IMDB_PATH_SCAN ? "scan" : p == IMDB_PATH_STORE ? "store"
+         : p == IMDB_PATH_ORDERED ? "ordered" : "auto";
+}
+
 /* Relative costs per row, from bench/index_sum.c (2026-10-24, i7-8550U; only the ratios are
  * used): the vectorised scan filters and sums a segment row in about 2 ns, the ordered path
  * reads a candidate from its segment in about 33 ns (imdb_seg_values), and either path decodes a
@@ -1483,7 +1533,8 @@ enum { COST_VEC = 1, COST_ONLY = 10, COST_SEG_FETCH = 16, COST_MEM_ROW = 55, COS
  * The candidates are every indexed version in the key range, dead ones too: under churn without
  * purges the estimate overstates the index and leaves it early, for a scan whose cost is the
  * table's size. */
-static bool scan_cheaper(const qspec *q, const sink *k)
+/* the two prices scan_cheaper compares (EXPLAIN prints them); false where none applies (not a plain aggregate) */
+static bool scan_price(const qspec *q, const sink *k, unsigned __int128 *ordp, unsigned __int128 *scanp)
 {
     if (!fast_aggregate(k)) return false;
     const imdb_table *t = q->t;
@@ -1500,7 +1551,15 @@ static bool scan_cheaper(const qspec *q, const sink *k)
                                         : (c - cmem) * COST_SEG_FETCH + cmem * COST_MEM_ROW;
     ord += (unsigned __int128)(t->nver - t->idx_upto) * COST_MEM_ROW;
     unsigned __int128 scan = (unsigned __int128)segrows * COST_VEC + (unsigned __int128)mem * COST_MEM_ROW;
-    return ord >= COST_FLOOR && scan < ord;
+    *ordp = ord;
+    *scanp = scan;
+    return true;
+}
+
+static bool scan_cheaper(const qspec *q, const sink *k)
+{
+    unsigned __int128 ord, scan;
+    return scan_price(q, k, &ord, &scan) && ord >= COST_FLOOR && scan < ord;
 }
 
 static int choose_path(const imdb_session *ss, const qspec *q, const sink *k)
@@ -2610,6 +2669,25 @@ static void join_inner_row(sink *k, uint64_t vid, const imdb_value *vals)
     else join_emit(k, vid, j->ovid, vals, j->ovals);
 }
 
+/* each side's read path in a plan (the runners' j->ran, and EXPLAIN's): the hash join's built side (side) and its
+ * probing side, or plan C's outer side (side) and the probed one (join_probe_setup's probe_path, set before); path[s] >= 0
+ * forces side s's (the cross-check's), else choose_path's with the sink kind the plan gives that side, the one thing it
+ * reads of a sink (a join's side is never a plain aggregate: no price is compared) */
+static void join_side_paths(const xctx *x, const jctx *j, const qspec q[2], bool index, int side, const int path[2],
+                            int out[2])
+{
+    sink k;
+    memset(&k, 0, sizeof k);
+    k.mode = index ? SINK_JOUTER : SINK_JBUILD;
+    out[side] = path[side] >= 0 ? path[side] : choose_path(x->ss, &q[side], &k);
+    if (index) {
+        out[1 - side] = j->probe_path;
+        return;
+    }
+    k.mode = SINK_JPROBE;
+    out[1 - side] = path[1 - side] >= 0 ? path[1 - side] : choose_path(x->ss, &q[1 - side], &k);
+}
+
 /* plan C: side `outer` read by path (-1: choose_path's), each of its rows probing the other side */
 static int join_index_plan(jctx *j, qspec q[2], int outer, int path, imdb_err *e)
 {
@@ -2632,8 +2710,8 @@ static int join_index_plan(jctx *j, qspec q[2], int outer, int path, imdb_err *e
     ki.e = e;
     ki.j = j;
     j->inner = &ki;
-    j->ran[outer] = path >= 0 ? path : choose_path(x->ss, &q[outer], &ko);
-    j->ran[1 - outer] = j->probe_path;
+    int forced[2] = {path, path};
+    join_side_paths(x, j, q, true, outer, forced, j->ran);
     int rc = run_path(x, j->ran[outer], &q[outer], &ko, e);
     j->inner = NULL;
     return rc ? rc : ko.err;
@@ -2662,8 +2740,7 @@ static int join_hash_plan(jctx *j, qspec q[2], int build, const int path[2], imd
     kp.t = j->t[1 - build];
     kp.e = e;
     kp.j = j;
-    j->ran[build] = path[build] >= 0 ? path[build] : choose_path(x->ss, &q[build], &kb);
-    j->ran[1 - build] = path[1 - build] >= 0 ? path[1 - build] : choose_path(x->ss, &q[1 - build], &kp);
+    join_side_paths(x, j, q, false, build, path, j->ran);
     int rc = run_path(x, j->ran[build], &q[build], &kb, e);
     if (!rc) rc = kb.err;
     if (!rc && j->left && build == 0 && !(j->matched = imdb_alloc_array(j->nent ? j->nent : 1, 1, e))) rc = e->code;
@@ -2732,6 +2809,14 @@ static uint64_t join_probe_cost(const jctx *j)
     return COST_JORD + (amp > 1 ? amp - 1 : 0) * COST_JCAND + (t->nver - t->idx_upto) * COST_MEM_ROW;
 }
 
+/* the prices the planner compares, kept for EXPLAIN (join_choose fills them) */
+typedef struct jprice {
+    bool priced;                  /* join_choose ran */
+    uint64_t est[2];              /* each side's rows, at most */
+    unsigned __int128 hash, c[2]; /* the hash join (side 2 built); plan C with side s outer, where has[s] */
+    bool has[2];
+} jprice;
+
 /* The plan (design.md §5, Joins): the hash join building side 1, or plan C where it costs less. The
  * hash join reads the build side whole after its own predicates; plan C costs a probe per outer
  * row instead. Every count is an upper bound, so plan C is chosen only when a bound on its probes
@@ -2739,15 +2824,26 @@ static uint64_t join_probe_cost(const jctx *j)
  * their plans. force (SET join_plan = index): plan C wherever a probe exists, in the cheaper
  * orientation; where none does, the hash join, and the path name says so. LEFT: side 0 is the
  * outer side (its unmatched rows are NULL-extended as they are read). */
-static jplan join_choose(jctx *j, const qspec q[2], bool force)
+static jplan join_choose(jctx *j, const qspec q[2], bool force, jprice *pr)
 {
     jplan p = {JP_HASH, 1, {-1, -1}};
     uint64_t n[2] = {join_est_rows(&q[0]), join_est_rows(&q[1])};
     unsigned __int128 hash = (unsigned __int128)n[1] * COST_JBUILD + (unsigned __int128)n[0] * COST_JHPROBE, best = 0;
+    if (pr) { /* EXPLAIN's (P1 Q1) */
+        memset(pr, 0, sizeof *pr);
+        pr->priced = true;
+        pr->est[0] = n[0];
+        pr->est[1] = n[1];
+        pr->hash = hash;
+    }
     int side = -1;
     for (int outer = 0; outer < (j->left ? 1 : 2); outer++) {
         if (!join_probe_setup(j, q, 1 - outer)) continue;
         unsigned __int128 c = (unsigned __int128)n[outer] * join_probe_cost(j);
+        if (pr) {
+            pr->c[outer] = c;
+            pr->has[outer] = true;
+        }
         if (side >= 0 && c >= best) continue;
         best = c;
         side = outer;
@@ -2945,6 +3041,164 @@ static int join_materialize(xctx *x, const sql_stmt *st, jctx *j, sink *k, imdb_
     return rc ? rc : res_finish(r, e);
 }
 
+/* ---- EXPLAIN's rows (P1 Q1) ---------------------------------------------------------------------------------------- */
+
+static void xp_snapshot(const xctx *x, const sql_stmt *st, uint64_t snap, uint64_t pend, xplain *xp)
+{
+    xp_add(xp, "snapshot", "commit %llu%s%s", (unsigned long long)snap,
+           st->has_asof ? " (AS OF)" : x->ss->txn.open ? " (the transaction's)" : " (the latest)",
+           pend ? ", and this transaction's own writes" : "");
+}
+
+/* what the statement makes of the rows read: the sink's kind, then ORDER BY, DISTINCT, OFFSET, LIMIT, FOR UPDATE */
+static void xp_output(xplain *xp, const sql_stmt *st, const sink *k, const imdb_schema *s)
+{
+    char o[XP_DETAIL];
+    size_t n = 0;
+    o[0] = 0;
+    if (st->explained != ST_SELECT)
+        xcat(o, sizeof o, &n, "%s", st->explained == ST_UPDATE ? "each row matched gets a new version (UPDATE)"
+                                                                : "each row matched is ended (DELETE)");
+    else if (k->mode == SINK_GROUP) xcat(o, sizeof o, &n, "a row for each group of %s", s->cols[k->gcol].name);
+    else if (k->mode == SINK_AGG) xcat(o, sizeof o, &n, "one row of aggregates");
+    else if (st->star) xcat(o, sizeof o, &n, "the rows, every column");
+    else xcat(o, sizeof o, &n, "the rows, %u item%s", st->nitems, st->nitems == 1 ? "" : "s");
+    if (st->having) xcat(o, sizeof o, &n, "; HAVING on each group");
+    if (st->distinct) xcat(o, sizeof o, &n, "; DISTINCT");
+    if (st->norder) xcat(o, sizeof o, &n, "; ordered by %u key%s", st->norder, st->norder == 1 ? "" : "s");
+    if (st->has_offset) xcat(o, sizeof o, &n, "; OFFSET %llu", (unsigned long long)st->offset);
+    if (st->has_limit) xcat(o, sizeof o, &n, "; LIMIT %llu", (unsigned long long)st->limit);
+    if (st->for_update) xcat(o, sizeof o, &n, "; FOR UPDATE (locks taken when it runs, none by EXPLAIN)");
+    xp_add(xp, "output", "%s", o);
+}
+
+/* one table's read: the path choose_path chose (path) and from what, in choose_path's order */
+static void xp_single(const xctx *x, const sql_stmt *st, const qspec *q, const sink *k, int path, xplain *xp)
+{
+    const imdb_table *t = q->t;
+    const imdb_schema *s = &t->s;
+    xp_add(xp, "table", "%s", s->name);
+    xp_snapshot(x, st, q->snap, q->pend, xp);
+    xp_add(xp, "path", "%s", path_name(path, q));
+    unsigned __int128 po = 0, ps = 0;
+    bool ordered = q->ord_pred >= 0 && !q->all_versions;
+    if (q->never) xp_add(xp, "why", "an empty range: no row can match, none is read");
+    else if (below_floor(x->db, q))
+        xp_add(xp, "why", "below this copy's memory floor (commit %llu): the lake answers, by its scan",
+               (unsigned long long)x->db->mem_floor);
+    else if (x->ss->access_path != IMDB_PATH_AUTO) xp_add(xp, "why", "SET access_path = %s", access_word(x->ss->access_path));
+    else if (q->pk_pred >= 0) xp_add(xp, "why", "an equality on the primary key");
+    else if (q->subj_pred >= 0) xp_add(xp, "why", "an equality on the subject");
+    else if (ordered && !scan_price(q, k, &po, &ps))
+        xp_add(xp, "why", "an ordered index serves the conditions (prices are compared only for a plain COUNT or SUM, "
+                          "whose scan sums segment rows without reading each)");
+    else if (ordered && po < COST_FLOOR)
+        xp_add(xp, "why", "the price: ordered %llu, scan %llu; under %u the index is kept", price_u64(po), price_u64(ps),
+               (unsigned)COST_FLOOR);
+    else if (ordered && ps < po) xp_add(xp, "why", "the price: scan %llu, below ordered %llu", price_u64(ps), price_u64(po));
+    else if (ordered) xp_add(xp, "why", "the price: ordered %llu, at most scan %llu", price_u64(po), price_u64(ps));
+    else xp_add(xp, "why", "no index serves the conditions");
+    unsigned by = 0;
+    if (path == IMDB_PATH_INDEX && q->pk_pred >= 0) {
+        xp_add(xp, "index", "the primary key (%s)", s->cols[s->pk].name);
+        by = 1;
+    } else if (path == IMDB_PATH_INDEX && q->subj_pred >= 0) {
+        xp_add(xp, "index", "the subject's (%s)", s->cols[s->subject].name);
+        by = 1;
+    } else if (path == IMDB_PATH_ORDERED && ordered) {
+        const imdb_index *ix = q->ord_idx;
+        char d[XP_DETAIL];
+        size_t n = 0;
+        d[0] = 0;
+        xcat(d, sizeof d, &n, "%s (", ix->d.name);
+        for (uint8_t c = 0; c < ix->d.ncols; c++) xcat(d, sizeof d, &n, "%s%s", c ? ", " : "", s->cols[ix->d.cols[c]].name);
+        xcat(d, sizeof d, &n, "):");
+        for (uint8_t c = 0; c < q->ord_neq; c++)
+            xcat(d, sizeof d, &n, "%s%s", c ? ", " : " equality on ", s->cols[ix->d.cols[c]].name);
+        if (q->ord_rng >= 0) xcat(d, sizeof d, &n, "%sa range on %s", q->ord_neq ? ", then " : " ", s->cols[ix->d.cols[q->ord_neq]].name);
+        if (q->ord_only) xcat(d, sizeof d, &n, "; the index alone answers: no row is read");
+        xp_add(xp, "index", "%s", d);
+        by = q->ord_neq + (q->ord_rng >= 0);
+    }
+    unsigned all = q->np + k->nresid;
+    if (all) xp_add(xp, "conditions", "%u: %u by the index, %u tested on each row read", all, by, all - by);
+    else xp_add(xp, "conditions", "none: every visible row");
+    uint64_t est = join_est_rows(q);
+    xp_add(xp, "estimate", "at most %llu version%s read (an upper bound from the indexes and the store: no statistics)",
+           (unsigned long long)est, est == 1 ? "" : "s");
+    if ((path == IMDB_PATH_SCAN || path == IMDB_PATH_ROWS) && !q->never) {
+        uint32_t rd = 0;
+        for (uint32_t i = 0; i < t->nseg; i++) rd += !seg_skipped(q, t->seg[i]);
+        xp_add(xp, "segments", "%u of %u read (%u skipped by their zone maps); %llu versions in memory", rd, t->nseg,
+               t->nseg - rd, (unsigned long long)(t->nver - t->mem_first));
+    }
+    xp_output(xp, st, k, s);
+}
+
+/* a join's plan (exec_join's choice, p, named pname) and why; the prices join_choose compared; each side's path */
+static int xp_join(xctx *x, const sql_stmt *st, jctx *j, qspec q[2], const jplan *p, const jprice *pr, const char *pname,
+                   xplain *xp, imdb_err *e)
+{
+    sink k;
+    int rc = plan_join_sink(x, st, j, &k, e); /* the select list bound as the run binds it: it fails the same way */
+    if (rc) {
+        sink_free(&k);
+        return rc;
+    }
+    const imdb_schema *s0 = &j->t[0]->s, *s1 = &j->t[1]->s;
+    xp_add(xp, "join", "%s %s %s, on %s.%s = %s.%s", s0->name, j->left ? "LEFT JOIN" : "JOIN", s1->name, s0->name,
+           s0->cols[j->key[0]].name, s1->name, s1->cols[j->key[1]].name);
+    xp_snapshot(x, st, q[0].snap, q[0].pend, xp);
+    xp_add(xp, "plan", "%s", pname);
+    int jp = x->ss->join_plan;
+    char side = p->side ? '2' : '1';
+    if (below_floor(x->db, &q[0]))
+        xp_add(xp, "why", "below this copy's memory floor (commit %llu): the hash join, each side read from the lake",
+               (unsigned long long)x->db->mem_floor);
+    else if (jp == IMDB_JOIN_HASH) xp_add(xp, "why", "SET join_plan = hash");
+    else if (jp == IMDB_JOIN_AUTO && x->ss->access_path != IMDB_PATH_AUTO)
+        xp_add(xp, "why", "SET access_path = %s is every table's read: the hash join", access_word(x->ss->access_path));
+    else if (jp == IMDB_JOIN_INDEX)
+        xp_add(xp, "why", "%s", p->kind == JP_INDEX ? "SET join_plan = index, in the cheaper orientation"
+                                                     : "SET join_plan = index, but no index serves a side's key: the hash join");
+    else if (p->kind == JP_INDEX) xp_add(xp, "why", "the price: plan C with side %c outer, below the hash join's", side);
+    else if (!pr->has[0] && !pr->has[1]) xp_add(xp, "why", "no index serves a side's key: the hash join");
+    else if (pr->hash < COST_FLOOR) xp_add(xp, "why", "the hash join's price is under %u: it is kept", (unsigned)COST_FLOOR);
+    else xp_add(xp, "why", "the price: the hash join is the cheapest");
+    if (pr->priced) {
+        char d[XP_DETAIL];
+        size_t n = 0;
+        d[0] = 0;
+        xcat(d, sizeof d, &n, "hash join %llu (side 2 built: at most %llu rows; side 1 probing: at most %llu)",
+             price_u64(pr->hash), (unsigned long long)pr->est[1], (unsigned long long)pr->est[0]);
+        for (int o = 0; o < 2; o++) {
+            if (pr->has[o]) xcat(d, sizeof d, &n, "; plan C, side %d outer: %llu", o + 1, price_u64(pr->c[o]));
+            else if (o && j->left) xcat(d, sizeof d, &n, "; plan C, side 2 outer: none (LEFT keeps side 1 outer)");
+            else xcat(d, sizeof d, &n, "; plan C, side %d outer: none (no index on side %d's key)", o + 1, 2 - o);
+        }
+        xp_add(xp, "price", "%s", d);
+    }
+    if (p->kind == JP_INDEX && !join_probe_setup(j, q, 1 - p->side)) { /* join_choose found it: as join_index_plan */
+        sink_free(&k);
+        return imdb_fail(e, IMDB_ERR_STATE, "a join planned on an index the other table does not have");
+    }
+    int ran[2];
+    join_side_paths(x, j, q, p->kind == JP_INDEX, p->side, p->path, ran);
+    for (int sd = 0; sd < 2; sd++) {
+        bool probed = p->kind == JP_INDEX && sd != p->side;
+        const char *role = p->kind == JP_INDEX ? (probed ? "probed by its key for each outer row" : "outer: each row probes")
+                                               : (sd == p->side ? "built into the hash" : "probing the hash");
+        if (probed)
+            xp_add(xp, sd ? "side 2" : "side 1", "%s: %s, %s", j->t[sd]->s.name, path_name(ran[sd], &j->probe), role);
+        else
+            xp_add(xp, sd ? "side 2" : "side 1", "%s: %s, %s, at most %llu versions", j->t[sd]->s.name,
+                   path_name(ran[sd], &q[sd]), role, (unsigned long long)join_est_rows(&q[sd]));
+    }
+    xp_output(xp, st, &k, &j->ct->s);
+    sink_free(&k);
+    return IMDB_OK;
+}
+
 /* one plan into r: the statement's sink, the plan, its result */
 static int join_run(xctx *x, const sql_stmt *st, jctx *j, qspec q[2], const jplan *p, imdb_result *r, imdb_err *e)
 {
@@ -2964,7 +3218,7 @@ static int join_run(xctx *x, const sql_stmt *st, jctx *j, qspec q[2], const jpla
     return rc;
 }
 
-static int exec_join(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
+static int exec_join(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, imdb_err *e)
 {
     imdb_table *t[2]; /* each at the read point (1f: a table dropped since, for AS OF before the drop) */
     if (read_table(x, st, st->table, &t[0], e) || read_table(x, st, st->table2, &t[1], e)) return e->code;
@@ -3047,12 +3301,21 @@ static int exec_join(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
     /* the hash join building side 1, or plan C (join_choose; only under access_path auto: a forced
      * path is every table read's) */
     jplan p = {JP_HASH, 1, {-1, -1}};
+    jprice jpr;
+    memset(&jpr, 0, sizeof jpr);
     int jp = x->ss->join_plan;
     if (!rc && !below_floor(x->db, &q[0]) && /* below the memory floor: the hash join over the lake (stage 3b) */
         (jp == IMDB_JOIN_INDEX || (jp == IMDB_JOIN_AUTO && x->ss->access_path == IMDB_PATH_AUTO)))
-        p = join_choose(j, q, jp == IMDB_JOIN_INDEX);
+        p = join_choose(j, q, jp == IMDB_JOIN_INDEX, &jpr);
     char n1[28]; /* the longest name: join(build 1; store, store) */
     join_plan_name(&p, n1, sizeof n1);
+    if (xp) { /* P1 Q1: the plan, not run */
+        if (!rc) rc = xp_join(x, st, j, q, &p, &jpr, n1, xp, e);
+        join_free(j);
+        imdb_free(j->ct);
+        imdb_free(j);
+        return rc;
+    }
     if (!rc) rc = join_run(x, st, j, q, &p, r, e);
     if (!rc) {
         snprintf(r->path, sizeof r->path, "%s", n1);
@@ -3091,9 +3354,9 @@ static int exec_join(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
     return rc;
 }
 
-static int exec_select(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
+static int exec_select(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, imdb_err *e)
 {
-    if (st->has_join) return exec_join(x, st, r, e);
+    if (st->has_join) return exec_join(x, st, r, xp, e);
     imdb_table *t;
     if (read_table(x, st, st->table, &t, e)) return e->code;
     qspec q;
@@ -3104,6 +3367,11 @@ static int exec_select(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
     int rc = plan_select(x, st, t, &k, e);
     if (!rc) q.ord_only = ordered_only(&q, &k);
     int p1 = rc ? IMDB_PATH_SCAN : choose_path(x->ss, &q, &k); /* the sink's kind is part of the cost */
+    if (xp) { /* P1 Q1: the plan, not run */
+        if (!rc) xp_single(x, st, &q, &k, p1, xp);
+        sink_free(&k);
+        return rc;
+    }
     if (!rc) rc = run_path(x, p1, &q, &k, e);
     if (!rc && st->for_update && x->ss->txn.open) rc = lock_rows(x, t, &k, e);
     if (!rc) rc = sink_pin(&k);
@@ -3145,7 +3413,7 @@ static int exec_select(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
 
 /* Matching versions for DML/ERASE, sorted by vid, cross-checked when enabled. */
 static int select_vids(xctx *x, const sql_stmt *st, imdb_table *t, bool all_versions, uint64_t **out, uint64_t *n,
-                       imdb_err *e)
+                       xplain *xp, imdb_err *e)
 {
     qspec q;
     memset(&q, 0, sizeof q);
@@ -3165,6 +3433,13 @@ static int select_vids(xctx *x, const sql_stmt *st, imdb_table *t, bool all_vers
     xscope sc = {.st = st, .s = &t->s, .t = t, .cols = true, .group_col = -1};
     if (bind_resid(x, &sc, k.resid, &k.nresid, e)) return e->code;
     int p1 = choose_path(x->ss, &q, &k);
+    if (xp) { /* P1 Q1: the plan, not run */
+        xp_single(x, st, &q, &k, p1, xp);
+        sink_free(&k);
+        *out = NULL;
+        *n = 0;
+        return IMDB_OK;
+    }
     int rc = run_path(x, p1, &q, &k, e);
     if (rc) {
         sink_free(&k);
@@ -3196,7 +3471,9 @@ static int select_vids(xctx *x, const sql_stmt *st, imdb_table *t, bool all_vers
             return rc;
         }
         x->ss->cross_checks_run++;
+        snprintf(x->vpath, sizeof x->vpath, "%s = %s (cross-checked)", path_name(p1, &q), path_name(p2, &q));
     }
+    if (!x->ss->cross_check) snprintf(x->vpath, sizeof x->vpath, "%s", path_name(p1, &q)); /* P1 Q1: the result's */
     *out = k.vids;
     *n = k.nvids;
     return IMDB_OK;
@@ -3249,7 +3526,7 @@ static int exec_insert(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
     return IMDB_OK;
 }
 
-static int exec_update(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
+static int exec_update(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, imdb_err *e)
 {
     imdb_table *t = imdb_table_by_name(x->db, st->table);
     if (!t) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", st->table);
@@ -3271,7 +3548,8 @@ static int exec_update(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
         }
     }
     uint64_t *vids, n;
-    if (select_vids(x, st, t, false, &vids, &n, e)) return e->code;
+    if (select_vids(x, st, t, false, &vids, &n, xp, e)) return e->code;
+    if (xp) return IMDB_OK; /* P1 Q1: the plan, not run */
     int rc = IMDB_OK;
     imdb_value vals[IMDB_MAX_COLS];
     for (uint64_t i = 0; i < n && !rc; i++) {
@@ -3292,22 +3570,53 @@ static int exec_update(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
     }
     imdb_free(vids);
     if (!rc) snprintf(r->status, sizeof r->status, "UPDATE %llu", (unsigned long long)n);
+    if (!rc) snprintf(r->path, sizeof r->path, "%s", x->vpath); /* P1 Q1: how the rows were found */
     return rc;
 }
 
-static int exec_delete(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
+static int exec_delete(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, imdb_err *e)
 {
     imdb_table *t = imdb_table_by_name(x->db, st->table);
     if (!t) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", st->table);
     uint64_t *vids, n;
-    if (select_vids(x, st, t, false, &vids, &n, e)) return e->code;
+    if (select_vids(x, st, t, false, &vids, &n, xp, e)) return e->code;
+    if (xp) return IMDB_OK; /* P1 Q1: the plan, not run */
     int rc = IMDB_OK;
     for (uint64_t i = 0; i < n && !rc; i++)
         if (!(rc = xtick(x, 64, e))) rc = imdb_delete(x->db, t, vids[i], e);
     imdb_free(vids);
     if (!rc) snprintf(r->status, sizeof r->status, "DELETE %llu", (unsigned long long)n);
+    if (!rc) snprintf(r->path, sizeof r->path, "%s", x->vpath); /* P1 Q1: how the rows were found */
     return rc;
 }
+
+/* EXPLAIN (P1 Q1): the explained statement's own executor, stopped at its plan (xp), then the plan's rows */
+static int exec_explain(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
+{
+    xplain *xp = imdb_alloc(sizeof *xp, e);
+    if (!xp) return e->code;
+    int rc = st->explained == ST_SELECT   ? exec_select(x, st, r, xp, e)
+             : st->explained == ST_UPDATE ? exec_update(x, st, r, xp, e)
+                                          : exec_delete(x, st, r, xp, e);
+    if (!rc) {
+        res_cols(r, 2);
+        res_name(r, 0, "item");
+        res_name(r, 1, "detail");
+        for (uint16_t i = 0; i < xp->n && !rc; i++) {
+            imdb_cell *row = res_row(r, e);
+            if (!row) {
+                rc = e->code;
+                break;
+            }
+            res_put_str(r, &row[0], xp->item[i]);
+            res_put_str(r, &row[1], xp->detail[i]);
+        }
+        if (!rc) rc = res_finish(r, e);
+    }
+    imdb_free(xp);
+    return rc;
+}
+
 
 static void erase_status(imdb_result *r, const imdb_erase_report *er, const imdb_db *db)
 {
@@ -3917,7 +4226,8 @@ static int stmt_class(int kind)
     case ST_CHECKPOINT: case ST_COMPACT: case ST_ERASE_SUBJECT: case ST_ERASE_WHERE: case ST_VERIFY: return IMDB_SC_PHYSICAL;
     case ST_SHOW_TABLES: case ST_SHOW_DIGEST: case ST_SHOW_HISTORY: case ST_SHOW_LOG: case ST_SHOW_LAKE:
     case ST_SHOW_IDENTITY: case ST_SHOW_REPLICAS: case ST_SHOW_REPLICATION: case ST_SHOW_ERASURE: case ST_SHOW_MEMORY:
-    case ST_SHOW_INDEXES: case ST_SHOW_RETENTION: case ST_SHOW_STATS: case ST_SHOW_TRANSACTIONS: return IMDB_SC_SHOW;
+    case ST_SHOW_INDEXES: case ST_SHOW_RETENTION: case ST_SHOW_STATS: case ST_SHOW_TRANSACTIONS: case ST_EXPLAIN:
+        return IMDB_SC_SHOW;
     default: return IMDB_SC_OTHER;
     }
 }
@@ -3963,7 +4273,8 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
                          "replica has unauthorised redactions or an unverified lake; resume apply before querying");
     }
     /* read-your-writes across copies: a session that needs commit N refuses one not there yet */
-    bool reads = st->kind == ST_SELECT || st->kind == ST_SHOW_DIGEST || st->kind == ST_SHOW_HISTORY || st->kind == ST_SHOW_IDENTITY;
+    bool reads = st->kind == ST_SELECT || st->kind == ST_SHOW_DIGEST || st->kind == ST_SHOW_HISTORY || st->kind == ST_SHOW_IDENTITY ||
+                 (st->kind == ST_EXPLAIN && st->explained == ST_SELECT); /* a plan of what that read would see */
     if (reads && ss->min_commit > db->seq) {
         rc = imdb_fail(e, IMDB_ERR_STATE, "this database is at commit %llu; the session requires commit %llu (SET min_commit)",
                        (unsigned long long)db->seq, (unsigned long long)ss->min_commit);
@@ -4043,7 +4354,7 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
                                            st->kind == ST_SHOW_REPLICATION || st->kind == ST_SHOW_ERASURE ||
                                            st->kind == ST_SHOW_MEMORY || st->kind == ST_SHOW_INDEXES ||
                                            st->kind == ST_SHOW_RETENTION || st->kind == ST_SHOW_STATS ||
-                                           st->kind == ST_SHOW_TRANSACTIONS);
+                                           st->kind == ST_SHOW_TRANSACTIONS || st->kind == ST_EXPLAIN);
     if (ceiling) imdb_heap_ceiling_set(imdb_heap_bytes() + workspace_of(ss), workspace_of(ss));
     switch (st->kind) {
     case ST_EMPTY: break;
@@ -4086,9 +4397,10 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
         if (!rc) snprintf(r->status, sizeof r->status, "DROP INDEX %s", st->index_name);
         break;
     case ST_INSERT: rc = exec_insert(&x, st, r, e); break;
-    case ST_UPDATE: rc = exec_update(&x, st, r, e); break;
-    case ST_DELETE: rc = exec_delete(&x, st, r, e); break;
-    case ST_SELECT: rc = exec_select(&x, st, r, e); break;
+    case ST_UPDATE: rc = exec_update(&x, st, r, NULL, e); break;
+    case ST_DELETE: rc = exec_delete(&x, st, r, NULL, e); break;
+    case ST_SELECT: rc = exec_select(&x, st, r, NULL, e); break;
+    case ST_EXPLAIN: rc = exec_explain(&x, st, r, e); break;
     case ST_BEGIN:
         if (txn) {
             rc = imdb_fail(e, IMDB_ERR_STATE, "transaction already open");
@@ -4201,7 +4513,7 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
             break;
         }
         uint64_t *vids, n;
-        if ((rc = select_vids(&x, st, t, true, &vids, &n, e))) break;
+        if ((rc = select_vids(&x, st, t, true, &vids, &n, NULL, e))) break;
         imdb_erase_ent *ents = n ? imdb_alloc_array(n, sizeof *ents, e) : NULL;
         if (n && !ents) {
             imdb_free(vids);
@@ -4524,7 +4836,8 @@ static size_t disp_width(const uint8_t *p, size_t n)
 void imdb_result_render(const imdb_result *r, bool csv, imdb_buf *out)
 {
     if (!r->has_rows) {
-        if (r->status[0]) imdb_buf_printf(out, "%s\n", r->status);
+        if (r->status[0]) /* a write's path: how its rows were found (P1 Q1) */
+            imdb_buf_printf(out, "%s%s%s%s\n", r->status, r->path[0] ? "  [" : "", r->path, r->path[0] ? "]" : "");
         return;
     }
     uint16_t nc = r->ncols;
