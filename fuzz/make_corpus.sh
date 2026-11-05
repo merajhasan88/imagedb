@@ -100,6 +100,8 @@ for q in "SELECT COUNT(*), SUM(amount) FROM txns AS OF 3 WHERE user_id = 42 AND 
          "SELECT c.id FROM c WHERE NOT EXISTS (SELECT 1 FROM o WHERE o.cust = c.id AND o.v > (SELECT MAX(v) FROM o AS p WHERE p.cust = o.cust))" \
          "SELECT a FROM t UNION ALL SELECT b FROM u INTERSECT SELECT c FROM w EXCEPT (SELECT d FROM x ORDER BY 1 LIMIT 2) ORDER BY a DESC LIMIT 3 OFFSET 1" \
          "WITH RECURSIVE r(n, d) AS (SELECT 1, 0 UNION ALL SELECT e.dst, r.d + 1 FROM r JOIN e ON e.src = r.n WHERE r.d < 9) SELECT d, COUNT(*) FROM r GROUP BY d" \
+         "SELECT id, ROW_NUMBER() OVER (PARTITION BY g ORDER BY x DESC NULLS LAST, id), LAG(s, 2, x) OVER (ORDER BY id) FROM t" \
+         "SELECT g, SUM(x) OVER (ORDER BY id ROWS BETWEEN 3 PRECEDING AND 1 FOLLOWING), RANK() OVER (ORDER BY SUM(x) DESC) FROM t GROUP BY g" \
          "((((((((((((((((((((((((((((((((((((((((SELECT 1))))))))))))))))))))))))))))))))))))))))" \
          "SELECT id, (SELECT COUNT(*) FROM u WHERE u.tid = t.id) FROM t WHERE g IN (SELECT v FROM u AS ci WHERE ci.tid = t.id)" \
          "SELECT AVG(f) FROM t HAVING COUNT(*) BETWEEN 1 AND 10 OFFSET 0 LIMIT 0"; do

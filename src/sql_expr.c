@@ -1020,6 +1020,9 @@ int imdb_x_eval(const sql_stmt *st, const imdb_xnode *xn, uint16_t k, const imdb
         }
         if (!env || !env->subq) return imdb_fail(e, IMDB_ERR_STATE, "a correlated subquery computed without its statement");
         return env->subq(env->ctx, k, row, out, NULL, e);
+    case EX_WIN: /* P2 S6: computed after the rows are (exec_window); in the rows' own run, a typed NULL */
+        *out = (imdb_xval){.type = b->type, .scale = b->scale, .null = true};
+        return IMDB_OK;
     case EX_COL:
         if (b->outer) *out = b->k; /* P2 S4b: a column of a statement around this one, fixed for the run */
         else imdb_x_from_value(&row[b->col], out);

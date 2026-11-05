@@ -57,6 +57,8 @@
 #define IMDB_MAX_SETOP_ARMS     64u          /* SELECTs one statement's set operations combine, every chain's counted (P2 S5) */
 #define IMDB_MAX_RECURSION      1000000u     /* rounds of one WITH RECURSIVE (P2 S5): past them, refused */
 #define IMDB_MAX_QUERY_PARENS   32u          /* queries parenthesized in queries, deepest (P2 S5: the parser's recursion) */
+#define IMDB_MAX_WINDOWS        8u           /* window functions in one SELECT (P2 S6) */
+#define IMDB_MAX_WIN_KEYS       8u           /* a window's PARTITION BY keys, and its ORDER BY keys (P2 S6) */
 #define IMDB_CHECKPOINT_BYTES   (64ull << 20) /* default auto-CHECKPOINT segment size (primary) */
 #define IMDB_LOG_FILL_CHUNK     (1u << 20)   /* zeros written ahead in a tagged segment at a time (design.md §3) */
 #define IMDB_LOG_FILL_LOW       (256u << 10) /* less fill than this left after an append: the next chunk */

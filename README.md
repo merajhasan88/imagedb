@@ -780,6 +780,32 @@ SELECT depth, COUNT(*) FROM chain GROUP BY depth;
   operation whose SELECTs read the statement around it (correlated), more than
   one base or step in a recursive WITH, SEARCH and CYCLE.
 
+Window functions:
+
+```sql
+SELECT cust, amount, RANK() OVER (PARTITION BY cust ORDER BY amount DESC) AS r FROM orders;
+SELECT id, SUM(amount) OVER (ORDER BY id ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS week FROM sales;
+SELECT id, amount - prev AS change
+  FROM (SELECT id, amount, LAG(amount) OVER (ORDER BY id) AS prev FROM sales) AS q;
+```
+
+- ROW_NUMBER, RANK, DENSE_RANK, NTILE(n), LAG and LEAD (value, offset,
+  default), FIRST_VALUE, LAST_VALUE, and COUNT, SUM, AVG, MIN and MAX, each
+  `OVER ([PARTITION BY ...] [ORDER BY ...] [ROWS | RANGE ...])`, as a SELECT
+  item of its own (to compute on one, select it from a derived table, as the
+  third query does), also over a grouped statement
+  (`RANK() OVER (ORDER BY SUM(x) DESC)`).
+- Frames: the default is the whole partition, or with ORDER BY its start to the
+  current row's last peer; ROWS takes `n PRECEDING`, `CURRENT ROW`,
+  `n FOLLOWING` and UNBOUNDED; RANGE takes UNBOUNDED and CURRENT ROW (not an
+  offset yet). Rows that tie in a window's ORDER BY keep the statement's own
+  order, so ROW_NUMBER, LAG and the like are deterministic even among ties.
+- The statement's ORDER BY, DISTINCT, OFFSET and LIMIT apply after the
+  windows, so every row the windows read is held first (LIMIT does not
+  shorten that work; the statement's memory ceiling bounds it). At most 8
+  window functions in a SELECT. Not yet: a window function
+  inside an expression, named windows, PERCENT_RANK, CUME_DIST, NTH_VALUE.
+
 ## Validation
 
 ```sh

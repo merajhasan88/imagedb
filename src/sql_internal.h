@@ -38,7 +38,7 @@ typedef struct sql_lit {
  * balanced tree of EX_LIST nodes (l, r) over its elements, in order, so its depth grows as log2 of its length and every
  * walker that follows l, r and x3 reaches each element within the height bound; a list of one is its element alone. */
 enum { EX_LIT = 1, EX_COL, EX_NEG, EX_ADD, EX_SUB, EX_MUL, EX_DIV, EX_MOD, EX_AGG, EX_CMP, EX_AND, EX_OR, EX_NOT,
-       EX_FN, EX_LIST, EX_CASE, EX_WHEN, EX_CAST, EX_SUBQ };
+       EX_FN, EX_LIST, EX_CASE, EX_WHEN, EX_CAST, EX_SUBQ, EX_WIN };
 
 typedef struct sql_expr {
     uint8_t op;
@@ -51,6 +51,8 @@ typedef struct sql_expr {
     uint8_t ctype, cscale, cprec; /* EX_CAST (P2 S1): the target type, scale and precision (a DECIMAL's) */
     bool dist;               /* EX_AGG (P2 S2): agg(DISTINCT x); its FILTER (WHERE c) is x3 */
     uint8_t sub, subk;       /* EX_SUBQ (P2 S4): the statement's sub[sub]; subk 0 a value, 1 EXISTS, 2 IN's values */
+                             /* EX_WIN (P2 S6): fn a WF_*, agg its aggregate (WF_AGG), l r x3 its arguments, sub its
+                              * window (the statement's win[sub]) */
     sql_lit lit;             /* EX_LIT */
     char qual[IMDB_MAX_IDENT + 1]; /* EX_COL: a.col's a, or "" */
     char col[IMDB_MAX_IDENT + 1];
@@ -101,6 +103,18 @@ enum {
 /* P2 S3: a join's kind as written (RIGHT keeps side 1's rows, FULL both sides'; CROSS and FROM a, b have no ON) */
 enum { SQL_JOIN_INNER = 1, SQL_JOIN_LEFT, SQL_JOIN_RIGHT, SQL_JOIN_FULL, SQL_JOIN_CROSS };
 enum { SQL_SET_UNION = 1, SQL_SET_INTERSECT, SQL_SET_EXCEPT, SQL_SET_ALL = 0x80 }; /* P2 S5: an arm's operator, | ALL */
+/* P2 S6: window functions (EX_WIN.fn), a frame's kind and its bounds */
+enum { WF_ROW_NUMBER = 1, WF_RANK, WF_DENSE_RANK, WF_NTILE, WF_LAG, WF_LEAD, WF_FIRST, WF_LAST, WF_AGG };
+enum { WFR_DEFAULT = 0, WFR_ROWS, WFR_RANGE };
+enum { WB_UNB_PREC = 1, WB_PREC, WB_CURRENT, WB_FOLL, WB_UNB_FOLL };
+typedef struct sql_win { /* OVER ( [PARTITION BY part ...] [ORDER BY ord ...] [ROWS | RANGE lo .. hi] ) */
+    uint8_t npart, nord;
+    uint16_t part[IMDB_MAX_WIN_KEYS], ord[IMDB_MAX_WIN_KEYS]; /* expression roots */
+    bool desc[IMDB_MAX_WIN_KEYS], nfirst[IMDB_MAX_WIN_KEYS];
+    uint8_t frame, lo, hi;   /* WFR_*, WB_* (WFR_DEFAULT: the whole partition, or to the current row's last peer under
+                              * ORDER BY) */
+    int64_t lo_n, hi_n;      /* n PRECEDING / n FOLLOWING */
+} sql_win;
 
 /* isolation levels as written (the executor maps them; SERIALIZABLE is refused for now) */
 enum { SQL_ISO_SNAPSHOT = 1, SQL_ISO_READ_COMMITTED, SQL_ISO_SERIALIZABLE };
@@ -132,6 +146,8 @@ typedef struct sql_stmt {
     char (*cte_col)[IMDB_MAX_IDENT + 1];
     uint8_t cte_ncols;
     bool recursive;
+    sql_win win[IMDB_MAX_WINDOWS]; /* P2 S6: its window functions' windows, EX_WIN.sub */
+    uint8_t nwin;
     char table2[IMDB_MAX_IDENT + 1], alias2[IMDB_MAX_IDENT + 1];
     char on_qual[2][IMDB_MAX_IDENT + 1], on_col[2][IMDB_MAX_IDENT + 1];
     imdb_schema schema;                         /* CREATE */

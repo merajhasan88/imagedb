@@ -263,6 +263,10 @@ typedef struct stmt {
     int rec, rk;       /* P2 S5: WITH RECURSIVE: 1 a count to rk, 2 a walk from rstart along u; rall: UNION ALL */
     int64_t rstart;
     bool rall;
+    bool win, wpart, wdesc, wdef, wtotal; /* P2 S6: a window statement (gen_wselect): its function wfn of column wcol,
+                                        * NTILE's buckets or LAG's offset wk, its ROWS frame (wframe: wlo
+                                        * PRECEDING, whi FOLLOWING) */
+    int wfn, wcol, wk, wframe, wlo, whi;
     int dsel;          /* P2 S4: 1 FROM (SELECT dc FROM t [WHERE dpred]) AS x, 2 WITH x AS (...) SELECT ... FROM x */
     int dc[4], ndc;
     pred dpred;
@@ -1572,11 +1576,44 @@ static void gen_rselect(stmt *q)
     if (!q->rall) q->skip |= 1u << D_MS;
 }
 
+/* P2 S6: a window function over t: SELECT id, f(...) OVER ([PARTITION BY g] ORDER BY k [, id]) FROM t [WHERE p]. The
+ * order keys are never NULL (no dialect's NULL placement matters): id % 3 (ties: RANK, DENSE_RANK and the default
+ * frame's aggregates, which read every peer alike), then id where a function reads the order among peers (ROW_NUMBER,
+ * NTILE, LAG, LEAD, FIRST_VALUE, LAST_VALUE, a ROWS frame: PostgreSQL and SQLite promise no order among ties, imagedb
+ * breaks them by its own); the values g and a (INT64, sums far from overflow) or s */
+enum { WO_ROW_NUMBER, WO_RANK, WO_DENSE_RANK, WO_NTILE, WO_LAG, WO_LEAD, WO_FIRST, WO_LAST, WO_SUM, WO_COUNT, WO_MIN, WO_MAX };
+static void gen_wselect(stmt *q)
+{
+    q->win = true;
+    q->wfn = (int)rr(WO_ROW_NUMBER, WO_MAX);
+    q->wpart = chance(60);
+    q->wdesc = chance(40);
+    q->wcol = chance(70) ? (chance(50) ? 1 : 2) : 6; /* g, a, or s */
+    if (q->wfn == WO_SUM) q->wcol = chance(50) ? 1 : 2;
+    q->wk = q->wfn == WO_NTILE ? (int)rr(1, 5) : (int)rr(1, 3);
+    q->wdef = (q->wfn == WO_LAG || q->wfn == WO_LEAD) && chance(70); /* a default: read at a partition's edges */
+    if (q->wdef) q->skip |= 1u << D_MA; /* MariaDB's LAG and LEAD take no default */
+    bool agg = q->wfn >= WO_SUM;
+    q->wframe = agg && chance(40) ? 1 : 0;
+    q->wlo = (int)rr(0, 3);
+    q->whi = (int)rr(0, 2);
+    q->wtotal = !(q->wfn == WO_RANK || q->wfn == WO_DENSE_RANK || (agg && !q->wframe)) || chance(30);
+    if (chance(50)) {
+        gen_pred(0, &q->pr[0]);
+        q->npr = 1;
+    }
+    q->tab = 0;
+}
+
 static void gen_select(stmt *q)
 {
     memset(q, 0, sizeof *q);
     q->kind = Q_SELECT;
     q->gcol = -1;
+    if (g_fns && chance(5)) { /* P2 S6: a window function */
+        gen_wselect(q);
+        return;
+    }
     if (g_fns && chance(6)) { /* P2 S5: a set operation */
         gen_sselect(q);
         return;
@@ -2424,7 +2461,8 @@ static void put_okey(sb *b, int d, const stmt *q, const struct okey *k)
  * t.d END, the CASE WHEN k IS NULL over either, or that CASE over a position whose item folds (seeds 14, 25, 43, 49, 93
  * of the 2026-11-05 five-engine run). A constant orders nothing, so each item it names is left out and the statement
  * run again (ms_drop_constants): g_ms_drop holds them, numbered over the list as printed with none left out, and
- * g_ms_at maps a printed position back to that numbering */
+ * g_ms_at maps a printed position back to that numbering. Only the statement's own ORDER BY comes here: a set
+ * operation's and a window's are printed apart */
 static unsigned long long g_ms_drop;
 static int g_ms_item, g_ms_at[64], g_ms_nat;
 static long g_ms_dropped;
@@ -2525,9 +2563,35 @@ static void print_rec(sb *b, int d, const stmt *q)
     else if (q->rec == 1)
         sb_printf(b, "%s n(i) AS (SELECT 1 %s SELECT i + 1 FROM n WHERE i < %d) SELECT COUNT(*), SUM(i) FROM n", rk, op, q->rk);
     else
-        sb_printf(b, "%s r(x, depth) AS (SELECT %" PRId64 ", 0 %s SELECT u.id, r.depth + 1 FROM r JOIN u ON u.tid = r.x WHERE "
+        sb_printf(b, "%s r(x, depth) AS (SELECT %s%" PRId64 "%s, 0 %s SELECT u.id, r.depth + 1 FROM r JOIN u ON u.tid = r.x WHERE "
                      "r.depth < 6) SELECT COUNT(*), SUM(x) FROM r",
-                  rk, q->rstart, op);
+                  rk, d == D_PG || d == D_MS ? "CAST(" : "", q->rstart, d == D_PG || d == D_MS ? " AS BIGINT)" : "", op); /* the start
+                  * a BIGINT, as u.id is: PostgreSQL and SQL Server want the two parts' types alike (MySQL's CAST has no
+                  * BIGINT) */
+}
+
+/* P2 S6: the window statement, each dialect alike (T-SQL writes the frame the same; its default is the same) */
+static void print_win(sb *b, int d, const stmt *q)
+{
+    static const char *const F[] = {"ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE", "LAG", "LEAD", "FIRST_VALUE", "LAST_VALUE",
+                                    "SUM", "COUNT", "MIN", "MAX"};
+    const char *col = cols(0)[q->wcol].name;
+    sb_printf(b, "SELECT id, %s(", F[q->wfn]);
+    if (q->wfn == WO_NTILE) sb_printf(b, "%d", q->wk);
+    else if (q->wfn == WO_LAG || q->wfn == WO_LEAD) {
+        sb_printf(b, "%s, %d", col, q->wk);
+        if (q->wdef) sb_str(b, cols(0)[q->wcol].t == CT_TXT ? ", 'none'" : ", -1");
+    } else if (q->wfn >= WO_FIRST) sb_str(b, col);
+    sb_str(b, ") OVER (");
+    if (q->wpart) sb_str(b, "PARTITION BY g ");
+    sb_printf(b, "ORDER BY id %% 3%s", q->wdesc ? " DESC" : "");
+    if (q->wtotal) sb_printf(b, ", id%s", q->wdesc ? " DESC" : "");
+    if (q->wframe) sb_printf(b, " ROWS BETWEEN %d PRECEDING AND %d FOLLOWING", q->wlo, q->whi);
+    sb_str(b, ") AS w FROM t");
+    if (q->npr) {
+        sb_str(b, " WHERE ");
+        put_pred(b, d, q, &q->pr[0]);
+    }
 }
 
 static void print_stmt(sb *b, int d, const stmt *q)
@@ -2561,6 +2625,10 @@ static void print_stmt(sb *b, int d, const stmt *q)
     case Q_DELETE:
         sb_printf(b, "DELETE FROM %s", tname(q->tab));
         put_where(b, d, q);
+        return;
+    }
+    if (q->win) { /* P2 S6 */
+        print_win(b, d, q);
         return;
     }
     if (q->narm) { /* P2 S5 */
@@ -2703,6 +2771,13 @@ static int out_types(const stmt *q, int *ty)
     if (q->narm) { /* P2 S5 */
         for (int c = 0; c < q->ncol; c++) ty[c] = TY(cols(q->arm[0].tab)[q->arm[0].col[c]].t, 0);
         return q->ncol;
+    }
+    if (q->win) { /* P2 S6: id, then the function's value (a count or a rank INT64, else its column's type) */
+        ty[0] = TY(CT_INT, 0);
+        bool isval = q->wfn == WO_LAG || q->wfn == WO_LEAD || q->wfn == WO_FIRST || q->wfn == WO_LAST || q->wfn == WO_MIN ||
+                   q->wfn == WO_MAX || q->wfn == WO_SUM;
+        ty[1] = TY(isval ? cols(0)[q->wcol].t : CT_INT, 0);
+        return 2;
     }
     if (q->rec) { /* P2 S5: COUNT(*), SUM */
         ty[0] = ty[1] = TY(CT_INT, 0);
@@ -3391,6 +3466,7 @@ static long g_jn_compared; /* P2 S3: comparisons of its join forms */
 static long g_subq_compared; /* P2 S4: comparisons of statements with a subquery, a derived table or a CTE */
 static long g_corr_compared; /* P2 S4b: comparisons of statements with a correlated subquery */
 static long g_set_compared, g_rec_compared; /* P2 S5: comparisons of set operations, of WITH RECURSIVE */
+static long g_win_compared; /* P2 S6: comparisons of window functions */
 
 static void show_rows(const res *r, size_t from)
 {
@@ -3407,7 +3483,7 @@ static void show_rows(const res *r, size_t from)
  * on the engine that disagreed: which condition the two read differently. */
 static void diagnose(const stmt *q, int d)
 {
-    if (q->kind != Q_SELECT || !q->npr || (q->join == 4 && d == D_SQLITE) || q->dsel) return; /* FULL there: two counts; a
+    if (q->kind != Q_SELECT || !q->npr || (q->join == 4 && d == D_SQLITE) || q->dsel || q->win) return; /* FULL: two counts; a
                                                                                              * derived table: its own FROM */
     stmt c;
     sb text = {0};
@@ -3555,6 +3631,7 @@ static int run_stmt(unsigned seed, int step, const stmt *q, bool state)
         if (q->corr) g_corr_compared++;
         if (q->narm) g_set_compared++;
         if (q->rec) g_rec_compared++;
+        if (q->win) g_win_compared++;
         const res *o = &out[d];
         const char *why = NULL;
         size_t at = 0;
@@ -3787,6 +3864,7 @@ int main(int argc, char **argv)
     printf("oracle: EXPLAIN checked against the run on %ld SELECTs, %ld disagreements\n", g_explained, g_explain_bad);
     bool servers = g_eng[D_PG].on || g_eng[D_MY].on || g_eng[D_MA].on || g_eng[D_MS].on;
     printf("oracle: %ld comparisons of P2 S2's grouped form (several keys and trees, DISTINCT, FILTER)\n", g_grp_compared);
+    printf("oracle: %ld comparisons of P2 S6's window functions\n", g_win_compared);
     printf("oracle: %ld comparisons of P2 S5's set operations, %ld of its WITH RECURSIVE\n", g_set_compared, g_rec_compared);
     printf("oracle: %ld comparisons of P2 S4b's correlated subqueries\n", g_corr_compared);
     printf("oracle: %ld comparisons of P2 S4's subqueries (IN, NOT IN, EXISTS, a value), derived tables and CTEs\n",

@@ -193,6 +193,7 @@ typedef struct parser {
     uint8_t depth;           /* P2 S4: nested SELECTs around this point */
     uint16_t narms;          /* P2 S5: the statement's set operations' arms so far (arm_new) */
     uint8_t parens;          /* P2 S5: parenthesized queries around this point (parse_operand: bounded) */
+    bool win_ok;             /* P2 S6: parsing a SELECT item's expression, where a window function may stand */
 } parser;
 
 static int parse_nested(parser *p, sql_stmt *outer, const char *name); /* P2 S4 */
@@ -203,6 +204,7 @@ static const char *const kReserved[] = {
     "primary", "key", "subject", "erase", "count", "sum", "min", "max", "begin", "commit", "rollback", "is",
     "case", "when", "then", "else", "end", "cast", "in", "like", "escape", /* P2 S1 */
     "union", "intersect", "except", /* P2 S5: never a FROM item's alias */
+    "over",                          /* P2 S6 */
 };
 
 static bool tok_is_kw(const parser *p, uint32_t at, const char *kw)
@@ -546,6 +548,150 @@ static int subq(parser *p, uint8_t kind, uint16_t *out)
     return IMDB_OK;
 }
 
+/* ---- P2 S6: window functions -------------------------------------------------------------------------------------- */
+
+static uint8_t wf_named(const parser *p, uint32_t at)
+{
+    static const struct {
+        const char *n;
+        uint8_t f;
+    } W[] = {{"row_number", WF_ROW_NUMBER}, {"rank", WF_RANK},   {"dense_rank", WF_DENSE_RANK}, {"ntile", WF_NTILE},
+             {"lag", WF_LAG},               {"lead", WF_LEAD},   {"first_value", WF_FIRST},     {"last_value", WF_LAST}};
+    for (size_t i = 0; i < sizeof W / sizeof *W; i++)
+        if (tok_is_kw(p, at, W[i].n)) return W[i].f;
+    return 0;
+}
+
+/* a frame's bound: UNBOUNDED PRECEDING, n PRECEDING, CURRENT ROW, n FOLLOWING, UNBOUNDED FOLLOWING */
+static int frame_bound(parser *p, uint8_t *kind, int64_t *n)
+{
+    if (kw(p, "unbounded")) {
+        if (kw(p, "preceding")) *kind = WB_UNB_PREC;
+        else if (kw(p, "following")) *kind = WB_UNB_FOLL;
+        else return fail_at(p, "PRECEDING or FOLLOWING");
+        return IMDB_OK;
+    }
+    if (kw(p, "current")) {
+        *kind = WB_CURRENT;
+        return expect_kw(p, "row");
+    }
+    uint64_t v;
+    if (uint_lit(p, &v)) return p->e->code;
+    if (v > IMDB_MAX_VERSIONS) return imdb_fail(p->e, IMDB_ERR_LIMIT, "a frame of more than %llu rows", (unsigned long long)IMDB_MAX_VERSIONS);
+    *n = (int64_t)v;
+    if (kw(p, "preceding")) *kind = WB_PREC;
+    else if (kw(p, "following")) *kind = WB_FOLL;
+    else return fail_at(p, "PRECEDING or FOLLOWING");
+    return IMDB_OK;
+}
+
+/* OVER ( [PARTITION BY e, ...] [ORDER BY k [ASC | DESC] [NULLS FIRST | LAST], ...] [ROWS | RANGE frame] ) into the
+ * statement's next window: no window function inside one (win_ok off); RANGE with UNBOUNDED and CURRENT ROW bounds only
+ * (an offset needs a numeric distance between order keys: a later step); PostgreSQL's order of bounds */
+static int window_spec(parser *p, uint8_t *out, unsigned depth)
+{
+    sql_stmt *st = p->st;
+    if (st->nwin >= IMDB_MAX_WINDOWS)
+        return imdb_fail(p->e, IMDB_ERR_LIMIT, "more than %u window functions in one SELECT", IMDB_MAX_WINDOWS);
+    if (expect(p, TK_LP, "(")) return p->e->code;
+    if (p->t[p->i].kind == TK_IDENT && !is_reserved(p, p->i) && !tok_is_kw(p, p->i, "partition") &&
+        !tok_is_kw(p, p->i, "rows") && !tok_is_kw(p, p->i, "range"))
+        return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "a named window (WINDOW w AS ...): a later step");
+    sql_win *w = &st->win[st->nwin];
+    memset(w, 0, sizeof *w);
+    bool ok = p->win_ok;
+    p->win_ok = false;
+    int rc = IMDB_OK;
+    if (kw(p, "partition") && !(rc = expect_kw(p, "by"))) {
+        do {
+            if (w->npart >= IMDB_MAX_WIN_KEYS) rc = imdb_fail(p->e, IMDB_ERR_LIMIT, "PARTITION BY of more than %u keys", IMDB_MAX_WIN_KEYS);
+            else rc = bexpr(p, &w->part[w->npart++], depth + 1);
+        } while (!rc && tok(p, TK_COMMA));
+    }
+    if (!rc && kw(p, "order") && !(rc = expect_kw(p, "by"))) {
+        do {
+            if (w->nord >= IMDB_MAX_WIN_KEYS) {
+                rc = imdb_fail(p->e, IMDB_ERR_LIMIT, "a window's ORDER BY of more than %u keys", IMDB_MAX_WIN_KEYS);
+                break;
+            }
+            uint8_t o = w->nord;
+            if ((rc = bexpr(p, &w->ord[o], depth + 1))) break;
+            w->desc[o] = kw(p, "desc");
+            if (!w->desc[o]) kw(p, "asc");
+            w->nfirst[o] = w->desc[o]; /* PostgreSQL's default: NULLs as the largest */
+            if (kw(p, "nulls")) {
+                if (kw(p, "first")) w->nfirst[o] = true;
+                else if (kw(p, "last")) w->nfirst[o] = false;
+                else rc = fail_at(p, "FIRST or LAST after NULLS");
+            }
+            w->nord++;
+        } while (!rc && tok(p, TK_COMMA));
+    }
+    if (!rc && (tok_is_kw(p, p->i, "rows") || tok_is_kw(p, p->i, "range"))) {
+        w->frame = kw(p, "rows") ? WFR_ROWS : (kw(p, "range"), WFR_RANGE);
+        if (kw(p, "between")) {
+            if (!(rc = frame_bound(p, &w->lo, &w->lo_n)) && !(rc = expect_kw(p, "and"))) rc = frame_bound(p, &w->hi, &w->hi_n);
+        } else {
+            rc = frame_bound(p, &w->lo, &w->lo_n);
+            w->hi = WB_CURRENT;
+        }
+        if (!rc && w->lo == WB_UNB_FOLL) rc = imdb_fail(p->e, IMDB_ERR_INVALID, "a frame cannot start UNBOUNDED FOLLOWING");
+        if (!rc && w->hi == WB_UNB_PREC) rc = imdb_fail(p->e, IMDB_ERR_INVALID, "a frame cannot end UNBOUNDED PRECEDING");
+        if (!rc && ((w->lo == WB_CURRENT && w->hi == WB_PREC) || (w->lo == WB_FOLL && (w->hi == WB_PREC || w->hi == WB_CURRENT))))
+            rc = imdb_fail(p->e, IMDB_ERR_INVALID, "a frame cannot end before the row it starts at");
+        if (!rc && w->frame == WFR_RANGE && (w->lo == WB_PREC || w->lo == WB_FOLL || w->hi == WB_PREC || w->hi == WB_FOLL))
+            rc = imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "RANGE with an offset: a later step (ROWS takes one)");
+    }
+    if (!rc) rc = expect(p, TK_RP, ")");
+    p->win_ok = ok;
+    if (!rc) *out = st->nwin++;
+    return rc;
+}
+
+/* a window function's call: f(args) OVER (...), a SELECT item's whole expression only (win_ok) */
+static int window_call(parser *p, uint8_t wf, uint16_t *out, unsigned depth)
+{
+    if (!p->win_ok)
+        return imdb_fail(p->e, IMDB_ERR_INVALID, "a window function stands only as a SELECT item, alone (compute on it from a "
+                                                 "derived table)");
+    p->i += 2; /* the name, then ( */
+    uint16_t a[3] = {0, 0, 0};
+    uint8_t n = 0;
+    bool none = wf == WF_ROW_NUMBER || wf == WF_RANK || wf == WF_DENSE_RANK;
+    if (!none) {
+        bool ok = p->win_ok;
+        p->win_ok = false;
+        int rc = IMDB_OK;
+        do {
+            if (n >= 3) rc = imdb_fail(p->e, IMDB_ERR_INVALID, "a window function of more than 3 arguments");
+            else rc = bexpr(p, &a[n++], depth + 1);
+        } while (!rc && tok(p, TK_COMMA));
+        p->win_ok = ok;
+        if (rc) return rc;
+    }
+    if (expect(p, TK_RP, ")")) return p->e->code;
+    uint8_t lo = none ? 0 : 1, hi = none ? 0 : wf == WF_LAG || wf == WF_LEAD ? 3 : 1;
+    if (n < lo || n > hi) return imdb_fail(p->e, IMDB_ERR_INVALID, "that window function takes %u to %u arguments", lo, hi);
+    if (!kw(p, "over")) return fail_at(p, "OVER (...) after a window function");
+    uint8_t w;
+    if (window_spec(p, &w, depth) || ex_new(p, EX_WIN, a[0], a[1], out)) return p->e->code;
+    sql_expr *x = &p->st->ex[*out];
+    x->fn = wf;
+    x->sub = w;
+    x->x3 = a[2];
+    if (a[2] && p->st->ex[a[2]].h + 1u > x->h) x->h = (uint8_t)(p->st->ex[a[2]].h + 1u);
+    return x->h > IMDB_MAX_EXPR_DEPTH ? too_deep(p) : IMDB_OK;
+}
+
+/* a tree holds a window function below its root */
+static bool win_below(const sql_stmt *st, uint16_t k, bool root)
+{
+    if (!k) return false;
+    const sql_expr *x = &st->ex[k];
+    if (x->op == EX_WIN && !root) return true;
+    return win_below(st, x->l, false) || win_below(st, x->r, false) || win_below(st, x->x3, false); /* height-bounded */
+}
+
 static int primary(parser *p, uint16_t *out, unsigned depth)
 {
     if (depth > IMDB_MAX_EXPR_DEPTH) return too_deep(p);
@@ -578,6 +724,19 @@ static int primary(parser *p, uint16_t *out, unsigned depth)
             p->i += 2;
             if (expect_kw(p, "where") || bexpr(p, &f, depth + 1) || expect(p, TK_RP, ")")) return p->e->code;
         }
+        if (tok_is_kw(p, p->i, "over")) { /* P2 S6: an aggregate over a window */
+            if (dist || f) return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "DISTINCT or FILTER with OVER: a later step");
+            if (!p->win_ok)
+                return imdb_fail(p->e, IMDB_ERR_INVALID, "a window function stands only as a SELECT item, alone (compute on "
+                                                         "it from a derived table)");
+            p->i++;
+            uint8_t w;
+            if (window_spec(p, &w, depth) || ex_new(p, EX_WIN, a, 0, out)) return p->e->code;
+            p->st->ex[*out].fn = WF_AGG;
+            p->st->ex[*out].agg = agg;
+            p->st->ex[*out].sub = w;
+            return IMDB_OK;
+        }
         if (ex_new(p, EX_AGG, a, 0, out)) return p->e->code;
         p->st->ex[*out].agg = agg;
         p->st->ex[*out].dist = dist;
@@ -590,6 +749,8 @@ static int primary(parser *p, uint16_t *out, unsigned depth)
     if (kw(p, "case")) return case_expr(p, out, depth); /* P2 S1 */
     if (kw(p, "cast")) return cast_expr(p, out, depth);
     if (p->t[p->i].kind == TK_IDENT && p->t[p->i + 1].kind == TK_LP) { /* an identifier is not the end: i + 1 exists */
+        uint8_t wf = wf_named(p, p->i); /* P2 S6 */
+        if (wf) return window_call(p, wf, out, depth);
         uint8_t fn = fn_named(p, p->i);
         if (fn) return fn_call(p, fn, out, depth);
     }
@@ -1039,7 +1200,10 @@ static int parse_nested(parser *p, sql_stmt *outer, const char *name)
     sql_stmt *saved = p->st;
     p->st = in;
     p->depth++;
+    bool wok = p->win_ok; /* P2 S6: a nested SELECT's items set it for their own */
+    p->win_ok = false;
     int rc = parse_query(p, in); /* P2 S5: a set operation too */
+    p->win_ok = wok;
     p->depth--;
     p->st = saved;
     return rc;
@@ -1076,7 +1240,14 @@ static int parse_core(parser *p, sql_stmt *st)
             sql_item *it = &st->items[st->nitems];
             uint32_t from = p->t[p->i].off - (p->t[p->i].kind == TK_STR); /* a string token's span: inside its quotes */
             uint16_t k;
-            if (bexpr(p, &k, 0)) return p->e->code;
+            bool wok = p->win_ok;
+            p->win_ok = true; /* P2 S6: a window function may stand here, as the item's whole expression */
+            int brc = bexpr(p, &k, 0);
+            p->win_ok = wok;
+            if (brc) return p->e->code;
+            if (win_below(st, k, true))
+                return imdb_fail(p->e, IMDB_ERR_INVALID, "a window function stands only as a SELECT item, alone (compute on it "
+                                                         "from a derived table)");
             it->off = from;
             it->len = p->t[p->i - 1].off + p->t[p->i - 1].len + (p->t[p->i - 1].kind == TK_STR) - from;
             if (kw(p, "as") ? ident(p, it->alias) /* P2 S1: an alias, with AS or without it */
@@ -1415,7 +1586,7 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
     sql_tok *t;
     uint32_t nt;
     if (imdb_sql_lex(s, n, &t, &nt, e)) return e->code;
-    parser p = {s, t, nt, 0, e, st, 0, 0, 0};
+    parser p = {s, t, nt, 0, e, st, 0, 0, 0, false};
     int rc = IMDB_OK;
     if (nt == 0 || (nt == 1 && t[0].kind == TK_SEMI)) {
         st->kind = ST_EMPTY;

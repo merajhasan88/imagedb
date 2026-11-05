@@ -785,6 +785,78 @@ static int bind_outer(xctx *x, const xscope *sc, uint16_t k, imdb_err *e)
     return IMDB_OK;
 }
 
+/* P2 S6: a window function, bound as a SELECT item's whole expression (sql_parse.c refuses one elsewhere): its type, its
+ * arguments'. ROW_NUMBER, RANK, DENSE_RANK and NTILE INT64; LAG, LEAD, FIRST_VALUE and LAST_VALUE their value's (LAG's
+ * and LEAD's default unified with it); an aggregate by the aggregate's rules. NTILE's buckets and LAG's offset are
+ * integer literals; an aggregate inside one's arguments is a later step (it would need the group's slots twice). The
+ * function itself is computed after the rows are (exec_window): in that run it is a typed NULL. */
+static int bind_win(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
+{
+    const sql_stmt *st = sc->st;
+    const sql_expr *n = &st->ex[k];
+    imdb_xnode *b = &x->xn[k];
+    if (st->no_from) return imdb_fail(e, IMDB_ERR_INVALID, "a window function needs FROM");
+    if (!sc->aggs || sc->in_agg) return imdb_fail(e, IMDB_ERR_INVALID, "a window function stands only as a SELECT item");
+    if (imdb_sql_has_agg(st, n->l) || imdb_sql_has_agg(st, n->r) || imdb_sql_has_agg(st, n->x3))
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "an aggregate inside a window function's arguments: a later step");
+    b->type = IMDB_T_INT64;
+    b->scale = 0;
+    switch (n->fn) {
+    case WF_ROW_NUMBER:
+    case WF_RANK:
+    case WF_DENSE_RANK: return IMDB_OK;
+    case WF_NTILE: {
+        if (xbind(x, sc, n->l, e)) return e->code;
+        const imdb_xval *c = &x->xn[n->l].k;
+        if (st->ex[n->l].op != EX_LIT || c->type != IMDB_T_INT64 || c->null || c->i < 1 || c->i > INT64_MAX)
+            return imdb_fail(e, IMDB_ERR_INVALID, "NTILE takes a positive integer");
+        return IMDB_OK;
+    }
+    case WF_LAG:
+    case WF_LEAD:
+        if (n->r) {
+            if (xbind(x, sc, n->r, e)) return e->code;
+            const imdb_xval *c = &x->xn[n->r].k;
+            if (st->ex[n->r].op != EX_LIT || c->type != IMDB_T_INT64 || c->null || c->i < 0 || c->i > INT64_MAX)
+                return imdb_fail(e, IMDB_ERR_INVALID, "LAG's and LEAD's offset is an integer, 0 or more");
+        }
+        __attribute__((fallthrough)); /* then the value, as FIRST_VALUE's */
+    case WF_FIRST:
+    case WF_LAST:
+        if (xbind_v(x, sc, n->l, e)) return e->code;
+        b->type = x->xn[n->l].type;
+        b->scale = x->xn[n->l].scale;
+        if (n->x3) { /* the default: one type with the value (an untyped NULL takes the value's) */
+            if (xbind_v(x, sc, n->x3, e)) return e->code;
+            if (imdb_x_unify(&b->type, &b->scale, x->xn[n->x3].type, x->xn[n->x3].scale, "LAG's and LEAD's value and default are", e))
+                return e->code;
+            x_type_null(x, n->x3, b->type, b->scale);
+        }
+        if (!b->type) b->type = IMDB_T_TEXT; /* LAG(NULL): a TEXT NULL, as SELECT NULL is */
+        return IMDB_OK;
+    case WF_AGG: {
+        if (n->agg == AGG_COUNT_STAR) return IMDB_OK;
+        if (xbind(x, sc, n->l, e)) return e->code;
+        const imdb_xnode *a = &x->xn[n->l];
+        bool num = a->type == IMDB_T_INT64 || a->type == IMDB_T_DECIMAL || a->type == IMDB_T_FLOAT64;
+        if ((n->agg == AGG_SUM || n->agg == AGG_AVG) && !num)
+            return imdb_fail(e, IMDB_ERR_INVALID, n->agg == AGG_SUM ? "SUM needs an INT64, DECIMAL or FLOAT64 value"
+                                                                  : "AVG needs an INT64, DECIMAL or FLOAT64 value");
+        if (n->agg == AGG_COUNT) return IMDB_OK;
+        b->type = a->type;
+        b->scale = a->scale;
+        if (n->agg == AGG_AVG && a->type != IMDB_T_FLOAT64) { /* SUM / COUNT by the division rule, as AVG is (1e) */
+            unsigned s = (a->type == IMDB_T_DECIMAL ? a->scale : 0u) + 6u;
+            if (s > IMDB_X_MAX_SCALE) return imdb_fail(e, IMDB_ERR_LIMIT, "AVG of a DECIMAL past %u decimal places", IMDB_X_MAX_SCALE - 6);
+            b->type = IMDB_T_DECIMAL;
+            b->scale = (uint8_t)s;
+        }
+        return IMDB_OK;
+    }
+    }
+    return imdb_fail(e, IMDB_ERR_STATE, "an unknown window function");
+}
+
 static int xbind_node(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
 {
     const sql_expr *n = &sc->st->ex[k];
@@ -859,6 +931,7 @@ static int xbind_node(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
             return imdb_fail(e, IMDB_ERR_INVALID, "arithmetic takes INT64, DECIMAL and FLOAT64 values");
         return IMDB_OK;
     case EX_SUBQ: return bind_subq(x, sc, k, e); /* P2 S4 */
+    case EX_WIN: return bind_win(x, sc, k, e); /* P2 S6 */
     case EX_FN: /* P2 S1 */
     case EX_CASE:
     case EX_CAST: return xbind_s1(x, sc, k, e);
@@ -5221,6 +5294,374 @@ static int rset_recursive(xctx *x, const sql_stmt *c, const char *name, xrset *r
     return IMDB_OK;
 }
 
+/* ---- P2 S6: window functions -------------------------------------------------------------------------------------- */
+
+/* two parse trees alike, so one hidden column serves every window naming it: ops, names, literals by their text */
+static bool ex_alike(const xctx *x, const sql_stmt *st, uint16_t a, uint16_t b)
+{
+    if (a == b) return true;
+    if (!a || !b) return false;
+    const sql_expr *p = &st->ex[a], *q = &st->ex[b];
+    if (p->op != q->op || p->agg != q->agg || p->cmp != q->cmp || p->fn != q->fn || p->nargs != q->nargs || p->sub != q->sub ||
+        p->subk != q->subk || p->ctype != q->ctype || p->cscale != q->cscale || p->cprec != q->cprec || p->dist != q->dist ||
+        p->op == EX_WIN)
+        return false;
+    if (p->op == EX_LIT)
+        return p->lit.kind == q->lit.kind && p->lit.neg == q->lit.neg && p->lit.bval == q->lit.bval &&
+               p->lit.param == q->lit.param && p->lit.len == q->lit.len && p->lit.kind != LIT_EXPR &&
+               (!p->lit.len || !memcmp(x->sql + p->lit.off, x->sql + q->lit.off, p->lit.len));
+    if (p->op == EX_COL) return !strcmp(p->qual, q->qual) && !strcmp(p->col, q->col);
+    return ex_alike(x, st, p->l, q->l) && ex_alike(x, st, p->r, q->r) && ex_alike(x, st, p->x3, q->x3);
+}
+
+/* the column of the rows' run that holds tree k's value: a hidden item of the copy w, one for each alike tree; the
+ * items and the hidden ones share IMDB_MAX_COLS (the sinks are sized by it) */
+static int wcol(xctx *x, const sql_stmt *st, sql_stmt *w, uint16_t k, uint16_t *col, imdb_err *e)
+{
+    for (uint16_t i = st->nitems; i < w->nitems; i++)
+        if (ex_alike(x, st, w->items[i].expr, k)) {
+            *col = i;
+            return IMDB_OK;
+        }
+    if (w->nitems >= IMDB_MAX_COLS)
+        return imdb_fail(e, IMDB_ERR_LIMIT, "a SELECT's items and its windows' keys and arguments make more than %u columns",
+                         IMDB_MAX_COLS);
+    sql_item *it = &w->items[w->nitems];
+    memset(it, 0, sizeof *it);
+    it->expr = k;
+    *col = w->nitems++;
+    return IMDB_OK;
+}
+
+typedef struct witem { /* a window function of the SELECT list */
+    uint16_t item, node;   /* its item, its EX_WIN node */
+    uint16_t vcol, dcol;   /* the columns of its value and of LAG's / LEAD's default (UINT16_MAX: none) */
+} witem;
+
+static void rval(const imdb_result *R, uint64_t row, uint16_t col, imdb_xval *v)
+{
+    cell_xval(&R->cells[row * R->ncols + col], R->ctype[col], R->cscale[col], v);
+}
+
+/* two rows alike in columns c[0..n) (NULLs alike: one partition, one peer group) */
+static bool rows_alike(const imdb_result *R, uint64_t a, uint64_t b, const uint16_t *c, uint8_t n)
+{
+    for (uint8_t i = 0; i < n; i++) {
+        imdb_xval u, v;
+        rval(R, a, c[i], &u);
+        rval(R, b, c[i], &v);
+        if (u.null != v.null || (!u.null && imdb_x_cmp(&u, &v) != 0)) return false;
+    }
+    return true;
+}
+
+typedef struct wsortc {
+    const imdb_result *R;
+    const sql_win *s;
+    const uint16_t *pc, *oc;
+} wsortc;
+
+/* a window's order: its partition (NULLs first, any one order keeps a partition together), then its ORDER BY, then
+ * the rows' own order (the default order: ties are broken as the statement orders its rows) */
+static int cmp_wrow(const void *pa, const void *pb, void *ctx)
+{
+    const wsortc *c = ctx;
+    uint64_t i = *(const uint64_t *)pa, j = *(const uint64_t *)pb;
+    for (uint8_t k = 0; k < c->s->npart + c->s->nord; k++) {
+        bool part = k < c->s->npart;
+        uint16_t col = part ? c->pc[k] : c->oc[k - c->s->npart];
+        imdb_xval u, w;
+        rval(c->R, i, col, &u);
+        rval(c->R, j, col, &w);
+        int d;
+        bool nfirst = part || c->s->nfirst[k - c->s->npart];
+        if (u.null || w.null) d = u.null == w.null ? 0 : (u.null == nfirst) ? -1 : 1;
+        else d = !part && c->s->desc[k - c->s->npart] ? -imdb_x_cmp(&u, &w) : imdb_x_cmp(&u, &w);
+        if (d) return d;
+    }
+    return i < j ? -1 : i > j;
+}
+
+/* row p's frame [*fs, *fe] (positions in the sorted rows): ps..pe its partition, gs..ge its peer group. The default:
+ * the whole partition, or under ORDER BY to the current row's last peer (RANGE UNBOUNDED PRECEDING AND CURRENT ROW,
+ * peers included); RANGE's bounds UNBOUNDED or CURRENT ROW (its first or last peer); ROWS's counted rows, clipped */
+static void win_frame(const sql_win *s, int64_t ps, int64_t pe, int64_t gs, int64_t ge, int64_t p, int64_t *fs, int64_t *fe)
+{
+    if (s->frame == WFR_DEFAULT) {
+        *fs = ps;
+        *fe = s->nord ? ge - 1 : pe - 1;
+        return;
+    }
+    if (s->frame == WFR_RANGE) {
+        *fs = s->lo == WB_CURRENT ? gs : ps;
+        *fe = s->hi == WB_UNB_FOLL ? pe - 1 : ge - 1;
+        return;
+    }
+    *fs = s->lo == WB_UNB_PREC ? ps : s->lo == WB_PREC ? p - s->lo_n : s->lo == WB_CURRENT ? p : p + s->lo_n;
+    *fe = s->hi == WB_UNB_FOLL ? pe - 1 : s->hi == WB_FOLL ? p + s->hi_n : s->hi == WB_CURRENT ? p : p - s->hi_n;
+    if (*fs < ps) *fs = ps;
+    if (*fe > pe - 1) *fe = pe - 1;
+}
+
+/* one window function over the rows R, in its window's order srt, into W's column j (W's row r for R's row r) */
+static int win_compute(xctx *x, const sql_stmt *st, const witem *v, const imdb_result *R, const uint64_t *srt,
+                       const uint16_t *pc, const uint16_t *oc, imdb_result *W, uint16_t j, imdb_err *e)
+{
+    const sql_expr *n = &st->ex[v->node];
+    const imdb_xnode *b = &x->xn[v->node];
+    const sql_win *s = &st->win[n->sub];
+    int64_t N = (int64_t)R->nrows, off = 1;
+    if (n->fn == WF_NTILE) off = (int64_t)x->xn[n->l].k.i;
+    else if ((n->fn == WF_LAG || n->fn == WF_LEAD) && n->r) off = (int64_t)x->xn[n->r].k.i;
+    uint8_t ta = v->vcol != UINT16_MAX ? R->ctype[v->vcol] : 0, sa = v->vcol != UINT16_MAX ? R->cscale[v->vcol] : 0;
+    bool running = n->fn == WF_AGG && (s->frame == WFR_DEFAULT || s->lo == WB_UNB_PREC); /* its frame starts at ps */
+    int rc = IMDB_OK;
+    for (int64_t ps = 0; ps < N && !rc;) {
+        int64_t pe = ps + 1;
+        while (pe < N && rows_alike(R, srt[ps], srt[pe], pc, s->npart)) pe++;
+        xacc acc;
+        memset(&acc, 0, sizeof acc);
+        int64_t added = ps, dense = 0;
+        for (int64_t gs = ps; gs < pe && !rc;) {
+            int64_t ge = gs + 1;
+            while (ge < pe && rows_alike(R, srt[gs], srt[ge], oc, s->nord)) ge++;
+            dense++;
+            for (int64_t p = gs; p < ge && !rc; p++) {
+                if (++x->ticks >= x->next_check && (rc = xcheck(x, e))) break;
+                imdb_xval out = {.type = b->type, .scale = b->scale};
+                switch (n->fn) {
+                case WF_ROW_NUMBER: out.i = p - ps + 1; break;
+                case WF_RANK: out.i = gs - ps + 1; break;
+                case WF_DENSE_RANK: out.i = dense; break;
+                case WF_NTILE: { /* the first m % n buckets one row larger */
+                    int64_t m = pe - ps, q = m / off, rem = m % off, i = p - ps;
+                    out.i = i < rem * (q + 1) ? i / (q + 1) + 1 : rem + (i - rem * (q + 1)) / q + 1;
+                    break;
+                }
+                case WF_LAG:
+                case WF_LEAD: {
+                    int64_t t = n->fn == WF_LAG ? p - off : p + off;
+                    if (t >= ps && t < pe) rval(R, srt[t], v->vcol, &out);
+                    else if (v->dcol != UINT16_MAX) rval(R, srt[p], v->dcol, &out);
+                    else out.null = true;
+                    rc = imdb_x_widen(&out, b->type, b->scale, e);
+                    break;
+                }
+                default: { /* FIRST_VALUE, LAST_VALUE, an aggregate: over the row's frame */
+                    int64_t fs, fe;
+                    win_frame(s, ps, pe, gs, ge, p, &fs, &fe);
+                    if (n->fn == WF_FIRST || n->fn == WF_LAST) {
+                        if (fs > fe) out.null = true;
+                        else rval(R, srt[n->fn == WF_FIRST ? fs : fe], v->vcol, &out);
+                        break;
+                    }
+                    imdb_xval a = {.null = true};
+                    if (!running) { /* a frame that moves: summed afresh */
+                        xacc_free(&acc);
+                        memset(&acc, 0, sizeof acc);
+                        added = fs;
+                    }
+                    for (; !rc && added <= fe; added++) {
+                        if (v->vcol != UINT16_MAX) rval(R, srt[added], v->vcol, &a);
+                        rc = xacc_add(&acc, n->agg, &a, e);
+                    }
+                    if (!rc) rc = xacc_value(&acc, n->agg, b, ta, sa, &out, e);
+                }
+                }
+                if (!rc) res_put_x(W, &W->cells[srt[p] * W->ncols + j], &out);
+            }
+            gs = ge;
+        }
+        xacc_free(&acc);
+        ps = pe;
+    }
+    return rc;
+}
+
+typedef struct wtailc {
+    const sql_stmt *st;
+    const imdb_result *R, *W;
+    const uint16_t *kcol;   /* each ORDER BY key's column: R's, or W's (wfrom: a window item) */
+    const bool *wfrom;
+} wtailc;
+
+static void tail_val(const wtailc *c, uint64_t row, uint8_t o, imdb_xval *v)
+{
+    if (c->wfrom[o]) rval(c->W, row, c->kcol[o], v);
+    else rval(c->R, row, c->kcol[o], v);
+}
+
+static int cmp_wtail(const void *pa, const void *pb, void *ctx)
+{
+    const wtailc *c = ctx;
+    uint64_t i = *(const uint64_t *)pa, j = *(const uint64_t *)pb;
+    for (uint8_t o = 0; o < c->st->norder; o++) {
+        imdb_xval u, w;
+        tail_val(c, i, o, &u);
+        tail_val(c, j, o, &w);
+        int d;
+        if (u.null || w.null) d = u.null == w.null ? 0 : (u.null == c->st->ord_nulls_first[o]) ? -1 : 1;
+        else d = c->st->ord_desc[o] ? -imdb_x_cmp(&u, &w) : imdb_x_cmp(&u, &w);
+        if (d) return d;
+    }
+    return i < j ? -1 : i > j;
+}
+
+/* A SELECT with window functions: the statement run as a copy without its tail and with hidden items (each window's
+ * keys and arguments, ORDER BY's trees), its window functions typed NULLs; then each window's rows sorted (partition,
+ * ORDER BY, then their own order: ties as the statement orders its rows) and each function computed; then the tail
+ * (ORDER BY, DISTINCT, OFFSET, LIMIT) over the rows with their windows, the hidden columns dropped. EXPLAIN: the
+ * copy's plan and a window row (nothing computed) */
+static int exec_window(xctx *x, const sql_stmt *st, imdb_result *r, struct xplain *xp, imdb_err *e)
+{
+    if (st->for_update) return imdb_fail(e, IMDB_ERR_INVALID, "FOR UPDATE with window functions");
+    for (uint8_t o = 0; st->distinct && o < st->norder; o++)
+        if (!st->ord_pos[o] && !distinct_key(st, st->ord_ex[o])) /* a bare column the list names, as without windows */
+            return imdb_fail(e, IMDB_ERR_INVALID, "with DISTINCT and window functions, ORDER BY names an item");
+    sql_stmt *w = xalloc(x, sizeof *w, e);
+    if (!w) return e->code;
+    memcpy(w, st, sizeof *w);
+    w->nwin = 0;
+    w->norder = 0;
+    w->has_limit = w->has_offset = w->distinct = false;
+    witem wi[IMDB_MAX_WINDOWS];
+    uint8_t nwi = 0;
+    uint16_t pcol[IMDB_MAX_WINDOWS][IMDB_MAX_WIN_KEYS], ocol[IMDB_MAX_WINDOWS][IMDB_MAX_WIN_KEYS], kcol[IMDB_MAX_ORDER];
+    bool wfrom[IMDB_MAX_ORDER];
+    int rc = IMDB_OK;
+    for (uint16_t i = 0; !rc && i < st->nitems; i++) {
+        uint16_t k = st->items[i].expr;
+        if (!k || st->ex[k].op != EX_WIN) continue;
+        if (nwi >= IMDB_MAX_WINDOWS) /* the parser's bound too: one window each */
+            return imdb_fail(e, IMDB_ERR_LIMIT, "more than %u window functions in one SELECT", IMDB_MAX_WINDOWS);
+        const sql_expr *n = &st->ex[k];
+        witem *v = &wi[nwi++];
+        *v = (witem){.item = i, .node = k, .vcol = UINT16_MAX, .dcol = UINT16_MAX};
+        if (n->fn == WF_LAG || n->fn == WF_LEAD || n->fn == WF_FIRST || n->fn == WF_LAST || (n->fn == WF_AGG && n->agg != AGG_COUNT_STAR))
+            rc = wcol(x, st, w, n->l, &v->vcol, e);
+        if (!rc && n->x3) rc = wcol(x, st, w, n->x3, &v->dcol, e);
+        const sql_win *s = &st->win[n->sub];
+        for (uint8_t q = 0; !rc && q < s->npart; q++) rc = wcol(x, st, w, s->part[q], &pcol[n->sub][q], e);
+        for (uint8_t q = 0; !rc && q < s->nord; q++) rc = wcol(x, st, w, s->ord[q], &ocol[n->sub][q], e);
+    }
+    for (uint8_t o = 0; !rc && o < st->norder; o++) {
+        wfrom[o] = false;
+        if (!st->ord_pos[o]) {
+            rc = wcol(x, st, w, st->ord_ex[o], &kcol[o], e);
+            continue;
+        }
+        kcol[o] = (uint16_t)(st->ord_pos[o] - 1);
+        if (kcol[o] >= st->nitems) rc = imdb_fail(e, IMDB_ERR_INVALID, "ORDER BY %u: no such item", st->ord_pos[o]);
+        for (uint8_t q = 0; !rc && q < nwi; q++)
+            if (wi[q].item == kcol[o]) { /* a window item's value: W's column */
+                wfrom[o] = true;
+                kcol[o] = q;
+                break;
+            }
+    }
+    if (rc) return rc;
+    if (xp) {
+        xp_add(xp, "window", "%u window function%s: computed over the rows below, in each window's order (its partition, its "
+                             "ORDER BY, ties in the rows' order), then ORDER BY, DISTINCT, OFFSET and LIMIT",
+               nwi, nwi == 1 ? "" : "s");
+        return exec_select(x, w, r, xp, e);
+    }
+    imdb_result R, W;
+    imdb_result_init(&R);
+    imdb_result_init(&W);
+    rc = exec_select(x, w, &R, NULL, e);
+    uint64_t N = R.nrows;
+    if (!rc) {
+        res_cols(&W, nwi);
+        W.byte_cap = workspace_of(x->ss);
+        for (uint8_t q = 0; q < nwi; q++) {
+            W.ctype[q] = R.ctype[wi[q].item];
+            W.cscale[q] = R.cscale[wi[q].item];
+        }
+        for (uint64_t i = 0; !rc && i < N; i++)
+            if (!res_row(&W, e)) rc = e->code;
+    }
+    uint64_t *srt[IMDB_MAX_WINDOWS] = {0};
+    for (uint8_t q = 0; !rc && q < nwi; q++) {
+        uint8_t sw = st->ex[wi[q].node].sub;
+        if (!srt[sw]) {
+            if (!(srt[sw] = xalloc(x, (N ? N : 1) * sizeof *srt[sw], e))) {
+                rc = e->code;
+                break;
+            }
+            for (uint64_t i = 0; i < N; i++) srt[sw][i] = i;
+            wsortc c = {&R, &st->win[sw], pcol[sw], ocol[sw]};
+            qsort_r(srt[sw], N, sizeof *srt[sw], cmp_wrow, &c);
+            if ((rc = xcheck(x, e))) break; /* a sort runs to its end: the check after it */
+        }
+        rc = win_compute(x, st, &wi[q], &R, srt[sw], pcol[sw], ocol[sw], &W, q, e);
+    }
+    if (!rc) rc = res_finish(&W, e);
+    uint64_t *ord = NULL;
+    if (!rc && !(ord = xalloc(x, (N ? N : 1) * sizeof *ord, e))) rc = e->code;
+    if (!rc) {
+        for (uint64_t i = 0; i < N; i++) ord[i] = i;
+        wtailc c = {st, &R, &W, kcol, wfrom};
+        if (st->norder) qsort_r(ord, N, sizeof *ord, cmp_wtail, &c);
+        res_cols(r, st->nitems);
+        r->byte_cap = workspace_of(x->ss);
+        for (uint16_t i = 0; i < st->nitems; i++) {
+            res_name(r, i, R.names[i]);
+            r->ctype[i] = R.ctype[i];
+            r->cscale[i] = R.cscale[i];
+        }
+    }
+    imdb_hmap seen;
+    memset(&seen, 0, sizeof seen);
+    imdb_buf kb;
+    imdb_buf_init(&kb);
+    if (!rc && st->distinct) rc = imdb_hmap_init(&seen, IMDB_T_TEXT, e);
+    uint64_t skipped = 0, emitted = 0;
+    imdb_xval v[IMDB_MAX_COLS + 4];
+    for (uint64_t i = 0; !rc && i < N; i++) {
+        if (st->has_limit && emitted >= st->limit) break;
+        uint64_t row = ord[i];
+        uint8_t q = 0;
+        for (uint16_t c = 0; c < st->nitems; c++) {
+            if (q < nwi && wi[q].item == c) rval(&W, row, q++, &v[c]);
+            else rval(&R, row, c, &v[c]);
+        }
+        if (st->distinct) {
+            kb.len = 0;
+            for (uint16_t c = 0; c < st->nitems; c++) key_enc(&kb, &v[c]);
+            imdb_buf_put_u8(&kb, 0);
+            if ((rc = imdb_buf_check(&kb, e))) break;
+            imdb_value k = {.type = IMDB_T_TEXT, .s = kb.p, .len = (uint32_t)kb.len};
+            if (imdb_hmap_get(&seen, &k)) continue;
+            if ((rc = imdb_hmap_put(&seen, &k, 1, e))) break;
+        }
+        if (st->has_offset && skipped < st->offset) {
+            skipped++;
+            continue;
+        }
+        imdb_cell *cells = res_row(r, e);
+        if (!cells) {
+            rc = e->code;
+            break;
+        }
+        for (uint16_t c = 0; c < st->nitems; c++) res_put_x(r, &cells[c], &v[c]);
+        emitted++;
+    }
+    if (st->distinct) imdb_hmap_free(&seen);
+    imdb_buf_free(&kb);
+    if (!rc) rc = res_finish(r, e);
+    if (!rc) {
+        snprintf(r->path, sizeof r->path, "%s", R.path);
+        r->snap = R.snap;
+        r->has_snap = R.has_snap;
+        r->snap_own = R.snap_own;
+        rc = read_point(x, r, e);
+    }
+    imdb_result_free(&W);
+    imdb_result_free(&R);
+    return rc;
+}
+
 static int exec_select(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, imdb_err *e)
 {
     if (st->narm) { /* P2 S5: a set operation, its WITH's row sets first */
@@ -5230,6 +5671,7 @@ static int exec_select(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, 
         }
         return exec_setop(x, st, r, xp, e);
     }
+    if (st->nwin) return exec_window(x, st, r, xp, e); /* P2 S6 */
     if (st->nsub && !x->own) { /* P2 S4: its nested SELECTs first, each a row set */
         if (rset_prepare(x, st, e)) return e->code;
         if (xp) xp_nested(x, st, xp); /* EXPLAIN: they ran (their rows are what the rest is planned over) */
