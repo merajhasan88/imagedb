@@ -3146,12 +3146,6 @@ static bool excused(int d, const char *msg, const char *text)
     return false;
 }
 
-/* imagedb refused, under LIMIT or OFFSET, what engine d answered: imagedb computes every group's and row's items before
- * the window (design.md, Expressions: whether an operation fails never depends on the plan), while a reference
- * streaming sorted groups may stop at its LIMIT before the failing one (PostgreSQL, seed 5 of the 2026-11-05 run:
- * SUM(-d) / AVG(g * -11) over GROUP BY g with g = 0 past the window). Excused only when d, asked the same statement
- * without LIMIT and OFFSET, refuses it for the same class of reason, so the claim is checked every time; never
- * inside a transaction, where a failed statement would abort PostgreSQL's */
 /* SQL Server named an ORDER BY item a constant (its folding: g_ms_drop): left out, the statement printed and run again,
  * once for each it names. Its compile error leaves a transaction as it was (XACT_ABORT OFF) */
 static void ms_drop_constants(const stmt *q, sb *t, bool rows, const int *ty, int nty, res *r)
@@ -3169,13 +3163,22 @@ static void ms_drop_constants(const stmt *q, sb *t, bool rows, const int *ty, in
     g_ms_drop = 0;
 }
 
+/* imagedb refused, under HAVING, LIMIT or OFFSET, what engine d answered: imagedb computes every group's aggregates
+ * before HAVING and every group's and row's items before the window (design.md, Expressions: whether an operation fails
+ * never depends on the plan), while a reference streaming sorted groups may stop at its LIMIT before the failing one
+ * (PostgreSQL, seed 5 of the 2026-11-05 run: SUM(-d) / AVG(g * -11) over GROUP BY g with g = 0 past the window), and
+ * PostgreSQL moves a HAVING condition on the keys alone into WHERE, so it never aggregates a group the condition drops
+ * (seed 23 of S6's five-engine run, 2026-11-05: MAX(514005 / x) ... HAVING g > 6). Excused only when d, asked the same
+ * statement without HAVING, LIMIT and OFFSET, refuses it for the same class of reason, so the claim is checked every
+ * time; never inside a transaction, where a failed statement would abort PostgreSQL's */
 static long g_excused_window;
 static bool excused_window(int d, const stmt *q, const char *base_msg)
 {
-    if (!(q->limit || q->offset) || g_in_txn || !err_class(base_msg)) return false;
+    if (!(q->limit || q->offset || q->hv) || g_in_txn || !err_class(base_msg)) return false;
     stmt q2 = *q;
     q2.limit = 0;
     q2.offset = 0;
+    q2.hv = 0;
     static sb t2;
     static res o2;
     int ty[MAXC + 8];
@@ -3447,7 +3450,7 @@ int main(int argc, char **argv)
            "SQLite; an INT64 overflow: REAL in SQLite; INT64 past 2^53 in FLOAT64: rounded by all; MySQL's INT64_MIN DIV n; SQL Server's INT64_MIN %% -1); %ld both refused "
            "for another reason\n", g_excused, g_eng[D_PG].on ? "" : " (UNGUARDED: PostgreSQL was not run)", g_class_diff);
     printf("oracle: DROP TABLE u made again %ld times on every engine\n", g_drops);
-    printf("oracle: %ld refusals under LIMIT/OFFSET excused: the reference refused the same statement without them\n",
+    printf("oracle: %ld refusals under HAVING, LIMIT or OFFSET excused: the reference refused the same statement without them\n",
            g_excused_window);
     printf("oracle: %ld ORDER BY items SQL Server called constants, left out (a constant orders nothing)\n", g_ms_dropped);
     printf("oracle: imagedb alone: %ld CHECKPOINTs, %ld reopens; the paths it answered by:\n", g_checkpoints, g_reopens);
