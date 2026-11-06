@@ -413,7 +413,7 @@ static int scale(const char *dir, int64_t n)
         s.cross_check = false;
         samples pr = {.name = "point_read"};
         uint64_t rng = 0x2545f4914f6cdd1dull;
-        char q[160], path[100];
+        char q[160], path[sizeof ((imdb_result *)0)->path]; /* a result's path, whatever its size (S4 made it 128) */
         for (int i = 0; i < 10000; i++) {
             int64_t id = 1 + (int64_t)(xs(&rng) % (uint64_t)n), v = -1;
             snprintf(q, sizeof q, "SELECT v FROM t WHERE id = %lld", (long long)id);
