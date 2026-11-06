@@ -94,6 +94,9 @@ static void t_window_cancel(void)
     if (!rc) rc = imdb_commit(db, &e);
     CHECK(rc == IMDB_OK);
     uint64_t seq = db->seq;
+    /* P2 S12: the frame slides now (each row in and out of it once: linear), so the statement no longer outlasts the
+     * deadline; C3's property is the frames summed afresh, the reference the slide is checked against, kept here */
+    imdb_sql_set_window_reference(true);
     expect(&s, "SET statement_timeout = 50", true);
     imdb_result r;
     rc = run(&s, "SELECT MIN(s) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM w WHERE id < 1000",
@@ -102,12 +105,21 @@ static void t_window_cancel(void)
     CHECK(rc == IMDB_ERR_CANCELLED);
     expect(&s, "SET statement_timeout = 0", true);
     CHECK(db->seq == seq);
-    /* without the deadline it answers: every row's minimum is the last row's value */
+    /* without the deadline it answers, slid or summed afresh: every row's minimum is the last row's value */
+    for (int ref = 1; ref >= 0; ref--) {
+        imdb_sql_set_window_reference(ref);
+        rc = run(&s, "SELECT COUNT(*) FROM (SELECT MIN(s) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) "
+                     "AS m FROM w WHERE id >= 990) AS q WHERE SUBSTR(m, 1, 8) = '00000001'",
+                 NULL, 0, &r);
+        CHECK(rc == IMDB_OK && r.nrows == 1 && r.cells[0].v.i == 10);
+        if (rc == IMDB_OK) imdb_result_free(&r);
+    }
     rc = run(&s, "SELECT COUNT(*) FROM (SELECT MIN(s) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS m "
-                 "FROM w WHERE id >= 990) AS q WHERE SUBSTR(m, 1, 8) = '00000001'",
+                 "FROM w) AS q WHERE SUBSTR(m, 1, 8) = '00000001'",
              NULL, 0, &r);
-    CHECK(rc == IMDB_OK && r.nrows == 1 && r.cells[0].v.i == 10);
+    CHECK(rc == IMDB_OK && r.nrows == 1 && r.cells[0].v.i == 1000);
     if (rc == IMDB_OK) imdb_result_free(&r);
+    imdb_sql_set_window_reference(false);
     imdb_session_close(&s);
     imdb_close(db);
 }

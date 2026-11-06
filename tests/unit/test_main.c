@@ -8,6 +8,7 @@
 
 #include "../../src/backup.h"
 #include "../../src/db.h"
+#include "../../src/sql.h"
 #include "test.h"
 
 int g_test_failed;
@@ -124,6 +125,7 @@ int main(int argc, char **argv)
             g_rng = 0x9E3779B97F4A7C15ull ^ (uint64_t)(i + 1) * 0xBF58476D1CE4E5B9ull;
             g_test_failed = 0;
             imdb_log_set_tagged(true); /* a test of the untagged format turns it off for itself only */
+            imdb_sql_set_window_reference(false); /* P2 S12: the sliding frames, but where a test asks for the reference */
             imdb_clock_offset(0);      /* a test that moves the clock (expiry) moves it for itself only */
             imdb_backup_test_between(NULL, NULL); /* a test that cuts between a backup's parts does it for itself only */
             g_errmsg[0] = 0;

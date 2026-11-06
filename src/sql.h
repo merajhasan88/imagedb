@@ -124,6 +124,9 @@ void imdb_session_close(imdb_session *s);
  * statement savepoint undoes what it wrote. COMMIT, CREATE TABLE, CREATE INDEX, DROP INDEX, ALTER, CHECKPOINT, COMPACT,
  * ERASE and VERIFY run to their end. */
 void imdb_session_cancel(imdb_session *s);
+/* P2 S12, tests: a window function's moving frames each summed afresh (the reference the sliding window is checked
+ * against), process-wide; off by default */
+void imdb_sql_set_window_reference(bool on);
 void imdb_result_init(imdb_result *r);
 void imdb_result_free(imdb_result *r);
 

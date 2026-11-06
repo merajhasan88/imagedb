@@ -1376,7 +1376,9 @@ typedef struct agg_acc {
 /* an aggregate inside a tree item (an EX_AGG node's slot): its argument is a tree, its values expression values */
 typedef struct xacc {
     uint64_t count;
-    __int128 sum;            /* INT64, DECIMAL at the argument's scale: checked under 10^38 */
+    __int128 sum;            /* INT64, DECIMAL at the argument's scale, wrapping: the exact sum is sum + wrap * 2^128 */
+    int64_t wrap;            /* P2 S12: the times sum wrapped (up 1, down -1); only the total is checked under 10^38,
+                              * when it is read (xacc_total), so no order of the rows decides whether a SUM fails */
     imdb_fsum fsum;          /* FLOAT64, exact */
     bool has;
     imdb_xval mn, mx;        /* a TEXT extreme points into mnb / mxb, the accumulator's own copy: the row's value, or the
@@ -1422,10 +1424,8 @@ static int xacc_add(xacc *a, uint8_t agg, const imdb_xval *v, imdb_err *e)
     bool sum = agg == AGG_SUM || agg == AGG_AVG; /* AVG: the same sum, divided at the end (1e) */
     if (sum && v->type == IMDB_T_FLOAT64) {
         if (imdb_fsum_add(&a->fsum, imdb_f64_key(v->f), e)) return e->code;
-    } else if (sum) {
-        const __int128 lim = (__int128)10000000000000000000ull * 10000000000000000000ull; /* 10^38 */
-        if (__builtin_add_overflow(a->sum, v->i, &a->sum) || a->sum >= lim || a->sum <= -lim)
-            return imdb_fail(e, IMDB_ERR_LIMIT, agg == AGG_AVG ? "an AVG's sum of more than 38 digits" : "a SUM of more than 38 digits");
+    } else if (sum) { /* exact in any order (the wrap counted); 38 digits are the total's rule (xacc_total) */
+        if (__builtin_add_overflow(a->sum, v->i, &a->sum)) a->wrap += v->i < 0 ? -1 : 1;
     } else if (agg == AGG_MIN || agg == AGG_MAX) {
         if (!a->has || imdb_x_cmp(v, &a->mn) < 0) {
             a->mn = *v;
@@ -1437,6 +1437,40 @@ static int xacc_add(xacc *a, uint8_t agg, const imdb_xval *v, imdb_err *e)
         }
     }
     a->has = true;
+    return IMDB_OK;
+}
+
+/* P2 S12: v leaves a sliding window frame (slide_to): xacc_add's inverse for COUNT, SUM and AVG, exact (an integer
+ * sum with its wrap counted, a FLOAT64's in the superaccumulator, the negation added: never -0.0, which is no value),
+ * so a frame's total, and whether it passes 38 digits, are the frame's own, as when it is summed afresh */
+static int xacc_sub(xacc *a, uint8_t agg, const imdb_xval *v, imdb_err *e)
+{
+    if (agg == AGG_COUNT_STAR) {
+        a->count--;
+        return IMDB_OK;
+    }
+    if (v->null) return IMDB_OK;
+    a->count--;
+    bool sum = agg == AGG_SUM || agg == AGG_AVG;
+    if (sum && v->type == IMDB_T_FLOAT64) {
+        if (v->f != 0 && imdb_fsum_add(&a->fsum, imdb_f64_key(-v->f), e)) return e->code;
+    } else if (sum) {
+        if (__builtin_sub_overflow(a->sum, v->i, &a->sum)) a->wrap += v->i < 0 ? 1 : -1;
+    }
+    a->has = a->count > 0;
+    return IMDB_OK;
+}
+
+/* P2 S12: an integer SUM's (or AVG's) exact total, refused past 38 digits only here. Every partial sum was checked
+ * before, so the rows' order, which is the plan's, decided whether a statement failed: an ordered index answered
+ * where the scan of the same rows failed, and cross_check reported the engine at odds with itself. A wrap means
+ * past 2^127 (> 10^38) */
+static int xacc_total(const xacc *a, uint8_t agg, __int128 *out, imdb_err *e)
+{
+    const __int128 lim = (__int128)10000000000000000000ull * 10000000000000000000ull; /* 10^38 */
+    if (a->wrap || a->sum >= lim || a->sum <= -lim)
+        return imdb_fail(e, IMDB_ERR_LIMIT, agg == AGG_AVG ? "an AVG's sum of more than 38 digits" : "a SUM of more than 38 digits");
+    *out = a->sum;
     return IMDB_OK;
 }
 
@@ -1460,8 +1494,8 @@ static int xacc_value(xacc *a, uint8_t agg, const imdb_xnode *b, uint8_t ta, uin
             int64_t key;
             if (imdb_fsum_result(&a->fsum, &key, e)) return e->code;
             s.f = imdb_f64_value(key);
-        } else {
-            s.i = a->sum;
+        } else if (xacc_total(a, agg, &s.i, e)) {
+            return e->code;
         }
         return imdb_x_arith(EX_DIV, &s, &n, b->type, b->scale, out, e);
     }
@@ -1469,10 +1503,7 @@ static int xacc_value(xacc *a, uint8_t agg, const imdb_xnode *b, uint8_t ta, uin
         *out = agg == AGG_MIN ? a->mn : a->mx;
         return IMDB_OK;
     }
-    if (b->type != IMDB_T_FLOAT64) {
-        out->i = a->sum;
-        return IMDB_OK;
-    }
+    if (b->type != IMDB_T_FLOAT64) return xacc_total(a, agg, &out->i, e);
     int64_t key;
     if (imdb_fsum_result(&a->fsum, &key, e)) return e->code;
     out->f = imdb_f64_value(key);
@@ -5614,6 +5645,73 @@ static void win_frame(const sql_win *s, int64_t ps, int64_t pe, int64_t gs, int6
     if (*fe > pe - 1) *fe = pe - 1;
 }
 
+/* P2 S12: a frame that moves (its start not the partition's): each row's frame starts and ends no earlier than the
+ * frame of the row before it in the partition (win_frame: ps, gs, p - n, p, p + n; pe - 1, ge - 1, p + n, p, p - n,
+ * clipped), so one window slides over the partition: COUNT, SUM and AVG add the rows that come in and take out those
+ * that leave (xacc_sub, exact); MIN and MAX keep a deque of positions whose values never fall (MIN) or rise (MAX),
+ * a row coming in dropping those behind it it beats, so the first is the frame's extreme, the earliest of equal values
+ * as a frame summed afresh keeps the first it meets. Each row comes in and leaves once: linear in the partition, where
+ * summing each frame afresh cost its size for every row (C3's remainder of the 2026-11-05 review, deferred.md D9) */
+typedef struct wslide {
+    int64_t lo, hi; /* the window: positions [lo, hi) of the sorted rows */
+    xacc acc;       /* COUNT, SUM, AVG */
+    int64_t *dq;    /* MIN, MAX: the deque, dq[dh .. dt) */
+    int64_t dh, dt;
+} wslide;
+
+static bool g_win_reference; /* P2 S12, tests: every moving frame summed afresh, as before (the reference) */
+void imdb_sql_set_window_reference(bool on) { g_win_reference = on; }
+
+static void slide_reset(wslide *w, int64_t at)
+{
+    xacc_free(&w->acc);
+    memset(&w->acc, 0, sizeof w->acc);
+    w->lo = w->hi = at;
+    w->dh = w->dt = 0;
+}
+
+/* the window moved to [fs, fe + 1) (fe < fs: no row), then its value into out */
+static int slide_to(xctx *x, wslide *w, const imdb_result *R, const uint64_t *srt, uint16_t vcol, uint8_t agg,
+                    const imdb_xnode *b, uint8_t ta, uint8_t sa, int64_t fs, int64_t fe, imdb_xval *out, imdb_err *e)
+{
+    bool ext = agg == AGG_MIN || agg == AGG_MAX;
+    int rc = IMDB_OK;
+    if (fs < w->lo || (fs < w->hi && fe < w->hi - 1)) /* a frame kind moving back needs the frames summed afresh */
+        return imdb_fail(e, IMDB_ERR_STATE, "a window frame moved back");
+    if (fs >= w->hi) slide_reset(w, fs); /* nothing in the window stays */
+    if (ext) { /* the positions that left drop off the deque's front */
+        w->lo = fs;
+        while (w->dh < w->dt && w->dq[w->dh] < fs) w->dh++;
+    }
+    for (; w->lo < fs; w->lo++) { /* the rows that leave */
+        imdb_xval a = {.null = true};
+        if (vcol != UINT16_MAX) rval(R, srt[w->lo], vcol, &a);
+        if ((rc = xacc_sub(&w->acc, agg, &a, e))) return rc;
+    }
+    for (; w->hi <= fe; w->hi++) { /* the rows that come in */
+        if ((rc = xtick(x, 1, e))) return rc;
+        imdb_xval a = {.null = true};
+        if (vcol != UINT16_MAX) rval(R, srt[w->hi], vcol, &a);
+        if (!ext) {
+            if ((rc = xacc_add(&w->acc, agg, &a, e))) return rc;
+            continue;
+        }
+        if (a.null) continue;
+        while (w->dt > w->dh) {
+            imdb_xval t;
+            rval(R, srt[w->dq[w->dt - 1]], vcol, &t);
+            int d = imdb_x_cmp(&t, &a);
+            if (agg == AGG_MIN ? d <= 0 : d >= 0) break; /* it stays: no greater (MIN), no less (MAX), or earlier */
+            w->dt--;
+        }
+        w->dq[w->dt++] = w->hi;
+    }
+    if (!ext) return xacc_value(&w->acc, agg, b, ta, sa, out, e);
+    if (w->dh == w->dt) *out = (imdb_xval){.type = b->type, .scale = b->scale, .null = true};
+    else rval(R, srt[w->dq[w->dh]], vcol, out);
+    return IMDB_OK;
+}
+
 /* one window function over the rows R, in its window's order srt, into W's column j (W's row r for R's row r) */
 static int win_compute(xctx *x, const sql_stmt *st, const witem *v, const imdb_result *R, const uint64_t *srt,
                        const uint16_t *pc, const uint16_t *oc, imdb_result *W, uint16_t j, imdb_err *e)
@@ -5626,10 +5724,16 @@ static int win_compute(xctx *x, const sql_stmt *st, const witem *v, const imdb_r
     else if ((n->fn == WF_LAG || n->fn == WF_LEAD) && n->r) off = (int64_t)x->xn[n->r].k.i;
     uint8_t ta = v->vcol != UINT16_MAX ? R->ctype[v->vcol] : 0, sa = v->vcol != UINT16_MAX ? R->cscale[v->vcol] : 0;
     bool running = n->fn == WF_AGG && (s->frame == WFR_DEFAULT || s->lo == WB_UNB_PREC); /* its frame starts at ps */
+    bool slide = n->fn == WF_AGG && !running && !g_win_reference; /* P2 S12 */
+    wslide sw;
+    memset(&sw, 0, sizeof sw);
+    if (slide && (n->agg == AGG_MIN || n->agg == AGG_MAX) && N && !(sw.dq = xalloc(x, (size_t)N * sizeof *sw.dq, e)))
+        return e->code;
     int rc = IMDB_OK;
     for (int64_t ps = 0; ps < N && !rc;) {
         int64_t pe = ps + 1;
         while (pe < N && rows_alike(R, srt[ps], srt[pe], pc, s->npart)) pe++;
+        slide_reset(&sw, ps);
         xacc acc;
         memset(&acc, 0, sizeof acc);
         int64_t added = ps, dense = 0;
@@ -5666,8 +5770,12 @@ static int win_compute(xctx *x, const sql_stmt *st, const witem *v, const imdb_r
                         else rval(R, srt[n->fn == WF_FIRST ? fs : fe], v->vcol, &out);
                         break;
                     }
+                    if (slide) { /* P2 S12: a frame that moves, the window slid to it */
+                        rc = slide_to(x, &sw, R, srt, v->vcol, n->agg, b, ta, sa, fs, fe, &out, e);
+                        break;
+                    }
                     imdb_xval a = {.null = true};
-                    if (!running) { /* a frame that moves: summed afresh */
+                    if (!running) { /* a frame that moves: summed afresh (the reference: imdb_sql_set_window_reference) */
                         xacc_free(&acc);
                         memset(&acc, 0, sizeof acc);
                         added = fs;
@@ -5690,6 +5798,7 @@ static int win_compute(xctx *x, const sql_stmt *st, const witem *v, const imdb_r
         xacc_free(&acc);
         ps = pe;
     }
+    xacc_free(&sw.acc); /* P2 S12 (sw.dq is the statement's: xalloc) */
     return rc;
 }
 

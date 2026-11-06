@@ -531,7 +531,9 @@ SELECT id FROM t WHERE a + b > 10;
 ```
 
 Every operation is checked: an INT64 overflow, a zero divisor or a DECIMAL past
-38 digits is an error, never a wrapped or silently rounded value. INT64 `/`
+38 digits is an error, never a wrapped or silently rounded value; a SUM is
+exact until it ends, so only its total is held to 38 digits, whatever order its
+rows came in. INT64 `/`
 truncates toward zero; a DECIMAL quotient keeps six more decimal places than
 its operands, rounded half away from zero; an INT64 joins a FLOAT64 expression
 only when exact (|v| ≤ 2^53). A computed value stored into a DECIMAL column is
@@ -822,6 +824,8 @@ SELECT id, amount - prev AS change
   `n FOLLOWING` and UNBOUNDED; RANGE takes UNBOUNDED and CURRENT ROW (not an
   offset yet). Rows that tie in a window's ORDER BY keep the statement's own
   order, so ROW_NUMBER, LAG and the like are deterministic even among ties.
+  A frame that moves slides over its partition, each row added once and taken
+  out once, so a 1,000-row moving frame costs about what a 1-row one does.
 - The statement's ORDER BY, DISTINCT, OFFSET and LIMIT apply after the
   windows, so every row the windows read is held first (LIMIT does not
   shorten that work; the statement's memory ceiling bounds it). At most 8

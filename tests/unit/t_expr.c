@@ -678,6 +678,27 @@ static void t_aggregates(void)
     CHECK(run("SELECT -SUM(m) FROM wide") == IMDB_ERR_LIMIT);  /* an INT64 result: past int64 either way */
     CHECK(run("SELECT SUM(m) + 0 FROM wide") == IMDB_ERR_LIMIT);
     CELL("SELECT SUM(m) - SUM(m) FROM wide", "0");
+    /* P2 S12: only a SUM's total is held to 38 digits, so no order of the rows, which is a path's, decides whether it
+     * fails: in id order two partial sums pass 38 digits, in k's (an ordered index) none do. Every path answers,
+     * cross-checked, in memory and in the lake, grouped too; a total past 38 digits fails on every path (before S12 the
+     * scan failed where the index answered, and cross_check reported the engine at odds with itself) */
+    RUN("CREATE TABLE ord (id INT64 PRIMARY KEY, k INT64, g INT64, d DECIMAL(18,0))");
+    RUN("INSERT INTO ord VALUES (1, 3, 1, 900000000000000000), (2, 1, 1, 900000000000000000), (3, 2, 1, -900000000000000000)");
+    RUN("CREATE INDEX ord_k ON ord (k)");
+    static const char *const opaths[] = {"scan", "store", "ordered", "auto"};
+    for (int lake = 0; lake < 2; lake++) {
+        if (lake) RUN("CHECKPOINT");
+        for (size_t p = 0; p < sizeof opaths / sizeof *opaths; p++) {
+            char set[64];
+            snprintf(set, sizeof set, "SET access_path = %s", opaths[p]);
+            RUN(set);
+            CELL("SELECT SUM(d * 10000000000000000000.0) FROM ord WHERE k > 0", "9000000000000000000000000000000000000.0");
+            CELL("SELECT SUM(d * 10000000000000000000.0) FROM ord WHERE k > 0 GROUP BY g", "9000000000000000000000000000000000000.0");
+            CHECK(run("SELECT SUM(d * 10000000000000000000.0) FROM ord WHERE k > 0 AND d > 0") == IMDB_ERR_LIMIT);
+            CHECK(strstr(g_e.msg, "a SUM of more than 38 digits") != NULL);
+        }
+    }
+    RUN("SET access_path = auto");
     /* more aggregates than a SELECT list's slots */
     imdb_buf b;
     imdb_buf_init(&b);

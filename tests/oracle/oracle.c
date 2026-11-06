@@ -266,8 +266,8 @@ typedef struct stmt {
     bool rall;
     bool win, wpart, wdesc, wdef, wtotal; /* P2 S6: a window statement (gen_wselect): its function wfn of column wcol,
                                         * NTILE's buckets or LAG's offset wk, its ROWS frame (wframe: wlo
-                                        * PRECEDING, whi FOLLOWING) */
-    int wfn, wcol, wk, wframe, wlo, whi;
+                                        * PRECEDING, whi FOLLOWING; P2 S12: of the shape wkind, print_win) */
+    int wfn, wcol, wk, wframe, wlo, whi, wkind;
     int dsel;          /* P2 S4: 1 FROM (SELECT dc FROM t [WHERE dpred]) AS x, 2 WITH x AS (...) SELECT ... FROM x */
     int dc[4], ndc;
     pred dpred;
@@ -1673,10 +1673,19 @@ static void gen_wselect(stmt *q)
     q->wdef = (q->wfn == WO_LAG || q->wfn == WO_LEAD) && chance(70); /* a default: read at a partition's edges */
     if (q->wdef) q->skip |= 1u << D_MA; /* MariaDB's LAG and LEAD take no default */
     bool agg = q->wfn >= WO_SUM;
-    q->wframe = agg && chance(40) ? 1 : 0;
+    q->wframe = agg && chance(75) ? 1 : 0; /* P2 S12: 75 (40 before), the same one draw; wkind below adds one */
     q->wlo = (int)rr(0, 3);
     q->whi = (int)rr(0, 2);
     q->wtotal = !(q->wfn == WO_RANK || q->wfn == WO_DENSE_RANK || (agg && !q->wframe)) || chance(30);
+    /* P2 S12: a frame that slides (imagedb adds the rows coming in, takes out those leaving), of five shapes (print_win);
+     * RANGE's reads every peer alike, so its order needs no tie-breaker */
+    q->wkind = q->wframe ? (int)rr(0, 4) : 0;
+    if (q->wkind == 4) q->wtotal = false;
+    /* MySQL's MIN of a TEXT over an empty frame answers '' where the four others answer NULL (found 2026-11-06,
+     * S12's oracle, seed 57: ROWS BETWEEN 2 FOLLOWING AND 2 FOLLOWING on a one-row partition): MySQL skipped there, for MAX
+     * too by symmetry (not seen); shape 2
+     * is the one whose frames can be empty. No draw: every other statement is the one it was */
+    if (q->wkind == 2 && (q->wfn == WO_MIN || q->wfn == WO_MAX) && q->wcol == 6) q->skip |= 1u << D_MY;
     if (chance(50)) {
         gen_pred(0, &q->pr[0]);
         q->npr = 1;
@@ -2758,7 +2767,13 @@ static void print_win(sb *b, int d, const stmt *q)
     if (q->wpart) sb_str(b, "PARTITION BY g ");
     sb_printf(b, "ORDER BY id %% 3%s", q->wdesc ? " DESC" : "");
     if (q->wtotal) sb_printf(b, ", id%s", q->wdesc ? " DESC" : "");
-    if (q->wframe) sb_printf(b, " ROWS BETWEEN %d PRECEDING AND %d FOLLOWING", q->wlo, q->whi);
+    if (q->wframe) switch (q->wkind) { /* P2 S12: the shapes a frame slides in; empty frames at a partition's end (2) */
+        case 0: sb_printf(b, " ROWS BETWEEN %d PRECEDING AND %d FOLLOWING", q->wlo, q->whi); break;
+        case 1: sb_str(b, " ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING"); break;
+        case 2: sb_printf(b, " ROWS BETWEEN %d FOLLOWING AND %d FOLLOWING", q->whi, q->whi + q->wlo); break;
+        case 3: sb_printf(b, " ROWS BETWEEN %d PRECEDING AND UNBOUNDED FOLLOWING", q->wlo); break;
+        default: sb_str(b, " RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING"); break;
+        }
     sb_str(b, ") AS w FROM t");
     if (q->npr) {
         sb_str(b, " WHERE ");
@@ -3773,6 +3788,7 @@ static long g_corr_compared; /* P2 S4b: comparisons of statements with a correla
 static long g_lazy_compared; /* P2 S11: comparisons of items over a SELECT that fails when it runs */
 static long g_set_compared, g_rec_compared; /* P2 S5: comparisons of set operations, of WITH RECURSIVE */
 static long g_win_compared; /* P2 S6: comparisons of window functions */
+static long g_slide_compared[5]; /* P2 S12: of window functions over a frame that slides, by its shape (wkind) */
 static long g_isel_compared, g_ret_compared; /* P2 S8: INSERT ... SELECT, RETURNING's rows */
 
 static void show_rows(const res *r, size_t from)
@@ -3999,6 +4015,7 @@ static int run_stmt(unsigned seed, int step, const stmt *q, bool state)
         if (q->narm) g_set_compared++;
         if (q->rec) g_rec_compared++;
         if (q->win) g_win_compared++;
+        if (q->win && q->wframe) g_slide_compared[q->wkind]++; /* P2 S12 */
         if (q->isel) g_isel_compared++; /* P2 S8 */
         if (q->ups) g_ups_compared++;
         if (q->ufrom) g_ufrom_compared++;
@@ -4241,6 +4258,11 @@ int main(int argc, char **argv)
     bool servers = g_eng[D_PG].on || g_eng[D_MY].on || g_eng[D_MA].on || g_eng[D_MS].on;
     printf("oracle: %ld comparisons of P2 S2's grouped form (several keys and trees, DISTINCT, FILTER)\n", g_grp_compared);
     printf("oracle: %ld comparisons of P2 S6's window functions\n", g_win_compared);
+    printf("oracle: %ld comparisons of P2 S12's sliding frames (ROWS n PRECEDING to m FOLLOWING %ld, CURRENT ROW to "
+           "UNBOUNDED FOLLOWING %ld, n FOLLOWING to m FOLLOWING %ld, n PRECEDING to UNBOUNDED FOLLOWING %ld, RANGE CURRENT "
+           "ROW to UNBOUNDED FOLLOWING %ld)\n",
+           g_slide_compared[0] + g_slide_compared[1] + g_slide_compared[2] + g_slide_compared[3] + g_slide_compared[4],
+           g_slide_compared[0], g_slide_compared[1], g_slide_compared[2], g_slide_compared[3], g_slide_compared[4]);
     printf("oracle: %ld comparisons of P2 S8's INSERT ... SELECT, %ld of RETURNING's rows, %ld of ON CONFLICT%s\n", g_isel_compared,
            g_ret_compared, g_ups_compared, "");
     printf("oracle: %ld comparisons of P2 S9's prepared SELECTs (imagedb's literals as $n: PREPARE, EXECUTE)\n", g_prep_compared);

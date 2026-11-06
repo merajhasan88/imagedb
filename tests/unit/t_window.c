@@ -360,8 +360,151 @@ static void t_window_forms(void)
     done(db);
 }
 
+/* P2 S12: one statement's answer (or error), the frames summed afresh (the reference) and slid, byte for byte */
+static char g_ref[1 << 20], g_sld[1 << 20];
+static bool slide_same(const char *sql, int line)
+{
+    imdb_sql_set_window_reference(true);
+    csv_to(sql, g_ref, sizeof g_ref);
+    imdb_sql_set_window_reference(false);
+    csv_to(sql, g_sld, sizeof g_sld);
+    if (strcmp(g_ref, g_sld) != 0 || !strncmp(g_ref, "ERR render", 10)) {
+        size_t k = 0;
+        while (g_ref[k] && g_ref[k] == g_sld[k]) k++;
+        size_t from = k > 120 ? k - 120 : 0;
+        char m[1600];
+        snprintf(m, sizeof m, "%.600s\n      summed afresh: ...%.200s\n      slid:          ...%.200s", sql, g_ref + from, g_sld + from);
+        test_fail(__FILE__, line, m);
+        return false;
+    }
+    return true;
+}
+
+static void slide_sql(char *out, size_t cap, const char *const *items, int n, const char *w, const char *fr)
+{
+    size_t o = (size_t)snprintf(out, cap, "SELECT id");
+    for (int k = 0; k < n && o < cap; k++) o += (size_t)snprintf(out + o, cap - o, ", %s OVER (%s %s) AS c%d", items[k], w, fr, k);
+    if (o < cap) snprintf(out + o, cap - o, " FROM ws ORDER BY id");
+}
+
+/* P2 S12: every moving frame slid (each row into the window and out of it once) against the same frame summed afresh,
+ * the reference (imdb_sql_set_window_reference): ROWS frames of every pair of bounds the parser takes (n PRECEDING and
+ * FOLLOWING, CURRENT ROW, UNBOUNDED; frames empty at a partition's edges or everywhere), RANGE's peers and the default;
+ * four windows (partitions with a NULL one, an order key with ties and NULLs, ascending and descending, NULLs first
+ * and last; one partition ordered by two keys; partitions in no order, every row a peer); COUNT, SUM, AVG, MIN and
+ * MAX of INT64 (sums past 2^63), DECIMAL, FLOAT64 (1e300 beside 1e-300 and the least subnormal: the exact sum's
+ * cancellations) and TEXT (ties, the empty string, UTF-8), with NULLs; and wide arguments whose frames' sums pass 38
+ * digits or the finite range, where both must fail alike (some do, some answer). In memory, cross-checked and in the
+ * lake */
+static void t_window_slide(void)
+{
+    imdb_db *db = open_fresh();
+    CHECK(db != NULL);
+    if (!db) return;
+    CHECK(run("CREATE TABLE ws (id INT64 PRIMARY KEY, g INT64, o INT64, i INT64, d DECIMAL(18,2), f FLOAT64, t TEXT)") == 0);
+    static const char *const iv[] = {"NULL", "9223372036854775807", "-9223372036854775807", "4611686018427387904",
+                                     "0", "-7", "13", "-4611686018427387903"};
+    static const char *const dv[] = {"NULL", "9999999999999999.99", "-9999999999999999.99", "12.34", "0.01", "-0.5", "0", "77"};
+    static const char *const fv[] = {"NULL", "1e300", "-1e300", "1e-300", "5e-324", "0.1", "-2.5", "3", "0", "-1e-300"};
+    static const char *const tv[] = {"NULL", "''", "'a'", "'b'", "'ab'", "'\xc3\xa9'", "'zz'", "'a'"};
+    imdb_buf b;
+    imdb_buf_init(&b);
+    imdb_buf_put_str(&b, "INSERT INTO ws VALUES ");
+    for (int r = 1; r <= 80; r++) {
+        uint64_t u = test_rand();
+        char g[8], o[8];
+        snprintf(g, sizeof g, "%d", (int)(u % 4));
+        snprintf(o, sizeof o, "%d", (int)((u >> 8) % 6));
+        imdb_buf_printf(&b, "%s(%d, %s, %s, %s, %s, %s, %s)", r > 1 ? ", " : "", r, (u >> 4) % 7 == 0 ? "NULL" : g,
+                        (u >> 12) % 9 == 0 ? "NULL" : o, iv[(u >> 16) % 8], dv[(u >> 20) % 8], fv[(u >> 24) % 10],
+                        tv[(u >> 32) % 8]);
+    }
+    imdb_buf_put_u8(&b, 0);
+    CHECK(!imdb_buf_check(&b, &g_e) && !run((const char *)b.p));
+    imdb_buf_free(&b);
+    static const char *const lo[] = {"UNBOUNDED PRECEDING", "1000 PRECEDING", "3 PRECEDING", "1 PRECEDING", "CURRENT ROW",
+                                     "1 FOLLOWING", "3 FOLLOWING"};
+    static const char *const hi[] = {"3 PRECEDING", "1 PRECEDING", "CURRENT ROW", "1 FOLLOWING", "3 FOLLOWING",
+                                     "1000 FOLLOWING", "UNBOUNDED FOLLOWING"};
+    static char fr[64][64];
+    int nf = 0;
+    for (int l = 0; l < 7; l++)
+        for (int h = 0; h < 7; h++)
+            if (!((l == 4 && h < 2) || (l >= 5 && h <= 2))) /* the pairs the parser refuses: ending before the row */
+                snprintf(fr[nf++], sizeof fr[0], "ROWS BETWEEN %s AND %s", lo[l], hi[h]);
+    static const char *const more[] = {"ROWS 2 PRECEDING", "RANGE BETWEEN CURRENT ROW AND CURRENT ROW", "RANGE CURRENT ROW",
+                                       "RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING",
+                                       "RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING", ""};
+    for (size_t k = 0; k < sizeof more / sizeof *more; k++) snprintf(fr[nf++], sizeof fr[0], "%s", more[k]);
+    static const char *const WS[] = {"PARTITION BY g ORDER BY o", "PARTITION BY g ORDER BY o DESC NULLS LAST",
+                                     "ORDER BY o NULLS FIRST, t", "PARTITION BY g"}; /* the last: no order, every row a peer
+                                                                                       * (RANGE's frame the partition) */
+    static const char *const A[] = {"COUNT(*)", "COUNT(t)", "SUM(i)", "AVG(d)", "SUM(f)", "MIN(t)", "MAX(f)", "MAX(i)"};
+    static const char *const B[] = {"AVG(i)", "SUM(d)", "AVG(f)", "MIN(i)", "MIN(d)", "MAX(t)", "COUNT(f)", "MIN(f)"};
+    static const char *const C[] = {"SUM(i * 1000000000000000000.0)", "AVG(i * 1000000000000000000.0)", "SUM(f * 100000000.0)"};
+    static char sql[4096];
+    int failed = 0, answered = 0;
+    for (int pass = 0; pass < 3; pass++) {
+        if (pass == 1) CHECK(run("SET cross_check = on") == 0);
+        if (pass == 2) CHECK(run("SET cross_check = off") == 0 && run("CHECKPOINT") == 0);
+        for (int f = 0; f < nf; f++) {
+            if (pass && f % 3 != pass) continue; /* a third of the frames each, cross-checked and in the lake */
+            for (int set = 0; set < 2; set++) { /* each frame under two of the windows, turn about (the time is the
+                                                 * statements', about 4 ms each: the sorts, the rendering) */
+                slide_sql(sql, sizeof sql, set ? B : A, 8, WS[(f + set) % 4], fr[f]);
+                if (!slide_same(sql, __LINE__)) {
+                    done(db);
+                    return;
+                }
+                if (!strncmp(g_ref, "ERR", 3)) { /* these never fail */
+                    test_fail(__FILE__, __LINE__, g_ref);
+                    done(db);
+                    return;
+                }
+            }
+            for (int c = 0; c < 3; c++) {
+                slide_sql(sql, sizeof sql, &C[c], 1, WS[(f + c) % 4], fr[f]);
+                if (!slide_same(sql, __LINE__)) {
+                    done(db);
+                    return;
+                }
+                if (!strncmp(g_ref, "ERR", 3)) failed++;
+                else answered++;
+            }
+        }
+    }
+    CHECK(failed > 0 && answered > 0);
+    /* a window's sum past 2^127 and back, every frame's total within 38 digits: i * 10^18 at INT64's extremes in the
+     * order -M, M, M, -M, -M, M, M, -M; each frame of three answers, slid and summed afresh alike (xacc's wrap count:
+     * a row leaving or coming in may wrap it either way). Random rows cannot show it: a frame past 38 digits fails the
+     * statement first */
+    CHECK(run("SET cross_check = off") == 0);
+    CHECK(run("CREATE TABLE wz (id INT64 PRIMARY KEY, i INT64)") == 0);
+    CHECK(run("INSERT INTO wz VALUES (1, -9223372036854775807), (2, 9223372036854775807), (3, 9223372036854775807), "
+              "(4, -9223372036854775807), (5, -9223372036854775807), (6, 9223372036854775807), (7, 9223372036854775807), "
+              "(8, -9223372036854775807)") == 0);
+    static const char *const wf[] = {"ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING", "ROWS BETWEEN 2 PRECEDING AND CURRENT ROW",
+                                     "ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING", "ROWS BETWEEN 1 FOLLOWING AND 3 FOLLOWING"};
+    for (size_t k = 0; k < sizeof wf / sizeof *wf; k++) {
+        snprintf(sql, sizeof sql, "SELECT id, SUM(i * 1000000000000000000.0) OVER (ORDER BY id %s) AS s, "
+                                  "AVG(i * 100000000000.0) OVER (ORDER BY id %s) AS a FROM wz ORDER BY id", wf[k], wf[k]);
+        if (!slide_same(sql, __LINE__)) {
+            done(db);
+            return;
+        }
+        if (!strncmp(g_ref, "ERR", 3)) test_fail(__FILE__, __LINE__, g_ref);
+    }
+#define M37 "9223372036854775807000000000000000000.0"
+    EXPECT("SELECT id, SUM(i * 1000000000000000000.0) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s "
+           "FROM wz ORDER BY id",
+           "id,s\n1,0.0\n2," M37 "\n3," M37 "\n4,-" M37 "\n5,-" M37 "\n6," M37 "\n7," M37 "\n8,0.0\n");
+#undef M37
+    done(db);
+}
+
 const test_case window_tests[] = {
     {"window_model", t_window_model},
     {"window_forms", t_window_forms},
+    {"window_slide", t_window_slide},
 };
 const size_t window_ntests = sizeof window_tests / sizeof window_tests[0];
