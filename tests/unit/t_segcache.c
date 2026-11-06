@@ -1006,7 +1006,139 @@ out:
     imdb_close(db);
 }
 
+/* ---- P2 S15, the 2026-11-05 review's O3 (its first step): an aggregate lets each image go as it leaves the segment ---- */
+
+/* one statement at the cache's present budget: its outcome as text, and the most resident while it ran */
+static uint64_t peak_of(imdb_db *db, imdb_session *s, const char *sql, imdb_buf *out)
+{
+    db->segcache.peak = db->segcache.resident;
+    outcome(s, sql, out);
+    return db->segcache.peak;
+}
+
+/* Twelve segments of 400 rows, then rows in the memtable. Aggregates over the table (COUNT, SUM, AVG, MIN and MAX of
+ * INT64 and TEXT, DISTINCT, FILTER, a tree's extreme, predicates), on the scan and the store paths: the same outcome
+ * at a budget of every image, of the largest image, and of none. At one image's budget a statement holds at most two
+ * images at once (the budget and the one in hand), at none at most one, and the images it let go are counted;
+ * grouped ones too (a group's keys copied as it is made, its accumulators their own); a row SELECT, not on the
+ * allow-list, still holds every image it read until its operation ends; and a statement inside
+ * EXISTS, or under cross_check, lets none go */
+static void t_segcache_release(void)
+{
+    const char *dir = test_tmpdir();
+    OK(imdb_init(dir, false, NULL, E));
+    imdb_db *db = copen(dir, UINT64_MAX);
+    CHECK(db);
+    if (!db) return;
+    imdb_session s;
+    imdb_session_init(&s, db);
+    OK(ex(&s, "CREATE TABLE t (id INT64 PRIMARY KEY, g INT64, v INT64, s TEXT)"));
+    char sql[160];
+    enum { NSEG = 12, ROWS = 400 };
+    for (int k = 0; k <= NSEG; k++) {
+        OK(ex(&s, "BEGIN"));
+        for (int i = 0; i < ROWS; i++) {
+            int id = k * ROWS + i;
+            if (id % 97 == 0 || id % 89 == 0) /* an empty TEXT and a NULL among them: group keys of their own */
+                snprintf(sql, sizeof sql, "INSERT INTO t VALUES (%d, %d, %d, %s)", id, id % 7, (id * 7919) % 1000 - 500,
+                         id % 97 == 0 ? "''" : "NULL");
+            else
+                snprintf(sql, sizeof sql, "INSERT INTO t VALUES (%d, %d, %d, 'text %05d of a row, a while long %d')", id,
+                         id % 7, (id * 7919) % 1000 - 500, (id * 104729) % (NSEG * ROWS), id % 3);
+            OK(ex(&s, sql));
+        }
+        OK(ex(&s, "COMMIT"));
+        if (k < NSEG) OK(ex(&s, "CHECKPOINT")); /* the last batch stays in the memtable */
+    }
+    imdb_table *t = imdb_table_by_name(db, "t");
+    CHECK(t && t->nseg == NSEG);
+    if (!t || t->nseg != NSEG) goto out;
+    uint64_t largest = 0;
+    OK(ex(&s, "SELECT COUNT(*) FROM t WHERE v > 0")); /* every image resident (no budget yet) */
+    for (uint32_t k = 0; k < t->nseg; k++) {
+        uint64_t b = imdb_seg_image_bytes(t->seg[k]);
+        if (b > largest) largest = b;
+    }
+    CHECK(largest > 0);
+    static const char *const aggs[] = {
+        "SELECT COUNT(*), SUM(v), AVG(v), MIN(v), MAX(v) FROM t",
+        "SELECT MIN(s), MAX(s), COUNT(s) FROM t",
+        "SELECT MIN(s), MAX(s) FROM t WHERE v > 100 AND s >= 'text 01'",
+        "SELECT COUNT(DISTINCT s), COUNT(DISTINCT g), SUM(v) FILTER (WHERE g = 3) FROM t",
+        "SELECT MAX(s || '!'), MIN(UPPER(s)), SUM(v * 2) FROM t WHERE id % 5 = 1",
+        "SELECT COUNT(*) FROM t WHERE s LIKE '%of a row%' HAVING COUNT(*) > 10",
+        "SELECT g, COUNT(*), MIN(s), MAX(s), SUM(v) FROM t GROUP BY g",
+        "SELECT g, id % 3, MAX(UPPER(s)), COUNT(DISTINCT s) FROM t GROUP BY g, id % 3 HAVING COUNT(*) > 5 ORDER BY 2, 1",
+        "SELECT s, COUNT(*), MIN(v) FROM t WHERE v > 400 GROUP BY s", /* TEXT keys out of the images, copied as made */
+        "SELECT s, COUNT(*), MAX(g) FROM t WHERE id % 97 = 0 OR id % 89 = 0 GROUP BY s", /* the empty key and the NULL one */
+    };
+    static const char *const paths[] = {"SET access_path = scan", "SET access_path = store"};
+    enum { NA = sizeof aggs / sizeof *aggs };
+    imdb_buf want[2][NA], got;
+    imdb_buf_init(&got);
+    for (int p = 0; p < 2; p++)
+        for (int a = 0; a < NA; a++) {
+            imdb_buf_init(&want[p][a]);
+            OK(ex(&s, paths[p]));
+            outcome(&s, aggs[a], &want[p][a]);
+        }
+    for (int p = 0; p < 2; p++) /* the two paths agree before anything is let go */
+        for (int a = 0; a < NA; a++) CHECK(want[0][a].len == want[p][a].len && !memcmp(want[0][a].p, want[p][a].p, want[0][a].len));
+    static const uint64_t budget_of[] = {1, 0}; /* in largest images: one, none */
+    for (int b = 0; b < 2; b++) {
+        db->segcache.budget = budget_of[b] * largest;
+        for (int p = 0; p < 2; p++) {
+            OK(ex(&s, paths[p]));
+            for (int a = 0; a < NA; a++) {
+                uint64_t rel = db->segcache.released;
+                uint64_t peak = peak_of(db, &s, aggs[a], &got);
+                bool eq = got.len == want[p][a].len && !memcmp(got.p, want[p][a].p, got.len);
+                if (!eq || peak > (budget_of[b] + 1) * largest)
+                    fprintf(stderr, "    %s at %llu: peak %llu (largest %llu), released %llu\n%.*s", aggs[a],
+                            (unsigned long long)db->segcache.budget, (unsigned long long)peak,
+                            (unsigned long long)largest, (unsigned long long)(db->segcache.released - rel), (int)got.len,
+                            (const char *)got.p);
+                CHECK(eq);
+                CHECK(peak <= (budget_of[b] + 1) * largest);
+                CHECK(db->segcache.released > rel);
+            }
+        }
+    }
+    /* not on the allow-list: rows, inside EXISTS, under cross_check: every image the statement pinned kept */
+    db->segcache.budget = 0;
+    OK(ex(&s, "SET access_path = scan"));
+    static const char *const keep[] = {"SELECT id FROM t WHERE v + 1 = 500", "SELECT id FROM t WHERE v = 499",
+                                       "SELECT EXISTS (SELECT 1 FROM t WHERE v = 499 AND s > 'z')"};
+    for (size_t i = 0; i < sizeof keep / sizeof *keep; i++) {
+        uint64_t rel = db->segcache.released;
+        uint64_t peak = peak_of(db, &s, keep[i], &got);
+        if (db->segcache.released != rel || (i == 0 && peak < (uint64_t)NSEG * largest / 2))
+            fprintf(stderr, "    %s: released %llu, peak %llu (largest %llu)\n", keep[i],
+                    (unsigned long long)(db->segcache.released - rel), (unsigned long long)peak, (unsigned long long)largest);
+        CHECK(db->segcache.released == rel);
+        if (i == 0) CHECK(peak >= (uint64_t)NSEG * largest / 2); /* a tree in WHERE: no zone map skips a segment, so
+                                                                   * every image is read and kept; the others' zone maps and
+                                                                   * EXISTS' first row read a few */
+    }
+    OK(ex(&s, "SET cross_check = on"));
+    uint64_t rel = db->segcache.released;
+    peak_of(db, &s, aggs[1], &got);
+    CHECK(db->segcache.released == rel && got.len == want[0][1].len && !memcmp(got.p, want[0][1].p, got.len));
+    OK(ex(&s, "SET cross_check = off"));
+    for (int p = 0; p < 2; p++)
+        for (int a = 0; a < NA; a++) imdb_buf_free(&want[p][a]);
+    imdb_buf_free(&got);
+    OK(ex(&s, "SET access_path = auto"));
+    imdb_verify_report vr;
+    memset(&vr, 0, sizeof vr);
+    OK(imdb_verify(db, &vr, E));
+out:
+    imdb_session_close(&s);
+    imdb_close(db);
+}
+
 const test_case segcache_tests[] = {
+    {"segcache_release", t_segcache_release},
     {"segcache_one_load", t_segcache_one_load},
     {"segcache_reload_ends", t_segcache_reload_ends},
     {"segcache_lru", t_segcache_lru},

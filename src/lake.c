@@ -2443,6 +2443,18 @@ void imdb_seg_release_one(imdb_segment *g)
     if (c && c->streaming && c->resident > c->budget && seg_droppable(c, g)) seg_img_drop(g);
 }
 
+/* P2 S15 (the 2026-11-05 review's O3, its first step): a releasing statement's path has left g and keeps no pointer into
+ * its image (sql_exec.c: exec_select's allow-list): while the cache is over its budget, the image leaves now, not when
+ * the operation ends. On the engine thread, no parallel loop running (a statement's paths), so no load is in flight;
+ * the loading flag is checked all the same. One the cache did not charge, or whose objects are not on disk, stays */
+void imdb_seg_done(const imdb_table *t, imdb_segment *g)
+{
+    imdb_segcache *c = t ? t->segcache : NULL;
+    if (!c || !g || g->cache != c || c->resident <= c->budget || g->loading || !seg_droppable(c, g)) return;
+    seg_img_drop(g);
+    c->released++;
+}
+
 /* Between the open's replayed commits: no pointer into an image is held, so the cache trims as at an operation's end */
 void imdb_seg_trim_streaming(imdb_db *db)
 {

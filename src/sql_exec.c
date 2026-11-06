@@ -190,6 +190,10 @@ typedef struct xctx {
     struct xcorr *corr;           /* this statement's correlated subqueries, one per nested SELECT (NULL: none) */
     imdb_result *probe_r;         /* the bind-only pass's result: its columns typed, no row (probe_types) */
     bool wceil;                   /* P2 S8: a write set the memory ceiling for its reading (wceil_set) */
+    bool nested;                  /* P2 S15: a nested SELECT's run (run_nested): never a releasing one, and while one runs
+                                   * the statement around it holds row pointers into its own segments */
+    bool release;                 /* P2 S15 (O3's first step): this run's path lets each image go as it leaves the
+                                   * segment while the cache is over its budget (exec_select's allow-list) */
 } xctx;
 
 enum { TICK_ROWS = 4096 }; /* rows between two looks at the clock and the cancel flag: tens of microseconds of work */
@@ -276,7 +280,11 @@ static void xfree(xctx *x)
 /* Copies a TEXT value into context-owned memory (stable across writes). */
 static int xpin(xctx *x, imdb_value *v, imdb_err *e)
 {
-    if (v->type != IMDB_T_TEXT || !v->len) return IMDB_OK;
+    if (v->type != IMDB_T_TEXT || v->null) return IMDB_OK;
+    if (!v->len) { /* P2 S15: an empty value points nowhere it came from (a releasing statement lets its image go) */
+        v->s = (const uint8_t *)"";
+        return IMDB_OK;
+    }
     uint8_t *p = xalloc(x, v->len, e);
     if (!p) return e->code;
     memcpy(p, v->s, v->len);
@@ -1370,7 +1378,11 @@ typedef struct agg_acc {
     __int128 sum;
     imdb_fsum fsum;          /* SUM of a FLOAT64 column, exact */
     bool has;
-    imdb_value mn, mx;
+    imdb_value mn, mx;       /* P2 S15: a TEXT extreme points into mnb / mxb, the accumulator's own copy, never into a
+                              * segment image (the 2026-11-05 review's O3: a statement may let an image go before its
+                              * result is built); MIN keeps mn alone, MAX mx alone */
+    uint8_t *mnb, *mxb;
+    uint32_t mncap, mxcap;
 } agg_acc;
 
 /* an aggregate inside a tree item (an EX_AGG node's slot): its argument is a tree, its values expression values */
@@ -1697,6 +1709,33 @@ static void join_probe_row(sink *k, uint64_t vid, const imdb_value *vals);
 static void join_outer_row(sink *k, uint64_t vid, const imdb_value *vals);
 static void join_inner_row(sink *k, uint64_t vid, const imdb_value *vals);
 
+/* P2 S15: a bare column's TEXT extreme copied into the accumulator's own buffer (grown, never shrunk), as xacc_own does
+ * for a tree's: the row it came from may sit in an image the statement lets go (O3) */
+static int acc_own(imdb_value *v, uint8_t **buf, uint32_t *cap, imdb_err *e)
+{
+    if (v->type != IMDB_T_TEXT || v->null) return IMDB_OK;
+    if (!*buf || v->len > *cap) { /* an empty extreme too: its pointer is never NULL (memcmp) */
+        uint32_t nc = v->len > 2 * *cap ? v->len : 2 * *cap;
+        uint8_t *nb = imdb_alloc(nc ? nc : 1, e);
+        if (!nb) return e->code;
+        imdb_free(*buf);
+        *buf = nb;
+        *cap = nc;
+    }
+    if (v->len) memcpy(*buf, v->s, v->len);
+    v->s = *buf;
+    return IMDB_OK;
+}
+
+static void acc_free(agg_acc *a)
+{
+    imdb_fsum_free(&a->fsum);
+    imdb_free(a->mnb);
+    imdb_free(a->mxb);
+    a->mnb = a->mxb = NULL;
+    a->mncap = a->mxcap = 0;
+}
+
 static int acc_add(agg_acc *a, uint8_t agg, const imdb_value *v, imdb_err *e)
 {
     if (agg == AGG_COUNT_STAR) {
@@ -1707,9 +1746,13 @@ static int acc_add(agg_acc *a, uint8_t agg, const imdb_value *v, imdb_err *e)
     a->count++;
     if (agg == AGG_SUM && v->type == IMDB_T_FLOAT64 && imdb_fsum_add(&a->fsum, v->i, e)) return e->code;
     if (agg == AGG_SUM && v->type != IMDB_T_FLOAT64) a->sum += v->i;
-    if (agg == AGG_MIN || agg == AGG_MAX) {
-        if (!a->has || imdb_value_cmp(v, &a->mn) < 0) a->mn = *v;
-        if (!a->has || imdb_value_cmp(v, &a->mx) > 0) a->mx = *v;
+    if (agg == AGG_MIN && (!a->has || imdb_value_cmp(v, &a->mn) < 0)) {
+        a->mn = *v;
+        if (acc_own(&a->mn, &a->mnb, &a->mncap, e)) return e->code;
+    }
+    if (agg == AGG_MAX && (!a->has || imdb_value_cmp(v, &a->mx) > 0)) {
+        a->mx = *v;
+        if (acc_own(&a->mx, &a->mxb, &a->mxcap, e)) return e->code;
     }
     a->has = true;
     return IMDB_OK;
@@ -1901,8 +1944,8 @@ static int sink_pin(sink *k)
 
 static void sink_free(sink *k)
 {
-    for (uint16_t i = 0; i < IMDB_MAX_COLS; i++) imdb_fsum_free(&k->acc[i].fsum);
-    for (uint64_t i = 0; k->gacc && k->st && i < k->ngroups * k->st->nitems; i++) imdb_fsum_free(&k->gacc[i].fsum);
+    for (uint16_t i = 0; i < IMDB_MAX_COLS; i++) acc_free(&k->acc[i]);
+    for (uint64_t i = 0; k->gacc && k->st && i < k->ngroups * k->st->nitems; i++) acc_free(&k->gacc[i]); /* P2 S15 */
     for (uint16_t s = 0; k->xa && s < k->nxa; s++) xacc_free(&k->xa[s]); /* xa itself: the statement's */
     for (uint64_t i = 0; k->gxa && i < k->ngroups * k->nxa; i++) xacc_free(&k->gxa[i]);
     imdb_free(k->vids);
@@ -2066,7 +2109,7 @@ static int run_nested(xctx *x, const sql_stmt *in, imdb_result *r, uint8_t mode,
     mode = (uint8_t)(mode & ~NEST_PRES);
     xctx s = {.ss = x->ss, .db = x->db, .sql = x->sql, .params = x->params, .nparams = x->nparams, .st = in,
               .row_limit = x->row_limit, .deadline_ns = x->deadline_ns, .checks = x->checks, .ticks = x->ticks,
-              .next_check = x->next_check, .tested = x->tested};
+              .next_check = x->next_check, .tested = x->tested, .nested = true};
     s.env.check = xenv_check;
     s.env.subq = xenv_subq;
     s.env.ctx = &s;
@@ -2277,6 +2320,7 @@ static int fetch_row(xctx *x, imdb_table *t, uint64_t vid, imdb_value *vals, imd
 typedef struct walk_pin {
     uint32_t seg; /* t->seg index of gi (UINT32_MAX: none yet) */
     const imdb_segimg *gi;
+    bool release; /* P2 S15: a releasing run's walk lets the segment it leaves go (imdb_seg_done) */
 } walk_pin;
 
 static int walk_values(imdb_table *t, const imdb_version *v, walk_pin *wp, imdb_value *vals, imdb_err *e)
@@ -2284,6 +2328,7 @@ static int walk_values(imdb_table *t, const imdb_version *v, walk_pin *wp, imdb_
     if ((v->flags & (IMDB_V_SEG | IMDB_V_STUB | IMDB_V_PURGED)) != IMDB_V_SEG) return imdb_version_values_v(t, v, vals, e);
     if (v->seg != wp->seg) {
         if (v->seg >= t->nseg) return imdb_fail(e, IMDB_ERR_STATE, "version maps to a missing segment");
+        if (wp->release && wp->seg < t->nseg) imdb_seg_done(t, t->seg[wp->seg]); /* vid order: it does not come back */
         if (!(wp->gi = imdb_seg_pin(t, t->seg[v->seg], e))) return e->code;
         wp->seg = v->seg;
     }
@@ -2301,7 +2346,7 @@ static int path_store(xctx *x, const qspec *q, sink *k, imdb_err *e)
 {
     imdb_table *t = q->t;
     imdb_value vals[IMDB_MAX_COLS];
-    walk_pin wp = {UINT32_MAX, NULL};
+    walk_pin wp = {UINT32_MAX, NULL, x->release}; /* P2 S15 */
     for (uint64_t vid = imdb_v_next(t, 0); vid < t->nver && !k->err; vid = imdb_v_next(t, vid + 1)) {
         if (ktick(k, 1)) break;
         const imdb_version *v = imdb_vh(t, vid); /* held: the walk has its entry */
@@ -2325,7 +2370,7 @@ static int path_index(xctx *x, const qspec *q, sink *k, imdb_err *e)
         return k->err;
     }
     if (q->subj_pred >= 0) {
-        walk_pin wp = {UINT32_MAX, NULL};
+        walk_pin wp = {UINT32_MAX, NULL, false}; /* an index path reads by key: no release (P2 S15) */
         const imdb_vlist *l = imdb_subject_versions(t, &q->p[q->subj_pred].a);
         for (uint32_t i = 0; l && i < l->n && !k->err; i++) {
             if (ktick(k, 1)) break;
@@ -2590,6 +2635,7 @@ static int path_scan(xctx *x, const qspec *q, sink *k, imdb_err *e)
                     a->sum += (__int128)(((unsigned __int128)(uint64_t)r2[1] << 64) | (uint64_t)r2[0]);
                 }
             }
+            if (x->release && !rc) imdb_seg_done(t, g); /* P2 S15: counted and summed whole; nothing points into it */
             continue;
         }
         for (size_t w = 0; w < words && !k->err; w++) {
@@ -2603,6 +2649,7 @@ static int path_scan(xctx *x, const qspec *q, sink *k, imdb_err *e)
                 sink_row(k, vid, vals);
             }
         }
+        if (x->release) imdb_seg_done(t, g); /* P2 S15: its rows passed; nothing kept points into it */
     }
     imdb_free(bits);
     imdb_free(tmp);
@@ -2637,6 +2684,7 @@ static int path_rows(xctx *x, const qspec *q, sink *k, imdb_err *e)
             for (uint32_t c = 0; c < t->s.ncols; c++) imdb_seg_get(&t->s, gi, r, c, &vals[c]);
             if (preds_ok(q, vals)) sink_row(k, gi->vid[r], vals);
         }
+        if (x->release) imdb_seg_done(t, g); /* P2 S15 */
     }
     for (uint64_t vid = t->mem_first; vid < t->nver && !k->err; vid++) { /* the memtable: always held */
         if (ktick(k, 1)) break;
@@ -6049,7 +6097,17 @@ static int exec_select(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, 
     if (pres) k.first = !k.nresid;
     bool ran = !rc; /* what fails from here is a plan's run, for cross_check to weigh */
     xc_begin(x);
+    /* P2 S15 (the 2026-11-05 review's O3, its first step): an aggregate over one table with nothing nested, grouped or
+     * not, lets each image go as its path leaves the segment while the cache is over its budget (imdb_seg_done), so its
+     * images follow the budget, not the table's size: nothing it keeps points into an image (its accumulators own their
+     * TEXT, acc_own and xacc_own; a group's keys are copied as the group is made, xpin and group_gen, and the hash map
+     * owns its own; DISTINCT's sets own their keys; the result is built from these alone). v1's allow-list: rows
+     * (SINK_VIDS) are read again for the result, a later step; a nested run, a run of EXISTS and cross_check (two
+     * plans, the second would read again what the first let go) keep every image to the operation's end, as before */
+    x->release = !rc && !nested && !x->nested && !x->presence && !x->ss->cross_check &&
+                 (k.mode == SINK_AGG || k.mode == SINK_GROUP) && !st->nsub && !st->for_update;
     if (!rc && (rc = run_path(x, p1, &q, &k, e)) == SINK_FOUND) rc = IMDB_OK;
+    x->release = false;
     if (pres) found = k.nvids > 0;
     else {
         if (!rc && st->for_update && x->ss->txn.open && (rc = lock_rows(x, t, &k, e))) ran = false; /* the transaction's */

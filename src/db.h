@@ -122,6 +122,7 @@ typedef struct imdb_segcache {
                                  publication of an image: never held while a load reads (P2 S14) */
     pthread_cond_t loaded;    /* P2 S14: broadcast as each load ends, read or failed: the workers waiting for that image */
     uint64_t load_waits;      /* P2 S14: pins that waited for another worker's load of their image (under the lock) */
+    uint64_t released;        /* P2 S15: images a releasing statement let go before its operation ended (imdb_seg_done) */
 } imdb_segcache;
 
 typedef struct imdb_table {

@@ -123,6 +123,9 @@ void imdb_seg_load_hook(void (*fn)(const imdb_segment *g, void *ctx), void *ctx)
 /* The open streams (3c-2, lake.c): a pass lets go of a segment it has left while the cache is over its budget; the
  * replay trims between commits. No-ops outside the open. */
 void imdb_seg_release_one(imdb_segment *g);
+/* P2 S15 (O3's first step): a releasing statement's path has left g, keeping no pointer into its image: it leaves now
+ * while the cache is over its budget (sql_exec.c decides which statements release) */
+void imdb_seg_done(const imdb_table *t, imdb_segment *g);
 void imdb_seg_trim_streaming(imdb_db *db);
 uint64_t imdb_seg_image_bytes(const imdb_segment *g); /* a resident image's bytes, else 0 */
 /* Segment g's image, pinned for the current operation (t: g's table; NULL for a segment parsed apart from any table,
