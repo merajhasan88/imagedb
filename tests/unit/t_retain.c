@@ -263,6 +263,17 @@ static void t_retain_log_rules(void)
 
 #define SEC_US 1000000ll
 
+/* The clock pinned d past a commit's time t, so a margin a test reasons with is counted from that commit, not from
+ * whenever the statement runs: retain_seed's EXPIRE must expire the segment begun at +15 s and not the one begun at
+ * +20 s (cut_primary), and on the moving clock (+25 s) that held only while its ship, apply, VERIFY and audits took
+ * under 5 s (a loaded SAN run, 2026-11-06, took longer: the horizon passed the snapshot) */
+static void clock_past(uint64_t t, int64_t d)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    imdb_clock_offset((int64_t)t + d - ((int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000));
+}
+
 static uint64_t horizon_of(imdb_db *db, const char *name)
 {
     imdb_table *t = imdb_table_by_name(db, name);
@@ -1828,7 +1839,8 @@ static void t_retain_seed(void)
     /* an EXPIRE naming a segment start below the replica's floor (s3, in (s2, S]), which its own log never held: only
      * the seed's FLOOR knows it began a segment, and when (the starts it carries) */
     uint64_t c0 = db->seq, h0 = horizon_of(db, "a");
-    imdb_clock_offset(25 * SEC_US);
+    clock_past(db->last_time, 7 * SEC_US); /* the UPDATE that began the segment after the snapshot: s3 (+15 s) is past
+                                            * the retention, that segment (+20 s) is not */
     OK(ex(&s, "SELECT COUNT(*) FROM a"));
     CHECK(horizon_of(db, "a") > h0 && horizon_of(db, "a") <= S);
     OK(ship_to_file(p, c0, sf, E));
@@ -1862,7 +1874,7 @@ static void t_retain_seed(void)
     uint64_t s9 = db->seq + 1;
     OK(ex(&s, "UPDATE a SET v = 57 WHERE id = 2"));
     OK(ex(&s, "CHECKPOINT"));
-    imdb_clock_offset(40 * SEC_US); /* past s9's start (t0+25) by the retention */
+    clock_past(db->last_time, 15 * SEC_US); /* past s9's start (before the last commit) by the retention */
     OK(ex(&s, "SELECT COUNT(*) FROM a")); /* the horizons move past the seed's floor */
     OK(ship_to_file(p, from, sf, E)); /* the replica follows to the RETIRE: past its cut it could only be seeded */
     rdb = ropen(r, false);
