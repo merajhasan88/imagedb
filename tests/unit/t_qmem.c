@@ -211,7 +211,8 @@ static void t_qmem_lake(void)
 }
 
 /* The ceiling belongs to its statement: never left after one that answers, fails, is cancelled or is refused; inside a
- * transaction; never on a write (an INSERT and an UPDATE far larger than the workspace succeed), on DDL or on
+ * transaction; never on what a write writes (an INSERT and an UPDATE far larger than the workspace succeed: they read
+ * little; their reading is under it, P2 S8, t_dml_write_ceiling), on DDL or on
  * maintenance; and SET statement_memory's range */
 static void t_qmem_scope(void)
 {

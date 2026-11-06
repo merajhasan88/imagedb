@@ -118,6 +118,7 @@ typedef struct sql_win { /* OVER ( [PARTITION BY part ...] [ORDER BY ord ...] [R
 
 /* isolation levels as written (the executor maps them; SERIALIZABLE is refused for now) */
 enum { SQL_ISO_SNAPSHOT = 1, SQL_ISO_READ_COMMITTED, SQL_ISO_SERIALIZABLE };
+enum { SQL_UPSERT_NOTHING = 1, SQL_UPSERT_UPDATE }; /* P2 S8: ON CONFLICT DO NOTHING | DO UPDATE */
 
 typedef struct sql_stmt {
     uint8_t kind;
@@ -162,12 +163,21 @@ typedef struct sql_stmt {
     sql_lit *vals;                              /* INSERT: nrows x rowlen */
     uint32_t nrows;
     uint16_t rowlen;
+    struct sql_stmt *src;                       /* P2 S8: INSERT ... query: the query whose rows it inserts (its own
+                                                 * statement, not a row set of this one: nothing reads it by name) */
+    uint8_t upsert;                             /* P2 S8: INSERT ... ON CONFLICT: SQL_UPSERT_NOTHING or SQL_UPSERT_UPDATE
+                                                 * (0: none); DO UPDATE's SET in set_cols / set_vals, EXCLUDED as
+                                                 * table2 (join_col's side 1) */
+    uint8_t nconf;                              /* its target's columns (0: the primary key) */
+    char conf_cols[IMDB_MAX_INDEX_COLS][IMDB_MAX_IDENT + 1];
+    uint16_t upsert_where;                      /* DO UPDATE ... WHERE: a condition's tree, else 0 */
     char set_cols[IMDB_MAX_COLS][IMDB_MAX_IDENT + 1]; /* UPDATE */
     sql_lit set_vals[IMDB_MAX_COLS];
     uint16_t nset;
     sql_cmp where[IMDB_MAX_PREDICATES];
     uint16_t nwhere;
-    bool star;                                  /* SELECT */
+    bool star;                                  /* SELECT; P2 S8: RETURNING * */
+    bool returning;                             /* P2 S8: INSERT, UPDATE, DELETE ... RETURNING: items[] over the row */
     bool no_from;                               /* P2 S1: SELECT of expressions alone: one row, no table */
     sql_item items[IMDB_MAX_COLS];
     uint16_t nitems;

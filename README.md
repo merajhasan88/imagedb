@@ -99,8 +99,12 @@ it is a quarter of the budget, or 1 GiB without one. The lake's segments a query
 reads are not in this limit: they stay in memory until the query ends (the
 segment cache, `--seg-cache`, trims them after it), so a query's peak is its limit
 plus the segments it read; a scan that lets go of what it has passed is still to
-come. Writes are bounded by the budget, not by this limit, and nothing spills to
-disk.
+come. A write's reading is under the same limit: its nested SELECTs, INSERT's query,
+RETURNING's rows, and the rows an UPDATE or DELETE selects (8 bytes each, a list
+that doubles as it grows: at most about statement_memory / 16 rows, 65,536 at the
+1 MiB minimum, far past a transaction's 1,048,576 operations at the default). What
+a write writes is bounded by the budget and the transaction's limits, not by this
+limit, and nothing spills to disk.
 
 `SET statement_timeout = MS` stops any statement of the session that runs longer
 (0, the default, is none), and Ctrl-C in `imagedb sql` stops the running statement:
@@ -480,7 +484,7 @@ statement):
 | `statement_timeout` | 0 to 86,400,000 ms | 0 (none) | cancels a statement that runs longer |
 | `transaction_timeout` | 0 to 86,400,000 ms | 0 (none) | a transaction older than it can only roll back (from the next BEGIN) |
 | `idle_in_transaction_timeout` | 0 to 86,400,000 ms | 0 (none) | a transaction idle that long can only roll back (from the next BEGIN) |
-| `statement_memory` | 0, or 1 MiB to 16 GiB | 0: a quarter of the budget, or 1 GiB | a read statement's hard memory limit |
+| `statement_memory` | 0, or 1 MiB to 16 GiB | 0: a quarter of the budget, or 1 GiB | a statement's hard memory limit for what it reads (a write's too) |
 | `statement_row_limit` | 0 to 2^62 rows | 0 (none) | the rows a statement may test |
 | `slow_statement_ms` | 0 to 86,400,000 ms | 0 (none) | statements at least that long go to the event log |
 | `sync_replicas` | 0 to 64 | 0 | a commit waits for that many replicas' acknowledgements (a primary's) |
@@ -805,6 +809,62 @@ SELECT id, amount - prev AS change
   shorten that work; the statement's memory ceiling bounds it). At most 8
   window functions in a SELECT. Not yet: a window function
   inside an expression, named windows, PERCENT_RANK, CUME_DIST, NTH_VALUE.
+
+Writes from a query, and the rows they wrote:
+
+```sql
+INSERT INTO archive SELECT * FROM orders WHERE placed < '2026-01-01';
+INSERT INTO totals (cust, n) SELECT cust, COUNT(*) FROM orders GROUP BY cust;
+UPDATE accounts SET balance = balance - 100 WHERE id = 7 RETURNING balance;
+DELETE FROM sessions WHERE expires < '2026-11-01' RETURNING id, user_id;
+INSERT INTO counters (k, n) VALUES (7, 1)
+  ON CONFLICT (k) DO UPDATE SET n = counters.n + excluded.n RETURNING n;
+UPDATE stock SET qty = stock.qty - o.qty FROM orders AS o WHERE o.item = stock.item AND o.day = 5;
+DELETE FROM sessions USING users WHERE users.id = sessions.user_id AND users.banned;
+```
+
+- `INSERT INTO t [(columns)]` takes any query: a SELECT, a set operation, one
+  in parentheses (`INSERT INTO t (SELECT ...)`: a column list names columns),
+  `WITH ... SELECT`, and `WITH ... INSERT` reads its names too. The query runs
+  whole at the statement's snapshot before the first row is written, so an
+  INSERT reading its own table never reads its own rows. Values go to columns
+  by position, assigned as UPDATE's SET assigns: an integer into a DECIMAL
+  exactly, a DECIMAL rounded half away from zero to the column's places, a
+  number into a FLOAT64, nothing else converted (a fraction into an integer or
+  a string into a TIMESTAMP is refused: CAST it). A query of more rows than
+  the transaction has room for is refused before any is written.
+- `RETURNING * | expression [[AS] name], ...` on INSERT, UPDATE and DELETE:
+  each row as written (INSERT's and UPDATE's new values, DELETE's old ones),
+  in the order written: INSERT's in its rows' order (with ON CONFLICT too),
+  UPDATE's and DELETE's by version, oldest first, not by key (with FROM or
+  USING, by t's key). Its rows are a result, under the statement's memory
+  limit. Not yet in it: an aggregate, a window function, a nested SELECT.
+- `INSERT ... ON CONFLICT [(key)] DO NOTHING` keeps the existing row of a
+  proposed row's primary key; `ON CONFLICT (key) DO UPDATE SET c = v, ...`
+  `[WHERE condition]` writes it instead, reading the existing row by the
+  table's name and the proposed one as `excluded` (a column of both,
+  unqualified, is refused as ambiguous, as PostgreSQL refuses it). A key the
+  statement itself wrote is not written twice: DO NOTHING keeps the first,
+  DO UPDATE refuses the statement. The conflict is found in the statement's
+  view: under SNAPSHOT isolation a key another session committed after the
+  transaction began is not in it, and the statement fails with "could not
+  serialize access" (retry), never a second row; under READ COMMITTED each
+  statement sees what was committed before it, and resolves it. The target is
+  the primary key, and DO NOTHING without one resolves the primary key alone
+  (a row whose unique index's key is taken fails as a plain INSERT does, where
+  PostgreSQL would skip it); a unique index's columns as the target are a later
+  step. RETURNING gives the rows inserted or updated, and the count is theirs.
+- `UPDATE t SET ... FROM u [AS a] [WHERE ...]` and `DELETE FROM t USING u
+  [AS a] [WHERE ...]`: t joined with one other table (an inner join, the
+  WHERE its condition), run whole at the statement's snapshot before the first
+  write; SET reads both rows, an unqualified column of both refused as
+  ambiguous. Each t row is changed once: an UPDATE whose t row two rows of u
+  match is refused (PostgreSQL would take one of them, which one unspecified);
+  DELETE removes it once. The rows are written, and RETURNING's rows come, in
+  t's key order. Not yet: a nested SELECT or more than one table after FROM or
+  USING, EXPLAIN of either, RETURNING u's columns.
+- RETURNING, WITH and ON are reserved words; a SELECT item that is
+  NULL is a TEXT NULL, with FROM or without.
 
 ## Validation
 

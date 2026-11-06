@@ -205,6 +205,7 @@ static const char *const kReserved[] = {
     "case", "when", "then", "else", "end", "cast", "in", "like", "escape", /* P2 S1 */
     "union", "intersect", "except", /* P2 S5: never a FROM item's alias */
     "over",                          /* P2 S6 */
+    "returning", "with", "on",       /* P2 S8: never an alias in INSERT's query (ON CONFLICT); WITH, as PostgreSQL */
 };
 
 static bool tok_is_kw(const parser *p, uint32_t at, const char *kw)
@@ -1116,18 +1117,185 @@ static int parse_create(parser *p, sql_stmt *st)
     return IMDB_OK;
 }
 
+static int parse_query(parser *p, sql_stmt *st); /* P2 S5 */
+
+/* WITH [RECURSIVE] name [(c1, ...)] AS (query) [, ...], WITH already read: each a nested SELECT of st by its name (P2
+ * S4, S5); P2 S8: before a SELECT or an INSERT, and inside INSERT's query */
+static int parse_with_list(parser *p, sql_stmt *st)
+{
+    bool rec = kw(p, "recursive");
+    do {
+        char name[IMDB_MAX_IDENT + 1], cols[IMDB_MAX_COLS][IMDB_MAX_IDENT + 1];
+        uint8_t nc = 0;
+        if (ident(p, name)) return p->e->code;
+        if (tok(p, TK_LP)) {
+            int rc = IMDB_OK;
+            do {
+                if (nc >= IMDB_MAX_COLS) rc = imdb_fail(p->e, IMDB_ERR_LIMIT, "a WITH names more than %u columns", IMDB_MAX_COLS);
+                else rc = ident(p, cols[nc++]);
+                for (uint8_t i = 0; !rc && i + 1 < nc; i++)
+                    if (!strcmp(cols[i], cols[nc - 1])) rc = imdb_fail(p->e, IMDB_ERR_INVALID, "a WITH names its column %s twice", cols[i]);
+            } while (!rc && tok(p, TK_COMMA));
+            if (rc || expect(p, TK_RP, ")")) return p->e->code;
+        }
+        if (expect_kw(p, "as") || expect(p, TK_LP, "(") || parse_nested(p, st, name) || expect(p, TK_RP, ")"))
+            return p->e->code;
+        sql_stmt *in = st->sub[st->nsub - 1];
+        in->recursive = rec;
+        if (nc) {
+            if (!(in->cte_col = imdb_alloc((size_t)nc * sizeof *in->cte_col, p->e))) return p->e->code;
+            memcpy(in->cte_col, cols, (size_t)nc * sizeof *in->cte_col);
+            in->cte_ncols = nc;
+        }
+    } while (tok(p, TK_COMMA));
+    return IMDB_OK;
+}
+
+/* P2 S8: a query starts at token at (SELECT, WITH, or a parenthesized one) */
+static bool query_at(const parser *p, uint32_t at)
+{
+    return tok_is_kw(p, at, "select") || tok_is_kw(p, at, "with") || p->t[at].kind == TK_LP;
+}
+
+/* P2 S8: INSERT's query: its own statement, st->src, one level down (FOR UPDATE refused there, as in any nested
+ * SELECT); a WITH before it is its own */
+static int insert_query(parser *p, sql_stmt *st)
+{
+    if (!query_at(p, p->i)) return imdb_fail(p->e, IMDB_ERR_SYNTAX, "expected VALUES or a query (SELECT, WITH or one in parentheses)");
+    sql_stmt *in = imdb_alloc(sizeof *in, p->e);
+    if (!in) return p->e->code;
+    memset(in, 0, sizeof *in);
+    st->src = in;
+    sql_stmt *saved = p->st;
+    p->st = in;
+    p->depth++;
+    int rc = kw(p, "with") ? parse_with_list(p, in) : IMDB_OK;
+    if (!rc) rc = parse_query(p, in);
+    p->depth--;
+    p->st = saved;
+    return rc;
+}
+/* P2 S8: UPDATE t SET ... FROM u [AS a] [WHERE condition], DELETE FROM t USING u [AS a] [WHERE condition], FROM or
+ * USING at p->i: st->src is SELECT * FROM t JOIN u ON condition (CROSS without one), which the executor runs whole at
+ * the statement's snapshot; st's SET trees read t and u as a join's two sides (st->table2, alias2) */
+static int join_source(parser *p, sql_stmt *st, const char *what)
+{
+    p->i++;
+    if (p->t[p->i].kind == TK_LP) return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "%s a nested SELECT: a later step (name a table)", what);
+    sql_stmt *in = imdb_alloc(sizeof *in, p->e);
+    if (!in) return p->e->code;
+    memset(in, 0, sizeof *in);
+    st->src = in;
+    in->kind = ST_SELECT;
+    in->star = true;
+    in->has_join = true;
+    in->join_kind = SQL_JOIN_INNER;
+    memcpy(in->table, st->table, sizeof in->table);
+    if (ident(p, in->table2) || alias(p, in->alias2)) return p->e->code;
+    if (p->t[p->i].kind == TK_COMMA) return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "%s one table (more: a later step)", what);
+    if (!strcmp(in->table2, st->table) && !in->alias2[0])
+        return imdb_fail(p->e, IMDB_ERR_INVALID, "%s %s again: name it with AS", what, st->table);
+    memcpy(st->table2, in->table2, sizeof st->table2);
+    memcpy(st->alias2, in->alias2, sizeof st->alias2);
+    if (!kw(p, "where")) {
+        in->join_kind = SQL_JOIN_CROSS;
+        return IMDB_OK;
+    }
+    sql_stmt *saved = p->st;
+    p->st = in;
+    p->depth++;
+    int rc = bexpr(p, &in->on_ex, 0);
+    p->depth--;
+    p->st = saved;
+    if (rc) return rc;
+    const sql_expr *o = &in->ex[in->on_ex]; /* one equality of two columns: the path a join's ON has */
+    if (o->op == EX_CMP && o->cmp == CMP_EQ && in->ex[o->l].op == EX_COL && in->ex[o->r].op == EX_COL) {
+        memcpy(in->on_qual[0], in->ex[o->l].qual, sizeof in->on_qual[0]);
+        memcpy(in->on_col[0], in->ex[o->l].col, sizeof in->on_col[0]);
+        memcpy(in->on_qual[1], in->ex[o->r].qual, sizeof in->on_qual[1]);
+        memcpy(in->on_col[1], in->ex[o->r].col, sizeof in->on_col[1]);
+    }
+    return IMDB_OK;
+}
+
+/* P2 S8: ON CONFLICT [(c, ...)] DO NOTHING | DO UPDATE SET c = v, ... [WHERE condition]: the SET's values and the
+ * condition read the existing row by the table's name and the proposed one as EXCLUDED (table2: join_col's side 1) */
+static int on_conflict(parser *p, sql_stmt *st)
+{
+    if (!tok_is_kw(p, p->i, "on")) return IMDB_OK;
+    p->i++;
+    if (expect_kw(p, "conflict")) return p->e->code;
+    if (tok(p, TK_LP)) {
+        do {
+            if (st->nconf >= IMDB_MAX_INDEX_COLS)
+                return imdb_fail(p->e, IMDB_ERR_LIMIT, "ON CONFLICT names more than %u columns", IMDB_MAX_INDEX_COLS);
+            if (ident(p, st->conf_cols[st->nconf++])) return p->e->code;
+        } while (tok(p, TK_COMMA));
+        if (expect(p, TK_RP, ")")) return p->e->code;
+    }
+    if (expect_kw(p, "do")) return p->e->code;
+    if (kw(p, "nothing")) {
+        st->upsert = SQL_UPSERT_NOTHING;
+        return IMDB_OK;
+    }
+    if (expect_kw(p, "update") || expect_kw(p, "set")) return p->e->code;
+    if (!st->nconf) /* PostgreSQL's rule: which conflict it resolves is named */
+        return imdb_fail(p->e, IMDB_ERR_INVALID, "ON CONFLICT DO UPDATE names its key: ON CONFLICT (column, ...) DO UPDATE");
+    st->upsert = SQL_UPSERT_UPDATE;
+    snprintf(st->table2, sizeof st->table2, "excluded");
+    do {
+        if (st->nset >= IMDB_MAX_COLS) return imdb_fail(p->e, IMDB_ERR_LIMIT, "too many assignments");
+        if (ident(p, st->set_cols[st->nset]) || expect(p, TK_EQ, "=") || value(p, &st->set_vals[st->nset])) return p->e->code;
+        st->nset++;
+    } while (tok(p, TK_COMMA));
+    return kw(p, "where") && bexpr(p, &st->upsert_where, 0) ? p->e->code : IMDB_OK;
+}
+
+/* P2 S8: RETURNING * | item [[AS] alias], ...: each item a tree over the row written (INSERT's and UPDATE's new
+ * values, DELETE's old ones), its own columns alone: no aggregate, window function or nested SELECT */
+static int returning(parser *p, sql_stmt *st)
+{
+    if (!kw(p, "returning")) return IMDB_OK;
+    st->returning = true;
+    if (tok(p, TK_STAR)) {
+        st->star = true;
+        return IMDB_OK;
+    }
+    do {
+        if (st->nitems >= IMDB_MAX_COLS) return imdb_fail(p->e, IMDB_ERR_LIMIT, "too many RETURNING items");
+        sql_item *it = &st->items[st->nitems];
+        uint32_t from = p->t[p->i].off - (p->t[p->i].kind == TK_STR); /* a string token's span: inside its quotes */
+        uint8_t nsub = st->nsub;
+        uint16_t k;
+        if (bexpr(p, &k, 0)) return p->e->code;
+        if (st->nsub != nsub) return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "a nested SELECT in RETURNING: a later step");
+        if (imdb_sql_has_agg(st, k))
+            return imdb_fail(p->e, IMDB_ERR_INVALID, "RETURNING computes on each row written: no aggregate");
+        it->off = from;
+        it->len = p->t[p->i - 1].off + p->t[p->i - 1].len + (p->t[p->i - 1].kind == TK_STR) - from;
+        if (kw(p, "as") ? ident(p, it->alias)
+                        : p->t[p->i].kind == TK_IDENT && !is_reserved(p, p->i) && ident(p, it->alias))
+            return p->e->code;
+        it->expr = k; /* a bare column too: evaluated on the row */
+        st->nitems++;
+    } while (tok(p, TK_COMMA));
+    return IMDB_OK;
+}
+
+
 static int parse_insert(parser *p, sql_stmt *st)
 {
     st->kind = ST_INSERT;
     if (expect_kw(p, "into") || ident(p, st->table)) return p->e->code;
-    if (tok(p, TK_LP)) {
+    if (p->t[p->i].kind == TK_LP && !query_at(p, p->i + 1)) { /* a column list: (SELECT ...) is a query (P2 S8) */
+        tok(p, TK_LP);
         do {
             if (st->ncols >= IMDB_MAX_COLS) return imdb_fail(p->e, IMDB_ERR_LIMIT, "too many columns");
             if (ident(p, st->cols[st->ncols++])) return p->e->code;
         } while (tok(p, TK_COMMA));
         if (expect(p, TK_RP, ")")) return p->e->code;
     }
-    if (expect_kw(p, "values")) return p->e->code;
+    if (!kw(p, "values")) return insert_query(p, st) || on_conflict(p, st) ? p->e->code : returning(p, st); /* P2 S8 */
     uint32_t cap = 0;
     do {
         if (st->nrows >= IMDB_MAX_INSERT_ROWS)
@@ -1156,7 +1324,7 @@ static int parse_insert(parser *p, sql_stmt *st)
         }
         st->nrows++;
     } while (tok(p, TK_COMMA));
-    return IMDB_OK;
+    return on_conflict(p, st) ? p->e->code : returning(p, st); /* P2 S8 */
 }
 
 /* ISOLATION LEVEL SNAPSHOT | REPEATABLE READ | READ COMMITTED | READ UNCOMMITTED | SERIALIZABLE */
@@ -1573,6 +1741,11 @@ void imdb_sql_stmt_free(sql_stmt *st)
     imdb_free(st->cte_col); /* P2 S5 */
     st->cte_col = NULL;
     st->cte_ncols = 0;
+    if (st->src) { /* P2 S8 */
+        imdb_sql_stmt_free(st->src);
+        imdb_free(st->src);
+        st->src = NULL;
+    }
     imdb_free(st->vals);
     st->vals = NULL;
     imdb_free(st->ex);
@@ -1632,41 +1805,20 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
                     break;
                 st->nset++;
             } while (tok(&p, TK_COMMA));
-            if (!rc && kw(&p, "where")) rc = preds(&p, st);
+            if (!rc && tok_is_kw(&p, p.i, "from")) rc = join_source(&p, st, "UPDATE ... FROM"); /* P2 S8 */
+            else if (!rc && kw(&p, "where")) rc = preds(&p, st);
+            if (!rc) rc = returning(&p, st); /* P2 S8 */
         }
     } else if (kw(&p, "delete")) {
         st->kind = ST_DELETE;
-        if (!(rc = expect_kw(&p, "from")) && !(rc = ident(&p, st->table)) && kw(&p, "where")) rc = preds(&p, st);
+        if (!(rc = expect_kw(&p, "from")) && !(rc = ident(&p, st->table))) {
+            if (tok_is_kw(&p, p.i, "using")) rc = join_source(&p, st, "DELETE ... USING"); /* P2 S8 */
+            else if (kw(&p, "where")) rc = preds(&p, st);
+        }
+        if (!rc) rc = returning(&p, st); /* P2 S8 */
     } else if (kw(&p, "with")) { /* P2 S4: WITH name AS (SELECT ...) [, ...] SELECT ...; P2 S5: RECURSIVE, (c1, ...) */
-        bool rec = kw(&p, "recursive");
-        do {
-            char name[IMDB_MAX_IDENT + 1], cols[IMDB_MAX_COLS][IMDB_MAX_IDENT + 1];
-            uint8_t nc = 0;
-            if ((rc = ident(&p, name))) break;
-            if (tok(&p, TK_LP)) {
-                do {
-                    if (nc >= IMDB_MAX_COLS) rc = imdb_fail(e, IMDB_ERR_LIMIT, "a WITH names more than %u columns", IMDB_MAX_COLS);
-                    else rc = ident(&p, cols[nc++]);
-                    for (uint8_t i = 0; !rc && i + 1 < nc; i++)
-                        if (!strcmp(cols[i], cols[nc - 1])) rc = imdb_fail(e, IMDB_ERR_INVALID, "a WITH names its column %s twice", cols[i]);
-                } while (!rc && tok(&p, TK_COMMA));
-                if (rc || (rc = expect(&p, TK_RP, ")"))) break;
-            }
-            if ((rc = expect_kw(&p, "as")) || (rc = expect(&p, TK_LP, "(")) || (rc = parse_nested(&p, st, name)) ||
-                (rc = expect(&p, TK_RP, ")")))
-                break;
-            sql_stmt *in = st->sub[st->nsub - 1];
-            in->recursive = rec;
-            if (nc) {
-                if (!(in->cte_col = imdb_alloc((size_t)nc * sizeof *in->cte_col, e))) {
-                    rc = e->code;
-                    break;
-                }
-                memcpy(in->cte_col, cols, (size_t)nc * sizeof *in->cte_col);
-                in->cte_ncols = nc;
-            }
-        } while (tok(&p, TK_COMMA));
-        if (!rc) rc = parse_query(&p, st); /* P2 S5: a set operation too */
+        if (!(rc = parse_with_list(&p, st))) /* P2 S5: a set operation too; P2 S8: WITH ... INSERT, its query reading them */
+            rc = kw(&p, "insert") ? parse_insert(&p, st) : parse_query(&p, st);
     } else if (tok_is_kw(&p, p.i, "select") || p.t[p.i].kind == TK_LP) {
         rc = parse_query(&p, st); /* P2 S5: a set operation too, or a parenthesized query */
     }

@@ -175,6 +175,7 @@ typedef struct xctx {
     uint16_t oref[2 * IMDB_MAX_COLS];
     struct xcorr *corr;           /* this statement's correlated subqueries, one per nested SELECT (NULL: none) */
     imdb_result *probe_r;         /* the bind-only pass's result: its columns typed, no row (probe_types) */
+    bool wceil;                   /* P2 S8: a write set the memory ceiling for its reading (wceil_set) */
 } xctx;
 
 enum { TICK_ROWS = 4096 }; /* rows between two looks at the clock and the cancel flag: tens of microseconds of work */
@@ -401,7 +402,7 @@ typedef struct xcorr {
     imdb_buf kenc;
 } xcorr;
 
-enum { NEST_TABLE, NEST_FIRST, NEST_PROBE, NEST_ROW }; /* P2 S4b: run_nested's runs */
+enum { NEST_TABLE, NEST_FIRST, NEST_PROBE, NEST_ROW, NEST_SOURCE }; /* P2 S4b: run_nested's runs; P2 S8: INSERT's query */
 
 static void corr_free(xctx *x)
 {
@@ -900,20 +901,25 @@ static int xbind_node(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
         return IMDB_OK;
     case EX_COL: {
         if (!sc->cols) return imdb_fail(e, IMDB_ERR_INVALID, "column %s cannot be read here: VALUES takes constants", n->col);
-        int c, side;
+        int c, side = 0;
+        const imdb_column *cd; /* its type: a join's side's own (P2 S8: an upsert's two sides share one schema, with no
+                                * combined copy) */
         if (sc->jt) {
             if (join_col(sc->st, sc->jt, n->qual, n->col, &side, &c, e)) return bind_outer(x, sc, k, e); /* P2 S4b */
+            cd = &sc->jt[side]->s.cols[c];
             c = side ? sc->nc0 + c : c;
         } else if ((c = one_col(sc->st, sc->t, n->qual, n->col, e)) < 0) {
             return bind_outer(x, sc, k, e); /* P2 S4b: a column of the statement around this one, or the error */
+        } else {
+            cd = &sc->s->cols[c];
         }
         if (sc->group_col >= 0 && !sc->in_agg && c != sc->group_col)
             return imdb_fail(e, IMDB_ERR_INVALID, "column %s must be the GROUP BY column or inside an aggregate", n->col);
         if (sc->ngk && !sc->in_agg && !sc->in_key) /* P2 S2: grouped by trees, a column stands in a key or an aggregate */
             return imdb_fail(e, IMDB_ERR_INVALID, "column %s must be a GROUP BY key, or inside one or an aggregate", n->col);
         b->col = (int16_t)c;
-        b->type = sc->s->cols[c].type;
-        b->scale = sc->s->cols[c].scale;
+        b->type = cd->type;
+        b->scale = cd->scale;
         return IMDB_OK;
     }
     case EX_AGG: {
@@ -2006,7 +2012,7 @@ static int run_nested(xctx *x, const sql_stmt *in, imdb_result *r, uint8_t mode,
     s.env.arena = &s.arena;
     memcpy(s.vis, x->vis, x->nvis * sizeof *s.vis);
     s.nvis = x->nvis;
-    if (mode != NEST_TABLE) {
+    if (mode != NEST_TABLE && mode != NEST_SOURCE) { /* P2 S8: INSERT's query reads only its own, as a derived table */
         s.up = x;
         s.upscope = sc;
         s.upv = upv;
@@ -2028,7 +2034,7 @@ static int run_nested(xctx *x, const sql_stmt *in, imdb_result *r, uint8_t mode,
     x->next_check = s.next_check;
     x->tested = s.tested;
     xfree(&s);
-    if (rc && !def) rc = nested_unresolved(x, rc, mode, e);
+    if (rc && !def && mode != NEST_SOURCE) rc = nested_unresolved(x, rc, mode, e); /* INSERT's target: not around it */
     return rc;
 }
 
@@ -2896,10 +2902,11 @@ static bool ex_reads(const sql_stmt *st, uint16_t k)
 /* a tree item bound into the statement's sink: its aggregates become slots (xa_row); an aggregate item when it
  * holds one, a plain one when it reads a column outside one (grouped: the GROUP BY column alone, xbind's rule); a
  * tree of constants is neither and stands beside either */
-static int bind_item(xctx *x, sink *k, xscope *si, uint16_t root, bool *any_agg, bool *any_plain, imdb_err *e)
+static int bind_item(xctx *x, sink *k, xscope *si, uint16_t root, bool item, bool *any_agg, bool *any_plain, imdb_err *e)
 {
     k->trees = true;
-    if (xnodes(x, si->st, e) || xbind(x, si, root, e)) return e->code;
+    if (xnodes(x, si->st, e) || (item ? xbind_v(x, si, root, e) : xbind(x, si, root, e))) return e->code;
+    if (item) x_type_null(x, root, IMDB_T_TEXT, 0); /* P2 S8: SELECT NULL with FROM: a TEXT NULL, as without it */
     if (imdb_sql_has_agg(si->st, root)) *any_agg = true;
     else if (ex_reads(si->st, root)) *any_plain = true;
     return IMDB_OK;
@@ -2944,7 +2951,7 @@ static int bind_order(xctx *x, const sql_stmt *st, sink *k, xscope *si, uint16_t
         }
         if (st->distinct && !distinct_key(st, st->ord_ex[o]))
             return imdb_fail(e, IMDB_ERR_INVALID, "with DISTINCT, ORDER BY names select items: a position, or a column the list names");
-        if (bind_item(x, k, si, st->ord_ex[o], any_agg, any_plain, e)) return e->code;
+        if (bind_item(x, k, si, st->ord_ex[o], false, any_agg, any_plain, e)) return e->code;
     }
     return IMDB_OK;
 }
@@ -2954,7 +2961,7 @@ static int bind_order(xctx *x, const sql_stmt *st, sink *k, xscope *si, uint16_t
 static int bind_having(xctx *x, const sql_stmt *st, sink *k, xscope *si, bool *any_agg, bool *any_plain, imdb_err *e)
 {
     if (!st->having) return IMDB_OK;
-    if (bind_item(x, k, si, st->having, any_agg, any_plain, e)) return e->code;
+    if (bind_item(x, k, si, st->having, false, any_agg, any_plain, e)) return e->code;
     if (x->xn[st->having].type != IMDB_T_BOOL)
         return imdb_fail(e, IMDB_ERR_INVALID, "HAVING takes a condition: a comparison, IS NULL, AND, OR, NOT or a BOOL");
     return IMDB_OK;
@@ -3020,7 +3027,7 @@ static int plan_select(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb
         const sql_item *it = &st->items[i];
         k->item_col[i] = -1;
         if (it->expr) { /* a tree: per row (materialize), or over its aggregates' slots */
-            if (bind_item(x, k, &si, it->expr, &any_agg, &any_plain, e)) return e->code;
+            if (bind_item(x, k, &si, it->expr, true, &any_agg, &any_plain, e)) return e->code;
             continue;
         }
         if (it->agg == AGG_COUNT_STAR) {
@@ -4260,7 +4267,7 @@ static int plan_join_sink(xctx *x, const sql_stmt *st, jctx *j, sink *k, imdb_er
         const sql_item *it = &st->items[i];
         k->item_col[i] = -1;
         if (it->expr) { /* a tree: per row (materialize), or over its aggregates' slots */
-            if (bind_item(x, k, &si, it->expr, &any_agg, &any_plain, e)) return e->code;
+            if (bind_item(x, k, &si, it->expr, true, &any_agg, &any_plain, e)) return e->code;
             continue;
         }
         if (it->agg == AGG_COUNT_STAR) {
@@ -5844,14 +5851,219 @@ static int select_vids(xctx *x, const sql_stmt *st, imdb_table *t, bool all_vers
 
 /* ---- DML ---------------------------------------------------------------------------- */
 
+/* P2 S8: a write's reading (its nested SELECTs, INSERT's query, the rows UPDATE and DELETE select) is under the
+ * statement's memory ceiling, as a read statement is (R2); set here unless one is (an outer one's base never moves),
+ * lifted before the first write: what a write writes is its transaction's, bounded by the transaction's limits. The
+ * session lifts it too, after the statement, whichever way it left */
+static void wceil_set(xctx *x)
+{
+    if (imdb_heap_ceiling()) return;
+    imdb_heap_ceiling_set(imdb_heap_bytes() + workspace_of(x->ss), workspace_of(x->ss));
+    x->wceil = true;
+}
+
+static void wceil_lift(xctx *x)
+{
+    if (!x->wceil) return;
+    imdb_heap_ceiling_set(0, 0);
+    x->wceil = false;
+}
+
+/* P2 S8: RETURNING's items over table t's row, bound once (a NULL item a TEXT NULL, as a SELECT's), and the result's
+ * columns named and typed */
+static int ret_prepare(xctx *x, const sql_stmt *st, imdb_table *t, imdb_result *r, imdb_err *e)
+{
+    xscope sc = {.st = st, .s = &t->s, .t = t, .cols = true, .group_col = -1, .no_corr = true};
+    for (uint16_t i = 0; !st->star && i < st->nitems; i++) {
+        if (xnodes(x, st, e) || xbind_v(x, &sc, st->items[i].expr, e)) return e->code;
+        x_type_null(x, st->items[i].expr, IMDB_T_TEXT, 0);
+    }
+    uint16_t n = st->star ? t->s.ncols : st->nitems;
+    if (res_cols(r, n)) return imdb_fail(e, IMDB_ERR_NOMEM, "a result's columns");
+    for (uint16_t i = 0; i < n; i++) {
+        char nm[sizeof r->names[0]];
+        if (st->star) snprintf(nm, sizeof nm, "%s", t->s.cols[i].name);
+        else item_name(x, &st->items[i], nm, sizeof nm);
+        res_name(r, i, nm);
+    }
+    col_types(x, st, NULL, &t->s, r);
+    return IMDB_OK;
+}
+
+/* P2 S8: RETURNING's row for the row about to be written (vals, by column: INSERT's and UPDATE's new values, DELETE's
+ * old ones), computed before the write: a TEXT of vals may point into an image or the arena, and the result copies
+ * its own. What it computes goes from the arena with the row */
+static int ret_row(xctx *x, const sql_stmt *st, const imdb_table *t, const imdb_value *vals, imdb_result *r, imdb_err *e)
+{
+    imdb_cell *row = res_row(r, e);
+    if (!row) return e->code;
+    imdb_xmark m = imdb_xarena_mark(&x->arena);
+    int rc = IMDB_OK;
+    for (uint16_t i = 0; i < (st->star ? t->s.ncols : st->nitems) && !rc; i++) {
+        imdb_xval v;
+        if (st->star) res_put(r, &row[i], &vals[i]);
+        else if (!(rc = imdb_x_eval(st, x->xn, st->items[i].expr, vals, NULL, &x->env, &v, e))) res_put_x(r, &row[i], &v);
+    }
+    imdb_xarena_reset(&x->arena, m);
+    return rc;
+}
+
+/* P2 S8: an INSERT's writing: the statement's view (ON CONFLICT reads it), the table's version count when the statement
+ * began (a vid at or past it is a version this statement made: vids only grow), DO UPDATE's SET columns and literal
+ * values (a tree's computed per row), and the rows inserted or updated */
+typedef struct ups {
+    uint64_t first, snap, pend, written;
+    int cols[IMDB_MAX_COLS];
+    imdb_value lit[IMDB_MAX_COLS];
+} ups;
+
+/* P2 S8: ON CONFLICT's target checked (the primary key; a unique index's columns are a later step) and DO UPDATE's
+ * values and condition bound over the existing row (side 0, the table's name) beside the proposal (side 1, EXCLUDED) */
+static int ups_prepare(xctx *x, const sql_stmt *st, imdb_table *t, ups *u, imdb_err *e)
+{
+    memset(u, 0, sizeof *u);
+    u->first = t->nver;
+    if (!st->upsert) return IMDB_OK;
+    if (st->nconf && (st->nconf != 1 || imdb_schema_col(&t->s, st->conf_cols[0]) != t->s.pk)) {
+        for (uint32_t k = 0; k < t->nidx; k++) {
+            const imdb_index_def *d = &t->idx[k].d;
+            bool same = (d->flags & IMDB_INDEX_UNIQUE) && d->ncols == st->nconf;
+            for (uint8_t i = 0; same && i < st->nconf; i++) {
+                bool in = false;
+                for (uint8_t j = 0; j < d->ncols; j++) in |= imdb_schema_col(&t->s, st->conf_cols[i]) == (int)d->cols[j];
+                same = in;
+            }
+            if (same)
+                return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "ON CONFLICT on unique index %s: a later step (the primary key is a "
+                                                          "target today)", d->name);
+        }
+        return imdb_fail(e, IMDB_ERR_INVALID, "ON CONFLICT's columns are no key of table %s: name its primary key",
+                         t->s.name);
+    }
+    read_view(x, &u->snap, &u->pend);
+    if (check_view(x, t, u->snap, false, e)) return e->code;
+    if (st->upsert != SQL_UPSERT_UPDATE) return IMDB_OK;
+    imdb_table *const jt[2] = {t, t};
+    xscope sc = {.st = st, .s = &t->s, .jt = jt, .nc0 = t->s.ncols, .cols = true, .group_col = -1, .no_corr = true};
+    for (uint16_t k = 0; k < st->nset; k++) {
+        int c = u->cols[k] = imdb_schema_col(&t->s, st->set_cols[k]);
+        if (c < 0) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no column %s in table %s", st->set_cols[k], t->s.name);
+        if (c == t->s.pk) return imdb_fail(e, IMDB_ERR_INVALID, "ON CONFLICT DO UPDATE cannot change the primary key");
+        for (uint16_t j = 0; j < k; j++)
+            if (u->cols[j] == c) return imdb_fail(e, IMDB_ERR_INVALID, "column %s is set twice", st->set_cols[k]);
+        if (st->set_vals[k].kind == LIT_EXPR) {
+            if (xnodes(x, st, e) || xbind(x, &sc, st->set_vals[k].ex, e)) return e->code;
+        } else if (bind_lit(x, &st->set_vals[k], &t->s.cols[c], false, &u->lit[k], e)) {
+            return e->code;
+        }
+    }
+    if (st->upsert_where) {
+        if (xnodes(x, st, e) || xbind(x, &sc, st->upsert_where, e)) return e->code;
+        if (x->xn[st->upsert_where].type != IMDB_T_BOOL)
+            return imdb_fail(e, IMDB_ERR_INVALID, "ON CONFLICT DO UPDATE ... WHERE takes a condition");
+    }
+    return IMDB_OK;
+}
+
+/* P2 S8: one proposed row (vals, by column) inserted; under ON CONFLICT, a row its key names in the statement's view
+ * resolves it: DO NOTHING keeps that row, DO UPDATE writes it with SET's values unless WHERE says no. A row this
+ * statement wrote is never written twice: DO NOTHING keeps it, DO UPDATE refuses (PostgreSQL's rule). RETURNING's row
+ * is the row written. A key only another session's later commit holds is not in the view: the insert meets it */
+static int write_row(xctx *x, const sql_stmt *st, imdb_table *t, imdb_value *vals, ups *u, imdb_result *r, imdb_err *e)
+{
+    uint64_t vid = IMDB_NONE;
+    if (st->upsert && imdb_lookup_pk_at(x->db, t, &vals[t->s.pk], u->snap, u->pend, &vid, e)) return e->code;
+    uint8_t salt[16];
+    int rc;
+    if (vid == IMDB_NONE) {
+        if (st->returning && ret_row(x, st, t, vals, r, e)) return e->code;
+        rc = imdb_salt_next(&x->salts, salt, e) || imdb_insert_salt(x->db, t, vals, salt, e) ? e->code : IMDB_OK;
+        imdb_wipe(salt, sizeof salt);
+        u->written += !rc;
+        return rc;
+    }
+    if (st->upsert == SQL_UPSERT_NOTHING) return IMDB_OK;
+    if (vid >= u->first)
+        return imdb_fail(e, IMDB_ERR_INVALID, "ON CONFLICT DO UPDATE would change a row twice: two proposed rows share a key");
+    uint16_t nc = t->s.ncols;
+    imdb_value both[2 * IMDB_MAX_COLS], set[IMDB_MAX_COLS];
+    imdb_xmark m = imdb_xarena_mark(&x->arena);
+    rc = fetch_row(x, t, vid, both, e);
+    if (!rc) rc = xpin_row(x, both, nc, e);
+    memcpy(both + nc, vals, nc * sizeof *vals);
+    bool go = !rc;
+    if (go && st->upsert_where) {
+        imdb_xval w;
+        if ((rc = imdb_x_eval(st, x->xn, st->upsert_where, both, NULL, &x->env, &w, e))) go = false;
+        else go = !w.null && w.i; /* not TRUE: the existing row stays */
+    }
+    for (uint16_t k = 0; go && k < st->nset; k++) { /* every value before any column changes */
+        imdb_xval v;
+        if (st->set_vals[k].kind != LIT_EXPR) set[k] = u->lit[k];
+        else if ((rc = imdb_x_eval(st, x->xn, st->set_vals[k].ex, both, NULL, &x->env, &v, e)) ||
+                 (rc = imdb_x_assign(&t->s.cols[u->cols[k]], &v, &set[k], e)))
+            go = false;
+    }
+    if (go) {
+        for (uint16_t k = 0; k < st->nset; k++) both[u->cols[k]] = set[k];
+        if (!(st->returning && (rc = ret_row(x, st, t, both, r, e)))) {
+            rc = imdb_salt_next(&x->salts, salt, e) || imdb_update_salt(x->db, t, vid, both, salt, e) ? e->code : IMDB_OK;
+            imdb_wipe(salt, sizeof salt);
+            u->written += !rc;
+        }
+    }
+    imdb_xarena_reset(&x->arena, m);
+    return rc;
+}
+
+/* P2 S8: INSERT ... query: the query's rows, made whole at the statement's snapshot before the first is written (an
+ * INSERT reading its own table never reads its own rows), each assigned to its column by position as UPDATE's SET
+ * assigns (exact, or refused) */
+static int insert_query(xctx *x, const sql_stmt *st, imdb_table *t, const int *map, uint16_t width, imdb_value *vals,
+                        ups *u, imdb_result *r, imdb_err *e)
+{
+    imdb_result q;
+    imdb_result_init(&q);
+    int rc = run_nested(x, st->src, &q, NEST_SOURCE, NULL, NULL, NULL, NULL, e);
+    wceil_lift(x); /* the rows are made: what follows writes */
+    if (!rc && q.ncols != width)
+        rc = imdb_fail(e, IMDB_ERR_INVALID, "INSERT's query returns %u column%s, table %s needs %u", q.ncols, q.ncols == 1 ? "" : "s",
+                       t->s.name, width);
+    for (uint16_t i = 0; !rc && i < width; i++)
+        if (!q.ctype[i]) rc = imdb_fail(e, IMDB_ERR_STATE, "INSERT's query's column %u has no type", i + 1);
+    uint64_t room = x->db->ntx < x->db->lim_txn_ops ? x->db->lim_txn_ops - x->db->ntx : 0; /* refused before any write,
+                                                                                             * not undone at the limit */
+    if (!rc && q.nrows > room)
+        rc = imdb_fail(e, IMDB_ERR_LIMIT, "transaction exceeds %u operations: INSERT's query returns %llu rows",
+                       x->db->lim_txn_ops, (unsigned long long)q.nrows);
+    for (uint64_t row = 0; !rc && row < q.nrows; row++) {
+        if ((rc = xtick(x, 64, e))) break; /* a write weighs more than a read */
+        for (uint16_t i = 0; i < width && !rc; i++) {
+            imdb_xval v;
+            cell_xval(&q.cells[row * q.ncols + i], q.ctype[i], q.cscale[i], &v);
+            imdb_err e2 = {0};
+            if (imdb_x_assign(&t->s.cols[map[i]], &v, &vals[map[i]], &e2))
+                rc = imdb_fail(e, e2.code, "row %llu: %s", (unsigned long long)(row + 1), e2.msg);
+        }
+        if (rc) break;
+        imdb_err e2 = {0};
+        if (write_row(x, st, t, vals, u, r, &e2)) rc = imdb_fail(e, e2.code, "row %llu: %s", (unsigned long long)(row + 1), e2.msg);
+    }
+    if (!rc) snprintf(r->status, sizeof r->status, "INSERT %llu", (unsigned long long)u->written);
+    if (!rc && st->returning) rc = res_finish(r, e);
+    imdb_result_free(&q);
+    return rc;
+}
+
 static int exec_insert(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
 {
+    if ((st->nsub || st->src) && !x->own) wceil_set(x); /* P2 S8: what it reads */
     if (st->nsub && !x->own && rset_prepare(x, st, e)) return e->code; /* P2 S4: its subqueries, before any write */
     imdb_table *t = imdb_table_by_name(x->db, st->table);
     if (!t) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", st->table);
     int map[IMDB_MAX_COLS];
     uint16_t width = st->ncols ? st->ncols : t->s.ncols;
-    if (st->rowlen != width)
+    if (!st->src && st->rowlen != width)
         return imdb_fail(e, IMDB_ERR_INVALID, "INSERT supplies %u values per row, table %s needs %u", st->rowlen,
                          t->s.name, width);
     imdb_value vals[IMDB_MAX_COLS];
@@ -5873,7 +6085,13 @@ static int exec_insert(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
     } else {
         for (uint16_t i = 0; i < width; i++) map[i] = i;
     }
+    if (st->returning && ret_prepare(x, st, t, r, e)) return e->code; /* P2 S8 */
+    ups u; /* P2 S8 */
+    if (ups_prepare(x, st, t, &u, e)) return e->code;
+    if (st->src) return insert_query(x, st, t, map, width, vals, &u, r, e); /* P2 S8 */
+    wceil_lift(x); /* P2 S8: its subqueries ran; what follows writes */
     for (uint32_t row = 0; row < st->nrows; row++) {
+        if (st->upsert && xtick(x, 64, e)) return e->code; /* P2 S8: a lookup, a read and a write a row: cancellable */
         for (uint16_t i = 0; i < width; i++) {
             const imdb_column *c = &t->s.cols[map[i]];
             imdb_err e2 = {0};
@@ -5881,21 +6099,133 @@ static int exec_insert(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
                 return imdb_fail(e, e2.code, "row %u: %s", row + 1, e2.msg);
         }
         imdb_err e2 = {0};
-        uint8_t salt[16];
-        int irc = imdb_salt_next(&x->salts, salt, &e2) || imdb_insert_salt(x->db, t, vals, salt, &e2);
-        imdb_wipe(salt, sizeof salt);
-        if (irc) return imdb_fail(e, e2.code, "row %u: %s", row + 1, e2.msg);
+        if (write_row(x, st, t, vals, &u, r, &e2)) return imdb_fail(e, e2.code, "row %u: %s", row + 1, e2.msg); /* P2 S8 */
     }
-    snprintf(r->status, sizeof r->status, "INSERT %u", st->nrows);
-    return IMDB_OK;
+    snprintf(r->status, sizeof r->status, "INSERT %llu", (unsigned long long)u.written);
+    return st->returning ? res_finish(r, e) : IMDB_OK;
+}
+
+/* P2 S8: a pair's place in t's key order (UPDATE ... FROM, DELETE ... USING) */
+typedef struct pkrow {
+    imdb_xval k;
+    uint64_t i;
+} pkrow;
+
+static int cmp_pkrow(const void *a, const void *b)
+{
+    const pkrow *p = a, *q = b;
+    int c = imdb_x_cmp(&p->k, &q->k);
+    return c ? c : (p->i > q->i) - (p->i < q->i);
+}
+
+/* P2 S8: UPDATE t SET ... FROM u WHERE c and DELETE FROM t USING u WHERE c: the inner join of t and u (st->src) run
+ * whole at the statement's snapshot, its reading under the ceiling, then its pairs in t's key order. Each t row a pair
+ * names is found again by its key in the statement's view; UPDATE writes it once with SET's values computed from the
+ * pair (t's row beside u's, a join's scope: an unqualified column of both is ambiguous), and refuses a t row two pairs
+ * name (PostgreSQL takes one of them, which one unspecified); DELETE removes it once. The writes, RETURNING's rows
+ * with them, go in t's key order whichever plan the join took */
+static int exec_join_write(xctx *x, const sql_stmt *st, bool upd, imdb_result *r, xplain *xp, imdb_err *e)
+{
+    /* upd: an UPDATE's (st->kind is EXPLAIN's under EXPLAIN) */
+    const char *what = upd ? "UPDATE ... FROM" : "DELETE ... USING";
+    if (xp) return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "EXPLAIN of %s: a later step", what);
+    imdb_table *t = imdb_table_by_name(x->db, st->table), *u = imdb_table_by_name(x->db, st->table2);
+    if (!t) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", st->table);
+    if (!u) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", st->table2);
+    uint16_t nt = t->s.ncols, nu = u->s.ncols;
+    if ((unsigned)nt + nu > IMDB_MAX_COLS)
+        return imdb_fail(e, IMDB_ERR_LIMIT, "a join reads at most %u columns of its two tables", IMDB_MAX_COLS);
+    int cols[IMDB_MAX_COLS];
+    imdb_value lit[IMDB_MAX_COLS];
+    imdb_table *const jt[2] = {t, u};
+    xscope sc = {.st = st, .s = &t->s, .jt = jt, .nc0 = nt, .cols = true, .group_col = -1, .no_corr = true};
+    for (uint16_t k = 0; k < st->nset; k++) {
+        cols[k] = imdb_schema_col(&t->s, st->set_cols[k]);
+        if (cols[k] < 0) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no column %s in table %s", st->set_cols[k], t->s.name);
+        if (cols[k] == t->s.pk) return imdb_fail(e, IMDB_ERR_INVALID, "UPDATE cannot change the primary key (use DELETE + INSERT)");
+        for (uint16_t j = 0; j < k; j++)
+            if (cols[j] == cols[k]) return imdb_fail(e, IMDB_ERR_INVALID, "column %s is set twice", st->set_cols[k]);
+        if (st->set_vals[k].kind == LIT_EXPR) {
+            if (xnodes(x, st, e) || xbind(x, &sc, st->set_vals[k].ex, e)) return e->code;
+        } else if (bind_lit(x, &st->set_vals[k], &t->s.cols[cols[k]], false, &lit[k], e)) {
+            return e->code;
+        }
+    }
+    if (st->returning && ret_prepare(x, st, t, r, e)) return e->code;
+    imdb_result q;
+    imdb_result_init(&q);
+    pkrow *pr = NULL;
+    uint64_t n = 0;
+    int rc = run_nested(x, st->src, &q, NEST_SOURCE, NULL, NULL, NULL, NULL, e);
+    if (!rc && q.ncols != nt + nu) rc = imdb_fail(e, IMDB_ERR_STATE, "%s's join returned %u columns", what, q.ncols);
+    if (!rc && q.nrows && !(pr = imdb_alloc_array(q.nrows, sizeof *pr, e))) rc = e->code;
+    for (uint64_t i = 0; !rc && i < q.nrows; i++) {
+        cell_xval(&q.cells[i * q.ncols + t->s.pk], q.ctype[t->s.pk], q.cscale[t->s.pk], &pr[i].k);
+        pr[i].i = i;
+    }
+    if (!rc && q.nrows) qsort(pr, q.nrows, sizeof *pr, cmp_pkrow);
+    for (uint64_t i = 0; !rc && i < q.nrows; i++) { /* each t row once */
+        if (n && !imdb_x_cmp(&pr[n - 1].k, &pr[i].k)) {
+            if (upd)
+                rc = imdb_fail(e, IMDB_ERR_INVALID, "UPDATE ... FROM matched a row of %s with two rows of %s: it changes "
+                                                    "each row once (narrow the WHERE)", t->s.name, u->s.name);
+            continue;
+        }
+        pr[n++] = pr[i];
+    }
+    wceil_lift(x); /* the pairs are made: what follows writes */
+    uint64_t room = x->db->ntx < x->db->lim_txn_ops ? x->db->lim_txn_ops - x->db->ntx : 0, snap, pend;
+    if (!rc && n > room)
+        rc = imdb_fail(e, IMDB_ERR_LIMIT, "transaction exceeds %u operations: %s changes %llu rows", x->db->lim_txn_ops, what,
+                       (unsigned long long)n);
+    read_view(x, &snap, &pend);
+    imdb_value both[2 * IMDB_MAX_COLS], set[IMDB_MAX_COLS];
+    for (uint64_t i = 0; !rc && i < n; i++) {
+        if ((rc = xtick(x, 64, e))) break; /* a write weighs more than a read */
+        uint64_t row = pr[i].i, vid = IMDB_NONE;
+        imdb_xmark m = imdb_xarena_mark(&x->arena);
+        for (uint16_t c = 0; c < nt + nu && !rc; c++) { /* the pair as the join read it: t's row, then u's */
+            imdb_xval v;
+            cell_xval(&q.cells[row * q.ncols + c], q.ctype[c], q.cscale[c], &v);
+            rc = imdb_x_assign(c < nt ? &t->s.cols[c] : &u->s.cols[c - nt], &v, &both[c], e);
+        }
+        if (!rc && !(rc = imdb_lookup_pk_at(x->db, t, &both[t->s.pk], snap, pend, &vid, e)) && vid == IMDB_NONE)
+            rc = imdb_fail(e, IMDB_ERR_STATE, "%s: a row its join read is not in the statement's view", what);
+        for (uint16_t k = 0; upd && !rc && k < st->nset; k++) { /* every value before any column changes */
+            imdb_xval v;
+            if (st->set_vals[k].kind != LIT_EXPR) set[k] = lit[k];
+            else if (!(rc = imdb_x_eval(st, x->xn, st->set_vals[k].ex, both, NULL, &x->env, &v, e)))
+                rc = imdb_x_assign(&t->s.cols[cols[k]], &v, &set[k], e);
+        }
+        for (uint16_t k = 0; upd && !rc && k < st->nset; k++) both[cols[k]] = set[k];
+        if (!rc && st->returning) rc = ret_row(x, st, t, both, r, e);
+        if (!rc && upd) {
+            uint8_t salt[16];
+            rc = imdb_salt_next(&x->salts, salt, e) || imdb_update_salt(x->db, t, vid, both, salt, e) ? e->code : IMDB_OK;
+            imdb_wipe(salt, sizeof salt);
+        } else if (!rc) {
+            rc = imdb_delete(x->db, t, vid, e);
+        }
+        imdb_xarena_reset(&x->arena, m);
+    }
+    imdb_free(pr);
+    if (!rc) {
+        snprintf(r->status, sizeof r->status, "%s %llu", upd ? "UPDATE" : "DELETE", (unsigned long long)n);
+        snprintf(r->path, sizeof r->path, "%s", q.path); /* how the pairs were found */
+    }
+    if (!rc && st->returning) rc = res_finish(r, e);
+    imdb_result_free(&q);
+    return rc;
 }
 
 static int exec_update(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, imdb_err *e)
 {
+    wceil_set(x); /* P2 S8: what it reads */
     if (st->nsub && !x->own) { /* P2 S4: its subqueries, at its snapshot, before any write */
         if (rset_prepare(x, st, e)) return e->code;
         if (xp) xp_nested(x, st, xp); /* EXPLAIN: they ran (their rows are what the rest is planned over) */
     }
+    if (st->src) return exec_join_write(x, st, true, r, xp, e); /* P2 S8: UPDATE ... FROM */
     imdb_table *t = imdb_table_by_name(x->db, st->table);
     if (!t) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", st->table);
     int cols[IMDB_MAX_COLS];
@@ -5916,7 +6246,9 @@ static int exec_update(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, 
         }
     }
     uint64_t *vids, n;
+    if (st->returning && !xp && ret_prepare(x, st, t, r, e)) return e->code; /* P2 S8 */
     if (select_vids(x, st, t, false, &vids, &n, xp, e)) return e->code;
+    wceil_lift(x); /* P2 S8: what follows writes */
     if (xp) return IMDB_OK; /* P1 Q1: the plan, not run */
     int rc = IMDB_OK;
     imdb_value vals[IMDB_MAX_COLS];
@@ -5933,6 +6265,7 @@ static int exec_update(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, 
         }
         if (rc) break;
         for (uint16_t k = 0; k < st->nset; k++) vals[cols[k]] = newv[k];
+        if (st->returning && (rc = ret_row(x, st, t, vals, r, e))) break; /* P2 S8: the row as written */
         uint8_t salt[16];
         if (!rc && !(rc = imdb_salt_next(&x->salts, salt, e))) rc = imdb_update_salt(x->db, t, vids[i], vals, salt, e);
         imdb_wipe(salt, sizeof salt);
@@ -5941,26 +6274,41 @@ static int exec_update(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, 
     imdb_free(vids);
     if (!rc) snprintf(r->status, sizeof r->status, "UPDATE %llu", (unsigned long long)n);
     if (!rc) snprintf(r->path, sizeof r->path, "%s", x->vpath); /* P1 Q1: how the rows were found */
+    if (!rc && st->returning) rc = res_finish(r, e); /* P2 S8 */
     return rc;
 }
 
 static int exec_delete(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, imdb_err *e)
 {
+    wceil_set(x); /* P2 S8: what it reads */
     if (st->nsub && !x->own) { /* P2 S4 */
         if (rset_prepare(x, st, e)) return e->code;
         if (xp) xp_nested(x, st, xp); /* EXPLAIN: they ran (their rows are what the rest is planned over) */
     }
+    if (st->src) return exec_join_write(x, st, false, r, xp, e); /* P2 S8: DELETE ... USING */
     imdb_table *t = imdb_table_by_name(x->db, st->table);
     if (!t) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", st->table);
     uint64_t *vids, n;
+    if (st->returning && !xp && ret_prepare(x, st, t, r, e)) return e->code; /* P2 S8 */
     if (select_vids(x, st, t, false, &vids, &n, xp, e)) return e->code;
+    wceil_lift(x); /* P2 S8: what follows writes */
     if (xp) return IMDB_OK; /* P1 Q1: the plan, not run */
     int rc = IMDB_OK;
-    for (uint64_t i = 0; i < n && !rc; i++)
-        if (!(rc = xtick(x, 64, e))) rc = imdb_delete(x->db, t, vids[i], e);
+    imdb_value vals[IMDB_MAX_COLS];
+    for (uint64_t i = 0; i < n && !rc; i++) {
+        if ((rc = xtick(x, 64, e))) break;
+        if (st->returning) { /* P2 S8: the row as it was */
+            imdb_xmark m = imdb_xarena_mark(&x->arena);
+            if (!(rc = fetch_row(x, t, vids[i], vals, e))) rc = ret_row(x, st, t, vals, r, e);
+            imdb_xarena_reset(&x->arena, m);
+            if (rc) break;
+        }
+        rc = imdb_delete(x->db, t, vids[i], e);
+    }
     imdb_free(vids);
     if (!rc) snprintf(r->status, sizeof r->status, "DELETE %llu", (unsigned long long)n);
     if (!rc) snprintf(r->path, sizeof r->path, "%s", x->vpath); /* P1 Q1: how the rows were found */
+    if (!rc && st->returning) rc = res_finish(r, e); /* P2 S8 */
     return rc;
 }
 
@@ -7004,6 +7352,7 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
         break;
     }
     if (ceiling) imdb_heap_ceiling_set(0, 0);
+    wceil_lift(&x); /* P2 S8: a write that left before lifting its own (an error), before its savepoint is restored */
     if (is_write(st->kind)) {
         if (rc) {
             imdb_savepoint_restore(db, sp);
@@ -7058,6 +7407,7 @@ done:
     ss->rows_tested = x.tested; /* D8 #4: the first plan's count, for the caller and the tests */
     if (ss->txn.open) ss->txn.last_ns = mono_ns(); /* R4: idle from here */
     if (ceiling) imdb_heap_ceiling_set(0, 0);
+    wceil_lift(&x); /* P2 S8: a write that left before lifting its own */
     { /* P1 M2: a slow statement (its shape: no row value) and the handle's failure, once, in the event log */
         uint64_t us = (mono_ns() - now_ns) / 1000u;
         if (ss->slow_ms && us >= (uint64_t)ss->slow_ms * 1000u && db->events_fd >= 0) {

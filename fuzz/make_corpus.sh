@@ -102,6 +102,10 @@ for q in "SELECT COUNT(*), SUM(amount) FROM txns AS OF 3 WHERE user_id = 42 AND 
          "WITH RECURSIVE r(n, d) AS (SELECT 1, 0 UNION ALL SELECT e.dst, r.d + 1 FROM r JOIN e ON e.src = r.n WHERE r.d < 9) SELECT d, COUNT(*) FROM r GROUP BY d" \
          "SELECT id, ROW_NUMBER() OVER (PARTITION BY g ORDER BY x DESC NULLS LAST, id), LAG(s, 2, x) OVER (ORDER BY id) FROM t" \
          "SELECT g, SUM(x) OVER (ORDER BY id ROWS BETWEEN 3 PRECEDING AND 1 FOLLOWING), RANK() OVER (ORDER BY SUM(x) DESC) FROM t GROUP BY g" \
+         "INSERT INTO t (id, s) SELECT id + 1000, s || 'x' FROM t WHERE g = 1 ON CONFLICT DO NOTHING RETURNING id, s" \
+         "INSERT INTO t (id, x) VALUES (1, 2), (3, 4) ON CONFLICT (id) DO UPDATE SET x = excluded.x + t.x WHERE excluded.x > t.x" \
+         "UPDATE t SET x = t.x + u.x FROM t AS u WHERE u.id = t.id + 1 RETURNING *" \
+         "DELETE FROM t USING t AS u WHERE u.g = t.g AND u.id < t.id RETURNING id" \
          "((((((((((((((((((((((((((((((((((((((((SELECT 1))))))))))))))))))))))))))))))))))))))))" \
          "SELECT id, (SELECT COUNT(*) FROM u WHERE u.tid = t.id) FROM t WHERE g IN (SELECT v FROM u AS ci WHERE ci.tid = t.id)" \
          "SELECT AVG(f) FROM t HAVING COUNT(*) BETWEEN 1 AND 10 OFFSET 0 LIMIT 0"; do
