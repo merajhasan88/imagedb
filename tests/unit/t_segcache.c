@@ -1104,21 +1104,59 @@ static void t_segcache_release(void)
             }
         }
     }
-    /* not on the allow-list: rows, inside EXISTS, under cross_check: every image the statement pinned kept */
+    /* P2 S16: row SELECTs let their walk's images go too; the result's reading takes the matching rows' segments again
+     * (a selective statement: fewer than every image at once; DISTINCT over every segment: all of them, read again) */
+    static const char *const rows[] = {"SELECT id, s FROM t WHERE v + 1 = 500 ORDER BY s, id",
+                                       "SELECT id FROM t WHERE v * 2 > 990 ORDER BY id DESC LIMIT 3",
+                                       "SELECT id, s FROM t WHERE s = '' OR s IS NULL ORDER BY id",
+                                       "SELECT DISTINCT g FROM t WHERE s LIKE '%a while long 1%' ORDER BY g"};
+    enum { NR = sizeof rows / sizeof *rows };
+    imdb_buf wantr[2][NR];
+    db->segcache.budget = UINT64_MAX;
+    for (int p = 0; p < 2; p++)
+        for (int a = 0; a < NR; a++) {
+            imdb_buf_init(&wantr[p][a]);
+            OK(ex(&s, paths[p]));
+            outcome(&s, rows[a], &wantr[p][a]);
+        }
+    for (int b = 0; b < 2; b++) {
+        db->segcache.budget = budget_of[b] * largest;
+        for (int p = 0; p < 2; p++) {
+            OK(ex(&s, paths[p]));
+            for (int a = 0; a < NR; a++) {
+                uint64_t rel = db->segcache.released;
+                uint64_t peak = peak_of(db, &s, rows[a], &got);
+                bool eq = got.len == wantr[p][a].len && !memcmp(got.p, wantr[p][a].p, got.len);
+                bool sel = a < 3; /* the selective ones */
+                if (!eq || (sel && peak >= (uint64_t)NSEG * largest))
+                    fprintf(stderr, "    %s at %llu: peak %llu (largest %llu), released %llu\n%.*s", rows[a],
+                            (unsigned long long)db->segcache.budget, (unsigned long long)peak,
+                            (unsigned long long)largest, (unsigned long long)(db->segcache.released - rel), (int)got.len,
+                            (const char *)got.p);
+                CHECK(eq);
+                CHECK(db->segcache.released > rel);
+                if (sel) CHECK(peak < (uint64_t)NSEG * largest);
+            }
+        }
+    }
+    for (int p = 0; p < 2; p++)
+        for (int a = 0; a < NR; a++) imdb_buf_free(&wantr[p][a]);
+    /* not on the allow-list: a nested run (a derived table's, a subquery's) and the statement around it, EXISTS,
+     * cross_check: every image the statement pinned kept */
     db->segcache.budget = 0;
     OK(ex(&s, "SET access_path = scan"));
-    static const char *const keep[] = {"SELECT id FROM t WHERE v + 1 = 500", "SELECT id FROM t WHERE v = 499",
+    static const char *const keep[] = {"SELECT COUNT(*) FROM (SELECT id FROM t WHERE v + 1 = 500) AS q",
+                                       "SELECT id FROM t WHERE v = (SELECT MAX(v) FROM t WHERE v + 1 < 400)",
                                        "SELECT EXISTS (SELECT 1 FROM t WHERE v = 499 AND s > 'z')"};
     for (size_t i = 0; i < sizeof keep / sizeof *keep; i++) {
         uint64_t rel = db->segcache.released;
         uint64_t peak = peak_of(db, &s, keep[i], &got);
-        if (db->segcache.released != rel || (i == 0 && peak < (uint64_t)NSEG * largest / 2))
+        if (db->segcache.released != rel || (i < 2 && peak < (uint64_t)NSEG * largest / 2))
             fprintf(stderr, "    %s: released %llu, peak %llu (largest %llu)\n", keep[i],
                     (unsigned long long)(db->segcache.released - rel), (unsigned long long)peak, (unsigned long long)largest);
         CHECK(db->segcache.released == rel);
-        if (i == 0) CHECK(peak >= (uint64_t)NSEG * largest / 2); /* a tree in WHERE: no zone map skips a segment, so
-                                                                   * every image is read and kept; the others' zone maps and
-                                                                   * EXISTS' first row read a few */
+        if (i < 2) CHECK(peak >= (uint64_t)NSEG * largest / 2); /* a tree in WHERE: no zone map skips a segment, so every
+                                                                  * image is read and kept; EXISTS' first row reads a few */
     }
     OK(ex(&s, "SET cross_check = on"));
     uint64_t rel = db->segcache.released;

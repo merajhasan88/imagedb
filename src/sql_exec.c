@@ -6101,11 +6101,14 @@ static int exec_select(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, 
      * not, lets each image go as its path leaves the segment while the cache is over its budget (imdb_seg_done), so its
      * images follow the budget, not the table's size: nothing it keeps points into an image (its accumulators own their
      * TEXT, acc_own and xacc_own; a group's keys are copied as the group is made, xpin and group_gen, and the hash map
-     * owns its own; DISTINCT's sets own their keys; the result is built from these alone). v1's allow-list: rows
-     * (SINK_VIDS) are read again for the result, a later step; a nested run, a run of EXISTS and cross_check (two
-     * plans, the second would read again what the first let go) keep every image to the operation's end, as before */
+     * owns its own; DISTINCT's sets own their keys; the result is built from these alone). P2 S16: a plain row SELECT
+     * too: its walk keeps vids alone, and materialize reads the matching rows again by vid after it (its keys, ORDER BY's
+     * and the primary key's, and its rows with today's lifetime: it lets nothing go), so a segment the walk let go and
+     * that holds a matching row is read again, only while the cache is over its budget. A nested run, a run of EXISTS
+     * and cross_check (two plans, the second would read again what the first let go) keep every image to the operation's
+     * end, as before */
     x->release = !rc && !nested && !x->nested && !x->presence && !x->ss->cross_check &&
-                 (k.mode == SINK_AGG || k.mode == SINK_GROUP) && !st->nsub && !st->for_update;
+                 (k.mode == SINK_AGG || k.mode == SINK_GROUP || k.mode == SINK_VIDS) && !st->nsub && !st->for_update;
     if (!rc && (rc = run_path(x, p1, &q, &k, e)) == SINK_FOUND) rc = IMDB_OK;
     x->release = false;
     if (pres) found = k.nvids > 0;
