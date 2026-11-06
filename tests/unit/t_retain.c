@@ -1871,8 +1871,12 @@ static void t_retain_seed(void)
     OK(imdb_rotate_key(db, E));
     OK(ex(&s, "UPDATE a SET v = 56 WHERE id = 2"));
     OK(ex(&s, "CHECKPOINT"));
-    uint64_t s9 = db->seq + 1;
     OK(ex(&s, "UPDATE a SET v = 57 WHERE id = 2"));
+    /* s9: the first commit of the segment that CHECKPOINT began, from the segment list: a CHECKPOINT runs the expiry
+     * policy after its publish, so an EXPIRE that fell due there (a slow run: tsan, 2026-11-06) begins the segment, and
+     * db->seq + 1 taken after the CHECKPOINT would be one past it, s9 - 1 then no segment's end */
+    uint64_t s9 = db->nsegs ? db->segs[db->nsegs - 1] : 0;
+    CHECK(s9 > from);
     OK(ex(&s, "CHECKPOINT"));
     clock_past(db->last_time, 15 * SEC_US); /* past s9's start (before the last commit) by the retention */
     OK(ex(&s, "SELECT COUNT(*) FROM a")); /* the horizons move past the seed's floor */
