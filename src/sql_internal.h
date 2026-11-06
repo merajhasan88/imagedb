@@ -98,6 +98,7 @@ enum {
     ST_ALTER_RETENTION, ST_SHOW_RETENTION,
     ST_SHOW_STATS, ST_SHOW_TRANSACTIONS, /* P1 M1 */
     ST_EXPLAIN, /* P1 Q1: the plan of the statement in explained (SELECT, UPDATE or DELETE), which is not run */
+    ST_PREPARE, ST_EXECUTE, ST_DEALLOCATE, ST_SHOW_PREPARED, /* P2 S9 */
 };
 
 /* P2 S3: a join's kind as written (RIGHT keeps side 1's rows, FULL both sides'; CROSS and FROM a, b have no ON) */
@@ -119,6 +120,9 @@ typedef struct sql_win { /* OVER ( [PARTITION BY part ...] [ORDER BY ord ...] [R
 /* isolation levels as written (the executor maps them; SERIALIZABLE is refused for now) */
 enum { SQL_ISO_SNAPSHOT = 1, SQL_ISO_READ_COMMITTED, SQL_ISO_SERIALIZABLE };
 enum { SQL_UPSERT_NOTHING = 1, SQL_UPSERT_UPDATE }; /* P2 S8: ON CONFLICT DO NOTHING | DO UPDATE */
+typedef struct sql_ptype { /* P2 S9: a parameter PREPARE declares: a column's type */
+    uint8_t type, scale, precision;
+} sql_ptype;
 
 typedef struct sql_stmt {
     uint8_t kind;
@@ -171,6 +175,13 @@ typedef struct sql_stmt {
     uint8_t nconf;                              /* its target's columns (0: the primary key) */
     char conf_cols[IMDB_MAX_INDEX_COLS][IMDB_MAX_IDENT + 1];
     uint16_t upsert_where;                      /* DO UPDATE ... WHERE: a condition's tree, else 0 */
+    /* P2 S9: PREPARE name [(type, ...)] AS body: the body's text in the statement's (body_off, body_len), the declared
+     * types; EXECUTE name [(value, ...)]: the values in vals, rowlen of them; DEALLOCATE name | ALL (prep_all) */
+    char prep_name[IMDB_MAX_IDENT + 1];
+    uint32_t body_off, body_len;
+    sql_ptype *ptypes;
+    uint16_t nptype;
+    bool prep_all;
     char set_cols[IMDB_MAX_COLS][IMDB_MAX_IDENT + 1]; /* UPDATE */
     sql_lit set_vals[IMDB_MAX_COLS];
     uint16_t nset;

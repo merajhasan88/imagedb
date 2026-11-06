@@ -291,7 +291,7 @@ static int g_ntids;
 static int g_nisel; /* P2 S8: this seed's INSERT ... SELECTs: the n-th copies at keys + n << 20 */
 static long g_ups_compared; /* P2 S8: ON CONFLICT's statements compared */
 static long g_ufrom_compared; /* P2 S8: UPDATE ... FROM and DELETE ... USING compared */
-static bool g_ups_ok; /* P2 S8: no engine run spells ON CONFLICT otherwise (MySQL, MariaDB, SQL Server): main sets it */
+static long g_prep_compared; /* P2 S9: SELECTs imagedb ran prepared, compared */
 
 /* values the tables hold (inserted or set, some since gone): a predicate drawn from them matches rows, where a random
  * one mostly matches none or all */
@@ -1764,11 +1764,12 @@ static void gen_dml(stmt *q, bool may_fail)
         if (may_fail && q->tab == 0 && g_ntids > 1 && chance(15)) /* a key that may exist: refused everywhere */
             q->row[q->nrow - 1][0].i = g_tids[rnd() % (uint64_t)(g_ntids - 1)];
         /* P2 S8: an upsert, where every engine run spells it as imagedb does (MySQL, MariaDB and SQL Server do not) */
-        if (g_expr && q->tab == 0 && g_ntids > 1 && g_ups_ok && chance(30)) {
+        if (g_expr && q->tab == 0 && g_ntids > 1 && chance(30)) {
             q->ups = (int)rr(1, 3);
             for (int i = 0; i < q->nrow; i++)
                 if (chance(50)) q->row[i][0].i = g_tids[rnd() % (uint64_t)g_ntids];
-            for (int i = 0; q->ups == 3 && i < q->nrow; i++) /* DO UPDATE never meets its own row twice: SQLite would */
+            for (int i = 0; i < q->nrow; i++) /* keys distinct: SQLite's DO UPDATE would meet its own row twice, MERGE
+                                                * refuses that and inserts a repeated new key twice */
                 for (int j = 0; j < i; j++)
                     if (q->row[j][0].i == q->row[i][0].i) q->row[i][0].i = g_next_id++;
             if (q->ups == 3) {
@@ -1785,7 +1786,7 @@ static void gen_dml(stmt *q, bool may_fail)
         }
     } else if (r < 75) {
         q->kind = Q_UPDATE;
-        if (g_expr && g_ups_ok && q->tab == 1 && chance(35)) { /* P2 S8: u from its parent t, one pair a row */
+        if (g_expr && q->tab == 1 && chance(35)) { /* P2 S8: u from its parent t, one pair a row */
             q->ufrom = true;
             q->nuf = chance(50) ? 1 : 2;
             q->ufc[0] = 2, q->uft[0] = chance(50) ? 1 : 2; /* v = t.g or t.a */
@@ -1821,7 +1822,7 @@ static void gen_dml(stmt *q, bool may_fail)
         gen_preds(q, 2, false);
     } else {
         q->kind = Q_DELETE;
-        if (g_expr && g_ups_ok && q->tab == 1 && chance(35)) { /* P2 S8: DELETE FROM u USING t */
+        if (g_expr && q->tab == 1 && chance(35)) { /* P2 S8: DELETE FROM u USING t */
             q->ufrom = true;
             q->ufg = chance(70) ? (int)rr(0, 4) : -1;
             goto returning;
@@ -1893,8 +1894,32 @@ static void put_dec(sb *b, __int128 x)
     sb_printf(b, ".%02u", (unsigned)(a % 100));
 }
 
+/* P2 S9: imagedb's SELECT run prepared: its literals printed as $n, each kept (its type, its text) for the EXECUTE */
+static bool g_pmode, g_pfail;
+static struct {
+    int t;
+    char s[100];
+} g_par[48];
+static int g_npar;
+
 static void put_lit(sb *b, int d, int t, const val *v)
 {
+    if (g_pmode && d == D_IMDB && !v->null) {
+        sb lit = {0};
+        g_pmode = false;
+        put_lit(&lit, d, t, v);
+        g_pmode = true;
+        if (g_npar >= 48 || !lit.p || lit.n >= sizeof g_par[0].s) {
+            g_pfail = true; /* run written out instead */
+        } else {
+            memcpy(g_par[g_npar].s, lit.p, lit.n);
+            g_par[g_npar].s[lit.n] = 0;
+            g_par[g_npar].t = t;
+            sb_printf(b, "$%d", ++g_npar);
+        }
+        free(lit.p);
+        if (!g_pfail) return;
+    }
     if (v->null) {
         sb_str(b, "NULL");
         return;
@@ -2674,7 +2699,9 @@ static void print_win(sb *b, int d, const stmt *q)
  * the rows are compared, elsewhere the count */
 static bool ret_ok(int d, const stmt *q)
 {
-    return q->nret && (d == D_IMDB || d == D_SQLITE || d == D_PG || (d == D_MA && q->kind != Q_UPDATE));
+    return q->nret && (d == D_IMDB || d == D_SQLITE || d == D_PG ||
+                       (d == D_MA && q->kind != Q_UPDATE && !q->ups && !q->ufrom)); /* MariaDB: not with an upsert or a
+                                                                                * multi-table DELETE */
 }
 
 /* P2 S8: ON CONFLICT, spelled as imagedb, SQLite and PostgreSQL spell it (never drawn with the others on); t's columns
@@ -2693,7 +2720,69 @@ static void put_ups(sb *b, const stmt *q)
 
 static void put_ret(sb *b, int d, const stmt *q)
 {
-    for (int i = 0; ret_ok(d, q) && i < q->nret; i++) sb_printf(b, "%s%s", i ? ", " : " RETURNING ", cols(q->tab)[q->ret[i]].name);
+    for (int i = 0; ret_ok(d, q) && i < q->nret; i++) /* with FROM or USING qualified: a name in both is ambiguous */
+        sb_printf(b, "%s%s%s%s", i ? ", " : " RETURNING ", q->ufrom ? tname(q->tab) : "", q->ufrom ? "." : "", cols(q->tab)[q->ret[i]].name);
+}
+
+/* P2 S8: DO UPDATE in MySQL's and MariaDB's words: ON DUPLICATE KEY UPDATE, the proposal MySQL's row alias new
+ * (MariaDB: VALUES(c)); a WHERE as IF() on each assignment, its column a assigned last (an assignment sees the ones
+ * before it); t's own value plus one the column's, bare. DO NOTHING is INSERT IGNORE (only key conflicts arise: the
+ * generated rows are valid) */
+static void put_ups_my(sb *b, int d, const stmt *q)
+{
+    if (d == D_MY) sb_str(b, " AS new");
+    sb_str(b, " ON DUPLICATE KEY UPDATE ");
+    int ord[3], n = 0;
+    for (int i = 0; i < q->nus; i++)
+        if (!(q->uswhere && q->usc[i] == 2)) ord[n++] = i;
+    for (int i = 0; i < q->nus; i++)
+        if (q->uswhere && q->usc[i] == 2) ord[n++] = i;
+    for (int k = 0; k < n; k++) {
+        const char *c = cols(0)[q->usc[ord[k]]].name;
+        char nv[80], nval[200];
+        if (d == D_MY) snprintf(nv, sizeof nv, "new.%s", c);
+        else snprintf(nv, sizeof nv, "VALUES(%s)", c);
+        const char *me = d == D_MY ? "t." : ""; /* MySQL: a bare column is ambiguous beside the row alias new, which has it */
+        if (q->usinc[ord[k]]) snprintf(nval, sizeof nval, "%s%s + 1", me, c);
+        else snprintf(nval, sizeof nval, "%s", nv);
+        if (q->uswhere) sb_printf(b, "%s%s = IF(%s > %sa, %s, %s%s)", k ? ", " : "", c, d == D_MY ? "new.a" : "VALUES(a)", me, nval, me, c);
+        else sb_printf(b, "%s%s = %s", k ? ", " : "", c, nval);
+    }
+}
+
+/* P2 S8: an upsert in SQL Server's words: MERGE from the proposed rows, each value cast to its column's type (a VALUES
+ * column NULL throughout would be an int, which DATETIME2 refuses), ON the key; DO NOTHING without WHEN MATCHED, DO
+ * UPDATE's WHERE the match's AND. The keys within one statement are distinct (gen_dml): MERGE refuses a target row
+ * matched twice and would insert a repeated new key twice */
+static void print_merge(sb *b, const stmt *q)
+{
+    static const char *const MT[] = {"BIGINT", "DECIMAL(12,2)", "FLOAT(53)", "VARCHAR(255)", "BIT", "DATETIME2(6)"};
+    sb_str(b, "MERGE INTO t AS tgt USING (VALUES ");
+    for (int r = 0; r < q->nrow; r++) {
+        sb_str(b, r ? ", (" : "(");
+        for (int c = 0; c < ncols(0); c++) {
+            sb_str(b, c ? ", CAST(" : "CAST(");
+            put_lit(b, D_MS, cols(0)[c].t, &q->row[r][c]);
+            sb_printf(b, " AS %s)", MT[cols(0)[c].t]);
+        }
+        sb_str(b, ")");
+    }
+    sb_str(b, ") AS src (");
+    for (int c = 0; c < ncols(0); c++) sb_printf(b, "%s%s", c ? ", " : "", cols(0)[c].name);
+    sb_str(b, ") ON tgt.id = src.id");
+    if (q->ups == 3) {
+        sb_str(b, q->uswhere ? " WHEN MATCHED AND src.a > tgt.a THEN UPDATE SET " : " WHEN MATCHED THEN UPDATE SET ");
+        for (int i = 0; i < q->nus; i++) {
+            const char *c = cols(0)[q->usc[i]].name;
+            if (q->usinc[i]) sb_printf(b, "%s%s = tgt.%s + 1", i ? ", " : "", c, c);
+            else sb_printf(b, "%s%s = src.%s", i ? ", " : "", c, c);
+        }
+    }
+    sb_str(b, " WHEN NOT MATCHED THEN INSERT (");
+    for (int c = 0; c < ncols(0); c++) sb_printf(b, "%s%s", c ? ", " : "", cols(0)[c].name);
+    sb_str(b, ") VALUES (");
+    for (int c = 0; c < ncols(0); c++) sb_printf(b, "%ssrc.%s", c ? ", " : "", cols(0)[c].name);
+    sb_str(b, ");");
 }
 
 static void print_stmt(sb *b, int d, const stmt *q)
@@ -2715,7 +2804,13 @@ static void print_stmt(sb *b, int d, const stmt *q)
             put_ret(b, d, q);
             return;
         }
-        sb_printf(b, "INSERT INTO %s VALUES ", tname(q->tab));
+        if (q->ups && d == D_MS) { /* P2 S8: SQL Server's upsert */
+            print_merge(b, q);
+            put_ret(b, d, q);
+            return;
+        }
+        bool my = d == D_MY || d == D_MA;
+        sb_printf(b, "INSERT %sINTO %s VALUES ", q->ups && q->ups < 3 && my ? "IGNORE " : "", tname(q->tab));
         for (int r = 0; r < q->nrow; r++) {
             sb_str(b, r ? ", (" : "(");
             for (int c = 0; c < ncols(q->tab); c++) {
@@ -2724,15 +2819,19 @@ static void print_stmt(sb *b, int d, const stmt *q)
             }
             sb_str(b, ")");
         }
-        put_ups(b, q);
+        if (q->ups == 3 && my) put_ups_my(b, d, q);
+        else if (!my) put_ups(b, q);
         put_ret(b, d, q);
         return;
     case Q_UPDATE:
         if (q->ufrom) { /* P2 S8 */
-            sb_str(b, "UPDATE u SET ");
-            for (int i = 0; i < q->nuf; i++) sb_printf(b, "%s%s = t.%s", i ? ", " : "", UC[q->ufc[i]].name, TC[q->uft[i]].name);
-            sb_str(b, " FROM t WHERE t.id = u.tid");
-            if (q->ufg >= 0) sb_printf(b, " AND t.g = %d", q->ufg);
+            bool myj = d == D_MY || d == D_MA;
+            sb_str(b, myj ? "UPDATE u JOIN t ON t.id = u.tid SET " : "UPDATE u SET ");
+            for (int i = 0; i < q->nuf; i++)
+                sb_printf(b, "%s%s%s = t.%s", i ? ", " : "", myj ? "u." : "", UC[q->ufc[i]].name, TC[q->uft[i]].name);
+            if (d == D_MS) sb_str(b, " FROM u JOIN t ON t.id = u.tid");
+            else if (!myj) sb_str(b, " FROM t WHERE t.id = u.tid");
+            if (q->ufg >= 0) sb_printf(b, "%s t.g = %d", myj || d == D_MS ? " WHERE" : " AND", q->ufg);
             put_ret(b, d, q);
             return;
         }
@@ -2748,8 +2847,11 @@ static void print_stmt(sb *b, int d, const stmt *q)
         return;
     case Q_DELETE:
         if (q->ufrom) { /* P2 S8: SQLite has no DELETE ... USING: the same rows by EXISTS */
-            sb_str(b, d == D_SQLITE ? "DELETE FROM u WHERE EXISTS (SELECT 1 FROM t WHERE t.id = u.tid" : "DELETE FROM u USING t WHERE t.id = u.tid");
-            if (q->ufg >= 0) sb_printf(b, " AND t.g = %d", q->ufg);
+            bool join = d == D_MY || d == D_MA || d == D_MS; /* their multi-table DELETE */
+            sb_str(b, d == D_SQLITE ? "DELETE FROM u WHERE EXISTS (SELECT 1 FROM t WHERE t.id = u.tid"
+                      : join      ? "DELETE u FROM u JOIN t ON t.id = u.tid"
+                                  : "DELETE FROM u USING t WHERE t.id = u.tid");
+            if (q->ufg >= 0) sb_printf(b, "%s t.g = %d", join ? " WHERE" : " AND", q->ufg);
             if (d == D_SQLITE) sb_str(b, ")");
             put_ret(b, d, q);
             return;
@@ -3737,11 +3839,41 @@ static bool excused_other(int d, const char *msg, const char *text)
            strstr(text, "% CAST(-1 AS BIGINT)");
 }
 
+/* P2 S9: imagedb's statement (text, its literals $1..$n in g_par) run as PREPARE with their types, EXECUTE with their
+ * texts, DEALLOCATE; text then all of it, for a mismatch's report */
+static void exec_prepared(eng *e, sb *text, bool rows, const int *ty, int nty, res *r)
+{
+    static const char *const TN[] = {"INT64", "DECIMAL(18,2)", "FLOAT64", "TEXT", "BOOL", "TIMESTAMP"};
+    sb p = {0}, x = {0};
+    sb_str(&p, "PREPARE oq");
+    for (int i = 0; i < g_npar; i++) sb_printf(&p, "%s%s", i ? ", " : " (", TN[g_par[i].t]);
+    sb_printf(&p, "%s AS %s", g_npar ? ")" : "", text->p);
+    sb_str(&x, "EXECUTE oq");
+    for (int i = 0; i < g_npar; i++) sb_printf(&x, "%s%s", i ? ", " : " (", g_par[i].s);
+    if (g_npar) sb_str(&x, ")");
+    res tmp = {0};
+    tmp.affected = -1;
+    exec_eng(e, p.p, false, NULL, 0, &tmp);
+    if (tmp.err) {
+        res_clear(r);
+        res_fail(r, "PREPARE: %s", tmp.msg);
+    } else {
+        exec_eng(e, x.p, rows, ty, nty, r);
+        exec_eng(e, "DEALLOCATE oq", false, NULL, 0, &tmp);
+    }
+    res_clear(&tmp);
+    sb_reset(text);
+    sb_printf(text, "%s; %s", p.p, x.p);
+    free(p.p);
+    free(x.p);
+}
+
 static int run_stmt(unsigned seed, int step, const stmt *q, bool state)
 {
     static sb text[ND];
     static res out[ND];
     int ty[MAXC + 8], nty = 0;
+    bool prepped = false; /* P2 S9: imagedb's ran prepared */
     bool rows = q->kind == Q_SELECT;
     if (rows) nty = out_types(q, ty);
     else if (q->nret) /* P2 S8: RETURNING's columns, typed as SELECT * types them */
@@ -3750,11 +3882,19 @@ static int run_stmt(unsigned seed, int step, const stmt *q, bool state)
     for (int d = 0; d < ND; d++) {
         if (!g_eng[d].on || (q->skip & (1u << d))) continue; /* not put to it: its dialect computes it otherwise */
         bool rd = rows || ret_ok(d, q); /* P2 S8: RETURNING's rows, where the dialect has it */
+        /* P2 S9: a quarter of imagedb's SELECTs (by seed and step: no draw taken) run prepared, its literals $n */
+        bool pm = d == D_IMDB && q->kind == Q_SELECT && !state && (seed * 7u + (unsigned)step) % 4 == 0;
+        g_pmode = pm, g_pfail = false, g_npar = 0;
         print_stmt(&text[d], d, q);
-        exec_eng(&g_eng[d], text[d].p, rd, ty, nty, &out[d]);
+        g_pmode = false;
+        if (pm && g_pfail) print_stmt(&text[d], d, q), pm = false; /* a literal too long: written out */
+        if (d == D_IMDB) prepped = pm;
+        if (pm) exec_prepared(&g_eng[d], &text[d], rd, ty, nty, &out[d]);
+        else exec_eng(&g_eng[d], text[d].p, rd, ty, nty, &out[d]);
         if (d == D_MS) ms_drop_constants(q, &text[d], rd, ty, nty, &out[d]);
         if (rd && !ordered && !out[d].err) qsort(out[d].rows, out[d].n, sizeof *out[d].rows, cmp_rows);
         if (!rows && rd && !out[d].err) out[d].affected = (long long)out[d].n; /* its count: the rows it returned */
+        if (q->ups == 3 && (d == D_MY || d == D_MA)) out[d].affected = -1; /* ON DUPLICATE KEY UPDATE counts an update twice */
     }
     if (g_verbose) fprintf(stderr, "  [%u.%d] %s\n", seed, step, text[D_IMDB].p);
     const res *base = &out[D_IMDB];
@@ -3772,6 +3912,7 @@ static int run_stmt(unsigned seed, int step, const stmt *q, bool state)
         if (q->isel) g_isel_compared++; /* P2 S8 */
         if (q->ups) g_ups_compared++;
         if (q->ufrom) g_ufrom_compared++;
+        if (prepped) g_prep_compared++;
         bool rows_d = rows || ret_ok(d, q);
         if (q->nret && rows_d) g_ret_compared++;
         const res *o = &out[d];
@@ -3968,7 +4109,6 @@ int main(int argc, char **argv)
         g_eng[d].on = true;
     }
     g_eng[D_IMDB].on = true; /* the engine under test */
-    g_ups_ok = !g_eng[D_MY].on && !g_eng[D_MA].on && !g_eng[D_MS].on; /* P2 S8 */
     mkdir(g_root, 0755);
     connect_all();
     if (ping) return 0;
@@ -4010,9 +4150,10 @@ int main(int argc, char **argv)
     printf("oracle: %ld comparisons of P2 S2's grouped form (several keys and trees, DISTINCT, FILTER)\n", g_grp_compared);
     printf("oracle: %ld comparisons of P2 S6's window functions\n", g_win_compared);
     printf("oracle: %ld comparisons of P2 S8's INSERT ... SELECT, %ld of RETURNING's rows, %ld of ON CONFLICT%s\n", g_isel_compared,
-           g_ret_compared, g_ups_compared, g_eng[D_MY].on || g_eng[D_MA].on || g_eng[D_MS].on ? " (not drawn: MySQL, MariaDB or SQL Server run)" : "");
+           g_ret_compared, g_ups_compared, "");
+    printf("oracle: %ld comparisons of P2 S9's prepared SELECTs (imagedb's literals as $n: PREPARE, EXECUTE)\n", g_prep_compared);
     printf("oracle: %ld comparisons of P2 S8's UPDATE ... FROM and DELETE ... USING%s\n", g_ufrom_compared,
-           g_ups_ok ? "" : " (not drawn: MySQL, MariaDB or SQL Server run)");
+           "");
     printf("oracle: %ld comparisons of P2 S5's set operations, %ld of its WITH RECURSIVE\n", g_set_compared, g_rec_compared);
     printf("oracle: %ld comparisons of P2 S4b's correlated subqueries\n", g_corr_compared);
     printf("oracle: %ld comparisons of P2 S4's subqueries (IN, NOT IN, EXISTS, a value), derived tables and CTEs\n",

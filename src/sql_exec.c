@@ -27,9 +27,12 @@ _Static_assert(ATOMIC_BOOL_LOCK_FREE == 2, "the cancel flag is set from a signal
 
 void imdb_session_cancel(imdb_session *s) { atomic_store_explicit(&s->cancel, true, memory_order_relaxed); }
 
+static void prep_all_free(imdb_session *ss); /* P2 S9 */
+
 void imdb_session_close(imdb_session *s)
 {
     if (s->txn.open) imdb_txn_rollback(s->db, &s->txn);
+    prep_all_free(s); /* P2 S9 */
 }
 
 void imdb_result_init(imdb_result *r)
@@ -304,7 +307,8 @@ static int bind_lit(xctx *x, const sql_lit *l, const imdb_column *c, bool compar
         if (l->param > x->nparams) return imdb_fail(e, IMDB_ERR_INVALID, "parameter $%u was not supplied", (unsigned)l->param);
         const imdb_value *pv = &x->params[l->param - 1];
         if (pv->type != c->type || (c->type == IMDB_T_DECIMAL && pv->scale != c->scale))
-            return imdb_fail(e, IMDB_ERR_INVALID, "parameter $%u does not have the type of column %s", (unsigned)l->param, c->name);
+            return imdb_fail(e, IMDB_ERR_INVALID, "parameter $%u does not have the type of column %s (give it that type; an "
+                                                  "EXECUTE's: PREPARE name (type, ...) declares it)", (unsigned)l->param, c->name);
         *out = *pv;
     } else {
         char num[IMDB_MAX_NUMERIC + 2];
@@ -5871,35 +5875,49 @@ static void wceil_lift(xctx *x)
 
 /* P2 S8: RETURNING's items over table t's row, bound once (a NULL item a TEXT NULL, as a SELECT's), and the result's
  * columns named and typed */
-static int ret_prepare(xctx *x, const sql_stmt *st, imdb_table *t, imdb_result *r, imdb_err *e)
+/* u: UPDATE ... FROM's or DELETE ... USING's other table (else NULL), whose row beside t's the items read too, as
+ * PostgreSQL's RETURNING does: a name in both is ambiguous, * is both rows */
+static int ret_prepare(xctx *x, const sql_stmt *st, imdb_table *t, imdb_table *u, imdb_result *r, imdb_err *e)
 {
+    imdb_table *const jt[2] = {t, u ? u : t};
     xscope sc = {.st = st, .s = &t->s, .t = t, .cols = true, .group_col = -1, .no_corr = true};
+    if (u) sc.jt = jt, sc.nc0 = t->s.ncols;
     for (uint16_t i = 0; !st->star && i < st->nitems; i++) {
         if (xnodes(x, st, e) || xbind_v(x, &sc, st->items[i].expr, e)) return e->code;
         x_type_null(x, st->items[i].expr, IMDB_T_TEXT, 0);
     }
-    uint16_t n = st->star ? t->s.ncols : st->nitems;
+    uint16_t nt = t->s.ncols, n = st->star ? (uint16_t)(nt + (u ? u->s.ncols : 0)) : st->nitems;
     if (res_cols(r, n)) return imdb_fail(e, IMDB_ERR_NOMEM, "a result's columns");
     for (uint16_t i = 0; i < n; i++) {
         char nm[sizeof r->names[0]];
-        if (st->star) snprintf(nm, sizeof nm, "%s", t->s.cols[i].name);
+        if (st->star) snprintf(nm, sizeof nm, "%s", i < nt ? t->s.cols[i].name : u->s.cols[i - nt].name);
         else item_name(x, &st->items[i], nm, sizeof nm);
         res_name(r, i, nm);
     }
-    col_types(x, st, NULL, &t->s, r);
+    if (!st->star) {
+        col_types(x, st, NULL, &t->s, r);
+        return IMDB_OK;
+    }
+    for (uint16_t i = 0; i < n; i++) {
+        const imdb_column *c = i < nt ? &t->s.cols[i] : &u->s.cols[i - nt];
+        r->ctype[i] = c->type;
+        r->cscale[i] = c->scale;
+    }
     return IMDB_OK;
 }
 
 /* P2 S8: RETURNING's row for the row about to be written (vals, by column: INSERT's and UPDATE's new values, DELETE's
  * old ones), computed before the write: a TEXT of vals may point into an image or the arena, and the result copies
  * its own. What it computes goes from the arena with the row */
-static int ret_row(xctx *x, const sql_stmt *st, const imdb_table *t, const imdb_value *vals, imdb_result *r, imdb_err *e)
+static int ret_row(xctx *x, const sql_stmt *st, const imdb_table *t, const imdb_table *u, const imdb_value *vals, imdb_result *r,
+                   imdb_err *e)
 {
     imdb_cell *row = res_row(r, e);
     if (!row) return e->code;
     imdb_xmark m = imdb_xarena_mark(&x->arena);
     int rc = IMDB_OK;
-    for (uint16_t i = 0; i < (st->star ? t->s.ncols : st->nitems) && !rc; i++) {
+    uint16_t n = st->star ? (uint16_t)(t->s.ncols + (u ? u->s.ncols : 0)) : st->nitems; /* u: vals holds its row too */
+    for (uint16_t i = 0; i < n && !rc; i++) {
         imdb_xval v;
         if (st->star) res_put(r, &row[i], &vals[i]);
         else if (!(rc = imdb_x_eval(st, x->xn, st->items[i].expr, vals, NULL, &x->env, &v, e))) res_put_x(r, &row[i], &v);
@@ -5976,7 +5994,7 @@ static int write_row(xctx *x, const sql_stmt *st, imdb_table *t, imdb_value *val
     uint8_t salt[16];
     int rc;
     if (vid == IMDB_NONE) {
-        if (st->returning && ret_row(x, st, t, vals, r, e)) return e->code;
+        if (st->returning && ret_row(x, st, t, NULL, vals, r, e)) return e->code;
         rc = imdb_salt_next(&x->salts, salt, e) || imdb_insert_salt(x->db, t, vals, salt, e) ? e->code : IMDB_OK;
         imdb_wipe(salt, sizeof salt);
         u->written += !rc;
@@ -6006,7 +6024,7 @@ static int write_row(xctx *x, const sql_stmt *st, imdb_table *t, imdb_value *val
     }
     if (go) {
         for (uint16_t k = 0; k < st->nset; k++) both[u->cols[k]] = set[k];
-        if (!(st->returning && (rc = ret_row(x, st, t, both, r, e)))) {
+        if (!(st->returning && (rc = ret_row(x, st, t, NULL, both, r, e)))) {
             rc = imdb_salt_next(&x->salts, salt, e) || imdb_update_salt(x->db, t, vid, both, salt, e) ? e->code : IMDB_OK;
             imdb_wipe(salt, sizeof salt);
             u->written += !rc;
@@ -6085,7 +6103,7 @@ static int exec_insert(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
     } else {
         for (uint16_t i = 0; i < width; i++) map[i] = i;
     }
-    if (st->returning && ret_prepare(x, st, t, r, e)) return e->code; /* P2 S8 */
+    if (st->returning && ret_prepare(x, st, t, NULL, r, e)) return e->code; /* P2 S8 */
     ups u; /* P2 S8 */
     if (ups_prepare(x, st, t, &u, e)) return e->code;
     if (st->src) return insert_query(x, st, t, map, width, vals, &u, r, e); /* P2 S8 */
@@ -6151,7 +6169,7 @@ static int exec_join_write(xctx *x, const sql_stmt *st, bool upd, imdb_result *r
             return e->code;
         }
     }
-    if (st->returning && ret_prepare(x, st, t, r, e)) return e->code;
+    if (st->returning && ret_prepare(x, st, t, u, r, e)) return e->code;
     imdb_result q;
     imdb_result_init(&q);
     pkrow *pr = NULL;
@@ -6198,7 +6216,7 @@ static int exec_join_write(xctx *x, const sql_stmt *st, bool upd, imdb_result *r
                 rc = imdb_x_assign(&t->s.cols[cols[k]], &v, &set[k], e);
         }
         for (uint16_t k = 0; upd && !rc && k < st->nset; k++) both[cols[k]] = set[k];
-        if (!rc && st->returning) rc = ret_row(x, st, t, both, r, e);
+        if (!rc && st->returning) rc = ret_row(x, st, t, u, both, r, e);
         if (!rc && upd) {
             uint8_t salt[16];
             rc = imdb_salt_next(&x->salts, salt, e) || imdb_update_salt(x->db, t, vid, both, salt, e) ? e->code : IMDB_OK;
@@ -6246,7 +6264,7 @@ static int exec_update(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, 
         }
     }
     uint64_t *vids, n;
-    if (st->returning && !xp && ret_prepare(x, st, t, r, e)) return e->code; /* P2 S8 */
+    if (st->returning && !xp && ret_prepare(x, st, t, NULL, r, e)) return e->code; /* P2 S8 */
     if (select_vids(x, st, t, false, &vids, &n, xp, e)) return e->code;
     wceil_lift(x); /* P2 S8: what follows writes */
     if (xp) return IMDB_OK; /* P1 Q1: the plan, not run */
@@ -6265,7 +6283,7 @@ static int exec_update(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, 
         }
         if (rc) break;
         for (uint16_t k = 0; k < st->nset; k++) vals[cols[k]] = newv[k];
-        if (st->returning && (rc = ret_row(x, st, t, vals, r, e))) break; /* P2 S8: the row as written */
+        if (st->returning && (rc = ret_row(x, st, t, NULL, vals, r, e))) break; /* P2 S8: the row as written */
         uint8_t salt[16];
         if (!rc && !(rc = imdb_salt_next(&x->salts, salt, e))) rc = imdb_update_salt(x->db, t, vids[i], vals, salt, e);
         imdb_wipe(salt, sizeof salt);
@@ -6289,7 +6307,7 @@ static int exec_delete(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, 
     imdb_table *t = imdb_table_by_name(x->db, st->table);
     if (!t) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", st->table);
     uint64_t *vids, n;
-    if (st->returning && !xp && ret_prepare(x, st, t, r, e)) return e->code; /* P2 S8 */
+    if (st->returning && !xp && ret_prepare(x, st, t, NULL, r, e)) return e->code; /* P2 S8 */
     if (select_vids(x, st, t, false, &vids, &n, xp, e)) return e->code;
     wceil_lift(x); /* P2 S8: what follows writes */
     if (xp) return IMDB_OK; /* P1 Q1: the plan, not run */
@@ -6299,7 +6317,7 @@ static int exec_delete(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, 
         if ((rc = xtick(x, 64, e))) break;
         if (st->returning) { /* P2 S8: the row as it was */
             imdb_xmark m = imdb_xarena_mark(&x->arena);
-            if (!(rc = fetch_row(x, t, vids[i], vals, e))) rc = ret_row(x, st, t, vals, r, e);
+            if (!(rc = fetch_row(x, t, vids[i], vals, e))) rc = ret_row(x, st, t, NULL, vals, r, e);
             imdb_xarena_reset(&x->arena, m);
             if (rc) break;
         }
@@ -6522,12 +6540,12 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
     if (st->kind == ST_SHOW_MEMORY) { /* what the database holds, by kind, against its budget (db.h) */
         imdb_mem_report m;
         imdb_mem(db, &m);
-        const char *kinds[] = {"versions", "rows", "indexes", "segments", "commits", "transactions", "total"};
-        const uint64_t v[] = {m.versions, m.rows, m.indexes, m.segments, m.commits, m.txns, m.total};
+        const char *kinds[] = {"versions", "rows", "indexes", "segments", "commits", "transactions", "prepared", "total"};
+        const uint64_t v[] = {m.versions, m.rows, m.indexes, m.segments, m.commits, m.txns, m.prepared, m.total};
         res_cols(r, 2);
         res_name(r, 0, "kind");
         res_name(r, 1, "bytes");
-        for (int i = 0; i < 7; i++) {
+        for (int i = 0; i < 8; i++) {
             imdb_cell *row = res_row(r, e);
             if (!row) return e->code;
             res_put_str(r, &row[0], kinds[i]);
@@ -6949,6 +6967,7 @@ static int stmt_class(int kind)
     case ST_SHOW_TABLES: case ST_SHOW_DIGEST: case ST_SHOW_HISTORY: case ST_SHOW_LOG: case ST_SHOW_LAKE:
     case ST_SHOW_IDENTITY: case ST_SHOW_REPLICAS: case ST_SHOW_REPLICATION: case ST_SHOW_ERASURE: case ST_SHOW_MEMORY:
     case ST_SHOW_INDEXES: case ST_SHOW_RETENTION: case ST_SHOW_STATS: case ST_SHOW_TRANSACTIONS: case ST_EXPLAIN:
+    case ST_SHOW_PREPARED: /* P2 S9 */
         return IMDB_SC_SHOW;
     default: return IMDB_SC_OTHER;
     }
@@ -6960,21 +6979,196 @@ static uint64_t workspace_of(const imdb_session *ss)
     return imdb_query_share(ss->db->mem_limit); /* D8 #2: the share the budget keeps from writes (db.h) */
 }
 
-static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const imdb_value *params, uint32_t nparams,
-                  imdb_result *r, imdb_err *e)
+/* ---- P2 S9: prepared statements ---------------------------------------------------------------------------- */
+
+/* a session's prepared statement: its name, its text (x->sql points into it when it runs), its parse, made once (no
+ * run writes into a sql_stmt), the types its PREPARE declared, its runs, and what it holds (the heap counter's growth
+ * while it was made) */
+typedef struct prep_entry {
+    char name[IMDB_MAX_IDENT + 1];
+    char *sql;
+    size_t len;
+    sql_stmt *st;
+    sql_ptype *ptypes;
+    uint16_t nptype;
+    uint64_t uses, bytes;
+} prep_entry;
+
+struct imdb_prep_set {
+    prep_entry e[IMDB_MAX_PREPARED];
+    uint16_t n;
+    uint64_t bytes;
+};
+
+static prep_entry *prep_find(const imdb_session *ss, const char *name)
 {
-    imdb_result_init(r);
-    r->byte_cap = workspace_of(ss);
-    sql_stmt *st = imdb_alloc(sizeof *st, e);
-    if (!st) return e->code;
-    int rc = imdb_sql_parse(sql, len, st, e);
+    for (uint16_t i = 0; ss->prep && i < ss->prep->n; i++)
+        if (!strcmp(ss->prep->e[i].name, name)) return &ss->prep->e[i];
+    return NULL;
+}
+
+static void prep_free(prep_entry *p)
+{
+    if (p->st) {
+        imdb_sql_stmt_free(p->st);
+        imdb_free(p->st);
+    }
+    imdb_free(p->sql);
+    imdb_free(p->ptypes);
+    memset(p, 0, sizeof *p);
+}
+
+/* entry i gone, the last in its place (SHOW PREPARED sorts by name) */
+static void prep_drop(imdb_session *ss, uint16_t i)
+{
+    struct imdb_prep_set *s = ss->prep;
+    s->bytes -= s->e[i].bytes;
+    ss->db->prep_bytes -= s->e[i].bytes;
+    prep_free(&s->e[i]);
+    if (i + 1 < s->n) {
+        s->e[i] = s->e[s->n - 1];
+        memset(&s->e[s->n - 1], 0, sizeof s->e[0]);
+    }
+    s->n--;
+}
+
+static void prep_all_free(imdb_session *ss)
+{
+    if (!ss->prep) return;
+    while (ss->prep->n) prep_drop(ss, (uint16_t)(ss->prep->n - 1));
+    imdb_free(ss->prep);
+    ss->prep = NULL;
+}
+
+/* name's statement made: its text copied and parsed once; its kind one a run may take (a query, INSERT, UPDATE or
+ * DELETE: PREPARE, EXECUTE, DEALLOCATE, a transaction's control and what commits on its own are not); what it holds
+ * counted against the session's bound and the memory budget (the database's own memory, which a session's is not) */
+static int prep_add(imdb_session *ss, const char *name, const char *sql, size_t len, const sql_ptype *ptypes,
+                    uint16_t nptype, imdb_err *e)
+{
+    if (prep_find(ss, name))
+        return imdb_fail(e, IMDB_ERR_INVALID, "a statement named %s is prepared already: DEALLOCATE it first", name);
+    if (!ss->prep && !(ss->prep = imdb_alloc(sizeof *ss->prep, e))) return e->code;
+    if (ss->prep->n >= IMDB_MAX_PREPARED)
+        return imdb_fail(e, IMDB_ERR_LIMIT, "a session prepares at most %u statements: DEALLOCATE one", IMDB_MAX_PREPARED);
+    if (len > IMDB_MAX_PREPARED_BYTES)
+        return imdb_fail(e, IMDB_ERR_LIMIT, "a statement of more than %llu bytes to prepare",
+                         (unsigned long long)IMDB_MAX_PREPARED_BYTES);
+    uint64_t heap0 = imdb_heap_bytes();
+    prep_entry *p = &ss->prep->e[ss->prep->n];
+    memset(p, 0, sizeof *p);
+    int rc = IMDB_OK;
+    if (!(p->sql = imdb_alloc(len + 1, e)) || !(p->st = imdb_alloc(sizeof *p->st, e))) rc = e->code;
+    if (!rc) {
+        memcpy(p->sql, sql, len);
+        p->len = len;
+        if ((rc = imdb_sql_parse(p->sql, p->len, p->st, e))) {
+            imdb_free(p->st);
+            p->st = NULL;
+        }
+    }
+    if (!rc && p->st->kind != ST_SELECT && p->st->kind != ST_INSERT && p->st->kind != ST_UPDATE && p->st->kind != ST_DELETE)
+        rc = imdb_fail(e, IMDB_ERR_INVALID, "PREPARE takes a query, INSERT, UPDATE or DELETE");
+    if (!rc && nptype) {
+        if (!(p->ptypes = imdb_alloc_array(nptype, sizeof *p->ptypes, e))) rc = e->code;
+        else memcpy(p->ptypes, ptypes, nptype * sizeof *ptypes), p->nptype = nptype;
+    }
+    uint64_t bytes = imdb_heap_bytes() - heap0;
+    if (!rc && ss->prep->bytes + bytes > IMDB_MAX_PREPARED_BYTES)
+        rc = imdb_fail(e, IMDB_ERR_LIMIT, "a session's prepared statements hold at most %llu bytes: DEALLOCATE one",
+                       (unsigned long long)IMDB_MAX_PREPARED_BYTES);
+    if (!rc && ss->db->mem_limit) { /* every session's prepared statements are in the total: imdb_mem's prepared */
+        imdb_mem_report mr;
+        imdb_mem(ss->db, &mr);
+        if (mr.total + bytes > ss->db->mem_limit)
+            rc = imdb_fail(e, IMDB_ERR_LIMIT, "memory budget: PREPARE %s would hold %llu bytes more (%llu held, budget %llu)",
+                           name, (unsigned long long)bytes, (unsigned long long)mr.total, (unsigned long long)ss->db->mem_limit);
+    }
     if (rc) {
-        imdb_free(st);
+        prep_free(p);
         return rc;
     }
+    snprintf(p->name, sizeof p->name, "%s", name);
+    p->bytes = bytes;
+    ss->prep->bytes += bytes;
+    ss->db->prep_bytes += bytes;
+    ss->prep->n++;
+    return IMDB_OK;
+}
+
+static int exec_prepare(imdb_session *ss, const sql_stmt *st, const char *sql, imdb_result *r, imdb_err *e)
+{
+    if (prep_add(ss, st->prep_name, sql + st->body_off, st->body_len, st->ptypes, st->nptype, e)) return e->code;
+    snprintf(r->status, sizeof r->status, "PREPARE");
+    return IMDB_OK;
+}
+
+static int exec_deallocate(imdb_session *ss, const sql_stmt *st, imdb_result *r, imdb_err *e)
+{
+    if (st->prep_all) {
+        while (ss->prep && ss->prep->n) prep_drop(ss, (uint16_t)(ss->prep->n - 1));
+    } else {
+        prep_entry *p = prep_find(ss, st->prep_name);
+        if (!p) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no prepared statement %s", st->prep_name);
+        prep_drop(ss, (uint16_t)(p - ss->prep->e));
+    }
+    snprintf(r->status, sizeof r->status, "DEALLOCATE%s", st->prep_all ? " ALL" : "");
+    return IMDB_OK;
+}
+
+/* SHOW PREPARED: the session's, by name: its declared types, its text (as written, if it is UTF-8), its runs */
+static int exec_show_prepared(const imdb_session *ss, imdb_result *r, imdb_err *e)
+{
+    res_cols(r, 4);
+    res_name(r, 0, "name");
+    res_name(r, 1, "parameters");
+    res_name(r, 2, "statement");
+    res_name(r, 3, "uses");
+    uint16_t n = ss->prep ? ss->prep->n : 0, ord[IMDB_MAX_PREPARED];
+    for (uint16_t i = 0; i < n; i++) {
+        uint16_t j = i;
+        for (; j && strcmp(ss->prep->e[ord[j - 1]].name, ss->prep->e[i].name) > 0; j--) ord[j] = ord[j - 1];
+        ord[j] = i;
+    }
+    for (uint16_t i = 0; i < n; i++) {
+        const prep_entry *p = &ss->prep->e[ord[i]];
+        imdb_cell *row = res_row(r, e);
+        if (!row) return e->code;
+        char ty[IMDB_MAX_PARAMS * 16];
+        size_t k = 0;
+        ty[0] = 0;
+        for (uint16_t a = 0; a < p->nptype && k + 24 < sizeof ty; a++) {
+            const sql_ptype *pt = &p->ptypes[a];
+            k += (size_t)(pt->type == IMDB_T_DECIMAL
+                              ? snprintf(ty + k, sizeof ty - k, "%sDECIMAL(%u,%u)", a ? ", " : "", pt->precision, pt->scale)
+                              : snprintf(ty + k, sizeof ty - k, "%s%s", a ? ", " : "", imdb_type_name(pt->type)));
+        }
+        size_t bad;
+        res_put_str(r, &row[0], p->name);
+        res_put_str(r, &row[1], ty);
+        res_put_str(r, &row[2], imdb_utf8_valid((const uint8_t *)p->sql, p->len, &bad) && !memchr(p->sql, 0, p->len)
+                                    ? p->sql : "(its text is not UTF-8)");
+        res_put(r, &row[3], &(imdb_value){.type = IMDB_T_INT64, .i = (int64_t)p->uses});
+    }
+    return res_finish(r, e);
+}
+
+/* P2 S9: a statement parsed once: freed here when owned (one written out), never when it is a prepared one (the
+ * session's, which no run writes into) */
+static void stmt_drop(sql_stmt *st, bool owned)
+{
+    if (!owned) return;
+    imdb_sql_stmt_free(st);
+    imdb_free(st);
+}
+
+/* one statement, parsed, run: sql its text (x->sql and its literals point into it); pname its prepared name (P2 S9) */
+static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char *sql, size_t len, const imdb_value *params,
+                          uint32_t nparams, const char *pname, imdb_result *r, imdb_err *e)
+{
+    int rc = IMDB_OK;
     if (nparams > IMDB_MAX_PARAMS) {
-        imdb_sql_stmt_free(st);
-        imdb_free(st);
+        stmt_drop(st, owned);
         return imdb_fail(e, IMDB_ERR_LIMIT, "too many parameters");
     }
     xctx x = {.ss = ss, .db = ss->db, .sql = sql, .params = params, .nparams = nparams, .st = st, .row_limit = ss->row_limit};
@@ -6987,15 +7181,13 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
     uint64_t seq_before = db->seq;
     if (db->failed) {
         /* in-memory state may be half-installed: no answers until reopen + replay */
-        imdb_sql_stmt_free(st);
-        imdb_free(st);
+        stmt_drop(st, owned);
         imdb_stats_tick(db, !db->stats_said_failed); /* P1 M1: a monitor learns the handle failed */
         imdb_event_failed(db, db->warning); /* P1 M2: the failure's event, if no statement logged it */
         return imdb_fail(e, IMDB_ERR_STATE, "database is in a failed state; reopen it to recover");
     }
     if ((db->pending_auth || db->lake_unverified) && st->kind != ST_VERIFY) {
-        imdb_sql_stmt_free(st);
-        imdb_free(st);
+        stmt_drop(st, owned);
         return imdb_fail(e, IMDB_ERR_STATE,
                          "replica has unauthorised redactions or an unverified lake; resume apply before querying");
     }
@@ -7005,8 +7197,7 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
     if (reads && ss->min_commit > db->seq) {
         rc = imdb_fail(e, IMDB_ERR_STATE, "this database is at commit %llu; the session requires commit %llu (SET min_commit)",
                        (unsigned long long)db->seq, (unsigned long long)ss->min_commit);
-        imdb_sql_stmt_free(st);
-        imdb_free(st);
+        stmt_drop(st, owned);
         return rc;
     }
     bool autocommit = false, txn = ss->txn.open, ceiling = false; /* ceiling: R2's, below */
@@ -7021,8 +7212,7 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
             imdb_txn_expire(db, &ss->txn, why);
             bool ends = st->kind == ST_COMMIT; /* a COMMIT ends it either way, as a doomed COMMIT does */
             if (ends) imdb_txn_rollback(db, &ss->txn);
-            imdb_sql_stmt_free(st);
-            imdb_free(st);
+            stmt_drop(st, owned);
             if (ends) return imdb_fail(e, IMDB_ERR_CANCELLED, "%s; the transaction rolled back", why);
             return imdb_fail(e, IMDB_ERR_CANCELLED, "%s; roll back", why);
         }
@@ -7035,7 +7225,8 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
                     st->kind == ST_ERASE_WHERE || st->kind == ST_VERIFY;
     bool control = st->kind == ST_BEGIN || st->kind == ST_COMMIT || st->kind == ST_ROLLBACK || st->kind == ST_SET ||
                    st->kind == ST_EMPTY || st->kind == ST_SAVEPOINT || st->kind == ST_ROLLBACK_TO ||
-                   st->kind == ST_RELEASE || st->kind == ST_SET_TXN;
+                   st->kind == ST_RELEASE || st->kind == ST_SET_TXN || st->kind == ST_PREPARE || st->kind == ST_DEALLOCATE ||
+                   st->kind == ST_SHOW_PREPARED; /* P2 S9: the session's, no transaction's */
     /* R1: a cancel asked for before this statement is dropped; what runs to its end (COMMIT, the statements that commit
      * on their own, the physical ones) is never checked, so neither a cancel nor the deadline cuts a logged op part
      * way */
@@ -7128,6 +7319,10 @@ static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const im
     case ST_DELETE: rc = exec_delete(&x, st, r, NULL, e); break;
     case ST_SELECT: rc = exec_select(&x, st, r, NULL, e); break;
     case ST_EXPLAIN: rc = exec_explain(&x, st, r, e); break;
+    case ST_PREPARE: rc = exec_prepare(ss, st, sql, r, e); break; /* P2 S9 */
+    case ST_DEALLOCATE: rc = exec_deallocate(ss, st, r, e); break;
+    case ST_SHOW_PREPARED: rc = exec_show_prepared(ss, r, e); break;
+    case ST_EXECUTE: rc = imdb_fail(e, IMDB_ERR_STATE, "EXECUTE runs in the place of its statement"); break; /* exec_one_body */
     case ST_BEGIN:
         if (txn) {
             rc = imdb_fail(e, IMDB_ERR_STATE, "transaction already open");
@@ -7416,6 +7611,7 @@ done:
             const char *cn = stmt_class_name[stmt_class(st->kind)];
             imdb_event_begin(db, "slow");
             imdb_event_str(db, "class", cn, strlen(cn));
+            if (pname) imdb_event_str(db, "prepared", pname, strlen(pname)); /* P2 S9: its shape is the prepared text's */
             imdb_event_int(db, "ms", (int64_t)(us / 1000u));
             imdb_event_str(db, "path", r->path, strlen(r->path));
             imdb_event_int(db, "rows_tested", (int64_t)x.tested);
@@ -7433,9 +7629,129 @@ done:
     imdb_stats_tick(db, said_running || (db->failed && !db->stats_said_failed));
     if (rc) imdb_result_free(r);
     xfree(&x);
-    imdb_sql_stmt_free(st);
-    imdb_free(st);
+    stmt_drop(st, owned);
     return rc;
+}
+
+/* P2 S9: a literal's value as a parameter of its own type (EXECUTE's undeclared values) */
+static int xval_param(const imdb_xval *v, imdb_value *out, imdb_err *e)
+{
+    memset(out, 0, sizeof *out);
+    out->type = v->type;
+    out->scale = v->scale;
+    out->null = v->null;
+    if (v->null) return IMDB_OK; /* NULL has no payload to convert. */
+    if (v->type == IMDB_T_TEXT) out->s = v->s, out->len = v->len;
+    else if (v->type == IMDB_T_FLOAT64) out->i = imdb_f64_key(v->f);
+    else if (v->i < INT64_MIN || v->i > INT64_MAX) return imdb_fail(e, IMDB_ERR_LIMIT, "a value past 18 digits");
+    else out->i = (int64_t)v->i;
+    return IMDB_OK;
+}
+
+/* P2 S9: EXECUTE: its values bound as the prepared statement's $1..$n (a declared type: the value converted to it
+ * exactly, as into a column of that type, or refused; undeclared: the literal's own type, and a NULL or an expression,
+ * which has none, refused), then that statement run in the EXECUTE's place: one pass through its own transaction,
+ * ceiling, statistics and event paths, as its own kind. Its names and types bind now, as written out they would */
+static int exec_execute(imdb_session *ss, const sql_stmt *st, const char *sql, const imdb_value *params, uint32_t nparams,
+                        imdb_result *r, imdb_err *e)
+{
+    prep_entry *p = prep_find(ss, st->prep_name);
+    if (!p) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no prepared statement %s", st->prep_name);
+    if (p->nptype && st->rowlen > p->nptype)
+        return imdb_fail(e, IMDB_ERR_INVALID, "EXECUTE %s passes %u values: its PREPARE declares %u", p->name, st->rowlen,
+                         p->nptype);
+    xctx px = {.ss = ss, .db = ss->db, .sql = sql, .params = params, .nparams = nparams, .st = st};
+    px.env.check = xenv_check;
+    px.env.subq = xenv_subq;
+    px.env.ctx = &px;
+    px.env.arena = &px.arena;
+    imdb_value vals[IMDB_MAX_PARAMS];
+    int rc = IMDB_OK;
+    for (uint16_t i = 0; !rc && i < st->rowlen; i++) {
+        const sql_lit *l = &st->vals[i];
+        imdb_err e2 = {0};
+        if (i < p->nptype) {
+            imdb_column c;
+            memset(&c, 0, sizeof c);
+            c.type = p->ptypes[i].type;
+            c.scale = p->ptypes[i].scale;
+            c.precision = p->ptypes[i].precision;
+            c.flags = IMDB_COL_NULLABLE;
+            snprintf(c.name, sizeof c.name, "$%u", i + 1u);
+            if (bind_lit(&px, l, &c, false, &vals[i], &e2))
+                rc = imdb_fail(e, e2.code, "EXECUTE %s, value %u: %s", p->name, i + 1u, e2.msg);
+        } else if (l->kind == LIT_NULL || l->kind == LIT_EXPR) {
+            rc = imdb_fail(e, IMDB_ERR_INVALID, "EXECUTE %s, value %u: %s has no type of its own: declare it (PREPARE %s (type, ...))",
+                           p->name, i + 1u, l->kind == LIT_NULL ? "NULL" : "an expression", p->name);
+        } else {
+            imdb_xval v;
+            if (bind_xlit(&px, l, &v, &e2) || xval_param(&v, &vals[i], &e2))
+                rc = imdb_fail(e, e2.code, "EXECUTE %s, value %u: %s", p->name, i + 1u, e2.msg);
+        }
+    }
+    const imdb_value *pv = vals;
+    uint32_t pn = st->rowlen;
+    if (!st->rowlen && nparams) pv = params, pn = nparams; /* EXECUTE name with no values: the API's, as given */
+    if (!rc) {
+        rc = exec_stmt_body(ss, p->st, false, p->sql, p->len, pv, pn, p->name, r, e);
+        if (!rc) p->uses++; /* runs that ran to their end */
+    }
+    xfree(&px);
+    return rc;
+}
+
+static int exec_one_body(imdb_session *ss, const char *sql, size_t len, const imdb_value *params, uint32_t nparams,
+                         imdb_result *r, imdb_err *e)
+{
+    imdb_result_init(r);
+    r->byte_cap = workspace_of(ss);
+    sql_stmt *st = imdb_alloc(sizeof *st, e);
+    if (!st) return e->code;
+    int rc = imdb_sql_parse(sql, len, st, e);
+    if (rc) {
+        imdb_free(st);
+        return rc;
+    }
+    if (st->kind == ST_EXECUTE) { /* P2 S9: the prepared statement in its place */
+        rc = exec_execute(ss, st, sql, params, nparams, r, e);
+        stmt_drop(st, true);
+        return rc;
+    }
+    return exec_stmt_body(ss, st, true, sql, len, params, nparams, NULL, r, e);
+}
+
+/* P2 S9: the API's (sql.h); a name as SQL would fold it: an identifier, lowercase */
+int imdb_prepare(imdb_session *s, const char *name, const char *sql, size_t len, imdb_err *e)
+{
+    size_t n = strlen(name);
+    if (!imdb_ident_valid(name, n)) return imdb_fail(e, IMDB_ERR_INVALID, "invalid prepared statement name");
+    for (size_t i = 0; i < n; i++)
+        if (name[i] >= 'A' && name[i] <= 'Z') return imdb_fail(e, IMDB_ERR_INVALID, "prepared statement name not folded to lowercase");
+    return prep_add(s, name, sql, len, NULL, 0, e);
+}
+
+int imdb_execute(imdb_session *s, const char *name, const imdb_value *params, uint32_t nparams, imdb_result *res, imdb_err *e)
+{
+    prep_entry *p = prep_find(s, name);
+    if (!p) {
+        imdb_result_init(res);
+        return imdb_fail(e, IMDB_ERR_NOTFOUND, "no prepared statement %s", name);
+    }
+    imdb_op_enter(s->db);
+    imdb_result_init(res);
+    res->byte_cap = workspace_of(s);
+    int rc = exec_stmt_body(s, p->st, false, p->sql, p->len, params, nparams, p->name, res, e);
+    if (!rc) p->uses++; /* runs that ran to their end */
+    imdb_op_leave(s->db);
+    return rc;
+}
+
+int imdb_deallocate(imdb_session *s, const char *name, imdb_err *e)
+{
+    prep_entry *p = prep_find(s, name);
+    if (!p) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no prepared statement %s", name);
+    prep_drop(s, (uint16_t)(p - s->prep->e));
+    return IMDB_OK;
 }
 
 /* One operation (stage 3c-1): the segment cache trims when the outermost ends, so a statement's result holds no

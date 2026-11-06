@@ -860,11 +860,47 @@ DELETE FROM sessions USING users WHERE users.id = sessions.user_id AND users.ban
   write; SET reads both rows, an unqualified column of both refused as
   ambiguous. Each t row is changed once: an UPDATE whose t row two rows of u
   match is refused (PostgreSQL would take one of them, which one unspecified);
-  DELETE removes it once. The rows are written, and RETURNING's rows come, in
-  t's key order. Not yet: a nested SELECT or more than one table after FROM or
-  USING, EXPLAIN of either, RETURNING u's columns.
+  DELETE removes it once. RETURNING reads both rows too, as PostgreSQL's does
+  (`*` is t's columns then u's; a name in both must be qualified). The rows
+  are written, and RETURNING's rows come, in t's key order. Not yet: a
+  nested SELECT or more than one table after FROM or USING, EXPLAIN of either.
 - RETURNING, WITH and ON are reserved words; a SELECT item that is
   NULL is a TEXT NULL, with FROM or without.
+
+Prepared statements:
+
+```sql
+PREPARE by_id (INT64) AS SELECT * FROM orders WHERE id = $1;
+EXECUTE by_id (42);
+PREPARE add (INT64, DECIMAL(12,2), TIMESTAMP) AS
+  INSERT INTO orders (id, amount, placed) VALUES ($1, $2, $3);
+EXECUTE add (43, 19.5, '2026-11-05 10:00:00');
+SHOW PREPARED;
+DEALLOCATE by_id;
+```
+
+- `PREPARE name [(type, ...)] AS statement` parses a query, INSERT, UPDATE or
+  DELETE once, for the session; `EXECUTE name [(value, ...)]` runs it with the
+  values as its `$1`, `$2`, ...: a declared type converts its value as a
+  column of that type would (a string into a TIMESTAMP, `19.5` into
+  DECIMAL(12,2)) or refuses it; an undeclared one is the literal's own type
+  (an integer, a DECIMAL with its own places, a string, a boolean), and a
+  NULL or an expression needs a declared type. `DEALLOCATE name | ALL`; `SHOW
+  PREPARED` lists them with their runs (those that ran to their end).
+- Names and types bind at each EXECUTE, as written out they would: a table
+  dropped and made again is the new one, and a statement whose table is gone
+  fails (PostgreSQL binds at PREPARE and plans again after a change; the
+  answers are the same). EXECUTE runs as its statement: its transaction,
+  statement memory, timeout, statistics and slow-statement event (which names
+  the prepared statement and gives the prepared text's shape) are the
+  statement's own.
+- At most 256 prepared statements a session, and 64 MiB of their texts and
+  parses together, counted against the memory budget; they last until
+  DEALLOCATE or the session's end, never only a transaction (SHOW MEMORY's
+  `prepared` row: every session's). The C API has the
+  same: `imdb_prepare`, `imdb_execute` (parameters as `imdb_value`s; an
+  EXECUTE without values takes the API's as given),
+  `imdb_deallocate`. Not yet: EXPLAIN EXECUTE.
 
 ## Validation
 

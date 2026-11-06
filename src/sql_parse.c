@@ -1151,6 +1151,52 @@ static int parse_with_list(parser *p, sql_stmt *st)
     return IMDB_OK;
 }
 
+/* P2 S9: PREPARE name [(type, ...)] AS statement: the statement's text kept (every token to the end, a final ; the
+ * statement's own end) for the executor, which parses it into the session's registry and checks its kind */
+static int parse_prepare(parser *p, sql_stmt *st)
+{
+    st->kind = ST_PREPARE;
+    if (ident(p, st->prep_name)) return p->e->code;
+    if (tok(p, TK_LP)) {
+        do {
+            if (st->nptype >= IMDB_MAX_PARAMS)
+                return imdb_fail(p->e, IMDB_ERR_LIMIT, "PREPARE declares more than %u parameters", IMDB_MAX_PARAMS);
+            if (!st->ptypes && !(st->ptypes = imdb_alloc_array(IMDB_MAX_PARAMS, sizeof *st->ptypes, p->e))) return p->e->code;
+            imdb_column c;
+            memset(&c, 0, sizeof c);
+            if (col_type(p, &c)) return p->e->code;
+            st->ptypes[st->nptype++] = (sql_ptype){c.type, c.scale, c.precision};
+        } while (tok(p, TK_COMMA));
+        if (expect(p, TK_RP, ")")) return p->e->code;
+    }
+    if (expect_kw(p, "as")) return p->e->code;
+    uint32_t end = p->n;
+    if (end > p->i && p->t[end - 1].kind == TK_SEMI) end--;
+    if (end <= p->i) return fail_at(p, "a statement to prepare");
+    const sql_tok *a = &p->t[p->i], *z = &p->t[end - 1];
+    st->body_off = a->off - (a->kind == TK_STR); /* a string token's span: inside its quotes */
+    st->body_len = z->off + z->len + (z->kind == TK_STR) - st->body_off;
+    p->i = end;
+    return IMDB_OK;
+}
+
+/* P2 S9: EXECUTE name [(value, ...)]: the values, literals or constant expressions, kept as an INSERT keeps a row */
+static int parse_execute(parser *p, sql_stmt *st)
+{
+    st->kind = ST_EXECUTE;
+    if (ident(p, st->prep_name)) return p->e->code;
+    if (!tok(p, TK_LP)) return IMDB_OK;
+    if (!(st->vals = imdb_alloc_array(IMDB_MAX_PARAMS, sizeof *st->vals, p->e))) return p->e->code;
+    uint16_t w = 0;
+    do {
+        if (w >= IMDB_MAX_PARAMS) return imdb_fail(p->e, IMDB_ERR_LIMIT, "EXECUTE passes more than %u values", IMDB_MAX_PARAMS);
+        if (value(p, &st->vals[w++])) return p->e->code;
+    } while (tok(p, TK_COMMA));
+    st->rowlen = w;
+    st->nrows = 1;
+    return expect(p, TK_RP, ")") ? p->e->code : IMDB_OK;
+}
+
 /* P2 S8: a query starts at token at (SELECT, WITH, or a parenthesized one) */
 static bool query_at(const parser *p, uint32_t at)
 {
@@ -1738,6 +1784,8 @@ void imdb_sql_stmt_free(sql_stmt *st)
         st->arm[i] = NULL;
     }
     st->narm = 0;
+    imdb_free(st->ptypes); /* P2 S9 */
+    st->ptypes = NULL;
     imdb_free(st->cte_col); /* P2 S5 */
     st->cte_col = NULL;
     st->cte_ncols = 0;
@@ -1792,6 +1840,14 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
             rc = parse_retention(&p, &st->retention_us);
     }
     else if (kw(&p, "insert")) rc = parse_insert(&p, st);
+    else if (kw(&p, "prepare")) rc = parse_prepare(&p, st); /* P2 S9 */
+    else if (kw(&p, "execute")) rc = parse_execute(&p, st);
+    else if (kw(&p, "deallocate")) {
+        st->kind = ST_DEALLOCATE;
+        kw(&p, "prepare");
+        if (kw(&p, "all")) st->prep_all = true;
+        else rc = ident(&p, st->prep_name);
+    }
     else if (kw(&p, "update")) {
         st->kind = ST_UPDATE;
         if (!(rc = ident(&p, st->table)) && !(rc = expect_kw(&p, "set"))) {
@@ -1865,6 +1921,7 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
     } else if (kw(&p, "verify")) st->kind = ST_VERIFY;
     else if (kw(&p, "show")) {
         if (kw(&p, "tables")) st->kind = ST_SHOW_TABLES;
+        else if (kw(&p, "prepared")) st->kind = ST_SHOW_PREPARED; /* P2 S9 */
         else if (kw(&p, "indexes")) st->kind = ST_SHOW_INDEXES;
         else if (kw(&p, "retention")) st->kind = ST_SHOW_RETENTION;
         else if (kw(&p, "lake")) st->kind = ST_SHOW_LAKE;

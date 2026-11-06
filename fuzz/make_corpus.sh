@@ -106,6 +106,9 @@ for q in "SELECT COUNT(*), SUM(amount) FROM txns AS OF 3 WHERE user_id = 42 AND 
          "INSERT INTO t (id, x) VALUES (1, 2), (3, 4) ON CONFLICT (id) DO UPDATE SET x = excluded.x + t.x WHERE excluded.x > t.x" \
          "UPDATE t SET x = t.x + u.x FROM t AS u WHERE u.id = t.id + 1 RETURNING *" \
          "DELETE FROM t USING t AS u WHERE u.g = t.g AND u.id < t.id RETURNING id" \
+         "PREPARE p (INT64, TEXT) AS SELECT id, s FROM t WHERE id > \$1 AND s <> \$2" \
+         "EXECUTE p (3, 'x')" \
+         "DEALLOCATE ALL" \
          "((((((((((((((((((((((((((((((((((((((((SELECT 1))))))))))))))))))))))))))))))))))))))))" \
          "SELECT id, (SELECT COUNT(*) FROM u WHERE u.tid = t.id) FROM t WHERE g IN (SELECT v FROM u AS ci WHERE ci.tid = t.id)" \
          "SELECT AVG(f) FROM t HAVING COUNT(*) BETWEEN 1 AND 10 OFFSET 0 LIMIT 0"; do

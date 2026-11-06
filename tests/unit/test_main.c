@@ -107,6 +107,7 @@ int main(int argc, char **argv)
         {"setop", setop_tests, &setop_ntests},
         {"window", window_tests, &window_ntests},
         {"dml", dml_tests, &dml_ntests},
+        {"prep", prep_tests, &prep_ntests},
         {"backup", backup_tests, &backup_ntests},
         {"expr", expr_tests, &expr_ntests},
         {"cancel", cancel_tests, &cancel_ntests},

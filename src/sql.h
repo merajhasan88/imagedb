@@ -73,6 +73,7 @@ typedef struct imdb_session {
     uint32_t idle_timeout_ms; /* SET idle_in_transaction_timeout = ms: one idle longer, the same (R4; 0: none) */
     uint64_t stmt_memory;     /* SET statement_memory = bytes: a read statement's workspace ceiling (P0 R2; 0: the default,
                                * a quarter of the memory budget or IMDB_MAX_RESULT_BYTES) */
+    struct imdb_prep_set *prep; /* P2 S9: its prepared statements (PREPARE, imdb_prepare), NULL until the first */
     atomic_bool cancel;       /* imdb_session_cancel: the running statement stops at its next check (cleared at
                                * each statement's start, so a request between statements is dropped) */
 } imdb_session;
@@ -121,6 +122,13 @@ void imdb_result_free(imdb_result *r);
  * bound to $1..$n with exact type matching. */
 int imdb_exec_one(imdb_session *s, const char *sql, size_t len, const imdb_value *params, uint32_t nparams,
                   imdb_result *res, imdb_err *e);
+/* P2 S9: a session's prepared statement by name, as PREPARE, EXECUTE and DEALLOCATE make, run and drop one: sql parsed
+ * once (SELECT, INSERT, UPDATE or DELETE), each run with params as its $1..$n (as imdb_exec_one's: each of the type its
+ * use wants), names and types bound at each run */
+int imdb_prepare(imdb_session *s, const char *name, const char *sql, size_t len, imdb_err *e);
+int imdb_execute(imdb_session *s, const char *name, const imdb_value *params, uint32_t nparams, imdb_result *res,
+                 imdb_err *e);
+int imdb_deallocate(imdb_session *s, const char *name, imdb_err *e);
 
 /* Splits a script into statements (respecting string literals and -- comments).
  * Calls cb for each; stops at the first error. */

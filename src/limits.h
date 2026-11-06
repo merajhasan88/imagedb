@@ -20,6 +20,8 @@
 #define IMDB_MAX_PREDICATES     32u          /* AND-ed comparisons in a WHERE        */
 #define IMDB_MAX_ORDER          16u          /* ORDER BY keys (1d)                   */
 #define IMDB_MAX_PARAMS         256u         /* $n bound parameters                  */
+#define IMDB_MAX_PREPARED       256u         /* P2 S9: a session's prepared statements (each parse ~36 KiB a statement in it) */
+#define IMDB_MAX_PREPARED_BYTES (64ull << 20) /* P2 S9: and their texts and parses together, a session's */
 #define IMDB_MAX_NUMERIC        128u         /* bytes in one numeric literal          */
 #define IMDB_MAX_EXPR_NODES     16384u       /* terms in one statement's expressions (1b; a literal value takes none) */
 #define IMDB_MAX_EXPR_DEPTH     64u          /* an expression's height: the parser's and evaluator's recursion */

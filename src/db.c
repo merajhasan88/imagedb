@@ -4689,7 +4689,8 @@ void imdb_mem(const imdb_db *db, imdb_mem_report *r)
                    (uint64_t)x->capsps * sizeof(imdb_txn_sp);
         for (uint32_t i = 0; i < x->nops; i++) r->txns += x->ops[i].row_len;
     }
-    r->total = r->versions + r->rows + r->indexes + r->segments + r->commits + r->txns;
+    r->prepared = db->prep_bytes; /* P2 S9 */
+    r->total = r->versions + r->rows + r->indexes + r->segments + r->commits + r->txns + r->prepared;
     r->limit = db->mem_limit;
     r->reserve = db->mem_reserve;
 }

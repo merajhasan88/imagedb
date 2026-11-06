@@ -75,7 +75,7 @@ static void t_mem_admission(void)
     imdb_session_init(&s, db);
     imdb_result r;
     OK(run(&s, "SHOW MEMORY", &r));
-    CHECK(r.nrows == 7 && strstr(r.status, "budget") && strstr(r.status, "; no memory window: "));
+    CHECK(r.nrows == 8 && strstr(r.status, "budget") && strstr(r.status, "; no memory window: ")); /* P2 S9: prepared */
     imdb_result_free(&r);
     /* the ways down, over the budget or not */
     OK(run(&s, "DELETE FROM txns WHERE id = 1", &r));

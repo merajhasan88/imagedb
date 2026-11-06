@@ -112,8 +112,40 @@ static void t_window_cancel(void)
     imdb_close(db);
 }
 
+/* C1: EXECUTE keeps an API parameter's typed NULL, for every type, and a prepared INSERT stores it as NULL */
+static void t_null_param(void)
+{
+    imdb_session s;
+    imdb_db *db = fresh(&s);
+    CHECK(db);
+    if (!db) return;
+    expect(&s, "PREPARE p AS SELECT $1", true);
+    const uint8_t types[] = {IMDB_T_INT64, IMDB_T_DECIMAL, IMDB_T_TEXT, IMDB_T_FLOAT64, IMDB_T_BOOL, IMDB_T_TIMESTAMP};
+    for (size_t i = 0; i < sizeof types / sizeof *types; i++) {
+        imdb_value v = {.type = types[i], .scale = types[i] == IMDB_T_DECIMAL ? 2 : 0, .null = true};
+        imdb_result r;
+        int rc = run(&s, "EXECUTE p($1)", &v, 1, &r);
+        if (rc || r.nrows != 1 || !r.cells[0].null)
+            test_fail(__FILE__, __LINE__, "EXECUTE must preserve a typed NULL supplied through an API parameter");
+        if (!rc) imdb_result_free(&r);
+    }
+    expect(&s, "CREATE TABLE t(id INT64 PRIMARY KEY, a INT64)", true);
+    expect(&s, "PREPARE w AS INSERT INTO t VALUES(1,$1)", true);
+    imdb_value v = {.type = IMDB_T_INT64, .null = true};
+    imdb_result r;
+    int rc = run(&s, "EXECUTE w($1)", &v, 1, &r);
+    if (rc) test_fail(__FILE__, __LINE__, "insert through a NULL parameter");
+    else imdb_result_free(&r);
+    rc = run(&s, "SELECT COUNT(*) FROM t WHERE a IS NULL", NULL, 0, &r);
+    if (rc || r.nrows != 1 || r.cells[0].v.i != 1) test_fail(__FILE__, __LINE__, "a NULL argument must remain NULL in the stored row");
+    if (!rc) imdb_result_free(&r);
+    imdb_session_close(&s);
+    imdb_close(db);
+}
+
 const test_case review1105_tests[] = {
     {"review1105_scope", t_scope},
     {"review1105_window_cancel", t_window_cancel},
+    {"review1105_null_param", t_null_param},
 };
 const size_t review1105_ntests = sizeof review1105_tests / sizeof *review1105_tests;

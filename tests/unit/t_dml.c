@@ -652,8 +652,8 @@ static void t_dml_update_from(void)
         int fv = filt == 1 ? k : jg;
         char ftxt[40] = "";
         if (filt) snprintf(ftxt, sizeof ftxt, "%s%d", fs, fv);
-        if (upd) snprintf(sql, sizeof sql, "UPDATE t SET v = t.v + u.w, g = u.w %% 7 FROM u WHERE u.tid = t.id%s RETURNING id, g, v", ftxt);
-        else snprintf(sql, sizeof sql, "DELETE FROM t USING u WHERE u.tid = t.id%s RETURNING id, v", ftxt);
+        if (upd) snprintf(sql, sizeof sql, "UPDATE t SET v = t.v + u.w, g = u.w %% 7 FROM u WHERE u.tid = t.id%s RETURNING t.id AS id, t.g AS g, t.v AS v", ftxt);
+        else snprintf(sql, sizeof sql, "DELETE FROM t USING u WHERE u.tid = t.id%s RETURNING t.id AS id, t.v AS v", ftxt);
         /* the model */
         int cnt[TN] = {0}, last[TN];
         for (int j = 0; j < UN2; j++) {
@@ -700,7 +700,9 @@ static void t_dml_update_from(void)
     /* in a transaction: its own rows read and written; ROLLBACK takes them */
     CHECK(run("BEGIN") == 0);
     CHECK(run("DELETE FROM u") == 0 && run("INSERT INTO u VALUES (5000, 3, 1000)") == 0);
-    EXPECT("UPDATE t SET v = u.w FROM u WHERE u.tid = t.id RETURNING id, v", "id,v\n3,1000\n");
+    EXPECT("UPDATE t SET v = u.w FROM u WHERE u.tid = t.id RETURNING id, v", "ERR column id is in both tables: qualify it");
+    EXPECT("UPDATE t SET v = u.w FROM u WHERE u.tid = t.id RETURNING t.id AS id, v, u.w * 2 AS w2", "id,v,w2\n3,1000,2000\n");
+    EXPECT("UPDATE t SET v = u.w FROM u WHERE u.tid = t.id RETURNING *", "id,g,v,id,tid,w\n3,3,1000,5000,3,1000\n"); /* both rows */
     EXPECT("SELECT v FROM t WHERE id = 3", "v\n1000\n");
     CHECK(run("ROLLBACK") == 0);
     /* an unqualified column of both is ambiguous; the refusals, before any row */

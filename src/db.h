@@ -328,6 +328,7 @@ typedef struct imdb_db {
     bool no_auto_retire;      /* tests that RETIRE by hand turn the policy off for their handle */
     uint64_t pin_max_lag;     /* IMDB_PIN_MAX_LAG (tests lower it) */
     uint64_t mem_limit;       /* the memory budget (imdb_open_opts.mem_limit; 0: none) */
+    uint64_t prep_bytes;      /* P2 S9: what every session's prepared statements hold (sql_exec.c), in imdb_mem's total */
     uint64_t mem_reserve;     /* D8 #2: the budget's part kept from writes for a query (imdb_query_share; 0: none) */
     uint64_t mem_window_us;   /* stage 3b: a version ended within it stays in memory (imdb_open_opts.mem_window_us) */
     uint64_t mem_floor;       /* every version ended past it is held; one ended at or before it may be the lake's alone,
@@ -769,7 +770,8 @@ uint64_t imdb_cleanup_seq(imdb_db *db);
  * state stays consistent), until the budget is raised. Results have their own cap
  * (IMDB_MAX_RESULT_BYTES, a quarter of the budget when there is one). */
 typedef struct imdb_mem_report {
-    uint64_t versions, rows, indexes, segments, commits, txns, total, limit, reserve; /* reserve: db->mem_reserve */
+    uint64_t versions, rows, indexes, segments, commits, txns, prepared, total, limit, reserve; /* reserve: db->mem_reserve;
+                                                                     * prepared: every session's (P2 S9) */
     /* the segment cache (stage 3c-1): its images' bytes (in segments), its budget, the images loaded since the open and
      * the object bytes read for them */
     uint64_t seg_images, seg_budget, seg_loads, seg_load_bytes;
