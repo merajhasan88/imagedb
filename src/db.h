@@ -118,7 +118,10 @@ typedef struct imdb_segcache {
     uint64_t snap_seq;        /* a snapshot load's commit S while it runs (db->seq is still 0 then): a reload's bound for its
                                  deletion vector's ends (3c-2: the open's passes read a segment again) */
     struct imdb_db *db;       /* the database it belongs to: a load opens its objects/ */
-    pthread_mutex_t lock;     /* loads by imdb_par_for's workers, and the counters they move */
+    pthread_mutex_t lock;     /* a segment's load state (lake.h: loading, ld_fail, ld_err), the counters a load moves, the
+                                 publication of an image: never held while a load reads (P2 S14) */
+    pthread_cond_t loaded;    /* P2 S14: broadcast as each load ends, read or failed: the workers waiting for that image */
+    uint64_t load_waits;      /* P2 S14: pins that waited for another worker's load of their image (under the lock) */
 } imdb_segcache;
 
 typedef struct imdb_table {

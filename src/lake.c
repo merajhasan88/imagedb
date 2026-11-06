@@ -127,6 +127,7 @@ void imdb_segment_free(imdb_segment *g)
 {
     if (!g) return;
     seg_img_drop(g);
+    imdb_free(g->ld_err); /* P2 S14: a failed load's error kept for its operation */
     imdb_free(g);
 }
 
@@ -2203,8 +2204,11 @@ imdb_segimg *imdb_seg_resident(const imdb_table *t, imdb_segment *g)
 /* g's image read again (it left memory, so its objects are on disk): the rows by the segment's name, the published
  * ends by its deletion vector's, then each held version's own end, which is later or a running transaction's (an
  * end goes into a resident image only: imdb_seg_set_end). The bytes hash to the descriptor's name, so the
- * descriptor stands. Under the cache's lock: imdb_par_for's workers pin too. */
-static int seg_load_body(imdb_segcache *c, const imdb_table *t, imdb_segment *g, imdb_segimg **out, imdb_err *e)
+ * descriptor stands. P2 S14: outside the cache's lock, g marked loading (one worker reads it); it reads only what
+ * changes between operations, never within one: the descriptor, the store, the copy's commit. Its object bytes in
+ * *bytes; seg_publish then charges and shows the image under the lock */
+static int seg_load_body(imdb_segcache *c, const imdb_table *t, imdb_segment *g, imdb_segimg **out, uint64_t *bytes,
+                         imdb_err *e)
 {
     *out = NULL;
     if (!g->ondisk || g->cache != c)
@@ -2257,26 +2261,51 @@ static int seg_load_body(imdb_segcache *c, const imdb_table *t, imdb_segment *g,
     }
     tmp->img_ = NULL;
     imdb_free(tmp);
-    c->loads++;
-    c->load_bytes += read;
-    c->resident += seg_img_bytes(g, gi);
-    if (c->resident > c->peak) c->peak = c->resident;
-    __atomic_store_n(&g->touched, c->clock, __ATOMIC_RELAXED);
-    __atomic_store_n(&g->img_, gi, __ATOMIC_RELEASE);
+    *bytes = read;
     *out = gi;
     return IMDB_OK;
 }
 
 /* An image is the segment cache's, under its own budget, not a read statement's workspace (P0 R2, util.h): its
- * load is exempt from the statement's ceiling, which its allocations raise and its temporaries' frees lower again */
-static int seg_load(imdb_segcache *c, const imdb_table *t, imdb_segment *g, imdb_segimg **out, imdb_err *e)
+ * load is exempt from the statement's ceiling, which its allocations raise and its temporaries' frees lower again
+ * (the exemption is the thread's own: each worker's load is) */
+static int seg_load(imdb_segcache *c, const imdb_table *t, imdb_segment *g, imdb_segimg **out, uint64_t *bytes,
+                    imdb_err *e)
 {
     imdb_heap_exempt_begin();
-    int rc = seg_load_body(c, t, g, out, e);
+    int rc = seg_load_body(c, t, g, out, bytes, e);
     imdb_heap_exempt_end();
     return rc;
 }
 
+/* Under the cache's lock: a load read gi (bytes of objects); charged, stamped, then shown to every pin (the release
+ * store: a reader of img_ sees the whole image) */
+static void seg_publish(imdb_segcache *c, imdb_segment *g, imdb_segimg *gi, uint64_t bytes)
+{
+    c->loads++;
+    c->load_bytes += bytes;
+    c->resident += seg_img_bytes(g, gi);
+    if (c->resident > c->peak) c->peak = c->resident;
+    __atomic_store_n(&g->touched, c->clock, __ATOMIC_RELAXED);
+    __atomic_store_n(&g->img_, gi, __ATOMIC_RELEASE);
+}
+
+/* P2 S14, tests only: called between a load's read and its publication, with no lock held, so a test can hold a load
+ * there while other workers pin the same segment (they wait) or others (they load), and let loads end in any order */
+static void (*g_load_hook)(const imdb_segment *g, void *ctx);
+static void *g_load_hook_ctx;
+void imdb_seg_load_hook(void (*fn)(const imdb_segment *g, void *ctx), void *ctx)
+{
+    g_load_hook = fn;
+    g_load_hook_ctx = ctx;
+}
+
+/* The pin of an image not stamped in this operation. P2 S14 (the 2026-11-05 review's O4): a cold image is read outside
+ * the cache's lock, so imdb_par_for's workers read different segments at once rather than queue behind one read; one
+ * load an image: a worker finding it loading waits for that load (the cache's condition), then takes its image, or,
+ * when it failed in this operation, its error whole (what this worker's own read would have said: messages do not
+ * depend on which worker read, nor on the thread count); a later operation reads again. Nothing drops an image while
+ * a load runs: trims and the open's releases run only when no parallel loop does */
 imdb_segimg *imdb_seg_pin_slow(const imdb_table *t, imdb_segment *g, imdb_err *e)
 {
     imdb_segimg *gi = __atomic_load_n(&g->img_, __ATOMIC_ACQUIRE);
@@ -2292,8 +2321,40 @@ imdb_segimg *imdb_seg_pin_slow(const imdb_table *t, imdb_segment *g, imdb_err *e
         return NULL;
     }
     pthread_mutex_lock(&c->lock);
-    gi = __atomic_load_n(&g->img_, __ATOMIC_ACQUIRE); /* another worker's load, while this one waited */
-    int rc = gi ? IMDB_OK : seg_load(c, t, g, &gi, e);
+    for (;;) {
+        gi = __atomic_load_n(&g->img_, __ATOMIC_ACQUIRE); /* another worker's load, while this one waited */
+        if (gi) {
+            pthread_mutex_unlock(&c->lock);
+            return gi;
+        }
+        if (g->ld_fail == c->clock && g->ld_err) { /* that load failed in this operation: its error, whole */
+            imdb_fail(e, g->ld_err->code, "%s", g->ld_err->msg);
+            pthread_mutex_unlock(&c->lock);
+            return NULL;
+        }
+        if (!g->loading) break; /* nobody reads it: this worker does */
+        c->load_waits++;
+        pthread_cond_wait(&c->loaded, &c->lock);
+    }
+    g->loading = true;
+    pthread_mutex_unlock(&c->lock);
+    uint64_t bytes = 0;
+    int rc = seg_load(c, t, g, &gi, &bytes, e);
+    if (g_load_hook) g_load_hook(g, g_load_hook_ctx);
+    imdb_err *kept = NULL;
+    if (rc) { /* kept for the workers waiting, and any that pins it later in this operation; none if it cannot be made */
+        imdb_err ke = {0};
+        imdb_heap_exempt_begin();
+        if ((kept = imdb_alloc(sizeof *kept, &ke))) *kept = *e;
+        imdb_heap_exempt_end();
+    }
+    pthread_mutex_lock(&c->lock);
+    imdb_free(g->ld_err); /* an earlier operation's */
+    g->ld_err = kept;
+    g->ld_fail = rc ? c->clock : 0;
+    if (!rc) seg_publish(c, g, gi, bytes);
+    g->loading = false;
+    pthread_cond_broadcast(&c->loaded);
     pthread_mutex_unlock(&c->lock);
     return rc ? NULL : gi;
 }

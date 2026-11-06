@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
 
 #include "../../src/db_internal.h"
 #include "../../src/lake.h"
@@ -783,7 +785,229 @@ static void t_segcache_open_streams(void)
     for (int run = 0; run < 3; run++) imdb_buf_free(&ans[run]);
 }
 
+/* ---- P2 S14, the 2026-11-05 review's O4: a cold image read outside the cache's lock, one load an image ---- */
+
+/* the load hook: each load held between its read and its publication until the test lets its segment go */
+static struct {
+    pthread_mutex_t m;
+    pthread_cond_t cv;
+    const imdb_segment *go[8];
+    int nheld, ngo, calls;
+} H = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, {0}, 0, 0, 0};
+
+static bool h_gone(const imdb_segment *g)
+{
+    for (int i = 0; i < H.ngo; i++)
+        if (H.go[i] == g) return true;
+    return false;
+}
+
+static void hold_hook(const imdb_segment *g, void *ctx)
+{
+    (void)ctx;
+    pthread_mutex_lock(&H.m);
+    H.calls++;
+    H.nheld++;
+    pthread_cond_broadcast(&H.cv);
+    while (!h_gone(g)) pthread_cond_wait(&H.cv, &H.m);
+    pthread_mutex_unlock(&H.m);
+}
+
+static void h_reset(void)
+{
+    pthread_mutex_lock(&H.m);
+    H.nheld = H.ngo = H.calls = 0;
+    pthread_mutex_unlock(&H.m);
+}
+
+static void h_wait_held(int n) /* until n loads have read and are held */
+{
+    pthread_mutex_lock(&H.m);
+    while (H.nheld < n) pthread_cond_wait(&H.cv, &H.m);
+    pthread_mutex_unlock(&H.m);
+}
+
+static void h_let_go(const imdb_segment *g)
+{
+    pthread_mutex_lock(&H.m);
+    if (H.ngo < 8) H.go[H.ngo++] = g;
+    pthread_cond_broadcast(&H.cv);
+    pthread_mutex_unlock(&H.m);
+}
+
+static int h_calls(void)
+{
+    pthread_mutex_lock(&H.m);
+    int n = H.calls;
+    pthread_mutex_unlock(&H.m);
+    return n;
+}
+
+static void wait_waits(imdb_db *db, uint64_t n) /* until the cache has counted n pins waiting for another's load */
+{
+    for (;;) {
+        pthread_mutex_lock(&db->segcache.lock);
+        uint64_t w = db->segcache.load_waits;
+        pthread_mutex_unlock(&db->segcache.lock);
+        if (w >= n) return;
+        usleep(1000);
+    }
+}
+
+typedef struct pinner {
+    const imdb_table *t;
+    imdb_segment *g;
+    imdb_segimg *gi;
+    imdb_err e;
+    pthread_t th;
+} pinner;
+
+static void *pin_main(void *arg)
+{
+    pinner *p = arg;
+    p->gi = imdb_seg_pin(p->t, p->g, &p->e);
+    return NULL;
+}
+
+static bool pin_start(pinner *p, const imdb_table *t, imdb_segment *g)
+{
+    memset(p, 0, sizeof *p);
+    p->t = t;
+    p->g = g;
+    return pthread_create(&p->th, NULL, pin_main, p) == 0;
+}
+
+/* an I/O or allocation failure in a load, after its object opened (the fault hooks: no other thread in the engine
+ * while they are set, but the test's own pinners, one of which reads) */
+static struct {
+    int op, seen_open, failed;
+} F;
+
+static long fail_mid(imdb_io_call *c, void *ctx)
+{
+    (void)ctx;
+    if (F.failed) return 0;
+    if (c->op == IMDB_IO_OPEN && c->name && strstr(c->name, ".seg")) {
+        F.seen_open = 1;
+        return 0;
+    }
+    if (F.seen_open && c->op == F.op) {
+        F.failed = 1;
+        errno = F.op == IMDB_IO_ALLOC ? ENOMEM : EIO;
+        return -1;
+    }
+    return 0;
+}
+
+/* Two cold segments pinned by four threads: each load held after its read (the hook) until the test has seen a second
+ * pin of the same segment wait for it, the other segment's load running meanwhile; the loads let go in the other order
+ * than they began. Each segment loads once, and every pin of it has that one image. Then loads that fail (the object
+ * away, a read failing after its open, an allocation failing after it): the worker waiting takes the loader's error
+ * whole (its code and message, as its own read would have said), a third pin in that operation the same without
+ * reading, and the next operation reads again */
+static void t_segcache_one_load(void)
+{
+    char dir[512], from[700], to[700];
+    snprintf(dir, sizeof dir, "%s", test_tmpdir());
+    OK(imdb_init(dir, false, NULL, E));
+    imdb_db *db = copen(dir, UINT64_MAX);
+    CHECK(db);
+    if (!db) return;
+    imdb_session s;
+    imdb_session_init(&s, db);
+    OK(ex(&s, "CREATE TABLE t (id INT64 PRIMARY KEY, v INT64)"));
+    char sql[96];
+    for (int k = 0; k < 2; k++) {
+        OK(ex(&s, "BEGIN"));
+        for (int i = 0; i < 200; i++) {
+            snprintf(sql, sizeof sql, "INSERT INTO t VALUES (%d, %d)", k * 200 + i, i);
+            OK(ex(&s, sql));
+        }
+        OK(ex(&s, "COMMIT"));
+        OK(ex(&s, "CHECKPOINT"));
+    }
+    imdb_table *t = imdb_table_by_name(db, "t");
+    CHECK(t && t->nseg == 2);
+    if (!t || t->nseg != 2) goto out;
+    db->segcache.budget = 0;
+    OK(ex(&s, "SELECT COUNT(*) FROM t WHERE id = 1")); /* an operation ends: at a budget of none every image leaves */
+    CHECK(resident_images(t) == 0);
+    imdb_segment *A = t->seg[0], *B = t->seg[1];
+    pinner p[4];
+    h_reset();
+    imdb_seg_load_hook(hold_hook, NULL);
+    uint64_t loads0 = db->segcache.loads, waits0 = db->segcache.load_waits;
+    imdb_op_enter(db);
+    CHECK(pin_start(&p[0], t, A));
+    h_wait_held(1); /* A read, held */
+    CHECK(pin_start(&p[1], t, A));
+    wait_waits(db, waits0 + 1); /* a second pin of A waits for that load */
+    CHECK(pin_start(&p[2], t, B));
+    h_wait_held(2); /* B's load ran meanwhile: no lock held through a read */
+    CHECK(pin_start(&p[3], t, B));
+    wait_waits(db, waits0 + 2);
+    h_let_go(B); /* the later load ends first */
+    pthread_join(p[2].th, NULL);
+    pthread_join(p[3].th, NULL);
+    CHECK(p[2].gi && p[2].gi == p[3].gi && !imdb_seg_resident(t, A));
+    h_let_go(A);
+    pthread_join(p[0].th, NULL);
+    pthread_join(p[1].th, NULL);
+    CHECK(p[0].gi && p[0].gi == p[1].gi && p[0].gi != p[2].gi);
+    CHECK(db->segcache.loads == loads0 + 2 && h_calls() == 2 && resident_images(t) == 2);
+    imdb_op_leave(db);
+    CHECK(resident_images(t) == 0);
+    /* a load that fails, three ways */
+    imdb_hex(A->hash, 32, from); /* the object's name, then the paths */
+    char hex[65];
+    memcpy(hex, from, 65);
+    snprintf(from, sizeof from, "%s/objects/%s.seg", dir, hex);
+    snprintf(to, sizeof to, "%s/objects/%s.away", dir, hex);
+    for (int how = 0; how < 3; how++) {
+        static const imdb_io_hooks hooks = {fail_mid, NULL, NULL};
+        if (how == 0) CHECK(rename(from, to) == 0);
+        else {
+            memset(&F, 0, sizeof F);
+            F.op = how == 1 ? IMDB_IO_READ : IMDB_IO_ALLOC;
+            imdb_io_set_hooks(&hooks);
+        }
+        h_reset();
+        loads0 = db->segcache.loads;
+        waits0 = db->segcache.load_waits;
+        imdb_op_enter(db);
+        CHECK(pin_start(&p[0], t, A));
+        h_wait_held(1);
+        CHECK(pin_start(&p[1], t, A));
+        wait_waits(db, waits0 + 1);
+        h_let_go(A);
+        pthread_join(p[0].th, NULL);
+        pthread_join(p[1].th, NULL);
+        if (how) imdb_io_set_hooks(NULL);
+        if (how) CHECK(F.failed);
+        CHECK(!p[0].gi && !p[1].gi && p[0].e.code && p[0].e.code == p[1].e.code && !strcmp(p[0].e.msg, p[1].e.msg));
+        imdb_err e3 = {0};
+        CHECK(!imdb_seg_pin(t, A, &e3) && e3.code == p[0].e.code && !strcmp(e3.msg, p[0].e.msg));
+        CHECK(h_calls() == 1 && db->segcache.loads == loads0 && !db->failed); /* the third read nothing */
+        imdb_op_leave(db);
+        if (how == 0) CHECK(rename(to, from) == 0);
+        imdb_op_enter(db); /* the next operation reads again */
+        imdb_err e4 = {0};
+        CHECK(imdb_seg_pin(t, A, &e4) != NULL && !e4.code && db->segcache.loads == loads0 + 1 && h_calls() == 2);
+        imdb_op_leave(db);
+    }
+    imdb_seg_load_hook(NULL, NULL);
+    imdb_result r;
+    OK(imdb_exec_one(&s, "SELECT COUNT(*), SUM(v) FROM t", 30, NULL, 0, &r, E));
+    CHECK(r.nrows == 1 && r.cells[0].v.i == 400);
+    imdb_result_free(&r);
+out:
+    imdb_seg_load_hook(NULL, NULL);
+    imdb_session_close(&s);
+    imdb_close(db);
+}
+
 const test_case segcache_tests[] = {
+    {"segcache_one_load", t_segcache_one_load},
     {"segcache_reload_ends", t_segcache_reload_ends},
     {"segcache_lru", t_segcache_lru},
     {"segcache_unwritten_kept", t_segcache_unwritten_kept},

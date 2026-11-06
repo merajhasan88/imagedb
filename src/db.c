@@ -4163,6 +4163,7 @@ int imdb_close(imdb_db *db)
     if (db->events_dirfd >= 0) close(db->events_dirfd);
     pthread_mutex_destroy(&db->events_lock);
     pthread_mutex_destroy(&db->segcache.lock);
+    pthread_cond_destroy(&db->segcache.loaded); /* P2 S14 */
     imdb_free(db);
     return rc;
 }
@@ -4236,6 +4237,12 @@ int imdb_open(const char *path, const imdb_open_opts *o, imdb_db **out, imdb_err
         pthread_mutex_destroy(&db->segcache.lock);
         imdb_free(db);
         return imdb_fail(e, IMDB_ERR_NOMEM, "cannot make the event log's lock");
+    }
+    if (pthread_cond_init(&db->segcache.loaded, NULL) != 0) { /* P2 S14: third; imdb_close destroys it too */
+        pthread_mutex_destroy(&db->events_lock);
+        pthread_mutex_destroy(&db->segcache.lock);
+        imdb_free(db);
+        return imdb_fail(e, IMDB_ERR_NOMEM, "cannot make the segment cache's condition");
     }
     db->dirfd = db->logfd = db->lockfd = db->logdirfd = db->durfd = db->anchorfd = db->anchor_lockfd = -1;
     db->stats_fd = -1; /* P1 M1: 0 is a file descriptor */

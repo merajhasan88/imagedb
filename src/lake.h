@@ -106,10 +106,20 @@ typedef struct imdb_segment {
     uint64_t end_lo, end_hi;
     imdb_segcache *cache;    /* the cache its image is charged to (NULL: apart from any table, never dropped) */
     imdb_segimg *img_;
+    /* P2 S14 (the 2026-11-05 review's O4): a load reads outside the cache's lock, one load an image. Under that lock:
+     * loading while one worker reads it (the others wait on the cache's condition); ld_fail the operation (the cache's
+     * clock) whose load of it failed, and ld_err that failure whole, so a pin in the same operation reports what its
+     * own read would have, whichever worker read (the message never depends on the thread count); a later operation
+     * reads again (ld_fail 0: none; ld_err NULL when its copy could not be made: a waiter then reads itself) */
+    bool loading;
+    uint64_t ld_fail;
+    imdb_err *ld_err;
 } imdb_segment;
 
 /* The rest of imdb_seg_pin (lake.c): the stamp of a segment first pinned in this operation, or the load. */
 imdb_segimg *imdb_seg_pin_slow(const imdb_table *t, imdb_segment *g, imdb_err *e);
+/* P2 S14, tests only: fn(g, ctx) runs between each load's read and its publication, no lock held (NULL: none) */
+void imdb_seg_load_hook(void (*fn)(const imdb_segment *g, void *ctx), void *ctx);
 /* The open streams (3c-2, lake.c): a pass lets go of a segment it has left while the cache is over its budget; the
  * replay trims between commits. No-ops outside the open. */
 void imdb_seg_release_one(imdb_segment *g);
