@@ -1505,6 +1505,9 @@ static void t_retain_retire_replica(void)
     if (!db) return;
     imdb_session s;
     imdb_session_init(&s, db);
+    uint64_t t0 = imdb_now_us(); /* the clock frozen from here, stepped by the test: no margin depends on how long a
+                                  * step took (2026-11-06: a loaded run overran this test's on the moving clock) */
+    imdb_clock_freeze(t0);
     uint8_t seed[IMDB_SEED_LEN];
     memset(seed, 1, sizeof seed);
     imdb_signer k;
@@ -1527,14 +1530,14 @@ static void t_retain_retire_replica(void)
     OK(ex(&s, "CHECKPOINT"));
     put_ack(dir, db, s2 - 1, h1, 0); /* the replica holds the first segment */
     CHECK(r1_state(db) == IMDB_REPL_SAME_HISTORY);
-    imdb_clock_offset(15 * SEC_US);
+    imdb_clock_freeze(t0 + 15 * SEC_US);
     OK(ex(&s, "SELECT COUNT(*) FROM a")); /* the expiry to s3; the policy's own RETIRE, s3 - 1, capped at s2 - 1 */
     CHECK(horizon_of(db, "a") == s3 && db->boundary == s2 - 1 && db->log_floor == s2 - 1 && held_of(db, "a") == 16 - 4);
     CHECK(r1_state(db) == IMDB_REPL_SAME_HISTORY && answer_has(&s, "SHOW REPLICAS", "same history")); /* FLOOR's hash */
     OK(ex(&s, "SELECT COUNT(*) FROM a")); /* due at s3 - 1 again, and held back: nothing below s2 - 1 is left */
     CHECK(db->boundary == s2 - 1 && db->retire_held_us);
     put_ack(dir, db, s2 - 1, h1, 25ll * 3600 * 1000); /* silent for longer than the hold */
-    imdb_clock_offset(17 * SEC_US);                    /* past the second the policy waits */
+    imdb_clock_freeze(t0 + 17 * SEC_US);                    /* past the second the policy waits */
     OK(ex(&s, "SELECT COUNT(*) FROM a"));
     CHECK(db->boundary == s3 - 1 && db->log_floor == s3 - 1 && held_of(db, "a") == 16 - 8 && !db->retire_held_us);
     CHECK(r1_state(db) == IMDB_REPL_RETIRED && answer_has(&s, "SHOW REPLICAS", "behind the retired log: seed it again"));
@@ -1700,24 +1703,27 @@ static void t_retain_floor_carry(void)
     db->no_auto_retire = true;
     imdb_session s;
     imdb_session_init(&s, db);
+    uint64_t t0 = imdb_now_us(); /* the clock frozen from here, stepped by the test: no margin depends on how long a
+                                  * step took (2026-11-06: a loaded run overran this test's on the moving clock) */
+    imdb_clock_freeze(t0);
     OK(ex(&s, "CREATE TABLE a (id INT64 PRIMARY KEY, v INT64) RETENTION 10 SECONDS"));
     OK(ex(&s, "INSERT INTO a VALUES (1, 0), (2, 0)"));
     OK(ex(&s, "CHECKPOINT")); /* segment A ends */
     uint64_t s2 = db->seq + 1;
-    imdb_clock_offset(5 * SEC_US); /* B begins at +5 s: 10 s old only after the second floor is committed */
+    imdb_clock_freeze(t0 + 5 * SEC_US); /* B begins at +5 s: 10 s old only after the second floor is committed */
     OK(ex(&s, "UPDATE a SET v = 1 WHERE id = 1"));
     OK(ex(&s, "CHECKPOINT")); /* B ends: the first floor */
     uint64_t f0 = db->seq;
-    imdb_clock_offset(10 * SEC_US);
+    imdb_clock_freeze(t0 + 10 * SEC_US);
     OK(ex(&s, "UPDATE a SET v = 2 WHERE id = 1")); /* C begins at +10 s (its statement expires to A's start alone) */
     OK(ex(&s, "CHECKPOINT"));                       /* C ends: the second floor */
     uint64_t f = db->seq;
     OK(ex(&s, "UPDATE a SET v = 3 WHERE id = 1")); /* D begins at +10 s */
     OK(ex(&s, "CHECKPOINT"));
-    imdb_clock_offset(16 * SEC_US);
+    imdb_clock_freeze(t0 + 16 * SEC_US);
     OK(ex(&s, "SELECT COUNT(*) FROM a")); /* past f: B is 10 s old now, C and D not: the EXPIRE names s2 (<= f0) */
     CHECK(horizon_of(db, "a") == s2);
-    imdb_clock_offset(30 * SEC_US);
+    imdb_clock_freeze(t0 + 30 * SEC_US);
     OK(ex(&s, "SELECT COUNT(*) FROM a")); /* C and D too: the horizon past f */
     CHECK(horizon_of(db, "a") > f);
     OK(imdb_retire(db, f0, E)); /* the first cut: A and B gone, their starts in its FLOOR */

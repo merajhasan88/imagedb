@@ -129,6 +129,7 @@ int main(int argc, char **argv)
             imdb_sql_set_window_reference(false); /* P2 S12: the sliding frames, but where a test asks for the reference */
             imdb_seg_load_hook(NULL, NULL);        /* P2 S14: no load held, but where a test holds them */
             imdb_clock_offset(0);      /* a test that moves the clock (expiry) moves it for itself only */
+            imdb_clock_freeze(0);      /* and one that froze it */
             imdb_backup_test_between(NULL, NULL); /* a test that cuts between a backup's parts does it for itself only */
             g_errmsg[0] = 0;
             printf("[%s] %s\n", groups[g].name, tc->name);

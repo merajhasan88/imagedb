@@ -865,6 +865,10 @@ void imdb_log_set_tagged(bool on);
 /* Tests only: the engine's clock (commit times, expiry) moved by us from the wall clock's; reset to 0
  * before every test. */
 void imdb_clock_offset(int64_t us);
+/* Tests only: the engine's clock reads us, frozen, until imdb_clock_freeze(0) (reset before every test): a test whose
+ * margins are measured on the clock steps it itself (a commit still takes the last commit's time + 1 at the least), so
+ * no margin depends on how long a step took (retain_floor_carry, retain_retire_replica: 2026-11-06, a loaded machine) */
+void imdb_clock_freeze(uint64_t us);
 /* In an open transaction: an EXPIRE of table to the horizon before (log.h). Expiry's (db.c), which
  * chooses before by the rule VERIFY checks; tests commit ones that break it. */
 int imdb_expire_op(imdb_db *db, uint32_t table, uint64_t before, imdb_err *e);

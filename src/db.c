@@ -3044,15 +3044,19 @@ int imdb_tx_add_writer(imdb_db *db, uint32_t epoch, const uint8_t new_pk[IMDB_PU
 int imdb_meta_write(imdb_db *db, bool replica, imdb_err *e) { return write_meta(db->dirfd, &db->meta, replica, e); }
 
 static int64_t g_clock_offset; /* imdb_clock_offset: tests only */
+static uint64_t g_clock_frozen; /* imdb_clock_freeze: tests only; 0 the wall clock */
 
 static uint64_t now_us(void)
 {
     struct timespec ts;
+    if (g_clock_frozen) return g_clock_frozen;
     clock_gettime(CLOCK_REALTIME, &ts);
     return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u + (uint64_t)g_clock_offset;
 }
 
 void imdb_clock_offset(int64_t us) { g_clock_offset = us; }
+
+void imdb_clock_freeze(uint64_t us) { g_clock_frozen = us; }
 
 uint64_t imdb_now_us(void) { return now_us(); }
 
