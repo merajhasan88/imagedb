@@ -100,6 +100,7 @@ enum {
     ST_EXPLAIN, /* P1 Q1: the plan of the statement in explained (SELECT, UPDATE or DELETE), which is not run */
     ST_PREPARE, ST_EXECUTE, ST_DEALLOCATE, ST_SHOW_PREPARED, /* P2 S9 */
     ST_COPY_FROM, ST_COPY_TO, /* P2 S10 */
+    ST_CREATE_VIEW, ST_DROP_VIEW, ST_SHOW_VIEWS, /* P2 S7 */
 };
 
 /* P2 S3: a join's kind as written (RIGHT keeps side 1's rows, FULL both sides'; CROSS and FROM a, b have no ON) */
@@ -192,7 +193,8 @@ typedef struct sql_stmt {
     char copy_delim;
     uint32_t copy_batch;
     uint64_t copy_skip;
-    char set_cols[IMDB_MAX_COLS][IMDB_MAX_IDENT + 1]; /* UPDATE */
+    char set_cols[IMDB_MAX_COLS][IMDB_MAX_IDENT + 1]; /* UPDATE; P2 S7: CREATE VIEW's column list (nset of them), its
+                                                 * query in src, the query's text in body_off, body_len */
     sql_lit set_vals[IMDB_MAX_COLS];
     uint16_t nset;
     sql_cmp where[IMDB_MAX_PREDICATES];

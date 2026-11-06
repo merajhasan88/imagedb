@@ -184,6 +184,13 @@ typedef struct imdb_manifest_tab {
     uint64_t retention_us;
     uint64_t created_at, dropped_at; /* version 5 (1f): the commits that created and dropped it (0: live) */
 } imdb_manifest_tab;
+/* P2 S7: a view in a manifest (version 6): a live one's definition, a dropped one's tombstone (def NULL) */
+typedef struct imdb_manifest_view {
+    uint32_t id;
+    char name[IMDB_MAX_IDENT + 1];
+    uint64_t created_at, dropped_at;
+    imdb_viewdef *def;
+} imdb_manifest_view;
 typedef struct imdb_manifest {
     uint8_t db_id[16];
     uint64_t seq;
@@ -191,6 +198,8 @@ typedef struct imdb_manifest {
     uint64_t boundary; /* the commit at or below which the log is retired (0: none) */
     imdb_manifest_tab *t;
     uint32_t nt;
+    imdb_manifest_view *v; /* P2 S7: every view ever created, by id */
+    uint32_t nv;
 } imdb_manifest;
 int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err *e);
 void imdb_manifest_free(imdb_manifest *m);

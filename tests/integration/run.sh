@@ -120,6 +120,7 @@ echo "--seg-cache 1M and all taken, 0 and 12x refused; tiny: AS OF $before still
 
 step "past the checkpoint: the auditor reads the lake plus the log tail, and prints the engine's view token"
 sql "INSERT INTO txns VALUES (900, 7, 1.00, 'tail', '2026-10-16 09:00:00');" >/dev/null
+sql "CREATE VIEW big (id, amt) AS SELECT id, amount FROM txns WHERE amount > 5.00;" >/dev/null # P2 S7: op 20 in the tail
 ship
 out=$("$AUD" count "$P" txns)
 echo "$out"
@@ -131,6 +132,8 @@ audtok() { "$AUD" identity "$1" | sed -E 's/.*view_token ([0-9a-f]+).*/\1/'; }
 tp=$(idtok "$P"); tr=$(idtok "$R")
 [ -n "$tp" ] && [ "$tp" = "$(audtok "$P")" ] || fail "view token: engine $tp, auditor $(audtok "$P")"
 [ "$tp" = "$tr" ] && [ "$tr" = "$(audtok "$R")" ] || fail "view token of the replica differs: $tr"
+[ "$("$BIN" sql "$P" --csv -c "SELECT * FROM big ORDER BY id;")" = "$("$BIN" sql "$R" --csv -c "SELECT * FROM big ORDER BY id;")" ] ||
+  fail "the view answers differently on the replica"
 echo "view token, engine = auditor, primary = replica: $tp"
 
 step "erase subject 42 (right to be forgotten): 0 everywhere, no bytes left"
@@ -380,19 +383,20 @@ echo "COPY: a file's bytes back unchanged; a script's inline data to its \\. lin
 # dump at the primary's commit the primary's, byte for byte; a dump of no directory fails with nothing on stdout
 "$BIN" sql "$C" --nosync -c "CREATE TABLE d2 (k INT64 PRIMARY KEY, who INT64 SUBJECT, v DECIMAL(9,3) NOT NULL) RETENTION 90 MINUTES;" \
   -c "INSERT INTO d2 VALUES (3, 30, 1.5), (1, 10, -2.25), (2, 20, 0);" -c "CREATE UNIQUE INDEX d2v ON d2 (v);" \
-  -c "UPDATE d2 SET v = 7.125 WHERE k = 1;" >/dev/null
+  -c "UPDATE d2 SET v = 7.125 WHERE k = 1;" -c "CREATE VIEW dv (k, v) AS SELECT k, v FROM d2 WHERE v > 0;" >/dev/null # P2 S7
 "$BIN" dump "$C" --batch 4 > "$WORK/d.sql" || fail "imagedb dump"
 expect "COPY c FROM STDIN (BATCH 4);" "$(cat "$WORK/d.sql")"
 expect "CREATE UNIQUE INDEX d2v ON d2 (v);" "$(cat "$WORK/d.sql")"
 nc=$("$BIN" sql "$C" --csv -c "SELECT COUNT(*) FROM c;" | tail -1) # 12, or 10 without script(1) above
-expect "-- the end of the dump: 2 tables, $((nc + 3)) rows" "$(tail -1 "$WORK/d.sql")"
+expect "CREATE VIEW dv (k, v) AS SELECT k, v FROM d2 WHERE v > 0;" "$(cat "$WORK/d.sql")"
+expect "-- the end of the dump: 2 tables, 1 views, $((nc + 3)) rows" "$(tail -1 "$WORK/d.sql")"
 alg=$(sed -n '1s/.*digest algorithm \([12]\)).*/\1/p' "$WORK/d.sql")
 other=$((3 - ${alg:-2}))
 "$BIN" init "$WORK/dst" --digest-alg "$other" >/dev/null || fail "init the dump's target"
 "$BIN" sql "$WORK/dst" --nosync -f "$WORK/d.sql" >/dev/null || fail "the dump's restore"
 "$BIN" dump "$WORK/dst" --batch 4 > "$WORK/d2.sql" || fail "the restored copy's dump"
 cmp -s <(tail -n +2 "$WORK/d.sql") <(tail -n +2 "$WORK/d2.sql") || fail "the restored copy's dump differs: $(diff "$WORK/d.sql" "$WORK/d2.sql")"
-for q in "SELECT * FROM c ORDER BY id" "SELECT * FROM d2 ORDER BY k"; do
+for q in "SELECT * FROM c ORDER BY id" "SELECT * FROM d2 ORDER BY k" "SELECT * FROM dv ORDER BY k"; do
   [ "$("$BIN" sql "$C" --csv -c "$q;")" = "$("$BIN" sql "$WORK/dst" --csv -c "$q;")" ] || fail "rows differ after the restore: $q"
 done
 "$BIN" verify "$WORK/dst" >/dev/null || fail "VERIFY of the restored copy"

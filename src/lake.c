@@ -718,6 +718,8 @@ int imdb_dv_parse(const uint8_t *b, size_t len, uint8_t seg_hash[32], imdb_dv_en
 
 void imdb_manifest_free(imdb_manifest *m)
 {
+    for (uint32_t i = 0; i < m->nv; i++) imdb_viewdef_free(m->v[i].def); /* P2 S7 */
+    imdb_free(m->v);
     for (uint32_t i = 0; i < m->nt; i++) imdb_free(m->t[i].seg);
     imdb_free(m->t);
     memset(m, 0, sizeof *m);
@@ -746,10 +748,45 @@ static int manifest_index_names(const imdb_manifest *m, imdb_err *e)
 }
 
 /* a manifest of an older format, refused by name (no reader is kept for one before the format freeze) */
+/* P2 S7: a manifest's views against its tables: each live view's name is no other live relation's (sorted, so a
+ * hostile manifest cannot make this quadratic), each live view names only live tables and live earlier views.
+ * IMDB_ERR_CORRUPT, or the allocation's own error */
+static int manifest_views_ok(const imdb_manifest *m, imdb_err *e)
+{
+    size_t n = 0;
+    for (uint32_t i = 0; i < m->nt; i++) n += !m->t[i].dropped_at;
+    for (uint32_t i = 0; i < m->nv; i++) n += !m->v[i].dropped_at;
+    const char **p = imdb_alloc_array(n ? n : 1, sizeof *p, e);
+    if (!p) return e->code;
+    size_t k = 0;
+    for (uint32_t i = 0; i < m->nt; i++)
+        if (!m->t[i].dropped_at) p[k++] = m->t[i].s.name;
+    int rc = IMDB_OK;
+    for (uint32_t i = 0; i < m->nv && !rc; i++) {
+        const imdb_manifest_view *v = &m->v[i];
+        if (v->dropped_at) continue;
+        p[k++] = v->name;
+        for (uint16_t d = 0; d < v->def->ndeps && !rc; d++) {
+            const imdb_viewdep *dp = &v->def->deps[d];
+            bool live = dp->kind == IMDB_VIEWDEP_TABLE ? dp->id < m->nt && !m->t[dp->id].dropped_at
+                                                       : dp->id < i && !m->v[dp->id].dropped_at;
+            if (!live) rc = imdb_fail(e, IMDB_ERR_CORRUPT, "manifest: a live view names a table or view that is not live");
+        }
+    }
+    if (!rc) qsort(p, k, sizeof *p, cmp_name_ptr);
+    for (size_t i = 1; !rc && i < k; i++)
+        if (!strcmp(p[i - 1], p[i])) rc = imdb_fail(e, IMDB_ERR_CORRUPT, "manifest: two live tables or views of one name");
+    imdb_free(p);
+    return rc;
+}
+
 static int old_manifest(uint32_t ver, imdb_err *e)
 {
-    return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version %u: this lake was written by an imagedb before DROP TABLE's "
-                     "format (manifest 5), which this version does not read", ver);
+    if (ver < 5)
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version %u: this lake was written by an imagedb before DROP "
+                         "TABLE's format (manifest 5), which this version does not read", ver);
+    return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version %u: this lake was written by an imagedb before views' "
+                     "format (manifest 6, P2 S7), which this version does not read", ver);
 }
 
 int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err *e)
@@ -759,9 +796,10 @@ int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err
     imdb_rd_init(&r, b, len);
     const uint8_t *mg = imdb_rd_bytes(&r, 8);
     if (!mg || memcmp(mg, kManMagic, 8) != 0) return imdb_fail(e, IMDB_ERR_CORRUPT, "manifest: bad magic");
-    uint32_t ver = imdb_rd_u32(&r); /* 5: every table's indexes, retention, creation and drop (no reader for 2-4) */
-    if (ver >= 2 && ver <= 4) return old_manifest(ver, e);
-    if (ver != 5) return imdb_fail(e, IMDB_ERR_CORRUPT, "manifest: unsupported version");
+    uint32_t ver = imdb_rd_u32(&r); /* 6: every table's indexes, retention, creation and drop; the views (P2 S7; no
+                                     * reader for 2-5) */
+    if (ver >= 2 && ver <= 5) return old_manifest(ver, e);
+    if (ver != 6) return imdb_fail(e, IMDB_ERR_CORRUPT, "manifest: unsupported version");
     uint32_t nt = imdb_rd_u32(&r);
     imdb_rd_copy(&r, m->db_id, 16);
     m->seq = imdb_rd_u64(&r);
@@ -820,6 +858,33 @@ int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err
                                                                             t->dropped_at > m->seq || t->live)))
             goto bad;
     }
+    uint32_t nv = imdb_rd_u32(&r); /* P2 S7: each view by id, a live one's definition after it */
+    if (r.err || nv > IMDB_MAX_VIEWS || nv > imdb_rd_left(&r) / 22) goto bad;
+    if (nv && !(m->v = imdb_alloc_array(nv, sizeof *m->v, e))) {
+        imdb_manifest_free(m);
+        return e->code;
+    }
+    m->nv = nv;
+    for (uint32_t i = 0; i < nv; i++) {
+        imdb_manifest_view *v = &m->v[i];
+        imdb_err ev = {0};
+        v->id = imdb_rd_u32(&r);
+        if (imdb_rd_ident(&r, v->name, &ev)) goto bad;
+        v->created_at = imdb_rd_u64(&r);
+        v->dropped_at = imdb_rd_u64(&r);
+        bool lower = true;
+        for (const char *q = v->name; *q; q++) lower &= !(*q >= 'A' && *q <= 'Z');
+        if (r.err || v->id != i || !lower || !v->created_at || v->created_at > m->seq ||
+            (v->dropped_at && (v->dropped_at <= v->created_at || v->dropped_at > m->seq)))
+            goto bad;
+        if (v->dropped_at) continue;
+        int vrc = imdb_viewdef_decode(&r, &v->def, e);
+        if (vrc && vrc != IMDB_ERR_CORRUPT) {
+            imdb_manifest_free(m);
+            return vrc;
+        }
+        if (vrc || v->def->id != i || strcmp(v->def->name, v->name)) goto bad;
+    }
     if (imdb_rd_left(&r)) goto bad;
     int nrc = manifest_index_names(m, e);
     if (nrc && nrc != IMDB_ERR_CORRUPT) {
@@ -827,6 +892,12 @@ int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err
         return nrc;
     }
     if (nrc) goto bad;
+    int vrc = manifest_views_ok(m, e);
+    if (vrc && vrc != IMDB_ERR_CORRUPT) {
+        imdb_manifest_free(m);
+        return vrc;
+    }
+    if (vrc) goto bad;
     return IMDB_OK;
 bad:
     imdb_manifest_free(m);
@@ -1256,7 +1327,7 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
     /* manifest */
     imdb_buf *mb = &p->manifest;
     imdb_buf_put(mb, kManMagic, 8);
-    imdb_buf_put_u32(mb, 5); /* lake.h: every table's indexes, retention, creation and drop */
+    imdb_buf_put_u32(mb, 6); /* lake.h: every table's indexes, retention, creation and drop; the views (P2 S7) */
     imdb_buf_put_u32(mb, db->nt);
     imdb_buf_put(mb, db->db_id, 16);
     imdb_buf_put_u64(mb, seq);
@@ -1300,6 +1371,17 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
         imdb_buf_put_u64(mb, t->retention_us);
         imdb_buf_put_u64(mb, t->created_at);
         imdb_buf_put_u64(mb, t->dropped_at);
+    }
+    imdb_buf_put_u32(mb, db->nviews); /* P2 S7: each view by id; a live one's definition after it (lake.h) */
+    for (uint32_t i = 0; i < db->nviews; i++) {
+        const imdb_view *v = &db->views[i];
+        size_t nl = strlen(v->name);
+        imdb_buf_put_u32(mb, v->id);
+        imdb_buf_put_u8(mb, (uint8_t)nl);
+        imdb_buf_put(mb, v->name, nl);
+        imdb_buf_put_u64(mb, v->created_at);
+        imdb_buf_put_u64(mb, v->dropped_at);
+        if (!v->dropped_at) imdb_viewdef_encode(v->def, mb);
     }
     imdb_buf_free(&sch);
     if (rc || (rc = imdb_buf_check(mb, e))) {
@@ -2739,7 +2821,7 @@ int imdb_lake_format_check(imdb_db *db, imdb_err *e)
         imdb_rd_init(&r, mb, ml);
         const uint8_t *mg = imdb_rd_bytes(&r, 8);
         uint32_t ver = imdb_rd_u32(&r);
-        if (mg && !r.err && memcmp(mg, kManMagic, 8) == 0 && ver >= 2 && ver <= 4) rc = old_manifest(ver, e);
+        if (mg && !r.err && memcmp(mg, kManMagic, 8) == 0 && ver >= 2 && ver <= 5) rc = old_manifest(ver, e); /* P2 S7: 5 */
     }
     imdb_free(mb);
     close(ofd);
@@ -2796,6 +2878,19 @@ int imdb_lake_load_snapshot(imdb_db *db, uint64_t *seq, bool *moved, imdb_err *e
         if (!rc) imdb_progress(db, "lake", segs_done, nsegs, false);
     }
     if (!rc) imdb_progress(db, "lake", nsegs, nsegs, true);
+    if (!rc && m.nv) { /* P2 S7: the views, every definition the manifest's catalog's now */
+        if (!(db->views = imdb_alloc_array(m.nv, sizeof *db->views, e))) rc = e->code;
+        for (uint32_t i = 0; !rc && i < m.nv; i++) {
+            imdb_view *v = &db->views[i];
+            v->id = m.v[i].id;
+            memcpy(v->name, m.v[i].name, sizeof v->name);
+            v->created_at = m.v[i].created_at;
+            v->dropped_at = m.v[i].dropped_at;
+            v->def = m.v[i].def;
+            m.v[i].def = NULL;
+        }
+        if (!rc) db->nviews = db->capviews = m.nv;
+    }
     db->segcache.snap_seq = 0;
     if (!rc) {
         imdb_lthash sum;

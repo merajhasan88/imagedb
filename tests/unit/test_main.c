@@ -116,6 +116,7 @@ int main(int argc, char **argv)
         {"expr", expr_tests, &expr_ntests},
         {"cancel", cancel_tests, &cancel_ntests},
         {"drop", drop_tests, &drop_ntests},
+        {"view", view_tests, &view_ntests}, /* P2 S7 */
         {"qmem", qmem_tests, &qmem_ntests},
     };
     int failed = 0, run = 0;

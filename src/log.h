@@ -105,7 +105,43 @@ enum {
                                    retention expires it. Its commit holds only it, after at most one SET_RETENTION of
                                    the same table (DROP TABLE t RETENTION r); the table is live, and its retention,
                                    that op applied, is not FOREVER (replay, VERIFY and the auditor check both) */
+    IMDB_OP_CREATE_VIEW = 20,   /* alone in its commit (P2 S7): a view's definition (imdb_viewdef below): the next view
+                                   id (dense, never reused), a name no live table or view holds, its columns' names and
+                                   types, the tables and views its query names (each live), its query's text as written.
+                                   Replay re-binds the text against the catalog at the commit and wants exactly the
+                                   logged columns and dependencies; the auditor, which has no parser, checks the rest */
+    IMDB_OP_DROP_VIEW = 21,     /* alone in its commit (P2 S7): u32 view: live, and no live view names it; it becomes a
+                                   tombstone (its id, name and the two commits), its name free */
 };
+
+/* P2 S7: a view's definition, as op 20 logs it and a manifest keeps a live view's (imdb_viewdef_encode): u32 id, the
+ * name (u8 length, bytes), u16 columns each a name, a type (IMDB_T_*) and a scale (a DECIMAL's, else 0), u16
+ * dependencies each a kind (IMDB_VIEWDEP_*) and a u32 id, strictly increasing by kind then id, u32 text length and the
+ * text: strict UTF-8 without NUL, 1 to IMDB_MAX_VIEW_TEXT bytes. Every name is an identifier folded to lowercase. */
+#define IMDB_VIEWDEP_TABLE 1
+#define IMDB_VIEWDEP_VIEW 2
+typedef struct imdb_viewcol {
+    char name[IMDB_MAX_IDENT + 1];
+    uint8_t type, scale;
+} imdb_viewcol;
+typedef struct imdb_viewdep {
+    uint8_t kind;
+    uint32_t id;
+} imdb_viewdep;
+typedef struct imdb_viewdef {
+    uint32_t id;
+    char name[IMDB_MAX_IDENT + 1];
+    uint16_t ncols, ndeps;
+    uint32_t text_len;
+    imdb_viewcol *cols; /* allocated: ncols */
+    imdb_viewdep *deps; /* allocated: ndeps, NULL for none */
+    char *text;         /* allocated: text_len bytes and a NUL (the text holds none) */
+} imdb_viewdef;
+void imdb_viewdef_free(imdb_viewdef *d); /* its arrays and itself; NULL is nothing */
+void imdb_viewdef_encode(const imdb_viewdef *d, imdb_buf *b);
+int imdb_viewdef_decode(imdb_rd *r, imdb_viewdef **out, imdb_err *e); /* *out allocated; strict (above) */
+int imdb_viewdef_check(const imdb_viewdef *d, imdb_err *e);           /* the decoder's rules, for the writer's side */
+bool imdb_viewdep_less(const imdb_viewdep *a, const imdb_viewdep *b);
 
 /* A table's retention (op 16): how long its history stays answerable (AS OF) after a version ends. */
 #define IMDB_RETAIN_FOREVER UINT64_MAX
@@ -161,6 +197,9 @@ typedef struct imdb_op {
     uint8_t iflags, incols;
     uint16_t icols[IMDB_MAX_INDEX_COLS];
     char *iname;               /* allocated: IMDB_MAX_IDENT + 1 */
+    /* CREATE_VIEW: the definition (allocated; an install takes it); DROP_VIEW: the view (P2 S7) */
+    imdb_viewdef *vdef;
+    uint32_t view;
     /* WRITER_KEY */
     uint32_t epoch;
     uint8_t new_pk[IMDB_PUBKEY_LEN];

@@ -805,6 +805,31 @@ SELECT depth, COUNT(*) FROM chain GROUP BY depth;
   operation whose SELECTs read the statement around it (correlated), more than
   one base or step in a recursive WITH, SEARCH and CYCLE.
 
+Views:
+
+```sql
+CREATE VIEW big_orders (id, cust, amt) AS SELECT id, cust, amount FROM orders WHERE amount > 1000;
+CREATE VIEW big_eu AS SELECT o.id, c.name FROM big_orders AS o JOIN customers AS c ON o.cust = c.id WHERE c.region = 'eu';
+SELECT * FROM big_eu ORDER BY id;
+SHOW VIEWS;
+DROP VIEW big_eu;
+```
+
+- A view is its query's text, kept as written (logged with its columns and the tables and views it names), parsed
+  again in each statement that names it and read as a derived table: at that statement's snapshot, under its limits.
+  Its query may be any a derived table takes: joins, WITH, set operations, windows, subqueries.
+- Its columns are named by the list, else by the query: an expression needs AS or a list. `*` is refused but in an
+  EXISTS (a view's columns stay what its creation saw), and so are FOR UPDATE, AS OF and `$n` in its query, AS OF on
+  a view, writes through one (INSERT, UPDATE, DELETE, COPY) and UPDATE ... FROM one.
+- RESTRICT, as PostgreSQL has it: DROP TABLE or DROP VIEW of what a live view names is refused, naming the view; drop
+  that first. Tables and views share one name space. CREATE VIEW and DROP VIEW commit on their own, outside a
+  transaction; OR REPLACE, IF [NOT] EXISTS and CASCADE are not supported.
+- A transaction reads the views of its snapshot: one older than a DROP VIEW still reads the view; one older than a
+  CREATE VIEW reads it at its own snapshot, as a table created since answers.
+- Views inside views at most 4 deep; a view's text at most 64 KiB; 1,024 views a database, dropped ones counted.
+- A view's text is the operator's, like a table's name: ERASE SUBJECT does not reach a literal in it. The log holds it
+  until a RETIRE cuts below its commit; a dropped view leaves its name and commits in the manifest, not its text.
+
 Window functions:
 
 ```sql
@@ -970,7 +995,7 @@ SELECT COUNT(*) FROM orders;
   key ranges). A COPY TO that fails part way (a cancel, the writer, a segment's load) leaves what it wrote, and the
   statement fails: what the client holds is not the table.
 
-Logical dump (`imagedb dump`): every table at one commit, as one script that `imagedb sql -f` restores into an empty
+Logical dump (`imagedb dump`): every table and view at one commit, as one script that `imagedb sql -f` restores into an empty
 database, of either digest algorithm:
 
 ```sh
@@ -980,7 +1005,8 @@ imagedb init NEW && imagedb sql NEW -f dump.sql
 
 - The first line names the commit (and its head and the database's digest algorithm); then each live table by name:
   its `CREATE TABLE` (types, PRIMARY KEY, SUBJECT, NOT NULL, RETENTION), its rows as `COPY t FROM STDIN (BATCH n)` data
-  ended by `\.` (walked, as COPY TO's), its indexes; the last line the totals. A dump cut short has no totals line.
+  ended by `\.` (walked, as COPY TO's), its indexes; after the tables, each live view by id (`CREATE VIEW v (cols) AS
+  query`, its text as written); the last line the totals. A dump cut short has no totals line.
 - A dump holds the tables' current rows: no history, no dropped table, no key, no retention clock. A replica's dump at
   its primary's commit is the primary's, byte for byte.
 - `--batch N` (default 10,000) is each table's `BATCH`: a restore commits every N rows, so a table larger than one

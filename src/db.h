@@ -156,6 +156,18 @@ typedef struct imdb_table {
                               /* active transaction's own (versions are only appended) */
 } imdb_table;
 
+/* P2 S7: a view (design.md §5, Views). Its definition is logged (op 20) and kept in the manifest while it lives; a
+ * dropped one is a tombstone, its id, name and two commits (a manifest keeps no more), its definition held only until
+ * the handle closes, for a transaction older than the drop: def is NULL for a tombstone a manifest gave. Views live
+ * in one array, reserved before a commit (imdb_view_reserve), so the install allocates nothing and a pointer to one is
+ * good until the next CREATE VIEW. */
+typedef struct imdb_view {
+    imdb_viewdef *def; /* allocated */
+    char name[IMDB_MAX_IDENT + 1];
+    uint32_t id;
+    uint64_t created_at, dropped_at; /* dropped_at 0: live */
+} imdb_view;
+
 /* vid's entry in sparse chunk c (UINT32_MAX: none) */
 static inline uint32_t imdb_vchunk_find(const imdb_vchunk *c, uint64_t vid)
 {
@@ -384,6 +396,8 @@ typedef struct imdb_db {
     uint64_t nci, capci, ci_first;
     imdb_table **t;
     uint32_t nt;
+    imdb_view *views; /* P2 S7: views[i] is view i, a dropped one a tombstone */
+    uint32_t nviews, capviews;
     imdb_lthash global;
     /* transaction */
     bool in_txn;
@@ -524,6 +538,26 @@ void imdb_table_drop_install(imdb_db *db, imdb_table *t, uint64_t seq);
 /* each DROP_TABLE of ops: minus its table's lanes into delta (touched), beside imdb_digest_delta's */
 void imdb_digest_drops(const imdb_db *db, const imdb_op *ops, uint32_t nops, uint32_t nt, imdb_lthash *delta, bool *touched);
 imdb_table *imdb_table_by_id(imdb_db *db, uint32_t id);
+
+/* P2 S7: views. imdb_view_by_name: a live view; imdb_view_at: the view a read at snapshot snap sees by that name
+ * (created at or before snap, dropped after it); imdb_view_dependent: a live view naming the table or view (kind
+ * IMDB_VIEWDEP_*), or NULL. Tables and views share one name space among the live ones. */
+imdb_view *imdb_view_by_name(imdb_db *db, const char *name);
+imdb_view *imdb_view_at(imdb_db *db, const char *name, uint64_t snap);
+const imdb_view *imdb_view_dependent(const imdb_db *db, uint8_t kind, uint32_t id);
+/* CREATE VIEW (op 20), alone in its transaction: def is taken, freed on a failure too; its id is assigned here. DROP
+ * VIEW (op 21), alone: refused while a live view names it (DROP TABLE likewise). Each installs once its frame is
+ * durable (imdb_view_install, imdb_view_drop_install: no allocation; replay calls them too) */
+int imdb_create_view(imdb_db *db, imdb_viewdef *def, imdb_err *e);
+int imdb_drop_view(imdb_db *db, imdb_view *v, imdb_err *e);
+int imdb_view_reserve(imdb_db *db, imdb_err *e);
+void imdb_view_install(imdb_db *db, imdb_viewdef *def, uint64_t seq);
+void imdb_view_drop_install(imdb_db *db, imdb_view *v, uint64_t seq);
+/* every dependency of def a live table or view of db (replay's and the writer's rule) */
+bool imdb_view_deps_live(const imdb_db *db, const imdb_viewdef *def);
+/* replay's and VERIFY's check of a view's text (sql_exec.c): bound against db's catalog now, it must yield def's
+ * columns and dependencies exactly; IMDB_ERR_CORRUPT when it does not, or does not bind; a resource's error as it is */
+int imdb_view_rebind(imdb_db *db, const imdb_viewdef *def, imdb_err *e);
 
 /* ---- transactions --------------------------------------------------------- */
 int imdb_begin(imdb_db *db, imdb_err *e);
@@ -849,9 +883,10 @@ int imdb_verify(imdb_db *db, imdb_verify_report *rep, imdb_err *e);
 
 /* Digest (32 bytes) of one table, or of all tables when t == NULL. */
 void imdb_state_digest(const imdb_db *db, const imdb_table *t, uint8_t out[32]);
-/* The view token: SHA-256("IMDBVIEW2" || db id || u64 seq || head || u32 tables || for each table in
+/* The view token: SHA-256("IMDBVIEW3" || db id || u64 seq || head || u32 tables || for each table in
  * id order: u32 id || u32 schema length || its encoding || u64 horizon || u64 live || u64 created || u64 dropped
- * (0: live) || LtHash lanes).
+ * (0: live) || LtHash lanes) || u32 views || for each view in id order (P2 S7): u32 id || u32 name length || its name ||
+ * u64 created || u64 dropped (0: live) || a live one's definition's SHA-256 (imdb_viewdef_encode, log.h)).
  * Equal tokens: the same database, chain position, schemas, horizons and rows (a digest alone says
  * nothing about which database or history). imagedb-audit identity computes it from files. */
 int imdb_view_token(const imdb_db *db, uint8_t out[32], imdb_err *e);
@@ -870,6 +905,7 @@ void imdb_clock_offset(int64_t us);
  * margins are measured on the clock steps it itself (a commit still takes the last commit's time + 1 at the least), so
  * no margin depends on how long a step took (retain_floor_carry, retain_retire_replica: 2026-11-06, a loaded machine) */
 void imdb_clock_freeze(uint64_t us);
+uint64_t imdb_clock_frozen(void); /* tests: the frozen base (0: the wall clock); imdb_clock_offset moves a frozen clock too */
 /* In an open transaction: an EXPIRE of table to the horizon before (log.h). Expiry's (db.c), which
  * chooses before by the rule VERIFY checks; tests commit ones that break it. */
 int imdb_expire_op(imdb_db *db, uint32_t table, uint64_t before, imdb_err *e);

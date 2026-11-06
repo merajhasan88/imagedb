@@ -164,8 +164,8 @@ typedef struct xctx {
     char vpath[80];               /* select_vids' path: an UPDATE's or DELETE's result's (P1 Q1) */
     xrset *own;                   /* P2 S4: the row sets this statement made (xfree frees their results) */
     uint8_t nown;
-    const xrset *vis[IMDB_MAX_SUBQUERIES * IMDB_MAX_SUBQUERY_DEPTH]; /* the row sets it reads by name: its own and
-                                                                     * an outer statement's */
+    const xrset *vis[IMDB_MAX_SUBQUERIES * IMDB_MAX_SUBQUERY_DEPTH + IMDB_MAX_VIEW_REFS]; /* the row sets it reads by
+                                                                     * name: its own, an outer statement's, its views' */
     uint8_t nvis;
     /* P2 S4b: correlated subqueries. A nested SELECT of an expression runs with up, the statement directly around it;
      * upscope, the scope that statement bound the expression in (NULL during its rset_prepare, which runs this one
@@ -194,6 +194,11 @@ typedef struct xctx {
                                    * the statement around it holds row pointers into its own segments */
     bool release;                 /* P2 S15 (O3's first step): this run's path lets each image go as it leaves the
                                    * segment while the cache is over its budget (exec_select's allow-list) */
+    uint8_t vdepth;               /* P2 S7: the views expanded around this run (expand_view: IMDB_MAX_VIEW_DEPTH) */
+    struct xdeps *deps;           /* P2 S7: CREATE VIEW's probe and replay's re-bind: the tables and views read */
+    xrset *vown[IMDB_MAX_VIEW_REFS]; /* P2 S7: the views this run expanded, each a row set read by its name, */
+    struct sql_stmt *vst[IMDB_MAX_VIEW_REFS]; /* its statement parsed from its text (xfree frees both) */
+    uint8_t nvown, nvst;
 } xctx;
 
 enum { TICK_ROWS = 4096 }; /* rows between two looks at the clock and the cancel flag: tens of microseconds of work */
@@ -270,6 +275,8 @@ static void xfree(xctx *x)
 {
     corr_free(x); /* P2 S4b: the memos, before the block they sit in */
     for (uint8_t i = 0; i < x->nown; i++) imdb_result_free(&x->own[i].r); /* P2 S4: before the allocations they sit in */
+    for (uint8_t i = 0; i < x->nvown; i++) imdb_result_free(&x->vown[i]->r); /* P2 S7: likewise */
+    for (uint8_t i = 0; i < x->nvst; i++) imdb_sql_stmt_free(x->vst[i]);
     for (uint32_t i = 0; i < x->nallocs; i++) imdb_free(x->allocs[i]);
     imdb_free(x->allocs);
     imdb_buf_wipe_free(&x->row_text);
@@ -2136,7 +2143,7 @@ static int run_nested(xctx *x, const sql_stmt *in, imdb_result *r, uint8_t mode,
     mode = (uint8_t)(mode & ~NEST_PRES);
     xctx s = {.ss = x->ss, .db = x->db, .sql = x->sql, .params = x->params, .nparams = x->nparams, .st = in,
               .row_limit = x->row_limit, .deadline_ns = x->deadline_ns, .checks = x->checks, .ticks = x->ticks,
-              .next_check = x->next_check, .tested = x->tested, .nested = true};
+              .next_check = x->next_check, .tested = x->tested, .nested = true, .vdepth = x->vdepth, .deps = x->deps};
     s.env.check = xenv_check;
     s.env.subq = xenv_subq;
     s.env.ctx = &s;
@@ -3671,6 +3678,8 @@ static void read_view(const xctx *x, uint64_t *snap, uint64_t *pend)
  * itself: HISTORY. */
 static int check_view(xctx *x, const imdb_table *t, uint64_t snap, bool asof, imdb_err *e)
 {
+    if (x->probe) return IMDB_OK; /* P2 S7: a bind-only pass reads no row: the history and readiness rules are its run's
+                                   * (a replica's apply re-binds a view while it waits for an ERASE record) */
     int rc = imdb_check_history(x->db, t, snap, e);
     imdb_txn *tx = &x->ss->txn;
     if (rc != IMDB_ERR_HISTORY || asof || !tx->open) return rc;
@@ -3709,9 +3718,80 @@ static int resolve_snapshot(xctx *x, const sql_stmt *st, imdb_table *t, uint64_t
     return check_view(x, t, *snap, st->has_asof, e);
 }
 
-/* The table a read names, at its read point (1f): the live one if it existed then; else the one dropped since that
- * the read point still sees (AS OF before the drop, or a transaction older than it). Before its creation the live
- * table answers, with no row, as it always did. */
+/* P2 S7: CREATE VIEW's probe and replay's re-bind note each table and view a statement resolves, once (deps_note):
+ * a view's dependencies, what its query names directly (a view it expands notes its own in its own run: none here) */
+typedef struct xdeps {
+    imdb_viewdep d[IMDB_MAX_VIEW_DEPS];
+    uint16_t n;
+    bool over;
+} xdeps;
+
+static void deps_note(xctx *x, uint8_t kind, uint32_t id)
+{
+    xdeps *p = x->deps;
+    if (!p) return;
+    for (uint16_t i = 0; i < p->n; i++)
+        if (p->d[i].kind == kind && p->d[i].id == id) return;
+    if (p->n >= IMDB_MAX_VIEW_DEPS) {
+        p->over = true;
+        return;
+    }
+    p->d[p->n].kind = kind;
+    p->d[p->n].id = id;
+    p->n++;
+}
+
+/* P2 S7: a view a read names, run as `(its query) AS name` would be: its text parsed again (each statement that names
+ * it: DDL between two runs of a prepared statement re-resolves), run inside the statement's view, limits and ceiling
+ * (a bind-only pass types it, running nothing), its rows a row set read under the view's name. The columns it yields
+ * must still be the logged ones, named as logged. */
+static int expand_view(xctx *x, const sql_stmt *st, imdb_view *v, imdb_table **out, imdb_err *e)
+{
+    if (st->has_asof) return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "AS OF with a view: a later step");
+    if (!v->def) return imdb_fail(e, IMDB_ERR_STATE, "view %s: its definition went with its drop", v->name);
+    if (x->vdepth >= IMDB_MAX_VIEW_DEPTH)
+        return imdb_fail(e, IMDB_ERR_LIMIT, "views inside views deeper than %u", IMDB_MAX_VIEW_DEPTH);
+    if (x->nvown >= IMDB_MAX_VIEW_REFS || x->nvis >= sizeof x->vis / sizeof *x->vis)
+        return imdb_fail(e, IMDB_ERR_LIMIT, "more than %u views in one statement", IMDB_MAX_VIEW_REFS);
+    deps_note(x, IMDB_VIEWDEP_VIEW, v->id);
+    const imdb_viewdef *d = v->def;
+    xrset *rs = xalloc(x, sizeof *rs, e);
+    sql_stmt *vs = rs ? xalloc(x, sizeof *vs, e) : NULL;
+    if (!vs) return e->code;
+    imdb_result_init(&rs->r);
+    x->vown[x->nvown++] = rs; /* xfree frees its result from here on */
+    snprintf(rs->name, sizeof rs->name, "%s", v->name);
+    imdb_err pe = {0};
+    if (imdb_sql_parse(d->text, d->text_len, vs, &pe)) /* the parse frees what it made */
+        return pe.code == IMDB_ERR_NOMEM || pe.code == IMDB_ERR_LIMIT
+                   ? imdb_fail(e, pe.code, "view %s: %s", v->name, pe.msg)
+                   : imdb_fail(e, IMDB_ERR_CORRUPT, "view %s: its text no longer parses", v->name);
+    x->vst[x->nvst++] = vs;
+    if (vs->kind != ST_SELECT) return imdb_fail(e, IMDB_ERR_CORRUPT, "view %s: its text is not a query", v->name);
+    const char *sql0 = x->sql; /* the view's own spans: its items' names, its errors' places */
+    xdeps *deps0 = x->deps;    /* what the view reads is its own dependencies', noted at its creation */
+    x->sql = d->text;
+    x->deps = NULL;
+    x->vdepth++;
+    int rc = run_nested(x, vs, &rs->r, x->probe ? NEST_TPROBE : NEST_TABLE, NULL, NULL, NULL, NULL, e);
+    x->vdepth--;
+    x->deps = deps0;
+    x->sql = sql0;
+    if (rc) return rc;
+    bool same = rs->r.ncols == d->ncols;
+    for (uint16_t c = 0; same && c < d->ncols; c++)
+        same = rs->r.ctype[c] == d->cols[c].type && (d->cols[c].type != IMDB_T_DECIMAL || rs->r.cscale[c] == d->cols[c].scale);
+    if (!same) return imdb_fail(e, IMDB_ERR_STATE, "view %s no longer matches its definition", v->name);
+    for (uint16_t c = 0; c < d->ncols; c++) res_name(&rs->r, c, d->cols[c].name);
+    if (rset_table(x, rs, e)) return e->code;
+    x->vis[x->nvis++] = rs;
+    *out = rs->t;
+    return IMDB_OK;
+}
+
+/* The table a read names, at its read point (1f): the one it saw then, live or dropped since (AS OF before the drop, a
+ * transaction older than it); else the live one, which answers with no row, as it always did. P2 S7: a view likewise, by
+ * the same rule (a name is a table's or a view's at any one commit), expanded as a derived table (expand_view) */
 static int read_table(xctx *x, const sql_stmt *st, const char *name, imdb_table **out, imdb_err *e)
 {
     for (int i = (int)x->nvis - 1; i >= 0; i--) /* P2 S4: a row set by its name first, the latest made (WITH shadows) */
@@ -3721,14 +3801,207 @@ static int read_table(xctx *x, const sql_stmt *st, const char *name, imdb_table 
         }
     uint64_t snap, pend;
     if (snapshot_of(x, st, &snap, &pend, e)) return e->code;
-    imdb_table *t = imdb_table_by_name(x->db, name);
-    if (!t || t->created_at > snap) {
-        imdb_table *old = imdb_table_at(x->db, name, snap);
-        if (old) t = old;
-    }
+    imdb_table *t = imdb_table_at(x->db, name, snap);
+    imdb_view *v = t ? NULL : imdb_view_at(x->db, name, snap);
+    if (!t && !v && !(t = imdb_table_by_name(x->db, name))) v = imdb_view_by_name(x->db, name);
+    if (v) return expand_view(x, st, v, out, e);
     if (!t) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", name);
+    deps_note(x, IMDB_VIEWDEP_TABLE, t->s.id);
     *out = t;
     return IMDB_OK;
+}
+
+/* P2 S7: a write's target not a table: a view says so (a view is read only: its rows are its query's) */
+static int no_table(xctx *x, const char *name, imdb_err *e)
+{
+    if (imdb_view_by_name(x->db, name))
+        return imdb_fail(e, IMDB_ERR_INVALID, "%s is a view: it is read only (write the tables it reads)", name);
+    return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", name);
+}
+
+/* ---- P2 S7: CREATE VIEW, DROP VIEW, SHOW VIEWS; replay's re-bind (design.md §5, Views) --------------------------- */
+
+/* a view's query: `*` nowhere but in an EXISTS's own list (a view's columns, and every row set it reads, stay what its
+ * creation saw, as PostgreSQL's expansion at creation keeps them), no FOR UPDATE, no AS OF (a view reads at its
+ * reader's snapshot) */
+static int view_shape(const sql_stmt *s, bool exists, imdb_err *e)
+{
+    if (s->star && !exists)
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "a view's query names its columns (an EXISTS's aside): write them "
+                                                  "instead of *");
+    if (s->for_update) return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "FOR UPDATE in a view's query");
+    if (s->has_asof)
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "AS OF in a view's query: a view reads at its reader's snapshot");
+    for (uint8_t i = 0; i < s->nsub; i++)
+        if (view_shape(s->sub[i], !s->sub_name[i][0] && sub_exists(s, i), e)) return e->code;
+    for (uint8_t i = 0; i < s->narm; i++)
+        if (view_shape(s->arm[i], false, e)) return e->code;
+    return IMDB_OK;
+}
+
+static int cmp_viewdep(const void *a, const void *b)
+{
+    const imdb_viewdep *x = a, *y = b;
+    return imdb_viewdep_less(x, y) ? -1 : imdb_viewdep_less(y, x) ? 1 : 0;
+}
+
+/* the bind-only pass over a view's query q (x->sql its text): its result typed, nothing read, the tables and views it
+ * names noted in *deps, sorted */
+static int view_probe(xctx *x, const sql_stmt *q, imdb_result *pr, xdeps *deps, imdb_err *e)
+{
+    memset(deps, 0, sizeof *deps);
+    xdeps *deps0 = x->deps;
+    uint8_t vd0 = x->vdepth;
+    x->deps = deps;
+    x->vdepth = 1; /* the view itself is a level: a statement reading it expands one deeper than its creation does */
+    int rc = run_nested(x, q, pr, NEST_TPROBE, NULL, NULL, NULL, NULL, e);
+    x->vdepth = vd0;
+    x->deps = deps0;
+    if (rc) return rc;
+    if (deps->over)
+        return imdb_fail(e, IMDB_ERR_LIMIT, "a view's query names more than %u tables and views", IMDB_MAX_VIEW_DEPS);
+    qsort(deps->d, deps->n, sizeof *deps->d, cmp_viewdep);
+    return IMDB_OK;
+}
+
+static int exec_create_view(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
+{
+    const sql_stmt *q = st->src;
+    if (!q || view_shape(q, false, e)) return q ? e->code : imdb_fail(e, IMDB_ERR_STATE, "CREATE VIEW without its query");
+    if (st->body_len > IMDB_MAX_VIEW_TEXT)
+        return imdb_fail(e, IMDB_ERR_LIMIT, "a view's query of more than %u bytes", IMDB_MAX_VIEW_TEXT);
+    const sql_stmt *core = q;
+    while (core->narm) core = core->arm[0]; /* a set operation's first arm names its columns */
+    for (uint16_t i = 0; !st->nset && i < core->nitems; i++) {
+        const sql_item *it = &core->items[i];
+        if (!it->alias[0] && (it->expr || it->agg || !it->col[0])) /* the engines name an expression differently */
+            return imdb_fail(e, IMDB_ERR_INVALID, "view %s: its column %u is an expression: name it (AS name) or give "
+                             "the view a column list", st->table, i + 1);
+    }
+    imdb_result pr;
+    imdb_result_init(&pr);
+    xdeps *deps = xalloc(x, sizeof *deps, e);
+    int rc = deps ? view_probe(x, q, &pr, deps, e) : e->code;
+    if (!rc && st->nset && st->nset != pr.ncols)
+        rc = imdb_fail(e, IMDB_ERR_INVALID, "view %s names %u columns, its query yields %u", st->table, st->nset, pr.ncols);
+    for (uint16_t c = 0; !rc && c < pr.ncols; c++) {
+        const char *nm = st->nset ? st->set_cols[c] : pr.names[c];
+        if (!imdb_ident_valid(nm, strlen(nm)))
+            rc = imdb_fail(e, IMDB_ERR_INVALID, "view %s: its column %u needs a name (AS name)", st->table, c + 1);
+        else if (!pr.ctype[c])
+            rc = imdb_fail(e, IMDB_ERR_INVALID, "view %s: its column %s has no type: CAST it", st->table, nm);
+        else if (pr.ctype[c] == IMDB_T_DECIMAL && pr.cscale[c] > 18)
+            rc = imdb_fail(e, IMDB_ERR_LIMIT, "view %s: its DECIMAL %s has more than 18 places: CAST it", st->table, nm);
+        for (uint16_t d = 0; !rc && d < c; d++)
+            if (!strcmp(nm, st->nset ? st->set_cols[d] : pr.names[d]))
+                rc = imdb_fail(e, IMDB_ERR_INVALID, "view %s names two columns %s", st->table, nm);
+    }
+    imdb_viewdef *def = rc ? NULL : imdb_alloc(sizeof *def, e);
+    if (!rc && !def) rc = e->code;
+    if (!rc) {
+        def->ncols = pr.ncols;
+        def->ndeps = deps->n;
+        def->text_len = st->body_len;
+        snprintf(def->name, sizeof def->name, "%s", st->table);
+        if (!(def->cols = imdb_alloc_array(pr.ncols ? pr.ncols : 1, sizeof *def->cols, e)) ||
+            (deps->n && !(def->deps = imdb_alloc_array(deps->n, sizeof *def->deps, e))) ||
+            !(def->text = imdb_alloc((size_t)st->body_len + 1, e)))
+            rc = e->code;
+    }
+    if (!rc) {
+        for (uint16_t c = 0; c < pr.ncols; c++) {
+            snprintf(def->cols[c].name, sizeof def->cols[c].name, "%s", st->nset ? st->set_cols[c] : pr.names[c]);
+            def->cols[c].type = pr.ctype[c];
+            def->cols[c].scale = pr.ctype[c] == IMDB_T_DECIMAL ? pr.cscale[c] : 0;
+        }
+        if (deps->n) memcpy(def->deps, deps->d, deps->n * sizeof *def->deps);
+        memcpy(def->text, x->sql + st->body_off, st->body_len);
+    }
+    imdb_result_free(&pr);
+    if (rc) {
+        imdb_viewdef_free(def);
+        return rc;
+    }
+    if ((rc = imdb_create_view(x->db, def, e))) return rc; /* it takes def, a failure's too */
+    snprintf(r->status, sizeof r->status, "CREATE VIEW %s", st->table);
+    return IMDB_OK;
+}
+
+static int exec_drop_view(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
+{
+    imdb_view *v = imdb_view_by_name(x->db, st->table);
+    if (!v) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no view %s", st->table);
+    if (imdb_drop_view(x->db, v, e)) return e->code;
+    snprintf(r->status, sizeof r->status, "DROP VIEW %s", st->table);
+    return IMDB_OK;
+}
+
+static int exec_show_views(xctx *x, imdb_result *r, imdb_err *e)
+{
+    imdb_db *db = x->db;
+    res_cols(r, 4);
+    const char *nm[] = {"view", "columns", "created_at", "query"};
+    for (int i = 0; i < 4; i++) res_name(r, (uint16_t)i, nm[i]);
+    char cols[IMDB_MAX_COLS * (IMDB_MAX_IDENT + 24)];
+    for (uint32_t i = 0; i < db->nviews; i++) {
+        const imdb_view *v = &db->views[i];
+        if (v->dropped_at || !v->def) continue; /* a dropped view's name is free */
+        size_t at = 0;
+        for (uint16_t c = 0; c < v->def->ncols; c++) {
+            const imdb_viewcol *vc = &v->def->cols[c];
+            if (vc->type == IMDB_T_DECIMAL)
+                at += (size_t)snprintf(cols + at, sizeof cols - at, "%s%s DECIMAL(18,%u)", c ? ", " : "", vc->name, vc->scale);
+            else at += (size_t)snprintf(cols + at, sizeof cols - at, "%s%s %s", c ? ", " : "", vc->name, imdb_type_name(vc->type));
+        }
+        imdb_cell *row = res_row(r, e);
+        if (!row) return e->code;
+        res_put_str(r, &row[0], v->name);
+        res_put_str(r, &row[1], cols);
+        res_put_int(r, &row[2], (int64_t)v->created_at);
+        res_put_str(r, &row[3], v->def->text);
+    }
+    snprintf(r->status, sizeof r->status, "%llu views", (unsigned long long)r->nrows);
+    return res_finish(r, e);
+}
+
+int imdb_view_rebind(imdb_db *db, const imdb_viewdef *def, imdb_err *e)
+{
+    imdb_session ss;
+    imdb_session_init(&ss, db);
+    sql_stmt *vs = imdb_alloc(sizeof *vs, e);
+    if (!vs) return e->code;
+    imdb_err pe = {0};
+    int rc = imdb_sql_parse(def->text, def->text_len, vs, &pe);
+    if (rc) {
+        imdb_free(vs);
+        return rc == IMDB_ERR_NOMEM || rc == IMDB_ERR_LIMIT ? imdb_fail(e, rc, "view %u: %s", def->id, pe.msg)
+                                                            : imdb_fail(e, IMDB_ERR_CORRUPT, "view %u: its text does not parse",
+                                                                        def->id);
+    }
+    xctx x = {.ss = &ss, .db = db, .sql = def->text, .st = vs};
+    imdb_result pr;
+    imdb_result_init(&pr);
+    xdeps *deps = xalloc(&x, sizeof *deps, e);
+    if (!deps) rc = e->code;
+    else if (vs->kind != ST_SELECT || view_shape(vs, false, &pe))
+        rc = imdb_fail(e, IMDB_ERR_CORRUPT, "view %u: its text is not a query a view may hold", def->id);
+    else if ((rc = view_probe(&x, vs, &pr, deps, &pe)))
+        rc = rc == IMDB_ERR_NOMEM || rc == IMDB_ERR_LIMIT ? imdb_fail(e, rc, "view %u: %s", def->id, pe.msg)
+                                                          : imdb_fail(e, IMDB_ERR_CORRUPT, "view %u: its text does not bind "
+                                                                      "against the catalog at its commit (%s)", def->id, pe.msg);
+    bool same = !rc && pr.ncols == def->ncols && deps->n == def->ndeps;
+    for (uint16_t c = 0; same && c < def->ncols; c++)
+        same = pr.ctype[c] == def->cols[c].type && (def->cols[c].type != IMDB_T_DECIMAL || pr.cscale[c] == def->cols[c].scale);
+    for (uint16_t k = 0; same && k < def->ndeps; k++)
+        same = deps->d[k].kind == def->deps[k].kind && deps->d[k].id == def->deps[k].id;
+    if (!rc && !same)
+        rc = imdb_fail(e, IMDB_ERR_CORRUPT, "view %u: its text yields other columns or dependencies than it logged", def->id);
+    imdb_result_free(&pr);
+    xfree(&x);
+    imdb_sql_stmt_free(vs);
+    imdb_free(vs);
+    imdb_session_close(&ss);
+    return rc;
 }
 
 /* SELECT ... FOR UPDATE: every selected committed row must still be live when the
@@ -6566,7 +6839,7 @@ static int exec_insert(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
     if ((st->nsub || st->src) && !x->own) wceil_set(x); /* P2 S8: what it reads */
     if (st->nsub && !x->own && rset_prepare(x, st, false, e)) return e->code; /* P2 S4: its subqueries, before any write */
     imdb_table *t = imdb_table_by_name(x->db, st->table);
-    if (!t) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", st->table);
+    if (!t) return no_table(x, st->table, e); /* P2 S7: a view says so */
     int map[IMDB_MAX_COLS];
     uint16_t width = st->ncols ? st->ncols : t->s.ncols;
     if (!st->src && st->rowlen != width)
@@ -6711,7 +6984,7 @@ static int exec_copy_from(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err 
         return imdb_fail(e, IMDB_ERR_STATE, "COPY ... FROM STDIN reads the client's stream, and this session has none "
                                             "(the CLI's -c or a script, imdb_session_copy_io)");
     imdb_table *t = imdb_table_by_name(x->db, st->table);
-    if (!t) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", st->table);
+    if (!t) return no_table(x, st->table, e); /* P2 S7: a view says so */
     if (st->copy_batch && !x->autocommit)
         return imdb_fail(e, IMDB_ERR_STATE, "COPY ... BATCH commits as it goes: run it outside an explicit transaction");
     int map[IMDB_MAX_COLS];
@@ -6863,6 +7136,9 @@ static int copy_to_table(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *
     imdb_table *t;
     if (read_table(x, st, st->table, &t, e)) return e->code; /* the table at the read point, a dropped one an old
                                                               * transaction still sees included */
+    if (x->nvown && x->vown[x->nvown - 1]->t == t) /* P2 S7: as PostgreSQL has it */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "COPY of view %s: write COPY (SELECT ... FROM %s) TO STDOUT", st->table,
+                         st->table);
     int map[IMDB_MAX_COLS];
     uint16_t width;
     if (copy_columns(t, st, map, &width, NULL, e)) return e->code;
@@ -6997,7 +7273,9 @@ static int exec_join_write(xctx *x, const sql_stmt *st, bool upd, imdb_result *r
     const char *what = upd ? "UPDATE ... FROM" : "DELETE ... USING";
     if (xp) return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "EXPLAIN of %s: a later step", what);
     imdb_table *t = imdb_table_by_name(x->db, st->table), *u = imdb_table_by_name(x->db, st->table2);
-    if (!t) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", st->table);
+    if (!t) return no_table(x, st->table, e); /* P2 S7: a view says so */
+    if (!u && imdb_view_by_name(x->db, st->table2)) /* P2 S7: its rows bound as a table's here */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "%s a view: a later step (name a table)", what);
     if (!u) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", st->table2);
     uint16_t nt = t->s.ncols, nu = u->s.ncols;
     if ((unsigned)nt + nu > IMDB_MAX_COLS)
@@ -7094,7 +7372,7 @@ static int exec_update(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, 
     }
     if (st->src) return exec_join_write(x, st, true, r, xp, e); /* P2 S8: UPDATE ... FROM */
     imdb_table *t = imdb_table_by_name(x->db, st->table);
-    if (!t) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", st->table);
+    if (!t) return no_table(x, st->table, e); /* P2 S7: a view says so */
     int cols[IMDB_MAX_COLS];
     imdb_value newv[IMDB_MAX_COLS];
     bool trees = false;
@@ -7154,7 +7432,7 @@ static int exec_delete(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, 
     }
     if (st->src) return exec_join_write(x, st, false, r, xp, e); /* P2 S8: DELETE ... USING */
     imdb_table *t = imdb_table_by_name(x->db, st->table);
-    if (!t) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", st->table);
+    if (!t) return no_table(x, st->table, e); /* P2 S7: a view says so */
     uint64_t *vids, n;
     if (st->returning && !xp && ret_prepare(x, st, t, NULL, r, e)) return e->code; /* P2 S8 */
     if (select_vids(x, st, t, false, &vids, &n, xp, e)) return e->code;
@@ -7795,7 +8073,8 @@ static int check_iso(const sql_stmt *st, imdb_err *e)
 static bool is_write(uint8_t k)
 {
     return k == ST_CREATE || k == ST_INSERT || k == ST_UPDATE || k == ST_DELETE || k == ST_CREATE_INDEX ||
-           k == ST_DROP_INDEX || k == ST_ALTER_RETENTION || k == ST_DROP_TABLE || k == ST_COPY_FROM; /* P2 S10 */
+           k == ST_DROP_INDEX || k == ST_ALTER_RETENTION || k == ST_DROP_TABLE || k == ST_COPY_FROM || /* P2 S10 */
+           k == ST_CREATE_VIEW || k == ST_DROP_VIEW; /* P2 S7 */
 }
 
 /* A read statement's workspace (P0 R2): what SET statement_memory says, else a quarter of the memory budget, at most
@@ -7812,12 +8091,14 @@ static int stmt_class(int kind)
     case ST_BEGIN: case ST_COMMIT: case ST_ROLLBACK: case ST_SAVEPOINT: case ST_ROLLBACK_TO: case ST_RELEASE:
     case ST_SET_TXN: return IMDB_SC_TXN;
     case ST_CREATE: case ST_CREATE_INDEX: case ST_DROP_INDEX: case ST_DROP_TABLE: case ST_ALTER_RETENTION:
+    case ST_CREATE_VIEW: case ST_DROP_VIEW: /* P2 S7 */
         return IMDB_SC_DDL;
     case ST_CHECKPOINT: case ST_COMPACT: case ST_ERASE_SUBJECT: case ST_ERASE_WHERE: case ST_VERIFY: return IMDB_SC_PHYSICAL;
     case ST_SHOW_TABLES: case ST_SHOW_DIGEST: case ST_SHOW_HISTORY: case ST_SHOW_LOG: case ST_SHOW_LAKE:
     case ST_SHOW_IDENTITY: case ST_SHOW_REPLICAS: case ST_SHOW_REPLICATION: case ST_SHOW_ERASURE: case ST_SHOW_MEMORY:
     case ST_SHOW_INDEXES: case ST_SHOW_RETENTION: case ST_SHOW_STATS: case ST_SHOW_TRANSACTIONS: case ST_EXPLAIN:
     case ST_SHOW_PREPARED: /* P2 S9 */
+    case ST_SHOW_VIEWS: /* P2 S7 */
         return IMDB_SC_SHOW;
     default: return IMDB_SC_OTHER;
     }
@@ -8082,17 +8363,20 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
      * way */
     atomic_store_explicit(&ss->cancel, false, memory_order_relaxed);
     x.checks = !physical && st->kind != ST_COMMIT && st->kind != ST_CREATE && st->kind != ST_CREATE_INDEX &&
-               st->kind != ST_DROP_INDEX && st->kind != ST_ALTER_RETENTION && st->kind != ST_DROP_TABLE; /* each commits on
-                                                                                                       * its own */
+               st->kind != ST_DROP_INDEX && st->kind != ST_ALTER_RETENTION && st->kind != ST_DROP_TABLE &&
+               st->kind != ST_CREATE_VIEW && st->kind != ST_DROP_VIEW; /* each commits on its own */
     x.next_check = TICK_ROWS;
     if (x.checks && ss->stmt_timeout_ms) x.deadline_ns = mono_ns() + (uint64_t)ss->stmt_timeout_ms * 1000000u;
     if (txn && (st->kind == ST_CREATE || st->kind == ST_CREATE_INDEX || st->kind == ST_DROP_INDEX ||
-                st->kind == ST_ALTER_RETENTION || st->kind == ST_DROP_TABLE)) {
+                st->kind == ST_ALTER_RETENTION || st->kind == ST_DROP_TABLE || st->kind == ST_CREATE_VIEW ||
+                st->kind == ST_DROP_VIEW)) {
         rc = imdb_fail(e, IMDB_ERR_STATE, "%s commits on its own: run it outside the transaction",
                        st->kind == ST_CREATE         ? "CREATE TABLE"
                        : st->kind == ST_CREATE_INDEX ? "CREATE INDEX"
                        : st->kind == ST_DROP_INDEX   ? "DROP INDEX"
                        : st->kind == ST_DROP_TABLE   ? "DROP TABLE"
+                       : st->kind == ST_CREATE_VIEW  ? "CREATE VIEW" /* P2 S7 */
+                       : st->kind == ST_DROP_VIEW    ? "DROP VIEW"
                                                      : "ALTER TABLE");
         goto done;
     }
@@ -8123,7 +8407,8 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
                                            st->kind == ST_SHOW_MEMORY || st->kind == ST_SHOW_INDEXES ||
                                            st->kind == ST_SHOW_RETENTION || st->kind == ST_SHOW_STATS ||
                                            st->kind == ST_SHOW_TRANSACTIONS || st->kind == ST_EXPLAIN ||
-                                           st->kind == ST_COPY_TO); /* P2 S10: its rows are a query's result */
+                                           st->kind == ST_COPY_TO || /* P2 S10: its rows are a query's result */
+                                           st->kind == ST_SHOW_VIEWS); /* P2 S7 */
     if (ceiling) imdb_heap_ceiling_set(imdb_heap_bytes() + workspace_of(ss), workspace_of(ss));
     switch (st->kind) {
     case ST_EMPTY: break;
@@ -8161,6 +8446,9 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
         if (!rc) snprintf(r->status, sizeof r->status, "DROP TABLE %s", st->table);
         break;
     }
+    case ST_CREATE_VIEW: rc = exec_create_view(&x, st, r, e); break; /* P2 S7 */
+    case ST_DROP_VIEW: rc = exec_drop_view(&x, st, r, e); break;
+    case ST_SHOW_VIEWS: rc = exec_show_views(&x, r, e); break;
     case ST_DROP_INDEX:
         rc = imdb_drop_index(db, st->index_name, e);
         if (!rc) snprintf(r->status, sizeof r->status, "DROP INDEX %s", st->index_name);
@@ -8760,6 +9048,7 @@ void imdb_result_render(const imdb_result *r, bool csv, imdb_buf *out)
             }
             imdb_buf_put_u8(out, '\n');
         }
+        if (tmp.err && !out->err) out->err = tmp.err; /* a cell's text that could not be made: the render failed, never a wrong text */
         imdb_buf_free(&tmp);
         return;
     }
@@ -8815,5 +9104,6 @@ void imdb_result_render(const imdb_result *r, bool csv, imdb_buf *out)
                         (unsigned long long)r->snap, hd, dg, (unsigned long long)r->lake_seq, r->lake_seq ? mf : "-");
     }
     if (r->status[0]) imdb_buf_printf(out, "%s\n", r->status);
+    if (tmp.err && !out->err) out->err = tmp.err;
     imdb_buf_free(&tmp);
 }

@@ -8,7 +8,8 @@
  * Server's licence).
  *   oracle [--engines imagedb,sqlite,pg,mysql,mariadb,mssql] [--seeds A-B] [--steps N] [--dir DIR] [--keep-going]
  *          [--no-expr] [--no-fns] [--ping] [-v]   (--no-expr: 1a's generator, without arithmetic expressions, draw for draw;
- *          --no-fns: the generator before P2 S1's functions, CASE, CAST, IN, LIKE and ||, draw for draw)
+ *          --no-fns: the generator before P2 S1's functions, CASE, CAST, IN, LIKE and ||, draw for draw; --no-views: before P2 S7's
+ *          views, draw for draw)
  * The servers, from the environment: ORACLE_PG (a libpq conninfo), ORACLE_MYSQL and ORACLE_MARIADB ("socket user
  * password database"), ORACLE_ODBC (an ODBC connection string, out of ps). */
 #include <errno.h>
@@ -102,6 +103,12 @@ static const colspec UC[] = {{"id", CT_INT}, {"tid", CT_INT}, {"v", CT_INT}, {"s
 static const colspec *cols(int tab) { return tab ? UC : TC; }
 static int ncols(int tab) { return tab ? NU : NT; }
 static const char *tname(int tab) { return tab ? "u" : "t"; }
+/* P2 S7: a SELECT that reads the views vt and vu in t's and u's places (stmt.vfrom): each view is all of its table's
+ * columns through a predicate drawn per seed (make_views), named by the table's own name as an alias, so the rest of
+ * the statement is unchanged. src: a FROM item standing for the table; srcn: one an alias of its own follows */
+static bool g_view;
+static const char *src(int tab) { return g_view ? (tab ? "vu AS u" : "vt AS t") : tname(tab); }
+static const char *srcn(int tab) { return g_view ? (tab ? "vu" : "vt") : tname(tab); }
 
 typedef struct val {
     bool null;
@@ -235,6 +242,7 @@ typedef struct stmt {
     int nxp;
     int nxe;
     unsigned skip;     /* engines this statement is not put to: a dialect computes it otherwise (a SELECT only) */
+    bool ma_like;      /* MariaDB not put to it either: a column's LIKE its index range answers wrong (ma_like_ok) */
     int nord;          /* ORDER BY (1d): a key a column (col >= 0, of tab), a tree (ex) or an item's position (pos) */
     struct okey {
         int tab, col, ex, pos;
@@ -251,6 +259,7 @@ typedef struct stmt {
     bool subq;         /* P2 S4: a subquery, a derived table or a CTE (counted when compared) */
     bool corr;         /* P2 S4b: a correlated subquery (counted when compared) */
     bool shadow;       /* P2 S19: a correlated subquery whose table takes the outer one's name (corr_add) */
+    bool vfrom;        /* P2 S7: it reads the views vt and vu in t's and u's places (src) */
     bool lazy;         /* P2 S11: items over a SELECT that fails when it runs (counted when compared) */
     int narm, ncol;    /* P2 S5: a set operation's SELECTs (arm, armop[a] before arm a: 0 UNION, 1 UNION ALL, 2 INTERSECT,
                         * 3 EXCEPT) of ncol columns; its tail (stail: ORDER BY 1 [DESC] [LIMIT slim] [OFFSET soff]) */
@@ -356,6 +365,7 @@ static void gen_pred(int tab, pred *p)
 
 static bool g_expr = true; /* --no-expr: 1a's generator, draw for draw */
 static bool g_fns = true;  /* --no-fns: the generator before P2 S1, draw for draw */
+static bool g_views = true; /* --no-views: the generator before P2 S7's views, draw for draw */
 /* A seed names the same statements only within one stage: each P2 stage (S1 to S4) adds forms to the default
  * generator's draws, so seed N's statements differ from the stage before's (a mismatch is reproduced on its own
  * build); --no-fns and --no-expr reproduce the generators before P2 S1 and before 1a. */
@@ -608,6 +618,34 @@ static bool ms_ok(const stmt *q, int k)
     return ms_ok(q, n->l) && ms_ok(q, n->r) && ms_ok(q, n->x3);
 }
 
+/* MariaDB 12.3.3: a LIKE whose pattern begins with literal characters and has a wildcard after them is answered, through
+ * an index on its column, by a range that drops every value whose character after those literals is past U+FFFF: 'a😀',
+ * 'a😀b' and 'a𐀀' for 'a%', 'ab😀c' for 'ab%', 'a😀' for 'a_', 'a%😀' for 'a!%%', 'ß😀' for 'ß%', '😀😀' for '😀%' ('a' then
+ * U+FFFF kept; a leading wildcard, NOT LIKE and a pattern without one answered alike with the index and without it;
+ * reproduced alone, 2026-11-07, from seed 90 of P2 S7's five-engine run, where
+ * PostgreSQL, MySQL, SQL Server and SQLite answered as imagedb). A pattern's ! escapes its next character */
+static bool ma_like_ok(const char *pat)
+{
+    if (pat[0] == '%' || pat[0] == '_') return true; /* no literal prefix: no range */
+    for (const char *p = pat; *p; p++) {
+        if (*p == '!') { /* the next character a literal */
+            if (!*++p) break;
+            continue;
+        }
+        if (*p == '%' || *p == '_') return false;
+    }
+    return true; /* no wildcard: an equality */
+}
+
+/* whether tree k holds a LIKE of a bare column ma_like_ok refuses: anywhere, WHERE's, an item's, a subquery's (x3) */
+static bool ma_like_tree(const stmt *q, int k)
+{
+    if (!k) return false;
+    const xnode *n = XN(q, k);
+    if (n->op == X_LIKE && XN(q, n->l)->op == X_COL && !ma_like_ok(n->s)) return true;
+    return ma_like_tree(q, n->l) || ma_like_tree(q, n->r) || ma_like_tree(q, n->x3); /* height-bounded */
+}
+
 /* MariaDB 12.3.3: a DECIMAL remainder of a negative value is -0.00, which compares below 0 and unequal to it
  * (-5.37 % 0.01 < 0 is true; reproduced alone, 2026-11-04; its * 0 and negation give 0.00): no DECIMAL % for it */
 static bool ma_ok(const stmt *q, int k)
@@ -645,6 +683,7 @@ static void xmark(stmt *q, int k)
     if (!lite_ok(q, k, false)) q->skip |= 1u << D_SQLITE;
     if (!ms_ok(q, k)) q->skip |= 1u << D_MS;
     if (!ma_ok(q, k)) q->skip |= 1u << D_MA;
+    if (ma_like_tree(q, k)) q->ma_like = true; /* its own mask: counted where it alone keeps MariaDB out */
     if (!my_ok(q, k)) q->skip |= 1u << D_MY;
     fn_mark(q, k); /* P2 S1 */
 }
@@ -2349,8 +2388,9 @@ static void put_x(sb *b, int d, const stmt *q, int k, int pty)
         else if (n->fn == 2 && n->qual)
             sb_printf(b, "%s(%s.%s)", AG[n->i], n->qual == 3 ? tname(!n->tab) : "ci", cols(n->tab)[n->col].name);
         else if (n->fn == 2) sb_printf(b, "%s(", AG[n->i]), put_col(b, q, n->tab, n->col), sb_str(b, ")");
-        if (n->qual == 3) sb_printf(b, " FROM %s AS %s", tname(n->tab), tname(!n->tab)); /* P2 S19 */
-        else sb_printf(b, n->qual ? " FROM %s AS ci" : " FROM %s", tname(n->tab));
+        if (n->qual == 3) sb_printf(b, " FROM %s AS %s", srcn(n->tab), tname(!n->tab)); /* P2 S19 */
+        else if (n->qual) sb_printf(b, " FROM %s AS ci", srcn(n->tab));
+        else sb_printf(b, " FROM %s", src(n->tab));
         if (n->x3) sb_str(b, " WHERE "), put_x(b, d, q, n->x3, -1);
         sb_str(b, n->fn == 1 ? "))" : ")");
         return;
@@ -2721,7 +2761,7 @@ static void put_okey_ms(sb *b, const stmt *q, const struct okey *k, bool *first)
 static void put_join(sb *b, int d, const stmt *q, int kind, bool swap)
 {
     static const char *const KW[] = {"", " JOIN ", " LEFT JOIN ", " RIGHT JOIN ", " FULL JOIN ", " CROSS JOIN "};
-    sb_printf(b, " FROM %s%s%s", swap ? "u" : "t", KW[kind], swap ? "t" : "u");
+    sb_printf(b, " FROM %s%s%s", src(swap), KW[kind], src(!swap));
     if (kind == 5) return;
     if (q->jusing && d != D_MS) {
         sb_str(b, " USING (s)");
@@ -2756,7 +2796,7 @@ static void print_setop(sb *b, int d, const stmt *q)
         if (a) sb_printf(b, " %s ", OP[q->armop[a]]);
         sb_str(b, "SELECT ");
         for (int c = 0; c < q->ncol; c++) sb_printf(b, "%s%s", c ? ", " : "", cols(m->tab)[m->col[c]].name);
-        sb_printf(b, " FROM %s", tname(m->tab));
+        sb_printf(b, " FROM %s", src(m->tab));
         if (m->has_pr) {
             sb_str(b, " WHERE ");
             put_pred(b, d, q, &m->pr);
@@ -2780,14 +2820,14 @@ static void print_rec(sb *b, int d, const stmt *q)
 {
     const char *rk = d == D_MS ? "WITH" : "WITH RECURSIVE", *op = q->rall ? "UNION ALL" : "UNION";
     if (q->rec == 3)
-        sb_printf(b, "%s r(x) AS (SELECT g FROM t WHERE g IS NOT NULL %s SELECT x + 1 FROM r WHERE x < 6) SELECT COUNT(*), "
-                     "SUM(x) FROM r", rk, op);
+        sb_printf(b, "%s r(x) AS (SELECT g FROM %s WHERE g IS NOT NULL %s SELECT x + 1 FROM r WHERE x < 6) SELECT COUNT(*), "
+                     "SUM(x) FROM r", rk, src(0), op);
     else if (q->rec == 1)
         sb_printf(b, "%s n(i) AS (SELECT 1 %s SELECT i + 1 FROM n WHERE i < %d) SELECT COUNT(*), SUM(i) FROM n", rk, op, q->rk);
     else
-        sb_printf(b, "%s r(x, depth) AS (SELECT %s%" PRId64 "%s, 0 %s SELECT u.id, r.depth + 1 FROM r JOIN u ON u.tid = r.x WHERE "
+        sb_printf(b, "%s r(x, depth) AS (SELECT %s%" PRId64 "%s, 0 %s SELECT u.id, r.depth + 1 FROM r JOIN %s ON u.tid = r.x WHERE "
                      "r.depth < 6) SELECT COUNT(*), SUM(x) FROM r",
-                  rk, d == D_PG || d == D_MS ? "CAST(" : "", q->rstart, d == D_PG || d == D_MS ? " AS BIGINT)" : "", op); /* the start
+                  rk, d == D_PG || d == D_MS ? "CAST(" : "", q->rstart, d == D_PG || d == D_MS ? " AS BIGINT)" : "", op, src(1)); /* the start
                   * a BIGINT, as u.id is: PostgreSQL and SQL Server want the two parts' types alike (MySQL's CAST has no
                   * BIGINT) */
 }
@@ -2815,7 +2855,7 @@ static void print_win(sb *b, int d, const stmt *q)
         case 3: sb_printf(b, " ROWS BETWEEN %d PRECEDING AND UNBOUNDED FOLLOWING", q->wlo); break;
         default: sb_str(b, " RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING"); break;
         }
-    sb_str(b, ") AS w FROM t");
+    sb_printf(b, ") AS w FROM %s", src(0));
     if (q->npr) {
         sb_str(b, " WHERE ");
         put_pred(b, d, q, &q->pr[0]);
@@ -2912,7 +2952,16 @@ static void print_merge(sb *b, const stmt *q)
     sb_str(b, ");");
 }
 
-static void print_stmt(sb *b, int d, const stmt *q)
+static void print_stmt_body(sb *b, int d, const stmt *q);
+
+static void print_stmt(sb *b, int d, const stmt *q) /* P2 S7: the views' flag around the body */
+{
+    g_view = q->vfrom;
+    print_stmt_body(b, d, q);
+    g_view = false;
+}
+
+static void print_stmt_body(sb *b, int d, const stmt *q)
 {
     sb_reset(b);
     switch (q->kind) {
@@ -3003,7 +3052,7 @@ static void print_stmt(sb *b, int d, const stmt *q)
     if (q->dsel == 2) { /* P2 S4: the CTE first */
         sb_str(b, "WITH x AS (SELECT ");
         for (int i = 0; i < q->ndc; i++) sb_printf(b, "%s%s", i ? ", " : "", cols(0)[q->dc[i]].name);
-        sb_str(b, " FROM t");
+        sb_printf(b, " FROM %s", src(0));
         if (q->has_dpred) sb_str(b, " WHERE "), put_pred(b, d, q, &q->dpred);
         sb_str(b, ") ");
     }
@@ -3026,13 +3075,13 @@ static void print_stmt(sb *b, int d, const stmt *q)
     if (q->dsel == 1) { /* P2 S4: a derived table */
         sb_str(b, " FROM (SELECT ");
         for (int i = 0; i < q->ndc; i++) sb_printf(b, "%s%s", i ? ", " : "", cols(0)[q->dc[i]].name);
-        sb_str(b, " FROM t");
+        sb_printf(b, " FROM %s", src(0));
         if (q->has_dpred) sb_str(b, " WHERE "), put_pred(b, d, q, &q->dpred);
         sb_str(b, ") AS x");
     } else if (q->dsel == 2) {
         sb_str(b, " FROM x");
     } else if (!q->join) {
-        sb_printf(b, " FROM %s", tname(q->tab)); /* a join's FROM: put_join (P2 S3) */
+        sb_printf(b, " FROM %s", src(q->tab)); /* a join's FROM: put_join (P2 S3) */
     }
     if (q->join == 4 && d == D_SQLITE) { /* P2 S3: FULL as LEFT JOIN UNION ALL the other side's rows nothing matched */
         size_t sel = b->n;
@@ -3808,8 +3857,10 @@ static void reset_all(unsigned seed)
             exec_eng(e, d == D_MS ? "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION" : "ROLLBACK", false, NULL, 0, &rb);
             res_clear(&rb);
             if (d == D_MS) {
-                must(e, "DROP TABLE IF EXISTS u; DROP TABLE IF EXISTS t");
+                must(e, "DROP VIEW IF EXISTS vu; DROP VIEW IF EXISTS vt; DROP TABLE IF EXISTS u; DROP TABLE IF EXISTS t");
             } else {
+                must(e, "DROP VIEW IF EXISTS vu"); /* P2 S7: a seed's views, before their tables */
+                must(e, "DROP VIEW IF EXISTS vt");
                 must(e, "DROP TABLE IF EXISTS u");
                 must(e, "DROP TABLE IF EXISTS t");
             }
@@ -3834,6 +3885,8 @@ static long g_jn_compared; /* P2 S3: comparisons of its join forms */
 static long g_subq_compared; /* P2 S4: comparisons of statements with a subquery, a derived table or a CTE */
 static long g_corr_compared; /* P2 S4b: comparisons of statements with a correlated subquery */
 static long g_shadow_compared; /* P2 S19: of them, a subquery whose table takes the outer one's name */
+static long g_view_compared;   /* P2 S7: of them, a SELECT over the views vt and vu */
+static long g_ma_like;         /* SELECTs not put to MariaDB for ma_like_ok alone: put to it before (P2 S7's run) */
 static long g_lazy_compared; /* P2 S11: comparisons of items over a SELECT that fails when it runs */
 static long g_set_compared, g_rec_compared; /* P2 S5: comparisons of set operations, of WITH RECURSIVE */
 static long g_win_compared; /* P2 S6: comparisons of window functions */
@@ -3874,6 +3927,7 @@ static void diagnose(const stmt *q, int d)
         memcpy(c.xp, q->xp, sizeof q->xp);
         c.nxp = q->nxp;
         c.skip = q->skip;
+        c.ma_like = q->ma_like;
         c.gcol = -1;
         c.it[c.nit++] = (item){F_COUNT_STAR, 0, 0, 0};
         if (i < q->npr) c.pr[c.npr++] = q->pr[i];
@@ -3912,10 +3966,13 @@ static bool excused(int d, const char *msg, const char *text)
     if (strstr(msg, "division by zero")) return d == D_SQLITE || d == D_MY || d == D_MA;
     /* P2 S11: SQLite's value of a subquery is its first row, however many it returns */
     if (strstr(msg, "returned more than one row")) return d == D_SQLITE;
-    /* MariaDB 12.3.3 wraps 0 - x for x = INT64_MIN to INT64_MIN, silently (-x, 1 - x, x - 1, -1 * x and x DIV -1 it
-     * refuses as overflows; reproduced alone, 2026-11-05, seed 6 of that day's five-engine run: AVG((0 - x))). An
-     * INT64 overflow imagedb wrongly raised would still be caught: PostgreSQL is compared first */
-    if (strstr(msg, "INT64 overflow") && d == D_MA && strstr(text, "(0 - ")) return true;
+    /* MariaDB 12.3.3 wraps 0 - x for x = INT64_MIN to INT64_MIN, silently, whenever the left side is 0 when it runs (-x,
+     * 1 - x, x - 1, -1 * x and x DIV -1 it refuses as overflows; reproduced alone, 2026-11-05, seed 6 of that day's
+     * five-engine run: AVG((0 - x)); and 2026-11-07, from seed 52 of P2 S7's: (7 DIV x) - x, 7 DIV x
+     * being 0). Excused for any subtraction: an INT64 overflow imagedb wrongly raised would still be caught, PostgreSQL
+     * being put to every statement MariaDB is (it is left out only of ROUND of a FLOAT64, LOWER and UPPER, as every server
+     * is) and excused for an overflow only where it raises one itself (excused_window) */
+    if (strstr(msg, "INT64 overflow") && d == D_MA && strstr(text, " - ")) return true;
     if (strstr(msg, "INT64 overflow")) return d == D_SQLITE;
     /* imagedb never turns an INT64 past 2^53 into a FLOAT64 (design.md, Expressions); the others round it silently */
     if (strstr(msg, "beyond 2^53")) return true;
@@ -3970,7 +4027,7 @@ static bool excused_window(int d, const stmt *q, const char *base_msg)
 
 /* the reverse: engine d refused what imagedb answered, as d does wrongly. MySQL 8.4.13 refuses INT64_MIN DIV n though the
  * quotient is an INT64 ("BIGINT value is out of range"; MariaDB 12.3.3 answers it; reproduced alone, 2026-11-04);
- * an INT64_MIN DIV -1 that imagedb wrongly answered would still be caught: PostgreSQL is compared first */
+ * an INT64_MIN DIV -1 that imagedb wrongly answered would still be caught: PostgreSQL is put to every statement MySQL is */
 static bool excused_other(int d, const char *msg, const char *text)
 {
     if (d == D_MY) return strstr(msg, "BIGINT value is out of range") && strstr(msg, " DIV ");
@@ -4077,8 +4134,10 @@ static int run_stmt(unsigned seed, int step, const stmt *q, bool state)
     else if (q->nret) /* P2 S8: RETURNING's columns, typed as SELECT * types them */
         for (nty = 0; nty < q->nret; nty++) ty[nty] = TY(cols(q->tab)[q->ret[nty]].t, cols(q->tab)[q->ret[nty]].t == CT_DEC ? 2 : 0);
     bool ordered = rows && (q->limit || q->nord || q->offset); /* a total order (1d): compared row by row */
+    unsigned skip = q->skip | (q->ma_like ? 1u << D_MA : 0u); /* P2 S7: MariaDB's LIKE range (ma_like_ok) too */
+    if (q->ma_like && !(q->skip & 1u << D_MA) && g_eng[D_MA].on) g_ma_like++;
     for (int d = 0; d < ND; d++) {
-        if (!g_eng[d].on || (q->skip & (1u << d))) continue; /* not put to it: its dialect computes it otherwise */
+        if (!g_eng[d].on || (skip & (1u << d))) continue; /* not put to it: its dialect computes it otherwise */
         bool rd = rows || ret_ok(d, q); /* P2 S8: RETURNING's rows, where the dialect has it */
         /* P2 S9: a quarter of imagedb's SELECTs (by seed and step: no draw taken) run prepared, its literals $n; P2 S13:
          * its writes too, a NULL a typed parameter */
@@ -4099,7 +4158,7 @@ static int run_stmt(unsigned seed, int step, const stmt *q, bool state)
     if (g_verbose) fprintf(stderr, "  [%u.%d] %s\n", seed, step, text[D_IMDB].p);
     const res *base = &out[D_IMDB];
     for (int d = 1; d < ND; d++) {
-        if (!g_eng[d].on || (q->skip & (1u << d))) continue;
+        if (!g_eng[d].on || (skip & (1u << d))) continue;
         g_compared++;
         if (q->fns) g_fn_compared++;
         if (q->grp) g_grp_compared++;
@@ -4107,6 +4166,7 @@ static int run_stmt(unsigned seed, int step, const stmt *q, bool state)
         if (q->subq) g_subq_compared++;
         if (q->corr) g_corr_compared++;
         if (q->shadow) g_shadow_compared++; /* P2 S19 */
+        if (q->vfrom) g_view_compared++; /* P2 S7 */
         if (q->lazy) g_lazy_compared++; /* P2 S11 */
         if (q->narm) g_set_compared++;
         if (q->rec) g_rec_compared++;
@@ -4190,6 +4250,27 @@ static int check_state(unsigned seed, int step)
 
 /* ---- the driver ---------------------------------------------------------------------------------------------------- */
 
+/* P2 S7: the views vt and vu, all of t's and u's columns through a predicate drawn per seed (id % k <> r), made on every
+ * engine after the first rows; a quarter of the SELECTs read them in t's and u's places (stmt.vfrom, src) */
+static int g_vk[2], g_vr[2];
+
+static void view_sql(char *out, size_t cap, int tab)
+{
+    size_t at = (size_t)snprintf(out, cap, "CREATE VIEW %s (", tab ? "vu" : "vt");
+    for (int c = 0; c < ncols(tab); c++) at += (size_t)snprintf(out + at, cap - at, "%s%s", c ? ", " : "", cols(tab)[c].name);
+    at += (size_t)snprintf(out + at, cap - at, ") AS SELECT ");
+    for (int c = 0; c < ncols(tab); c++) at += (size_t)snprintf(out + at, cap - at, "%s%s", c ? ", " : "", cols(tab)[c].name);
+    snprintf(out + at, cap - at, " FROM %s WHERE id %% %d <> %d", tname(tab), g_vk[tab], g_vr[tab]);
+}
+
+static void make_view(int tab)
+{
+    char q[512];
+    view_sql(q, sizeof q, tab);
+    for (int d = 0; d < ND; d++)
+        if (g_eng[d].on) must(&g_eng[d], q);
+}
+
 /* DROP TABLE (P0 1f) against the references: between statements (no transaction open), u dropped on every engine,
  * made again by its dialect's DDL with its index, and refilled; what follows reads the new u (on imagedb the name
  * resolves to the table live at the read's snapshot, the dropped one kept as history), compared like any table */
@@ -4198,10 +4279,12 @@ static int drop_u_again(unsigned seed, int *step)
     for (int d = 0; d < ND; d++) {
         eng *e = &g_eng[d];
         if (!e->on) continue;
+        if (g_views) must(e, "DROP VIEW vu"); /* P2 S7: a view names it (PostgreSQL's RESTRICT, imagedb's) */
         must(e, "DROP TABLE u");
         must(e, ddl(d, 1));
         must(e, "CREATE INDEX u_tid ON u (tid)");
     }
+    if (g_views) make_view(1); /* vu again, over the new u */
     g_drops++;
     if (g_verbose) fprintf(stderr, "  [%u.%d] (DROP TABLE u on every engine, made again)\n", seed, *step);
     if (check_state(seed, *step)) return -1;
@@ -4244,6 +4327,11 @@ static int run_seed(unsigned seed, int steps)
         }
     }
     if (check_state(seed, step)) return -1;
+    if (g_views) { /* P2 S7 */
+        for (int tab = 0; tab < 2; tab++) g_vk[tab] = (int)rr(2, 5), g_vr[tab] = (int)rr(0, g_vk[tab] - 1);
+        make_view(0);
+        make_view(1);
+    }
     for (int s = 0; s < steps; s++, step++) {
         if (chance(5)) { /* imagedb alone, between statements: its rows to the lake, or its directory reopened; the
                           * answers after it come from segments and a replayed log, and must not change */
@@ -4258,6 +4346,7 @@ static int run_seed(unsigned seed, int steps)
         int r = (int)(rnd() % 100);
         if (r < 70) {
             gen_select(&q);
+            q.vfrom = g_views && chance(25); /* P2 S7 */
             if (run_stmt(seed, step, &q, false)) return -1;
         } else if (r < 90) { /* a statement on its own: it may fail (an existing key), alike everywhere */
             gen_dml(&q, true);
@@ -4273,6 +4362,7 @@ static int run_seed(unsigned seed, int steps)
                 if (run_stmt(seed, step, &q, false)) return -1;
                 g_in_txn = true; /* a SELECT here must not fail either */
                 gen_select(&q);
+                q.vfrom = g_views && chance(25);
                 g_in_txn = false;
                 if (run_stmt(seed, step, &q, false)) return -1;
             }
@@ -4301,6 +4391,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--keep-going")) keep_going = true;
         else if (!strcmp(argv[i], "--no-expr")) g_expr = false;
         else if (!strcmp(argv[i], "--no-fns")) g_fns = false;
+        else if (!strcmp(argv[i], "--no-views")) g_views = false; /* P2 S7 */
         else if (!strcmp(argv[i], "--ping")) ping = true; /* connect to every engine named, then stop (run.sh waits on it) */
         else if (!strcmp(argv[i], "-v")) g_verbose = true;
         else {
@@ -4380,6 +4471,11 @@ int main(int argc, char **argv)
            "");
     printf("oracle: %ld comparisons of P2 S5's set operations, %ld of its WITH RECURSIVE\n", g_set_compared, g_rec_compared);
     printf("oracle: %ld comparisons of P2 S4b's correlated subqueries\n", g_corr_compared);
+    printf("oracle: %ld comparisons of P2 S7's SELECTs over the views vt and vu (t's and u's rows through a predicate)\n",
+           g_view_compared);
+    printf("oracle: %ld SELECTs not put to MariaDB for a column's LIKE with literals before a wildcard alone (its index range "
+           "drops a value whose next character is past U+FFFF: ma_like_ok)\n",
+           g_ma_like);
     printf("oracle: %ld comparisons of P2 S19's subqueries whose table takes the outer one's name (SQLite skipped)\n",
            g_shadow_compared);
     printf("oracle: %ld comparisons of P2 S11's subqueries a row may never need\n", g_lazy_compared);

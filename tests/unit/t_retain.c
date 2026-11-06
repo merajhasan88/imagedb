@@ -267,11 +267,13 @@ static void t_retain_log_rules(void)
  * whenever the statement runs: retain_seed's EXPIRE must expire the segment begun at +15 s and not the one begun at
  * +20 s (cut_primary), and on the moving clock (+25 s) that held only while its ship, apply, VERIFY and audits took
  * under 5 s (a loaded SAN run, 2026-11-06, took longer: the horizon passed the snapshot) */
-static void clock_past(uint64_t t, int64_t d)
+static void clock_past(uint64_t t, int64_t d) /* now t + d: from the frozen base when the test froze the clock */
 {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    imdb_clock_offset((int64_t)t + d - ((int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000));
+    uint64_t f = imdb_clock_frozen();
+    int64_t base = f ? (int64_t)f : (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+    imdb_clock_offset((int64_t)t + d - base);
 }
 
 static uint64_t horizon_of(imdb_db *db, const char *name)
@@ -1804,6 +1806,7 @@ static imdb_db *cut_primary(const char *p, imdb_session *s, uint64_t *S)
  * RETIRE (its own cut) */
 static void t_retain_seed(void)
 {
+    imdb_clock_freeze(imdb_now_us()); /* every offset and pin exact: no wall time between the steps (three flakes under load) */
     const char *dir = test_tmpdir();
     char p[700], r[700], sf[700];
     snprintf(p, sizeof p, "%s/p", dir);

@@ -620,7 +620,7 @@ static void ack_closed(void)
 
 enum {
     VIOL_FAILSTOP = 3, VIOL_OPEN = 4, VIOL_PINNED = 5, VIOL_INDEX = 7, VIOL_ORDERED = 8, VIOL_JOIN = 9,
-    VIOL_LEAK = 10, VIOL_FILL = 11, VIOL_PUTBACK = 12, VIOL_EXPIRE = 13, VIOL_RETIRE = 14
+    VIOL_LEAK = 10, VIOL_FILL = 11, VIOL_PUTBACK = 12, VIOL_EXPIRE = 13, VIOL_RETIRE = 14, VIOL_VIEW = 15
 };
 
 typedef struct fscen {
@@ -1091,6 +1091,74 @@ static int run_join(const char *run)
     }
     /* not vacuous: a run nothing faulted ran all six joins */
     if (!v && done == sizeof q / sizeof *q && !db->warning[0] && !db->failed && joins != 6) v = VIOL_JOIN;
+    imdb_session_close(&s);
+    imdb_close(db);
+    return v;
+}
+
+/* P2 S7: views created, read, published and dropped under every fault: a view read that succeeds answers as its query
+ * inlined as a derived table (the twin run alike), and the recovered copy holds each acknowledged view whole (the
+ * checks' open, VERIFY and the auditor re-derive ops 20 and 21 and the manifest's views) */
+static int run_view(const char *run)
+{
+    imdb_open_opts o = {.sync = 1};
+    imdb_db *db = NULL;
+    imdb_err e = {0};
+    if (imdb_open(dir_in(run, "p"), &o, &db, &e)) return 0;
+    db->warning[0] = 0;
+    imdb_session s;
+    imdb_session_init(&s, db);
+    s.cross_check = true;
+    static const char *const q[][2] = {
+        {"CREATE VIEW big AS SELECT id, user_id, memo FROM txns WHERE amount > 1.50", NULL},
+        {"CREATE VIEW pair (n) AS SELECT COUNT(*) FROM big", NULL},
+        {"SELECT n FROM pair", "SELECT COUNT(*) FROM (SELECT id FROM txns WHERE amount > 1.50) AS b"},
+        {"CHECKPOINT", NULL},
+        {"CREATE VIEW gone AS SELECT id FROM txns", NULL},
+        {"DROP VIEW gone", NULL},
+        {"SELECT memo FROM big WHERE user_id = 42 ORDER BY id", "SELECT memo FROM txns WHERE amount > 1.50 AND user_id = 42 ORDER BY id"},
+        {"DROP VIEW pair", NULL},
+        {"SELECT COUNT(*) FROM big", "SELECT COUNT(*) FROM txns WHERE amount > 1.50"},
+    };
+    int v = 0;
+    size_t done = 0;
+    for (size_t i = 0; i < sizeof q / sizeof *q && !v; i++) {
+        imdb_result r, t;
+        imdb_err_clear(&e);
+        int rc = imdb_exec_one(&s, q[i][0], strlen(q[i][0]), NULL, 0, &r, &e);
+        if (rc) {
+            v = after_error(db);
+            break;
+        }
+        if (q[i][1]) { /* the twin: if it runs, its rows are the view's */
+            imdb_err_clear(&e);
+            if (!imdb_exec_one(&s, q[i][1], strlen(q[i][1]), NULL, 0, &t, &e)) {
+                imdb_buf a, b;
+                imdb_buf_init(&a);
+                imdb_buf_init(&b);
+                imdb_result_render(&r, true, &a);
+                imdb_result_render(&t, true, &b);
+                /* a render the fault failed has no bytes (p NULL): compared only when both rendered */
+                const char *pa = !a.err && a.p ? memchr(a.p, '\n', a.len) : NULL,
+                           *pb = !b.err && b.p ? memchr(b.p, '\n', b.len) : NULL;
+                if (!a.err && !b.err && (!pa || !pb || a.len - (size_t)(pa - (const char *)a.p) !=
+                                                                b.len - (size_t)(pb - (const char *)b.p) ||
+                                         memcmp(pa, pb, a.len - (size_t)(pa - (const char *)a.p))))
+                    v = VIOL_VIEW;
+                imdb_buf_free(&a);
+                imdb_buf_free(&b);
+                imdb_result_free(&t);
+            } else if (after_error(db)) {
+                v = VIOL_FAILSTOP;
+            }
+        }
+        imdb_result_free(&r);
+        if (v) break;
+        ack(db);
+        done++;
+    }
+    /* not vacuous: a run nothing faulted made, read and dropped them all */
+    if (!v && done == sizeof q / sizeof *q && !db->warning[0] && !db->failed && db->nviews != 3) v = VIOL_VIEW;
     imdb_session_close(&s);
     imdb_close(db);
     return v;
@@ -2050,6 +2118,7 @@ static const char *check_run(const fscen *s, const char *run, const frun *r)
                  : code == VIOL_PUTBACK ? "a failed commit that left bytes in its tagged segment (no put-back)"
                  : code == VIOL_EXPIRE ? "a clean run whose policy did not expire the table once"
                  : code == VIOL_RETIRE ? "a clean run that did not retire below its boundary"
+                 : code == VIOL_VIEW   ? "a view whose answer is not its inlined query's, or a clean run that did not end with its views"
                                        : "a violation",
                  code);
         return g_why;
@@ -2350,6 +2419,7 @@ static const fscen kScen[] = {
     {"backup", setup_backup, run_backup, false, NULL, backup_base_ok, false, false, false},
     {"restore", setup_restore, run_restore, false, NULL, restore_base_ok, false, false, false},
     {"backup_incr", setup_backup_incr, run_backup_incr, false, NULL, backup_incr_base_ok, false, false, false},
+    {"view", setup_txns, run_view, false, NULL, NULL, false, false, false}, /* P2 S7 */
 };
 
 static void t_fault_commits(void) { fault_scenario(&kScen[0]); }
@@ -2382,6 +2452,7 @@ static void t_fault_replica_seed(void) { fault_scenario(&kScen[26]); }
 static void t_fault_backup(void) { fault_scenario(&kScen[27]); }
 static void t_fault_restore(void) { fault_scenario(&kScen[28]); }
 static void t_fault_backup_incr(void) { fault_scenario(&kScen[29]); }
+static void t_fault_view(void) { fault_scenario(&kScen[30]); }
 
 const test_case fault_tests[] = {
     {"fault_commits", t_fault_commits},     {"fault_nosync", t_fault_nosync}, {"fault_checkpoint", t_fault_checkpoint},
@@ -2409,5 +2480,6 @@ const test_case fault_tests[] = {
     {"fault_backup", t_fault_backup},
     {"fault_restore", t_fault_restore},
     {"fault_backup_incr", t_fault_backup_incr},
+    {"fault_view", t_fault_view},
 };
 const size_t fault_ntests = sizeof fault_tests / sizeof *fault_tests;

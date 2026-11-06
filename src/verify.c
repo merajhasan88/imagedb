@@ -83,11 +83,22 @@ typedef struct vsnap {
     imdb_lthash global;
     uint8_t prev[32], manifest[32], prev_manifest[32];
     uint64_t boundary; /* the log's retirement boundary at that commit (0 until RETIRE, stage 3a's step (c)) */
+    struct vview *v;   /* P2 S7: the views then (no dependencies kept) */
+    uint32_t nv;
 } vsnap;
 
 typedef struct vstart { /* a log segment's first commit, and its time: what an EXPIRE may name (log.h) */
     uint64_t seq, time_us;
 } vstart;
+
+/* P2 S7: a view the log made: replay's rules on it, then the engine's catalog and the manifest's against it */
+typedef struct vview {
+    char name[IMDB_MAX_IDENT + 1];
+    uint64_t created_at, dropped_at;
+    uint8_t def_hash[32];   /* a live one's definition, as imdb_viewdef_encode makes it: its SHA-256 */
+    imdb_viewdep *deps;     /* allocated: the drop rules' (a snapshot's copy holds none) */
+    uint16_t ndeps;
+} vview;
 
 typedef struct vctx {
     vtab *t;
@@ -114,7 +125,66 @@ typedef struct vctx {
     vstart *pubs;            /* every publish of the log read, its manifest's hash in place of a time (the keepers) */
     uint8_t (*pubhash)[32];
     size_t npubs, cappubs;
+    vview *v;                /* P2 S7: the views the log made, by id */
+    uint32_t nv;
 } vctx;
+
+/* ---- P2 S7: the views ------------------------------------------------------------- */
+
+static bool v_name_live(const vctx *x, const char *name)
+{
+    for (uint32_t i = 0; i < x->nt; i++)
+        if (!x->t[i].dropped_at && !strcmp(x->t[i].s.name, name)) return true;
+    for (uint32_t i = 0; i < x->nv; i++)
+        if (!x->v[i].dropped_at && !strcmp(x->v[i].name, name)) return true;
+    return false;
+}
+
+static bool v_named(const vctx *x, uint8_t kind, uint32_t id) /* a live view names it */
+{
+    for (uint32_t i = 0; i < x->nv; i++)
+        for (uint16_t k = 0; !x->v[i].dropped_at && k < x->v[i].ndeps; k++)
+            if (x->v[i].deps[k].kind == kind && x->v[i].deps[k].id == id) return true;
+    return false;
+}
+
+static int v_def_hash(const imdb_viewdef *d, uint8_t out[32], imdb_err *e)
+{
+    imdb_buf b;
+    imdb_buf_init(&b);
+    imdb_viewdef_encode(d, &b);
+    int rc = imdb_buf_check(&b, e);
+    if (!rc) imdb_sha256(b.p, b.len, out);
+    imdb_buf_free(&b);
+    return rc;
+}
+
+/* the next view of the model: a live one's definition hashed and its dependencies kept, a tombstone's (d NULL) none */
+static int v_view_push(vctx *x, const char *name, uint64_t created, uint64_t dropped, const imdb_viewdef *d, imdb_err *e)
+{
+    vview *nv = imdb_realloc_array(x->v, x->nv, x->nv + 1, sizeof *nv, e);
+    if (!nv) return e->code;
+    x->v = nv;
+    vview *w = &x->v[x->nv++];
+    memset(w, 0, sizeof *w);
+    snprintf(w->name, sizeof w->name, "%s", name);
+    w->created_at = created;
+    w->dropped_at = dropped;
+    if (!d) return IMDB_OK;
+    if (v_def_hash(d, w->def_hash, e)) return e->code;
+    if (d->ndeps) {
+        if (!(w->deps = imdb_alloc_array(d->ndeps, sizeof *w->deps, e))) return e->code;
+        memcpy(w->deps, d->deps, d->ndeps * sizeof *w->deps);
+        w->ndeps = d->ndeps;
+    }
+    return IMDB_OK;
+}
+
+static void v_views_free(vview *v, uint32_t n)
+{
+    for (uint32_t i = 0; i < n; i++) imdb_free(v[i].deps);
+    imdb_free(v);
+}
 
 /* ---- per-batch work --------------------------------------------------------------- */
 
@@ -489,6 +559,9 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
         switch (o->code) {
         case IMDB_OP_CREATE_TABLE: {
             if (o->table != x->nt) return imdb_fail(e, IMDB_ERR_VERIFY, "verify: table id out of sequence");
+            if (v_name_live(x, o->schema->name)) /* P2 S7: one name space for the live tables and views */
+                return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: CREATE TABLE takes a live view's name",
+                                 (unsigned long long)seq);
             vtab *nt = imdb_realloc_array(x->t, x->nt, x->nt + 1, sizeof *nt, e);
             if (!nt) return e->code;
             x->t = nt;
@@ -563,12 +636,36 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
             else if (o->purge_before)
                 t->horizon = t->purged = o->purge_before;
             break;
+        case IMDB_OP_CREATE_VIEW: { /* P2 S7: replay's rules; its re-bind is verify_engine's, over the live views */
+            const imdb_viewdef *d = o->vdef;
+            bool deps_live = true;
+            for (uint16_t q = 0; q < d->ndeps; q++)
+                deps_live &= d->deps[q].kind == IMDB_VIEWDEP_TABLE
+                                 ? d->deps[q].id < x->nt && !x->t[d->deps[q].id].dropped_at
+                                 : d->deps[q].id < x->nv && !x->v[d->deps[q].id].dropped_at;
+            if (d->id != x->nv || v_name_live(x, d->name) || !deps_live)
+                return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: CREATE VIEW out of sequence, its name taken, or "
+                                 "naming a table or view that is not live", (unsigned long long)seq);
+            rc = v_view_push(x, d->name, seq, 0, d, e);
+            break;
+        }
+        case IMDB_OP_DROP_VIEW: {
+            vview *w = o->view < x->nv ? &x->v[o->view] : NULL;
+            if (!w || w->dropped_at || v_named(x, IMDB_VIEWDEP_VIEW, o->view))
+                return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: DROP VIEW of a view unknown, dropped already or "
+                                 "named by a live view", (unsigned long long)seq);
+            w->dropped_at = seq;
+            break;
+        }
         case IMDB_OP_DROP_TABLE: /* live, not kept FOREVER (its commit's op 16 first); every live version ends here */
             if (t->dropped_at || t->retention_us == IMDB_RETAIN_FOREVER) {
                 rc = imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: DROP of table %s, dropped already or kept "
                                "FOREVER", (unsigned long long)seq, t->s.name);
                 break;
             }
+            if (v_named(x, IMDB_VIEWDEP_TABLE, o->table)) /* P2 S7: RESTRICT */
+                return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: DROP of table %s, which a live view names",
+                                 (unsigned long long)seq, t->s.name);
             for (uint64_t vid = 0; vid < t->n; vid++) {
                 vver *dv = vv(t, vid);
                 if (dv && dv->end == IMDB_LIVE) dv->end = seq;
@@ -656,6 +753,13 @@ static int snapshot_at_s(vctx *x, const imdb_commit_rec *c, const uint8_t *publi
         memcpy(s->t[ti].idx, x->t[ti].idx, sizeof s->t[ti].idx);
         s->t[ti].nidx = x->t[ti].nidx;
     }
+    if (x->nv && !(s->v = imdb_alloc_array(x->nv, sizeof *s->v, e))) return e->code; /* P2 S7 */
+    for (uint32_t i = 0; i < x->nv; i++) {
+        s->v[i] = x->v[i];
+        s->v[i].deps = NULL;
+        s->v[i].ndeps = 0;
+    }
+    s->nv = x->nv;
     s->boundary = x->boundary;
     s->global = x->global;
     memcpy(s->prev, c->prev, 32);
@@ -1191,6 +1295,19 @@ static int verify_lake(imdb_db *db, const vctx *x, imdb_verify_report *rep, imdb
             rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: the manifest's indexes of table %s differ from the log's",
                            x->t[ti].s.name);
     }
+    if (!rc && m.nv != at->nv) /* P2 S7: the manifest's views, the log's at its commit */
+        rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: the manifest's views differ from the log at commit %llu",
+                       (unsigned long long)m.seq);
+    for (uint32_t i = 0; i < m.nv && !rc; i++) {
+        const imdb_manifest_view *mv = &m.v[i];
+        const vview *w = &at->v[i];
+        uint8_t h[32];
+        if (strcmp(mv->name, w->name) != 0 || mv->created_at != w->created_at || mv->dropped_at != w->dropped_at)
+            rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: view %s in the manifest differs from the log", w->name);
+        else if (!mv->dropped_at && !(rc = v_def_hash(mv->def, h, e)) && memcmp(h, w->def_hash, 32) != 0)
+            rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: the manifest's definition of view %s differs from the log's",
+                           w->name);
+    }
     /* every segment against the log, in parallel windows; the seen-once marks in item order */
     size_t nitems = 0;
     for (uint32_t ti = 0; ti < m.nt; ti++) nitems += m.t[ti].nseg;
@@ -1338,6 +1455,28 @@ static int verify_engine(imdb_db *db, const vctx *x, imdb_verify_report *rep, im
     if (x->nt != db->nt) return imdb_fail(e, IMDB_ERR_VERIFY, "verify: table count differs");
     if (db->boundary != x->boundary)
         return imdb_fail(e, IMDB_ERR_VERIFY, "verify: the engine's retirement boundary differs from the log's");
+    if (x->nv != db->nviews) return imdb_fail(e, IMDB_ERR_VERIFY, "verify: view count differs"); /* P2 S7 */
+    for (uint32_t i = 0; i < x->nv; i++) {
+        const vview *w = &x->v[i];
+        const imdb_view *ev = &db->views[i];
+        if (ev->id != i || strcmp(ev->name, w->name) != 0 || ev->created_at != w->created_at ||
+            ev->dropped_at != w->dropped_at)
+            return imdb_fail(e, IMDB_ERR_VERIFY, "verify: view %s differs from the log", w->name);
+        if (w->dropped_at) continue;
+        uint8_t h[32];
+        if (!ev->def) return imdb_fail(e, IMDB_ERR_VERIFY, "verify: live view %s holds no definition", w->name);
+        if (v_def_hash(ev->def, h, e)) return e->code;
+        if (memcmp(h, w->def_hash, 32) != 0)
+            return imdb_fail(e, IMDB_ERR_VERIFY, "verify: view %s's definition differs from the log's", w->name);
+        /* its text against the catalog now: what it reads is live, so unchanged since its commit (no ALTER yet) */
+        int rc = imdb_view_rebind(db, ev->def, e);
+        if (rc == IMDB_ERR_CORRUPT) {
+            char m[sizeof e->msg];
+            snprintf(m, sizeof m, "%s", e->msg);
+            return imdb_fail(e, IMDB_ERR_VERIFY, "verify: %s", m);
+        }
+        if (rc) return rc;
+    }
     for (uint32_t ti = 0; ti < x->nt; ti++) {
         imdb_table *et = db->t[ti];
         const vtab *vt = &x->t[ti];
@@ -1446,6 +1585,8 @@ static int verify_seed(imdb_db *db, vctx *x, imdb_err *e)
         memcpy(t->idx, fm.t[i].idx, sizeof t->idx);
         t->nidx = fm.t[i].nidx;
     }
+    for (uint32_t i = 0; !rc && i < fm.nv; i++) /* P2 S7: F's views, a live one's definition the replay's rules read */
+        rc = v_view_push(x, fm.v[i].name, fm.v[i].created_at, fm.v[i].dropped_at, fm.v[i].def, e);
     x->boundary = fm.boundary;
     uint8_t *mb = NULL, *sb = NULL;
     size_t ml = 0, sl = 0;
@@ -1662,6 +1803,8 @@ static int verify_body(imdb_db *db, imdb_verify_report *rep, imdb_err *e)
     }
     imdb_free(x.t);
     imdb_free(x.at_s.t);
+    v_views_free(x.v, x.nv); /* P2 S7 */
+    imdb_free(x.at_s.v);
     imdb_free(x.pin);
     imdb_free(x.starts);
     imdb_free(x.pubs);

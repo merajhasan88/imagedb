@@ -271,6 +271,80 @@ static bool ident_ok(const uint8_t *s, size_t n)
     return true;
 }
 
+/* ---- P2 S7: views (design.md §5, Views) ----------------------------------------------------------- */
+
+#define MAX_TABLES 1024u
+#define MAX_VIEWS 1024u
+#define MAX_VIEW_TEXT 65536u
+#define MAX_VIEW_DEPS 256u
+
+/* a view's definition, read by this auditor's own rules (op 20; a manifest's live view): u32 id, u8 name length and
+ * the name, u16 columns each a name, a type (1-6) and a scale (a DECIMAL's, to 18; else 0), u16 dependencies each a
+ * kind (1 a table, 2 an earlier view) and a u32 id, strictly increasing, u32 text length and the text, strict UTF-8.
+ * The identity token and the manifest's copy are checked by its bytes' SHA-256: the same encoding in both places */
+typedef struct aviewdef {
+    uint32_t id;
+    char name[64];
+    uint16_t ndeps;
+    uint8_t *dep_kind;
+    uint32_t *dep_id;
+    uint8_t hash[32];
+} aviewdef;
+
+static void aviewdef_free(aviewdef *d)
+{
+    if (!d) return;
+    free(d->dep_kind);
+    free(d->dep_id);
+    free(d);
+}
+
+static aviewdef *decode_viewdef(rd *r)
+{
+    size_t at = r->o;
+    aviewdef *d = xcalloc(1, sizeof *d);
+    char cn[MAX_COLS][64];
+    d->id = rd_u32(r);
+    uint8_t nl = rd_u8(r);
+    const uint8_t *nm = rd_bytes(r, nl);
+    if (r->bad || !ident_ok(nm, nl) || d->id >= MAX_VIEWS) goto bad;
+    memcpy(d->name, nm, nl);
+    uint16_t nc = rd_u16(r);
+    if (r->bad || nc < 1 || nc > MAX_COLS) goto bad;
+    for (uint16_t i = 0; i < nc; i++) {
+        uint8_t cl = rd_u8(r);
+        const uint8_t *c = rd_bytes(r, cl);
+        uint8_t type = rd_u8(r), scale = rd_u8(r);
+        if (r->bad || !ident_ok(c, cl) || type < T_INT64 || type > T_FLOAT64 || (type == T_DECIMAL ? scale > 18 : scale != 0))
+            goto bad;
+        memcpy(cn[i], c, cl);
+        cn[i][cl] = 0;
+        for (uint16_t j = 0; j < i; j++)
+            if (!strcmp(cn[j], cn[i])) goto bad;
+    }
+    d->ndeps = rd_u16(r);
+    if (r->bad || d->ndeps > MAX_VIEW_DEPS || d->ndeps > rd_left(r) / 5) goto bad;
+    d->dep_kind = xcalloc(d->ndeps ? d->ndeps : 1, 1);
+    d->dep_id = xcalloc(d->ndeps ? d->ndeps : 1, sizeof *d->dep_id);
+    for (uint16_t k = 0; k < d->ndeps; k++) {
+        d->dep_kind[k] = rd_u8(r);
+        d->dep_id[k] = rd_u32(r);
+        bool ok = d->dep_kind[k] == 1 ? d->dep_id[k] < MAX_TABLES : d->dep_kind[k] == 2 && d->dep_id[k] < d->id;
+        if (r->bad || !ok) goto bad;
+        if (k && (d->dep_kind[k - 1] > d->dep_kind[k] ||
+                  (d->dep_kind[k - 1] == d->dep_kind[k] && d->dep_id[k - 1] >= d->dep_id[k])))
+            goto bad;
+    }
+    uint32_t tl = rd_u32(r);
+    const uint8_t *tx = !r->bad && tl && tl <= MAX_VIEW_TEXT ? rd_bytes(r, tl) : NULL;
+    if (r->bad || !tx || !utf8_ok(tx, tl)) goto bad;
+    a_sha256(r->p + at, r->o - at, d->hash);
+    return d;
+bad:
+    aviewdef_free(d);
+    return NULL;
+}
+
 /* ---- schemas and rows ------------------------------------------------------------- */
 
 typedef struct col {
@@ -672,6 +746,8 @@ typedef struct op {
     uint8_t how;
     aidx ix; /* CREATE_INDEX (14): the definition; DROP_INDEX (15): its name only */
     char iname[64];
+    aviewdef *vd; /* CREATE_VIEW (20, P2 S7): the definition; DROP_VIEW (21): view */
+    uint32_t view;
     /* payload */
     bool redacted;
     const uint8_t *salt, *row;
@@ -693,6 +769,7 @@ static void commit_free(commit *c)
         if (c->ops[i].sch) free(c->ops[i].sch->raw);
         free(c->ops[i].sch);
         free(c->ops[i].erase);
+        aviewdef_free(c->ops[i].vd);
     }
     free(c->ops);
     memset(c, 0, sizeof *c);
@@ -853,6 +930,15 @@ static int decode_body(const uint8_t *b, size_t n, const meta *m, keys *ks, comm
             if (!hr.bad && (o->purge_before == 0 || o->purge_before >= c->seq))
                 return fail("header: EXPIRE's horizon is not in the past");
             break;
+        case 20: /* CREATE_VIEW (P2 S7): alone */
+            o->vd = decode_viewdef(&hr);
+            if (!o->vd) return fail("header: bad view definition");
+            if (nops != 1) return fail("header: a view op must be the only op");
+            break;
+        case 21: /* DROP_VIEW: u32 view, alone */
+            o->view = rd_u32(&hr);
+            if (!hr.bad && (nops != 1 || o->view >= MAX_VIEWS)) return fail("header: a view op must be the only op, in range");
+            break;
         case 19: /* DROP_TABLE (1f): u32 table */
             o->table = rd_u32(&hr);
             break;
@@ -991,6 +1077,16 @@ static uint64_t av_skip(const table *t, uint64_t vid)
     return vid;
 }
 
+/* P2 S7: a view the log made: its name, commits and definition's hash, the dependencies its drop rules read */
+typedef struct aview {
+    char name[64];
+    uint64_t created_at, dropped_at, dropped_at_lake; /* the drop: now, and at the lake snapshot's commit */
+    uint8_t hash[32];
+    uint16_t ndeps;
+    uint8_t *dep_kind;
+    uint32_t *dep_id;
+} aview;
+
 typedef struct state {
     meta m;
     table *t;
@@ -1026,6 +1122,8 @@ typedef struct state {
     uint8_t (*pub_hash)[32];
     size_t npub, cappub;
     uint64_t boundary, boundary_at_lake; /* RETIRE (18): versions ended at or before it are gone; now, at the lake */
+    aview *v;                /* P2 S7: the views the log made, by id; nv_at_lake of them at the lake snapshot */
+    uint32_t nv, nv_at_lake;
     char note[200];
 } state;
 
@@ -1203,9 +1301,69 @@ static void uk_end(table *t, uint64_t vid)
     v->row = NULL;
 }
 
+/* P2 S7: a live table or view holds the name */
+static bool name_live(const state *S, const char *name)
+{
+    for (uint32_t i = 0; i < S->nt; i++)
+        if (!S->t[i].dropped_at && strcmp(S->t[i].s.name, name) == 0) return true;
+    for (uint32_t i = 0; i < S->nv; i++)
+        if (!S->v[i].dropped_at && strcmp(S->v[i].name, name) == 0) return true;
+    return false;
+}
+
+/* P2 S7: a live view names the table (kind 1) or view (kind 2) */
+static const aview *view_naming(const state *S, uint8_t kind, uint32_t id)
+{
+    for (uint32_t i = 0; i < S->nv; i++)
+        for (uint16_t k = 0; !S->v[i].dropped_at && k < S->v[i].ndeps; k++)
+            if (S->v[i].dep_kind[k] == kind && S->v[i].dep_id[k] == id) return &S->v[i];
+    return NULL;
+}
+
+/* P2 S7: the next view of the model (op 20, or F's manifest past a cut: dropped then a tombstone, d NULL) */
+static void view_push(state *S, const char *name, uint64_t created, uint64_t dropped, const aviewdef *d)
+{
+    S->v = xrealloc(S->v, S->nv + 1, sizeof *S->v);
+    aview *w = &S->v[S->nv++];
+    memset(w, 0, sizeof *w);
+    snprintf(w->name, sizeof w->name, "%s", name);
+    w->created_at = created;
+    w->dropped_at = w->dropped_at_lake = dropped;
+    if (!d) return;
+    memcpy(w->hash, d->hash, 32);
+    w->ndeps = d->ndeps;
+    w->dep_kind = xcalloc(d->ndeps ? d->ndeps : 1, 1);
+    w->dep_id = xcalloc(d->ndeps ? d->ndeps : 1, sizeof *w->dep_id);
+    memcpy(w->dep_kind, d->dep_kind, d->ndeps);
+    memcpy(w->dep_id, d->dep_id, d->ndeps * sizeof *w->dep_id);
+}
+
+static int apply_view_op(state *S, const op *o, uint64_t seq)
+{
+    if (o->code == 21) { /* DROP_VIEW: live, and no live view names it */
+        if (o->view >= S->nv || S->v[o->view].dropped_at)
+            return fail("commit %llu: DROP of view %u, unknown or dropped already", (unsigned long long)seq, o->view);
+        const aview *n = view_naming(S, 2, o->view);
+        if (n) return fail("commit %llu: DROP of view %s, which view %s names", (unsigned long long)seq, S->v[o->view].name, n->name);
+        S->v[o->view].dropped_at = seq;
+        return 0;
+    }
+    const aviewdef *d = o->vd; /* CREATE_VIEW: the next id, a free name, every dependency live */
+    if (d->id != S->nv) return fail("commit %llu: view id out of sequence", (unsigned long long)seq);
+    if (name_live(S, d->name)) return fail("commit %llu: view %s takes a live table's or view's name", (unsigned long long)seq, d->name);
+    for (uint16_t k = 0; k < d->ndeps; k++) {
+        bool live = d->dep_kind[k] == 1 ? d->dep_id[k] < S->nt && !S->t[d->dep_id[k]].dropped_at
+                                        : d->dep_id[k] < S->nv && !S->v[d->dep_id[k]].dropped_at;
+        if (!live) return fail("commit %llu: view %s names a table or view that is not live", (unsigned long long)seq, d->name);
+    }
+    view_push(S, d->name, seq, 0, d);
+    return 0;
+}
+
 static int apply_op(state *S, const op *o, uint64_t seq)
 {
     if (o->code == 13) return 0; /* WRITER_KEY: keys, not data (decode_body follows it) */
+    if (o->code == 20 || o->code == 21) return apply_view_op(S, o, seq); /* P2 S7 */
     if (o->code == 1) {
         if (o->table != S->nt) return fail("commit %llu: table id out of sequence", (unsigned long long)seq);
         S->t = xrealloc(S->t, S->nt + 1, sizeof *S->t);
@@ -1217,6 +1375,9 @@ static int apply_op(state *S, const op *o, uint64_t seq)
         for (uint32_t i = 0; i < S->nt; i++)
             if (!S->t[i].dropped_at && strcmp(S->t[i].s.name, o->sch->name) == 0)
                 return fail("commit %llu: duplicate table", (unsigned long long)seq);
+        for (uint32_t i = 0; i < S->nv; i++) /* P2 S7: one name space for the live tables and views */
+            if (!S->v[i].dropped_at && strcmp(S->v[i].name, o->sch->name) == 0)
+                return fail("commit %llu: table %s takes a live view's name", (unsigned long long)seq, o->sch->name);
         S->nt++;
         return 0;
     }
@@ -1225,6 +1386,8 @@ static int apply_op(state *S, const op *o, uint64_t seq)
         table *t = &S->t[o->table];
         if (t->dropped_at || t->retention == UINT64_MAX)
             return fail("commit %llu: DROP of table %s, dropped already or kept FOREVER", (unsigned long long)seq, t->s.name);
+        const aview *n = view_naming(S, 1, o->table); /* P2 S7: RESTRICT */
+        if (n) return fail("commit %llu: DROP of table %s, which view %s names", (unsigned long long)seq, t->s.name, n->name);
         for (uint64_t vid = av_skip(t, 0); vid < t->n; vid = av_skip(t, vid + 1)) {
             ver *v = av(t, vid);
             if (!v || v->end != LIVE) continue;
@@ -1778,6 +1941,8 @@ static int replay(state *S, int dirfd, uint64_t *commits)
                     S->t[ti].n_at_lake = S->t[ti].n;
                 }
                 S->boundary_at_lake = S->boundary;
+                S->nv_at_lake = S->nv; /* P2 S7 */
+                for (uint32_t vi = 0; vi < S->nv; vi++) S->v[vi].dropped_at_lake = S->v[vi].dropped_at;
                 memcpy(S->lake_digest, c.digest, 32);
                 memcpy(S->lake_prev, c.prev, 32);
                 for (uint32_t i = 0; i < c.nops; i++)
@@ -2124,12 +2289,20 @@ typedef struct mtable {
     uint64_t created_at, dropped_at; /* version 5: the commits that created and dropped it (0: live) */
 } mtable;
 
+typedef struct mview { /* P2 S7: a manifest's view: a live one's definition, a dropped one's tombstone (def NULL) */
+    char name[64];
+    uint64_t created_at, dropped_at;
+    aviewdef *def;
+} mview;
+
 typedef struct manifest {
     uint8_t db_id[16], prev[32], state[32], hash[32], prev_manifest[32];
     uint64_t seq;
     uint64_t boundary; /* version 4: the commit at or below which the log is retired (0: none) */
     mtable *t;
     uint32_t nt;
+    mview *v; /* version 6 (P2 S7): every view, by id */
+    uint32_t nv;
 } manifest;
 
 static void manifest_free(manifest *m)
@@ -2141,6 +2314,8 @@ static void manifest_free(manifest *m)
         free(m->t[i].nrows);
     }
     free(m->t);
+    for (uint32_t i = 0; i < m->nv; i++) aviewdef_free(m->v[i].def); /* P2 S7 */
+    free(m->v);
     memset(m, 0, sizeof *m);
 }
 
@@ -2208,7 +2383,7 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
     rd r = {b, len, 0, false};
     const uint8_t *mg = rd_bytes(&r, 8);
     uint32_t mver = mg && memcmp(mg, "IMDBMAN1", 8) == 0 ? rd_u32(&r) : 0;
-    if (mver != 5) return fail("manifest: bad header (version 5 only)");
+    if (mver != 6) return fail("manifest: bad header (version 6 only: P2 S7's views)");
     uint32_t nt = rd_u32(&r);
     const uint8_t *id = rd_bytes(&r, 16);
     m->seq = rd_u64(&r);
@@ -2267,6 +2442,46 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
         if (r.bad || !t->created_at || t->created_at > m->seq ||
             (t->dropped_at && (t->dropped_at <= t->created_at || t->dropped_at > m->seq || t->live)))
             return fail("manifest: bad creation or drop commits");
+    }
+    uint32_t nv = rd_u32(&r); /* P2 S7: every view by id, a live one's definition after it */
+    if (r.bad || nv > MAX_VIEWS || nv > rd_left(&r) / 22) return fail("manifest: bad view count");
+    m->v = xcalloc(nv ? nv : 1, sizeof *m->v);
+    m->nv = nv;
+    for (uint32_t i = 0; i < nv; i++) {
+        mview *v = &m->v[i];
+        uint32_t vid = rd_u32(&r);
+        uint8_t nl = rd_u8(&r);
+        const uint8_t *nm = rd_bytes(&r, nl);
+        v->created_at = rd_u64(&r);
+        v->dropped_at = rd_u64(&r);
+        if (r.bad || vid != i || !ident_ok(nm, nl) || !v->created_at || v->created_at > m->seq ||
+            (v->dropped_at && (v->dropped_at <= v->created_at || v->dropped_at > m->seq)))
+            return fail("manifest: bad view");
+        memcpy(v->name, nm, nl);
+        if (v->dropped_at) continue;
+        if (!(v->def = decode_viewdef(&r)) || v->def->id != i || strcmp(v->def->name, v->name) != 0)
+            return fail("manifest: bad view definition");
+        for (uint16_t k = 0; k < v->def->ndeps; k++) { /* what a live view names is live */
+            uint32_t di = v->def->dep_id[k];
+            if (v->def->dep_kind[k] == 1 ? di >= nt || m->t[di].dropped_at : m->v[di].dropped_at)
+                return fail("manifest: a live view names a table or view that is not live");
+        }
+    }
+    size_t nlive = 0; /* the live tables' and views' names: one each */
+    for (uint32_t i = 0; i < nt; i++) nlive += !m->t[i].dropped_at;
+    for (uint32_t i = 0; i < nv; i++) nlive += !m->v[i].dropped_at;
+    if (nlive) {
+        const char **ln = xcalloc(nlive, sizeof *ln);
+        size_t k = 0;
+        for (uint32_t i = 0; i < nt; i++)
+            if (!m->t[i].dropped_at) ln[k++] = m->t[i].s.name;
+        for (uint32_t i = 0; i < nv; i++)
+            if (!m->v[i].dropped_at) ln[k++] = m->v[i].name;
+        qsort(ln, nlive, sizeof *ln, cmp_str);
+        bool dup = false;
+        for (size_t i = 1; i < nlive; i++) dup |= strcmp(ln[i - 1], ln[i]) == 0;
+        free(ln);
+        if (dup) return fail("manifest: two live tables or views of one name");
     }
     if (rd_left(&r)) return fail("manifest: trailing bytes");
     size_t total = 0; /* index names unique across tables */
@@ -2821,6 +3036,9 @@ static int floor_seed(int dirfd, state *S, flr *f)
         t->nidx = mt->nidx;
         for (uint32_t k = 0; k < t->nidx; k++) t->idx[k].uk = (t->idx[k].flags & 1) ? xcalloc(1, sizeof *t->idx[k].uk) : NULL;
     }
+    for (uint32_t i = 0; i < f->m.nv; i++) /* P2 S7: F's views, a live one's definition the replay's rules read */
+        view_push(S, f->m.v[i].name, f->m.v[i].created_at, f->m.v[i].dropped_at, f->m.v[i].def);
+    S->nv_at_lake = S->nv;
     S->boundary = f->m.boundary;
     manifest m;
     memset(&m, 0, sizeof m);
@@ -2934,6 +3152,15 @@ static int cmd_verify(const char *dir, const char *anchor)
             rc = fail("manifest's retirement boundary differs from the log's at its commit");
         if (!rc) rc = check_objects(dirfd, &m, &S);
         if (!rc && m.nt > S.nt) rc = fail("manifest names tables the log does not have");
+        if (!rc && m.nv != S.nv_at_lake) rc = fail("the manifest's views differ from the log's at its commit"); /* P2 S7 */
+        for (uint32_t vi = 0; !rc && vi < m.nv; vi++) {
+            const mview *mv = &m.v[vi];
+            const aview *w = &S.v[vi];
+            if (strcmp(mv->name, w->name) != 0 || mv->created_at != w->created_at || mv->dropped_at != w->dropped_at_lake)
+                rc = fail("view %s: the manifest's name or commits differ from the log's", w->name);
+            else if (!mv->dropped_at && memcmp(mv->def->hash, w->hash, 32) != 0)
+                rc = fail("view %s: the manifest's definition differs from the log's", w->name);
+        }
         for (uint32_t ti = 0; !rc && ti < m.nt; ti++) {
             table *t = &S.t[ti];
             mtable *mt = &m.t[ti];
@@ -2984,6 +3211,8 @@ static int cmd_verify(const char *dir, const char *anchor)
     }
     keys_free(&S.K);
     free(S.t);
+    for (uint32_t i = 0; i < S.nv; i++) free(S.v[i].dep_kind), free(S.v[i].dep_id); /* P2 S7 */
+    free(S.v);
     free(S.pin);
     free(S.start_seq);
     free(S.start_time);
@@ -3029,6 +3258,12 @@ typedef struct ttab {
     lt d;
 } ttab;
 
+typedef struct tview { /* P2 S7: a view at the identity's commit: the manifest's, then the tail's ops 20 and 21 */
+    char name[64];
+    uint64_t created_at, dropped_at;
+    uint8_t hash[32];
+} tview;
+
 typedef struct ttail {
     uint64_t S, N, end; /* end: the last commit in the log */
     ttab *t;
@@ -3038,6 +3273,8 @@ typedef struct ttail {
     uint8_t **bufs;   /* the segments read: tail values point into them */
     uint8_t alg;      /* META's digest algorithm */
     size_t nbufs;
+    tview *v; /* P2 S7 */
+    uint32_t nv;
 } ttail;
 
 static void lt_from(lt *a, const uint8_t b[2 * LANES])
@@ -3077,12 +3314,28 @@ static void tail_free(ttail *T)
     free(T->t);
     for (size_t i = 0; i < T->nbufs; i++) free(T->bufs[i]);
     free(T->bufs);
+    free(T->v); /* P2 S7 */
     memset(T, 0, sizeof *T);
 }
 
 /* one op of a tail commit; apply = false past N: only ERASE entries count */
 static int tail_op(ttail *T, const op *o, uint64_t seq, bool apply)
 {
+    if (o->code == 20 || o->code == 21) { /* P2 S7: views hold no row; the identity names them (the main pass checked 
+                                          * their rules) */
+        if (!apply) return 0;
+        if (o->code == 21) {
+            if (o->view < T->nv) T->v[o->view].dropped_at = seq;
+            return 0;
+        }
+        T->v = xrealloc(T->v, T->nv + 1, sizeof *T->v);
+        tview *w = &T->v[T->nv++];
+        memset(w, 0, sizeof *w);
+        snprintf(w->name, sizeof w->name, "%s", o->vd->name);
+        w->created_at = seq;
+        memcpy(w->hash, o->vd->hash, 32);
+        return 0;
+    }
     if (o->code == 12) {
         for (uint32_t k = 0; k < o->n_erase; k++) {
             const erase_ent *en = &o->erase[k];
@@ -3329,6 +3582,14 @@ static int tail_load(int dirfd, const meta *mt, const manifest *m, const uint8_t
         t->dropped_at = m->t[i].dropped_at;
         lt_from(&t->d, m->t[i].lthash);
         lt_sum(&T->glob, &t->d);
+    }
+    T->v = xcalloc(m->nv ? m->nv : 1, sizeof *T->v); /* P2 S7 */
+    T->nv = m->nv;
+    for (uint32_t i = 0; i < m->nv; i++) {
+        memcpy(T->v[i].name, m->v[i].name, sizeof T->v[i].name);
+        T->v[i].created_at = m->v[i].created_at;
+        T->v[i].dropped_at = m->v[i].dropped_at;
+        if (m->v[i].def) memcpy(T->v[i].hash, m->v[i].def->hash, 32);
     }
     int logfd;
     uint64_t *segs;
@@ -3773,7 +4034,7 @@ static int cmd_identity(const char *dir, int argc, char **argv)
         a_sha256_ctx c;
         uint8_t b[16], tok[32], d[32];
         a_sha256_init(&c);
-        a_sha256_update(&c, (const uint8_t *)"IMDBVIEW2", 9); /* 2: each table's creation and drop commits too */
+        a_sha256_update(&c, (const uint8_t *)"IMDBVIEW3", 9); /* 2: each table's creation and drop commits; 3: views */
         a_sha256_update(&c, mt.db_id, 16);
         put64(b, N);
         a_sha256_update(&c, b, 8);
@@ -3795,6 +4056,20 @@ static int cmd_identity(const char *dir, int argc, char **argv)
             a_sha256_update(&c, b, 16);
             lt_bytes(&t->d, lanes);
             a_sha256_update(&c, lanes, sizeof lanes);
+        }
+        put32(b, T.nv); /* P2 S7: each view by id: its name and commits, a live one's definition's SHA-256 */
+        a_sha256_update(&c, b, 4);
+        for (uint32_t i = 0; i < T.nv; i++) {
+            const tview *w = &T.v[i];
+            uint32_t nl = (uint32_t)strlen(w->name);
+            put32(b, i);
+            put32(b + 4, nl);
+            a_sha256_update(&c, b, 8);
+            a_sha256_update(&c, (const uint8_t *)w->name, nl);
+            put64(b, w->created_at);
+            put64(b + 8, w->dropped_at);
+            a_sha256_update(&c, b, 16);
+            if (!w->dropped_at) a_sha256_update(&c, w->hash, 32);
         }
         a_sha256_final(&c, tok);
         lt_digest(mt.alg, &T.glob, d);

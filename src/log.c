@@ -36,6 +36,7 @@ void imdb_commit_free(imdb_commit_rec *c)
             imdb_free(c->ops[i].erase);
             imdb_free(c->ops[i].rewrites);
             imdb_free(c->ops[i].iname);
+            imdb_viewdef_free(c->ops[i].vdef);
         }
         imdb_free(c->ops);
     }
@@ -149,6 +150,22 @@ void imdb_commit_encode_header(const imdb_commit_rec *c, imdb_buf *b)
                 break;
             }
             imdb_buf_put_u32(b, o->table);
+            break;
+        case IMDB_OP_CREATE_VIEW: { /* alone (log.h), its definition valid: never signed otherwise */
+            imdb_err e2 = {0};
+            if (c->nops != 1 || !o->vdef || imdb_viewdef_check(o->vdef, &e2)) {
+                b->err = IMDB_ERR_INVALID;
+                break;
+            }
+            imdb_viewdef_encode(o->vdef, b);
+            break;
+        }
+        case IMDB_OP_DROP_VIEW:
+            if (c->nops != 1 || o->view >= IMDB_MAX_VIEWS) {
+                b->err = IMDB_ERR_INVALID;
+                break;
+            }
+            imdb_buf_put_u32(b, o->view);
             break;
         case IMDB_OP_EXPIRE: /* only EXPIREs in its commit, by table, each before its commit (log.h) */
             if (!o->purge_before || o->purge_before >= c->seq ||
@@ -316,8 +333,8 @@ void imdb_frame_build_ext(const uint8_t *header, size_t hlen, uint64_t seq, cons
 
 /* ---- decoding ------------------------------------------------------------ */
 
-#define OP_MIN_BYTES 13u /* smallest encoded op among many (SET_RETENTION; a DROP_INDEX's 7 come alone); bounds
-                          * n_ops by input size */
+#define OP_MIN_BYTES 13u /* smallest encoded op among many (SET_RETENTION; a DROP_INDEX's 7 and a DROP_VIEW's 5 come
+                          * alone); bounds n_ops by input size */
 
 static int cmp_erase(const imdb_erase_ent *a, const imdb_erase_ent *b)
 {
@@ -457,6 +474,15 @@ int imdb_commit_decode_header(const uint8_t *h, size_t hlen, imdb_commit_rec *c,
             o->purge_before = imdb_rd_u64(&r);
             if (!r.err && (!o->purge_before || o->purge_before >= c->seq))
                 return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: EXPIRE's horizon is not in the past");
+            break;
+        case IMDB_OP_CREATE_VIEW: /* P2 S7: alone */
+            if (imdb_viewdef_decode(&r, &o->vdef, e)) return e->code;
+            if (nops != 1) return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: a view op must be the only op");
+            break;
+        case IMDB_OP_DROP_VIEW:
+            o->view = imdb_rd_u32(&r);
+            if (!r.err && (nops != 1 || o->view >= IMDB_MAX_VIEWS))
+                return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: a view op must be the only op, its view in range");
             break;
         case IMDB_OP_DROP_TABLE:
             o->table = imdb_rd_u32(&r);
@@ -1074,4 +1100,119 @@ bool imdb_anchor_pick(const uint8_t *b, size_t n, imdb_anchor_key_fn key_of, voi
     }
     if (!found) *bad = true;
     return found && !*bad;
+}
+
+/* ---- P2 S7: a view's definition (log.h) ----------------------------------- */
+
+void imdb_viewdef_free(imdb_viewdef *d)
+{
+    if (!d) return;
+    imdb_free(d->cols);
+    imdb_free(d->deps);
+    imdb_free(d->text);
+    imdb_free(d);
+}
+
+bool imdb_viewdep_less(const imdb_viewdep *a, const imdb_viewdep *b)
+{
+    return a->kind != b->kind ? a->kind < b->kind : a->id < b->id;
+}
+
+static bool lower_ident(const char *s)
+{
+    size_t n = strnlen(s, IMDB_MAX_IDENT + 1);
+    if (!imdb_ident_valid(s, n)) return false;
+    for (size_t i = 0; i < n; i++)
+        if (s[i] >= 'A' && s[i] <= 'Z') return false;
+    return true;
+}
+
+int imdb_viewdef_check(const imdb_viewdef *d, imdb_err *e)
+{
+    if (d->id >= IMDB_MAX_VIEWS || !lower_ident(d->name)) return imdb_fail(e, IMDB_ERR_CORRUPT, "view: bad id or name");
+    if (!d->ncols || d->ncols > IMDB_MAX_COLS || !d->cols) return imdb_fail(e, IMDB_ERR_CORRUPT, "view: bad column count");
+    for (uint16_t i = 0; i < d->ncols; i++) {
+        const imdb_viewcol *c = &d->cols[i];
+        if (!lower_ident(c->name)) return imdb_fail(e, IMDB_ERR_CORRUPT, "view: bad column name");
+        for (uint16_t j = 0; j < i; j++)
+            if (!strcmp(d->cols[j].name, c->name)) return imdb_fail(e, IMDB_ERR_CORRUPT, "view: two columns of one name");
+        if (c->type < IMDB_T_INT64 || c->type > IMDB_T_FLOAT64 || (c->type == IMDB_T_DECIMAL ? c->scale > 18 : c->scale))
+            return imdb_fail(e, IMDB_ERR_CORRUPT, "view: bad column type");
+    }
+    if (d->ndeps > IMDB_MAX_VIEW_DEPS || (d->ndeps && !d->deps))
+        return imdb_fail(e, IMDB_ERR_CORRUPT, "view: bad dependency count");
+    for (uint16_t i = 0; i < d->ndeps; i++) {
+        const imdb_viewdep *p = &d->deps[i];
+        bool ok = p->kind == IMDB_VIEWDEP_TABLE ? p->id < IMDB_MAX_TABLES
+                                                : p->kind == IMDB_VIEWDEP_VIEW && p->id < d->id; /* an earlier view */
+        if (!ok || (i && !imdb_viewdep_less(&d->deps[i - 1], p)))
+            return imdb_fail(e, IMDB_ERR_CORRUPT, "view: a bad dependency, or not strictly sorted");
+    }
+    if (!d->text || !d->text_len || d->text_len > IMDB_MAX_VIEW_TEXT ||
+        !imdb_utf8_valid((const uint8_t *)d->text, d->text_len, NULL) || memchr(d->text, 0, d->text_len))
+        return imdb_fail(e, IMDB_ERR_CORRUPT, "view: bad text");
+    return IMDB_OK;
+}
+
+void imdb_viewdef_encode(const imdb_viewdef *d, imdb_buf *b)
+{
+    size_t nl = strnlen(d->name, IMDB_MAX_IDENT + 1);
+    imdb_buf_put_u32(b, d->id);
+    imdb_buf_put_u8(b, (uint8_t)nl);
+    imdb_buf_put(b, d->name, nl);
+    imdb_buf_put_u16(b, d->ncols);
+    for (uint16_t i = 0; i < d->ncols; i++) {
+        size_t cl = strnlen(d->cols[i].name, IMDB_MAX_IDENT + 1);
+        imdb_buf_put_u8(b, (uint8_t)cl);
+        imdb_buf_put(b, d->cols[i].name, cl);
+        imdb_buf_put_u8(b, d->cols[i].type);
+        imdb_buf_put_u8(b, d->cols[i].scale);
+    }
+    imdb_buf_put_u16(b, d->ndeps);
+    for (uint16_t i = 0; i < d->ndeps; i++) {
+        imdb_buf_put_u8(b, d->deps[i].kind);
+        imdb_buf_put_u32(b, d->deps[i].id);
+    }
+    imdb_buf_put_u32(b, d->text_len);
+    imdb_buf_put(b, d->text, d->text_len);
+}
+
+int imdb_viewdef_decode(imdb_rd *r, imdb_viewdef **out, imdb_err *e)
+{
+    *out = NULL;
+    imdb_viewdef *d = imdb_alloc(sizeof *d, e);
+    if (!d) return e->code;
+    imdb_err e2 = {0};
+    d->id = imdb_rd_u32(r);
+    if (imdb_rd_ident(r, d->name, &e2)) goto bad;
+    d->ncols = imdb_rd_u16(r);
+    if (r->err || !d->ncols || d->ncols > IMDB_MAX_COLS) goto bad;
+    if (!(d->cols = imdb_alloc_array(d->ncols, sizeof *d->cols, e))) goto nomem;
+    for (uint16_t i = 0; i < d->ncols; i++) {
+        if (imdb_rd_ident(r, d->cols[i].name, &e2)) goto bad;
+        d->cols[i].type = imdb_rd_u8(r);
+        d->cols[i].scale = imdb_rd_u8(r);
+    }
+    d->ndeps = imdb_rd_u16(r);
+    if (r->err || d->ndeps > IMDB_MAX_VIEW_DEPS || d->ndeps > imdb_rd_left(r) / 5) goto bad;
+    if (d->ndeps && !(d->deps = imdb_alloc_array(d->ndeps, sizeof *d->deps, e))) goto nomem;
+    for (uint16_t i = 0; i < d->ndeps; i++) {
+        d->deps[i].kind = imdb_rd_u8(r);
+        d->deps[i].id = imdb_rd_u32(r);
+    }
+    d->text_len = imdb_rd_u32(r);
+    if (r->err || !d->text_len || d->text_len > IMDB_MAX_VIEW_TEXT) goto bad;
+    const uint8_t *tp = imdb_rd_bytes(r, d->text_len);
+    if (!tp) goto bad;
+    if (!(d->text = imdb_alloc((size_t)d->text_len + 1, e))) goto nomem;
+    memcpy(d->text, tp, d->text_len);
+    if (r->err || imdb_viewdef_check(d, &e2)) goto bad;
+    *out = d;
+    return IMDB_OK;
+bad:
+    imdb_viewdef_free(d);
+    return imdb_fail(e, IMDB_ERR_CORRUPT, "view definition: malformed");
+nomem:
+    imdb_viewdef_free(d);
+    return e->code;
 }

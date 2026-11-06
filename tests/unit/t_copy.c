@@ -743,7 +743,7 @@ static void t_copy_dump(void)
     OK(imdb_dump(db, 1000, outb_write, &d1, E));
     char head[120], tail[120];
     snprintf(head, sizeof head, "-- imagedb dump of commit %llu (head ", (unsigned long long)db->seq);
-    snprintf(tail, sizeof tail, "\\.\nCREATE UNIQUE INDEX zv ON z (v);\n-- the end of the dump: 4 tables, %d rows\n", 3 + 2500 + 2 + 2);
+    snprintf(tail, sizeof tail, "\\.\nCREATE UNIQUE INDEX zv ON z (v);\n-- the end of the dump: 4 tables, 0 views, %d rows\n", 3 + 2500 + 2 + 2);
     if (!d1.p || strncmp(d1.p, head, strlen(head)) || d1.n <= strlen(tail) || strcmp(d1.p + d1.n - strlen(tail), tail))
         fprintf(stderr, "    the dump: %.160s ... %s\n", d1.p ? d1.p : "(none)", d1.p && d1.n > 120 ? d1.p + d1.n - 120 : "");
     CHECK(d1.p && !strncmp(d1.p, head, strlen(head)) && d1.n > strlen(tail) && !strcmp(d1.p + d1.n - strlen(tail), tail));
@@ -820,7 +820,7 @@ static void t_copy_dump_refused(void)
  * of the other digest algorithm, it dumps again the same past its first line, VERIFY passing */
 static void t_copy_dump_fixtures(void)
 {
-    static const char *const tgz[] = {"tests/fixtures/alg1-20261104.tar.gz", "tests/fixtures/alg2-20261104.tar.gz"};
+    static const char *const tgz[] = {"tests/fixtures/alg1-20261106.tar.gz", "tests/fixtures/alg2-20261106.tar.gz"};
     for (int f = 0; f < 2; f++) {
         char dir[600], cmd[1600], p[700], r[700], q[700];
         snprintf(dir, sizeof dir, "%s", test_tmpdir());
@@ -838,6 +838,10 @@ static void t_copy_dump_fixtures(void)
         for (uint32_t i = 0; i < db->nt; i++) live += !db->t[i]->dropped_at;
         for (const char *at = d1.p; (at = strstr(at, "\nCREATE TABLE ")) != NULL; at++) made++;
         CHECK(live > 0 && live < db->nt && made == live); /* a dropped table there, and not in the dump */
+        uint32_t vlive = 0, vmade = 0; /* P2 S7: the live views, and the dropped one left out */
+        for (uint32_t i = 0; i < db->nviews; i++) vlive += !db->views[i].dropped_at;
+        for (const char *at = d1.p; (at = strstr(at, "\nCREATE VIEW ")) != NULL; at++) vmade++;
+        CHECK(vlive > 1 && vlive < db->nviews && vmade == vlive);
         uint8_t other = db->meta.digest_alg == IMDB_DIGEST_ALG_LTHASH16 ? IMDB_DIGEST_ALG_LTHASH16_TREE : IMDB_DIGEST_ALG_LTHASH16;
         imdb_close(db);
         OK(imdb_open(r, &o, &rdb, E));

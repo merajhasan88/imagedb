@@ -1,18 +1,20 @@
 #!/bin/sh
-# Makes the format's fixtures (2026-11-04: META 5, manifest version 5, ops 16 and 19; alg1-20261104.tar.gz and
-# alg2-20261104.tar.gz beside this script): a primary and its replica under digest algorithm ALG, by
+# Makes the format's fixtures (2026-11-06: META 5, manifest version 6, ops 16, 19, 20 and 21; alg1-20261106.tar.gz and
+# alg2-20261106.tar.gz beside this script): a primary and its replica under digest algorithm ALG, by
 # make_alg2.sh's steps, which reach every reader of the format: a log of several segments (each manifest
 # publish ends one), CHECKPOINTs (manifests, segments, the lanes), a two-column index and a unique one,
 # an UPDATE and a DELETE, ERASE SUBJECT (redacted log payloads, rewritten segments), commits after it, and
-# a replica by ship | apply, and a table dropped (op 19; the manifest's tombstone). Both live tables are RETENTION
+# a replica by ship | apply, a table dropped (op 19; the manifest's tombstone), and views (P2 S7: op 20, one on
+# another, one dropped by op 21, the manifest's tombstone; one more after the first CHECKPOINT, which the replica
+# applies from the log). Both live tables are RETENTION
 # FOREVER and the dropped one is kept a century, the longest but FOREVER: a fixture is frozen data, so its history
 # never expires under the tests that open it (the 24-hour default is tested by the unit tests). Every
 # statement runs cross-checked; the engine and the auditor verify both directories, and the replica's
 # digest must equal the primary's. The primary's signing key is in the tarball: it signs nothing but
 # this fixture. The old fixtures (alg1-20261026, alg2-20261026, tagged-20261027; alg1-20261029 and alg2-20261029,
-# manifest version 4) stay as directories this format refuses.
+# manifest version 4; alg1-20261104 and alg2-20261104, manifest version 5) stay as directories this format refuses.
 #   sh tests/fixtures/make_fixtures.sh BIN AUDIT ALG OUTDIR   (OUTDIR must not exist)
-#   tar -czf tests/fixtures/algALG-20261104.tar.gz -C OUTDIR primary replica
+#   tar -czf tests/fixtures/algALG-20261106.tar.gz -C OUTDIR primary replica
 set -eu
 BIN=$1
 AUD=$2
@@ -47,11 +49,17 @@ sql "CREATE UNIQUE INDEX acct_name ON acct (name)"
 sql "CREATE TABLE gone (id INT64 PRIMARY KEY, v INT64) RETENTION FOREVER"
 sql "INSERT INTO gone VALUES (1, 10), (2, 20)"
 sql "DROP TABLE gone RETENTION 36500 DAYS" # a FOREVER table is given a retention at its drop
+sql "CREATE VIEW rich (id, bal) AS SELECT id, balance FROM acct WHERE balance > 100.00" # P2 S7: a column list
+sql "CREATE VIEW per_acct AS SELECT acct, COUNT(*) AS n FROM ev GROUP BY acct"
+sql "CREATE VIEW top AS SELECT id FROM rich WHERE bal > 150.00" # a view on a view
+sql "CREATE VIEW kind3 AS SELECT id, note FROM ev WHERE kind = 3"
+sql "DROP VIEW kind3" # a tombstone in the manifest
 sql "CHECKPOINT"
 ship
 sql "UPDATE acct SET balance = 1.00 WHERE id <= 10"
 sql "DELETE FROM ev WHERE id BETWEEN 1 AND 5"
 sql "ERASE SUBJECT 7"
+sql "CREATE VIEW noted AS SELECT e.id, a.name FROM ev AS e JOIN acct AS a ON e.acct = a.id WHERE e.note IS NOT NULL"
 sql "INSERT INTO ev VALUES (1001, 3, 2, 'after the erase'), (1002, 4, 6, NULL)"
 sql "CHECKPOINT"
 sql "INSERT INTO acct VALUES (201, 3, 9.99, 'acct-201', '2026-10-26 06:00:00')"

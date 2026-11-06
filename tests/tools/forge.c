@@ -753,7 +753,7 @@ static void append_commit(const char *dir, imdb_db *db, imdb_op *ops, uint32_t n
     append_commit_digest(dir, db, ops, nops, key, ext, NULL);
 }
 
-/* a lake manifest (version 5) that breaks one of its rules, re-pointed and re-signed so only that rule can
+/* a lake manifest (version 6) that breaks one of its rules, re-pointed and re-signed so only that rule can
  * refuse it: boundary (the header names a retirement boundary, commit 1, that no op of the log made)
  * or column (the last index names a column its table lacks; needs an index in the last table, whose
  * entry is then followed only by that table's retention, creation and drop commits) */
@@ -779,15 +779,15 @@ static void manifest_lie(const char *dir, const char *kind)
     if (imdb_manifest_parse(man, mn, &m, &e)) die("manifest", &e);
     imdb_buf nb;
     imdb_buf_init(&nb);
-    if (strcmp(kind, "boundary") == 0 && imdb_get_le32(man + 8) == 5 && S > 1 && m.boundary == 0) {
+    if (strcmp(kind, "boundary") == 0 && imdb_get_le32(man + 8) == 6 && S > 1 && m.boundary == 0) {
         imdb_buf_put(&nb, man, mn);
         /* after magic, version, ntables, db id, seq, prev, state digest, prev manifest: the u64 boundary */
         nb.p[136] = 1;
-    } else if (strcmp(kind, "column") == 0 && m.nt && m.t[m.nt - 1].nidx) {
+    } else if (strcmp(kind, "column") == 0 && m.nt && m.t[m.nt - 1].nidx && !m.nv) {
         imdb_buf_put(&nb, man, mn);
         uint16_t c = m.t[m.nt - 1].s.ncols; /* the last index's column, little endian, before the three u64 */
-        nb.p[nb.len - 26] = (uint8_t)c;
-        nb.p[nb.len - 25] = (uint8_t)(c >> 8);
+        nb.p[nb.len - 30] = (uint8_t)c; /* the views' count (u32 0: none) after the three u64 */
+        nb.p[nb.len - 29] = (uint8_t)(c >> 8);
     } else {
         fputs("imdb-forge: manifest-lie DIR boundary (none yet) | column (an index in the last table)\n", stderr);
         exit(1);
@@ -882,6 +882,67 @@ static void index_lie(const char *dir, const char *kind)
         return;
     } else {
         fputs("imdb-forge: index-lie DIR column | duplicate (needs an index) | drop-absent | unique-dup (needs a unique index)\n", stderr);
+        exit(1);
+    }
+    append_commit(dir, db, &op, 1, &sg, NULL);
+    imdb_close(db);
+}
+
+/* P2 S7: a commit with a view op the log's rules forbid, signed by the writer, its state digest right: drop-table (the
+ * DROP_TABLE of table 0, which a live view names), name (a CREATE_VIEW named as table 0), deps (a CREATE_VIEW of SELECT
+ * id FROM table 0 that logs no dependency: the engine's re-bind refuses it; the auditor, which has no parser, cannot),
+ * drop-named (the DROP_VIEW of view 0, which a live view names) */
+static void view_lie(const char *dir, const char *kind)
+{
+    char p[1200];
+    snprintf(p, sizeof p, "%s/signing.key", dir);
+    size_t kn;
+    uint8_t *seed = slurp(p, &kn);
+    if (kn != IMDB_SEED_LEN) exit(1);
+    imdb_signer sg;
+    imdb_signer_init(&sg, seed);
+    free(seed);
+    imdb_db *db = open_ro(dir);
+    if (!db->nt || !db->nviews) {
+        fputs("imdb-forge: view-lie needs a table and a view\n", stderr);
+        exit(1);
+    }
+    imdb_op op;
+    memset(&op, 0, sizeof op);
+    imdb_viewdef d;
+    memset(&d, 0, sizeof d);
+    imdb_viewcol col = {.type = IMDB_T_INT64};
+    imdb_viewdep dep = {IMDB_VIEWDEP_TABLE, 0};
+    char text[2 * IMDB_MAX_IDENT + 32];
+    const imdb_table *t = db->t[0];
+    if (strcmp(kind, "drop-table") == 0) {
+        op.code = IMDB_OP_DROP_TABLE;
+        op.table = 0;
+        imdb_lthash g = db->global; /* all it held leaves the state: the digest the drop's commit records */
+        imdb_lthash_sub(&g, &t->digest);
+        uint8_t dg[32];
+        imdb_lthash_digest(db->meta.digest_alg, &g, dg);
+        append_commit_digest(dir, db, &op, 1, &sg, NULL, dg);
+        imdb_close(db);
+        return;
+    } else if ((strcmp(kind, "name") == 0 || strcmp(kind, "deps") == 0) && t->s.cols[0].type == IMDB_T_INT64) {
+        op.code = IMDB_OP_CREATE_VIEW;
+        d.id = db->nviews;
+        snprintf(d.name, sizeof d.name, "%s", strcmp(kind, "name") == 0 ? t->s.name : "lie_deps");
+        snprintf(col.name, sizeof col.name, "%s", t->s.cols[0].name);
+        d.ncols = 1;
+        d.cols = &col;
+        d.ndeps = strcmp(kind, "name") == 0; /* deps: none logged, though the text reads the table */
+        d.deps = &dep;
+        snprintf(text, sizeof text, "SELECT %s FROM %s", t->s.cols[0].name, t->s.name);
+        d.text = text;
+        d.text_len = (uint32_t)strlen(text);
+        op.vdef = &d;
+    } else if (strcmp(kind, "drop-named") == 0 && db->nviews >= 2) {
+        op.code = IMDB_OP_DROP_VIEW;
+        op.view = 0;
+    } else {
+        fputs("imdb-forge: view-lie DIR drop-table | name | deps (table 0's first column INT64) | drop-named (two views)\n", stderr);
         exit(1);
     }
     append_commit(dir, db, &op, 1, &sg, NULL);
@@ -1060,6 +1121,10 @@ int main(int argc, char **argv)
         manifest_lie(argv[2], argv[3]);
         return 0;
     }
+    if (argc == 4 && strcmp(argv[1], "view-lie") == 0) { /* P2 S7 */
+        view_lie(argv[2], argv[3]);
+        return 0;
+    }
     if (argc == 4 && strcmp(argv[1], "index-lie") == 0) {
         index_lie(argv[2], argv[3]);
         return 0;
@@ -1072,7 +1137,7 @@ int main(int argc, char **argv)
         corpus(argv[2], argv[3]);
         return 0;
     }
-    fputs("usage: imdb-forge lie-payload SEGMENT | redact-all SEGMENT | index-lie DIR KIND | manifest-lie DIR KIND | lie-zonemap DIR | lie-tombstone DIR | durable-rewind DIR | "
+    fputs("usage: imdb-forge lie-payload SEGMENT | redact-all SEGMENT | index-lie DIR KIND | view-lie DIR KIND | manifest-lie DIR KIND | lie-zonemap DIR | lie-tombstone DIR | durable-rewind DIR | "
           "rotate-foreign DIR | promote-elsewhere DIR ROOTKEY | writers-resign DIR | alg-flip DIR SEQ | corpus DIR OUT\n", stderr);
     return 2;
 }

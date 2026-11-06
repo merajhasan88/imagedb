@@ -323,4 +323,28 @@ must_fail "malformed digest algorithm" "$AUD" verify "$PM"
 echo "   Z the algorithm byte of a signed commit flipped, either way, and META's unknown 3: the auditor refuses each,
    the engine at its open's replay (VERIFY's own check: t_round3 digest_alg_mismatch, under an open handle)"
 
+echo "== VA, VB, VC, VD: view ops the log's rules forbid, each signed by the writer, alone in its commit (P2 S7)"
+make_vdb() {
+  make_db "$1"
+  "$BIN" sql "$1" --nosync -c "CREATE VIEW v0 AS SELECT id, memo FROM t;" -c "CREATE VIEW v1 AS SELECT id FROM v0;" >/dev/null
+}
+for kind in drop-table name drop-named; do
+  PV=$WORK/view-$kind; make_vdb "$PV"
+  "$FORGE" view-lie "$PV" "$kind"
+  case $kind in
+    drop-table) we="which a live view names"; wa="which view v0 names" ;;
+    name) we="takes a live table's or view's name"; wa="takes a live table's or view's name" ;;
+    drop-named) we="which a live view names"; wa="which view v1 names" ;;
+  esac
+  must_fail "$we" "$BIN" verify "$PV"
+  must_fail "$wa" "$AUD" verify "$PV"
+done
+PV=$WORK/view-deps; make_vdb "$PV"
+"$FORGE" view-lie "$PV" deps
+must_fail "yields other columns or dependencies than it logged" "$BIN" verify "$PV"
+"$AUD" verify "$PV" >/dev/null || fail "the auditor refused VD, a view whose text it cannot read (it has no parser)"
+echo "   VA a table dropped under a view, VB a view named as a table, VC a view dropped under another: both refuse;
+   VD a view whose dependencies omit what its text reads: the engine's re-bind refuses it; the auditor, which has
+   no parser, accepts it (design.md §5, Views)"
+
 echo "ALL REJECTION CHECKS PASSED"

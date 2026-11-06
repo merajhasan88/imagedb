@@ -746,16 +746,16 @@ static void fixture_check(const char *tgz, uint8_t alg, const char *meta_head, b
     free(m);
 }
 
-/* The format's fixtures (make_fixtures.sh, 2026-11-04: META 5, manifest version 5, ops 16 and 19, tagged
+/* The format's fixtures (make_fixtures.sh, 2026-11-06: META 5, manifest version 6, ops 16, 19, 20 and 21, tagged
  * segments), one a digest algorithm: they pin the format, so a change to it fails here first */
 static void t_round3_alg1_fixture(void)
 {
-    fixture_check("tests/fixtures/alg1-20261104.tar.gz", IMDB_DIGEST_ALG_LTHASH16, "imagedb-meta 5\n", true, 16);
+    fixture_check("tests/fixtures/alg1-20261106.tar.gz", IMDB_DIGEST_ALG_LTHASH16, "imagedb-meta 5\n", true, 22);
 }
 
 static void t_round3_alg2_fixture(void)
 {
-    fixture_check("tests/fixtures/alg2-20261104.tar.gz", IMDB_DIGEST_ALG_LTHASH16_TREE, "imagedb-meta 5\n", true, 16);
+    fixture_check("tests/fixtures/alg2-20261106.tar.gz", IMDB_DIGEST_ALG_LTHASH16_TREE, "imagedb-meta 5\n", true, 22);
 }
 
 /* The fixtures of the formats before the current one (alg1-20261026: META 2; alg2-20261026 and
@@ -788,9 +788,12 @@ static void t_round3_old_fixtures(void)
         CHECK(imdb_open(p, &o, &db, E) == IMDB_ERR_UNSUPPORTED && !db && strstr(g_e.msg, "before the retention format"));
         CHECK(audit_dir(p) != 0); /* refused (1), or no auditor in this build (-1) */
     }
-    /* the fixtures of META 5 with manifest version 4 (alg1-20261029, alg2-20261029: before DROP TABLE, 1f): META reads,
-     * and the open refuses the lake by name, never replaying past it to a rebuilt manifest of another version */
-    static const char *const tgz4[] = {"tests/fixtures/alg1-20261029.tar.gz", "tests/fixtures/alg2-20261029.tar.gz"};
+    /* the fixtures of META 5 with manifest version 4 (alg1-20261029, alg2-20261029: before DROP TABLE, 1f) and 5
+     * (alg1-20261104, alg2-20261104: before views, P2 S7): META reads, and the open refuses the lake by name, never
+     * replaying past it to a rebuilt manifest of another version */
+    static const char *const tgz4[] = {"tests/fixtures/alg1-20261029.tar.gz", "tests/fixtures/alg2-20261029.tar.gz",
+                                       "tests/fixtures/alg1-20261104.tar.gz", "tests/fixtures/alg2-20261104.tar.gz"};
+    static const char *const why4[] = {"before DROP TABLE", "before DROP TABLE", "before views", "before views"};
     for (size_t i = 0; i < sizeof tgz4 / sizeof *tgz4; i++) {
         struct stat st;
         if (stat(tgz4[i], &st) != 0) {
@@ -811,7 +814,7 @@ static void t_round3_old_fixtures(void)
             imdb_db *db = NULL;
             imdb_err_clear(E);
             int rc = imdb_open(p, &o, &db, E);
-            CHECK(!db && rc == IMDB_ERR_UNSUPPORTED && strstr(g_e.msg, "before DROP TABLE"));
+            CHECK(!db && rc == IMDB_ERR_UNSUPPORTED && strstr(g_e.msg, why4[i]));
             if (db) imdb_close(db);
         }
         CHECK(audit_dir(p) != 0);

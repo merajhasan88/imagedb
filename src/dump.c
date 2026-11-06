@@ -2,7 +2,8 @@
  * data of a COPY ... FROM STDIN (a table's COPY TO, walked: never held), ended by a \. line, then its indexes. One
  * script that `imagedb sql -f` restores into an empty database (design.md §5, Import and export). The rows are a table's
  * current ones: a dump carries no history, no dropped table, no key and no retention clock; its commit is named in its
- * first line, its totals in its last (a dump cut short has none). */
+ * first line, its totals in its last (a dump cut short has none). P2 S7: after the tables, each live view by id (each
+ * names only earlier ones), its CREATE VIEW naming its columns as logged, its query's text as written. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -149,8 +150,21 @@ int imdb_dump(imdb_db *db, uint32_t batch, imdb_copy_write_fn wr, void *arg, imd
         imdb_buf_put_str(&d->b, "\\.\n");
         if ((rc = put(d, e)) || (rc = index_text(d, t, e))) break;
     }
+    uint32_t nviews = 0; /* P2 S7: the live views by id, after every table: each names only earlier ones */
+    for (uint32_t i = 0; !rc && i < db->nviews; i++) {
+        const imdb_view *v = &db->views[i];
+        if (v->dropped_at || !v->def) continue;
+        imdb_buf_printf(&d->b, "CREATE VIEW %s (", v->name);
+        for (uint16_t c = 0; c < v->def->ncols; c++) imdb_buf_printf(&d->b, "%s%s", c ? ", " : "", v->def->cols[c].name);
+        imdb_buf_put_str(&d->b, ") AS ");
+        imdb_buf_put(&d->b, v->def->text, v->def->text_len);
+        imdb_buf_put_str(&d->b, ";\n");
+        rc = put(d, e);
+        nviews++;
+    }
     if (!rc) {
-        imdb_buf_printf(&d->b, "-- the end of the dump: %u tables, %llu rows\n", (unsigned)n, (unsigned long long)rows);
+        imdb_buf_printf(&d->b, "-- the end of the dump: %u tables, %u views, %llu rows\n", (unsigned)n, (unsigned)nviews,
+                        (unsigned long long)rows);
         rc = put(d, e);
     }
     imdb_free(ts);

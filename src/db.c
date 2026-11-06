@@ -1109,7 +1109,7 @@ int imdb_view_token(const imdb_db *db, uint8_t out[32], imdb_err *e)
     imdb_sha256_ctx c;
     uint8_t b[16];
     imdb_sha256_init(&c);
-    imdb_sha256_update(&c, "IMDBVIEW2", 9); /* 2: each table's created and dropped commits too (1f) */
+    imdb_sha256_update(&c, "IMDBVIEW3", 9); /* 2: each table's created and dropped commits too (1f); 3: the views (P2 S7) */
     imdb_sha256_update(&c, db->db_id, 16);
     imdb_le64(b, db->seq);
     imdb_sha256_update(&c, b, 8);
@@ -1137,6 +1137,26 @@ int imdb_view_token(const imdb_db *db, uint8_t out[32], imdb_err *e)
         uint8_t lanes[IMDB_LTHASH_BYTES];
         imdb_lthash_to_bytes(&t->digest, lanes);
         imdb_sha256_update(&c, lanes, sizeof lanes);
+    }
+    imdb_le32(b, db->nviews); /* P2 S7: each view by id: its name and commits, a live one's definition's SHA-256 */
+    imdb_sha256_update(&c, b, 4);
+    for (uint32_t i = 0; i < db->nviews && !rc; i++) {
+        const imdb_view *v = &db->views[i];
+        uint32_t nl = (uint32_t)strlen(v->name);
+        imdb_le32(b, v->id);
+        imdb_le32(b + 4, nl);
+        imdb_sha256_update(&c, b, 8);
+        imdb_sha256_update(&c, v->name, nl);
+        imdb_le64(b, v->created_at);
+        imdb_le64(b + 8, v->dropped_at);
+        imdb_sha256_update(&c, b, 16);
+        if (v->dropped_at) continue;
+        sb.len = 0;
+        imdb_viewdef_encode(v->def, &sb);
+        if ((rc = imdb_buf_check(&sb, e))) break;
+        uint8_t h[32];
+        imdb_sha256(sb.p, sb.len, h);
+        imdb_sha256_update(&c, h, 32);
     }
     imdb_buf_free(&sb);
     if (!rc) imdb_sha256_final(&c, out);
@@ -1737,10 +1757,12 @@ static void tx_op_free(imdb_op *o)
     imdb_free(o->erase);
     imdb_free(o->rewrites);
     imdb_free(o->iname);
+    imdb_viewdef_free(o->vdef);
     o->schema = NULL;
     o->erase = NULL;
     o->rewrites = NULL;
     o->iname = NULL;
+    o->vdef = NULL;
 }
 
 static int index_build(imdb_table *t, imdb_index *ix, imdb_err *e);
@@ -1825,6 +1847,8 @@ int imdb_create_table_ex(imdb_db *db, imdb_schema *s, uint64_t retention_us, imd
     if (!db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "no transaction");
     if (!imdb_retention_ok(retention_us))
         return imdb_fail(e, IMDB_ERR_INVALID, "RETENTION is a second to a century, or FOREVER");
+    if (imdb_view_by_name(db, s->name)) /* P2 S7: one name space for the live tables and views */
+        return imdb_fail(e, IMDB_ERR_INVALID, "view %s exists already", s->name);
     s->id = db->nt;
     if (imdb_table_new(db, s, e)) return e->code;
     imdb_undo u = {.kind = UNDO_CREATE, .table = s->id};
@@ -1877,6 +1901,8 @@ int imdb_drop_table(imdb_db *db, imdb_table *t, uint64_t retention_us, imdb_err 
     if (!db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "no transaction");
     if (db->ntx) return imdb_fail(e, IMDB_ERR_STATE, "DROP TABLE commits on its own");
     if (t->dropped_at) return imdb_fail(e, IMDB_ERR_NOTFOUND, "table %s was dropped already", t->s.name);
+    const imdb_view *dv = imdb_view_dependent(db, IMDB_VIEWDEP_TABLE, t->s.id); /* P2 S7: PostgreSQL's RESTRICT */
+    if (dv) return imdb_fail(e, IMDB_ERR_INVALID, "view %s names table %s: drop it first", dv->name, t->s.name);
     if (retention_us && !imdb_retention_ok(retention_us))
         return imdb_fail(e, IMDB_ERR_INVALID, "RETENTION is a second to a century, or FOREVER");
     uint64_t r = retention_us ? retention_us : t->retention_us;
@@ -1910,6 +1936,140 @@ void imdb_table_drop_install(imdb_db *db, imdb_table *t, uint64_t seq)
     t->dropped_at = seq;
     db->ended_pass += ended; /* the memory window's trigger, as DELETE's ends */
     imdb_txn_doom_dropped(db, t->s.id, seq);
+}
+
+/* ---- P2 S7: views (db.h) ---------------------------------------------------------------------------- */
+
+imdb_view *imdb_view_by_name(imdb_db *db, const char *name)
+{
+    for (uint32_t i = 0; i < db->nviews; i++)
+        if (!db->views[i].dropped_at && strcmp(db->views[i].name, name) == 0) return &db->views[i];
+    return NULL;
+}
+
+imdb_view *imdb_view_at(imdb_db *db, const char *name, uint64_t snap)
+{
+    for (uint32_t i = 0; i < db->nviews; i++) { /* at most one: a name is reused only after its view's drop */
+        imdb_view *v = &db->views[i];
+        if (v->created_at <= snap && (!v->dropped_at || snap < v->dropped_at) && strcmp(v->name, name) == 0) return v;
+    }
+    return NULL;
+}
+
+const imdb_view *imdb_view_dependent(const imdb_db *db, uint8_t kind, uint32_t id)
+{
+    for (uint32_t i = 0; i < db->nviews; i++) {
+        const imdb_view *v = &db->views[i];
+        if (v->dropped_at || !v->def) continue; /* a live view always holds its definition */
+        for (uint16_t k = 0; k < v->def->ndeps; k++)
+            if (v->def->deps[k].kind == kind && v->def->deps[k].id == id) return v;
+    }
+    return NULL;
+}
+
+bool imdb_view_deps_live(const imdb_db *db, const imdb_viewdef *def)
+{
+    for (uint16_t k = 0; k < def->ndeps; k++) {
+        const imdb_viewdep *p = &def->deps[k];
+        bool live = p->kind == IMDB_VIEWDEP_TABLE ? p->id < db->nt && !db->t[p->id]->dropped_at
+                                                  : p->kind == IMDB_VIEWDEP_VIEW && p->id < db->nviews &&
+                                                        !db->views[p->id].dropped_at;
+        if (!live) return false;
+    }
+    return true;
+}
+
+int imdb_view_reserve(imdb_db *db, imdb_err *e)
+{
+    if (db->nviews < db->capviews) return IMDB_OK;
+    if (db->nviews >= IMDB_MAX_VIEWS)
+        return imdb_fail(e, IMDB_ERR_LIMIT, "a database holds at most %u views, dropped ones counted", IMDB_MAX_VIEWS);
+    uint32_t cap = db->capviews ? db->capviews * 2 : 8;
+    if (cap > IMDB_MAX_VIEWS) cap = IMDB_MAX_VIEWS;
+    imdb_view *n = imdb_alloc_array(cap, sizeof *n, e);
+    if (!n) return e->code;
+    if (db->nviews) memcpy(n, db->views, db->nviews * sizeof *n);
+    imdb_free(db->views);
+    db->views = n;
+    db->capviews = cap;
+    return IMDB_OK;
+}
+
+void imdb_view_install(imdb_db *db, imdb_viewdef *def, uint64_t seq)
+{
+    if (db->nviews >= db->capviews) { /* imdb_view_reserve made the room before the frame: never here */
+        imdb_viewdef_free(def);
+        db->failed = true;
+        snprintf(db->warning, sizeof db->warning, "commit %llu created a view with no room reserved; reopen",
+                 (unsigned long long)seq);
+        return;
+    }
+    imdb_view *v = &db->views[db->nviews++];
+    memset(v, 0, sizeof *v);
+    v->def = def;
+    v->id = def->id;
+    memcpy(v->name, def->name, sizeof v->name);
+    v->created_at = seq;
+}
+
+void imdb_view_drop_install(imdb_db *db, imdb_view *v, uint64_t seq)
+{
+    (void)db;
+    v->dropped_at = seq; /* its definition stays until the close: a transaction older than the drop still reads it */
+}
+
+static void views_free(imdb_db *db)
+{
+    for (uint32_t i = 0; i < db->nviews; i++) imdb_viewdef_free(db->views[i].def);
+    imdb_free(db->views);
+    db->views = NULL;
+    db->nviews = db->capviews = 0;
+}
+
+int imdb_create_view(imdb_db *db, imdb_viewdef *def, imdb_err *e)
+{
+    int rc = IMDB_OK;
+    imdb_err e2 = {0};
+    if (!db->in_txn) rc = imdb_fail(e, IMDB_ERR_STATE, "no transaction");
+    else if (db->ntx) rc = imdb_fail(e, IMDB_ERR_STATE, "CREATE VIEW commits on its own");
+    else if (imdb_table_by_name(db, def->name)) rc = imdb_fail(e, IMDB_ERR_INVALID, "table %s exists already", def->name);
+    else if (imdb_view_by_name(db, def->name)) rc = imdb_fail(e, IMDB_ERR_INVALID, "view %s exists already", def->name);
+    else if (db->nviews >= IMDB_MAX_VIEWS)
+        rc = imdb_fail(e, IMDB_ERR_LIMIT, "a database holds at most %u views, dropped ones counted", IMDB_MAX_VIEWS);
+    if (!rc) {
+        def->id = db->nviews;
+        if (!imdb_view_deps_live(db, def))
+            rc = imdb_fail(e, IMDB_ERR_STATE, "view %s names a table or view that is not live", def->name);
+        else if (imdb_viewdef_check(def, &e2)) /* the decoder's rules: what the SQL layer built must pass them */
+            rc = imdb_fail(e, IMDB_ERR_INVALID, "view %s: %s", def->name, e2.msg);
+        else if ((rc = imdb_view_rebind(db, def, &e2))) /* replay's rule, before the log has it: never an unreplayable op */
+            rc = rc == IMDB_ERR_CORRUPT ? imdb_fail(e, IMDB_ERR_INVALID, "view %s: its columns or dependencies are not what "
+                                                    "its text yields", def->name)
+                                        : imdb_fail(e, rc, "view %s: %s", def->name, e2.msg);
+    }
+    if (!rc) rc = imdb_view_reserve(db, e);
+    imdb_op *op = rc ? NULL : tx_push(db, e);
+    if (!op) {
+        imdb_viewdef_free(def);
+        return rc ? rc : e->code;
+    }
+    op->code = IMDB_OP_CREATE_VIEW;
+    op->vdef = def; /* the install takes it */
+    return IMDB_OK;
+}
+
+int imdb_drop_view(imdb_db *db, imdb_view *v, imdb_err *e)
+{
+    if (!db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "no transaction");
+    if (db->ntx) return imdb_fail(e, IMDB_ERR_STATE, "DROP VIEW commits on its own");
+    if (v->dropped_at) return imdb_fail(e, IMDB_ERR_NOTFOUND, "view %s was dropped already", v->name);
+    const imdb_view *d = imdb_view_dependent(db, IMDB_VIEWDEP_VIEW, v->id);
+    if (d) return imdb_fail(e, IMDB_ERR_INVALID, "view %s names view %s: drop it first", d->name, v->name);
+    imdb_op *op = tx_push(db, e);
+    if (!op) return e->code;
+    op->code = IMDB_OP_DROP_VIEW;
+    op->view = v->id;
+    return IMDB_OK;
 }
 
 int imdb_expire_op(imdb_db *db, uint32_t table, uint64_t before, imdb_err *e)
@@ -3049,7 +3209,7 @@ static uint64_t g_clock_frozen; /* imdb_clock_freeze: tests only; 0 the wall clo
 static uint64_t now_us(void)
 {
     struct timespec ts;
-    if (g_clock_frozen) return g_clock_frozen;
+    if (g_clock_frozen) return g_clock_frozen + (uint64_t)g_clock_offset; /* an offset moves a frozen clock exactly */
     clock_gettime(CLOCK_REALTIME, &ts);
     return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u + (uint64_t)g_clock_offset;
 }
@@ -3057,6 +3217,8 @@ static uint64_t now_us(void)
 void imdb_clock_offset(int64_t us) { g_clock_offset = us; }
 
 void imdb_clock_freeze(uint64_t us) { g_clock_frozen = us; }
+
+uint64_t imdb_clock_frozen(void) { return g_clock_frozen; }
 
 uint64_t imdb_now_us(void) { return now_us(); }
 
@@ -3973,12 +4135,18 @@ static int commit_body(imdb_db *db, imdb_err *e)
         uint8_t code = db->tx[i].code;
         if (code == IMDB_OP_INSERT || code == IMDB_OP_DELETE || code == IMDB_OP_UPDATE || code == IMDB_OP_CREATE_TABLE ||
             code == IMDB_OP_CREATE_INDEX || code == IMDB_OP_DROP_INDEX || code == IMDB_OP_SET_RETENTION ||
-            code == IMDB_OP_EXPIRE || code == IMDB_OP_DROP_TABLE)
-            db->lake_dirty = true; /* the manifest records the definitions, the retentions, the horizons, the drops */
+            code == IMDB_OP_EXPIRE || code == IMDB_OP_DROP_TABLE || code == IMDB_OP_CREATE_VIEW || code == IMDB_OP_DROP_VIEW)
+            db->lake_dirty = true; /* the manifest records the definitions, the retentions, the horizons, the drops,
+                                    * the views (P2 S7) */
         if (code == IMDB_OP_CREATE_TABLE) db->t[db->tx[i].table]->created_at = c.seq;
         if (code == IMDB_OP_SET_RETENTION) db->t[db->tx[i].table]->retention_us = db->tx[i].retention_us;
         if (code == IMDB_OP_EXPIRE) db->t[db->tx[i].table]->horizon = db->tx[i].purge_before;
         if (code == IMDB_OP_DROP_TABLE) imdb_table_drop_install(db, db->t[db->tx[i].table], c.seq);
+        if (code == IMDB_OP_CREATE_VIEW) { /* P2 S7: the definition passes to the catalog */
+            imdb_view_install(db, db->tx[i].vdef, c.seq);
+            db->tx[i].vdef = NULL;
+        }
+        if (code == IMDB_OP_DROP_VIEW && db->tx[i].view < db->nviews) imdb_view_drop_install(db, &db->views[db->tx[i].view], c.seq);
     }
     db->seq = c.seq;
     memcpy(db->head, c.hash, 32);
@@ -4080,6 +4248,7 @@ void imdb_reset_state(imdb_db *db)
 {
     imdb_lake_db_free(db);
     for (uint32_t i = 0; i < db->nt; i++) imdb_table_free(db->t[i]);
+    views_free(db); /* P2 S7 */
 #ifdef IMDB_STORE_CHECKS
     if (db->segcache.resident) { /* every image charged was credited as it left (lake.c: seg_img_bytes) */
         fprintf(stderr, "imagedb: the segment cache counts %llu bytes after every table left\n",
@@ -4126,6 +4295,7 @@ int imdb_close(imdb_db *db)
     if (db->in_txn) imdb_rollback(db);
     imdb_lake_db_free(db);
     for (uint32_t i = 0; i < db->nt; i++) imdb_table_free(db->t[i]);
+    views_free(db); /* P2 S7 */
     imdb_free(db->t);
     for (uint32_t i = 0; i < db->ntx; i++) tx_op_free(&db->tx[i]);
     imdb_free(db->tx);

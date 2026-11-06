@@ -1874,6 +1874,43 @@ void imdb_sql_stmt_free(sql_stmt *st)
     st->nex = st->capex = 0;
 }
 
+/* P2 S7: CREATE VIEW name [(c1, ...)] AS query: the query its own statement (src) at the top of its own parse, as the
+ * text parses when the view is used; the text kept as written, from the token after AS to the end of the last token
+ * (body_off, body_len: no trailing comment, so a dump's ';' after it stays a statement's end); the column list in
+ * set_cols (nset). A parameter is refused: a view's query is complete */
+static int parse_create_view(parser *p, sql_stmt *st)
+{
+    st->kind = ST_CREATE_VIEW;
+    if (ident(p, st->table)) return p->e->code;
+    if (tok(p, TK_LP)) {
+        do {
+            if (st->nset >= IMDB_MAX_COLS)
+                return imdb_fail(p->e, IMDB_ERR_LIMIT, "a view of more than %u columns", IMDB_MAX_COLS);
+            if (ident(p, st->set_cols[st->nset])) return p->e->code;
+            st->nset++;
+        } while (tok(p, TK_COMMA));
+        if (expect(p, TK_RP, ")")) return p->e->code;
+    }
+    if (expect_kw(p, "as")) return p->e->code;
+    if (!query_at(p, p->i)) return imdb_fail(p->e, IMDB_ERR_SYNTAX, "expected a query after AS (SELECT, WITH or one in parentheses)");
+    uint32_t t0 = p->i;
+    sql_stmt *in = imdb_alloc(sizeof *in, p->e);
+    if (!in) return p->e->code;
+    st->src = in;
+    sql_stmt *saved = p->st;
+    p->st = in;
+    int rc = kw(p, "with") ? parse_with_list(p, in) : IMDB_OK;
+    if (!rc) rc = parse_query(p, in);
+    p->st = saved;
+    if (rc) return rc;
+    for (uint32_t k = t0; k < p->i; k++)
+        if (p->t[k].kind == TK_PARAM) return imdb_fail(p->e, IMDB_ERR_INVALID, "a view's query takes no parameter ($n)");
+    const sql_tok *a = &p->t[t0], *z = &p->t[p->i - 1];
+    st->body_off = a->off - (a->kind == TK_STR);
+    st->body_len = z->off + z->len + (z->kind == TK_STR) - st->body_off;
+    return IMDB_OK;
+}
+
 int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
 {
     memset(st, 0, sizeof *st);
@@ -1889,12 +1926,20 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
     }
     bool explain = kw(&p, "explain"); /* P1 Q1: the plan of what follows, which is not run */
     if (kw(&p, "create")) {
-        bool unique = kw(&p, "unique");
-        if (unique) rc = expect_kw(&p, "index");
-        if (!rc) rc = unique || kw(&p, "index") ? parse_create_index(&p, st, unique) : parse_create(&p, st);
+        if (tok_is_kw(&p, p.i, "or") && tok_is_kw(&p, p.i + 1, "replace")) /* P2 S7 */
+            rc = imdb_fail(e, IMDB_ERR_UNSUPPORTED, "CREATE OR REPLACE: drop the view and create it again");
+        else if (kw(&p, "view")) rc = parse_create_view(&p, st);
+        else {
+            bool unique = kw(&p, "unique");
+            if (unique) rc = expect_kw(&p, "index");
+            if (!rc) rc = unique || kw(&p, "index") ? parse_create_index(&p, st, unique) : parse_create(&p, st);
+        }
     }
     else if (kw(&p, "drop")) {
-        if (kw(&p, "table")) { /* DROP TABLE t [RETENTION n UNIT] (1f): its history kept, for that long */
+        if (kw(&p, "view")) { /* P2 S7 */
+            st->kind = ST_DROP_VIEW;
+            rc = ident(&p, st->table);
+        } else if (kw(&p, "table")) { /* DROP TABLE t [RETENTION n UNIT] (1f): its history kept, for that long */
             st->kind = ST_DROP_TABLE;
             if (!(rc = ident(&p, st->table)) && kw(&p, "retention")) {
                 st->has_retention = true;
@@ -1996,6 +2041,7 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
     else if (kw(&p, "show")) {
         if (kw(&p, "tables")) st->kind = ST_SHOW_TABLES;
         else if (kw(&p, "prepared")) st->kind = ST_SHOW_PREPARED; /* P2 S9 */
+        else if (kw(&p, "views")) st->kind = ST_SHOW_VIEWS; /* P2 S7 */
         else if (kw(&p, "indexes")) st->kind = ST_SHOW_INDEXES;
         else if (kw(&p, "retention")) st->kind = ST_SHOW_RETENTION;
         else if (kw(&p, "lake")) st->kind = ST_SHOW_LAKE;
@@ -2032,7 +2078,7 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
                 }
             }
         } else {
-            rc = fail_at(&p, "TABLES, DIGEST, HISTORY, LOG, LAKE, IDENTITY or REPLICAS after SHOW");
+            rc = fail_at(&p, "TABLES, VIEWS, DIGEST, HISTORY, LOG, LAKE, IDENTITY or REPLICAS after SHOW");
         }
     } else if (kw(&p, "set")) {
         st->kind = ST_SET;
