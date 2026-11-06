@@ -69,8 +69,10 @@ static void t_scope(void)
 /* C3: a suffix frame's MIN visits every following value for each row: the review measured 610 ms past a 50 ms
  * statement_timeout before the frame loop charged its work to the deadline, 51 ms after. 1,000 rows here: the scan's and
  * the rows' own ticks stay under one check (4,096), so only the frame loop's can stop it (with 3,000 they passed one
- * anyway, and the test passed without the fix), while each visit is a new minimum whose 4 KiB the accumulator copies:
- * about half a second uncancelled.
+ * anyway, and the test passed without the fix), while each visit is a new minimum whose 16 KiB the accumulator copies:
+ * about 370 ms uncancelled on this machine quiet. (With 4 KiB it took 60 ms by 2026-11-06, and in a full suite the
+ * statement answered, rc 0: it ran within the 50 ms, or the deadline passed after the frame loop's last check, where
+ * nothing checks again: the result's rows are built unchecked.)
  * The values' leading bytes differ, so a comparison is cheap: the time is the visits' and the copies'. A read: no commit */
 static void t_window_cancel(void)
 {
@@ -80,7 +82,7 @@ static void t_window_cancel(void)
     if (!db) return;
     expect(&s, "CREATE TABLE w(id INT64 PRIMARY KEY, s TEXT NOT NULL)", true);
     imdb_table *t = imdb_table_by_name(db, "w");
-    static uint8_t text[4096];
+    static uint8_t text[16384];
     memset(text, 'x', sizeof text);
     imdb_err e = {0};
     int rc = imdb_begin(db, &e);
