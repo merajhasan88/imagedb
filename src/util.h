@@ -70,6 +70,7 @@ uint64_t imdb_heap_bytes(void);
  * (sql_exec.c), when nothing else allocates but the pool's workers for that statement. */
 void imdb_heap_ceiling_set(uint64_t ceiling, uint64_t workspace); /* workspace: the bytes it allows, for messages */
 uint64_t imdb_heap_ceiling(void);
+uint64_t imdb_heap_ceiling_refusals(void); /* P2 S11: how many requests the ceiling has refused, ever */
 /* This thread's allocations from here to the end are not the statement's workspace (a segment image's load, under
  * the segment cache's own budget): each raises the ceiling first, each free lowers it. Nests. */
 void imdb_heap_exempt_begin(void);

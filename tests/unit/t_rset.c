@@ -361,7 +361,11 @@ static void t_rset_explain(void)
     CHECK(run("SET statement_row_limit = 10") == 0);
     EXPECT("EXPLAIN SELECT COUNT(*) FROM (SELECT id FROM t) AS q", "ERR statement row limit");
     EXPECT("SELECT COUNT(*) FROM (SELECT id FROM t) AS q", "ERR statement row limit");
-    EXPECT("EXPLAIN SELECT id FROM t WHERE id = 1 AND g IN (SELECT g FROM t)", "ERR statement row limit");
+    /* P2 S11: an expression's SELECT waits for a row: EXPLAIN runs none, the run's first row runs it */
+    CHECK(strstr(csv("EXPLAIN SELECT id FROM t WHERE id = 1 AND g IN (SELECT g FROM t)"),
+                 "\"nested\",\"1 nested SELECT: (an expression's) run when a row first needs it") != NULL);
+    EXPECT("SELECT id FROM t WHERE id = 1 AND g IN (SELECT g FROM t)", "ERR statement row limit");
+    EXPECT("SELECT id FROM t WHERE id = 0 AND g IN (SELECT g FROM t)", "id\n"); /* no row: the SELECT never runs */
     CHECK(run("SET statement_row_limit = 100") == 0);
     EXPECT("SELECT COUNT(*) FROM (SELECT id FROM t) AS q", "count\n40\n");
     CHECK(run("SET statement_row_limit = 0") == 0);

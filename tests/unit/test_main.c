@@ -109,6 +109,7 @@ int main(int argc, char **argv)
         {"dml", dml_tests, &dml_ntests},
         {"prep", prep_tests, &prep_ntests},
         {"copy", copy_tests, &copy_ntests},
+        {"lazy", lazy_tests, &lazy_ntests},
         {"backup", backup_tests, &backup_ntests},
         {"expr", expr_tests, &expr_ntests},
         {"cancel", cancel_tests, &cancel_ntests},

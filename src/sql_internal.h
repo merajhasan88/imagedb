@@ -152,6 +152,8 @@ typedef struct sql_stmt {
     char (*cte_col)[IMDB_MAX_IDENT + 1];
     uint8_t cte_ncols;
     bool recursive;
+    bool with_cte; /* P2 S11: a WITH's: the one kind of row set a nested SELECT reads by its name (a derived table's name is
+                    * a range variable of its own statement alone, as SQL has it) */
     sql_win win[IMDB_MAX_WINDOWS]; /* P2 S6: its window functions' windows, EX_WIN.sub */
     uint8_t nwin;
     char table2[IMDB_MAX_IDENT + 1], alias2[IMDB_MAX_IDENT + 1];

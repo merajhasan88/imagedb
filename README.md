@@ -640,7 +640,8 @@ SHOW INDEXES;
   the statement makes of the rows. A join's: its plan (`join(build N)`,
   `join(index N)`) and why, the prices of the hash join and of each
   orientation of the index join, each side's path. No row is read (but a
-  statement's nested SELECTs, which run first: see Subqueries), nothing is
+  statement's derived tables, WITHs and a write's subqueries, which run
+  first: see Subqueries), nothing is
   written or locked. The plan is this copy's: two replicas may explain a
   statement differently (their memory floors differ) and answer it the same.
   An UPDATE or DELETE reports the path that found its rows
@@ -727,13 +728,29 @@ WITH big AS (SELECT cust, SUM(amount) AS total FROM orders GROUP BY cust)
   `x [NOT] IN (SELECT y ...)`, `[NOT] EXISTS (SELECT ...)`, `(SELECT v ...)`,
   in SELECT, UPDATE, DELETE and INSERT's VALUES. Three tables join through a
   derived table: `FROM (SELECT ... FROM a JOIN b ON ...) AS ab JOIN c ON ...`.
-- Each nested SELECT runs once, first, at the statement's snapshot (a
+- A derived table or a WITH runs first, once, at the statement's snapshot (a
   transaction's own writes included) and under its timeout, row limit and
-  memory ceiling; a write's run before it writes anything. A derived table's
+  memory ceiling. A subquery in an expression (`IN`, `EXISTS`, a value) runs
+  the first time a row needs it, once (or once per distinct set of the
+  outer values it reads, below): `CASE WHEN x = 1 THEN 7 ELSE (SELECT ...)
+  END` never runs its SELECT for rows with x = 1, `COALESCE(a, (SELECT ...))`
+  only where a is NULL, and a subquery no row reaches costs nothing and
+  raises nothing; its names and types are still checked first, wherever it
+  stands. A write's subqueries all run before it writes anything: they read
+  the statement's snapshot, never its own writes. A derived table's
   path is `nested`: its rows in their order, no index. A value subquery with
   no row is NULL, with two rows an error. `x IN (SELECT ...)` is UNKNOWN when
   x is NULL, or when nothing matches and the set holds a NULL, so `NOT IN`
   over a set with a NULL keeps no row, as in SQL.
+- `EXISTS` asks only whether a row qualifies: its SELECT list, DISTINCT,
+  ORDER BY and GROUP BY are not computed (with an aggregate, HAVING, OFFSET,
+  a window function or UNION and the like, it runs as written), LIMIT 0 is
+  false, and it stops at the first qualifying row when its WHERE holds only
+  comparisons of a column with a value (an expression there is tested on
+  every row, so whether it fails never depends on the order rows are read).
+- A derived table's name is a name for its own statement's columns, not a
+  table: a subquery's `FROM d` reads the table d, or a WITH named d, never a
+  derived table `AS d` around it (as in SQL).
 - A correlated subquery reads the columns of the statement directly around
   it from its conditions and expressions (`o.cust = c.id` above): it is
   computed on each row, once per distinct set of the outer values it reads
@@ -748,9 +765,10 @@ WITH big AS (SELECT cust, SUM(amount) AS total FROM orders GROUP BY cust)
 - At most 8 nested SELECTs in a statement, nested 4 deep. Not yet: a
   reference two statements out, LATERAL, `ANY` and `ALL`, AS OF with a nested
   SELECT, FOR UPDATE of a derived table.
-- EXPLAIN runs a statement's uncorrelated nested SELECTs (the rest is planned
-  over their rows) and lists each with its row count; a correlated one is named,
-  not run; nothing else runs.
+- EXPLAIN runs a statement's derived tables and WITHs (the rest is planned
+  over their rows), and a write's subqueries, and lists each with its row
+  count; a SELECT's subquery in an expression is named, not run (it runs when
+  a row needs it); nothing else runs.
 
 Set operations and recursive queries:
 

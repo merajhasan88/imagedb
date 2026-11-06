@@ -250,6 +250,7 @@ typedef struct stmt {
     bool jkey2, jusing, jn3; /* ON's second key pair, t.s = u.s; USING (s) for ON; P2 S3's (counted when compared) */
     bool subq;         /* P2 S4: a subquery, a derived table or a CTE (counted when compared) */
     bool corr;         /* P2 S4b: a correlated subquery (counted when compared) */
+    bool lazy;         /* P2 S11: items over a SELECT that fails when it runs (counted when compared) */
     int narm, ncol;    /* P2 S5: a set operation's SELECTs (arm, armop[a] before arm a: 0 UNION, 1 UNION ALL, 2 INTERSECT,
                         * 3 EXCEPT) of ncol columns; its tail (stail: ORDER BY 1 [DESC] [LIMIT slim] [OFFSET soff]) */
     struct sarm {
@@ -1151,6 +1152,68 @@ static int gen_subq_cond(stmt *q)
     return k;
 }
 
+
+/* P2 S11 (deferred.md D9, O1 and O2): a SELECT that fails when it runs, for a branch or an EXISTS: MAX(100 / (c - c))
+ * over its table's rows (a zero divisor wherever c is not NULL; a column, so PostgreSQL never folds it while planning),
+ * or a bare column as a value (two rows, maybe); for EXISTS, 100 / (c - c) as its SELECT list */
+static int gen_lazyq(stmt *q, bool exists)
+{
+    int w = chance(55) ? 1 : 0, c = (int)rr(0, 2); /* t: id, g, a; u: id, tid, v */
+    int sq = xnew(q, X_SUBQ, 0, 0);
+    XN(q, sq)->tab = w;
+    XN(q, sq)->col = c;
+    XN(q, sq)->ty = exists ? CT_BOOL : CT_INT;
+    if (exists || chance(60)) {
+        int z = xnew(q, X_SUB, xcol(q, w, c), xcol(q, w, c));
+        int dv = xnew(q, X_DIV, xlit_int(q, 100), z);
+        XN(q, sq)->l = dv;
+        XN(q, sq)->fn = exists ? 1 : 3;
+    } else {
+        XN(q, sq)->fn = 4;
+    }
+    if (chance(70)) XN(q, sq)->x3 = gen_subq_where(q, w, -1);
+    return sq;
+}
+
+/* P2 S11: an item over such a SELECT: CASE WHEN c THEN x ELSE (SELECT ...) END (or the branches the other way),
+ * COALESCE(a column that may be NULL, (SELECT ...)), CASE WHEN [NOT] EXISTS (SELECT 100 / (c - c) ...) THEN 1 ELSE 0 */
+static int gen_lazy_item(stmt *q)
+{
+    int r = (int)rr(0, 99);
+    if (r < 45) {
+        int sq = gen_lazyq(q, false), x = gen_xint(q, 1, false);
+        return chance(70) ? xcase(q, x, sq) : xcase(q, sq, x);
+    }
+    if (r < 75) {
+        int sq = gen_lazyq(q, false);
+        return xfn(q, XF_COALESCE, xcol(q, q->tab, (int)rr(1, 2)), sq, CT_INT, 0); /* t: g, a; u: tid, v */
+    }
+    int sq = gen_lazyq(q, true);
+    if (chance(30)) sq = xbool(q, X_NOT, sq, 0);
+    int k = xnew(q, X_CASE, sq, xlit_int(q, 1));
+    XN(q, k)->x3 = xlit_int(q, 0);
+    XN(q, k)->ty = CT_INT;
+    XN(q, k)->sc = 0;
+    q->fns = true;
+    return k;
+}
+
+/* P2 S11: rows of t or u under plain predicates, the key and one or two such items. A subquery runs when a row first
+ * needs it in PostgreSQL (the reference: an initplan) and in imagedb, so the statement fails exactly when a row takes
+ * the branch; EXISTS computes no SELECT list in any engine. Items only: SQL leaves the order of WHERE's conjuncts open
+ * (PostgreSQL's by cost, imagedb's left to right), and items are computed after the rows are chosen. No order:
+ * compared as a multiset */
+static void gen_lselect(stmt *q)
+{
+    q->tab = chance(70) ? 0 : 1;
+    q->subq = q->lazy = q->fns = true;
+    q->it[q->nit++] = (item){F_COL, q->tab, 0, 0};
+    int n = (int)rr(1, 2);
+    for (int i = 0; i < n && FNROOM(q); i++) q->it[q->nit++] = (item){F_COL, 0, 0, gen_lazy_item(q)};
+    gen_preds(q, 2, false);
+    for (int i = 0; i < q->nit; i++) xmark(q, q->it[i].ex);
+}
+
 /* P2 S4: aggregates over a derived table or a CTE of t (its columns g, a, d, s; a plain predicate inside), with a
  * plain predicate outside on one of them sometimes: one row, every engine */
 static void gen_dselect(stmt *q)
@@ -1626,6 +1689,11 @@ static void gen_select(stmt *q)
     memset(q, 0, sizeof *q);
     q->kind = Q_SELECT;
     q->gcol = -1;
+    if (g_fns && !g_in_txn && chance(4)) { /* P2 S11: a subquery a row may never need (it may fail: never in a transaction,
+                                             * which a failed statement aborts in PostgreSQL) */
+        gen_lselect(q);
+        return;
+    }
     if (g_fns && chance(5)) { /* P2 S6: a window function */
         gen_wselect(q);
         return;
@@ -2224,9 +2292,12 @@ static void put_x(sb *b, int d, const stmt *q, int k, int pty)
     case X_LIST: return; /* its elements: printed by their X_IN */
     case X_SUBQ: { /* P2 S4: (SELECT y FROM w [WHERE c]), EXISTS (SELECT 1 ...), (SELECT MAX(y) ...) */
         static const char *const AG[] = {"", "COUNT", "COUNT", "SUM", "MIN", "MAX", "AVG"};
-        sb_str(b, n->fn == 1 ? "(EXISTS (SELECT 1" : "(SELECT ");
-        if (n->fn == 0 && n->qual) sb_printf(b, "ci.%s", cols(n->tab)[n->col].name); /* P2 S4b */
-        else if (n->fn == 0) put_col(b, q, n->tab, n->col);
+        sb_str(b, n->fn == 1 ? "(EXISTS (SELECT " : "(SELECT ");
+        if (n->fn == 1 && n->l) put_x(b, d, q, n->l, XN(q, n->l)->ty); /* P2 S11: a SELECT list that fails */
+        else if (n->fn == 1) sb_str(b, "1");
+        else if (n->fn == 3) sb_str(b, "MAX("), put_x(b, d, q, n->l, XN(q, n->l)->ty), sb_str(b, ")"); /* P2 S11 */
+        else if ((n->fn == 0 || n->fn == 4) && n->qual) sb_printf(b, "ci.%s", cols(n->tab)[n->col].name); /* P2 S4b */
+        else if (n->fn == 0 || n->fn == 4) put_col(b, q, n->tab, n->col); /* P2 S11: 4, a value of a column */
         else if (n->fn == 2 && n->i == F_COUNT_STAR) sb_str(b, "COUNT(*)");
         else if (n->fn == 2 && n->qual) sb_printf(b, "%s(ci.%s)", AG[n->i], cols(n->tab)[n->col].name);
         else if (n->fn == 2) sb_printf(b, "%s(", AG[n->i]), put_col(b, q, n->tab, n->col), sb_str(b, ")");
@@ -3699,6 +3770,7 @@ static long g_grp_compared; /* P2 S2: comparisons of its grouped form */
 static long g_jn_compared; /* P2 S3: comparisons of its join forms */
 static long g_subq_compared; /* P2 S4: comparisons of statements with a subquery, a derived table or a CTE */
 static long g_corr_compared; /* P2 S4b: comparisons of statements with a correlated subquery */
+static long g_lazy_compared; /* P2 S11: comparisons of items over a SELECT that fails when it runs */
 static long g_set_compared, g_rec_compared; /* P2 S5: comparisons of set operations, of WITH RECURSIVE */
 static long g_win_compared; /* P2 S6: comparisons of window functions */
 static long g_isel_compared, g_ret_compared; /* P2 S8: INSERT ... SELECT, RETURNING's rows */
@@ -3762,16 +3834,19 @@ static void diagnose(const stmt *q, int d)
 static long g_excused;
 static long g_class_diff; /* both refused, one for a zero divisor and one for an overflow */
 
-/* an error's class: 1 a zero divisor, 2 an overflow, 0 another (each engine's words) */
+/* an error's class: 1 a zero divisor, 2 an overflow, 3 a value's second row (P2 S11), 0 another (each engine's words) */
 static int err_class(const char *msg)
 {
     if (strstr(msg, "division by zero") || strstr(msg, "Divide by zero")) return 1;
     if (strstr(msg, "overflow") || strstr(msg, "out of range") || strstr(msg, "38 digits")) return 2;
+    if (strstr(msg, "more than one row") || strstr(msg, "more than 1 row") || strstr(msg, "more than 1 value")) return 3;
     return 0;
 }
 static bool excused(int d, const char *msg, const char *text)
 {
     if (strstr(msg, "division by zero")) return d == D_SQLITE || d == D_MY || d == D_MA;
+    /* P2 S11: SQLite's value of a subquery is its first row, however many it returns */
+    if (strstr(msg, "returned more than one row")) return d == D_SQLITE;
     /* MariaDB 12.3.3 wraps 0 - x for x = INT64_MIN to INT64_MIN, silently (-x, 1 - x, x - 1, -1 * x and x DIV -1 it
      * refuses as overflows; reproduced alone, 2026-11-05, seed 6 of that day's five-engine run: AVG((0 - x))). An
      * INT64 overflow imagedb wrongly raised would still be caught: PostgreSQL is compared first */
@@ -3837,6 +3912,20 @@ static bool excused_other(int d, const char *msg, const char *text)
     /* SQL Server refuses INT64_MIN % -1 ("Arithmetic overflow"), which is 0 (PostgreSQL, MySQL, imagedb) */
     return d == D_MS && strstr(msg, "Arithmetic overflow error converting expression to data type bigint") &&
            strstr(text, "% CAST(-1 AS BIGINT)");
+}
+
+/* P2 S11: engine d refused, for a zero divisor or a value's second row, a SELECT whose subquery imagedb runs only where a
+ * row needs it (q->lazy: in a branch no row takes, or with no row to need it). SQL Server, MySQL and MariaDB evaluate an
+ * uncorrelated subquery before the rows (SQL Server's divide by zero over no row: the five-engine smoke of 2026-11-06, seed
+ * 4 step 57 on S13's tree). PostgreSQL runs it on demand, as imagedb does, and is never excused here: a subquery imagedb
+ * ran too late, or skipped where a row needed it, is still caught against it */
+static long g_lazy_early;
+static bool excused_lazy(int d, const stmt *q, const char *msg)
+{
+    int c = err_class(msg);
+    if (!q->lazy || !(d == D_MY || d == D_MA || d == D_MS) || !(c == 1 || c == 3)) return false;
+    g_lazy_early++;
+    return true;
 }
 
 /* P2 S9: imagedb's statement (text, its literals $1..$n in g_par) run as PREPARE with their types, EXECUTE with their
@@ -3906,6 +3995,7 @@ static int run_stmt(unsigned seed, int step, const stmt *q, bool state)
         if (q->jn3) g_jn_compared++;
         if (q->subq) g_subq_compared++;
         if (q->corr) g_corr_compared++;
+        if (q->lazy) g_lazy_compared++; /* P2 S11 */
         if (q->narm) g_set_compared++;
         if (q->rec) g_rec_compared++;
         if (q->win) g_win_compared++;
@@ -3919,7 +4009,7 @@ static int run_stmt(unsigned seed, int step, const stmt *q, bool state)
         const char *why = NULL;
         size_t at = 0;
         if ((base->err && !o->err && (excused(d, base->msg, text[d].p) || excused_window(d, q, base->msg))) ||
-            (!base->err && o->err && excused_other(d, o->msg, text[d].p))) {
+            (!base->err && o->err && (excused_other(d, o->msg, text[d].p) || excused_lazy(d, q, o->msg)))) {
             g_excused++;
             if (g_verbose) fprintf(stderr, "  excused (%s): %s\n    imagedb: %s\n    %s: %s\n", DNAME[d], text[d].p,
                                    base->err ? base->msg : "answered", DNAME[d], o->err ? o->msg : "answered");
@@ -4140,6 +4230,8 @@ int main(int argc, char **argv)
            "SQLite; an INT64 overflow: REAL in SQLite; INT64 past 2^53 in FLOAT64: rounded by all; MySQL's INT64_MIN DIV n; SQL Server's INT64_MIN %% -1); %ld both refused "
            "for another reason\n", g_excused, g_eng[D_PG].on ? "" : " (UNGUARDED: PostgreSQL was not run)", g_class_diff);
     printf("oracle: DROP TABLE u made again %ld times on every engine\n", g_drops);
+    printf("oracle: %ld refusals of a subquery imagedb runs on demand excused (P2 S11: SQL Server, MySQL and MariaDB "
+           "evaluate it before the rows; PostgreSQL never excused)\n", g_lazy_early);
     printf("oracle: %ld refusals under HAVING, LIMIT or OFFSET excused: the reference refused the same statement without them\n",
            g_excused_window);
     printf("oracle: %ld ORDER BY items SQL Server called constants, left out (a constant orders nothing)\n", g_ms_dropped);
@@ -4156,6 +4248,7 @@ int main(int argc, char **argv)
            "");
     printf("oracle: %ld comparisons of P2 S5's set operations, %ld of its WITH RECURSIVE\n", g_set_compared, g_rec_compared);
     printf("oracle: %ld comparisons of P2 S4b's correlated subqueries\n", g_corr_compared);
+    printf("oracle: %ld comparisons of P2 S11's subqueries a row may never need\n", g_lazy_compared);
     printf("oracle: %ld comparisons of P2 S4's subqueries (IN, NOT IN, EXISTS, a value), derived tables and CTEs\n",
            g_subq_compared);
     printf("oracle: %ld comparisons of P2 S3's joins (RIGHT, FULL, CROSS, ON's conditions and key pairs, USING); SQLite's "

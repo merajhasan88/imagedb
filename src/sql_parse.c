@@ -1142,6 +1142,7 @@ static int parse_with_list(parser *p, sql_stmt *st)
             return p->e->code;
         sql_stmt *in = st->sub[st->nsub - 1];
         in->recursive = rec;
+        in->with_cte = true; /* P2 S11 */
         if (nc) {
             if (!(in->cte_col = imdb_alloc((size_t)nc * sizeof *in->cte_col, p->e))) return p->e->code;
             memcpy(in->cte_col, cols, (size_t)nc * sizeof *in->cte_col);

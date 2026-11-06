@@ -22,6 +22,7 @@ static _Atomic uint64_t g_heap;
  * (malloc's rounding). */
 static _Atomic uint64_t g_ceiling;
 static _Atomic uint64_t g_workspace; /* the ceiling's workspace, for its message */
+static _Atomic uint64_t g_refusals; /* P2 S11: the ceiling's refusals, for cross_check to tell a plan's own (xc_own) */
 /* This thread is inside an allocation the ceiling does not cover (a segment image's load: the segment cache's
  * own budget bounds it): what it reserves raises the ceiling first, what it frees lowers it, so the ceiling
  * keeps bounding the statement's workspace alone. A depth: loads may nest. */
@@ -55,6 +56,7 @@ static int reserve(size_t n, size_t *held, imdb_err *e)
     uint64_t c = atomic_load_explicit(&g_ceiling, memory_order_relaxed);
     if (c && now > c) {
         atomic_fetch_sub_explicit(&g_heap, n, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_refusals, 1, memory_order_relaxed);
         return imdb_fail(e, IMDB_ERR_LIMIT,
                          "statement memory: this statement would hold more than its %llu bytes (SET statement_memory); "
                          "narrow it, or add LIMIT",
@@ -90,6 +92,7 @@ void imdb_heap_ceiling_set(uint64_t ceiling, uint64_t workspace)
     atomic_store_explicit(&g_ceiling, ceiling, memory_order_relaxed);
 }
 uint64_t imdb_heap_ceiling(void) { return atomic_load_explicit(&g_ceiling, memory_order_relaxed); }
+uint64_t imdb_heap_ceiling_refusals(void) { return atomic_load_explicit(&g_refusals, memory_order_relaxed); }
 void imdb_heap_exempt_begin(void) { t_exempt++; }
 void imdb_heap_exempt_end(void) { t_exempt--; }
 
