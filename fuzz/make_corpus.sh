@@ -143,5 +143,6 @@ idt=$("$BIN" identity "$ER")
 mkdir -p "$OUT/backup"
 printf 'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB' > "$WORK/fuzz-backup.key"
 chmod 0400 "$WORK/fuzz-backup.key"
+rm -f "$OUT/backup/full.bak" # a backup never writes over a name: a second make fuzz-run would stop here
 "$BIN" backup "$D" --key "$WORK/fuzz-backup.key" --out "$OUT/backup/full.bak" >/dev/null
 echo "corpus: $(find "$OUT" -type f | wc -l) seeds in $OUT"
