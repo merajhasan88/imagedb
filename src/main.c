@@ -54,6 +54,9 @@ static int usage(void)
           "                                             allowlist a replica's key for acknowledgements\n"
           "  imagedb verify <dir> [--anchor FILE]       re-verify log, chain, signatures, digests, erasure, lake\n"
           "  imagedb info <dir>                         head, digest, tables, lake\n"
+          "  imagedb dump <dir> [--batch N]             a logical dump on stdout: every table's CREATE TABLE, rows\n"
+          "                                             (COPY ... FROM STDIN, BATCH N rows a commit; 10000) and\n"
+          "                                             indexes at one commit; imagedb sql NEW -f FILE restores it\n"
           "  imagedb stats <file>                       a running copy's export (--stats FILE on sql, apply, follow)\n"
           "  imagedb health <dir> [--stats FILE] [--max-statement-s N]   0 healthy; 1 slow or unreadable; 2 failed; 3 damaged\n"
           "  imagedb recover <dir> [--discard-tail --save FILE]\n"
@@ -1422,6 +1425,26 @@ int main(int argc, char **argv)
     }
     if (strcmp(cmd, "stats") == 0 && argc == 3) return cmd_stats(argv[2]); /* P1 M1 */
     if (strcmp(cmd, "health") == 0 && argc >= 3) return cmd_health(argc, argv);
+    if (strcmp(cmd, "dump") == 0 && (argc == 3 || (argc == 5 && strcmp(argv[3], "--batch") == 0))) { /* P2 S17 */
+        uint32_t batch = 0;
+        if (argc == 5) {
+            char *end = NULL;
+            unsigned long v = strtoul(argv[4], &end, 10);
+            if (!end || *end || !v || v > UINT32_MAX) return usage();
+            batch = (uint32_t)v;
+        }
+        imdb_db *db = open_or_die(argv[2], true, 0); /* read-only: a live primary's or a replica's, never the writer's */
+        if (!db) return 1;
+        imdb_err de = {0};
+        int rc = imdb_dump(db, batch, copy_write, NULL, &de);
+        if (!rc && fflush(stdout) != 0) rc = imdb_fail(&de, IMDB_ERR_IO, "dump: writing stdout failed");
+        imdb_close(db);
+        if (rc) {
+            fprintf(stderr, "imagedb: error: %s (what was written is not a whole dump)\n", de.msg);
+            return 1;
+        }
+        return 0;
+    }
     if (strcmp(cmd, "info") == 0 && argc == 3) {
         imdb_db *db = open_or_die(argv[2], true, 0);
         if (!db) return 1;

@@ -1526,7 +1526,7 @@ typedef struct group {
     imdb_value key;
 } group;
 
-enum { SINK_VIDS = 1, SINK_AGG, SINK_GROUP, SINK_DIGEST, SINK_JBUILD, SINK_JPROBE, SINK_JOUTER, SINK_JINNER };
+enum { SINK_VIDS = 1, SINK_AGG, SINK_GROUP, SINK_DIGEST, SINK_COPY, SINK_JBUILD, SINK_JPROBE, SINK_JOUTER, SINK_JINNER };
 enum { SINK_FOUND = 1 }; /* P2 S11: k->err when a first row stopped the path (k->first): positive, never an IMDB_ERR_* */
 
 typedef struct sink {
@@ -1568,6 +1568,12 @@ typedef struct sink {
     imdb_buf kenc, denc;     /* a row's keys, a DISTINCT value: their bytes */
     imdb_hmap dmap;          /* DISTINCT's set (dist_seen) */
     bool first;              /* P2 S11: EXISTS with no WHERE tree: the first row it takes stops the path (SINK_FOUND) */
+    struct copy_out *co;     /* P2 S17: SINK_COPY, a table's COPY TO: each row written as the path gives it (copy_row) */
+    const int *cmap;         /* its columns, in COPY's order */
+    uint16_t cwidth;
+    char cdelim;
+    imdb_buf *ctmp;          /* one value's text */
+    uint64_t crows;
 } sink;
 
 /* xtick for a sink's loop: its error set, so the path stops there (every path loop tests k->err) */
@@ -1847,6 +1853,8 @@ fail:
     imdb_xarena_reset(&x->arena, m);
 }
 
+static void copy_row(sink *k, const imdb_value *vals); /* P2 S17 */
+
 static void sink_row(sink *k, uint64_t vid, const imdb_value *vals)
 {
     if (k->err) return;
@@ -1888,6 +1896,7 @@ static void sink_row(sink *k, uint64_t vid, const imdb_value *vals)
         }
         if (k->nxa && xa_row(k, k->xa, 0, vals)) k->err = k->e->code;
         return;
+    case SINK_COPY: copy_row(k, vals); return;
     case SINK_JBUILD: join_build_row(k, vid, vals); return;
     case SINK_JPROBE: join_probe_row(k, vid, vals); return;
     case SINK_JOUTER: join_outer_row(k, vid, vals); return;
@@ -6508,7 +6517,8 @@ static int exec_insert(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
 /* ---- P2 S10: COPY (design.md §5, Import and export) -------------------------------------------------------------- */
 static void cell_text(const imdb_cell *c, imdb_buf *out, bool safe);
 
-/* COPY's columns: a list as INSERT's (a column left out is NULL, refused when NOT NULL), else every column in order */
+/* COPY's columns: a list as INSERT's (FROM: a column left out is NULL, refused when NOT NULL; TO, vals NULL: any of
+ * them, P2 S17: S10 refused a TO that left out a NOT NULL column), else every column in order */
 static int copy_columns(imdb_table *t, const sql_stmt *st, int *map, uint16_t *width, imdb_value *vals, imdb_err *e)
 {
     *width = st->ncols ? st->ncols : t->s.ncols;
@@ -6526,7 +6536,7 @@ static int copy_columns(imdb_table *t, const sql_stmt *st, int *map, uint16_t *w
     }
     for (uint16_t c = 0; c < t->s.ncols; c++) {
         if (seen[c]) continue;
-        if (!(t->s.cols[c].flags & IMDB_COL_NULLABLE))
+        if (vals && !(t->s.cols[c].flags & IMDB_COL_NULLABLE))
             return imdb_fail(e, IMDB_ERR_CONSTRAINT, "column %s needs a value: it is NOT NULL", t->s.cols[c].name);
         if (vals) vals[c] = (imdb_value){.type = t->s.cols[c].type, .scale = t->s.cols[c].scale, .null = true};
     }
@@ -6712,52 +6722,114 @@ static int out_field(copy_out *o, const char *s, size_t n, char delim, imdb_err 
     return out_put(o, "\"", 1, e);
 }
 
-/* COPY t [(cols)] | (query) TO STDOUT: the query's result (a table's: its columns in key order), its header first
- * under HEADER, written in pieces as CSV. The rows are the result's, under the statement's memory (a later step:
- * a table's rows walked without holding them) */
+/* P2 S17: SINK_COPY's row, its columns in COPY's order as CSV into the output, which goes to the client every 64 KiB:
+ * nothing is kept but the output's buffer, so a table's COPY holds no row. A value is written as a result's cell is
+ * (cell_text on the value's own cell), so the two forms write it alike */
+static void copy_row(sink *k, const imdb_value *vals)
+{
+    copy_out *o = k->co;
+    for (uint16_t c = 0; c < k->cwidth; c++) {
+        const imdb_value *v = &vals[k->cmap[c]];
+        if (c && out_put(o, &k->cdelim, 1, k->e)) goto fail;
+        if (v->null) continue; /* NULL: the empty unquoted field */
+        imdb_cell cl = {.v = *v};
+        k->ctmp->len = 0;
+        cell_text(&cl, k->ctmp, false);
+        if (imdb_buf_check(k->ctmp, k->e) || out_field(o, (const char *)k->ctmp->p, k->ctmp->len, k->cdelim, k->e)) goto fail;
+    }
+    if (out_put(o, "\n", 1, k->e)) goto fail;
+    k->crows++;
+    return;
+fail:
+    k->err = k->e->code;
+}
+
+/* COPY's header under HEADER: the columns' names */
+static int out_header(copy_out *o, const sql_stmt *st, char names[][IMDB_MAX_IDENT + 8], uint16_t n, imdb_err *e)
+{
+    char d = st->copy_delim;
+    for (uint16_t c = 0; st->copy_header && c < n; c++)
+        if ((c && out_put(o, &d, 1, e)) || out_field(o, names[c], strlen(names[c]), d, e)) return e->code;
+    return st->copy_header && out_put(o, "\n", 1, e) ? e->code : IMDB_OK;
+}
+
+/* COPY t [(cols)] TO STDOUT (P2 S17, deferred.md D10): the table's rows walked at the statement's snapshot and written
+ * as the path gives them, never held, so a table larger than statement_memory is exported whole. The path is the
+ * scan, whatever the planner or SET access_path would choose, so every copy writes the same bytes at one commit: the
+ * lake's order, the table's segments in their order and then the rows not yet in one (a CHECKPOINT or COMPACT may
+ * change it; PostgreSQL's COPY writes its heap's order too). The images go behind the walk as a releasing statement's
+ * (nothing kept points into one). A failure part way (a cancel, a segment's load, the client's writer) leaves what was
+ * written: the statement fails, and what the client holds is not the table */
+static int copy_to_table(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
+{
+    imdb_table *t;
+    if (read_table(x, st, st->table, &t, e)) return e->code; /* the table at the read point, a dropped one an old
+                                                              * transaction still sees included */
+    int map[IMDB_MAX_COLS];
+    uint16_t width;
+    if (copy_columns(t, st, map, &width, NULL, e)) return e->code;
+    qspec q;
+    memset(&q, 0, sizeof q);
+    q.t = t;
+    if (resolve_snapshot(x, st, t, &q.snap, &q.pend, e) || bind_preds(x, st, &q, e)) return e->code; /* no WHERE */
+    copy_out o = {.ss = x->ss};
+    imdb_buf tmp;
+    imdb_buf_init(&tmp);
+    int rc = IMDB_OK;
+    char names[IMDB_MAX_COLS][IMDB_MAX_IDENT + 8];
+    for (uint16_t c = 0; c < width; c++) snprintf(names[c], sizeof names[c], "%s", t->s.cols[map[c]].name);
+    if (!(o.b = imdb_alloc(IMDB_COPY_BUF, e)) || out_header(&o, st, names, width, e)) {
+        rc = e->code;
+        goto done;
+    }
+    sink k;
+    memset(&k, 0, sizeof k); /* SINK_COPY allocates nothing: no sink_free */
+    k.mode = SINK_COPY;
+    k.x = x;
+    k.st = st;
+    k.t = t;
+    k.e = e;
+    k.co = &o;
+    k.cmap = map;
+    k.cwidth = width;
+    k.cdelim = st->copy_delim;
+    k.ctmp = &tmp;
+    x->release = !x->nested; /* never nested (COPY is a statement of its own): the guard states the rule */
+    rc = run_path(x, IMDB_PATH_SCAN, &q, &k, e);
+    x->release = false;
+    if (!rc) rc = out_flush(&o, e);
+    if (!rc) {
+        snprintf(r->status, sizeof r->status, "COPY %llu", (unsigned long long)k.crows);
+        r->copy_out = true;
+    }
+done:
+    if (o.b) imdb_wipe(o.b, IMDB_COPY_BUF), imdb_free(o.b);
+    if (tmp.p) imdb_wipe(tmp.p, tmp.cap);
+    imdb_buf_free(&tmp);
+    return rc;
+}
+
+/* COPY (query) TO STDOUT: the query's result, its header first under HEADER, written in pieces as CSV; the rows are the
+ * result's, under the statement's memory. A table's COPY is walked (copy_to_table) */
 static int exec_copy_to(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
 {
     imdb_session *ss = x->ss;
     if (!ss->copy_wr)
         return imdb_fail(e, IMDB_ERR_STATE, "COPY ... TO STDOUT writes the client's stream, and this session has none "
                                             "(the CLI's -c or a script, imdb_session_copy_io)");
-    const sql_stmt *src = st->src;
-    sql_stmt *made = NULL;
-    imdb_buf q;
-    imdb_buf_init(&q);
-    int rc = IMDB_OK;
-    if (!src) { /* SELECT cols FROM t ORDER BY its key: names alone, no literal (x->sql's offsets are COPY's) */
-        imdb_table *t = imdb_table_by_name(x->db, st->table);
-        if (!t) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", st->table);
-        int map[IMDB_MAX_COLS];
-        uint16_t width;
-        if (copy_columns(t, st, map, &width, NULL, e)) return e->code;
-        imdb_buf_put_str(&q, "SELECT ");
-        for (uint16_t i = 0; i < width; i++) imdb_buf_printf(&q, "%s%s", i ? ", " : "", t->s.cols[map[i]].name);
-        imdb_buf_printf(&q, " FROM %s ORDER BY %s", t->s.name, t->s.cols[t->s.pk].name);
-        if (imdb_buf_check(&q, e)) goto out;
-        if (!(made = imdb_alloc(sizeof *made, e))) {
-            rc = e->code;
-            goto out;
-        }
-        memset(made, 0, sizeof *made);
-        if ((rc = imdb_sql_parse((const char *)q.p, q.len, made, e))) goto out;
-        src = made;
-    }
+    if (!st->src) return copy_to_table(x, st, r, e);
     imdb_result res;
     imdb_result_init(&res);
     copy_out o = {.ss = ss};
     imdb_buf tmp;
     imdb_buf_init(&tmp);
-    if ((rc = run_nested(x, src, &res, NEST_SOURCE, NULL, NULL, NULL, NULL, e))) goto done;
-    if (!(o.b = imdb_alloc(IMDB_COPY_BUF, e))) {
+    int rc;
+    if ((rc = run_nested(x, st->src, &res, NEST_SOURCE, NULL, NULL, NULL, NULL, e))) goto done;
+    if (!(o.b = imdb_alloc(IMDB_COPY_BUF, e)) || out_header(&o, st, res.names, res.ncols, e)) {
         rc = e->code;
         goto done;
     }
     char d = st->copy_delim;
-    for (uint16_t c = 0; st->copy_header && c < res.ncols && !rc; c++)
-        rc = (c && out_put(&o, &d, 1, e)) || out_field(&o, res.names[c], strlen(res.names[c]), d, e) ? e->code : IMDB_OK;
-    if (!rc && st->copy_header && out_put(&o, "\n", 1, e)) rc = e->code;
     for (uint64_t i = 0; i < res.nrows && !rc; i++) {
         if ((rc = xtick(x, 1, e))) break;
         for (uint16_t c = 0; c < res.ncols && !rc; c++) {
@@ -6781,9 +6853,6 @@ done:
     if (tmp.p) imdb_wipe(tmp.p, tmp.cap);
     imdb_buf_free(&tmp);
     imdb_result_free(&res);
-out:
-    if (made) imdb_sql_stmt_free(made), imdb_free(made);
-    imdb_buf_free(&q);
     return rc;
 }
 

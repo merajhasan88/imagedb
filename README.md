@@ -454,6 +454,7 @@ Command-line options (`imagedb` with no arguments prints the commands):
 | `--digest-alg N` | init | the state digest's algorithm, 1 or 2 | `IMDB_DIGEST_ALG`, else 2 |
 | `--identity FILE` | init-replica | a replica from a primary's identity file | |
 | `--after N` | ship | the commits after N | 0 |
+| `--batch N` | dump | each table's `COPY ... FROM STDIN (BATCH N)`: rows a restore commits at once | 10000 |
 | `--after PREV` | backup | an incremental backup after backup PREV | a full one |
 | `--follow` | ship | keeps shipping new commits | stops at the end |
 | `--acks` | ship | reads the replica's acknowledgements on stdin | off |
@@ -959,10 +960,33 @@ SELECT COUNT(*) FROM orders;
   rows earlier batches committed and the `SKIP n` that resumes after them (SKIP counts data records, after the header).
   Rows go through INSERT's own path: the same checks, the same log records (no new op); a replica applies them as any.
 - COPY TO writes the header under HEADER, then each row as SELECT renders its values; a field is quoted when it holds the
-  delimiter, a quote, CR or LF, is empty, or is `\.`; NULL is the empty unquoted field; a table's rows in key order.
-  Its count goes to stderr, so stdout is the data alone. The rows are a query's result, under `statement_memory`: a
-  table larger than that is refused, so export it in key ranges, `COPY (SELECT ... WHERE id BETWEEN ...) TO STDOUT`.
-  Not yet: a streamed COPY TO, a logical dump (schema and rows as SQL) and its restore.
+  delimiter, a quote, CR or LF, is empty, or is `\.`; NULL is the empty unquoted field. Its count goes to stderr, so
+  stdout is the data alone. A table's rows (`COPY t [(cols)] TO STDOUT`, any of its columns) are walked, never held:
+  a table of any size is exported within the segment cache's budget and a 64 KiB buffer, whatever `statement_memory`
+  says. They come in the lake's order, the same on every copy at a commit: the table's segments, then the rows not yet
+  in one, each row where its current version was written (a changed row after the rest; a CHECKPOINT keeps the order,
+  a COMPACT may change it), as PostgreSQL's COPY writes its heap's order. For an order, a query: `COPY (SELECT ...
+  ORDER BY id) TO STDOUT`, whose rows are its result, under `statement_memory` (a larger one is refused: export it in
+  key ranges). A COPY TO that fails part way (a cancel, the writer, a segment's load) leaves what it wrote, and the
+  statement fails: what the client holds is not the table.
+
+Logical dump (`imagedb dump`): every table at one commit, as one script that `imagedb sql -f` restores into an empty
+database, of either digest algorithm:
+
+```sh
+imagedb dump DIR > dump.sql      # a live primary's or a replica's: it opens read-only
+imagedb init NEW && imagedb sql NEW -f dump.sql
+```
+
+- The first line names the commit (and its head and the database's digest algorithm); then each live table by name:
+  its `CREATE TABLE` (types, PRIMARY KEY, SUBJECT, NOT NULL, RETENTION), its rows as `COPY t FROM STDIN (BATCH n)` data
+  ended by `\.` (walked, as COPY TO's), its indexes; the last line the totals. A dump cut short has no totals line.
+- A dump holds the tables' current rows: no history, no dropped table, no key, no retention clock. A replica's dump at
+  its primary's commit is the primary's, byte for byte.
+- `--batch N` (default 10,000) is each table's `BATCH`: a restore commits every N rows, so a table larger than one
+  transaction restores; a batch must fit one (1,048,576 rows, 768 MiB). A restore that fails part way leaves the
+  batches it committed: remove the database and start again.
+- Refused: a table whose retention is not a whole number of seconds (an API's may be finer; `RETENTION` cannot spell it).
 
 ## Validation
 

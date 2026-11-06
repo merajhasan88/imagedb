@@ -22,6 +22,7 @@ typedef struct mem_io {
     size_t outlen, outcap;
     bool fail_read, fail_write;
     size_t cancel_at; /* a byte count: the session is cancelled once the reads pass it (0: never) */
+    bool cancel_on_write; /* P2 S17: the session is cancelled at the writer's first call */
 } mem_io;
 static mem_io g_io;
 
@@ -41,6 +42,7 @@ static long mem_read(void *arg, char *buf, size_t cap)
 static int mem_write(void *arg, const char *b, size_t n)
 {
     mem_io *m = arg;
+    if (m->cancel_on_write) imdb_session_cancel(&g_s);
     if (m->fail_write || m->outlen + n > m->outcap) return -1;
     if (n) memcpy(m->out + m->outlen, b, n);
     m->outlen += n;
@@ -392,6 +394,10 @@ static void t_copy_replica(void)
     for (int i = 1; i <= 500; i++)
         n += (size_t)snprintf(g_batch + n, sizeof g_batch - n, "%d,\"r%d, \"\"q\"\"\",%d.%02d\n", i, i, i, i % 100);
     EXPECT(copy_in("COPY c FROM STDIN (BATCH 100)", g_batch, n, 997), "COPY 500");
+    /* P2 S17: rows moved in the lake's order (a changed row after the rest, a segment, the rows after it): the replica's
+     * walk writes the same bytes */
+    CHECK(run("UPDATE c SET s = 'changed' WHERE id = 7") == 0 && run("CHECKPOINT") == 0 &&
+          run("UPDATE c SET d = 1.25 WHERE id = 3") == 0);
     CHECK(run("VERIFY") == 0);
     char want[1 << 16];
     snprintf(want, sizeof want, "%s", copy_out("COPY c TO STDOUT"));
@@ -425,7 +431,7 @@ static void t_copy_query(void)
     EXPECT(copy_out("COPY (SELECT g, COUNT(*) AS n, MIN(s) AS lo FROM q GROUP BY g ORDER BY g) TO STDOUT (HEADER)"),
            "g,n,lo\n1,2,a\n2,2,\"\"\n");
     EXPECT(copy_out("COPY (WITH w AS (SELECT id FROM q WHERE g = 2) SELECT id * 10 AS t FROM w ORDER BY t) TO STDOUT"), "30\n40\n");
-    EXPECT(copy_out("COPY q (s, id) TO STDOUT"), "a,1\n,2\n\"c,d\",3\n\"\",4\n"); /* key order */
+    EXPECT(copy_out("COPY q (s, id) TO STDOUT"), "a,1\n,2\n\"c,d\",3\n\"\",4\n"); /* the lake's order (P2 S17): written in key order */
     EXPECT(csv("COPY (SELECT nosuch FROM q) TO STDOUT"), "ERR nosuch");
     /* a read: no commit, and SET min_commit holds it as it holds a SELECT */
     uint64_t seq = db->seq;
@@ -483,6 +489,377 @@ static void t_copy_forms(void)
     done(db);
 }
 
+/* ---- P2 S17: a table's COPY TO walked, and the logical dump (deferred.md D10) ------------------------------------ */
+
+/* rows from..to of (id, g, s): g = id % 7, s len letters; INSERTs of 500 rows */
+static int fill(const char *table, int from, int to, int len)
+{
+    size_t cap = 500u * (size_t)(len + 48) + 64;
+    char *q = malloc(cap);
+    if (!q) return -1;
+    int rc = 0;
+    for (int at = from; at <= to && !rc; at += 500) {
+        size_t k = (size_t)snprintf(q, cap, "INSERT INTO %s VALUES ", table);
+        for (int i = at; i < at + 500 && i <= to; i++) {
+            k += (size_t)snprintf(q + k, cap - k, "%s(%d, %d, '", i > at ? ", " : "", i, i % 7);
+            for (int c = 0; c < len; c++) q[k++] = (char)('a' + (i + c) % 26);
+            q[k++] = '\'';
+            q[k++] = ')';
+        }
+        q[k] = 0;
+        rc = run(q);
+    }
+    free(q);
+    return rc;
+}
+
+/* a table's COPY writes the lake's order whatever the planner would choose: the segments in the table's order, then
+ * the rows not yet in one, each where its version was written (a changed row after the rest); a column list may leave
+ * a NOT NULL column out (S10 refused it: FROM's rule); a transaction's own rows where its versions are */
+static void t_copy_walk_order(void)
+{
+    imdb_db *db = open_fresh();
+    CHECK(db);
+    CHECK(run("CREATE TABLE t (id INT64 PRIMARY KEY, v INT64 NOT NULL, w TEXT)") == 0);
+    CHECK(run("INSERT INTO t VALUES (5, 50, 'e'), (1, 10, 'a'), (6, 60, 'f'), (3, 30, 'c'), (2, 20, 'b'), (4, 40, 'd')") == 0);
+    CHECK(run("UPDATE t SET v = 21 WHERE id = 2") == 0);
+    EXPECT(copy_out("COPY t TO STDOUT"), "5,50,e\n1,10,a\n6,60,f\n3,30,c\n4,40,d\n2,21,b\n");
+    CHECK(run("CHECKPOINT") == 0 && run("UPDATE t SET v = 41 WHERE id = 4") == 0);
+    const char *want = "5,50,e\n1,10,a\n6,60,f\n3,30,c\n2,21,b\n4,41,d\n";
+    EXPECT(copy_out("COPY t TO STDOUT"), want);
+    EXPECT(copy_out("COPY t (w, id) TO STDOUT (HEADER)"), "w,id\ne,5\na,1\nf,6\nc,3\nb,2\nd,4\n");
+    EXPECT(copy_in("COPY t (w) FROM STDIN", "z\n", 2, 0), "ERR column id needs a value: it is NOT NULL");
+    static const char *const paths[] = {"SET access_path = store", "SET access_path = scan", "SET access_path = auto"};
+    for (int i = 0; i < 3; i++) {
+        CHECK(run(paths[i]) == 0);
+        EXPECT(copy_out("COPY t TO STDOUT"), want);
+    }
+    CHECK(run("BEGIN") == 0 && run("INSERT INTO t VALUES (7, 70, 'g')") == 0 && run("UPDATE t SET v = 11 WHERE id = 1") == 0);
+    EXPECT(copy_out("COPY t TO STDOUT"), "5,50,e\n6,60,f\n3,30,c\n2,21,b\n4,41,d\n7,70,g\n1,11,a\n");
+    CHECK(run("ROLLBACK") == 0);
+    EXPECT(copy_out("COPY t TO STDOUT"), want);
+    done(db);
+}
+
+/* a table larger than the statement's memory is exported whole: the walk holds no row, so a 1 MiB ceiling never meets
+ * it, where the same rows as a query's result are refused under it (key order here: written in key order) */
+static void t_copy_walk_ceiling(void)
+{
+    imdb_db *db = open_fresh();
+    CHECK(db);
+    CHECK(run("CREATE TABLE big (id INT64 PRIMARY KEY, g INT64, s TEXT)") == 0);
+    CHECK(fill("big", 1, 8000, 150) == 0 && run("CHECKPOINT") == 0 && fill("big", 8001, 12000, 150) == 0);
+    char *keyed = strdup(copy_out("COPY (SELECT id, g, s FROM big ORDER BY id) TO STDOUT"));
+    CHECK(keyed && strlen(keyed) > (1u << 20));
+    CHECK(run("SET statement_memory = 1048576") == 0);
+    EXPECT(copy_out("COPY big TO STDOUT"), keyed);
+    const char *q = copy_out("COPY (SELECT id, g, s FROM big) TO STDOUT");
+    if (strncmp(q, "ERR ", 4) || !strstr(q, "1048576")) fprintf(stderr, "    the query form under 1 MiB: %.200s\n", q);
+    CHECK(!strncmp(q, "ERR ", 4) && strstr(q, "1048576") != NULL); /* the result's cap or the heap's ceiling: the 1 MiB */
+    CHECK(run("SET statement_memory = 0") == 0);
+    free(keyed);
+    done(db);
+}
+
+/* a failure part way leaves what was written, a prefix of the table's text: the client's writer failing at its second
+ * piece (the first 64 KiB written) and a cancel the writer makes (seen at the walk's next check); the session runs
+ * the next statement */
+static void t_copy_walk_fail(void)
+{
+    imdb_db *db = open_fresh();
+    CHECK(db);
+    CHECK(run("CREATE TABLE big (id INT64 PRIMARY KEY, g INT64, s TEXT)") == 0);
+    CHECK(fill("big", 1, 12000, 150) == 0);
+    char *all = strdup(copy_out("COPY big TO STDOUT"));
+    CHECK(all);
+    size_t len = strlen(all), cap = g_io.outcap;
+    g_io.outcap = 100000; /* the second piece does not fit */
+    EXPECT(copy_out("COPY big TO STDOUT"), "ERR COPY ... TO STDOUT: writing the data failed");
+    CHECK(g_io.outlen == IMDB_COPY_BUF && !memcmp(g_io.out, all, IMDB_COPY_BUF));
+    g_io.outcap = cap;
+    g_io.cancel_on_write = true;
+    const char *got = copy_out("COPY big TO STDOUT");
+    g_io.cancel_on_write = false;
+    CHECK(!strncmp(got, "ERR ", 4) && strstr(got, "cancel") != NULL);
+    CHECK(g_io.outlen >= IMDB_COPY_BUF && g_io.outlen < len && !memcmp(g_io.out, all, g_io.outlen));
+    EXPECT(copy_out("COPY big TO STDOUT"), all);
+    free(all);
+    done(db);
+}
+
+/* the walk lets each image go behind it while the cache is over its budget: the same bytes at a budget of every image,
+ * of one and of none, holding at most the budget and the image in hand */
+static void t_copy_walk_images(void)
+{
+    imdb_db *db = open_fresh();
+    CHECK(db);
+    CHECK(run("CREATE TABLE big (id INT64 PRIMARY KEY, g INT64, s TEXT)") == 0);
+    for (int k = 0; k < 8; k++) CHECK(fill("big", k * 600 + 1, (k + 1) * 600, 120) == 0 && run("CHECKPOINT") == 0);
+    CHECK(fill("big", 4801, 5000, 120) == 0);
+    imdb_table *t = imdb_table_by_name(db, "big");
+    CHECK(t && t->nseg >= 8);
+    db->segcache.budget = UINT64_MAX;
+    char *want = strdup(copy_out("COPY big TO STDOUT"));
+    CHECK(want);
+    uint64_t largest = 0; /* every image loaded and kept: the size of each known */
+    for (uint32_t k = 0; k < t->nseg; k++)
+        if (imdb_seg_image_bytes(t->seg[k]) > largest) largest = imdb_seg_image_bytes(t->seg[k]);
+    CHECK(largest > 0);
+    static const uint64_t times[] = {1, 0};
+    for (int b = 0; b < 2; b++) {
+        db->segcache.budget = times[b] * largest;
+        CHECK(run("SELECT 1") == 0); /* an operation's end trims the cache to the new budget */
+        uint64_t rel = db->segcache.released;
+        db->segcache.peak = db->segcache.resident;
+        EXPECT(copy_out("COPY big TO STDOUT"), want);
+        if (db->segcache.peak > (times[b] + 1) * largest)
+            fprintf(stderr, "    budget %llu: peak %llu, largest %llu, %u segments, released %llu\n",
+                    (unsigned long long)db->segcache.budget, (unsigned long long)db->segcache.peak, (unsigned long long)largest,
+                    t->nseg, (unsigned long long)(db->segcache.released - rel));
+        CHECK(db->segcache.peak <= (times[b] + 1) * largest);
+        CHECK(db->segcache.released > rel);
+    }
+    free(want);
+    done(db);
+}
+
+/* a dump's bytes, as a writer of the dump gets them */
+typedef struct outb {
+    char *p;
+    size_t n, cap;
+    size_t limit; /* a writer that fails past this many bytes (0: none) */
+} outb;
+
+static int outb_write(void *arg, const char *b, size_t n)
+{
+    outb *o = arg;
+    if (o->limit && o->n + n > o->limit) return -1;
+    if (o->n + n + 1 > o->cap) {
+        size_t c = (o->n + n + 1) * 2;
+        char *q = realloc(o->p, c);
+        if (!q) return -1;
+        o->p = q;
+        o->cap = c;
+    }
+    memcpy(o->p + o->n, b, n);
+    o->n += n;
+    o->p[o->n] = 0;
+    return 0;
+}
+
+/* a dump restored as imagedb sql -f restores it (main.c's runner, in small): each line a statement, a comment line
+ * skipped, and a COPY's data the lines after it up to a \. line outside quotes */
+static int restore_text(const char *s, size_t n)
+{
+    static char line[1 << 14];
+    size_t at = 0;
+    while (at < n) {
+        size_t eol = at;
+        while (eol < n && s[eol] != '\n') eol++;
+        size_t ll = eol - at;
+        if (ll >= sizeof line) return -1;
+        memcpy(line, s + at, ll);
+        line[ll] = 0;
+        at = eol < n ? eol + 1 : n;
+        if (!ll || !strncmp(line, "--", 2)) continue;
+        if (strncmp(line, "COPY ", 5)) {
+            if (run(line)) return -1;
+            continue;
+        }
+        size_t k = at;
+        bool bol = true, inq = false;
+        for (; k < n; k++) {
+            if (bol && !inq && s[k] == '\\' && k + 1 < n && s[k + 1] == '.' && (k + 2 == n || s[k + 2] == '\n')) break;
+            if (s[k] == '"') inq = !inq;
+            bol = s[k] == '\n';
+        }
+        if (k >= n || strncmp(copy_in(line, s + at, k - at, 0), "COPY ", 5)) return -1;
+        at = k + 2 < n ? k + 3 : n;
+    }
+    return 0;
+}
+
+static const char *const g_dump_tables[] = {"a", "big", "people", "z"};
+
+/* each table's rows in key order */
+static char *keyed_rows(void)
+{
+    outb o = {0};
+    for (size_t i = 0; i < sizeof g_dump_tables / sizeof *g_dump_tables; i++) {
+        char q[160];
+        snprintf(q, sizeof q, "COPY (SELECT * FROM %s ORDER BY %s) TO STDOUT", g_dump_tables[i], i == 3 ? "k" : "id");
+        const char *got = copy_out(q);
+        if (outb_write(&o, got, strlen(got))) return NULL;
+    }
+    return o.p;
+}
+
+/* a dump names its commit first and its totals last, and leaves the dropped table out; a replica's at the primary's
+ * commit is the primary's, byte for byte; restored into an empty database of the other digest algorithm (each table
+ * in batches of 1,000 rows) and dumped again it is the same text past its first line, each table's rows the same in key
+ * order, VERIFY passing */
+static void t_copy_dump(void)
+{
+    const char *base = test_tmpdir();
+    char p[600], r[600], q[600], sf[600];
+    snprintf(p, sizeof p, "%s/primary", base);
+    snprintf(r, sizeof r, "%s/replica", base);
+    snprintf(q, sizeof q, "%s/restored", base);
+    snprintf(sf, sizeof sf, "%s/stream", base);
+    OK(imdb_init(p, false, NULL, E));
+    OK(imdb_init(r, true, p, E));
+    memset(&g_io, 0, sizeof g_io);
+    g_io.outcap = 8u << 20;
+    g_io.out = malloc(g_io.outcap + 1);
+    CHECK(g_io.out);
+    imdb_db *db = open_at(p);
+    CHECK(db);
+    static const char *const setup[] = {
+        "CREATE TABLE people (id INT64 PRIMARY KEY, who INT64 SUBJECT, name TEXT NOT NULL, bal DECIMAL(12,2), f FLOAT64, "
+        "ok BOOL, at TIMESTAMP) RETENTION 7 DAYS",
+        "CREATE TABLE a (id INT64 PRIMARY KEY, s TEXT) RETENTION FOREVER",
+        "CREATE TABLE z (k INT64 PRIMARY KEY, v INT64 NOT NULL) RETENTION 90 MINUTES",
+        "CREATE TABLE gone (id INT64 PRIMARY KEY)",
+        "CREATE TABLE big (id INT64 PRIMARY KEY, g INT64, s TEXT)",
+        "INSERT INTO people VALUES (2, 7, 'Ann \"A\", jr.', 12.50, -0.1, true, '2026-11-06 16:30:00'), (1, 8, 'line1\nline2', "
+        "NULL, 1e300, NULL, NULL), (3, 7, '\\.', -0.01, 0, false, '1970-01-01 00:00:00')",
+        "INSERT INTO a VALUES (1, ''), (2, NULL), (3, 'x,y')",
+        "INSERT INTO z VALUES (5, 50), (6, 60)",
+        "INSERT INTO gone VALUES (1)",
+        "CREATE UNIQUE INDEX zv ON z (v)",
+        "CREATE INDEX pn ON people (who, name)",
+        "UPDATE people SET bal = 13.00 WHERE id = 2",
+        "CHECKPOINT",
+        "UPDATE a SET s = 'moved' WHERE id = 1",
+        "INSERT INTO people VALUES (4, 8, 'late', 1.00, 2.5, true, '2026-11-06 17:00:00')",
+        "ERASE SUBJECT 8", /* id 1 in a segment and id 4 in the memtable: stubs the walk skips */
+        "DROP TABLE gone",
+    };
+    for (size_t i = 0; i < sizeof setup / sizeof *setup; i++) CHECK(run(setup[i]) == 0);
+    CHECK(fill("big", 1, 2500, 40) == 0);
+    char *keyed = keyed_rows();
+    CHECK(keyed);
+    outb d1 = {0}, d2 = {0}, d3 = {0};
+    OK(imdb_dump(db, 1000, outb_write, &d1, E));
+    char head[120], tail[120];
+    snprintf(head, sizeof head, "-- imagedb dump of commit %llu (head ", (unsigned long long)db->seq);
+    snprintf(tail, sizeof tail, "\\.\nCREATE UNIQUE INDEX zv ON z (v);\n-- the end of the dump: 4 tables, %d rows\n", 3 + 2500 + 2 + 2);
+    if (!d1.p || strncmp(d1.p, head, strlen(head)) || d1.n <= strlen(tail) || strcmp(d1.p + d1.n - strlen(tail), tail))
+        fprintf(stderr, "    the dump: %.160s ... %s\n", d1.p ? d1.p : "(none)", d1.p && d1.n > 120 ? d1.p + d1.n - 120 : "");
+    CHECK(d1.p && !strncmp(d1.p, head, strlen(head)) && d1.n > strlen(tail) && !strcmp(d1.p + d1.n - strlen(tail), tail));
+    CHECK(!strstr(d1.p, "gone") && strstr(d1.p, "COPY big FROM STDIN (BATCH 1000);\n"));
+    CHECK(!strstr(d1.p, "line1") && !strstr(d1.p, "late") && strstr(d1.p, "jr.")); /* the erased rows' texts gone */
+    imdb_session_close(&g_s);
+    OK(ship_to_file(p, 0, sf, E));
+    imdb_db *rep = NULL;
+    imdb_open_opts o = {.sync = 0};
+    OK(imdb_open(r, &o, &rep, E));
+    uint64_t applied = 0;
+    OK(apply_file(rep, sf, &applied, E));
+    CHECK(rep->seq == db->seq);
+    OK(imdb_dump(rep, 1000, outb_write, &d2, E));
+    CHECK(d2.n == d1.n && !memcmp(d1.p, d2.p, d1.n));
+    imdb_close(rep);
+    uint8_t other = db->meta.digest_alg == IMDB_DIGEST_ALG_LTHASH16 ? IMDB_DIGEST_ALG_LTHASH16_TREE : IMDB_DIGEST_ALG_LTHASH16;
+    imdb_close(db);
+    OK(imdb_init_primary_alg(q, NULL, other, E));
+    imdb_db *dst = open_at(q);
+    CHECK(dst && dst->meta.digest_alg == other);
+    CHECK(restore_text(d1.p, d1.n) == 0);
+    OK(imdb_dump(dst, 1000, outb_write, &d3, E));
+    const char *a1 = strchr(d1.p, '\n'), *a3 = d3.p ? strchr(d3.p, '\n') : NULL;
+    CHECK(a1 && a3 && !strcmp(a1, a3));
+    char *keyed2 = keyed_rows();
+    CHECK(keyed2 && !strcmp(keyed, keyed2));
+    CHECK(run("VERIFY") == 0);
+    done(dst);
+    free(keyed);
+    free(keyed2);
+    free(d1.p);
+    free(d2.p);
+    free(d3.p);
+}
+
+/* a retention RETENTION cannot spell (whole seconds; the API's may be finer) refuses the dump, which ends without its
+ * totals; nothing is written for that table */
+static void t_copy_dump_refused(void)
+{
+    imdb_db *db = open_fresh();
+    CHECK(db);
+    CHECK(run("CREATE TABLE a (id INT64 PRIMARY KEY)") == 0 && run("INSERT INTO a VALUES (1)") == 0);
+    imdb_schema s;
+    memset(&s, 0, sizeof s);
+    snprintf(s.name, sizeof s.name, "b");
+    s.ncols = 1;
+    snprintf(s.cols[0].name, sizeof s.cols[0].name, "id");
+    s.cols[0].type = IMDB_T_INT64;
+    s.cols[0].flags = IMDB_COL_PK;
+    s.subject = -1;
+    OK(imdb_begin(db, E));
+    OK(imdb_create_table_ex(db, &s, 1500000, E));
+    OK(imdb_commit(db, E));
+    outb d = {0};
+    CHECK(imdb_dump(db, 0, outb_write, &d, E) == IMDB_ERR_UNSUPPORTED && strstr(g_e.msg, "whole seconds"));
+    CHECK(d.p && strstr(d.p, "COPY a FROM STDIN (BATCH 10000);\n1\n\\.\n") && !strstr(d.p, "CREATE TABLE b") &&
+          !strstr(d.p, "the end of the dump"));
+    CHECK(imdb_dump(db, IMDB_MAX_OPS_PER_COMMIT + 1u, outb_write, &d, E) == IMDB_ERR_INVALID);
+    /* a writer failing inside a table's COPY: the dump fails there, without its totals, and leaves nothing held (the
+     * harness's heap check: its session's transaction rolled back, its table list freed) */
+    CHECK(run("DROP TABLE b") == 0); /* the refusal's table goes: a dropped table is not dumped */
+    CHECK(run("CREATE TABLE c (id INT64 PRIMARY KEY, g INT64, s TEXT)") == 0 && fill("c", 1, 3000, 60) == 0);
+    outb w = {.limit = 100000};
+    int wrc = imdb_dump(db, 0, outb_write, &w, E);
+    CHECK(wrc == IMDB_ERR_IO && w.p && w.n <= w.limit && strstr(w.p, "COPY c FROM STDIN") && !strstr(w.p, "the end of the dump"));
+    free(w.p);
+    free(d.p);
+    done(db);
+}
+
+/* the format's fixtures (tests/fixtures: tables kept FOREVER, a dropped one kept a century), each opened read-only:
+ * the primary's dump is its replica's at the same commit and names no dropped table; restored into an empty database
+ * of the other digest algorithm, it dumps again the same past its first line, VERIFY passing */
+static void t_copy_dump_fixtures(void)
+{
+    static const char *const tgz[] = {"tests/fixtures/alg1-20261104.tar.gz", "tests/fixtures/alg2-20261104.tar.gz"};
+    for (int f = 0; f < 2; f++) {
+        char dir[600], cmd[1600], p[700], r[700], q[700];
+        snprintf(dir, sizeof dir, "%s", test_tmpdir());
+        snprintf(cmd, sizeof cmd, "tar -xzf '%s' -C '%s'", tgz[f], dir);
+        CHECK(system(cmd) == 0);
+        snprintf(p, sizeof p, "%s/primary", dir);
+        snprintf(r, sizeof r, "%s/replica", dir);
+        snprintf(q, sizeof q, "%s/restored", dir);
+        imdb_open_opts o = {.sync = 0, .read_only = true};
+        imdb_db *db = NULL, *rdb = NULL;
+        OK(imdb_open(p, &o, &db, E));
+        outb d1 = {0}, d2 = {0}, d3 = {0};
+        OK(imdb_dump(db, 0, outb_write, &d1, E));
+        uint32_t live = 0, made = 0;
+        for (uint32_t i = 0; i < db->nt; i++) live += !db->t[i]->dropped_at;
+        for (const char *at = d1.p; (at = strstr(at, "\nCREATE TABLE ")) != NULL; at++) made++;
+        CHECK(live > 0 && live < db->nt && made == live); /* a dropped table there, and not in the dump */
+        uint8_t other = db->meta.digest_alg == IMDB_DIGEST_ALG_LTHASH16 ? IMDB_DIGEST_ALG_LTHASH16_TREE : IMDB_DIGEST_ALG_LTHASH16;
+        imdb_close(db);
+        OK(imdb_open(r, &o, &rdb, E));
+        OK(imdb_dump(rdb, 0, outb_write, &d2, E));
+        imdb_close(rdb);
+        CHECK(d1.n == d2.n && !memcmp(d1.p, d2.p, d1.n));
+        OK(imdb_init_primary_alg(q, NULL, other, E));
+        memset(&g_io, 0, sizeof g_io);
+        imdb_db *dst = open_at(q);
+        CHECK(dst);
+        CHECK(restore_text(d1.p, d1.n) == 0);
+        OK(imdb_dump(dst, 0, outb_write, &d3, E));
+        CHECK(d3.p && !strcmp(strchr(d1.p, '\n'), strchr(d3.p, '\n')));
+        CHECK(run("VERIFY") == 0);
+        imdb_session_close(&g_s);
+        imdb_close(dst);
+        free(d1.p);
+        free(d2.p);
+        free(d3.p);
+    }
+}
+
 const test_case copy_tests[] = {
     {"copy_round_trip", t_copy_round_trip},
     {"copy_refusals", t_copy_refusals},
@@ -492,5 +869,12 @@ const test_case copy_tests[] = {
     {"copy_query", t_copy_query},
     {"copy_cancel", t_copy_cancel},
     {"copy_forms", t_copy_forms},
+    {"copy_walk_order", t_copy_walk_order},
+    {"copy_walk_ceiling", t_copy_walk_ceiling},
+    {"copy_walk_fail", t_copy_walk_fail},
+    {"copy_walk_images", t_copy_walk_images},
+    {"copy_dump", t_copy_dump},
+    {"copy_dump_refused", t_copy_dump_refused},
+    {"copy_dump_fixtures", t_copy_dump_fixtures},
 };
 const size_t copy_ntests = sizeof copy_tests / sizeof copy_tests[0];

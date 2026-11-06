@@ -146,6 +146,11 @@ int imdb_deallocate(imdb_session *s, const char *name, imdb_err *e);
 void imdb_session_copy_io(imdb_session *s, imdb_copy_read_fn rd, imdb_copy_write_fn wr, void *arg);
 /* P2 S10: sql is one COPY ... FROM STDIN statement, whose data a client sends after it (main.c: a script's inline data) */
 bool imdb_copy_in_stmt(const char *sql, size_t len);
+/* P2 S17 (deferred.md D10; src/dump.c): a logical dump of db at one commit through wr: every live table by name, its
+ * CREATE TABLE, its rows as COPY ... FROM STDIN (BATCH batch; 0: IMDB_DUMP_BATCH) data ended by \., its indexes; the
+ * commit named first, the totals last. imagedb sql -f restores it into an empty database. A failure part way leaves
+ * what was written, without the totals */
+int imdb_dump(imdb_db *db, uint32_t batch, imdb_copy_write_fn wr, void *arg, imdb_err *e);
 
 /* Splits a script into statements (respecting string literals and -- comments).
  * Calls cb for each; stops at the first error. */

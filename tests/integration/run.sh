@@ -375,4 +375,55 @@ fi
 "$AUD" verify "$C" >/dev/null || fail "the auditor after the COPYs"
 echo "COPY: a file's bytes back unchanged; a script's inline data to its \\. line, a quoted \\. kept as data; both verifiers agree"
 
+# P2 S17: a logical dump (imagedb dump): restored into an empty database of the other digest algorithm by sql -f, it
+# dumps again the same past its first line (the commit it names); each table's rows the same in key order; a replica's
+# dump at the primary's commit the primary's, byte for byte; a dump of no directory fails with nothing on stdout
+"$BIN" sql "$C" --nosync -c "CREATE TABLE d2 (k INT64 PRIMARY KEY, who INT64 SUBJECT, v DECIMAL(9,3) NOT NULL) RETENTION 90 MINUTES;" \
+  -c "INSERT INTO d2 VALUES (3, 30, 1.5), (1, 10, -2.25), (2, 20, 0);" -c "CREATE UNIQUE INDEX d2v ON d2 (v);" \
+  -c "UPDATE d2 SET v = 7.125 WHERE k = 1;" >/dev/null
+"$BIN" dump "$C" --batch 4 > "$WORK/d.sql" || fail "imagedb dump"
+expect "COPY c FROM STDIN (BATCH 4);" "$(cat "$WORK/d.sql")"
+expect "CREATE UNIQUE INDEX d2v ON d2 (v);" "$(cat "$WORK/d.sql")"
+nc=$("$BIN" sql "$C" --csv -c "SELECT COUNT(*) FROM c;" | tail -1) # 12, or 10 without script(1) above
+expect "-- the end of the dump: 2 tables, $((nc + 3)) rows" "$(tail -1 "$WORK/d.sql")"
+alg=$(sed -n '1s/.*digest algorithm \([12]\)).*/\1/p' "$WORK/d.sql")
+other=$((3 - ${alg:-2}))
+"$BIN" init "$WORK/dst" --digest-alg "$other" >/dev/null || fail "init the dump's target"
+"$BIN" sql "$WORK/dst" --nosync -f "$WORK/d.sql" >/dev/null || fail "the dump's restore"
+"$BIN" dump "$WORK/dst" --batch 4 > "$WORK/d2.sql" || fail "the restored copy's dump"
+cmp -s <(tail -n +2 "$WORK/d.sql") <(tail -n +2 "$WORK/d2.sql") || fail "the restored copy's dump differs: $(diff "$WORK/d.sql" "$WORK/d2.sql")"
+for q in "SELECT * FROM c ORDER BY id" "SELECT * FROM d2 ORDER BY k"; do
+  [ "$("$BIN" sql "$C" --csv -c "$q;")" = "$("$BIN" sql "$WORK/dst" --csv -c "$q;")" ] || fail "rows differ after the restore: $q"
+done
+"$BIN" verify "$WORK/dst" >/dev/null || fail "VERIFY of the restored copy"
+"$BIN" init-replica "$WORK/drep" "$C" >/dev/null || fail "a replica for the dump"
+"$BIN" ship "$C" --after 0 | "$BIN" apply "$WORK/drep" >/dev/null || fail "the dump's replica apply"
+cmp -s "$WORK/d.sql" <("$BIN" dump "$WORK/drep" --batch 4) || fail "the replica's dump is not the primary's"
+if "$BIN" dump "$WORK/no-such-dir" > "$WORK/d.none" 2>/dev/null; then fail "a dump of no directory succeeded"; fi
+[ ! -s "$WORK/d.none" ] || fail "a failed dump wrote to stdout"
+echo "dump: restored into the other digest algorithm, dumped again the same; a replica's dump the primary's"
+# a live primary's dump: another process commits throughout (a statement a process); each dump, opened read-only beside
+# it, names a commit and holds exactly the rows the primary had then (AS OF it), with its totals line; the last restores
+( for i in $(seq 1 40); do "$BIN" sql "$C" --nosync -c "INSERT INTO d2 VALUES ($((1000 + i)), $i, $((1000 + i)).25);" >/dev/null || { echo "the writer failed at i=$i" >&2; exit 1; }; done ) &
+wpid=$!
+k=0
+while [ $k -lt 6 ]; do
+  k=$((k + 1))
+  "$BIN" dump "$C" > "$WORK/dl$k.sql" || fail "a dump beside a writer ($k)"
+  n=$(sed -n '1s/^-- imagedb dump of commit \([0-9]*\) .*/\1/p' "$WORK/dl$k.sql")
+  [ -n "$n" ] || fail "a dump beside a writer names no commit ($k)"
+  expect "-- the end of the dump: 2 tables," "$(tail -1 "$WORK/dl$k.sql")"
+  rows=$(awk '/^COPY d2 FROM STDIN/ {f = 1; next} f && $0 == "\\." {f = 0} f {r++} END {print r + 0}' "$WORK/dl$k.sql")
+  want=$("$BIN" sql "$C" --read-only --csv -c "SELECT COUNT(*) FROM d2 AS OF $n;" | tail -1)
+  [ "$rows" = "$want" ] || fail "a dump at commit $n holds $rows rows of d2, the primary had $want then"
+done
+if ! wait $wpid; then # what the writer saw, for the record: its rows past the first three, and VERIFY
+  "$BIN" sql "$C" --read-only --csv -c "SELECT k, v FROM d2 WHERE k >= 1000 ORDER BY k;" >&2
+  "$BIN" verify "$C" >&2
+  fail "the writer beside the dumps"
+fi
+"$BIN" init "$WORK/dlive" >/dev/null && "$BIN" sql "$WORK/dlive" --nosync -f "$WORK/dl$k.sql" >/dev/null || fail "restoring a live dump"
+[ "$("$BIN" sql "$WORK/dlive" --csv -c "SELECT COUNT(*) FROM d2;" | tail -1)" = "$rows" ] || fail "the live dump's restore"
+echo "dump: six dumps beside a writer, each the primary's rows at the commit it names"
+
 printf '\nALL INTEGRATION CHECKS PASSED\n'
