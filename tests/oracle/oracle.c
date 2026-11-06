@@ -250,6 +250,7 @@ typedef struct stmt {
     bool jkey2, jusing, jn3; /* ON's second key pair, t.s = u.s; USING (s) for ON; P2 S3's (counted when compared) */
     bool subq;         /* P2 S4: a subquery, a derived table or a CTE (counted when compared) */
     bool corr;         /* P2 S4b: a correlated subquery (counted when compared) */
+    bool shadow;       /* P2 S19: a correlated subquery whose table takes the outer one's name (corr_add) */
     bool lazy;         /* P2 S11: items over a SELECT that fails when it runs (counted when compared) */
     int narm, ncol;    /* P2 S5: a set operation's SELECTs (arm, armop[a] before arm a: 0 UNION, 1 UNION ALL, 2 INTERSECT,
                         * 3 EXCEPT) of ncol columns; its tail (stail: ORDER BY 1 [DESC] [LIMIT slim] [OFFSET soff]) */
@@ -1074,37 +1075,47 @@ static int gen_subq_where(stmt *q, int tab, int avoid)
  * another column rarely holds x: half the INs read x's own column (every x found, a NULL in the set when the filter is
  * on another column), and half the EXISTS look for c = (SELECT MAX(c) ...), one row or a few (the mutants' finding:
  * EXISTS of exactly one row, NOT IN over a NULL and the set's search were each caught in 0 to 2 seeds of 30) */
-/* P2 S4b: the columns of a correlated subquery's own table, by its alias ci (a nested subquery's are its own) */
-static void corr_mark(stmt *q, int k)
+/* P2 S4b: the columns of a correlated subquery's own table, by its alias (qual: 1 ci, 4 the outer table's name, P2 S19;
+ * a nested subquery's are its own) */
+static void corr_mark(stmt *q, int k, int qual)
 {
     if (!k) return;
     xnode *n = XN(q, k);
     if (n->op == X_SUBQ) return;
-    if (n->op == X_COL) n->qual = 1;
-    corr_mark(q, n->l); /* height-bounded */
-    corr_mark(q, n->r);
-    corr_mark(q, n->x3);
+    if (n->op == X_COL) n->qual = qual;
+    corr_mark(q, n->l, qual); /* height-bounded */
+    corr_mark(q, n->r, qual);
+    corr_mark(q, n->x3, qual);
 }
 
 /* P2 S4b: subquery sq made correlated with the statement around it (WHERE only: g_corr_ok): its table aliased ci, a
  * comparison of one of its columns with one of the outer table's, by name (mostly ci.tid = t.id, which matches: u's tid
  * is often a t id), either side first, sometimes the outer one in a tree (the mutants: a comparison only ever written
  * inner first, and bare, left imagedb's flip and its constant outer values untested), ANDed to its WHERE */
+/* P2 S19 (the 2026-11-05 review's alias shadowing): a quarter of a one-table statement's correlated subqueries over
+ * the other table take the outer one's name, FROM u AS t inside FROM t: their columns t.c are the inner table's (the
+ * nearest scope: id and s are both tables', tid and v u's alone), and the outer column is compared bare, one the inner
+ * table lacks (t's g or a; u's tid or v), so every dialect finds it outward. SQLite skipped, as the review asked: its
+ * fall-through to an outer relation of the name, for a qualified column the inner table lacks, is the one rule where
+ * dialects part (never drawn: no answer to compare would be every dialect's) */
 static void corr_add(stmt *q, int sq, int otab)
 {
     int itab = XN(q, sq)->tab, ic, oc;
-    if (itab == 1 && otab == 0 && chance(60)) ic = 1, oc = 0;
+    bool shadow = !q->join && itab != otab && chance(25);
+    if (shadow) ic = (int)rr(0, 2), oc = (int)rr(1, 2); /* the outer column: not id, both tables' */
+    else if (itab == 1 && otab == 0 && chance(60)) ic = 1, oc = 0;
     else ic = (int)rr(0, 2), oc = (int)rr(0, 2);
-    corr_mark(q, XN(q, sq)->x3);
+    corr_mark(q, XN(q, sq)->x3, shadow ? 4 : 1);
     int a = xcol(q, itab, ic), o = xcol(q, otab, oc);
-    XN(q, a)->qual = 1;
-    XN(q, o)->qual = 2;
+    XN(q, a)->qual = shadow ? 4 : 1;
+    XN(q, o)->qual = shadow ? 5 : 2;
     if (chance(50)) o = xnew(q, X_ADD, o, xlit_int(q, rr(-2, 2))); /* in a tree: a residual on each run (imagedb takes a
                                                                     * bare outer column as a plain predicate) */
     int k = chance(50) ? xbool(q, X_CMP, a, o) : xbool(q, X_CMP, o, a); /* either side first */
     XN(q, k)->fn = chance(50) ? OP_EQ : (int)rr(OP_EQ, OP_GE);
     XN(q, sq)->x3 = XN(q, sq)->x3 ? xbool(q, X_AND, XN(q, sq)->x3, k) : k;
-    XN(q, sq)->qual = 1;
+    XN(q, sq)->qual = shadow ? 3 : 1;
+    if (shadow) q->skip |= 1u << D_SQLITE, q->shadow = true;
     q->corr = true;
 }
 
@@ -2331,12 +2342,15 @@ static void put_x(sb *b, int d, const stmt *q, int k, int pty)
         if (n->fn == 1 && n->l) put_x(b, d, q, n->l, XN(q, n->l)->ty); /* P2 S11: a SELECT list that fails */
         else if (n->fn == 1) sb_str(b, "1");
         else if (n->fn == 3) sb_str(b, "MAX("), put_x(b, d, q, n->l, XN(q, n->l)->ty), sb_str(b, ")"); /* P2 S11 */
-        else if ((n->fn == 0 || n->fn == 4) && n->qual) sb_printf(b, "ci.%s", cols(n->tab)[n->col].name); /* P2 S4b */
+        else if ((n->fn == 0 || n->fn == 4) && n->qual) /* P2 S4b; S19: the alias the outer table's name */
+            sb_printf(b, "%s.%s", n->qual == 3 ? tname(!n->tab) : "ci", cols(n->tab)[n->col].name);
         else if (n->fn == 0 || n->fn == 4) put_col(b, q, n->tab, n->col); /* P2 S11: 4, a value of a column */
         else if (n->fn == 2 && n->i == F_COUNT_STAR) sb_str(b, "COUNT(*)");
-        else if (n->fn == 2 && n->qual) sb_printf(b, "%s(ci.%s)", AG[n->i], cols(n->tab)[n->col].name);
+        else if (n->fn == 2 && n->qual)
+            sb_printf(b, "%s(%s.%s)", AG[n->i], n->qual == 3 ? tname(!n->tab) : "ci", cols(n->tab)[n->col].name);
         else if (n->fn == 2) sb_printf(b, "%s(", AG[n->i]), put_col(b, q, n->tab, n->col), sb_str(b, ")");
-        sb_printf(b, n->qual ? " FROM %s AS ci" : " FROM %s", tname(n->tab));
+        if (n->qual == 3) sb_printf(b, " FROM %s AS %s", tname(n->tab), tname(!n->tab)); /* P2 S19 */
+        else sb_printf(b, n->qual ? " FROM %s AS ci" : " FROM %s", tname(n->tab));
         if (n->x3) sb_str(b, " WHERE "), put_x(b, d, q, n->x3, -1);
         sb_str(b, n->fn == 1 ? "))" : ")");
         return;
@@ -2372,7 +2386,8 @@ static void put_x(sb *b, int d, const stmt *q, int k, int pty)
         return;
     case X_COL:
         if (n->qual) { /* P2 S4b: a correlated subquery's own column by its alias, or the outer table's by name */
-            sb_printf(b, "%s.%s", n->qual == 1 ? "ci" : tname(n->tab), cols(n->tab)[n->col].name);
+            if (n->qual == 5) sb_str(b, cols(n->tab)[n->col].name); /* P2 S19: the outer one, bare */
+            else sb_printf(b, "%s.%s", n->qual == 1 ? "ci" : n->qual == 4 ? tname(!n->tab) : tname(n->tab), cols(n->tab)[n->col].name);
             return;
         }
         if (d == D_MS && cols(n->tab)[n->col].t == CT_BOOL) { /* T-SQL has no bare boolean: its BIT, as a condition */
@@ -3818,6 +3833,7 @@ static long g_grp_compared; /* P2 S2: comparisons of its grouped form */
 static long g_jn_compared; /* P2 S3: comparisons of its join forms */
 static long g_subq_compared; /* P2 S4: comparisons of statements with a subquery, a derived table or a CTE */
 static long g_corr_compared; /* P2 S4b: comparisons of statements with a correlated subquery */
+static long g_shadow_compared; /* P2 S19: of them, a subquery whose table takes the outer one's name */
 static long g_lazy_compared; /* P2 S11: comparisons of items over a SELECT that fails when it runs */
 static long g_set_compared, g_rec_compared; /* P2 S5: comparisons of set operations, of WITH RECURSIVE */
 static long g_win_compared; /* P2 S6: comparisons of window functions */
@@ -4090,6 +4106,7 @@ static int run_stmt(unsigned seed, int step, const stmt *q, bool state)
         if (q->jn3) g_jn_compared++;
         if (q->subq) g_subq_compared++;
         if (q->corr) g_corr_compared++;
+        if (q->shadow) g_shadow_compared++; /* P2 S19 */
         if (q->lazy) g_lazy_compared++; /* P2 S11 */
         if (q->narm) g_set_compared++;
         if (q->rec) g_rec_compared++;
@@ -4363,6 +4380,8 @@ int main(int argc, char **argv)
            "");
     printf("oracle: %ld comparisons of P2 S5's set operations, %ld of its WITH RECURSIVE\n", g_set_compared, g_rec_compared);
     printf("oracle: %ld comparisons of P2 S4b's correlated subqueries\n", g_corr_compared);
+    printf("oracle: %ld comparisons of P2 S19's subqueries whose table takes the outer one's name (SQLite skipped)\n",
+           g_shadow_compared);
     printf("oracle: %ld comparisons of P2 S11's subqueries a row may never need\n", g_lazy_compared);
     printf("oracle: %ld comparisons of P2 S4's subqueries (IN, NOT IN, EXISTS, a value), derived tables and CTEs\n",
            g_subq_compared);
