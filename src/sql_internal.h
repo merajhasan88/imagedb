@@ -99,6 +99,7 @@ enum {
     ST_SHOW_STATS, ST_SHOW_TRANSACTIONS, /* P1 M1 */
     ST_EXPLAIN, /* P1 Q1: the plan of the statement in explained (SELECT, UPDATE or DELETE), which is not run */
     ST_PREPARE, ST_EXECUTE, ST_DEALLOCATE, ST_SHOW_PREPARED, /* P2 S9 */
+    ST_COPY_FROM, ST_COPY_TO, /* P2 S10 */
 };
 
 /* P2 S3: a join's kind as written (RIGHT keeps side 1's rows, FULL both sides'; CROSS and FROM a, b have no ON) */
@@ -182,6 +183,13 @@ typedef struct sql_stmt {
     sql_ptype *ptypes;
     uint16_t nptype;
     bool prep_all;
+    /* P2 S10: COPY t [(cols)] FROM STDIN, COPY t [(cols)] | (query) TO STDOUT: the table and columns as INSERT's (a
+     * query's statement in src), and the options: HEADER, DELIMITER (one byte), BATCH n rows a commit (FROM, outside a
+     * transaction), SKIP n records (FROM: a BATCH's resume) */
+    bool copy_header;
+    char copy_delim;
+    uint32_t copy_batch;
+    uint64_t copy_skip;
     char set_cols[IMDB_MAX_COLS][IMDB_MAX_IDENT + 1]; /* UPDATE */
     sql_lit set_vals[IMDB_MAX_COLS];
     uint16_t nset;

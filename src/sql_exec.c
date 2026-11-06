@@ -2,9 +2,11 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <strings.h>
 #include <time.h>
 
 #include "cpu.h"
+#include "csv.h"
 #include "db_internal.h"
 #include "fsio.h"
 #include "fsum.h"
@@ -147,6 +149,7 @@ typedef struct xctx {
     uint32_t nallocs, capallocs;
     imdb_buf row_text; /* reusable copies of one UPDATE/upsert row's TEXT, stable through its write */
     imdb_salts salts; /* the statement's (db.h): wiped by xfree, the one exit */
+    bool autocommit;  /* P2 S10: the statement runs in its own transaction (COPY ... BATCH commits as it goes) */
     imdb_xnode *xn;   /* the statement's trees bound (xbind), parallel to st->ex; NULL until one is */
     const sql_stmt *st;
     bool fb[IMDB_MAX_PREDICATES]; /* WHERE's plain conjuncts that fell back to residuals (falls_back) */
@@ -6123,6 +6126,307 @@ static int exec_insert(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
     return st->returning ? res_finish(r, e) : IMDB_OK;
 }
 
+
+/* ---- P2 S10: COPY (design.md §5, Import and export) -------------------------------------------------------------- */
+static void cell_text(const imdb_cell *c, imdb_buf *out, bool safe);
+
+/* COPY's columns: a list as INSERT's (a column left out is NULL, refused when NOT NULL), else every column in order */
+static int copy_columns(imdb_table *t, const sql_stmt *st, int *map, uint16_t *width, imdb_value *vals, imdb_err *e)
+{
+    *width = st->ncols ? st->ncols : t->s.ncols;
+    if (!st->ncols) {
+        for (uint16_t i = 0; i < *width; i++) map[i] = i;
+        return IMDB_OK;
+    }
+    bool seen[IMDB_MAX_COLS] = {false};
+    for (uint16_t i = 0; i < st->ncols; i++) {
+        int c = imdb_schema_col(&t->s, st->cols[i]);
+        if (c < 0) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no column %s in table %s", st->cols[i], t->s.name);
+        if (seen[c]) return imdb_fail(e, IMDB_ERR_INVALID, "column %s listed twice", st->cols[i]);
+        seen[c] = true;
+        map[i] = c;
+    }
+    for (uint16_t c = 0; c < t->s.ncols; c++) {
+        if (seen[c]) continue;
+        if (!(t->s.cols[c].flags & IMDB_COL_NULLABLE))
+            return imdb_fail(e, IMDB_ERR_CONSTRAINT, "column %s needs a value: it is NOT NULL", t->s.cols[c].name);
+        if (vals) vals[c] = (imdb_value){.type = t->s.cols[c].type, .scale = t->s.cols[c].scale, .null = true};
+    }
+    return IMDB_OK;
+}
+
+/* a CSV field as a column's value: an unquoted empty field is NULL, every other one read by the column's literal rules
+ * (exact or refused, never rounded); TEXT points into the reader's record. The messages name no value */
+static int copy_value(const imdb_column *col, const char *s, uint32_t n, bool quoted, imdb_value *v, imdb_err *e)
+{
+    memset(v, 0, sizeof *v);
+    v->type = col->type;
+    v->scale = col->scale;
+    if (!n && !quoted) {
+        if (!(col->flags & IMDB_COL_NULLABLE)) return imdb_fail(e, IMDB_ERR_CONSTRAINT, "NULL (an empty field) in a NOT NULL column");
+        v->null = true;
+        return IMDB_OK;
+    }
+    int64_t x = 0;
+    switch (col->type) {
+    case IMDB_T_INT64:
+        if (imdb_parse_int64(s, n, &x, e)) return e->code;
+        break;
+    case IMDB_T_DECIMAL:
+        if (imdb_parse_decimal(s, n, col->precision, col->scale, &x, e)) return e->code;
+        break;
+    case IMDB_T_FLOAT64:
+        if (imdb_parse_float64(s, n, &x, e)) return e->code;
+        break;
+    case IMDB_T_TIMESTAMP:
+        if (imdb_parse_timestamp(s, n, &x, e)) return e->code;
+        break;
+    case IMDB_T_BOOL: /* what COPY TO writes, and nothing else */
+        if (n == 4 && memcmp(s, "true", 4) == 0) x = 1;
+        else if (!(n == 5 && memcmp(s, "false", 5) == 0)) return imdb_fail(e, IMDB_ERR_INVALID, "a BOOL is true or false");
+        break;
+    case IMDB_T_TEXT: {
+        size_t at = 0;
+        if (!imdb_utf8_valid((const uint8_t *)s, n, &at))
+            return imdb_fail(e, IMDB_ERR_INVALID, "TEXT that is not UTF-8, or holds a NUL, at byte %zu", at + 1);
+        v->s = (const uint8_t *)s;
+        v->len = n;
+        return IMDB_OK;
+    }
+    default:
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "COPY of a column of this type");
+    }
+    v->i = x;
+    return IMDB_OK;
+}
+
+/* HEADER: the first record names the columns, in order (never used to reorder them) */
+static int copy_header(imdb_table *t, const imdb_csv *c, const int *map, uint16_t width, imdb_err *e)
+{
+    if (c->nf != width)
+        return imdb_fail(e, IMDB_ERR_INVALID, "COPY line %llu: the header has %u fields, the columns are %u",
+                         (unsigned long long)c->rec_line, c->nf, width);
+    for (uint16_t i = 0; i < width; i++) {
+        const char *name = t->s.cols[map[i]].name;
+        if (c->flen[i] != strlen(name) || strncasecmp(imdb_csv_field(c, i), name, c->flen[i]) != 0)
+            return imdb_fail(e, IMDB_ERR_INVALID, "COPY line %llu: the header's field %u is not column %s",
+                             (unsigned long long)c->rec_line, i + 1, name);
+    }
+    return IMDB_OK;
+}
+
+/* COPY t [(cols)] FROM STDIN: each record a row, inserted as INSERT inserts one (the statement's salts, the table's
+ * keys); BATCH n commits every n rows (autocommit only), and a failure then says what earlier batches committed and
+ * the SKIP that resumes after them */
+static int exec_copy_from(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
+{
+    imdb_session *ss = x->ss;
+    if (!ss->copy_rd)
+        return imdb_fail(e, IMDB_ERR_STATE, "COPY ... FROM STDIN reads the client's stream, and this session has none "
+                                            "(the CLI's -c or a script, imdb_session_copy_io)");
+    imdb_table *t = imdb_table_by_name(x->db, st->table);
+    if (!t) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", st->table);
+    if (st->copy_batch && !x->autocommit)
+        return imdb_fail(e, IMDB_ERR_STATE, "COPY ... BATCH commits as it goes: run it outside an explicit transaction");
+    int map[IMDB_MAX_COLS];
+    uint16_t width;
+    imdb_value vals[IMDB_MAX_COLS];
+    if (copy_columns(t, st, map, &width, vals, e)) return e->code;
+    imdb_csv c;
+    if (imdb_csv_init(&c, ss->copy_rd, ss->copy_arg, st->copy_delim, e)) return e->code;
+    uint64_t done = 0, committed = 0, skipped = 0;
+    uint32_t inbatch = 0;
+    int rc = IMDB_OK;
+    if (st->copy_header) {
+        rc = imdb_csv_next(&c, e);
+        if (rc == 0) rc = imdb_fail(e, IMDB_ERR_INVALID, "COPY ... HEADER: the data is empty, with no header line");
+        else if (rc > 0) rc = copy_header(t, &c, map, width, e);
+    }
+    while (!rc && (rc = imdb_csv_next(&c, e)) == 1) {
+        rc = IMDB_OK;
+        unsigned long long line = (unsigned long long)c.rec_line;
+        if ((rc = xtick(x, 64, e))) break; /* a write weighs more than a read */
+        if (c.nf != width) {
+            rc = imdb_fail(e, IMDB_ERR_INVALID, "COPY line %llu: %u fields, the columns are %u", line, c.nf, width);
+            break;
+        }
+        if (skipped < st->copy_skip) {
+            skipped++;
+            continue;
+        }
+        for (uint16_t i = 0; i < width && !rc; i++) {
+            const imdb_column *col = &t->s.cols[map[i]];
+            imdb_err e2 = {0};
+            if (copy_value(col, imdb_csv_field(&c, i), c.flen[i], c.fquoted[i], &vals[map[i]], &e2))
+                rc = imdb_fail(e, e2.code, "COPY line %llu, column %s: %s", line, col->name, e2.msg);
+        }
+        if (rc) break;
+        uint8_t salt[16];
+        imdb_err e2 = {0};
+        rc = imdb_salt_next(&x->salts, salt, &e2) || imdb_insert_salt(x->db, t, vals, salt, &e2) ? e2.code : IMDB_OK;
+        imdb_wipe(salt, sizeof salt);
+        if (rc) {
+            rc = imdb_fail(e, e2.code, "COPY line %llu: %s", line, e2.msg);
+            break;
+        }
+        done++;
+        if (st->copy_batch && ++inbatch == st->copy_batch) { /* this batch's commit, then the next one's transaction */
+            if ((rc = imdb_commit(x->db, e))) break;
+            committed = done;
+            inbatch = 0;
+            imdb_err em = {0};
+            if (!x->db->in_txn && !x->db->active) imdb_maintain(x->db, &em); /* between transactions, as after a statement */
+            if ((rc = imdb_begin(x->db, e))) break;
+        }
+    }
+    if (rc > 0) rc = IMDB_OK; /* the loop's last read: a record */
+    if (rc && committed) {
+        char m[sizeof e->msg + 128]; /* imdb_fail cuts it to the message's size */
+        snprintf(m, sizeof m, "%s; earlier batches committed %llu rows: SKIP %llu resumes after them", e->msg,
+                 (unsigned long long)committed, (unsigned long long)(st->copy_skip + committed));
+        int code = e->code;
+        imdb_err_clear(e); /* imdb_fail keeps the first message: this one replaces it */
+        rc = imdb_fail(e, code, "%s", m);
+    }
+    imdb_csv_free(&c);
+    if (!rc) snprintf(r->status, sizeof r->status, "COPY %llu", (unsigned long long)done);
+    return rc;
+}
+
+/* COPY TO's output: a fixed buffer handed to the session's writer as it fills */
+typedef struct copy_out {
+    imdb_session *ss;
+    char *b;
+    size_t n;
+} copy_out;
+
+static int out_flush(copy_out *o, imdb_err *e)
+{
+    if (o->n && o->ss->copy_wr(o->ss->copy_arg, o->b, o->n) < 0)
+        return imdb_fail(e, IMDB_ERR_IO, "COPY ... TO STDOUT: writing the data failed");
+    o->n = 0;
+    return IMDB_OK;
+}
+
+static int out_put(copy_out *o, const char *s, size_t n, imdb_err *e)
+{
+    while (n) {
+        if (o->n == IMDB_COPY_BUF && out_flush(o, e)) return e->code;
+        size_t k = IMDB_COPY_BUF - o->n < n ? IMDB_COPY_BUF - o->n : n;
+        memcpy(o->b + o->n, s, k);
+        o->n += k;
+        s += k;
+        n -= k;
+    }
+    return IMDB_OK;
+}
+
+/* a field, quoted when it holds the delimiter, a quote, CR or LF, is empty (NULL is the empty unquoted field) or is
+ * \. (psql's end of data) */
+static int out_field(copy_out *o, const char *s, size_t n, char delim, imdb_err *e)
+{
+    bool q = !n || (n == 2 && s[0] == '\\' && s[1] == '.');
+    for (size_t k = 0; k < n && !q; k++) q = s[k] == delim || s[k] == '"' || s[k] == '\r' || s[k] == '\n';
+    if (!q) return out_put(o, s, n, e);
+    if (out_put(o, "\"", 1, e)) return e->code;
+    for (size_t k = 0; k < n; k++)
+        if ((s[k] == '"' && out_put(o, "\"", 1, e)) || out_put(o, s + k, 1, e)) return e->code;
+    return out_put(o, "\"", 1, e);
+}
+
+/* COPY t [(cols)] | (query) TO STDOUT: the query's result (a table's: its columns in key order), its header first
+ * under HEADER, written in pieces as CSV. The rows are the result's, under the statement's memory (a later step:
+ * a table's rows walked without holding them) */
+static int exec_copy_to(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
+{
+    imdb_session *ss = x->ss;
+    if (!ss->copy_wr)
+        return imdb_fail(e, IMDB_ERR_STATE, "COPY ... TO STDOUT writes the client's stream, and this session has none "
+                                            "(the CLI's -c or a script, imdb_session_copy_io)");
+    const sql_stmt *src = st->src;
+    sql_stmt *made = NULL;
+    imdb_buf q;
+    imdb_buf_init(&q);
+    int rc = IMDB_OK;
+    if (!src) { /* SELECT cols FROM t ORDER BY its key: names alone, no literal (x->sql's offsets are COPY's) */
+        imdb_table *t = imdb_table_by_name(x->db, st->table);
+        if (!t) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", st->table);
+        int map[IMDB_MAX_COLS];
+        uint16_t width;
+        if (copy_columns(t, st, map, &width, NULL, e)) return e->code;
+        imdb_buf_put_str(&q, "SELECT ");
+        for (uint16_t i = 0; i < width; i++) imdb_buf_printf(&q, "%s%s", i ? ", " : "", t->s.cols[map[i]].name);
+        imdb_buf_printf(&q, " FROM %s ORDER BY %s", t->s.name, t->s.cols[t->s.pk].name);
+        if (imdb_buf_check(&q, e)) goto out;
+        if (!(made = imdb_alloc(sizeof *made, e))) {
+            rc = e->code;
+            goto out;
+        }
+        memset(made, 0, sizeof *made);
+        if ((rc = imdb_sql_parse((const char *)q.p, q.len, made, e))) goto out;
+        src = made;
+    }
+    imdb_result res;
+    imdb_result_init(&res);
+    copy_out o = {.ss = ss};
+    imdb_buf tmp;
+    imdb_buf_init(&tmp);
+    if ((rc = run_nested(x, src, &res, NEST_SOURCE, NULL, NULL, NULL, NULL, e))) goto done;
+    if (!(o.b = imdb_alloc(IMDB_COPY_BUF, e))) {
+        rc = e->code;
+        goto done;
+    }
+    char d = st->copy_delim;
+    for (uint16_t c = 0; st->copy_header && c < res.ncols && !rc; c++)
+        rc = (c && out_put(&o, &d, 1, e)) || out_field(&o, res.names[c], strlen(res.names[c]), d, e) ? e->code : IMDB_OK;
+    if (!rc && st->copy_header && out_put(&o, "\n", 1, e)) rc = e->code;
+    for (uint64_t i = 0; i < res.nrows && !rc; i++) {
+        if ((rc = xtick(x, 1, e))) break;
+        for (uint16_t c = 0; c < res.ncols && !rc; c++) {
+            const imdb_cell *cl = &res.cells[i * res.ncols + c];
+            if (c && out_put(&o, &d, 1, e)) rc = e->code;
+            else if (!cl->null) {
+                tmp.len = 0;
+                cell_text(cl, &tmp, false);
+                if (imdb_buf_check(&tmp, e) || out_field(&o, (const char *)tmp.p, tmp.len, d, e)) rc = e->code;
+            }
+        }
+        if (!rc && out_put(&o, "\n", 1, e)) rc = e->code;
+    }
+    if (!rc) rc = out_flush(&o, e);
+    if (!rc) {
+        snprintf(r->status, sizeof r->status, "COPY %llu", (unsigned long long)res.nrows);
+        r->copy_out = true;
+    }
+done:
+    if (o.b) imdb_wipe(o.b, IMDB_COPY_BUF), imdb_free(o.b);
+    if (tmp.p) imdb_wipe(tmp.p, tmp.cap);
+    imdb_buf_free(&tmp);
+    imdb_result_free(&res);
+out:
+    if (made) imdb_sql_stmt_free(made), imdb_free(made);
+    imdb_buf_free(&q);
+    return rc;
+}
+
+void imdb_session_copy_io(imdb_session *s, imdb_copy_read_fn rd, imdb_copy_write_fn wr, void *arg)
+{
+    s->copy_rd = rd;
+    s->copy_wr = wr;
+    s->copy_arg = arg;
+}
+
+bool imdb_copy_in_stmt(const char *sql, size_t len)
+{
+    imdb_err e = {0};
+    sql_stmt *st = imdb_alloc(sizeof *st, &e);
+    if (!st) return false;
+    memset(st, 0, sizeof *st);
+    bool in = !imdb_sql_parse(sql, len, st, &e) && st->kind == ST_COPY_FROM;
+    imdb_sql_stmt_free(st);
+    imdb_free(st);
+    return in;
+}
 /* P2 S8: a pair's place in t's key order (UPDATE ... FROM, DELETE ... USING) */
 typedef struct pkrow {
     imdb_xval k;
@@ -6946,7 +7250,7 @@ static int check_iso(const sql_stmt *st, imdb_err *e)
 static bool is_write(uint8_t k)
 {
     return k == ST_CREATE || k == ST_INSERT || k == ST_UPDATE || k == ST_DELETE || k == ST_CREATE_INDEX ||
-           k == ST_DROP_INDEX || k == ST_ALTER_RETENTION || k == ST_DROP_TABLE;
+           k == ST_DROP_INDEX || k == ST_ALTER_RETENTION || k == ST_DROP_TABLE || k == ST_COPY_FROM; /* P2 S10 */
 }
 
 /* A read statement's workspace (P0 R2): what SET statement_memory says, else a quarter of the memory budget, at most
@@ -6958,7 +7262,8 @@ static int stmt_class(int kind)
 {
     switch (kind) {
     case ST_SELECT: return IMDB_SC_READ;
-    case ST_INSERT: case ST_UPDATE: case ST_DELETE: return IMDB_SC_WRITE;
+    case ST_INSERT: case ST_UPDATE: case ST_DELETE: case ST_COPY_FROM: return IMDB_SC_WRITE;
+    case ST_COPY_TO: return IMDB_SC_READ; /* P2 S10 */
     case ST_BEGIN: case ST_COMMIT: case ST_ROLLBACK: case ST_SAVEPOINT: case ST_ROLLBACK_TO: case ST_RELEASE:
     case ST_SET_TXN: return IMDB_SC_TXN;
     case ST_CREATE: case ST_CREATE_INDEX: case ST_DROP_INDEX: case ST_DROP_TABLE: case ST_ALTER_RETENTION:
@@ -7192,7 +7497,7 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
                          "replica has unauthorised redactions or an unverified lake; resume apply before querying");
     }
     /* read-your-writes across copies: a session that needs commit N refuses one not there yet */
-    bool reads = st->kind == ST_SELECT || st->kind == ST_SHOW_DIGEST || st->kind == ST_SHOW_HISTORY || st->kind == ST_SHOW_IDENTITY ||
+    bool reads = st->kind == ST_SELECT || st->kind == ST_COPY_TO || st->kind == ST_SHOW_DIGEST || st->kind == ST_SHOW_HISTORY || st->kind == ST_SHOW_IDENTITY ||
                  (st->kind == ST_EXPLAIN && st->explained == ST_SELECT); /* a plan of what that read would see */
     if (reads && ss->min_commit > db->seq) {
         rc = imdb_fail(e, IMDB_ERR_STATE, "this database is at commit %llu; the session requires commit %llu (SET min_commit)",
@@ -7258,7 +7563,7 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
         if ((rc = imdb_txn_enter(db, &ss->txn, is_write(st->kind) ? IMDB_TXN_WRITE : IMDB_TXN_READ, e))) goto done;
     } else if (!txn && is_write(st->kind)) {
         if ((rc = imdb_txn_park(db, e)) || (rc = imdb_begin(db, e))) goto done;
-        autocommit = true;
+        autocommit = x.autocommit = true;
     }
     if (is_write(st->kind)) sp = imdb_savepoint_take(db); /* after the swap-in: it indexes this op list */
     /* R2: a read statement's memory has a hard ceiling (util.h): set after the swap-in above (a parked transaction's
@@ -7272,7 +7577,8 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
                                            st->kind == ST_SHOW_REPLICATION || st->kind == ST_SHOW_ERASURE ||
                                            st->kind == ST_SHOW_MEMORY || st->kind == ST_SHOW_INDEXES ||
                                            st->kind == ST_SHOW_RETENTION || st->kind == ST_SHOW_STATS ||
-                                           st->kind == ST_SHOW_TRANSACTIONS || st->kind == ST_EXPLAIN);
+                                           st->kind == ST_SHOW_TRANSACTIONS || st->kind == ST_EXPLAIN ||
+                                           st->kind == ST_COPY_TO); /* P2 S10: its rows are a query's result */
     if (ceiling) imdb_heap_ceiling_set(imdb_heap_bytes() + workspace_of(ss), workspace_of(ss));
     switch (st->kind) {
     case ST_EMPTY: break;
@@ -7315,6 +7621,8 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
         if (!rc) snprintf(r->status, sizeof r->status, "DROP INDEX %s", st->index_name);
         break;
     case ST_INSERT: rc = exec_insert(&x, st, r, e); break;
+    case ST_COPY_FROM: rc = exec_copy_from(&x, st, r, e); break; /* P2 S10 */
+    case ST_COPY_TO: rc = exec_copy_to(&x, st, r, e); break;
     case ST_UPDATE: rc = exec_update(&x, st, r, NULL, e); break;
     case ST_DELETE: rc = exec_delete(&x, st, r, NULL, e); break;
     case ST_SELECT: rc = exec_select(&x, st, r, NULL, e); break;

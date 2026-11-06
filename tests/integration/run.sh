@@ -330,4 +330,49 @@ for when in "the log alone" "the lake"; do
 done
 echo "SUM(x) = $ex from the engine and from the auditor (log, then lake); SUM(y) out of range for both"
 
+step "COPY (P2 S10): a file in and out through -c; a script's data inline up to a line \\.; the auditor"
+C=$WORK/copy
+"$BIN" init "$C" >/dev/null
+"$BIN" sql "$C" --nosync -c "CREATE TABLE c (id INT64 PRIMARY KEY, s TEXT, d DECIMAL(9,2), b BOOL, at TIMESTAMP);" >/dev/null
+printf 'id,s,d,b,at\n1,plain,1.50,true,2026-11-05 18:00:00\n2,"a, ""quoted""\nline",-0.01,false,\n3,"",0.00,,2026-01-01 00:00:00.000001\n4,,,,\n' > "$WORK/c.csv"
+out=$("$BIN" sql "$C" --nosync -c "COPY c FROM STDIN (HEADER)" < "$WORK/c.csv")
+expect "COPY 4" "$out"
+"$BIN" sql "$C" -c "COPY c TO STDOUT (HEADER)" > "$WORK/c.out" 2> "$WORK/c.err"
+cmp -s "$WORK/c.csv" "$WORK/c.out" || fail "COPY TO is not the file COPY FROM read: $(diff "$WORK/c.csv" "$WORK/c.out")"
+expect "COPY 4" "$(cat "$WORK/c.err")" # the count beside the data: stdout is the data alone
+# a script: its data after the statement (a comment on the statement's line), a ';' and a quoted field holding a line
+# \. as data, a quoted field ending its line just before the \. that ends the data, a statement after it, and a COPY
+# whose data runs to the script's end with no line end; then the same through a pipe
+printf 'COPY c (id, s) FROM STDIN; -- inline\n10,x;y\n11,"\n\\.\nend"\n12,"abc"\n\\.\nSELECT COUNT(*) FROM c WHERE id >= 10;\nCOPY c (id) FROM STDIN;\n20\n21' > "$WORK/c.sql"
+out=$("$BIN" sql "$C" --nosync --csv -f "$WORK/c.sql")
+expect "COPY 3" "$out"
+expect "$(printf 'count\n3')" "$out"
+expect "COPY 2" "$out"
+printf 'COPY c (id) FROM STDIN;\n30\n\\.\nSELECT COUNT(*) FROM c;\n' | "$BIN" sql "$C" --nosync --csv > "$WORK/c.pipe"
+expect "$(printf 'count\n10')" "$(cat "$WORK/c.pipe")"
+got=$("$BIN" sql "$C" -c "COPY (SELECT id, s FROM c WHERE id >= 10 ORDER BY id) TO STDOUT" 2>/dev/null)
+want=$(printf '10,x;y\n11,"\n\\.\nend"\n12,abc\n20,\n21,\n30,')
+[ "$got" = "$want" ] || fail "the script's rows: got
+$got
+want
+$want"
+# refused: a statement after the COPY on its line; a line '\. ' (a trailing space) is data, not the end, and fails as
+# data, the script stopping there with nothing of that COPY written
+if "$BIN" sql "$C" --nosync -f <(printf 'COPY c (id) FROM STDIN; SELECT 1;\n40\n\\.\n') > "$WORK/c.r1" 2>&1; then fail "a statement after COPY on its line ran"; fi
+expect "its data starts on the line after it" "$(cat "$WORK/c.r1")"
+if "$BIN" sql "$C" --nosync -f <(printf 'COPY c (id) FROM STDIN;\n41\n\\. \n42\n\\.\nSELECT 1;\n') > "$WORK/c.r2" 2>&1; then fail "a '\\. ' line ended COPY's data"; fi
+expect "COPY line 2, column id: invalid integer literal" "$(cat "$WORK/c.r2")"
+expect "$(printf 'count\n10')" "$("$BIN" sql "$C" --csv -c "SELECT COUNT(*) FROM c;")"
+# the REPL, given a terminal by script(1): the data a line at a time up to its \. line, the statement after it the REPL's
+# own (the marker's lookahead once read that line into COPY's buffer, and the REPL never saw it)
+if command -v script >/dev/null 2>&1; then
+  printf 'COPY c (id) FROM STDIN;\n50\n51\n\\.\nSELECT COUNT(*) FROM c;\n\\q\n' > "$WORK/c.repl"
+  out=$(script -qec "$BIN sql $C --nosync --csv" /dev/null < "$WORK/c.repl" 2>&1 | tr -d '\r')
+  expect "COPY 2" "$out"
+  expect "$(printf 'count\n12')" "$out"
+fi
+"$BIN" verify "$C" >/dev/null || fail "VERIFY after the COPYs"
+"$AUD" verify "$C" >/dev/null || fail "the auditor after the COPYs"
+echo "COPY: a file's bytes back unchanged; a script's inline data to its \\. line, a quoted \\. kept as data; both verifiers agree"
+
 printf '\nALL INTEGRATION CHECKS PASSED\n'

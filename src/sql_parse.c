@@ -1221,6 +1221,78 @@ static int insert_query(parser *p, sql_stmt *st)
     p->st = saved;
     return rc;
 }
+
+/* P2 S10: COPY t [(cols)] FROM STDIN | TO STDOUT [[WITH] (option, ...)] and COPY (query) TO STDOUT [...]. No file name,
+ * ever: a statement's text may come from anyone who can send SQL, and the operator's files are the client's to open
+ * (the CLI's -c with a redirection, a script's inline data, imdb_session_copy_io). Options: HEADER [TRUE | FALSE],
+ * DELIMITER 'c' (one byte: not a quote, CR, LF or past ASCII), BATCH n and SKIP n (FROM), FORMAT CSV (the one) */
+static int parse_copy(parser *p, sql_stmt *st)
+{
+    st->copy_delim = ',';
+    if (p->t[p->i].kind == TK_LP) { /* a query's rows */
+        if (!query_at(p, p->i + 1)) return fail_at(p, "a table or a query in parentheses");
+        tok(p, TK_LP);
+        if (insert_query(p, st) || expect(p, TK_RP, ")")) return p->e->code;
+        st->kind = ST_COPY_TO;
+        if (!kw(p, "to")) return fail_at(p, "TO STDOUT after COPY's query");
+        if (!kw(p, "stdout")) return fail_at(p, "STDOUT (COPY writes to the client's stream; no file names)");
+    } else {
+        if (ident(p, st->table)) return p->e->code;
+        if (tok(p, TK_LP)) {
+            do {
+                if (st->ncols >= IMDB_MAX_COLS) return imdb_fail(p->e, IMDB_ERR_LIMIT, "too many columns");
+                if (ident(p, st->cols[st->ncols++])) return p->e->code;
+            } while (tok(p, TK_COMMA));
+            if (expect(p, TK_RP, ")")) return p->e->code;
+        }
+        if (kw(p, "from")) {
+            st->kind = ST_COPY_FROM;
+            if (!kw(p, "stdin")) return fail_at(p, "STDIN (COPY reads the client's stream; no file names)");
+        } else if (kw(p, "to")) {
+            st->kind = ST_COPY_TO;
+            if (!kw(p, "stdout")) return fail_at(p, "STDOUT (COPY writes to the client's stream; no file names)");
+        } else {
+            return fail_at(p, "FROM STDIN or TO STDOUT");
+        }
+    }
+    bool with = kw(p, "with");
+    if (!tok(p, TK_LP)) return with ? fail_at(p, "( after WITH") : IMDB_OK;
+    bool seen[5] = {false};
+    do {
+        int o = tok_is_kw(p, p->i, "header") ? 0 : tok_is_kw(p, p->i, "delimiter") ? 1 : tok_is_kw(p, p->i, "batch") ? 2
+              : tok_is_kw(p, p->i, "skip") ? 3 : tok_is_kw(p, p->i, "format") ? 4 : -1;
+        if (o < 0) return fail_at(p, "a COPY option: HEADER, DELIMITER, BATCH, SKIP or FORMAT");
+        if (seen[o]) return imdb_fail(p->e, IMDB_ERR_SYNTAX, "a COPY option given twice at offset %u", p->t[p->i].off);
+        seen[o] = true;
+        p->i++;
+        if (o == 0) {
+            st->copy_header = !kw(p, "false");
+            if (st->copy_header) kw(p, "true");
+        } else if (o == 1) {
+            const sql_tok *t = &p->t[p->i];
+            if (t->kind != TK_STR) return fail_at(p, "a one-byte string after DELIMITER");
+            unsigned char ch = t->len == 1 ? (unsigned char)p->s[t->off] : 0;
+            if (t->len != 1 || ch == '"' || ch == '\r' || ch == '\n' || ch >= 0x80)
+                return imdb_fail(p->e, IMDB_ERR_INVALID, "COPY's DELIMITER is one ASCII byte, not a quote, CR or LF");
+            st->copy_delim = (char)ch;
+            p->i++;
+        } else if (o == 2 || o == 3) {
+            if (st->kind != ST_COPY_FROM) return imdb_fail(p->e, IMDB_ERR_INVALID, "%s is COPY ... FROM's", o == 2 ? "BATCH" : "SKIP");
+            uint64_t v;
+            if (uint_lit(p, &v)) return p->e->code;
+            if (o == 2) {
+                if (v < 1 || v > IMDB_MAX_OPS_PER_COMMIT)
+                    return imdb_fail(p->e, IMDB_ERR_LIMIT, "BATCH is 1 to %u rows a commit", IMDB_MAX_OPS_PER_COMMIT);
+                st->copy_batch = (uint32_t)v;
+            } else {
+                st->copy_skip = v;
+            }
+        } else if (!kw(p, "csv")) {
+            return fail_at(p, "CSV after FORMAT (the one format)");
+        }
+    } while (tok(p, TK_COMMA));
+    return expect(p, TK_RP, ")") ? p->e->code : IMDB_OK;
+}
 /* P2 S8: UPDATE t SET ... FROM u [AS a] [WHERE condition], DELETE FROM t USING u [AS a] [WHERE condition], FROM or
  * USING at p->i: st->src is SELECT * FROM t JOIN u ON condition (CROSS without one), which the executor runs whole at
  * the statement's snapshot; st's SET trees read t and u as a join's two sides (st->table2, alias2) */
@@ -1841,6 +1913,7 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
     }
     else if (kw(&p, "insert")) rc = parse_insert(&p, st);
     else if (kw(&p, "prepare")) rc = parse_prepare(&p, st); /* P2 S9 */
+    else if (kw(&p, "copy")) rc = parse_copy(&p, st); /* P2 S10 */
     else if (kw(&p, "execute")) rc = parse_execute(&p, st);
     else if (kw(&p, "deallocate")) {
         st->kind = ST_DEALLOCATE;

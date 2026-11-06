@@ -902,6 +902,46 @@ DEALLOCATE by_id;
   EXECUTE without values takes the API's as given),
   `imdb_deallocate`. Not yet: EXPLAIN EXECUTE.
 
+Import and export, CSV (COPY):
+
+```sh
+imagedb sql DIR -c "COPY orders FROM STDIN (HEADER)" < orders.csv
+imagedb sql DIR -c "COPY orders TO STDOUT (HEADER)" > orders.csv
+imagedb sql DIR -c "COPY (SELECT id, amount FROM orders WHERE amount > 100 ORDER BY id) TO STDOUT" > big.csv
+```
+
+In a script (`-f`, piped input) or the REPL, the data follows the statement, from the next line to a line `\.`:
+
+```sql
+COPY orders (id, amount) FROM STDIN;
+1,19.50
+2,"7.25"
+\.
+SELECT COUNT(*) FROM orders;
+```
+
+- `COPY t [(cols)] FROM STDIN [(option, ...)]` and `COPY t [(cols)] | (query) TO STDOUT [(option, ...)]`. No file name
+  in SQL, ever (a statement's text may come from anyone who can send SQL): the operator's files go through the CLI's
+  redirections, a script's inline data, or the C API's stream (`imdb_session_copy_io`, a reader and a writer).
+- CSV (RFC 4180), strictly: a field quoted or not, `""` a quote inside quotes, a newline only inside quotes; records end
+  with LF or CR LF, one style a stream, the last with the stream if it has no line end. An unquoted empty field is
+  NULL, a quoted one (`""`) the empty string. Each value by its column's literal rules, exact or refused: INT64, DECIMAL
+  to the column's places, FLOAT64, TEXT (strict UTF-8, no NUL), BOOL `true` or `false`, TIMESTAMP
+  `YYYY-MM-DD HH:MM:SS[.ffffff]`. A byte-order mark is refused. An error names the line and the column, never a value.
+  A script's data ends at a line that is exactly `\.` (a quoted `"\."` is data, and `\. ` with a space is data too).
+- Options: `HEADER [TRUE | FALSE]` (the first record names the columns, in order, any case: checked, never used to
+  reorder); `DELIMITER 'c'` (one ASCII byte, not a quote, CR or LF); `FORMAT CSV` (the one); `BATCH n` and `SKIP n`
+  (FROM).
+- One transaction by default, inside BEGIN ... COMMIT the transaction's own rows. A load larger than one transaction
+  (1,048,576 rows, 768 MiB) needs `BATCH n`: a commit every n rows, outside a transaction; a failure then says how many
+  rows earlier batches committed and the `SKIP n` that resumes after them (SKIP counts data records, after the header).
+  Rows go through INSERT's own path: the same checks, the same log records (no new op); a replica applies them as any.
+- COPY TO writes the header under HEADER, then each row as SELECT renders its values; a field is quoted when it holds the
+  delimiter, a quote, CR or LF, is empty, or is `\.`; NULL is the empty unquoted field; a table's rows in key order.
+  Its count goes to stderr, so stdout is the data alone. The rows are a query's result, under `statement_memory`: a
+  table larger than that is refused, so export it in key ranges, `COPY (SELECT ... WHERE id BETWEEN ...) TO STDOUT`.
+  Not yet: a streamed COPY TO, a logical dump (schema and rows as SQL) and its restore.
+
 ## Validation
 
 ```sh

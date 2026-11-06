@@ -82,6 +82,7 @@
 #define IMDB_PIN_MAX_LAG        (1u << 20)   /* commits a pinned generation may lag the current one, kept */
 #define IMDB_MAX_PIN_FILES      4096u        /* pins/ entries GC, VERIFY or the auditor reads */
 #define IMDB_PIN_RETRIES        3u           /* reads a reader starts again when its generation vanished */
+#define IMDB_COPY_BUF           (64u << 10)  /* COPY's input and output buffers (P2 S10): memory follows a row, never the data */
 #define IMDB_MAX_RESULT_BYTES   (1ull << 30) /* one statement's result (cells and text); a memory budget tightens it */
 #define IMDB_MIN_STATEMENT_MEMORY (1ull << 20) /* SET statement_memory's least (P0 R2): a read statement's workspace */
 #define IMDB_MAX_STATEMENT_MEMORY (16ull << 30) /* and its most; the default is IMDB_MAX_RESULT_BYTES or a budget's quarter */

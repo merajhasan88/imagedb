@@ -152,4 +152,17 @@ printf 'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB' > "$WORK/fuzz-backup.key"
 chmod 0400 "$WORK/fuzz-backup.key"
 rm -f "$OUT/backup/full.bak" # a backup never writes over a name: a second make fuzz-run would stop here
 "$BIN" backup "$D" --key "$WORK/fuzz-backup.key" --out "$OUT/backup/full.bak" >/dev/null
+# P2 S10: CSV streams for fuzz_csv (its first byte a read's size less one, its second the delimiter: 0 a comma, 1 a
+# semicolon, 2 a tab, 3 a bar), each a rule of src/csv.h: quotes, "" inside them, CR LF, a newline and a \\. line
+# inside quotes, a trailing delimiter at the end, the refusals
+mkdir -p "$OUT/csv"
+printf '\006\000id,s,d\n1,plain,1.50\n2,"a, ""q""\nline",-0.01\n3,,\n4,"",0' > "$OUT/csv/lf"
+printf '\002\000a,b\r\n"x\r\ny",2\r\n,\r\n' > "$OUT/csv/crlf"
+printf '\377\001a;"b;c";\n"\\.";1;\n' > "$OUT/csv/semicolon"
+printf '\000\002x\ty\n"tab\there"\t\n' > "$OUT/csv/tab"
+printf '\003\003a|b|\n|\n' > "$OUT/csv/bar"
+printf '\001\000\357\273\277a,b\n' > "$OUT/csv/bom"
+printf '\004\000a,"b\n' > "$OUT/csv/open-quote"
+printf '\004\000a,b\r2,c\n' > "$OUT/csv/bare-cr"
+printf '\004\000a,b\n1,2\r\n' > "$OUT/csv/mixed"
 echo "corpus: $(find "$OUT" -type f | wc -l) seeds in $OUT"

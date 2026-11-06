@@ -50,6 +50,11 @@ typedef struct imdb_repl_outcome {
     imdb_repl_kind kind;
 } imdb_repl_outcome;
 
+/* P2 S10: a session's COPY stream (imdb_session_copy_io): the bytes COPY ... FROM STDIN reads (> 0 put in buf, at most
+ * cap; 0 the data's end; < 0 a failure) and COPY ... TO STDOUT writes (0, or < 0 a failure) */
+typedef long (*imdb_copy_read_fn)(void *arg, char *buf, size_t cap);
+typedef int (*imdb_copy_write_fn)(void *arg, const char *buf, size_t len);
+
 typedef struct imdb_session {
     imdb_db *db;
     bool cross_check;
@@ -74,6 +79,9 @@ typedef struct imdb_session {
     uint64_t stmt_memory;     /* SET statement_memory = bytes: a read statement's workspace ceiling (P0 R2; 0: the default,
                                * a quarter of the memory budget or IMDB_MAX_RESULT_BYTES) */
     struct imdb_prep_set *prep; /* P2 S9: its prepared statements (PREPARE, imdb_prepare), NULL until the first */
+    imdb_copy_read_fn copy_rd;  /* P2 S10: the COPY stream (imdb_session_copy_io); NULL: COPY is refused */
+    imdb_copy_write_fn copy_wr;
+    void *copy_arg;
     atomic_bool cancel;       /* imdb_session_cancel: the running statement stops at its next check (cleared at
                                * each statement's start, so a request between statements is dropped) */
 } imdb_session;
@@ -105,6 +113,7 @@ typedef struct imdb_result {
     uint8_t lake_manifest[32];
     bool show_identity;      /* the session asked to print it */
     bool has_rows;
+    bool copy_out;           /* P2 S10: COPY ... TO STDOUT wrote its rows to the session's stream: status is its count alone */
 } imdb_result;
 
 void imdb_session_init(imdb_session *s, imdb_db *db);
@@ -129,6 +138,11 @@ int imdb_prepare(imdb_session *s, const char *name, const char *sql, size_t len,
 int imdb_execute(imdb_session *s, const char *name, const imdb_value *params, uint32_t nparams, imdb_result *res,
                  imdb_err *e);
 int imdb_deallocate(imdb_session *s, const char *name, imdb_err *e);
+/* P2 S10: the stream COPY ... FROM STDIN reads and COPY ... TO STDOUT writes (rd or wr NULL: that one refused), arg
+ * passed to each; until set, COPY is refused. No COPY names a file: the client opens the operator's and serves it here */
+void imdb_session_copy_io(imdb_session *s, imdb_copy_read_fn rd, imdb_copy_write_fn wr, void *arg);
+/* P2 S10: sql is one COPY ... FROM STDIN statement, whose data a client sends after it (main.c: a script's inline data) */
+bool imdb_copy_in_stmt(const char *sql, size_t len);
 
 /* Splits a script into statements (respecting string literals and -- comments).
  * Calls cb for each; stops at the first error. */
