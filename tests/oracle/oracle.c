@@ -284,6 +284,8 @@ typedef struct stmt {
     bool ufrom;        /* P2 S8: UPDATE u SET ufc[] = t.uft[] FROM t WHERE t.id = u.tid [AND t.g = ufg], or DELETE FROM u
                         * USING t WHERE the same (SQLite: WHERE EXISTS): each u row one pair, t.id its parent's key */
     int nuf, ufc[2], uft[2], ufg;
+    bool dupkey;       /* P2 S13: an INSERT whose rows hold a key that may exist, at any row */
+    bool ufail;        /* P2 S13: UPDATE t SET g = ABS(x) % 5: refused by every engine where a row's x is INT64_MIN */
 } stmt;
 
 static int64_t g_next_id;          /* the next new key of t, of u */
@@ -293,6 +295,11 @@ static int g_nisel; /* P2 S8: this seed's INSERT ... SELECTs: the n-th copies at
 static long g_ups_compared; /* P2 S8: ON CONFLICT's statements compared */
 static long g_ufrom_compared; /* P2 S8: UPDATE ... FROM and DELETE ... USING compared */
 static long g_prep_compared; /* P2 S9: SELECTs imagedb ran prepared, compared */
+/* P2 S13: writes imagedb ran prepared, compared; of the prepared, those run with their values as API parameters and
+ * those with a NULL among them; writes that may fail part way, compared and refused by both */
+static long g_prepw_compared, g_prep_api, g_prep_null, g_prep_runs;
+static long g_dup_compared, g_dup_refused, g_ufail_compared, g_ufail_refused;
+static bool g_prep_last_api, g_prep_last_null; /* the last prepared run's: API parameters, a NULL among its values */
 
 /* values the tables hold (inserted or set, some since gone): a predicate drawn from them matches rows, where a random
  * one mostly matches none or all */
@@ -1838,11 +1845,18 @@ static void gen_dml(stmt *q, bool may_fail)
         }
         q->nrow = (int)rr(1, 4);
         for (int i = 0; i < q->nrow; i++) gen_row(q->tab, q->row[i]);
-        if (may_fail && q->tab == 0 && g_ntids > 1 && chance(15)) /* a key that may exist: refused everywhere */
-            q->row[q->nrow - 1][0].i = g_tids[rnd() % (uint64_t)(g_ntids - 1)];
+        if (may_fail && q->tab == 0 && g_ntids > 1 && chance(15)) { /* a key that may exist: refused everywhere; P2
+                                                                     * S13: at any row, so an engine writing them in
+                                                                     * order has written the rows before it (the
+                                                                     * tables' states after it: none of them kept) */
+            int at = (int)rr(0, q->nrow - 1);
+            q->row[at][0].i = g_tids[rnd() % (uint64_t)(g_ntids - 1)];
+            q->dupkey = true;
+        }
         /* P2 S8: an upsert, where every engine run spells it as imagedb does (MySQL, MariaDB and SQL Server do not) */
         if (g_expr && q->tab == 0 && g_ntids > 1 && chance(30)) {
             q->ups = (int)rr(1, 3);
+            q->dupkey = false; /* P2 S13: DO NOTHING or DO UPDATE takes an existing key: nothing fails */
             for (int i = 0; i < q->nrow; i++)
                 if (chance(50)) q->row[i][0].i = g_tids[rnd() % (uint64_t)g_ntids];
             for (int i = 0; i < q->nrow; i++) /* keys distinct: SQLite's DO UPDATE would meet its own row twice, MERGE
@@ -1895,6 +1909,16 @@ static void gen_dml(stmt *q, bool may_fail)
                 gen_xset(q, i);
                 if (i && q->scol[i] == q->scol[0]) q->nset = 1;
             }
+        }
+        if (g_expr && may_fail && q->tab == 0 && chance(12)) { /* P2 S13: a write failing part way: ABS(x) overflows
+                                                                 * where x is INT64_MIN (in SQLite too: its abs()
+                                                                 * raises), after the rows before it are written; g
+                                                                 * stays 0 to 4. The tables' states after it show
+                                                                 * whether any engine kept a row of it */
+            q->nset = 1;
+            q->scol[0] = 1;
+            q->sx[0] = xnew(q, X_MOD, xfn(q, XF_ABS, xcol(q, 0, 3), 0, CT_INT, 0), xlit_int(q, 5));
+            q->ufail = true;
         }
         gen_preds(q, 2, false);
     } else {
@@ -1976,12 +2000,13 @@ static bool g_pmode, g_pfail;
 static struct {
     int t;
     char s[100];
+    val v; /* P2 S13: the value itself, for an EXECUTE through API parameters (a NULL typed by its column) */
 } g_par[48];
 static int g_npar;
 
 static void put_lit(sb *b, int d, int t, const val *v)
 {
-    if (g_pmode && d == D_IMDB && !v->null) {
+    if (g_pmode && d == D_IMDB) { /* P2 S13: a NULL too, typed by its column (C1: EXECUTE keeps a typed NULL) */
         sb lit = {0};
         g_pmode = false;
         put_lit(&lit, d, t, v);
@@ -1992,6 +2017,7 @@ static void put_lit(sb *b, int d, int t, const val *v)
             memcpy(g_par[g_npar].s, lit.p, lit.n);
             g_par[g_npar].s[lit.n] = 0;
             g_par[g_npar].t = t;
+            g_par[g_npar].v = *v;
             sb_printf(b, "$%d", ++g_npar);
         }
         free(lit.p);
@@ -3355,14 +3381,16 @@ static bool explain_path(eng *e, const char *sql, char *out, size_t cap)
     return true;
 }
 
-static void exec_imdb(eng *e, const char *sql, bool rows, const int *ty, int nty, res *r)
+/* imagedb's statement, with API parameters p[0..np) for its $n (P2 S13: an EXECUTE's values) */
+static void exec_imdb_p(eng *e, const char *sql, bool rows, const int *ty, int nty, res *r, const imdb_value *p,
+                        uint32_t np)
 {
     char xp[128];
     bool sel = rows && !strncasecmp(sql, "SELECT", 6), xok = sel && explain_path(e, sql, xp, sizeof xp);
     imdb_result ir;
     imdb_result_init(&ir);
     imdb_err er = {0};
-    if (imdb_exec_one(&e->ses, sql, strlen(sql), NULL, 0, &ir, &er)) {
+    if (imdb_exec_one(&e->ses, sql, strlen(sql), p, np, &ir, &er)) {
         res_fail(r, "%s", er.msg);
         imdb_result_free(&ir);
         return;
@@ -3421,6 +3449,11 @@ static void exec_imdb(eng *e, const char *sql, bool rows, const int *ty, int nty
     }
     free(row.p);
     imdb_result_free(&ir);
+}
+
+static void exec_imdb(eng *e, const char *sql, bool rows, const int *ty, int nty, res *r)
+{
+    exec_imdb_p(e, sql, rows, ty, nty, r, NULL, 0);
 }
 
 static void exec_lite(eng *e, const char *sql, bool rows, const int *ty, int nty, res *r)
@@ -3944,18 +3977,50 @@ static bool excused_lazy(int d, const stmt *q, const char *msg)
     return true;
 }
 
+/* P2 S13: g_par[i]'s value as the API passes a parameter: typed as PREPARE declared it (DECIMAL(18,2): scale 2), a NULL
+ * typed too; TEXT points into g_par, alive through the EXECUTE */
+static imdb_value par_value(int i)
+{
+    static const uint8_t IT[] = {IMDB_T_INT64, IMDB_T_DECIMAL, IMDB_T_FLOAT64, IMDB_T_TEXT, IMDB_T_BOOL, IMDB_T_TIMESTAMP};
+    const val *v = &g_par[i].v;
+    int t = g_par[i].t;
+    imdb_value x = {.type = IT[t], .scale = t == CT_DEC ? 2 : 0};
+    if (v->null) {
+        x.null = true;
+        return x;
+    }
+    if (t == CT_FLT) x.i = imdb_f64_key(v->f);
+    else if (t == CT_TXT) x.s = (const uint8_t *)v->s, x.len = (uint32_t)strlen(v->s);
+    else x.i = v->i; /* INT64, DECIMAL scaled by 100, BOOL, TIMESTAMP's microseconds */
+    return x;
+}
+
 /* P2 S9: imagedb's statement (text, its literals $1..$n in g_par) run as PREPARE with their types, EXECUTE with their
- * texts, DEALLOCATE; text then all of it, for a mismatch's report */
+ * texts, DEALLOCATE; text then all of it, for a mismatch's report. P2 S13: every other one EXECUTEs with $1..$n, its
+ * values passed as API parameters (imdb_exec_one's), and half of those PREPAREs declare no types, so each value is
+ * taken with its own (xval_param): the path the review's C1 typed NULL took */
 static void exec_prepared(eng *e, sb *text, bool rows, const int *ty, int nty, res *r)
 {
     static const char *const TN[] = {"INT64", "DECIMAL(18,2)", "FLOAT64", "TEXT", "BOOL", "TIMESTAMP"};
+    long k = g_prep_runs++;
+    bool api = k % 2 == 1, decl = !(api && k % 4 == 3);
+    g_prep_last_api = api;
+    g_prep_last_null = false;
+    for (int i = 0; i < g_npar; i++) g_prep_last_null |= g_par[i].v.null;
     sb p = {0}, x = {0};
     sb_str(&p, "PREPARE oq");
-    for (int i = 0; i < g_npar; i++) sb_printf(&p, "%s%s", i ? ", " : " (", TN[g_par[i].t]);
-    sb_printf(&p, "%s AS %s", g_npar ? ")" : "", text->p);
+    for (int i = 0; decl && i < g_npar; i++) sb_printf(&p, "%s%s", i ? ", " : " (", TN[g_par[i].t]);
+    sb_str(&p, g_npar && decl ? ") AS " : " AS "); /* the statement whole: sb_printf takes pieces of 512 bytes (P2 S13: a
+                                                    * write runs past) */
+    sb_str(&p, text->p);
     sb_str(&x, "EXECUTE oq");
-    for (int i = 0; i < g_npar; i++) sb_printf(&x, "%s%s", i ? ", " : " (", g_par[i].s);
+    for (int i = 0; i < g_npar; i++) {
+        if (api) sb_printf(&x, "%s$%d", i ? ", " : " (", i + 1);
+        else sb_printf(&x, "%s%s", i ? ", " : " (", g_par[i].s);
+    }
     if (g_npar) sb_str(&x, ")");
+    imdb_value pv[48];
+    for (int i = 0; api && i < g_npar; i++) pv[i] = par_value(i);
     res tmp = {0};
     tmp.affected = -1;
     exec_eng(e, p.p, false, NULL, 0, &tmp);
@@ -3963,12 +4028,24 @@ static void exec_prepared(eng *e, sb *text, bool rows, const int *ty, int nty, r
         res_clear(r);
         res_fail(r, "PREPARE: %s", tmp.msg);
     } else {
-        exec_eng(e, x.p, rows, ty, nty, r);
+        if (api) {
+            res_clear(r);
+            e->statements++;
+            exec_imdb_p(e, x.p, rows, ty, nty, r, pv, (uint32_t)g_npar);
+        } else {
+            exec_eng(e, x.p, rows, ty, nty, r);
+        }
         exec_eng(e, "DEALLOCATE oq", false, NULL, 0, &tmp);
     }
     res_clear(&tmp);
     sb_reset(text);
-    sb_printf(text, "%s; %s", p.p, x.p);
+    sb_str(text, p.p);
+    sb_str(text, "; ");
+    sb_str(text, x.p);
+    if (api) { /* the report names the values the API passed */
+        sb_str(text, " -- API:");
+        for (int i = 0; i < g_npar; i++) sb_printf(text, " $%d = %s", i + 1, g_par[i].s);
+    }
     free(p.p);
     free(x.p);
 }
@@ -3987,8 +4064,10 @@ static int run_stmt(unsigned seed, int step, const stmt *q, bool state)
     for (int d = 0; d < ND; d++) {
         if (!g_eng[d].on || (q->skip & (1u << d))) continue; /* not put to it: its dialect computes it otherwise */
         bool rd = rows || ret_ok(d, q); /* P2 S8: RETURNING's rows, where the dialect has it */
-        /* P2 S9: a quarter of imagedb's SELECTs (by seed and step: no draw taken) run prepared, its literals $n */
-        bool pm = d == D_IMDB && q->kind == Q_SELECT && !state && (seed * 7u + (unsigned)step) % 4 == 0;
+        /* P2 S9: a quarter of imagedb's SELECTs (by seed and step: no draw taken) run prepared, its literals $n; P2 S13:
+         * its writes too, a NULL a typed parameter */
+        bool pm = d == D_IMDB && (q->kind == Q_SELECT ? !state : q->kind == Q_INSERT || q->kind == Q_UPDATE || q->kind == Q_DELETE) &&
+                  (seed * 7u + (unsigned)step) % 4 == 0;
         g_pmode = pm, g_pfail = false, g_npar = 0;
         print_stmt(&text[d], d, q);
         g_pmode = false;
@@ -4019,7 +4098,14 @@ static int run_stmt(unsigned seed, int step, const stmt *q, bool state)
         if (q->isel) g_isel_compared++; /* P2 S8 */
         if (q->ups) g_ups_compared++;
         if (q->ufrom) g_ufrom_compared++;
-        if (prepped) g_prep_compared++;
+        if (prepped) {
+            if (rows) g_prep_compared++;
+            else g_prepw_compared++; /* P2 S13 */
+            g_prep_api += g_prep_last_api;
+            g_prep_null += g_prep_last_null;
+        }
+        if (q->dupkey) g_dup_compared++, g_dup_refused += base->err && out[d].err; /* P2 S13 */
+        if (q->ufail) g_ufail_compared++, g_ufail_refused += base->err && out[d].err;
         bool rows_d = rows || ret_ok(d, q);
         if (q->nret && rows_d) g_ret_compared++;
         const res *o = &out[d];
@@ -4123,6 +4209,7 @@ static int run_seed(unsigned seed, int steps)
     g_next_id = 1;
     g_ntids = 0;
     g_nisel = 0; /* P2 S8 */
+    g_prep_runs = 0; /* P2 S13: which prepared runs take API parameters is the seed's own (--seeds N alone repeats it) */
     memset(g_nsamp, 0, sizeof g_nsamp);
     reset_all(seed);
     stmt q;
@@ -4266,6 +4353,12 @@ int main(int argc, char **argv)
     printf("oracle: %ld comparisons of P2 S8's INSERT ... SELECT, %ld of RETURNING's rows, %ld of ON CONFLICT%s\n", g_isel_compared,
            g_ret_compared, g_ups_compared, "");
     printf("oracle: %ld comparisons of P2 S9's prepared SELECTs (imagedb's literals as $n: PREPARE, EXECUTE)\n", g_prep_compared);
+    printf("oracle: %ld comparisons of P2 S13's prepared writes; of every prepared statement compared, %ld with its values as "
+           "API parameters, %ld with a NULL among them (a typed parameter)\n", g_prepw_compared, g_prep_api, g_prep_null);
+    printf("oracle: %ld comparisons of P2 S13's writes drawn to fail part way, outside transactions: an INSERT with a key that "
+           "may exist, at any row, %ld (%ld refused by both), UPDATE t SET g = ABS(x) %% 5 %ld (%ld refused by both); the "
+           "tables' states after each\n",
+           g_dup_compared + g_ufail_compared, g_dup_compared, g_dup_refused, g_ufail_compared, g_ufail_refused);
     printf("oracle: %ld comparisons of P2 S8's UPDATE ... FROM and DELETE ... USING%s\n", g_ufrom_compared,
            "");
     printf("oracle: %ld comparisons of P2 S5's set operations, %ld of its WITH RECURSIVE\n", g_set_compared, g_rec_compared);
