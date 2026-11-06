@@ -1104,12 +1104,26 @@ static void t_segcache_release(void)
             }
         }
     }
-    /* P2 S16: row SELECTs let their walk's images go too; the result's reading takes the matching rows' segments again
-     * (a selective statement: fewer than every image at once; DISTINCT over every segment: all of them, read again) */
-    static const char *const rows[] = {"SELECT id, s FROM t WHERE v + 1 = 500 ORDER BY s, id",
-                                       "SELECT id FROM t WHERE v * 2 > 990 ORDER BY id DESC LIMIT 3",
-                                       "SELECT id, s FROM t WHERE s = '' OR s IS NULL ORDER BY id",
-                                       "SELECT DISTINCT g FROM t WHERE s LIKE '%a while long 1%' ORDER BY g"};
+    /* P2 S16, S18: row SELECTs let their walk's images go too, and take their sort keys in the walk (walk_keys), so the
+     * result's reading takes again only the segments of the rows it outputs: a selective statement holds fewer than every
+     * image at once, a LIMIT n at most the budget, the image in hand and n more (OFFSET skips unread); a DISTINCT reads
+     * the rows its window passes over (out 0: no bound) */
+    static const struct {
+        const char *sql;
+        int out; /* the rows the result reads at most: -1 a selective statement's (fewer than every image), 0 unbounded */
+    } rows[] = {
+        {"SELECT id, s FROM t WHERE v + 1 = 500 ORDER BY s, id", -1},
+        {"SELECT id FROM t WHERE v * 2 > 990 ORDER BY id DESC LIMIT 3", 3},
+        {"SELECT id, s FROM t WHERE s = '' OR s IS NULL ORDER BY id", -1},
+        {"SELECT DISTINCT g FROM t WHERE s LIKE '%a while long 1%' ORDER BY g", 0},
+        {"SELECT id, s FROM t ORDER BY s DESC LIMIT 5", 5},
+        {"SELECT id, v FROM t ORDER BY v, id LIMIT 3 OFFSET 2", 3},
+        {"SELECT id FROM t WHERE g = 3 ORDER BY s LIMIT 4", 4},
+        {"SELECT id, s || '!' AS e FROM t ORDER BY s || '!' DESC LIMIT 2", 2}, /* a computed key: the arena's, copied */
+        {"SELECT DISTINCT s FROM t WHERE s IS NOT NULL ORDER BY s DESC LIMIT 3", 6}, /* nearly distinct: a few rows (the
+                                                                                      * NULLs first under DESC would be
+                                                                                      * ~58 rows over every segment) */
+    };
     enum { NR = sizeof rows / sizeof *rows };
     imdb_buf wantr[2][NR];
     db->segcache.budget = UINT64_MAX;
@@ -1117,7 +1131,7 @@ static void t_segcache_release(void)
         for (int a = 0; a < NR; a++) {
             imdb_buf_init(&wantr[p][a]);
             OK(ex(&s, paths[p]));
-            outcome(&s, rows[a], &wantr[p][a]);
+            outcome(&s, rows[a].sql, &wantr[p][a]);
         }
     for (int b = 0; b < 2; b++) {
         db->segcache.budget = budget_of[b] * largest;
@@ -1125,17 +1139,19 @@ static void t_segcache_release(void)
             OK(ex(&s, paths[p]));
             for (int a = 0; a < NR; a++) {
                 uint64_t rel = db->segcache.released;
-                uint64_t peak = peak_of(db, &s, rows[a], &got);
+                uint64_t peak = peak_of(db, &s, rows[a].sql, &got);
                 bool eq = got.len == wantr[p][a].len && !memcmp(got.p, wantr[p][a].p, got.len);
-                bool sel = a < 3; /* the selective ones */
-                if (!eq || (sel && peak >= (uint64_t)NSEG * largest))
-                    fprintf(stderr, "    %s at %llu: peak %llu (largest %llu), released %llu\n%.*s", rows[a],
-                            (unsigned long long)db->segcache.budget, (unsigned long long)peak,
-                            (unsigned long long)largest, (unsigned long long)(db->segcache.released - rel), (int)got.len,
+                uint64_t bound = rows[a].out < 0    ? (uint64_t)NSEG * largest - 1
+                                 : rows[a].out == 0 ? UINT64_MAX
+                                                    : (budget_of[b] + 1 + (uint64_t)rows[a].out) * largest;
+                if (!eq || peak > bound)
+                    fprintf(stderr, "    %s at %llu: peak %llu (largest %llu, bound %llu), released %llu\n%.*s", rows[a].sql,
+                            (unsigned long long)db->segcache.budget, (unsigned long long)peak, (unsigned long long)largest,
+                            (unsigned long long)bound, (unsigned long long)(db->segcache.released - rel), (int)got.len,
                             (const char *)got.p);
                 CHECK(eq);
                 CHECK(db->segcache.released > rel);
-                if (sel) CHECK(peak < (uint64_t)NSEG * largest);
+                CHECK(peak <= bound);
             }
         }
     }

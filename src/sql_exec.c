@@ -1574,6 +1574,16 @@ typedef struct sink {
     char cdelim;
     imdb_buf *ctmp;          /* one value's text */
     uint64_t crows;
+    /* P2 S18 (the 2026-11-05 review's O3, materialize's step): a row statement's sort keys taken in its walk, as the
+     * path gives each matching row (walk_keys), so materialize reads again only the rows it outputs; kwalk on every sink
+     * that will materialize (exec_select: never under EXISTS by presence) */
+    bool kwalk;
+    struct keyed *wkv;       /* each matching row's primary key (a row set's: its vid), nvids of them, the walk's order */
+    imdb_xval *wok;          /* ORDER BY's keys, nvids x norder, the walk's order */
+    uint64_t capw;           /* their room, in rows */
+    uint64_t kcap;           /* the result's cap, which the sort's keys are held under (order_keys_alloc's rule) */
+    imdb_buf kbuf;           /* every TEXT key's bytes, grown with them: a key holds its offset in i until key_resolve (the buffer
+                              * moves as it grows), since the row's image may go behind the walk, an arena's with the row */
 } sink;
 
 /* xtick for a sink's loop: its error set, so the path stops there (every path loop tests k->err) */
@@ -1854,6 +1864,7 @@ fail:
 }
 
 static void copy_row(sink *k, const imdb_value *vals); /* P2 S17 */
+static int walk_keys(sink *k, uint64_t vid, const imdb_value *vals); /* P2 S18 */
 
 static void sink_row(sink *k, uint64_t vid, const imdb_value *vals)
 {
@@ -1881,6 +1892,10 @@ static void sink_row(sink *k, uint64_t vid, const imdb_value *vals)
             }
             k->vids = nv;
             k->capvids = nc;
+        }
+        if (k->kwalk && walk_keys(k, vid, vals)) { /* P2 S18: its keys before the row's image or arena can go */
+            k->err = k->e->code;
+            return;
         }
         k->vids[k->nvids++] = vid;
         if (k->first) k->err = SINK_FOUND; /* P2 S11: every path loop stops on k->err */
@@ -1966,6 +1981,9 @@ static void sink_free(sink *k)
     imdb_buf_free(&k->kenc);
     imdb_buf_free(&k->denc);
     if (k->dmap.slots) imdb_hmap_free(&k->dmap);
+    imdb_free(k->wkv); /* P2 S18 */
+    imdb_free(k->wok);
+    imdb_buf_free(&k->kbuf);
 }
 
 /* ---- the three read paths --------------------------------------------------------- */
@@ -2851,6 +2869,7 @@ static int choose_path(const imdb_session *ss, const qspec *q, const sink *k)
 typedef struct keyed {
     imdb_value key;
     uint64_t vid;
+    uint64_t at; /* P2 S18: its row's place in the walk, where walk_keys put its ORDER BY keys */
 } keyed;
 
 static int cmp_keyed(const void *a, const void *b)
@@ -2880,14 +2899,16 @@ static int cmp_u64(const void *a, const void *b)
 typedef struct ordctx {
     const sql_stmt *st;
     const imdb_xval *keys;   /* rows x st->norder, row i's in the default order's place i */
+    const keyed *kv;         /* P2 S18: or, given, row i's at kv[i].at (the walk's place: walk_keys) */
 } ordctx;
 
 static int cmp_order(const void *pa, const void *pb, void *arg)
 {
     const ordctx *c = arg;
     uint64_t a = *(const uint64_t *)pa, b = *(const uint64_t *)pb, nk = c->st->norder;
+    uint64_t ka = c->kv ? c->kv[a].at : a, kb = c->kv ? c->kv[b].at : b; /* the tie stays a < b: the default order's */
     for (uint8_t o = 0; o < nk; o++) {
-        const imdb_xval *x = &c->keys[a * nk + o], *y = &c->keys[b * nk + o];
+        const imdb_xval *x = &c->keys[ka * nk + o], *y = &c->keys[kb * nk + o];
         if (x->null || y->null) {
             if (x->null == y->null) continue;
             int r = x->null ? 1 : -1; /* NULLs last, or first: whatever the direction */
@@ -3000,6 +3021,87 @@ static imdb_xval *order_keys_alloc(const imdb_result *r, const sql_stmt *st, uin
         return NULL;
     }
     return imdb_alloc_array(n ? n * st->norder : 1, sizeof(imdb_xval), e);
+}
+
+/* P2 S18: a key's TEXT appended to the sink's own buffer, past the row, its offset returned for the key's i (the buffer
+ * moves as it grows: key_resolve points the keys into it once the walk ends); an empty one points at a static string at
+ * once, so no key is a NULL pointer and none points into an image. The buffer grows with the keys' bytes, from nothing,
+ * so a small statement under a small ceiling costs what it did */
+static uint64_t key_text(sink *k, const uint8_t **s, uint32_t len)
+{
+    uint64_t off = k->kbuf.len;
+    if (!len) {
+        *s = (const uint8_t *)"";
+        return 0;
+    }
+    imdb_buf_put(&k->kbuf, *s, len);
+    *s = NULL;
+    return off;
+}
+
+/* P2 S18: the walk's TEXT keys pointed into the buffer, now that it no longer moves (materialize, before the sort) */
+static int key_resolve(sink *k, imdb_err *e)
+{
+    if (imdb_buf_check(&k->kbuf, e)) return e->code;
+    uint64_t nk = k->st->norder;
+    for (uint64_t j = 0; j < k->nvids; j++) {
+        imdb_value *v = &k->wkv[j].key;
+        if (v->type == IMDB_T_TEXT && !v->null && v->len) v->s = k->kbuf.p + v->i, v->i = 0;
+        for (uint64_t o = 0; o < nk; o++) {
+            imdb_xval *d = &k->wok[j * nk + o];
+            if (d->type == IMDB_T_TEXT && !d->null && d->len) d->s = k->kbuf.p + (uint64_t)d->i, d->i = 0;
+        }
+    }
+    return IMDB_OK;
+}
+
+/* P2 S18 (the 2026-11-05 review's O3, materialize's step): a matching row's sort keys, taken as the path gives the row
+ * (sink_row, SINK_VIDS under kwalk): its primary key (row_key's rule: a row set's is its vid) and ORDER BY's (order_key's),
+ * every TEXT copied, since a releasing walk lets the row's image go behind it and a computed key goes with the row's
+ * arena. materialize sorts these and reads again only the rows it outputs, so no segment is pinned for a key. They are
+ * held under the result's cap as they grow (order_keys_alloc's rule, counting the rows so far): the same refusal, as
+ * soon as it is due */
+static int walk_keys(sink *k, uint64_t vid, const imdb_value *vals)
+{
+    xctx *x = k->x;
+    const sql_stmt *st = k->st;
+    imdb_err *e = k->e;
+    uint64_t nk = st->norder;
+    if (nk && k->nvids + 1 > k->kcap / (nk * sizeof(imdb_xval)))
+        return imdb_fail(e, IMDB_ERR_LIMIT, "ORDER BY over %llu rows: the sort's keys pass the result's cap of %llu bytes; narrow it",
+                         (unsigned long long)(k->nvids + 1), (unsigned long long)k->kcap);
+    if (k->nvids == k->capw) {
+        uint64_t nc = k->capw ? k->capw * 2 : 16; /* from 16 rows: a small statement under a small ceiling as before */
+        keyed *nkv = imdb_realloc_array(k->wkv, k->capw, nc, sizeof *nkv, e);
+        if (!nkv) return e->code;
+        k->wkv = nkv;
+        if (nk) {
+            imdb_xval *nok = imdb_realloc_array(k->wok, k->capw * nk, nc * nk, sizeof *nok, e);
+            if (!nok) return e->code;
+            k->wok = nok;
+        }
+        k->capw = nc;
+    }
+    keyed *kv = &k->wkv[k->nvids];
+    kv->vid = vid;
+    kv->at = k->nvids;
+    if (x->nvis && rset_of(x, k->t)) {
+        kv->key = (imdb_value){.type = IMDB_T_INT64, .i = (int64_t)vid};
+    } else {
+        kv->key = vals[k->t->s.pk];
+        if (kv->key.type == IMDB_T_TEXT && !kv->key.null) kv->key.i = (int64_t)key_text(k, &kv->key.s, kv->key.len);
+    }
+    if (nk) {
+        imdb_xmark m = imdb_xarena_mark(&x->arena);
+        int rc = IMDB_OK;
+        for (uint8_t o = 0; !rc && o < nk; o++) {
+            imdb_xval *d = &k->wok[k->nvids * nk + o];
+            if (!(rc = order_key(x, st, k, o, vals, d, e)) && d->type == IMDB_T_TEXT && !d->null) d->i = key_text(k, &d->s, d->len);
+        }
+        imdb_xarena_reset(&x->arena, m);
+        if (rc) return rc;
+    }
+    return imdb_buf_check(&k->kbuf, e); /* an append that failed fails the statement here, not at the sort */
 }
 
 static int put_agg(imdb_result *r, imdb_cell *c, agg_acc *a, uint8_t agg, const imdb_column *col, imdb_err *e)
@@ -3305,7 +3407,7 @@ static int reorder_rows(const sql_stmt *st, imdb_xval *keys, imdb_result *r, imd
         for (uint8_t o = 0; o < st->norder; o++)
             if (st->ord_pos[o]) cell_x(r, &r->cells[i * r->ncols + st->ord_pos[o] - 1], &keys[i * st->norder + o]);
     if (st->norder) {
-        ordctx c = {st, keys};
+        ordctx c = {st, keys, NULL};
         qsort_r(ord, n, sizeof *ord, cmp_order, &c);
     }
     window w;
@@ -3418,37 +3520,30 @@ static int materialize(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb
         res_cols(r, nc);
         for (uint16_t i = 0; i < nc; i++) col_name(x, st, &t->s, i, r->names[i], sizeof r->names[i]);
         col_types(x, st, k, &t->s, r); /* P2 S4 */
-        keyed *kv = imdb_alloc_array(k->nvids ? k->nvids : 1, sizeof *kv, e);
-        if (!kv) return e->code;
-        for (uint64_t i = 0; i < k->nvids; i++) {
-            row_key(x, t, k->vids[i], &kv[i].key);
-            kv[i].vid = k->vids[i];
-        }
-        qsort(kv, k->nvids, sizeof *kv, cmp_keyed);
+        /* P2 S18: the keys the walk took (walk_keys), sorted by the primary key: no row is read again for a key, so a
+         * segment is pinned here only for a row the result takes */
+        if (!k->kwalk) return imdb_fail(e, IMDB_ERR_STATE, "a row statement materialized without its walk's keys");
+        if (key_resolve(k, e)) return e->code;
+        keyed *kv = k->wkv;
+        if (k->nvids) qsort(kv, k->nvids, sizeof *kv, cmp_keyed);
         imdb_value vals[IMDB_MAX_COLS];
         int rc = IMDB_OK;
         if (plain_order(st)) { /* the primary key's order, the first LIMIT rows */
             uint64_t lim = st->has_limit && st->limit < k->nvids ? st->limit : k->nvids;
             for (uint64_t i = 0; i < lim && !rc; i++)
                 if (!(rc = xtick(x, 1, e)) && !(rc = fetch_row(x, t, kv[i].vid, vals, e))) rc = put_row(x, st, k, vals, nc, r, e);
-            imdb_free(kv);
             return rc ? rc : res_finish(r, e);
         }
-        /* ORDER BY's keys for every matching row (a key that fails fails the statement: the matching set is every
-         * plan's), sorted with the primary key's order breaking ties; then OFFSET, DISTINCT and LIMIT */
+        /* ORDER BY's keys for every matching row, taken in the walk (a key that fails failed the statement there: the
+         * matching set is every plan's), sorted with the primary key's order breaking ties; then OFFSET, DISTINCT and
+         * LIMIT */
         uint64_t n = k->nvids, *ord = imdb_alloc_array(n ? n : 1, sizeof *ord, e);
-        imdb_xval *keys = NULL;
         window w;
         memset(&w, 0, sizeof w);
         if (!ord) rc = e->code;
         for (uint64_t i = 0; !rc && i < n; i++) ord[i] = i;
-        if (!rc && st->norder && !(keys = order_keys_alloc(r, st, n, e))) rc = e->code;
-        for (uint64_t i = 0; !rc && keys && i < n; i++) {
-            if ((rc = xtick(x, 1, e)) || (rc = fetch_row(x, t, kv[i].vid, vals, e))) break;
-            for (uint8_t o = 0; !rc && o < st->norder; o++) rc = order_key(x, st, k, o, vals, &keys[i * st->norder + o], e);
-        }
-        if (!rc && keys) {
-            ordctx c = {st, keys};
+        if (!rc && st->norder) {
+            ordctx c = {st, k->wok, kv};
             qsort_r(ord, n, sizeof *ord, cmp_order, &c);
             rc = xcheck(x, e); /* a sort runs to its end (the result cap bounds it): the check after it */
         }
@@ -3463,9 +3558,7 @@ static int materialize(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb
                 rc = window_take(&w, r, tl, e);
         }
         window_free(&w);
-        imdb_free(keys);
         imdb_free(ord);
-        imdb_free(kv);
         return rc ? rc : res_finish(r, e);
     }
     res_cols(r, st->nitems);
@@ -4534,7 +4627,7 @@ static int join_materialize(xctx *x, const sql_stmt *st, jctx *j, sink *k, imdb_
         for (uint8_t o = 0; !rc && o < st->norder; o++) rc = order_key(x, st, k, o, cv, &keys[i * st->norder + o], e);
     }
     if (!rc && keys) {
-        ordctx c = {st, keys};
+        ordctx c = {st, keys, NULL};
         qsort_r(ord, n, sizeof *ord, cmp_order, &c);
         rc = xcheck(x, e); /* a sort runs to its end: the check after it */
     }
@@ -6104,6 +6197,9 @@ static int exec_select(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, 
      * to test on a later one (one that could fail there: which rows come first is the path's) */
     bool pres = !rc && x->presence && k.mode == SINK_VIDS, found = false;
     if (pres) k.first = !k.nresid;
+    /* P2 S18: a row statement's keys taken in its walk (walk_keys), under the result's cap; EXISTS needs none */
+    k.kwalk = !rc && k.mode == SINK_VIDS && !pres;
+    k.kcap = r->byte_cap ? r->byte_cap : IMDB_MAX_RESULT_BYTES;
     bool ran = !rc; /* what fails from here is a plan's run, for cross_check to weigh */
     xc_begin(x);
     /* P2 S15 (the 2026-11-05 review's O3, its first step): an aggregate over one table with nothing nested, grouped or
@@ -6152,6 +6248,8 @@ static int exec_select(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, 
     imdb_err e2 = {0}; /* P2 S11: the second plan runs whatever the first did (xc_verdict) */
     int rc2 = plan_select(x, st, t, &k, &e2);
     if (!rc2 && pres) k.first = !k.nresid;
+    k.kwalk = !rc2 && k.mode == SINK_VIDS && !pres; /* P2 S18: as the first plan's */
+    k.kcap = r2.byte_cap ? r2.byte_cap : IMDB_MAX_RESULT_BYTES;
     if (!rc2 && (rc2 = run_path(x, p2, &q, &k, &e2)) == SINK_FOUND) rc2 = IMDB_OK;
     bool found2 = pres && k.nvids > 0;
     if (!rc2 && !pres) rc2 = sink_pin(&k);
