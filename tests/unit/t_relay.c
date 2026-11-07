@@ -614,7 +614,7 @@ static void t_relay_alive_silence(void)
                 imdb_alive_encode(r.db_id, a.nonce, r.last, r.hash[r.last], a.nka + 1 + k, ka);
                 if (!write_full(pf[1], ka, sizeof ka)) _exit(1);
             }
-            struct timespec ts = {mode == 2 ? 0 : 3, mode == 2 ? 600 * 1000 * 1000 : 0}; /* the pipe held open */
+            struct timespec ts = {mode == 2 ? 0 : 10, mode == 2 ? 600 * 1000 * 1000 : 0}; /* the pipe held open (killed sooner) */
             nanosleep(&ts, NULL);
             _exit(0);
         }
@@ -641,7 +641,9 @@ static void t_relay_alive_silence(void)
                          (int)ao.silent, (int)ao.truncated, (int)ao.has_session, (unsigned long long)el, g_e.msg);
                 test_fail(__FILE__, __LINE__, m);
             }
-            SOFT(el < 2500 && (mode == 0 || el >= 600 + 300 - 50)); /* before the child's end; past the keep-alives */
+            /* before the child's end (10 s, room for a loaded SAN run: 2.5 s was missed at load 12, 11-07), past the keep-alives;
+             * ao.silent already says a read timed out, which a pipe the child closed never does */
+            SOFT(el < 9500 && (mode == 0 || el >= 600 + 300 - 50));
         } else {
             SOFT(rc == IMDB_OK && !ao.silent && !ao.truncated && !ao.has_session && el >= 550);
         }
