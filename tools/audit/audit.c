@@ -43,6 +43,7 @@
 
 #include "acrypto.h"
 #include "afsum.h"
+#include "abind.h"
 
 #define LIVE ((uint64_t)INT64_MAX)
 #define MAX_COLS 64
@@ -289,6 +290,10 @@ typedef struct aviewdef {
     uint8_t *dep_kind;
     uint32_t *dep_id;
     uint8_t hash[32];
+    uint16_t ncols;              /* P2 S7b: the logged columns (the binder's catalog, and what its text must yield) */
+    ab_col cols[MAX_COLS];
+    char *text;                  /* the query's text, NUL ended (it holds no NUL) */
+    uint32_t text_len;
 } aviewdef;
 
 static void aviewdef_free(aviewdef *d)
@@ -296,6 +301,7 @@ static void aviewdef_free(aviewdef *d)
     if (!d) return;
     free(d->dep_kind);
     free(d->dep_id);
+    free(d->text);
     free(d);
 }
 
@@ -311,6 +317,7 @@ static aviewdef *decode_viewdef(rd *r)
     memcpy(d->name, nm, nl);
     uint16_t nc = rd_u16(r);
     if (r->bad || nc < 1 || nc > MAX_COLS) goto bad;
+    d->ncols = nc;
     for (uint16_t i = 0; i < nc; i++) {
         uint8_t cl = rd_u8(r);
         const uint8_t *c = rd_bytes(r, cl);
@@ -318,6 +325,9 @@ static aviewdef *decode_viewdef(rd *r)
         if (r->bad || !ident_ok(c, cl) || type < T_INT64 || type > T_FLOAT64 || (type == T_DECIMAL ? scale > 18 : scale != 0))
             goto bad;
         memcpy(cn[i], c, cl);
+        memcpy(d->cols[i].name, c, cl); /* P2 S7b */
+        d->cols[i].type = type;
+        d->cols[i].scale = scale;
         cn[i][cl] = 0;
         for (uint16_t j = 0; j < i; j++)
             if (!strcmp(cn[j], cn[i])) goto bad;
@@ -338,6 +348,9 @@ static aviewdef *decode_viewdef(rd *r)
     uint32_t tl = rd_u32(r);
     const uint8_t *tx = !r->bad && tl && tl <= MAX_VIEW_TEXT ? rd_bytes(r, tl) : NULL;
     if (r->bad || !tx || !utf8_ok(tx, tl)) goto bad;
+    d->text = xcalloc((size_t)tl + 1, 1); /* P2 S7b: for the binder */
+    memcpy(d->text, tx, tl);
+    d->text_len = tl;
     a_sha256(r->p + at, r->o - at, d->hash);
     return d;
 bad:
@@ -1085,6 +1098,8 @@ typedef struct aview {
     uint16_t ndeps;
     uint8_t *dep_kind;
     uint32_t *dep_id;
+    uint16_t ncols; /* P2 S7b: its logged columns, what a view reading it reads */
+    ab_col *cols;
 } aview;
 
 typedef struct state {
@@ -1336,6 +1351,71 @@ static void view_push(state *S, const char *name, uint64_t created, uint64_t dro
     w->dep_id = xcalloc(d->ndeps ? d->ndeps : 1, sizeof *w->dep_id);
     memcpy(w->dep_kind, d->dep_kind, d->ndeps);
     memcpy(w->dep_id, d->dep_id, d->ndeps * sizeof *w->dep_id);
+    w->ncols = d->ncols; /* P2 S7b */
+    w->cols = xcalloc(d->ncols, sizeof *w->cols);
+    memcpy(w->cols, d->cols, d->ncols * sizeof *w->cols);
+}
+
+/* P2 S7b: the catalog as the model holds it now (the commit being applied's, or F's past a cut), for the binder: a live
+ * table's columns, or a live view's logged ones */
+typedef struct catx {
+    const state *S;
+    ab_col cols[MAX_COLS];
+} catx;
+
+static bool cat_lookup(void *arg, const char *name, ab_rel *out)
+{
+    catx *c = arg;
+    const state *S = c->S;
+    for (uint32_t i = 0; i < S->nt; i++) {
+        const schema *s = &S->t[i].s;
+        if (S->t[i].dropped_at || strcmp(s->name, name) != 0) continue;
+        for (int k = 0; k < s->ncols && k < MAX_COLS; k++) {
+            snprintf(c->cols[k].name, sizeof c->cols[k].name, "%s", s->c[k].name);
+            c->cols[k].type = s->c[k].type;
+            c->cols[k].scale = s->c[k].type == T_DECIMAL ? s->c[k].scale : 0;
+        }
+        *out = (ab_rel){1, i, (uint16_t)s->ncols, c->cols};
+        return true;
+    }
+    for (uint32_t i = 0; i < S->nv; i++) {
+        const aview *v = &S->v[i];
+        if (v->dropped_at || strcmp(v->name, name) != 0) continue;
+        *out = (ab_rel){2, i, v->ncols, v->cols};
+        return true;
+    }
+    return false;
+}
+
+/* P2 S7b: a view's text, bound by the auditor's own binder (abind.c) against the catalog then, yields the columns'
+ * types and the dependencies its definition logs (the names are not in the text: a column list renames them) */
+static int view_bind_check(const state *S, const aviewdef *d, const char *where)
+{
+    static const char *const TN[] = {"?", "INT64", "DECIMAL", "TEXT", "BOOL", "TIMESTAMP", "FLOAT64"};
+    catx *c = xcalloc(1, sizeof *c);
+    ab_result *r = xcalloc(1, sizeof *r);
+    char why[256];
+    c->S = S;
+    int rc = 0;
+    if (ab_bind(d->text, d->text_len, cat_lookup, c, r, why, sizeof why))
+        rc = fail("%s: view %s: its text does not bind as a view's query against the catalog then: %s", where, d->name, why);
+    else if (r->ncols != d->ncols)
+        rc = fail("%s: view %s: its text yields %u columns, the log says %u", where, d->name, r->ncols, d->ncols);
+    for (uint16_t k = 0; !rc && k < d->ncols; k++)
+        if (r->cols[k].type != d->cols[k].type || r->cols[k].scale != d->cols[k].scale)
+            rc = fail("%s: view %s: its column %u (%s) is %s, scale %u, by its text and %s, scale %u, in the log", where,
+                      d->name, k + 1u, d->cols[k].name, TN[r->cols[k].type <= 6 ? r->cols[k].type : 0], r->cols[k].scale,
+                      TN[d->cols[k].type <= 6 ? d->cols[k].type : 0], d->cols[k].scale);
+    if (!rc && r->ndeps != d->ndeps)
+        rc = fail("%s: view %s: its text names %u tables and views, the log says %u", where, d->name, r->ndeps, d->ndeps);
+    for (uint16_t k = 0; !rc && k < d->ndeps; k++)
+        if (r->dep_kind[k] != d->dep_kind[k] || r->dep_id[k] != d->dep_id[k])
+            rc = fail("%s: view %s: its dependency %u is %s %u by its text and %s %u in the log", where, d->name, k + 1u,
+                      r->dep_kind[k] == 1 ? "table" : "view", r->dep_id[k], d->dep_kind[k] == 1 ? "table" : "view",
+                      d->dep_id[k]);
+    free(c);
+    free(r);
+    return rc;
 }
 
 static int apply_view_op(state *S, const op *o, uint64_t seq)
@@ -1356,6 +1436,9 @@ static int apply_view_op(state *S, const op *o, uint64_t seq)
                                         : d->dep_id[k] < S->nv && !S->v[d->dep_id[k]].dropped_at;
         if (!live) return fail("commit %llu: view %s names a table or view that is not live", (unsigned long long)seq, d->name);
     }
+    char where[48]; /* P2 S7b: its text yields what it logs, against the catalog at its commit (this one: alone in it) */
+    snprintf(where, sizeof where, "commit %llu", (unsigned long long)seq);
+    if (view_bind_check(S, d, where)) return -1;
     view_push(S, d->name, seq, 0, d);
     return 0;
 }
@@ -3038,6 +3121,9 @@ static int floor_seed(int dirfd, state *S, flr *f)
     }
     for (uint32_t i = 0; i < f->m.nv; i++) /* P2 S7: F's views, a live one's definition the replay's rules read */
         view_push(S, f->m.v[i].name, f->m.v[i].created_at, f->m.v[i].dropped_at, f->m.v[i].def);
+    for (uint32_t i = 0; i < f->m.nv; i++) /* P2 S7b: each live one's text against F's catalog, as at its own commit (what
+                                          * it names is live and unchanged since: RESTRICT, no ALTER) */
+        if (f->m.v[i].def && view_bind_check(S, f->m.v[i].def, "the floor's manifest")) return -1;
     S->nv_at_lake = S->nv;
     S->boundary = f->m.boundary;
     manifest m;
@@ -3211,7 +3297,7 @@ static int cmd_verify(const char *dir, const char *anchor)
     }
     keys_free(&S.K);
     free(S.t);
-    for (uint32_t i = 0; i < S.nv; i++) free(S.v[i].dep_kind), free(S.v[i].dep_id); /* P2 S7 */
+    for (uint32_t i = 0; i < S.nv; i++) free(S.v[i].dep_kind), free(S.v[i].dep_id), free(S.v[i].cols); /* P2 S7, S7b */
     free(S.v);
     free(S.pin);
     free(S.start_seq);

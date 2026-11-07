@@ -47,13 +47,13 @@ LIB     = $(BUILD)/libimagedb.a
 BIN     = $(BUILD)/imagedb
 
 TSRC    = $(wildcard tests/unit/*.c)
-TOBJ    = $(TSRC:tests/unit/%.c=$(BUILD)/tobj/%.o) $(BUILD)/tobj/acrypto.o $(BUILD)/tobj/afsum.o
+TOBJ    = $(TSRC:tests/unit/%.c=$(BUILD)/tobj/%.o) $(BUILD)/tobj/acrypto.o $(BUILD)/tobj/afsum.o $(BUILD)/tobj/abind.o
 TBIN    = $(BUILD)/test_unit
 
 .PHONY: all lint test unit san tsan ct fuzz fuzz-run bench whole index-sum mem-split join-cost workload clean integration faults soak oracle install uninstall
 
 AUDIT   = $(BUILD)/imagedb-audit
-ASRC    = tools/audit/audit.c tools/audit/acrypto.c tools/audit/afsum.c
+ASRC    = tools/audit/audit.c tools/audit/acrypto.c tools/audit/afsum.c tools/audit/abind.c
 
 all: $(BIN) $(AUDIT)
 
@@ -77,7 +77,7 @@ uninstall:
 	-rmdir $(DESTDIR)$(PREFIX)/share/doc/imagedb
 
 # The independent verifier shares no code with src/ (see tools/audit/acrypto.h).
-$(AUDIT): $(ASRC) tools/audit/acrypto.h tools/audit/afsum.h | $(BUILD)/obj
+$(AUDIT): $(ASRC) tools/audit/acrypto.h tools/audit/afsum.h tools/audit/abind.h | $(BUILD)/obj
 	$(CC) $(CFLAGS) $(ASRC) -o $@ $(LDFLAGS)
 
 # Test-only: builds hostile inputs and fuzz seeds (may use engine code).
@@ -112,6 +112,9 @@ $(BUILD)/tobj/acrypto.o: tools/audit/acrypto.c tools/audit/acrypto.h | $(BUILD)/
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/tobj/afsum.o: tools/audit/afsum.c tools/audit/afsum.h | $(BUILD)/tobj
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/tobj/abind.o: tools/audit/abind.c tools/audit/abind.h | $(BUILD)/tobj
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(TBIN): $(TOBJ) $(LIB)
@@ -202,6 +205,11 @@ build-fuzz/asm/%.o: asm/%.asm asm/common.inc
 	mkdir -p build-fuzz/asm
 	$(NASM) -f elf64 -I asm/ $< -o $@
 
+# P2 S7b: the auditor's view binder alone (it shares nothing with src/)
+build-fuzz/fuzz_abind: fuzz/fuzz_abind.c tools/audit/abind.c tools/audit/abind.h
+	@mkdir -p build-fuzz
+	clang $(FUZZ_FLAGS) fuzz/fuzz_abind.c tools/audit/abind.c -o $@
+
 build-fuzz/%: fuzz/%.c fuzz/fuzz_common.h $(SRC) $(HDR) $(FUZZ_ASM)
 	clang $(FUZZ_FLAGS) $< $(SRC) $(FUZZ_ASM) -o $@ -pthread
 
@@ -209,7 +217,7 @@ build-fuzz/%: fuzz/%.c fuzz/fuzz_common.h $(SRC) $(HDR) $(FUZZ_ASM)
 FUZZ_SECONDS ?= 60
 fuzz-run: fuzz $(BIN) $(FORGE)
 	bash fuzz/make_corpus.sh $(BIN) build-fuzz/corpus
-	@for t in frame stream segment manifest sql codec ed25519 tseg backup expr csv; do \
+	@for t in frame stream segment manifest sql codec ed25519 tseg backup expr csv abind; do \
 	  mkdir -p build-fuzz/work/$$t; \
 	  if ! $(SANRUN) build-fuzz/fuzz_$$t -max_total_time=$(FUZZ_SECONDS) -print_final_stats=1 -rss_limit_mb=2048 \
 	       -artifact_prefix=build-fuzz/crash-$$t- build-fuzz/work/$$t build-fuzz/corpus/$$t \
@@ -318,7 +326,7 @@ TSAN_FLAGS = -std=c11 -D_GNU_SOURCE -g -O1 -ffp-contract=off -fsanitize=thread -
 tsan:
 	mkdir -p build-tsan
 	clang $(TSAN_FLAGS) $(filter-out src/main.c,$(wildcard src/*.c)) $(wildcard src/vendor/monocypher/*.c) \
-	  $(TSRC) tools/audit/acrypto.c tools/audit/afsum.c -o build-tsan/test_unit -lcrypto
+	  $(TSRC) tools/audit/acrypto.c tools/audit/afsum.c tools/audit/abind.c -o build-tsan/test_unit -lcrypto
 	clang $(TSAN_FLAGS) tests/unit/t_pool.c tests/tsan/pool_main.c src/pool.c $(KERNEL_SRC) \
 	  src/util.c src/fsio.c -o build-tsan/pool_test
 	$(SANRUN) build-tsan/pool_test

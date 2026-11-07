@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "../../src/codec.h"
@@ -4123,6 +4124,120 @@ static void exec_prepared(eng *e, sb *text, bool rows, const int *ty, int nty, r
     free(x.p);
 }
 
+/* P2 S7b: the differential of the auditor's view binder (tools/audit/abind.c): a quarter of the SELECTs imagedb answered
+ * (by seed and step: no draw) made a view in imagedb alone, a column list naming its columns (so no item needs a name),
+ * and dropped at once; at each seed's end the auditor reads imagedb's directory, binding every view's text at its
+ * commit against the columns and dependencies the engine logged. A refusal of the view form is counted by its class
+ * (UNSUPPORTED, INVALID, LIMIT: a DECIMAL past 18 places most); any other failure is a mismatch. Nothing here reaches a
+ * comparison or takes a draw: the counts the other runs gate on do not move */
+static long g_avw_made, g_avw_ref[3], g_avw_audits, g_avw_unaudited;
+static struct {
+    char msg[sizeof ((imdb_err *)0)->msg];
+    long n;
+} g_avw_why[3][8]; /* each class's distinct messages (the first eight) and their counts: an INVALID one is read, not tallied */
+static char g_audit_bin[512] = "build/imagedb-audit";
+static bool g_view_audit = true;
+
+static int view_audit(unsigned seed, int step, const stmt *q, int nty)
+{
+    static sb t, v;
+    eng *e = &g_eng[D_IMDB];
+    if (nty < 1 || nty > 64 || !e->ses_open || e->ses.txn.open) return 0; /* CREATE VIEW commits alone: outside a transaction */
+    print_stmt(&t, D_IMDB, q); /* written out: never the prepared form */
+    sb_reset(&v);
+    sb_str(&v, "CREATE VIEW oracle_av (");
+    for (int c = 0; c < nty; c++) sb_printf(&v, "%sc%d", c ? ", " : "", c + 1);
+    sb_str(&v, ") AS ");
+    sb_str(&v, t.p);
+    imdb_result r;
+    imdb_err er = {0};
+    if (!imdb_exec_one(&e->ses, v.p, v.n, NULL, 0, &r, &er)) {
+        imdb_result_free(&r);
+        g_avw_made++;
+        if (!imdb_exec_one(&e->ses, "DROP VIEW oracle_av", 19, NULL, 0, &r, &er)) {
+            imdb_result_free(&r);
+            return 0;
+        }
+        g_mismatches++;
+        fprintf(stderr, "MISMATCH seed %u step %d, imagedb's view: its DROP failed: %s\n  %s\n", seed, step, er.msg, v.p);
+        return -1;
+    }
+    int cls = er.code == IMDB_ERR_UNSUPPORTED ? 0 : er.code == IMDB_ERR_INVALID ? 1 : er.code == IMDB_ERR_LIMIT ? 2 : -1;
+    if (cls < 0) {
+        g_mismatches++;
+        fprintf(stderr, "MISMATCH seed %u step %d, imagedb refused a view of a SELECT it answered (%d): %s\n  %s\n", seed,
+                step, er.code, er.msg, v.p);
+        return -1;
+    }
+    g_avw_ref[cls]++;
+    for (int i = 0; i < 8; i++) {
+        if (!g_avw_why[cls][i].n) snprintf(g_avw_why[cls][i].msg, sizeof g_avw_why[cls][i].msg, "%s", er.msg);
+        if (!strcmp(g_avw_why[cls][i].msg, er.msg)) {
+            g_avw_why[cls][i].n++;
+            break;
+        }
+    }
+    return 0;
+}
+
+/* the auditor over imagedb's closed directory: 0, or its last lines in why */
+static int audit_dir(const char *dir, char *why, size_t n)
+{
+    int p[2];
+    why[0] = 0;
+    if (pipe(p)) return snprintf(why, n, "pipe: %s", strerror(errno)), -1;
+    pid_t pid = fork();
+    if (pid < 0) return close(p[0]), close(p[1]), snprintf(why, n, "fork: %s", strerror(errno)), -1;
+    if (!pid) {
+        dup2(p[1], 1);
+        dup2(p[1], 2);
+        close(p[0]);
+        close(p[1]);
+        execl(g_audit_bin, "imagedb-audit", "verify", dir, (char *)NULL);
+        _exit(127);
+    }
+    close(p[1]);
+    char buf[4096];
+    size_t k = 0;
+    ssize_t got;
+    while ((got = read(p[0], buf + k, sizeof buf - 1 - k)) > 0) {
+        k += (size_t)got;
+        if (k > sizeof buf - 512) memmove(buf, buf + k - 1024, 1024), k = 1024; /* the end is what says why */
+    }
+    buf[k] = 0;
+    close(p[0]);
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {
+    }
+    if (WIFEXITED(st) && WEXITSTATUS(st) == 0) return 0;
+    snprintf(why, n, "%s", buf);
+    return -1;
+}
+
+/* P2 S7b: at a seed's end, imagedb's directory closed and read by the auditor (every op 20 bound at its commit by its own
+ * binder); a refusal is a mismatch, the directory kept beside (DIR-audit-failed: the next seed's reset removes DIR) */
+static int seed_audit(unsigned seed)
+{
+    if (access(g_audit_bin, X_OK) != 0) {
+        g_avw_unaudited++;
+        return 0;
+    }
+    eng *e = &g_eng[D_IMDB];
+    imdb_down(e);
+    char why[4096];
+    if (!audit_dir(e->dir, why, sizeof why)) {
+        g_avw_audits++;
+        return 0;
+    }
+    g_mismatches++;
+    char kept[sizeof e->dir + 16];
+    snprintf(kept, sizeof kept, "%s-audit-failed", e->dir);
+    nftw(kept, rm_entry, 16, FTW_DEPTH | FTW_PHYS);
+    fprintf(stderr, "MISMATCH seed %u, the auditor refused imagedb's directory (kept as %s):\n%s\n", seed,
+            rename(e->dir, kept) ? e->dir : kept, why);
+    return -1;
+}
+
 static int run_stmt(unsigned seed, int step, const stmt *q, bool state)
 {
     static sb text[ND];
@@ -4231,6 +4346,9 @@ static int run_stmt(unsigned seed, int step, const stmt *q, bool state)
         if (!state) diagnose(q, d);
         return -1;
     }
+    if (rows && !state && !g_in_txn && g_view_audit && !out[D_IMDB].err && (seed * 13u + (unsigned)step) % 4u == 1u &&
+        view_audit(seed, step, q, nty)) /* P2 S7b: after every comparison: none of their counts moves */
+        return -1;
     return 0;
 }
 
@@ -4392,6 +4510,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--no-expr")) g_expr = false;
         else if (!strcmp(argv[i], "--no-fns")) g_fns = false;
         else if (!strcmp(argv[i], "--no-views")) g_views = false; /* P2 S7 */
+        else if (!strcmp(argv[i], "--no-view-audit")) g_view_audit = false; /* P2 S7b */
+        else if (!strcmp(argv[i], "--audit") && i + 1 < argc) snprintf(g_audit_bin, sizeof g_audit_bin, "%s", argv[++i]);
         else if (!strcmp(argv[i], "--ping")) ping = true; /* connect to every engine named, then stop (run.sh waits on it) */
         else if (!strcmp(argv[i], "-v")) g_verbose = true;
         else {
@@ -4416,7 +4536,9 @@ int main(int argc, char **argv)
     if (ping) return 0;
     unsigned failed = 0;
     for (unsigned s = lo; s <= hi; s++) {
-        if (run_seed(s, steps)) {
+        int rs = run_seed(s, steps);
+        if (!rs && g_view_audit) rs = seed_audit(s); /* P2 S7b */
+        if (rs) {
             failed++;
             if (!keep_going) break;
         } else if (g_verbose) fprintf(stderr, "seed %u: agreed\n", s);
@@ -4473,6 +4595,14 @@ int main(int argc, char **argv)
     printf("oracle: %ld comparisons of P2 S4b's correlated subqueries\n", g_corr_compared);
     printf("oracle: %ld comparisons of P2 S7's SELECTs over the views vt and vu (t's and u's rows through a predicate)\n",
            g_view_compared);
+    printf("oracle: P2 S7b: %ld SELECTs made views in imagedb alone (a column list; dropped at once), refused as views %ld "
+           "UNSUPPORTED, %ld INVALID, %ld LIMIT; the auditor bound every view's text in %ld seeds' directories%s\n",
+           g_avw_made, g_avw_ref[0], g_avw_ref[1], g_avw_ref[2], g_avw_audits,
+           g_avw_unaudited ? " (NOT ALL: no auditor at --audit for some)" : g_view_audit ? "" : " (--no-view-audit)");
+    for (int c = 0; c < 3; c++)
+        for (int i = 0; i < 8 && g_avw_why[c][i].n; i++)
+            printf("oracle:   %s, %ld: %s\n", c == 0 ? "UNSUPPORTED" : c == 1 ? "INVALID" : "LIMIT", g_avw_why[c][i].n,
+                   g_avw_why[c][i].msg);
     printf("oracle: %ld SELECTs not put to MariaDB for a column's LIKE with literals before a wildcard alone (its index range "
            "drops a value whose next character is past U+FFFF: ma_like_ok)\n",
            g_ma_like);

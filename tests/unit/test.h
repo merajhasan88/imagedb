@@ -86,6 +86,7 @@ TESTS(expr)
 TESTS(cancel)
 TESTS(drop)
 TESTS(view) /* P2 S7 */
+TESTS(abind) /* P2 S7b */
 TESTS(qmem)
 
 #endif

@@ -890,8 +890,9 @@ static void index_lie(const char *dir, const char *kind)
 
 /* P2 S7: a commit with a view op the log's rules forbid, signed by the writer, its state digest right: drop-table (the
  * DROP_TABLE of table 0, which a live view names), name (a CREATE_VIEW named as table 0), deps (a CREATE_VIEW of SELECT
- * id FROM table 0 that logs no dependency: the engine's re-bind refuses it; the auditor, which has no parser, cannot),
- * drop-named (the DROP_VIEW of view 0, which a live view names) */
+ * id FROM table 0 that logs no dependency), type (the same view, its dependency logged, its column logged as TEXT;
+ * P2 S7b: the engine's re-bind and the auditor's binder refuse both), drop-named (the DROP_VIEW of view 0, which a live
+ * view names) */
 static void view_lie(const char *dir, const char *kind)
 {
     char p[1200];
@@ -925,14 +926,16 @@ static void view_lie(const char *dir, const char *kind)
         append_commit_digest(dir, db, &op, 1, &sg, NULL, dg);
         imdb_close(db);
         return;
-    } else if ((strcmp(kind, "name") == 0 || strcmp(kind, "deps") == 0) && t->s.cols[0].type == IMDB_T_INT64) {
+    } else if ((strcmp(kind, "name") == 0 || strcmp(kind, "deps") == 0 || strcmp(kind, "type") == 0) &&
+               t->s.cols[0].type == IMDB_T_INT64) {
         op.code = IMDB_OP_CREATE_VIEW;
         d.id = db->nviews;
-        snprintf(d.name, sizeof d.name, "%s", strcmp(kind, "name") == 0 ? t->s.name : "lie_deps");
+        snprintf(d.name, sizeof d.name, "%s", strcmp(kind, "name") == 0 ? t->s.name : strcmp(kind, "deps") == 0 ? "lie_deps" : "lie_type");
         snprintf(col.name, sizeof col.name, "%s", t->s.cols[0].name);
         d.ncols = 1;
         d.cols = &col;
-        d.ndeps = strcmp(kind, "name") == 0; /* deps: none logged, though the text reads the table */
+        d.ndeps = strcmp(kind, "deps") != 0; /* deps: none logged, though the text reads the table */
+        if (strcmp(kind, "type") == 0) col.type = IMDB_T_TEXT; /* the text yields INT64 */
         d.deps = &dep;
         snprintf(text, sizeof text, "SELECT %s FROM %s", t->s.cols[0].name, t->s.name);
         d.text = text;
@@ -942,7 +945,7 @@ static void view_lie(const char *dir, const char *kind)
         op.code = IMDB_OP_DROP_VIEW;
         op.view = 0;
     } else {
-        fputs("imdb-forge: view-lie DIR drop-table | name | deps (table 0's first column INT64) | drop-named (two views)\n", stderr);
+        fputs("imdb-forge: view-lie DIR drop-table | name | deps | type (table 0's first column INT64) | drop-named (two views)\n", stderr);
         exit(1);
     }
     append_commit(dir, db, &op, 1, &sg, NULL);
