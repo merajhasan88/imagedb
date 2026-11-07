@@ -14,10 +14,12 @@
 #include <unistd.h>
 
 #include "backup.h"
+#include "catalogue.h"
 #include "cpu.h"
 #include "db.h"
 #include "fsio.h"
 #include "lake.h"
+#include "logdir.h"
 #include "repl.h"
 #include "rewind.h"
 #include "sql.h"
@@ -75,13 +77,19 @@ static int usage(void)
           "                                             (its bytes saved to FILE first) and lower DURABLE to match\n"
           "  imagedb root-key FILE                      make an offline root key (secret, 0400) and print its public key\n"
           "  imagedb backup-key FILE                    make a backup key (secret, 0400) and print its id\n"
-          "  imagedb backup <dir> --key FILE --out FILE [--after PREV]\n"
+          "  imagedb backup <dir> --key FILE --out FILE [--after PREV] [--expires DAYS] [--catalogue FILE]\n"
           "                                             a full backup, encrypted: the last published snapshot and the\n"
           "                                             commits after it, while the database runs; with --after, an\n"
           "                                             incremental one: the commits after backup PREV's last\n"
+          "                                             (--catalogue: listed there once durable, with the\n"
+          "                                             erasures the database's log records)\n"
+          "  imagedb backups CATALOGUE [--debt DIR] [--forget FILE]\n"
+          "                                             the backups a catalogue lists, expired or not, and each\n"
+          "                                             erasure's debt; 0 nothing expired or owed, 1 something\n"
           "  imagedb backup-verify --key FILE --scratch DIR BACKUP...\n"
           "                                             a test restore under DIR, VERIFY on it, then removed\n"
-          "  imagedb restore <new-dir> --key FILE [--until N | --until-time TS] BACKUP...\n"
+          "  imagedb restore <new-dir> --key FILE [--until N | --until-time TS] [--catalogue FILE]\n"
+          "                    [--reerase PRIMARY | --accept-erased] BACKUP...\n"
           "                                             a read-only copy (a full backup, then its incrementals in\n"
           "                                             order), through commit N or the last at or before TS; imagedb\n"
           "                                             promote makes it writable\n"
@@ -938,6 +946,32 @@ static int cmd_follow(int argc, char **argv)
     return rc;
 }
 
+/* P2 D1.1: a restored copy's ERASE_DEBT (backup.c's write_debt): 0 none, 1 read (*n erasures, the last *last), -1 not
+ * one (a damaged file is said, never trusted) */
+static int debt_read(int dirfd, size_t *n, uint64_t *last)
+{
+    *n = 0;
+    *last = 0;
+    int fd = openat(dirfd, "ERASE_DEBT", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return errno == ENOENT ? 0 : -1;
+    char b[65536];
+    ssize_t k = read(fd, b, sizeof b - 1);
+    close(fd);
+    if (k <= 0 || (size_t)k == sizeof b - 1) return -1;
+    b[k] = 0;
+    char *crc = strstr(b, "crc32c ");
+    if (strncmp(b, "imagedb-erase-debt 1\n", 21) != 0 || !crc || crc[strlen(crc) - 1] != '\n') return -1;
+    unsigned want = 0;
+    if (sscanf(crc, "crc32c %8x\n", &want) != 1 || imdb_kern()->crc32c(0, b, (size_t)(crc - b)) != want) return -1;
+    for (char *l = b + 21; l < crc; l = strchr(l, '\n') + 1) {
+        unsigned long long s, t;
+        if (sscanf(l, "erase %llu %llu", &s, &t) != 2) return -1;
+        (*n)++;
+        *last = s;
+    }
+    return 1;
+}
+
 /* imagedb rewind DIR --save FILE [--demote] [--from N] -- CMD [ARG...] (P2 R1.3, rewind.h): CMD, the primary's
  * `ship --hashes --after {after}` (through ssh as follow's shipper), run with {after} where the comparison starts (by
  * default no more than IMDB_REWIND_WINDOW below the copy's last commit, never below its lowest rewind point; --from N);
@@ -1067,6 +1101,14 @@ static void print_info(imdb_db *db)
     imdb_state_digest(db, NULL, d);
     imdb_hex(d, 32, hex);
     printf("digest     %s\nrole       %s\n", hex, db->replica ? "replica" : "primary");
+    size_t nd;
+    uint64_t ld;
+    int dr = debt_read(db->dirfd, &nd, &ld);
+    if (dr < 0) printf("erasures   ERASE_DEBT is damaged: this copy may hold what erasures removed\n");
+    else if (dr && db->seq < ld)
+        printf("erasures   it holds what %zu erasures removed, through commit %llu (restored with --accept-erased)\n", nd,
+               (unsigned long long)ld);
+    else if (dr) printf("erasures   its ERASE_DEBT is paid: it has applied them since (remove the file)\n");
     printf("algorithm  digest_alg %u (%s)\n", (unsigned)db->meta.digest_alg,
            db->meta.digest_alg == IMDB_DIGEST_ALG_LTHASH16_TREE ? "LtHash16 by ChaCha20, the digest a tree of SHA-256"
                                                              : "LtHash16 by MGF1-SHA256, the digest SHA-256");
@@ -1178,6 +1220,22 @@ static int cmd_health(int argc, char **argv)
         printf("unhealthy: %s\n", e.msg);
         return 3;
     }
+    { /* P2 D1.1: a restored copy holding what erasures removed */
+        int hd = open(argv[2], O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        size_t nd = 0;
+        uint64_t ld = 0;
+        int dr = hd >= 0 ? debt_read(hd, &nd, &ld) : 0;
+        imdb_durable w;
+        bool hw = false;
+        imdb_err ed = {0};
+        if (dr && hd >= 0 && (imdb_durable_read(hd, &w, &hw, &ed) || !hw)) w.seq = 0;
+        if (hd >= 0) close(hd);
+        if (dr < 0 || (dr && w.seq < ld)) {
+            printf("owes erasures: %s\n", dr < 0 ? "its ERASE_DEBT is damaged" : "it was restored past erasures it does not apply "
+                                                                       "(ERASE_DEBT)");
+            return 1;
+        }
+    }
     if (!stats) {
         printf("healthy: META, DURABLE and replicas/ checked (no export given)\n");
         return 0;
@@ -1214,6 +1272,80 @@ static int cmd_health(int argc, char **argv)
     }
     printf("healthy: the export is %lld s old, commit %lld\n", age, commit);
     return 0;
+}
+
+/* a time for an operator, UTC */
+static const char *ts_text(uint64_t us, char *out, size_t n)
+{
+    imdb_buf b;
+    imdb_buf_init(&b);
+    imdb_format_timestamp((int64_t)us, &b);
+    snprintf(out, n, "%.*s UTC", b.p ? (int)b.len : 0, b.p ? (const char *)b.p : "");
+    imdb_buf_free(&b);
+    return out;
+}
+
+/* imagedb backups CATALOGUE [--debt DIR] [--forget FILE] (P2 D1.1, catalogue.h): the backups it lists, each expired
+ * or not, and the erasures, each owed by the listed backups made before it (they hold what it removed). --forget
+ * FILE records that FILE was destroyed (listed no longer); --debt DIR first lists the erasures in DIR's log past the
+ * catalogue's scan. Exit 0: nothing listed is expired and no erasure is owed; 1: something is; 2: unreadable */
+static int cmd_backups(int argc, char **argv)
+{
+    const char *cat = argv[2], *debt = NULL, *forget = NULL;
+    for (int i = 3; i < argc; i += 2) {
+        if (i + 1 >= argc) return usage();
+        if (strcmp(argv[i], "--debt") == 0) debt = argv[i + 1];
+        else if (strcmp(argv[i], "--forget") == 0) forget = argv[i + 1];
+        else return usage();
+    }
+    imdb_err e = {0};
+    uint64_t added = 0;
+    if ((forget && imdb_catalogue_forget(cat, forget, &e)) || (debt && imdb_catalogue_note(cat, debt, &added, &e))) {
+        print_err("backups", &e);
+        return 2;
+    }
+    imdb_catalogue c;
+    if (imdb_catalogue_read(cat, &c, &e)) {
+        print_err("backups", &e);
+        return 2;
+    }
+    uint64_t now = wall_us();
+    size_t listed = 0, expired = 0, owed = 0;
+    char id[33] = "(none yet)", t1[64], t2[64];
+    if (c.has_head) imdb_hex(c.db_id, 16, id);
+    for (size_t i = 0; i < c.nb; i++) {
+        const imdb_cat_backup *b = &c.b[i];
+        bool exp = !b->forgotten && b->expires_us && b->expires_us <= now;
+        listed += !b->forgotten;
+        expired += exp;
+        printf("backup %s  %s, commits %llu to %llu, made %s, expires %s%s\n", b->name, b->incremental ? "incremental" : "full",
+               (unsigned long long)b->first, (unsigned long long)b->last, ts_text(b->made_us, t1, sizeof t1),
+               b->expires_us ? ts_text(b->expires_us, t2, sizeof t2) : "never",
+               b->forgotten ? "  (forgotten: destroyed)" : exp ? "  EXPIRED: destroy it, then --forget it" : "");
+    }
+    for (size_t k = 0; k < c.ne; k++) {
+        size_t n = 0;
+        for (size_t i = 0; i < c.nb; i++) n += !c.b[i].forgotten && c.b[i].last < c.er[k].seq;
+        owed += n > 0;
+        printf("erase at commit %llu (%s): ", (unsigned long long)c.er[k].seq, ts_text(c.er[k].time_us, t1, sizeof t1));
+        if (!n) {
+            printf("no listed backup holds what it removed\n");
+            continue;
+        }
+        printf("owed by %zu listed backup%s made before it:", n, n == 1 ? "" : "s");
+        for (size_t i = 0; i < c.nb; i++)
+            if (!c.b[i].forgotten && c.b[i].last < c.er[k].seq) printf(" %s", c.b[i].name);
+        printf("\n");
+    }
+    printf("catalogue %s: database %s, %zu backups listed (%zu forgotten), %zu expired; %zu erasures, %zu owed; erasures "
+           "known through commit %llu%s%s\n",
+           cat, id, listed, c.nb - listed, expired, c.ne, owed, (unsigned long long)c.scanned,
+           c.gap_to ? " (its source's log was cut: erasures at or below the gap may be missing)" : "",
+           debt ? "" : " (--debt DIR brings them up to its source's log)");
+    if (debt) printf("%llu new erasures listed from %s\n", (unsigned long long)added, debt);
+    if (c.torn) printf("its last line was torn (an append a crash cut short): the next append cuts it off\n");
+    imdb_catalogue_free(&c);
+    return expired || owed ? 1 : 0;
 }
 
 int main(int argc, char **argv)
@@ -1287,19 +1419,28 @@ int main(int argc, char **argv)
         printf("%s\n", hex);
         return 0;
     }
-    if (strcmp(cmd, "backup") == 0 && (argc == 7 || argc == 9)) {
-        const char *keyf = NULL, *out = NULL, *after = NULL;
+    if (strcmp(cmd, "backup") == 0 && argc >= 7 && argc % 2 == 1) {
+        const char *keyf = NULL, *out = NULL, *after = NULL, *catalogue = NULL;
+        uint64_t expires = 0;
         for (int i = 3; i + 1 < argc; i += 2) {
             if (strcmp(argv[i], "--key") == 0) keyf = argv[i + 1];
             else if (strcmp(argv[i], "--out") == 0) out = argv[i + 1];
             else if (strcmp(argv[i], "--after") == 0) after = argv[i + 1];
+            else if (strcmp(argv[i], "--catalogue") == 0) catalogue = argv[i + 1]; /* P2 D1.1 */
+            else if (strcmp(argv[i], "--expires") == 0) {
+                int64_t d;
+                if (imdb_parse_int64(argv[i + 1], strlen(argv[i + 1]), &d, &e) || d < 1 || d > 36500) return usage();
+                expires = (uint64_t)d;
+            }
             else return usage();
         }
         if (!keyf || !out) return usage();
         uint8_t key[IMDB_BACKUP_KEY_LEN];
         imdb_backup_info bi;
+        imdb_backup_opts bo = {.expires_days = expires, .catalogue = catalogue};
         int rc = imdb_backup_key_load(keyf, key, &e) ||
-                 (after ? imdb_backup_incremental(argv[2], after, out, key, &bi, &e) : imdb_backup_full(argv[2], out, key, &bi, &e));
+                 (after ? imdb_backup_incremental_ex(argv[2], after, out, key, &bo, &bi, &e)
+                        : imdb_backup_full_ex(argv[2], out, key, &bo, &bi, &e));
         imdb_wipe(key, sizeof key);
         if (rc) {
             print_err("backup", &e);
@@ -1309,27 +1450,42 @@ int main(int argc, char **argv)
                (unsigned long long)bi.first_seq, (unsigned long long)bi.last_seq,
                bi.seed_seq ? " (a seed, then the commits after it)" : "", (unsigned long long)bi.payload_bytes,
                (unsigned long long)bi.chunks);
+        if (catalogue) printf("listed in %s\n", catalogue);
         return 0;
     }
     if (strcmp(cmd, "restore") == 0 && argc >= 6 && strcmp(argv[3], "--key") == 0) {
         uint8_t key[IMDB_BACKUP_KEY_LEN];
         imdb_backup_info bi;
-        imdb_restore_opts ro = {0, 0};
+        imdb_restore_opts ro = {.until_seq = 0};
         int first = 5;
-        if (argc >= 8 && strcmp(argv[5], "--until") == 0) {
-            int64_t v;
-            if (imdb_parse_int64(argv[6], strlen(argv[6]), &v, &e) || v < 1) return usage();
-            ro.until_seq = (uint64_t)v;
-            first = 7;
-        } else if (argc >= 8 && strcmp(argv[5], "--until-time") == 0) {
-            int64_t t;
-            if (imdb_parse_timestamp(argv[6], strlen(argv[6]), &t, &e) || t < 1) {
-                print_err("restore", &e);
-                return 1;
+        for (bool more = true; more && first + 1 < argc;) { /* options, then the backups */
+            if (strcmp(argv[first], "--until") == 0) {
+                int64_t v;
+                if (imdb_parse_int64(argv[first + 1], strlen(argv[first + 1]), &v, &e) || v < 1) return usage();
+                ro.until_seq = (uint64_t)v;
+                first += 2;
+            } else if (strcmp(argv[first], "--until-time") == 0) {
+                int64_t t;
+                if (imdb_parse_timestamp(argv[first + 1], strlen(argv[first + 1]), &t, &e) || t < 1) {
+                    print_err("restore", &e);
+                    return 1;
+                }
+                ro.until_time = (uint64_t)t;
+                first += 2;
+            } else if (strcmp(argv[first], "--catalogue") == 0) { /* P2 D1.1 */
+                ro.catalogue = argv[first + 1];
+                first += 2;
+            } else if (strcmp(argv[first], "--reerase") == 0) {
+                ro.reerase = argv[first + 1];
+                first += 2;
+            } else if (strcmp(argv[first], "--accept-erased") == 0) {
+                ro.accept_erased = true;
+                first++;
+            } else {
+                more = false;
             }
-            ro.until_time = (uint64_t)t;
-            first = 7;
         }
+        if (first >= argc) return usage();
         int rc = imdb_backup_key_load(argv[4], key, &e) ||
                  imdb_restore_ex(argv[2], key, (const char *const *)argv + first, (size_t)(argc - first), &ro, &bi, &e);
         imdb_wipe(key, sizeof key);
@@ -1338,6 +1494,15 @@ int main(int argc, char **argv)
             return 1;
         }
         printf("restored %s through commit %llu: a read-only replica\n", argv[2], (unsigned long long)bi.last_seq);
+        if (bi.reerased)
+            printf("past %llu erasures its backups predate: the primary's commits applied through the last, commit %llu\n",
+                   (unsigned long long)bi.erasures, (unsigned long long)bi.last_erasure);
+        else if (bi.debt_recorded)
+            printf("it holds what %llu erasures removed (through commit %llu): recorded in its ERASE_DEBT\n",
+                   (unsigned long long)bi.erasures, (unsigned long long)bi.last_erasure);
+        else if (bi.debt_unknown)
+            fprintf(stderr, "imagedb: restore: warning: the erasure debt is unknown (no --catalogue, no --reerase): the copy "
+                            "may hold what a later ERASE removed\n");
         if (bi.id.has_root)
             fprintf(stderr, "imagedb: restore: to write to it: imagedb promote %s --root-key FILE (--anchor FILE | "
                             "--old-writer-stopped); then enrol replicas again (replica-add) and give it a new anchor\n",
@@ -1630,6 +1795,7 @@ int main(int argc, char **argv)
     }
     if (strcmp(cmd, "stats") == 0 && argc == 3) return cmd_stats(argv[2]); /* P1 M1 */
     if (strcmp(cmd, "health") == 0 && argc >= 3) return cmd_health(argc, argv);
+    if (strcmp(cmd, "backups") == 0 && argc >= 3) return cmd_backups(argc, argv);
     if (strcmp(cmd, "dump") == 0 && (argc == 3 || (argc == 5 && strcmp(argv[3], "--batch") == 0))) { /* P2 S17 */
         uint32_t batch = 0;
         if (argc == 5) {

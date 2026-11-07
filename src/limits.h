@@ -44,6 +44,7 @@
 #define IMDB_SEED_OBJECTS_MAX   (1u << 24)  /* objects in one seed (a snapshot's manifests, segments, vectors) */
 #define IMDB_BACKUP_CHUNK       (1u << 20)  /* plaintext bytes in one sealed chunk of a backup file (backup.h) */
 #define IMDB_MAX_BACKUP_FILES   4096u        /* backup files one restore takes (a full one and its incrementals) */
+#define IMDB_CATALOGUE_MAX      (64u << 20)  /* P2 D1.1: a backup catalogue's bytes (catalogue.h; about 500,000 records) */
 #define IMDB_RESTORE_EVERY      4096u        /* commits a restore applies between its syncs (it is rerun after a crash) */
 #define IMDB_MAX_PATH           4096u        /* bytes in an operator's path (a backup, a restore's destination) */
 #define IMDB_MAX_NAME           255u         /* bytes in one name within it */

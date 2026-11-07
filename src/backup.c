@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "catalogue.h"
 #include "cpu.h"
 #include "db_internal.h"
 #include "fsio.h"
@@ -84,7 +85,7 @@ static void prologue_encode(uint8_t p[IMDB_BACKUP_PROLOGUE], const imdb_backup_i
 {
     memset(p, 0, IMDB_BACKUP_PROLOGUE);
     memcpy(p, MAGIC, sizeof MAGIC);
-    imdb_le32(p + 8, 1);
+    imdb_le32(p + 8, 2);
     imdb_le32(p + 12, in->incremental ? 2 : 1);
     memcpy(p + 16, in->id.db_id, 16);
     p[32] = in->id.digest_alg;
@@ -96,6 +97,8 @@ static void prologue_encode(uint8_t p[IMDB_BACKUP_PROLOGUE], const imdb_backup_i
     memcpy(p + 144, prefix, 16);
     memcpy(p + 160, key_id, 32);
     imdb_le32(p + 192, IMDB_BACKUP_CHUNK);
+    imdb_le64(p + 200, in->made_us);
+    imdb_le64(p + 208, in->expires_us);
 }
 
 static int prologue_decode(const uint8_t p[IMDB_BACKUP_PROLOGUE], imdb_backup_info *out, uint8_t prefix[16],
@@ -103,8 +106,11 @@ static int prologue_decode(const uint8_t p[IMDB_BACKUP_PROLOGUE], imdb_backup_in
 {
     memset(out, 0, sizeof *out);
     if (memcmp(p, MAGIC, sizeof MAGIC) != 0) return imdb_fail(e, IMDB_ERR_CORRUPT, "backup: not an imagedb backup file");
-    if (imdb_get_le32(p + 8) != 1)
-        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "backup: format version %u (this build reads 1)", imdb_get_le32(p + 8));
+    if (imdb_get_le32(p + 8) == 1)
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "backup: format version 1, from before backups had an expiry "
+                         "(2026-11-07): this build reads 2; take a new backup");
+    if (imdb_get_le32(p + 8) != 2)
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "backup: format version %u (this build reads 2)", imdb_get_le32(p + 8));
     uint32_t kind = imdb_get_le32(p + 12);
     if ((kind != 1 && kind != 2) || (p[32] != IMDB_DIGEST_ALG_LTHASH16 && p[32] != IMDB_DIGEST_ALG_LTHASH16_TREE) ||
         p[33] > 1 || !all_zero(p + 34, 6) || (!p[33] && !all_zero(p + 72, IMDB_PUBKEY_LEN)) ||
@@ -122,6 +128,10 @@ static int prologue_decode(const uint8_t p[IMDB_BACKUP_PROLOGUE], imdb_backup_in
         return imdb_fail(e, IMDB_ERR_CORRUPT, "backup: a malformed prologue");
     memcpy(prefix, p + 144, 16);
     memcpy(key_id, p + 160, 32);
+    out->made_us = imdb_get_le64(p + 200);
+    out->expires_us = imdb_get_le64(p + 208);
+    if (!out->made_us || (out->expires_us && out->expires_us <= out->made_us))
+        return imdb_fail(e, IMDB_ERR_CORRUPT, "backup: a malformed prologue");
     return IMDB_OK;
 }
 
@@ -330,8 +340,25 @@ static int write_backup(int fd, const char *src, const uint8_t key[IMDB_BACKUP_K
     return rc;
 }
 
-int imdb_backup_full(const char *src, const char *out, const uint8_t key[IMDB_BACKUP_KEY_LEN], imdb_backup_info *info,
-                     imdb_err *e)
+/* when a backup begins and when it expires (P2 D1.1) */
+static void stamp(imdb_backup_info *info, const imdb_backup_opts *o)
+{
+    info->made_us = imdb_now_us();
+    info->expires_us = o && o->expires_days ? info->made_us + o->expires_days * 86400ull * 1000000ull : 0;
+}
+
+/* the catalogue (catalogue.h) once the backup is durable: a failure there leaves a complete backup it does not list */
+static int catalogued(const char *src, const char *out, const imdb_backup_opts *o, const imdb_backup_info *info, imdb_err *e)
+{
+    if (!o || !o->catalogue) return IMDB_OK;
+    imdb_err ce = {0};
+    if (!imdb_catalogue_add_backup(o->catalogue, out, info, src, &ce)) return IMDB_OK;
+    return imdb_fail(e, ce.code, "backup: %s is complete, but the catalogue %s does not list it: %s", out, o->catalogue,
+                     ce.msg);
+}
+
+int imdb_backup_full_ex(const char *src, const char *out, const uint8_t key[IMDB_BACKUP_KEY_LEN], const imdb_backup_opts *o,
+                        imdb_backup_info *info, imdb_err *e)
 {
     memset(info, 0, sizeof *info);
     imdb_identity id;
@@ -356,6 +383,7 @@ int imdb_backup_full(const char *src, const char *out, const uint8_t key[IMDB_BA
         }
         memset(info, 0, sizeof *info);
         info->id = id;
+        stamp(info, o);
         bool retry = false;
         rc = write_backup(fd, src, key, info, &retry, e);
         /* the whole file durable before its name says it is complete */
@@ -381,6 +409,7 @@ int imdb_backup_full(const char *src, const char *out, const uint8_t key[IMDB_BA
             (void)imdb_io_unlinkat(dfd, tmp, 0);
         }
         if (!rc) rc = imdb_sync_dir(dfd, e);
+        if (!rc) rc = catalogued(src, out, o, info, e);
         break;
     }
     close(dfd);
@@ -669,6 +698,95 @@ static int open_copy(const char *path, imdb_db **db, imdb_err *e)
 
 static int remove_tree_at(int pfd, const char *name, int depth, imdb_err *e);
 
+/* P2 D1.1: the erasures past commit seq: the catalogue's and those in reerase's log, merged in commit order
+ * (*out its own allocation); *known false when there is neither source */
+static int erasure_debt(const imdb_restore_opts *ro, const uint8_t db_id[16], uint64_t seq, imdb_cat_erase **out, size_t *n,
+                        bool *known, imdb_err *e)
+{
+    *out = NULL;
+    *n = 0;
+    *known = ro && (ro->catalogue || ro->reerase);
+    if (!*known) return IMDB_OK;
+    imdb_catalogue c;
+    memset(&c, 0, sizeof c);
+    imdb_cat_erase *le = NULL;
+    size_t nl = 0, nc = 0;
+    uint64_t through, floor;
+    int rc = IMDB_OK;
+    if (ro->catalogue && !(rc = imdb_catalogue_read(ro->catalogue, &c, e)) && c.has_head && memcmp(c.db_id, db_id, 16) != 0)
+        rc = imdb_fail(e, IMDB_ERR_INVALID, "restore: the catalogue %s lists another database's backups", ro->catalogue);
+    if (!rc && ro->reerase) {
+        imdb_identity id;
+        bool replica;
+        if (!(rc = imdb_identity_read(ro->reerase, &id, &replica, e)) && memcmp(id.db_id, db_id, 16) != 0)
+            rc = imdb_fail(e, IMDB_ERR_INVALID, "restore: --reerase %s is another database", ro->reerase);
+        if (!rc) rc = imdb_erasures_in(ro->reerase, seq, &le, &nl, &through, &floor, e);
+    }
+    for (size_t i = 0; !rc && i < c.ne; i++) nc += c.er[i].seq > seq;
+    imdb_cat_erase *m = rc ? NULL : imdb_alloc_array(nc + nl + 1, sizeof *m, e);
+    if (!rc && !m) rc = e->code;
+    size_t k = 0, a = 0, b = 0;
+    while (!rc && (a < c.ne || b < nl)) { /* both in commit order: a merge, each commit once */
+        if (a < c.ne && c.er[a].seq <= seq) {
+            a++;
+            continue;
+        }
+        if (b == nl || (a < c.ne && c.er[a].seq < le[b].seq)) m[k++] = c.er[a++];
+        else if (a == c.ne || le[b].seq < c.er[a].seq) m[k++] = le[b++];
+        else m[k++] = le[b++], a++;
+    }
+    imdb_catalogue_free(&c);
+    imdb_free(le);
+    if (rc) imdb_free(m);
+    else *out = m, *n = k;
+    return rc;
+}
+
+/* --reerase: the primary's commits after the copy's last applied through commit through (the last erasure): shipped
+ * into path (made exclusively beside the destination, removed after), then applied as a replica applies them */
+static int reerase_apply(imdb_db *db, const char *primary, uint64_t through, int pfd, const char *name, imdb_err *e)
+{
+    int fd = imdb_io_openat(pfd, name, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0)
+        return imdb_fail(e, IMDB_ERR_IO, "restore: create %s beside the destination: %s (an interrupted restore's: remove it)",
+                         name, strerror(errno));
+    imdb_sink sk = {imdb_sink_fd_write, &fd};
+    int rc = imdb_ship_to(primary, db->seq, &sk, NULL, NULL, e);
+    int rfd = rc ? -1 : imdb_io_openat(pfd, name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW); /* read from its start */
+    if (!rc && rfd < 0) rc = imdb_fail(e, IMDB_ERR_IO, "restore: %s: %s", name, strerror(errno));
+    if (!rc) {
+        imdb_apply_opts ao;
+        memset(&ao, 0, sizeof ao);
+        ao.until_seq = through;
+        uint64_t applied = 0;
+        rc = imdb_apply_stream_ex(db, rfd, &applied, &ao, e);
+        if (!rc && db->seq != through)
+            rc = imdb_fail(e, IMDB_ERR_STATE, "restore: --reerase reached commit %llu, not the erasure at %llu",
+                           (unsigned long long)db->seq, (unsigned long long)through);
+    }
+    if (rfd >= 0) close(rfd);
+    close(fd);
+    (void)imdb_io_unlinkat(pfd, name, 0);
+    return rc;
+}
+
+/* --accept-erased: the debt recorded in the copy (ERASE_DEBT, atomically): the erasures it lacks, a CRC last */
+static int write_debt(imdb_db *db, const imdb_cat_erase *d, size_t n, imdb_err *e)
+{
+    imdb_buf b;
+    imdb_buf_init(&b);
+    imdb_buf_printf(&b, "imagedb-erase-debt 1\n");
+    for (size_t i = 0; i < n; i++)
+        imdb_buf_printf(&b, "erase %llu %llu\n", (unsigned long long)d[i].seq, (unsigned long long)d[i].time_us);
+    int rc = imdb_buf_check(&b, e);
+    if (!rc) {
+        imdb_buf_printf(&b, "crc32c %08x\n", imdb_kern()->crc32c(0, b.p, b.len));
+        if (!(rc = imdb_buf_check(&b, e))) rc = imdb_write_file_atomic(db->dirfd, "ERASE_DEBT", b.p, b.len, 0600, e);
+    }
+    imdb_buf_free(&b);
+    return rc;
+}
+
 int imdb_restore_ex(const char *dest, const uint8_t key[IMDB_BACKUP_KEY_LEN], const char *const *files, size_t nfiles,
                     const imdb_restore_opts *ro, imdb_backup_info *info, imdb_err *e)
 {
@@ -692,6 +810,9 @@ int imdb_restore_ex(const char *dest, const uint8_t key[IMDB_BACKUP_KEY_LEN], co
                            files[i - 1]);
     }
     uint64_t until = ro ? ro->until_seq : 0, until_t = ro ? ro->until_time : 0;
+    if (!rc && ro && ro->reerase && (until || ro->until_time))
+        rc = imdb_fail(e, IMDB_ERR_INVALID, "restore: --reerase moves the copy past the erasures, so not with --until or "
+                       "--until-time");
     if (!rc && until && ro->until_time)
         rc = imdb_fail(e, IMDB_ERR_INVALID, "restore: --until or --until-time, not both");
     if (!rc && until && (until > in[nfiles - 1].last_seq || until < (in[0].seed_seq ? in[0].seed_seq : 1)))
@@ -757,6 +878,31 @@ int imdb_restore_ex(const char *dest, const uint8_t key[IMDB_BACKUP_KEY_LEN], co
     } else if (!rc && (db->seq != last->last_seq || (last->last_seq && memcmp(db->head, last->last_hash, 32) != 0)))
         rc = imdb_fail(e, IMDB_ERR_VERIFY, "restore: the copy ends at commit %llu, its backup at %llu",
                        (unsigned long long)db->seq, (unsigned long long)last->last_seq);
+    /* P2 D1.1: an erasure past where the copy ends: refused, applied (--reerase), or recorded (--accept-erased) */
+    imdb_cat_erase *debt = NULL;
+    size_t ndebt = 0;
+    bool known = false, reerased = false, recorded = false;
+    if (!rc) rc = erasure_debt(ro, in[0].id.db_id, db->seq, &debt, &ndebt, &known, e);
+    if (!rc && ndebt) {
+        char rname[IMDB_MAX_NAME + 1];
+        if (ro->reerase && strlen(base) + 8 > IMDB_MAX_NAME) {
+            rc = imdb_fail(e, IMDB_ERR_INVALID, "restore: the destination name is too long");
+        } else if (ro->reerase) {
+            snprintf(rname, sizeof rname, "%s.reerase", base);
+            rc = reerase_apply(db, ro->reerase, debt[ndebt - 1].seq, dfd, rname, e);
+            reerased = !rc;
+        } else if (ro->accept_erased) {
+            rc = write_debt(db, debt, ndebt, e);
+            recorded = !rc;
+        } else {
+            rc = imdb_fail(e, IMDB_ERR_STATE, "restore: the copy would end at commit %llu, before the erasure at commit %llu%s: "
+                           "it would hold what that erasure removed; --reerase PRIMARY applies the erasures, --accept-erased "
+                           "keeps the data and records the debt (ERASE_DEBT)", (unsigned long long)db->seq,
+                           (unsigned long long)debt[0].seq, ndebt > 1 ? " (and later ones)" : "");
+        }
+    }
+    uint64_t last_erasure = ndebt ? debt[ndebt - 1].seq : 0;
+    imdb_free(debt);
     uint64_t db_seq = db ? db->seq : 0; /* where the copy ends, for info: the asked point, or the backups' last */
     uint8_t db_head[32] = {0};
     if (db) memcpy(db_head, db->head, 32);
@@ -777,6 +923,11 @@ int imdb_restore_ex(const char *dest, const uint8_t key[IMDB_BACKUP_KEY_LEN], co
         *info = *last;
         info->last_seq = db_seq;
         memcpy(info->last_hash, db_head, 32);
+        info->erasures = ndebt;
+        info->last_erasure = last_erasure;
+        info->reerased = reerased;
+        info->debt_recorded = recorded;
+        info->debt_unknown = !known;
     }
     imdb_free(in);
     return rc;
@@ -877,8 +1028,8 @@ static int write_incremental(int fd, const char *src, const uint8_t key[IMDB_BAC
     return rc;
 }
 
-int imdb_backup_incremental(const char *src, const char *prev, const char *out, const uint8_t key[IMDB_BACKUP_KEY_LEN],
-                            imdb_backup_info *info, imdb_err *e)
+int imdb_backup_incremental_ex(const char *src, const char *prev, const char *out, const uint8_t key[IMDB_BACKUP_KEY_LEN],
+                               const imdb_backup_opts *o, imdb_backup_info *info, imdb_err *e)
 {
     memset(info, 0, sizeof *info);
     imdb_backup_info pi;
@@ -904,6 +1055,7 @@ int imdb_backup_incremental(const char *src, const char *prev, const char *out, 
                              : imdb_fail(e, IMDB_ERR_IO, "backup: create %s.tmp: %s", out, strerror(errno));
     if (!rc) {
         info->id = id;
+        stamp(info, o);
         info->incremental = true;
         info->prev_seq = pi.last_seq;
         memcpy(info->prev_hash, pi.last_hash, 32);
@@ -917,6 +1069,7 @@ int imdb_backup_incremental(const char *src, const char *prev, const char *out, 
             (void)imdb_io_unlinkat(dfd, tmp, 0);
         }
         if (!rc) rc = imdb_sync_dir(dfd, e);
+        if (!rc) rc = catalogued(src, out, o, info, e);
     }
     close(dfd);
     return rc;
@@ -1000,4 +1153,16 @@ int imdb_backup_verify(const char *scratch, const uint8_t key[IMDB_BACKUP_KEY_LE
     }
     close(sfd);
     return rc;
+}
+
+int imdb_backup_full(const char *src, const char *out, const uint8_t key[IMDB_BACKUP_KEY_LEN], imdb_backup_info *info,
+                     imdb_err *e)
+{
+    return imdb_backup_full_ex(src, out, key, NULL, info, e);
+}
+
+int imdb_backup_incremental(const char *src, const char *prev, const char *out, const uint8_t key[IMDB_BACKUP_KEY_LEN],
+                            imdb_backup_info *info, imdb_err *e)
+{
+    return imdb_backup_incremental_ex(src, prev, out, key, NULL, info, e);
 }

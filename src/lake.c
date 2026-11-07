@@ -1936,7 +1936,10 @@ static int physical_commit_body(imdb_db *db, uint8_t kind, uint32_t table, uint6
             rc = gi ? obj_put(db, ofd, pt->seg[k]->hash, ".seg", gi->bytes, gi->len, e) : e->code;
             if (!rc) pt->seg[k]->seg_ondisk = true; /* lake_persist need not put it again (its vector may still wait) */
         }
-    if (!rc) rc = imdb_sync_dir(ofd, e);
+    /* no directory sync here (P2, Q2): each segment is fsynced, and their names become durable with the vectors' and the
+     * manifest's at lake_persist's one sync, before LAKE_HEAD. A crash that loses a name after the commit leaves a
+     * logged publish an open finishes (obj_put writes what is missing); nothing reads an object before LAKE_HEAD or
+     * FLOOR names its generation, so no reader saw the name lost */
     close(ofd);
     if (!rc) rc = imdb_begin(db, e);
     if (!rc) {

@@ -114,6 +114,7 @@ int main(int argc, char **argv)
         {"copy", copy_tests, &copy_ntests},
         {"lazy", lazy_tests, &lazy_ntests},
         {"backup", backup_tests, &backup_ntests},
+        {"catalogue", catalogue_tests, &catalogue_ntests},
         {"expr", expr_tests, &expr_ntests},
         {"cancel", cancel_tests, &cancel_ntests},
         {"drop", drop_tests, &drop_ntests},

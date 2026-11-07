@@ -15,7 +15,8 @@ NOASM   ?=
 WARN    = -Wall -Wextra -Werror -Wformat=2 -Werror=format-security -Wvla -Wshadow \
           -Wpointer-arith -Wstrict-prototypes -Wmissing-prototypes -Wundef -Wcast-qual \
           -Wimplicit-fallthrough -Wno-unused-parameter
-CFLAGS_BASE = -std=c11 -D_GNU_SOURCE -g -fno-common -fno-strict-overflow -ffp-contract=off -pthread $(WARN)
+CFLAGS_BASE = -std=c11 -D_GNU_SOURCE -g -fno-common -fno-strict-overflow -ffp-contract=off -pthread $(WARN) \
+              -ffile-prefix-map=$(CURDIR)=. # P2: reproducible builds (the path the tree is built in is in no output)
 
 ifeq ($(SAN),1)
   BUILD   = build-san

@@ -37,6 +37,7 @@
 #include <unistd.h>
 
 #include "../../src/backup.h"
+#include "../../src/catalogue.h"
 #include "../../src/lake.h"
 #include "../../src/logdir.h"
 #include "../../src/repl.h"
@@ -2101,6 +2102,7 @@ static const char *check_promote_ledger(const char *run)
 }
 
 static const char *check_rewind(const char *run); /* the rewind scenario's, with its setup below */
+static const char *check_backup_catalogue(const char *run, bool done); /* with its setup below */
 
 static const char *check_run(const fscen *s, const char *run, const frun *r)
 {
@@ -2198,6 +2200,7 @@ static const char *check_run(const fscen *s, const char *run, const frun *r)
     if (!why && strcmp(s->name, "restore") == 0) why = check_restore(run);
     if (!why && strcmp(s->name, "backup_incr") == 0) why = check_backup_incr(run);
     if (!why && strcmp(s->name, "rewind") == 0) why = check_rewind(run);
+    if (!why && strcmp(s->name, "backup_catalogue") == 0) why = check_backup_catalogue(run, closed);
     return why;
 }
 
@@ -2587,6 +2590,113 @@ static const char *check_rewind(const char *run)
     return why;
 }
 
+/* backup_catalogue (P2 D1.1): setup_backup's primary and key, a first backup b0 listed in the catalogue, then an
+ * ERASE of subject 42 on the primary; the run is a full backup listed in the same catalogue (the erasure noted with
+ * it). After any fault the catalogue reads (a torn last line allowed), lists b0, lists full.bak only once the file is
+ * complete, its record that file's, and always once the run reported it done; finishing it (the backup or its listing
+ * again) leaves both listed and the
+ * erasure once (check_backup_catalogue) */
+static void setup_backup_catalogue(const char *base)
+{
+    setup_backup_common(base, false);
+    imdb_err e = {0};
+    uint8_t key[IMDB_BACKUP_KEY_LEN];
+    char b0[700], cat[700], p[700];
+    snprintf(b0, sizeof b0, "%s/b0.bak", base);
+    snprintf(cat, sizeof cat, "%s/catalogue", base);
+    snprintf(p, sizeof p, "%s/p", base);
+    imdb_backup_info bi;
+    imdb_backup_opts o = {.catalogue = cat};
+    if (imdb_backup_key_load(dir_in(base, "backup.key"), key, &e) || imdb_backup_full_ex(p, b0, key, &o, &bi, &e)) return;
+    imdb_db *db = child_open(p, 1);
+    if (!db) return;
+    imdb_value subj = {.type = IMDB_T_INT64, .i = 42};
+    imdb_erase_report er;
+    if (!imdb_erase_subject(db, &subj, &er, &e)) {
+        char sv[32];
+        int n = snprintf(sv, sizeof sv, "%llu", (unsigned long long)db->seq);
+        spit(dir_in(base, "erase_seq"), (const uint8_t *)sv, (size_t)n);
+    }
+    imdb_close(db);
+}
+
+static const char *backup_catalogue_base_ok(const char *base)
+{
+    imdb_catalogue c;
+    imdb_err e = {0};
+    char cat[700];
+    snprintf(cat, sizeof cat, "%s/catalogue", base);
+    bool ok = !imdb_catalogue_read(cat, &c, &e) && c.nb == 1 && c.ne == 0 && access(dir_in(base, "erase_seq"), F_OK) == 0;
+    if (!e.code) imdb_catalogue_free(&c);
+    return ok ? NULL : "the setup made no catalogue with b0, or no erasure after it";
+}
+
+static int run_backup_catalogue(const char *run)
+{
+    uint8_t key[IMDB_BACKUP_KEY_LEN];
+    imdb_backup_info bi;
+    imdb_err e = {0};
+    char out[700], cat[700], p[700];
+    snprintf(out, sizeof out, "%s/full.bak", run);
+    snprintf(cat, sizeof cat, "%s/catalogue", run);
+    snprintf(p, sizeof p, "%s/p", run);
+    if (imdb_backup_key_load(dir_in(run, "backup.key"), key, &e)) return 0;
+    imdb_backup_opts o = {.catalogue = cat};
+    if (!imdb_backup_full_ex(p, out, key, &o, &bi, &e)) ack_closed(); /* reported done: the listing must survive */
+    return 0;
+}
+
+static const char *check_backup_catalogue(const char *run, bool done)
+{
+    char out[700], tmp[700], cat[700], p[700];
+    snprintf(out, sizeof out, "%s/full.bak", run);
+    snprintf(tmp, sizeof tmp, "%s/full.bak.tmp", run);
+    snprintf(cat, sizeof cat, "%s/catalogue", run);
+    snprintf(p, sizeof p, "%s/p", run);
+    size_t n = 0;
+    uint8_t *sv = slurp(dir_in(run, "erase_seq"), &n);
+    uint64_t es = 0;
+    for (size_t i = 0; sv && i < n && sv[i] >= '0' && sv[i] <= '9'; i++) es = es * 10 + (uint64_t)(sv[i] - '0');
+    free(sv);
+    uint8_t key[IMDB_BACKUP_KEY_LEN];
+    imdb_backup_info bi;
+    imdb_err e = {0};
+    imdb_catalogue c;
+    if (imdb_backup_key_load(dir_in(run, "backup.key"), key, &e) || imdb_catalogue_read(cat, &c, &e)) {
+        snprintf(g_why, sizeof g_why, "the catalogue (or the key) does not read after the fault: %s", e.msg);
+        return g_why;
+    }
+    ssize_t at = -1;
+    for (size_t i = 0; i < c.nb; i++)
+        if (strcmp(c.b[i].name, out) == 0) at = (ssize_t)i;
+    bool b0 = c.nb >= 1 && strstr(c.b[0].name, "/b0.bak") != NULL, listed = at >= 0;
+    uint64_t last = listed ? c.b[at].last : 0;
+    imdb_catalogue_free(&c);
+    if (!b0) return "the catalogue lost b0's record";
+    if (done && !listed) return "the backup reported its listing done, but after the crash the catalogue lacks it";
+    bool file = access(out, F_OK) == 0;
+    if (listed && (!file || imdb_backup_check(out, key, &bi, &e) || bi.last_seq != last))
+        return "the catalogue lists full.bak, but no complete file of that record is there";
+    imdb_backup_opts o = {.catalogue = cat};
+    if (!file) { /* finished: the backup again (a crash's .tmp removed, as an operator would) */
+        unlink(tmp);
+        if (imdb_backup_full_ex(p, out, key, &o, &bi, &e)) {
+            snprintf(g_why, sizeof g_why, "the backup, run again after the fault, fails: %s", e.msg);
+            return g_why;
+        }
+    } else if (!listed && (imdb_backup_check(out, key, &bi, &e) || imdb_catalogue_add_backup(cat, out, &bi, p, &e))) {
+        snprintf(g_why, sizeof g_why, "a complete full.bak cannot be listed after the fault: %s", e.msg);
+        return g_why;
+    }
+    if (imdb_catalogue_read(cat, &c, &e)) {
+        snprintf(g_why, sizeof g_why, "the catalogue does not read once finished: %s", e.msg);
+        return g_why;
+    }
+    bool ok = !c.torn && c.nb == 2 && c.ne == 1 && c.er[0].seq == es;
+    imdb_catalogue_free(&c);
+    return ok ? NULL : "once finished, the catalogue does not hold both backups and the erasure once";
+}
+
 static const fscen kScen[] = {
     {"commits", setup_txns, run_commits, false, NULL, NULL, false, false, false},
     {"nosync", setup_txns, run_nosync, true, NULL, NULL, false, false, false},
@@ -2620,6 +2730,8 @@ static const fscen kScen[] = {
     {"backup_incr", setup_backup_incr, run_backup_incr, false, NULL, backup_incr_base_ok, false, false, false},
     {"view", setup_txns, run_view, false, NULL, NULL, false, false, false}, /* P2 S7 */
     {"rewind", setup_rewind, run_rewind, false, NULL, rewind_base_ok, false, false, false}, /* P2 R1.3 */
+    {"backup_catalogue", setup_backup_catalogue, run_backup_catalogue, false, NULL, backup_catalogue_base_ok, false, false,
+     false}, /* P2 D1.1 */
 };
 
 static void t_fault_commits(void) { fault_scenario(&kScen[0]); }
@@ -2654,6 +2766,7 @@ static void t_fault_restore(void) { fault_scenario(&kScen[28]); }
 static void t_fault_backup_incr(void) { fault_scenario(&kScen[29]); }
 static void t_fault_view(void) { fault_scenario(&kScen[30]); }
 static void t_fault_rewind(void) { fault_scenario(&kScen[31]); }
+static void t_fault_backup_catalogue(void) { fault_scenario(&kScen[32]); }
 
 const test_case fault_tests[] = {
     {"fault_commits", t_fault_commits},     {"fault_nosync", t_fault_nosync}, {"fault_checkpoint", t_fault_checkpoint},
@@ -2683,5 +2796,6 @@ const test_case fault_tests[] = {
     {"fault_backup_incr", t_fault_backup_incr},
     {"fault_view", t_fault_view},
     {"fault_rewind", t_fault_rewind},
+    {"fault_backup_catalogue", t_fault_backup_catalogue},
 };
 const size_t fault_ntests = sizeof fault_tests / sizeof *fault_tests;

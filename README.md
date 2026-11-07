@@ -152,6 +152,11 @@ dropped it (`dropped_at`); ERASE SUBJECT still reaches its history.
 it, for a package); `make uninstall` removes them. A sanitizer build is never
 installed.
 
+**Reproducible builds.** Two clean builds of the same tree with the same tools
+give byte-identical `imagedb`, `imagedb-audit` and `libimagedb.a`, from any
+path: the build maps the tree's path to `.` (`-ffile-prefix-map`), so no path
+is in the outputs.
+
 **Platforms.** Linux on x86-64. The kernels are chosen at run time: AVX2 where
 the CPU has it, their C references elsewhere (`IMDB_NO_SIMD=1` forces those;
 the test matrix runs both); `make NOASM=1` builds without NASM. Tested here:
@@ -396,8 +401,28 @@ build/imagedb promote /data/p2 --root-key /offline/root.key --old-writer-stopped
   (a USB SSD, 2026-11-01; its backup took 3.4 s); one of 10^6 rows of ~420 bytes (949 MB on disk) backed up in 5.6 s
   to a 492 MB file and restored in 15.5 s, opening in 6.2 s more, with the source's view token (the internal SSD,
   2026-11-04).
-- An ERASE after a backup does not reach the backup: delete the file, or destroy the key, which makes every backup
-  sealed under it unreadable. `SHOW ERASURE` counts backups among the copies it does not track.
+- An ERASE after a backup does not reach the backup (a backup is the past, sealed): it holds what the erasure
+  removed until the file is destroyed or its key is (every backup sealed under a key becomes unreadable with
+  it). The **catalogue** is how that debt is kept in sight, and the production default:
+
+  ```sh
+  build/imagedb backup /data/p --key /safe/backup.key --out /backups/p-1.bak --expires 30 --catalogue /backups/catalogue
+  build/imagedb backups /backups/catalogue --debt /data/p      # expired backups, each erasure's debt; exit 1 if any
+  build/imagedb backups /backups/catalogue --forget /backups/p-1.bak   # after destroying it
+  build/imagedb restore /data/p2 --key /safe/backup.key --catalogue /backups/catalogue --reerase /data/p \
+      /backups/p-1.bak
+  ```
+
+  `--expires DAYS` is sealed in the backup (its prologue is part of every chunk's tag). The catalogue, an
+  append-only file at your path, lists each catalogued backup (its commits, when it was made and expires) and the
+  erasures in the database's log (each ERASE's commit, never its subject), noted at each catalogued backup and by
+  `backups --debt DIR`. `backups` lists the expired backups and, for each erasure, the listed backups made before
+  it: they hold what it removed. A restore with `--catalogue` (or `--reerase PRIMARY`, which reads the
+  primary's log itself) refuses a copy that would end before an erasure, unless `--reerase PRIMARY` (the copy
+  then applies the primary's commits through the last such erasure, so it holds none of what they removed) or
+  `--accept-erased` (it keeps the data, recorded in the copy's ERASE_DEBT, which `info` and `health` report
+  until the copy applies those erasures). Without either source the restore says the debt is unknown.
+  `SHOW ERASURE` counts backups among the copies it does not track.
 
 ## Erasure
 
@@ -513,6 +538,12 @@ Command-line options (`imagedb` with no arguments prints the commands):
 | `--scratch DIR` | backup-verify | where the test restore runs | |
 | `--until N` | restore | through commit N | the last |
 | `--until-time TS` | restore | through the last commit at or before TS | the last |
+| `--expires DAYS` | backup | sealed in the backup: it expires DAYS after it began (1 to 36500) | never |
+| `--catalogue FILE` | backup, restore | backup: list it there once durable, with the erasures its database logged; restore: refuse a copy ending before an erasure it lists | none |
+| `--reerase DIR` | restore | past the erasures: DIR's commits applied through the last erasure after the copy's end | refused |
+| `--accept-erased` | restore | keep what the erasures removed, recorded in the copy's ERASE_DEBT | refused |
+| `--debt DIR` | backups | first list the erasures in DIR's log past the catalogue's | |
+| `--forget FILE` | backups | FILE was destroyed: listed no longer, owing nothing | |
 | `--root-key FILE` | promote | the root key certifying the promotion | |
 | `--abandon` | promote | with `--anchor`: drops old-writer commits past its cut | refused |
 | `--old-writer-stopped` | promote | without an anchor: your word that the old writer is stopped | |
