@@ -9,7 +9,9 @@
 #   CHECKPOINT on a full disk;
 #   a backup written to a full disk (no FILE; its own FILE.tmp gone) and a restore into one (no DEST; DEST.tmp gone);
 #   a replica's apply that fills its disk, then catches up once grown (its log equal to the primary's, frame by frame);
-#   a writer killed mid-load and the rest of its disk filled, reopened while full.
+#   a writer killed mid-load and the rest of its disk filled, reopened while full;
+#   (P2 S7) in each load, a view made and one dropped on the full disk, each there after the reopen as its statement was
+#   acknowledged, every view there read; once grown, a view made, published by a CHECKPOINT and read.
 # Needs root (mount). Opt in with IMDB_CRASH_OK=1 (not part of make test):
 #   IMDB_CRASH_OK=1 bash tests/crash/disk_full.sh build/imagedb
 set -euo pipefail
@@ -68,11 +70,42 @@ check() { # DIR ROWS [OPEN OPTIONS]: reopened, the acknowledged rows there (stdo
     "$AUDIT" verify "$dir" > "$WORK/audit.out" 2>&1 || fail "$dir: the auditor: $(tail -1 "$WORK/audit.out")"
 }
 grow() { mount -o "remount,size=${2}m" "$WORK/$1"; }
+# P2 S7: STATEMENT on the full database at DIR: "ok" (committed: a view's commit is small and may still fit where the
+# last batch did not), "nospace" (refused for the disk), or "unacked" (--durable-ack: in the log, not acknowledged)
+view_try() {
+    local dir=$1 sql=$2 out
+    shift 2
+    if out=$("$BIN" sql "$dir" "$@" -c "$sql" 2>&1); then echo ok; return; fi
+    case "$out" in
+    *"No space left on device"*) echo nospace ;;
+    *"reached the log but is not acknowledged"*) echo unacked ;;
+    *) fail "$dir: $sql: $out" ;;
+    esac
+}
+# DIR NAME OUTCOME made|dropped: after a reopen the view NAME is there exactly as its statement's outcome says (unacked:
+# either), and every view there reads; prints yes or no (whether NAME is there)
+view_check() {
+    local dir=$1 name=$2 outcome=$3 kind=$4 out have=no v
+    out=$("$BIN" sql "$dir" --csv -c "SHOW VIEWS" 2>&1) || fail "$dir: SHOW VIEWS: $out"
+    printf "%s\n" "$out" | grep -q "^\"$name\"," && have=yes
+    case "$kind:$outcome:$have" in
+    made:ok:yes | made:nospace:no | dropped:ok:no | dropped:nospace:yes | *:unacked:*) ;;
+    *) fail "$dir: the view $name ($kind, $outcome) is there: $have" ;;
+    esac
+    for v in $(printf "%s\n" "$out" | sed -n 's/^"\([a-z][a-z0-9_]*\)",.*/\1/p'); do
+        "$BIN" sql "$dir" --read-only -c "SELECT COUNT(*) FROM $v" > "$WORK/view.out" 2>&1 ||
+            fail "$dir: the view $v does not read: $(tail -1 "$WORK/view.out")"
+    done
+    echo "$have"
+}
 after_growth() { # DIR: a write, a CHECKPOINT, VERIFY and the auditor once there is room again
     local dir=$1
-    "$BIN" sql "$dir" -c "INSERT INTO t VALUES (9999999, 'after'); CHECKPOINT" > "$WORK/grow.out" 2>&1 ||
+    # (P2 S7: a view made too, so the CHECKPOINT publishes a manifest with views; each view there read)
+    "$BIN" sql "$dir" -c "INSERT INTO t VALUES (9999999, 'after'); CREATE VIEW vgrown AS SELECT id FROM t WHERE id > 5; CHECKPOINT" \
+        > "$WORK/grow.out" 2>&1 ||
         fail "$dir: after growing: $(tail -1 "$WORK/grow.out")"
     check "$dir" 1
+    view_check "$dir" vgrown ok made > /dev/null || exit 1
 }
 
 for mode in sync nosync durable; do
@@ -80,14 +113,23 @@ for mode in sync nosync durable; do
     d="$WORK/$mode/db"
     "$BIN" init "$d" > /dev/null
     "$BIN" sql "$d" -c "CREATE TABLE t (id INT64 PRIMARY KEY, s TEXT)" > /dev/null
+    "$BIN" sql "$d" -c "CREATE VIEW vf AS SELECT id, LENGTH(s) AS n FROM t WHERE id % 2 = 0" > /dev/null # P2 S7
     case $mode in sync) opt=() ;; nosync) opt=(--nosync) ;; durable) opt=(--durable-ack) ;; esac
     n=$(fill "$d" "${opt[@]}") || exit 1
     check "$d" $((n * 50))
     "$BIN" sql "$d" -c "CHECKPOINT" > "$WORK/cp.out" 2>&1 && fail "$mode: a CHECKPOINT on a full disk succeeded"
     check "$d" $((n * 50))
+    vmake=$(view_try "$d" "CREATE VIEW vfull AS SELECT id FROM vf WHERE id > 100" "${opt[@]}") || exit 1
+    hv=$(view_check "$d" vfull "$vmake" made) || exit 1
+    vdn=vf
+    [ "$hv" = no ] || vdn=vfull # vf is named by vfull (RESTRICT): drop the one made
+    vdrop=$(view_try "$d" "DROP VIEW $vdn" "${opt[@]}") || exit 1
+    view_check "$d" "$vdn" "$vdrop" dropped > /dev/null || exit 1
+    check "$d" $((n * 50))
     grow "$mode" 96
     after_growth "$d"
-    echo "disk full: $mode load: $n commits acknowledged and kept; a CHECKPOINT refused while full; recovered once grown"
+    echo "disk full: $mode load: $n commits acknowledged and kept; a CHECKPOINT refused while full; a view made ($vmake)
+        and $vdn dropped ($vdrop) while full, each there as acknowledged; recovered once grown, a view made and read"
 done
 
 # a backup onto a full disk, a restore into one
@@ -132,9 +174,10 @@ k="$WORK/kill/db"
 (for b in $(seq 0 999); do batch "$b"; echo ";"; done) > "$WORK/load.sql"
 "$BIN" sql "$k" -f "$WORK/load.sql" > "$WORK/load.out" 2>&1 &
 pid=$!
-# killed mid-load (at 80% full, while it surely still writes), then the rest of the disk filled by another file:
+# killed mid-load (at half full, while it surely still writes: at 80% a loaded machine's poll could come after the
+# writer had already met ENOSPC, the P2 S7c smoke, 2026-11-07), then the rest of the disk filled by another file:
 # the reopen below meets a full disk and whatever the kill left at the log's end
-while kill -0 "$pid" 2>/dev/null && [ "$(df --output=pcent "$WORK/kill" | tail -1 | tr -dc 0-9)" -lt 80 ]; do sleep 0.05; done
+while kill -0 "$pid" 2>/dev/null && [ "$(df --output=pcent "$WORK/kill" | tail -1 | tr -dc 0-9)" -lt 50 ]; do sleep 0.01; done
 killed=no
 kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null && killed=yes
 wait "$pid" 2>/dev/null || true

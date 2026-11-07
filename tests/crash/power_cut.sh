@@ -113,6 +113,13 @@ step sql "$D" -c "CREATE TABLE gone (id INT64 PRIMARY KEY, v INT64);"
 for i in 1 2 3; do step sql "$D" -c "INSERT INTO gone VALUES ($i, $i);"; done
 step sql "$D" -c "DROP TABLE gone;"
 step sql "$D" -c "CREATE TABLE gone (id INT64 PRIMARY KEY, w TEXT);" -c "INSERT INTO gone VALUES (1, 'reused');" -c "CHECKPOINT;"
+# views (P2 S7): one over t, one over it, a publish (the manifest's views), the second dropped and its name taken
+# again, a publish with its tombstone, so the replayed states hold ops 20 and 21 at every point; the persistent
+# writers below make and drop their own
+step sql "$D" -c "CREATE VIEW vt AS SELECT id, memo, LENGTH(memo) AS n FROM t WHERE id % 2 = 0;"
+step sql "$D" -c "CREATE VIEW vv AS SELECT id, n FROM vt WHERE id > 2;" -c "CHECKPOINT;"
+step sql "$D" -c "DROP VIEW vv;"
+step sql "$D" -c "CREATE VIEW vv AS SELECT v.id, g.w FROM vt AS v LEFT JOIN gone AS g ON g.id = v.id;" -c "CHECKPOINT;"
 
 # A persistent writer (persist_writer.c): one open, many commits, each acknowledgement recorded
 # and marked before the next commit starts. Then the same with --durable-ack, after a mark: from
@@ -151,7 +158,7 @@ echo "replayer: all $N entries rebuild the device byte for byte"
 # 2. the states: every flush, every FUA write, and every SAMPLEth other entry after mkfs
 start=$(awk '$5 == "mkfs" {print $1}' "$WORK/entries")
 points=$(awk -v s="$start" -v k="$SAMPLE" '$1 > s && ($2 ~ /F/ || $2 ~ /U/ || ($1 % k) == 0) {print $1}' "$WORK/entries")
-checked=0 strict_checked=0
+checked=0 strict_checked=0 views_read=0
 strict_at=$(awk '$5 == "strict" {print $1}' "$WORK/entries")
 [ -n "$strict_at" ] || { echo "FAIL: the log has no strict mark"; exit 1; }
 for p in $points; do
@@ -183,9 +190,17 @@ for p in $points; do
     if [ -z "$acked" ]; then
         :   # before init returned nothing is acknowledged (an interrupted init leaves a partial directory)
     else
-        if ! out=$("$BIN" sql "$C" --csv -c "VERIFY;" -c "SHOW LOG 1000000;" 2>&1); then
+        if ! out=$("$BIN" sql "$C" --csv -c "VERIFY;" -c "SHOW LOG 1000000;" -c "SHOW VIEWS;" 2>&1); then
             echo "FAIL: entry $p: the writable open or VERIFY fails:"; echo "$out" | tail -n 5; exit 1
         fi
+        # P2 S7: every view the recovered state holds reads (VERIFY re-bound each one; this runs each body); a view
+        # line of SHOW VIEWS' CSV begins with its quoted name, which no SHOW LOG line does
+        for v in $(echo "$out" | sed -n 's/^"\([a-z][a-z0-9_]*\)",.*/\1/p'); do
+            if ! r=$("$BIN" sql "$C" --read-only --csv -c "SELECT COUNT(*) FROM $v;" 2>&1); then
+                echo "FAIL: entry $p: the recovered view $v does not read:"; echo "$r" | tail -n 3; exit 1
+            fi
+            views_read=$((views_read + 1))
+        done
         for s in $acked; do
             want=$(awk -v s="$s" '$1 == s {print $2}' "$ACKS" | tail -n 1)
             if [ "$s" = 0 ]; then continue; fi
@@ -208,4 +223,6 @@ for p in $points; do
 done
 echo "power cut: $checked replayed states (of $N log entries) recover, keep every acknowledged commit, VERIFY and audit"
 echo "durable-ack: in $strict_checked of them DURABLE was strict and named every commit acknowledged under it"
+echo "views: $views_read reads of the views the recovered states held (P2 S7)"
+[ "$views_read" -gt 0 ] || { echo "FAIL: no recovered state held a view"; exit 1; }
 echo "ALL POWER-CUT CHECKS PASSED"

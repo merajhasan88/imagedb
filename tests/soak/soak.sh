@@ -15,7 +15,8 @@
 # default, 24 hours; stage 3a's soak runs 600), IMDB_SOAK_WINDOW (the writer's memory window in seconds; unset:
 # the engine's, 10 minutes; stage 3b), IMDB_SOAK_CHECKPOINT and IMDB_SOAK_ERASE (commits between them,
 # by the log's sequence, so across restarts; 50000 and 20000; 0: never), IMDB_SOAK_SEG_CACHE (the writer's segment cache
-# budget, bytes or all; unset: the engine's, 256 MB; stage 3c-1), IMDB_SOAK_FLOOR (MB of MemAvailable below which it stops,
+# budget, bytes or all; unset: the engine's, 256 MB; stage 3c-1), IMDB_SOAK_VIEW (P2 S7: commits between view steps, by the log's sequence, 5000;
+# 0: never: the load makes the view sv, each step makes or drops one and reads every view against its body), IMDB_SOAK_FLOOR (MB of MemAvailable below which it stops,
 # 4608: the user's 4 GB and a margin), IMDB_SOAK_KEEP=1 keeps the database.
 # A run in which an asked-for ERASE or CHECKPOINT never completed did not test what it was asked to: it
 # ends SOAK INCOMPLETE (exit 5), not PASSED. A final VERIFY that counts no erased version after an ERASE
@@ -42,7 +43,8 @@ OPTS=()
 [ "${IMDB_SOAK_SYNC:-1}" = 1 ] || OPTS+=(--nosync)
 LOADOPTS=()
 [ -z "${IMDB_SOAK_RETENTION:-}" ] || LOADOPTS+=(--retention "$IMDB_SOAK_RETENTION")
-OPTS+=(--checkpoint "${IMDB_SOAK_CHECKPOINT:-50000}" --erase "${IMDB_SOAK_ERASE:-20000}")
+OPTS+=(--checkpoint "${IMDB_SOAK_CHECKPOINT:-50000}" --erase "${IMDB_SOAK_ERASE:-20000}" --view "${IMDB_SOAK_VIEW:-5000}")
+[ "${IMDB_SOAK_VIEW:-5000}" = 0 ] || LOADOPTS+=(--views)
 OUT=$W/out
 mkdir -p "$OUT"
 echo "soak: $MIN min, $LIVE live rows, a kill every ~${KILL} s, VERIFY every ${VEVERY} restarts, the auditor every ${AEVERY} VERIFY (0: never); writer ${OPTS[*]}; in $W"
@@ -144,6 +146,7 @@ ev() {
 completed() { awk -v w="$1" '$1 == w && $2 == "done" {d++} END {print d + 0}' "$OUT/events"; }
 erased=$(sed -n 's/.* live, \([0-9][0-9]*\) erased).*/\1/p' "$OUT/verify-last.txt")
 echo "ERASE: $(ev erase); CHECKPOINT: $(ev checkpoint); the final VERIFY counts ${erased:-no} erased versions"
+echo "VIEW steps (P2 S7): $(ev view)"
 echo "reopen (the engine's open after each kill), seconds: $(awk '$1 == "open" {n++; if (n == 1) f = $4; l = $4; if ($4 > m) m = $4}
     END {printf "%d opens, the first %.2f, the last %.2f, the longest %.2f", n, f, l, m}' "$OUT/events")"
 if [ "$(completed erase)" -gt 0 ] && [ "${erased:-0}" = 0 ]; then
@@ -154,6 +157,8 @@ incomplete=
     incomplete="no ERASE completed (one every ${IMDB_SOAK_ERASE:-20000} commits asked for)"
 [ "${IMDB_SOAK_CHECKPOINT:-50000}" = 0 ] || [ "$(completed checkpoint)" -gt 0 ] ||
     incomplete="${incomplete:+$incomplete; }no CHECKPOINT completed (one every ${IMDB_SOAK_CHECKPOINT:-50000} commits asked for)"
+[ "${IMDB_SOAK_VIEW:-5000}" = 0 ] || [ "$(completed view)" -gt 0 ] ||
+    incomplete="${incomplete:+$incomplete; }no view step completed (one every ${IMDB_SOAK_VIEW:-5000} commits asked for)"
 
 if [ -n "$early" ]; then echo "SOAK STOPPED EARLY ($early); the data: $OUT"; exit 4; fi
 if [ -n "$incomplete" ]; then echo "SOAK INCOMPLETE ($incomplete): it did not test what it was asked to; the data: $OUT"; exit 5; fi

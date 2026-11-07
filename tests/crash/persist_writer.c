@@ -4,14 +4,25 @@
  * the driver has recorded the acknowledgement and marked the dm log, so every mark follows its
  * commit's acknowledgement and precedes the next commit.
  *   persist_writer DIR FIRST_ID N [--durable-ack]
- * Statements: INSERTs of ids FIRST_ID.., an UPDATE every 7th, a CHECKPOINT every 10th, and one
- * ERASE SUBJECT 2 half way. */
+ * Statements: INSERTs of ids FIRST_ID.., an UPDATE every 7th, a CHECKPOINT every 10th, one ERASE SUBJECT 2 half
+ * way, and (P2 S7) every 13th the view pvFIRST_ID made over t, or dropped if it is there, then read: so the
+ * replayed states cut through ops 20 and 21 too, and the manifests the CHECKPOINTs publish hold a view or a
+ * tombstone. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "../../src/db.h"
 #include "../../src/sql.h"
+
+static int run(imdb_session *s, const char *sql, imdb_err *e)
+{
+    imdb_result r;
+    imdb_err_clear(e);
+    int rc = imdb_exec_one(s, sql, strlen(sql), NULL, 0, &r, e);
+    if (!rc) imdb_result_free(&r);
+    return rc;
+}
 
 int main(int argc, char **argv)
 {
@@ -29,20 +40,28 @@ int main(int argc, char **argv)
     imdb_session s;
     imdb_session_init(&s, db);
     long first = atol(argv[2]), n = atol(argv[3]);
+    char view[32];
+    snprintf(view, sizeof view, "pv%ld", first);
     int rc = 0;
     for (long i = 0; i < n && !rc; i++) {
         char sql[200];
-        if (i == n / 2) snprintf(sql, sizeof sql, "ERASE SUBJECT 2");
+        if (i % 13 == 5) { /* P2 S7: the view made or dropped (a commit alone), then read through */
+            if (imdb_view_by_name(db, view)) snprintf(sql, sizeof sql, "DROP VIEW %s", view);
+            else snprintf(sql, sizeof sql, "CREATE VIEW %s AS SELECT id, memo, LENGTH(memo) AS n FROM t WHERE id >= %ld", view, first);
+        } else if (i == n / 2) snprintf(sql, sizeof sql, "ERASE SUBJECT 2");
         else if (i % 10 == 9) snprintf(sql, sizeof sql, "CHECKPOINT");
         else if (i % 7 == 6) snprintf(sql, sizeof sql, "UPDATE t SET memo = 'persistent-upd-%ld' WHERE id = %ld", i, first);
         else snprintf(sql, sizeof sql, "INSERT INTO t VALUES (%ld, %ld, 'persistent-%ld')", first + i, (first + i) % 3, i);
-        imdb_result r;
-        imdb_err_clear(&e);
-        if ((rc = imdb_exec_one(&s, sql, strlen(sql), NULL, 0, &r, &e))) {
+        if ((rc = run(&s, sql, &e))) {
             fprintf(stderr, "persist_writer: %s: %s\n", sql, e.msg);
             break;
         }
-        imdb_result_free(&r);
+        char rd[64];
+        snprintf(rd, sizeof rd, "SELECT COUNT(*) FROM %s", view);
+        if (i % 13 == 5 && imdb_view_by_name(db, view) && (rc = run(&s, rd, &e))) {
+            fprintf(stderr, "persist_writer: %s: %s\n", rd, e.msg);
+            break;
+        }
         char hex[65];
         imdb_hex(db->head, 32, hex);
         printf("%llu %s\n", (unsigned long long)db->seq, hex); /* acknowledged: the statement returned */

@@ -3,9 +3,9 @@
  * one write(2), so a SIGKILL never loses an acknowledged line; at its start a churn run checks that
  * the last acknowledged commit survived the kill with its hash (exit 3 if not). Every 10 s it appends
  * a stats line: seconds, commits, the engine's memory report (imdb_mem) and the process's RSS.
- *   soak_writer DIR load LIVE ACKS [--retention SECONDS]
+ *   soak_writer DIR load LIVE ACKS [--retention SECONDS] [--views]
  *   soak_writer DIR churn LIVE SECONDS SEED ACKS STATS [--nosync] [--checkpoint N] [--erase N]
- *                                                      [--events FILE]
+ *                                                      [--events FILE] [--view N]
  * The live set: ids 1..LIVE, a SUBJECT among LIVE/10 people (id % people), a memo of 16-200 bytes; the table
  * keeps its history --retention seconds (its RETENTION; the engine's default when absent), past which the
  * engine expires it and retires it, log segments included (stage 3a).
@@ -17,7 +17,12 @@
  * statements than N, so a count that starts again at each restart never fired (the 10-27 baseline).
  * --events appends "erase|checkpoint start SEQ" before each and "... done SEQ SECONDS" after it, and "open
  * done SEQ SECONDS" at a churn run's start (the engine's open: the recovery a restart costs), one write(2)
- * each, so soak.sh counts the ones that ran, the ones a kill cut short, and the reopen times. */
+ * each, so soak.sh counts the ones that ran, the ones a kill cut short, and the reopen times.
+ * P2 S7: --views makes the view sv over t after the load; --view N (5,000; 0: never) a view step each time the
+ * sequence passes a multiple of N, its own events line ("view start SEQ", "view done SEQ SECONDS"): at an even
+ * multiple the next view made (sv, then sv2 over it), at an odd one the last dropped, then each view there read
+ * against its body; every churn run also reads them so at its start, after the kill (exit 3 if one answers otherwise).
+ * So expiry, RETIRE (FLOOR carries the views) and every reopen run with views made, dropped and named again. */
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -113,6 +118,45 @@ static int run(imdb_session *s, const char *sql)
     return 0;
 }
 
+/* P2 S7: the views the churn makes and drops: sv over t, sv2 over sv */
+static const char SV[] = "CREATE VIEW sv AS SELECT id, user_id, LENGTH(memo) AS n FROM t WHERE id % 7 <> 3";
+static const char SV2[] = "CREATE VIEW sv2 AS SELECT id, n FROM sv WHERE id > 10";
+
+static int count_of(imdb_session *s, const char *sql, int64_t *n) /* a COUNT(*) statement's one value */
+{
+    imdb_result r;
+    imdb_err e = {0};
+    if (imdb_exec_one(s, sql, strlen(sql), NULL, 0, &r, &e)) {
+        fprintf(stderr, "soak_writer: %.60s: %s\n", sql, e.msg);
+        return -1;
+    }
+    int rc = r.nrows == 1 && r.ncols == 1 && r.cells[0].v.type == IMDB_T_INT64 ? 0 : -1;
+    if (rc) fprintf(stderr, "soak_writer: %.60s: not one count\n", sql);
+    else *n = r.cells[0].v.i;
+    imdb_result_free(&r);
+    return rc;
+}
+
+/* each view there reads as its body over t: 0, -1 (a statement failed), or 3 (a view's rows are not its body's: as a lost
+ * commit, it changed what the database answers) */
+static int views_check(imdb_session *s, imdb_db *db)
+{
+    static const char *const Q[2][3] = {
+        {"sv", "SELECT COUNT(*) FROM sv", "SELECT COUNT(*) FROM t WHERE id % 7 <> 3"},
+        {"sv2", "SELECT COUNT(*) FROM sv2", "SELECT COUNT(*) FROM t WHERE id % 7 <> 3 AND id > 10"}};
+    for (int i = 0; i < 2; i++) {
+        int64_t a, b;
+        if (!imdb_view_by_name(db, Q[i][0])) continue;
+        if (count_of(s, Q[i][1], &a) || count_of(s, Q[i][2], &b)) return -1;
+        if (a != b) {
+            fprintf(stderr, "soak_writer: VIEW: %s reads %lld rows, its body %lld (log at %llu)\n", Q[i][0], (long long)a,
+                    (long long)b, (unsigned long long)db->seq);
+            return 3;
+        }
+    }
+    return 0;
+}
+
 static long rss_kb(void)
 {
     FILE *f = fopen("/proc/self/status", "r");
@@ -148,7 +192,7 @@ int main(int argc, char **argv)
 {
     if (argc < 5) {
         fprintf(stderr, "usage: soak_writer DIR load LIVE ACKS [--retention SECONDS] | DIR churn LIVE SECONDS SEED ACKS "
-                        "STATS [--nosync] [--checkpoint N] [--erase N] [--events FILE]\n");
+                        "STATS [--nosync] [--checkpoint N] [--erase N] [--events FILE] [--view N] (load: [--views])\n");
         return 2;
     }
     const char *dir = argv[1];
@@ -164,17 +208,21 @@ int main(int argc, char **argv)
     if (sc && strcmp(sc, "all") == 0) o.seg_cache_bytes = UINT64_MAX;
     else if (sc && strtoull(sc, NULL, 10) > 0) o.seg_cache_bytes = strtoull(sc, NULL, 10);
     uint64_t every_ckpt = 50000, every_erase = 20000;
+    uint64_t every_view = 5000; /* P2 S7: commits between view steps, by the log's sequence (0: never) */
+    bool with_views = false;    /* load: sv made after the rows */
     const char *events = NULL;
     long retention = 0; /* the table's RETENTION in seconds (load; 0: the engine's default) */
     for (int i = load ? 5 : 8; i < argc; i++) {
         if (load) {
             if (strcmp(argv[i], "--retention") == 0 && i + 1 < argc && (retention = atol(argv[++i])) > 0) continue;
+            if (strcmp(argv[i], "--views") == 0) { with_views = true; continue; }
             return 2;
         }
         if (strcmp(argv[i], "--nosync") == 0) o.sync = 0;
         else if (strcmp(argv[i], "--checkpoint") == 0 && i + 1 < argc) every_ckpt = strtoull(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--erase") == 0 && i + 1 < argc) every_erase = strtoull(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--events") == 0 && i + 1 < argc) events = argv[++i];
+        else if (strcmp(argv[i], "--view") == 0 && i + 1 < argc) every_view = strtoull(argv[++i], NULL, 10);
         else return 2;
     }
     rng = load ? 1 : strtoull(argv[5], NULL, 10) * 2654435761u + 1;
@@ -211,6 +259,12 @@ int main(int argc, char **argv)
     imdb_session_init(&s, db);
     uint64_t last = db->seq;
     int rc = load ? 0 : event(efd, "open", db->seq, open_s) || window(efd, "open", db);
+    int lost = 0; /* P2 S7: a view read otherwise than its body (exit 3, as a lost commit) */
+    if (!rc && !load && every_view) { /* the views the kill left must read as their bodies */
+        int vc = views_check(&s, db);
+        lost = vc == 3;
+        rc = vc != 0;
+    }
     uint64_t floor = db->mem_floor;
     char sql[512], m[256];
     if (load) {
@@ -230,10 +284,12 @@ int main(int argc, char **argv)
             }
             rc = rc || run(&s, "COMMIT") || ack(afd, db, &last);
         }
+        if (!rc && with_views) rc = run(&s, SV) || ack(afd, db, &last); /* P2 S7 */
     } else {
         double t0 = now(), next_stats = t0;
         /* the multiple of N the sequence last passed: a restart neither repeats one nor waits N again */
         uint64_t erase_mark = every_erase ? db->seq / every_erase : 0, ckpt_mark = every_ckpt ? db->seq / every_ckpt : 0;
+        uint64_t view_mark = every_view ? db->seq / every_view : 0;
         while (!rc && now() - t0 < seconds) {
             long k = 1 + (long)(next() % (uint64_t)live);
             uint64_t p = next() % 100;
@@ -250,6 +306,22 @@ int main(int argc, char **argv)
                     rc = run(&s, sql);
                 }
                 rc = rc || run(&s, "COMMIT");
+            } else if (every_view && db->seq / every_view > view_mark) {
+                /* P2 S7: a view step: at an even mark the next view made (sv, then sv2 over it), at an odd one the
+                 * last dropped (RESTRICT: sv2 before sv), each its own commit; then every view there read against
+                 * its body. From the views there, so a kill at any point leaves a state the next step goes on from */
+                view_mark = db->seq / every_view;
+                bool v1 = imdb_view_by_name(db, "sv") != NULL, v2 = imdb_view_by_name(db, "sv2") != NULL;
+                const char *vs = view_mark % 2 == 0 ? (!v1 ? SV : !v2 ? SV2 : NULL)
+                                                    : (v2 ? "DROP VIEW sv2" : v1 ? "DROP VIEW sv" : NULL);
+                double ts = now();
+                rc = event(efd, "view", db->seq, -1) || (vs && run(&s, vs)) || ack(afd, db, &last);
+                if (!rc) {
+                    int vc = views_check(&s, db);
+                    lost = vc == 3;
+                    rc = vc != 0;
+                }
+                rc = rc || event(efd, "view", db->seq, now() - ts);
             } else if (every_ckpt && db->seq / every_ckpt > ckpt_mark) {
                 ckpt_mark = db->seq / every_ckpt;
                 double ts = now();
@@ -300,5 +372,5 @@ int main(int argc, char **argv)
     close(afd);
     if (efd >= 0) close(efd);
     if (imdb_close(db)) rc = 1;
-    return rc ? 1 : 0;
+    return lost ? 3 : rc ? 1 : 0;
 }
