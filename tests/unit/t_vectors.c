@@ -8,8 +8,9 @@
  *   per digest algorithm (1: LtHash16 by MGF1-SHA256, the digest SHA-256; 2: by ChaCha20, the digest a tree of eight):
  *     SHA256 of c_1's element (its 2048 lane bytes), the digests of {}, {c_1}, {c_1, c_2, c_3}, and of that set less c_2
  *   the row commitment of table 7, salt 00..0f, row "imagedb"; the genesis hash of db_id 10..1f;
- *   the commit hash of a header (seq 5, digest algorithm 2, time 1700000000000000 us, prev the genesis above, one op
- *   SET_RETENTION(table 0, 86400000000 us), the digest of {c_1} by algorithm 2), and the 52 bytes its signature covers */
+ *   the commit hash of a header (log version 3, seq 5, digest algorithm 2, time 1700000000000000 us, prev the genesis
+ *   above, one op SET_RETENTION(table 0, 86400000000 us), the digest of {c_1} by algorithm 2), and the 52 bytes its
+ *   signature covers */
 #include <stdlib.h>
 
 #include "../../src/codec.h"
@@ -18,7 +19,8 @@
 #include "../../src/sha256.h"
 #include "thelp.h"
 
-/* the published values (2026-11-04); a change here is a format change, made on purpose and said in the plan log */
+/* the published values (2026-11-04; the commit hash and the signed message 2026-11-07: log version 3, the format
+ * design's slice 1); a change here is a format change, made on purpose and said in the plan log */
 #define VEC_A1_E1 "50101545a9d5adabc4702c479da75eb9d04fe0c8c278cf141dd2bad7c9f0a934"
 #define VEC_A1_EMPTY "951572071daa9b7e0d1ecf9cf0a4266818efc5d0b6c7f914e83316b0898c1bc4"
 #define VEC_A1_ONE "3fabbaaea1db805f1a9f3e7508ffbe9a9d896104bc615971f63a06c7252a1430"
@@ -31,8 +33,8 @@
 #define VEC_A2_LESS "8518fe9064e4e2eca6741d15cd251f9681f514b5d986545f11f79ee96916b29e"
 #define VEC_ROW "435487928b4a97389dbe29f98777dc1c5dc97821daaaf439564067bd49447f35"
 #define VEC_GENESIS "3641988ed1970c1746ac3fbaa891ba4a3a5d2814156d5390f6d486c2cb15fb05"
-#define VEC_COMMIT "3c30427caf9d24728cc8f7ab4aab7b94770b99e19b2096b52e2f3fe56e83f9e1"
-#define VEC_SIGMSG "494d4442534947320500000000000000630000003c30427caf9d24728cc8f7ab4aab7b94770b99e19b2096b52e2f3fe56e83f9e1"
+#define VEC_COMMIT "d3bd09990f107ee23bae2fd7811e12a5f272d0bfd639229eeb9e1c386cad544e"
+#define VEC_SIGMSG "494d444253494732050000000000000063000000d3bd09990f107ee23bae2fd7811e12a5f272d0bfd639229eeb9e1c386cad544e"
 
 static void hexs(const uint8_t *b, size_t n, char *out)
 {
@@ -136,6 +138,17 @@ static void t_vectors_chain(void)
     expect("commit hash", h, 32, VEC_COMMIT);
     imdb_commit_sigmsg(5, (uint32_t)b.len, h, msg);
     expect("signed message", msg, IMDB_SIGMSG_LEN, VEC_SIGMSG);
+    imdb_commit_rec d; /* the header's first byte: log version 3; 2 (before the format design's slice 1) by name */
+    OK(imdb_commit_decode_header(b.p, b.len, &d, E));
+    imdb_commit_free(&d);
+    b.p[0] = 2;
+    imdb_err_clear(E);
+    CHECK(imdb_commit_decode_header(b.p, b.len, &d, E) == IMDB_ERR_UNSUPPORTED && strstr(g_e.msg, "log version 2"));
+    imdb_commit_free(&d);
+    b.p[0] = 4;
+    imdb_err_clear(E);
+    CHECK(imdb_commit_decode_header(b.p, b.len, &d, E) == IMDB_ERR_CORRUPT);
+    imdb_commit_free(&d);
     imdb_buf_free(&b);
 }
 

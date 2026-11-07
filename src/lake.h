@@ -24,19 +24,42 @@
  *   Every version of a table is in exactly one segment of the manifest.
  *
  * Deletion vector ("IMDBDV01"): seg_hash[32] u32 count u32 0 | count x { u32 row, u32 0, u64 end }
- * Manifest ("IMDBMAN1"): u32 version (5) u32 ntables db_id[16] u64 seq prev_hash[32] state_digest[32]
+ * Manifest ("IMDBMAN1"): u32 version (7) u32 nsections (11) db_id[16] u64 seq prev_hash[32] state_digest[32]
  *   prev_manifest[32] (the generation GC keeps beside this one; zero for the first manifest and
  *   after an ERASE, which keeps nothing) u64 boundary (the commit at or below which the log is retired; 0: none)
- *   per table: u32 len | schema | u64 horizon | u64 live | u64 versions | lthash[2048] |
+ *   then nsections sections, each u32 kind | u64 length | its bytes, the kinds 1 to 11 in order, each once (the format
+ *   design, docs/format-design-v7.md section 8):
+ *   1 tables: u32 ntables, then per table:
+ *              u32 len | schema | u64 horizon | u64 live | u64 versions | lthash[2048] |
  *              u32 nseg | nseg x { seg_hash[32], dv_hash[32] (zero = none), u32 nrows } |
  *              u32 nidx | nidx x { u8 len | name | u8 flags | u8 ncols | ncols x u16 column } (names
  *              strictly increasing per table and unique across tables) | u64 retention_us (op 16) |
  *              u64 created_at | u64 dropped_at (version 5, 1f: the commits that created and dropped it; 0: live)
- *   Versions 2 to 4 (before the drops, 2026-11-04) are not read.
+ *   2 views: u32 nviews, each view by id (u32 id | u8 len | name | u64 created_at | u64 dropped_at | a live one's
+ *     definition, log.h imdb_viewdef);
+ *   3 sequences, 4 enums, 5 roles, 6 grants, 7 the replica set, 8 partition specs, 9 materialized views, 10 procedures,
+ *     11 triggers: each u32 0 until its slice fills it (a non-zero count is a later format's: refused);
+ *   nothing after the last. Versions 2 to 6 are refused by name (no reader before the freeze).
  * LAKE_HEAD: "imagedb-lake 1\nseq <n>\nmanifest <64 hex>\n"
  */
 #ifndef IMDB_LAKE_H
 #define IMDB_LAKE_H
+
+/* manifest 7's sections, in their order (above) */
+enum {
+    IMDB_MAN_TABLES = 1,
+    IMDB_MAN_VIEWS,
+    IMDB_MAN_SEQUENCES,
+    IMDB_MAN_ENUMS,
+    IMDB_MAN_ROLES,
+    IMDB_MAN_GRANTS,
+    IMDB_MAN_REPLICA_SET,
+    IMDB_MAN_PARTITIONS,
+    IMDB_MAN_MATVIEWS,
+    IMDB_MAN_PROCEDURES,
+    IMDB_MAN_TRIGGERS,
+    IMDB_MAN_SECTIONS = IMDB_MAN_TRIGGERS,
+};
 
 #include "db.h"
 

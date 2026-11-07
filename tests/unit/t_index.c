@@ -150,10 +150,10 @@ static void t_index_persist(void)
     OK(ex(&s, "CREATE TABLE t (id INT64 PRIMARY KEY, v INT64, s TEXT)"));
     OK(ex(&s, "INSERT INTO t VALUES (1, 10, 'a'), (2, 20, 'b')"));
     OK(ex(&s, "CHECKPOINT"));
-    CHECK(manifest_version(db) == 6);
+    CHECK(manifest_version(db) == 7);
     OK(ex(&s, "CREATE INDEX t_v ON t (v)"));
     OK(ex(&s, "CHECKPOINT"));
-    CHECK(manifest_version(db) == 6);
+    CHECK(manifest_version(db) == 7);
     OK(ex(&s, "CREATE INDEX t_s ON t (s)")); /* in the log tail only */
     imdb_session_close(&s);
     imdb_close(db);
@@ -173,7 +173,7 @@ static void t_index_persist(void)
     OK(ex(&s, "DROP INDEX t_v"));
     OK(ex(&s, "DROP INDEX t_s"));
     OK(ex(&s, "CHECKPOINT"));
-    CHECK(manifest_version(db) == 6);
+    CHECK(manifest_version(db) == 7);
     imdb_session_close(&s);
     OK(verify_db(db));
     imdb_close(db);
@@ -359,7 +359,7 @@ static void t_index_manifest_strict(void)
     OK(ex(&s, "CREATE INDEX u_w ON u (w)"));
     OK(ex(&s, "INSERT INTO t VALUES (1, 10)"));
     OK(ex(&s, "CHECKPOINT"));
-    CHECK(manifest_version(db) == 6);
+    CHECK(manifest_version(db) == 7);
     size_t n;
     uint8_t *b = manifest_copy(db, &n);
     CHECK(b && parse_bytes(b, n) == IMDB_OK);
@@ -368,29 +368,30 @@ static void t_index_manifest_strict(void)
     CHECK(w);
     if (!w) return;
     /* an entry: u8 length, the name, u8 flags, u8 ncols, u16 per column; u_w is u's last, and u's
-     * u64 retention, u64 creation and u64 drop commits (version 5), then the views' count (version 6: 0 here), end it */
+     * u64 retention, u64 creation and u64 drop commits (version 5); then (manifest 7) the views section and the nine empty
+     * ones, 160 bytes, end it */
     memcpy(w, b, n); /* the last index (u_w) on a column u lacks */
-    w[n - 30] = 2;
-    w[n - 29] = 0;
+    w[n - 186] = 2;
+    w[n - 185] = 0;
     CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
     memcpy(w, b, n); /* an unknown flag */
-    CHECK(w[n - 32] == 0 && w[n - 31] == 1);
-    w[n - 32] = 2;
+    CHECK(w[n - 188] == 0 && w[n - 187] == 1);
+    w[n - 188] = 2;
     CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
     memcpy(w, b, n); /* no column */
-    w[n - 31] = 0;
+    w[n - 187] = 0;
     CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
     memcpy(w, b, n); /* u's retention below a second */
-    memset(w + n - 28, 0, 8);
+    memset(w + n - 184, 0, 8);
     CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
     memcpy(w, b, n); /* u created at commit 0, past the manifest's commit, or dropped at its creation (1f) */
-    memset(w + n - 20, 0, 8);
+    memset(w + n - 176, 0, 8);
     CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
     memcpy(w, b, n);
-    memset(w + n - 20, 0xff, 7);
+    memset(w + n - 176, 0xff, 7);
     CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
     memcpy(w, b, n);
-    memcpy(w + n - 12, w + n - 20, 8);
+    memcpy(w + n - 168, w + n - 176, 8);
     CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
     memcpy(w, b, n); /* t, which has a live row, marked dropped: a dropped table has none */
     {
@@ -419,15 +420,135 @@ static void t_index_manifest_strict(void)
     OK(ex(&s, "DROP INDEX t_v"));
     OK(ex(&s, "DROP INDEX t_x"));
     OK(ex(&s, "CHECKPOINT"));
-    CHECK(manifest_version(db) == 6); /* u_w remains, last: u32 1, u8 3, "u_w", u8 0, u8 1, u16, then u64 retention, creation, drop */
+    CHECK(manifest_version(db) == 7); /* u_w remains, last: u32 1, u8 3, "u_w", u8 0, u8 1, u16, then u64 retention, creation, drop */
     b = manifest_copy(db, &n);
     CHECK(b && n > 20 && parse_bytes(b, n) == IMDB_OK);
     if (!b) return;
-    uint8_t *p = b + n - 40;
+    uint8_t *p = b + n - 196;
     CHECK(p[0] == 1 && p[1] == 0 && p[2] == 0 && p[3] == 0 && p[4] == 3);
     memset(p, 0, 4);          /* nidx = 0 */
-    memmove(p + 4, p + 12, 28); /* the entry gone, the retention, the two commits and the views' count after it */
+    memmove(p + 4, p + 12, 184); /* the entry gone; the retention, the two commits and every section after it */
+    imdb_le64(b + 148, imdb_get_le64(b + 148) - 8); /* the tables section's length (manifest 7: after the 144-byte header) */
     CHECK(parse_bytes(b, n - 8) == IMDB_OK);
+    free(b);
+    imdb_session_close(&s);
+    imdb_close(db);
+}
+
+/* manifest 7's frame (the format design's slice 1, lake.h) on real bytes, one rule broken at a time: eleven sections in
+ * order after the 144-byte header, each u32 kind | u64 length | exactly its bytes, the nine reserved ones a u32 count of
+ * 0 (any other count a later format's: UNSUPPORTED, by name), nothing after them; a table's schema ends with its key list
+ * (u8 1 | u16 column), which must name the column its PRIMARY KEY flag marks; manifest 6 refused by name */
+static void t_index_manifest_sections(void)
+{
+    const char *dir = test_tmpdir();
+    OK(imdb_init(dir, false, NULL, E));
+    imdb_db *db = iopen(dir, false);
+    CHECK(db);
+    if (!db) return;
+    imdb_session s;
+    imdb_session_init(&s, db);
+    OK(ex(&s, "CREATE TABLE t (v INT64, id INT64 PRIMARY KEY, w TEXT)")); /* the key not the first column */
+    OK(ex(&s, "INSERT INTO t VALUES (1, 10, 'a')"));
+    OK(ex(&s, "CHECKPOINT"));
+    CHECK(manifest_version(db) == 7);
+    size_t n;
+    uint8_t *b = manifest_copy(db, &n), *w = malloc(n + 1);
+    CHECK(b && w && n > 144 + 156 && parse_bytes(b, n) == IMDB_OK);
+    if (!b || !w || n <= 144 + 156) {
+        free(b);
+        free(w);
+        imdb_session_close(&s);
+        imdb_close(db);
+        return;
+    }
+    CHECK(imdb_get_le32(b + 12) == IMDB_MAN_SECTIONS && imdb_get_le32(b + 144) == IMDB_MAN_TABLES);
+    for (uint32_t k = IMDB_MAN_SEQUENCES; k <= IMDB_MAN_TRIGGERS; k++) { /* the reserved ones: kind, length 4, count 0 */
+        const uint8_t *q = b + n - 16 * (IMDB_MAN_TRIGGERS - k + 1);
+        CHECK(imdb_get_le32(q) == k && imdb_get_le64(q + 4) == 4 && imdb_get_le32(q + 12) == 0);
+        memcpy(w, b, n); /* a count not 0 */
+        w[q - b + 12] = 1;
+        CHECK(parse_bytes(w, n) == IMDB_ERR_UNSUPPORTED && strstr(g_e.msg, "a later imagedb's format"));
+        memcpy(w, b, n); /* another kind in its place */
+        w[q - b] = (uint8_t)(k == IMDB_MAN_TRIGGERS ? IMDB_MAN_SEQUENCES : k + 1);
+        CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
+        memcpy(w, b, n); /* a length other than its bytes' */
+        w[q - b + 4] = 5;
+        CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
+    }
+    { /* the last section as a later format would write it, longer: refused by name; empty but longer, or with no
+       * count: malformed */
+        uint8_t *l = malloc(n + 4);
+        CHECK(l);
+        if (l) {
+            static const struct {
+                uint64_t len;
+                uint32_t count;
+                int want;
+            } c[] = {{8, 1, IMDB_ERR_UNSUPPORTED}, {8, 0, IMDB_ERR_CORRUPT}, {0, 0, IMDB_ERR_CORRUPT}};
+            for (size_t i = 0; i < sizeof c / sizeof *c; i++) {
+                memcpy(l, b, n - 16);
+                imdb_le32(l + n - 16, IMDB_MAN_TRIGGERS);
+                imdb_le64(l + n - 12, c[i].len);
+                size_t ln = n - 4;
+                if (c[i].len) {
+                    imdb_le32(l + n - 4, c[i].count);
+                    imdb_le32(l + n, 0);
+                    ln = n + 4;
+                }
+                CHECK(parse_bytes(l, ln) == c[i].want);
+                if (c[i].want == IMDB_ERR_UNSUPPORTED) CHECK(strstr(g_e.msg, "section 11 is not empty"));
+            }
+            free(l);
+        }
+    }
+    memcpy(w, b, n); /* ten sections, or twelve */
+    w[12] = 10;
+    CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
+    w[12] = 12;
+    CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
+    memcpy(w, b, n); /* the tables section a byte longer or shorter than its bytes */
+    imdb_le64(w + 148, imdb_get_le64(b + 148) + 1);
+    CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
+    imdb_le64(w + 148, imdb_get_le64(b + 148) - 1);
+    CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
+    memcpy(w, b, n); /* the views section (after the tables') given the tables' kind */
+    size_t va = 156 + (size_t)imdb_get_le64(b + 148);
+    CHECK(imdb_get_le32(b + va) == IMDB_MAN_VIEWS);
+    w[va] = IMDB_MAN_TABLES;
+    CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
+    memcpy(w, b, n); /* the views section a byte longer or shorter than its bytes */
+    imdb_le64(w + va + 4, imdb_get_le64(b + va + 4) + 1);
+    CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
+    imdb_le64(w + va + 4, imdb_get_le64(b + va + 4) - 1);
+    CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
+    memcpy(w, b, n); /* a byte after the last section */
+    w[n] = 0;
+    CHECK(parse_bytes(w, n + 1) == IMDB_ERR_CORRUPT);
+    CHECK(parse_bytes(b, n - 1) == IMDB_ERR_CORRUPT); /* the last section cut short */
+    /* the key list: t's schema after the frame (12), the count and the schema's length (4 each); its last 3 bytes */
+    uint32_t sl = imdb_get_le32(b + 160);
+    CHECK(sl > 3 && 164 + (size_t)sl < n);
+    if (sl > 3 && 164 + (size_t)sl < n) {
+        uint8_t *kl = b + 164 + sl - 3;
+        CHECK(kl[0] == 1 && kl[1] == 1 && kl[2] == 0); /* one column, the second: id */
+        static const uint8_t other[3] = {0, 2, 3}; /* v, w (neither flagged PRIMARY KEY), or past the columns */
+        for (int c = 0; c < 3; c++) {
+            memcpy(w, b, n);
+            w[kl - b + 1] = other[c];
+            CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
+        }
+        memcpy(w, b, n); /* no key column, or two */
+        w[kl - b] = 0;
+        CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
+        w[kl - b] = 2;
+        CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
+    }
+    memcpy(w, b, n); /* manifest 6: refused by name, as 2-5 are */
+    w[8] = 6;
+    CHECK(parse_bytes(w, n) == IMDB_ERR_UNSUPPORTED && strstr(g_e.msg, "manifest version 6") &&
+          strstr(g_e.msg, "before the format design"));
+    free(w);
     free(b);
     imdb_session_close(&s);
     imdb_close(db);
@@ -1177,6 +1298,7 @@ static void t_index_composite(void)
 const test_case index_tests[] = {
     {"index_ddl", t_index_ddl},         {"index_rollback", t_index_rollback}, {"index_persist", t_index_persist},
     {"index_replica", t_index_replica}, {"index_codec", t_index_codec},   {"index_manifest_strict", t_index_manifest_strict},
+    {"index_manifest_sections", t_index_manifest_sections},
     {"index_oidx", t_index_oidx},       {"index_ordered_crosscheck", t_index_ordered_crosscheck}, {"index_erase", t_index_erase},
     {"index_budget", t_index_budget},   {"index_planner", t_index_planner}, {"index_unique", t_index_unique},
     {"index_unique_null_rollback", t_index_unique_null_rollback},

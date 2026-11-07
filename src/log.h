@@ -70,7 +70,7 @@
 #define IMDB_PROMOTE_MSG_LEN 100u     /* the root-signed bytes of a promotion */
 #define IMDB_SIGMSG_LEN  52u
 #define IMDB_HEADER_MIN  86u          /* header with no ops */
-#define IMDB_LOG_VERSION 2
+#define IMDB_LOG_VERSION 3 /* P2 (the format design, slice 1): 2 is refused by name, no reader kept before the freeze */
 #define IMDB_DIGEST_ALG_LTHASH16 1      /* LtHash16 elements by MGF1-SHA256; the state digest SHA-256 over the lanes */
 #define IMDB_DIGEST_ALG_LTHASH16_TREE 2 /* elements by ChaCha20 keyed by the commitment; the digest a tree of eight leaves */
 

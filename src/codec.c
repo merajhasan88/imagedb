@@ -204,6 +204,9 @@ void imdb_schema_encode(const imdb_schema *s, imdb_buf *b)
         imdb_buf_put_u8(b, c->scale);
         imdb_buf_put_u8(b, c->flags);
     }
+    /* the key, in key order (the format design, slice 1: one column until F4's composite keys; the PK flag stays on it) */
+    imdb_buf_put_u8(b, 1);
+    imdb_buf_put_u16(b, s->pk);
 }
 
 int imdb_rd_ident(imdb_rd *r, char out[IMDB_MAX_IDENT + 1], imdb_err *e)
@@ -237,7 +240,12 @@ int imdb_schema_decode(imdb_rd *r, imdb_schema *s, imdb_err *e)
         if (c->flags & IMDB_COL_PK) s->pk = (uint16_t)i;
         if (c->flags & IMDB_COL_SUBJECT) s->subject = (int16_t)i;
     }
+    uint8_t npk = imdb_rd_u8(r); /* the key list (slice 1: exactly the one column its flag names) */
+    uint16_t k0 = imdb_rd_u16(r);
     if (r->err) return imdb_fail(e, IMDB_ERR_CORRUPT, "schema: truncated");
+    if (npk != 1) return imdb_fail(e, IMDB_ERR_CORRUPT, "schema: a key of %u columns (one until composite keys)", npk);
+    if (k0 != s->pk || !(s->cols[k0 < s->ncols ? k0 : 0].flags & IMDB_COL_PK))
+        return imdb_fail(e, IMDB_ERR_CORRUPT, "schema: the key list is not its PRIMARY KEY column");
     imdb_err e2 = {0};
     if (imdb_schema_check(s, &e2)) return imdb_fail(e, IMDB_ERR_CORRUPT, "schema: %s", e2.msg);
     return IMDB_OK;

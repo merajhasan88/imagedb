@@ -1377,7 +1377,7 @@ static void t_retain_floor_forged(void)
     for (size_t at = n - 4 - 8; at > 64 && !mlen; at--) {
         uint64_t v = 0;
         for (int i = 7; i >= 0; i--) v = v << 8 | orig[at + (size_t)i];
-        if (v && at + 8 + v == n - 4) mlen = v;
+        if (v && at + 8 + v == n - 4 && memcmp(orig + at + 8, "IMDBMAN1", 8) == 0) mlen = v; /* its own, not a section's */
     }
     CHECK(mlen > 64);
     for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) {

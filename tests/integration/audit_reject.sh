@@ -297,6 +297,32 @@ echo "   W a retirement boundary no op made, X an index on a missing column: the
    the engine on its boundary against the log's (W) or on rebuilding the lake (X) (t_index manifest_strict: the
    engine's rule itself)"
 
+echo "== FA-FE: manifest 7 (the format design's slice 1) breaking one of its rules, re-pointed and re-signed"
+PFA=$WORK/fa; make_db "$PFA"
+"$FORGE" manifest-lie "$PFA" section
+must_fail "a later imagedb's format" "$BIN" verify "$PFA"
+must_fail "manifest: section 3 not empty" "$AUD" verify "$PFA"
+PFB=$WORK/fb; make_db "$PFB"
+"$FORGE" manifest-lie "$PFB" keylist
+must_fail "physical divergence" "$BIN" verify "$PFB"   # an unreadable manifest: the open replays and rebuilds it (as X)
+must_fail "schema: the key list is not its PRIMARY KEY column" "$AUD" verify "$PFB"
+PFC=$WORK/fc; make_db "$PFC"
+"$FORGE" manifest-lie "$PFC" order
+must_fail "physical divergence" "$BIN" verify "$PFC"   # unreadable: the open replays and rebuilds it (as X)
+must_fail "manifest: section 3 missing or out of order" "$AUD" verify "$PFC"
+PFD=$WORK/fd; make_db "$PFD"
+"$FORGE" manifest-lie "$PFD" later
+must_fail "its section 11 is not empty: a later imagedb's format" "$BIN" verify "$PFD"
+must_fail "manifest: section 11 not empty (a later format's)" "$AUD" verify "$PFD"
+PFE=$WORK/fe; make_db "$PFE"
+"$FORGE" manifest-lie "$PFE" nsections
+must_fail "physical divergence" "$BIN" verify "$PFE"   # unreadable: the open replays and rebuilds it (as X)
+must_fail "manifest: bad sections" "$AUD" verify "$PFE"
+echo "   FA a reserved section not empty and FD a longer one, both a later format's; FC one out of order; FE a
+   section count of ten; FB a table's key list naming another column than its PRIMARY KEY: the auditor refuses each
+   on its rule, the engine FA and FD by name, the others on rebuilding the lake (as X) (t_index manifest_sections:
+   the engine's rules one by one)"
+
 echo "== Y: an INSERT repeating a live row's key of a unique index, its state digest right, signed by the writer"
 PY=$WORK/y; make_db "$PY"
 "$BIN" sql "$PY" --nosync -c "CREATE UNIQUE INDEX t_memo ON t (memo);" >/dev/null

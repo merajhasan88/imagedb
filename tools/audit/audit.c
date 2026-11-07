@@ -45,6 +45,7 @@
 #include "afsum.h"
 #include "abind.h"
 
+#define LOG_VERSION 3 /* the commit header's first byte (design.md §3; the format design's slice 1: 2 refused by name) */
 #define LIVE ((uint64_t)INT64_MAX)
 #define MAX_COLS 64
 #define MAX_TEXT 65535u
@@ -421,6 +422,10 @@ static int decode_schema(rd *r, schema *s)
         }
     }
     if (s->pk < 0) return fail("schema: no PRIMARY KEY");
+    uint8_t npk = rd_u8(r); /* the key list, in key order (the format design's slice 1: the one flagged column) */
+    uint16_t k0 = rd_u16(r);
+    if (r->bad) return fail("schema: truncated");
+    if (npk != 1 || k0 != (uint16_t)s->pk) return fail("schema: the key list is not its PRIMARY KEY column");
     s->rawlen = r->o - start;
     s->raw = xcalloc(s->rawlen, 1);
     memcpy(s->raw, r->p + start, s->rawlen);
@@ -840,7 +845,8 @@ static int decode_body(const uint8_t *b, size_t n, const meta *m, keys *ks, comm
 
     rd hr = {h, hlen, 0, false};
     uint8_t hver = rd_u8(&hr), halg = rd_u8(&hr);
-    if (hver != 2) return fail("header: unsupported version");
+    if (hver == 2) return fail("header: log version 2, from before the format design's version 3 (2026-11-07): not read");
+    if (hver != LOG_VERSION) return fail("header: unsupported version");
     if (halg != m->alg) /* never mixed in one log: every digest is computed by META's algorithm */
         return fail("commit %llu: digest algorithm %u, but this database's is %u", (unsigned long long)dseq, halg, m->alg);
     c->seq = rd_u64(&hr);
@@ -2460,19 +2466,32 @@ static int load_head(int dirfd, uint64_t *seq, uint8_t mh[32], bool *present)
 
 static int cmp_str(const void *a, const void *b) { return strcmp(*(const char *const *)a, *(const char *const *)b); }
 
+/* manifest 7's section frame (the format design, section 8): u32 kind | u64 length; *end where its bytes end */
+static int man_section(rd *r, uint32_t kind, size_t *end)
+{
+    uint32_t k = rd_u32(r);
+    uint64_t n = rd_u64(r);
+    if (r->bad || k != kind || n > rd_left(r)) return -1;
+    *end = r->o + (size_t)n;
+    return 0;
+}
+
 static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
 {
     memset(m, 0, sizeof *m);
     rd r = {b, len, 0, false};
     const uint8_t *mg = rd_bytes(&r, 8);
     uint32_t mver = mg && memcmp(mg, "IMDBMAN1", 8) == 0 ? rd_u32(&r) : 0;
-    if (mver != 6) return fail("manifest: bad header (version 6 only: P2 S7's views)");
-    uint32_t nt = rd_u32(&r);
+    if (mver != 7) return fail("manifest: bad header (version 7 only: the format design's sections)");
+    uint32_t nsec = rd_u32(&r); /* every section, in order: 1 tables, 2 views, 3-11 reserved and empty */
     const uint8_t *id = rd_bytes(&r, 16);
     m->seq = rd_u64(&r);
     const uint8_t *prev = rd_bytes(&r, 32), *st = rd_bytes(&r, 32), *pm = rd_bytes(&r, 32);
     m->boundary = rd_u64(&r);
     if (!r.bad && m->boundary >= m->seq) return fail("manifest: boundary not below its commit");
+    size_t send = 0;
+    if (r.bad || nsec != 11 || man_section(&r, 1, &send)) return fail("manifest: bad sections");
+    uint32_t nt = rd_u32(&r);
     if (r.bad || nt > 1024 || nt > rd_left(&r) / 64) return fail("manifest: bad table count");
     memcpy(m->db_id, id, 16);
     memcpy(m->prev, prev, 32);
@@ -2526,6 +2545,7 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
             (t->dropped_at && (t->dropped_at <= t->created_at || t->dropped_at > m->seq || t->live)))
             return fail("manifest: bad creation or drop commits");
     }
+    if (r.bad || r.o != send || man_section(&r, 2, &send)) return fail("manifest: bad tables section");
     uint32_t nv = rd_u32(&r); /* P2 S7: every view by id, a live one's definition after it */
     if (r.bad || nv > MAX_VIEWS || nv > rd_left(&r) / 22) return fail("manifest: bad view count");
     m->v = xcalloc(nv ? nv : 1, sizeof *m->v);
@@ -2549,6 +2569,13 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
             if (v->def->dep_kind[k] == 1 ? di >= nt || m->t[di].dropped_at : m->v[di].dropped_at)
                 return fail("manifest: a live view names a table or view that is not live");
         }
+    }
+    if (r.bad || r.o != send) return fail("manifest: bad views section");
+    for (uint32_t k = 3; k <= 11; k++) { /* reserved until their slices: present, in order, empty */
+        if (man_section(&r, k, &send)) return fail("manifest: section %u missing or out of order", k);
+        size_t sl = send - r.o; /* a u32 count of 0; any other count a later format's, whatever its length */
+        if (sl >= 4 && rd_u32(&r) != 0) return fail("manifest: section %u not empty (a later format's)", k);
+        if (sl != 4) return fail("manifest: section %u's length is not its bytes", k);
     }
     size_t nlive = 0; /* the live tables' and views' names: one each */
     for (uint32_t i = 0; i < nt; i++) nlive += !m->t[i].dropped_at;
@@ -3575,8 +3602,8 @@ static int writers_entry(const meta *m, keys *k, rd *r, uint32_t i, uint64_t *la
         uint8_t promote = rd_u8(r);
         uint32_t hlen = rd_u32(r);
         const uint8_t *h = rd_bytes(r, hlen), *sig = rd_bytes(r, 64), *rs = promote ? rd_bytes(r, 64) : NULL;
-        /* header: version 2 | alg (META's) | seq | time | prev | n_ops 1 | 13 | epoch | key | how | digest */
-        if (r->bad || promote > 1 || seq <= last || hlen != 86 + 38 || h[0] != 2 || h[1] != m->alg || le64(h + 2) != seq ||
+        /* header: version 3 | alg (META's) | seq | time | prev | n_ops 1 | 13 | epoch | key | how | digest */
+        if (r->bad || promote > 1 || seq <= last || hlen != 86 + 38 || h[0] != LOG_VERSION || h[1] != m->alg || le64(h + 2) != seq ||
             le32(h + 50) != 1 || h[54] != 13 || (h[91] != 1 && h[91] != 2) || (h[91] == 2) != (promote == 1)) {
             rc = fail("%s: entry %u is not a WRITER_KEY commit", what, i + 1);
             break;
@@ -4272,13 +4299,13 @@ static int cmd_vectors(void)
     for (int i = 0; i < 16; i++) g[8 + i] = (uint8_t)(0x10 + i);
     a_sha256(g, sizeof g, gen);
     pvec("genesis", gen, 32);
-    /* the header: u8 version 2 | u8 digest algorithm 2 | u64 seq 5 | u64 time | prev[32] | u32 nops 1 |
+    /* the header: u8 version 3 | u8 digest algorithm 2 | u64 seq 5 | u64 time | prev[32] | u32 nops 1 |
      * op 16: u8 16, u32 table 0, u64 retention | the digest of {c_1} by algorithm 2 (99 bytes) */
     uint8_t h[99], tag_h[8 + 99], hash[32], msg[52];
     lt one;
     memset(&one, 0, sizeof one);
     lt_add(2, &one, c[0]);
-    h[0] = 2;
+    h[0] = LOG_VERSION;
     h[1] = 2;
     put64(h + 2, 5);
     put64(h + 10, 1700000000000000ull);

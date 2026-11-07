@@ -1,6 +1,7 @@
 #!/bin/sh
-# Makes the format's fixtures (2026-11-06: META 5, manifest version 6, ops 16, 19, 20 and 21; alg1-20261106.tar.gz and
-# alg2-20261106.tar.gz beside this script): a primary and its replica under digest algorithm ALG, by
+# Makes the format's fixtures (2026-11-07: META 5, log version 3, manifest version 7 (its sections, the format design's
+# slice 1), ops 16, 19, 20 and 21; alg1-20261107.tar.gz and alg2-20261107.tar.gz beside this script): a primary and
+# its replica under digest algorithm ALG, by
 # make_alg2.sh's steps, which reach every reader of the format: a log of several segments (each manifest
 # publish ends one), CHECKPOINTs (manifests, segments, the lanes), a two-column index and a unique one,
 # an UPDATE and a DELETE, ERASE SUBJECT (redacted log payloads, rewritten segments), commits after it, and
@@ -12,9 +13,10 @@
 # statement runs cross-checked; the engine and the auditor verify both directories, and the replica's
 # digest must equal the primary's. The primary's signing key is in the tarball: it signs nothing but
 # this fixture. The old fixtures (alg1-20261026, alg2-20261026, tagged-20261027; alg1-20261029 and alg2-20261029,
-# manifest version 4; alg1-20261104 and alg2-20261104, manifest version 5) stay as directories this format refuses.
+# manifest version 4; alg1-20261104 and alg2-20261104, manifest version 5; alg1-20261106 and alg2-20261106, manifest
+# version 6 and log version 2) stay as directories this format refuses.
 #   sh tests/fixtures/make_fixtures.sh BIN AUDIT ALG OUTDIR   (OUTDIR must not exist)
-#   tar -czf tests/fixtures/algALG-20261106.tar.gz -C OUTDIR primary replica
+#   tar -czf tests/fixtures/algALG-20261107.tar.gz -C OUTDIR primary replica
 set -eu
 BIN=$1
 AUD=$2

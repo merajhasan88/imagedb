@@ -820,7 +820,7 @@ static void t_copy_dump_refused(void)
  * of the other digest algorithm, it dumps again the same past its first line, VERIFY passing */
 static void t_copy_dump_fixtures(void)
 {
-    static const char *const tgz[] = {"tests/fixtures/alg1-20261106.tar.gz", "tests/fixtures/alg2-20261106.tar.gz"};
+    static const char *const tgz[] = {"tests/fixtures/alg1-20261107.tar.gz", "tests/fixtures/alg2-20261107.tar.gz"};
     for (int f = 0; f < 2; f++) {
         char dir[600], cmd[1600], p[700], r[700], q[700];
         snprintf(dir, sizeof dir, "%s", test_tmpdir());

@@ -780,13 +780,40 @@ static int manifest_views_ok(const imdb_manifest *m, imdb_err *e)
     return rc;
 }
 
+/* manifest 7 (lake.h): a section's frame, u32 kind | u64 length; *end the offset its bytes end at (they must end there) */
+static int man_section(imdb_rd *r, uint32_t kind, size_t *end)
+{
+    uint32_t k = imdb_rd_u32(r);
+    uint64_t n = imdb_rd_u64(r);
+    if (r->err || k != kind || n > imdb_rd_left(r)) return -1;
+    *end = r->off + (size_t)n;
+    return 0;
+}
+
+/* the encoder's frame: its kind and a length the close fills in */
+static size_t man_open(imdb_buf *b, uint32_t kind)
+{
+    imdb_buf_put_u32(b, kind);
+    size_t at = b->len;
+    imdb_buf_put_u64(b, 0);
+    return at;
+}
+
+static void man_close(imdb_buf *b, size_t at)
+{
+    if (!b->err && at + 8 <= b->len) imdb_le64(b->p + at, (uint64_t)(b->len - at - 8));
+}
+
 static int old_manifest(uint32_t ver, imdb_err *e)
 {
     if (ver < 5)
         return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version %u: this lake was written by an imagedb before DROP "
                          "TABLE's format (manifest 5), which this version does not read", ver);
-    return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version %u: this lake was written by an imagedb before views' "
-                     "format (manifest 6, P2 S7), which this version does not read", ver);
+    if (ver == 5)
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 5: this lake was written by an imagedb before views' "
+                         "format (manifest 6, P2 S7), which this version does not read");
+    return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version %u: this lake was written by an imagedb before the format "
+                     "design's sections (manifest 7, 2026-11-07), which this version does not read", ver);
 }
 
 int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err *e)
@@ -796,11 +823,11 @@ int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err
     imdb_rd_init(&r, b, len);
     const uint8_t *mg = imdb_rd_bytes(&r, 8);
     if (!mg || memcmp(mg, kManMagic, 8) != 0) return imdb_fail(e, IMDB_ERR_CORRUPT, "manifest: bad magic");
-    uint32_t ver = imdb_rd_u32(&r); /* 6: every table's indexes, retention, creation and drop; the views (P2 S7; no
-                                     * reader for 2-5) */
-    if (ver >= 2 && ver <= 5) return old_manifest(ver, e);
-    if (ver != 6) return imdb_fail(e, IMDB_ERR_CORRUPT, "manifest: unsupported version");
-    uint32_t nt = imdb_rd_u32(&r);
+    uint32_t ver = imdb_rd_u32(&r); /* 7: 6's tables and views, then the format design's sections, all present (no reader
+                                     * for 2-6) */
+    if (ver >= 2 && ver <= 6) return old_manifest(ver, e);
+    if (ver != 7) return imdb_fail(e, IMDB_ERR_CORRUPT, "manifest: unsupported version");
+    uint32_t nsec = imdb_rd_u32(&r); /* manifest 7: the sections after the header, every one (lake.h) */
     imdb_rd_copy(&r, m->db_id, 16);
     m->seq = imdb_rd_u64(&r);
     imdb_rd_copy(&r, m->prev, 32);
@@ -808,6 +835,10 @@ int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err
     imdb_rd_copy(&r, m->prev_manifest, 32);
     m->boundary = imdb_rd_u64(&r);
     if (!r.err && m->boundary >= m->seq) return imdb_fail(e, IMDB_ERR_CORRUPT, "manifest: boundary not below its commit");
+    size_t send;
+    if (r.err || nsec != IMDB_MAN_SECTIONS || man_section(&r, IMDB_MAN_TABLES, &send))
+        return imdb_fail(e, IMDB_ERR_CORRUPT, "manifest: bad sections");
+    uint32_t nt = imdb_rd_u32(&r);
     if (r.err || nt > IMDB_MAX_TABLES || nt > imdb_rd_left(&r) / 64) return imdb_fail(e, IMDB_ERR_CORRUPT, "manifest: bad table count");
     m->t = imdb_alloc_array(nt ? nt : 1, sizeof *m->t, e);
     if (!m->t) return e->code;
@@ -858,6 +889,7 @@ int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err
                                                                             t->dropped_at > m->seq || t->live)))
             goto bad;
     }
+    if (r.err || r.off != send || man_section(&r, IMDB_MAN_VIEWS, &send)) goto bad;
     uint32_t nv = imdb_rd_u32(&r); /* P2 S7: each view by id, a live one's definition after it */
     if (r.err || nv > IMDB_MAX_VIEWS || nv > imdb_rd_left(&r) / 22) goto bad;
     if (nv && !(m->v = imdb_alloc_array(nv, sizeof *m->v, e))) {
@@ -884,6 +916,16 @@ int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err
             return vrc;
         }
         if (vrc || v->def->id != i || strcmp(v->def->name, v->name)) goto bad;
+    }
+    if (r.err || r.off != send) goto bad;
+    for (uint32_t k = IMDB_MAN_SEQUENCES; k <= IMDB_MAN_TRIGGERS; k++) { /* reserved: empty until their slices */
+        if (man_section(&r, k, &send)) goto bad;
+        size_t sl = send - r.off; /* a u32 count of 0; any other count is a later format's, whatever its length */
+        if (sl >= 4 && imdb_rd_u32(&r) != 0) {
+            imdb_manifest_free(m);
+            return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest: its section %u is not empty: a later imagedb's format", k);
+        }
+        if (sl != 4) goto bad;
     }
     if (imdb_rd_left(&r)) goto bad;
     int nrc = manifest_index_names(m, e);
@@ -1327,8 +1369,8 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
     /* manifest */
     imdb_buf *mb = &p->manifest;
     imdb_buf_put(mb, kManMagic, 8);
-    imdb_buf_put_u32(mb, 6); /* lake.h: every table's indexes, retention, creation and drop; the views (P2 S7) */
-    imdb_buf_put_u32(mb, db->nt);
+    imdb_buf_put_u32(mb, 7); /* lake.h: 6's tables and views, then the format design's sections */
+    imdb_buf_put_u32(mb, IMDB_MAN_SECTIONS);
     imdb_buf_put(mb, db->db_id, 16);
     imdb_buf_put_u64(mb, seq);
     imdb_buf_put(mb, prev, 32);
@@ -1338,6 +1380,8 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
     static const uint8_t none[32];
     imdb_buf_put(mb, kind == IMDB_OP_ERASE || !db->lake_seq ? none : db->lake_manifest, 32); /* GC's retained generation */
     imdb_buf_put_u64(mb, p->boundary);
+    size_t sec = man_open(mb, IMDB_MAN_TABLES);
+    imdb_buf_put_u32(mb, db->nt);
     imdb_buf sch;
     imdb_buf_init(&sch);
     for (uint32_t ti = 0; ti < db->nt; ti++) {
@@ -1372,6 +1416,8 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
         imdb_buf_put_u64(mb, t->created_at);
         imdb_buf_put_u64(mb, t->dropped_at);
     }
+    man_close(mb, sec);
+    sec = man_open(mb, IMDB_MAN_VIEWS);
     imdb_buf_put_u32(mb, db->nviews); /* P2 S7: each view by id; a live one's definition after it (lake.h) */
     for (uint32_t i = 0; i < db->nviews; i++) {
         const imdb_view *v = &db->views[i];
@@ -1382,6 +1428,12 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
         imdb_buf_put_u64(mb, v->created_at);
         imdb_buf_put_u64(mb, v->dropped_at);
         if (!v->dropped_at) imdb_viewdef_encode(v->def, mb);
+    }
+    man_close(mb, sec);
+    for (uint32_t k = IMDB_MAN_SEQUENCES; k <= IMDB_MAN_TRIGGERS; k++) { /* reserved: present and empty */
+        sec = man_open(mb, k);
+        imdb_buf_put_u32(mb, 0);
+        man_close(mb, sec);
     }
     imdb_buf_free(&sch);
     if (rc || (rc = imdb_buf_check(mb, e))) {
@@ -2824,7 +2876,7 @@ int imdb_lake_format_check(imdb_db *db, imdb_err *e)
         imdb_rd_init(&r, mb, ml);
         const uint8_t *mg = imdb_rd_bytes(&r, 8);
         uint32_t ver = imdb_rd_u32(&r);
-        if (mg && !r.err && memcmp(mg, kManMagic, 8) == 0 && ver >= 2 && ver <= 5) rc = old_manifest(ver, e); /* P2 S7: 5 */
+        if (mg && !r.err && memcmp(mg, kManMagic, 8) == 0 && ver >= 2 && ver <= 6) rc = old_manifest(ver, e); /* 6: slice 1 */
     }
     imdb_free(mb);
     close(ofd);

@@ -803,17 +803,43 @@ static void manifest_lie(const char *dir, const char *kind)
     if (imdb_manifest_parse(man, mn, &m, &e)) die("manifest", &e);
     imdb_buf nb;
     imdb_buf_init(&nb);
-    if (strcmp(kind, "boundary") == 0 && imdb_get_le32(man + 8) == 6 && S > 1 && m.boundary == 0) {
+    if (strcmp(kind, "boundary") == 0 && imdb_get_le32(man + 8) == 7 && S > 1 && m.boundary == 0) {
         imdb_buf_put(&nb, man, mn);
-        /* after magic, version, ntables, db id, seq, prev, state digest, prev manifest: the u64 boundary */
+        /* after magic, version, nsections, db id, seq, prev, state digest, prev manifest: the u64 boundary */
         nb.p[136] = 1;
     } else if (strcmp(kind, "column") == 0 && m.nt && m.t[m.nt - 1].nidx && !m.nv) {
         imdb_buf_put(&nb, man, mn);
         uint16_t c = m.t[m.nt - 1].s.ncols; /* the last index's column, little endian, before the three u64 */
-        nb.p[nb.len - 30] = (uint8_t)c; /* the views' count (u32 0: none) after the three u64 */
-        nb.p[nb.len - 29] = (uint8_t)(c >> 8);
+        nb.p[nb.len - 186] = (uint8_t)c; /* then the views section (12 + a count of 0) and the nine empty ones (16 each) */
+        nb.p[nb.len - 185] = (uint8_t)(c >> 8);
+    } else if (strcmp(kind, "section") == 0 && imdb_get_le32(man + 8) == 7 && mn > 144 + 144) {
+        imdb_buf_put(&nb, man, mn); /* the format design's slice 1: the nine reserved sections end it, 16 bytes each */
+        nb.p[nb.len - 132] = 1;     /* the sequences section's u32 count: a later format's */
+    } else if (strcmp(kind, "nsections") == 0 && imdb_get_le32(man + 8) == 7 && mn > 144 + 144) {
+        imdb_buf_put(&nb, man, mn);
+        nb.p[12] = 10; /* the header's section count: ten, with eleven there */
+    } else if (strcmp(kind, "order") == 0 && imdb_get_le32(man + 8) == 7 && mn > 144 + 144) {
+        imdb_buf_put(&nb, man, mn);
+        nb.p[nb.len - 144] = 4; /* the sequences section given the enums' kind: out of order */
+    } else if (strcmp(kind, "later") == 0 && imdb_get_le32(man + 8) == 7 && mn > 144 + 144) {
+        imdb_buf_put(&nb, man, mn - 16); /* the triggers section, last, as a later format would write it: a count and */
+        imdb_buf_put_u32(&nb, 11);        /* its entry (4 bytes here), so its length is not 4 */
+        imdb_buf_put_u64(&nb, 8);
+        imdb_buf_put_u32(&nb, 1);
+        imdb_buf_put_u32(&nb, 0);
+    } else if (strcmp(kind, "keylist") == 0 && imdb_get_le32(man + 8) == 7 && m.nt && m.t[0].s.ncols > 1) {
+        imdb_buf_put(&nb, man, mn);
+        /* table 0's schema after the header (144), the tables section's frame (12), its count and the schema's length
+         * (4 each); its key list (u8 1, u16 column) is the schema's last 3 bytes: another column named there */
+        uint32_t sl = imdb_get_le32(man + 160);
+        uint16_t k = (uint16_t)((m.t[0].s.pk + 1) % m.t[0].s.ncols);
+        if (sl < 3 || 164 + (size_t)sl > mn) exit(1);
+        nb.p[164 + sl - 2] = (uint8_t)k;
+        nb.p[164 + sl - 1] = (uint8_t)(k >> 8);
     } else {
-        fputs("imdb-forge: manifest-lie DIR boundary (none yet) | column (an index in the last table)\n", stderr);
+        fputs("imdb-forge: manifest-lie DIR boundary (none yet) | column (an index in the last table) | section (a reserved"
+              " one not empty) | nsections (ten) | order (a reserved one out of order) | later (the last one a later"
+              " format's, longer) | keylist (table 0's key list another column)\n", stderr);
         exit(1);
     }
     if (nb.err) exit(1);

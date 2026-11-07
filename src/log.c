@@ -355,6 +355,9 @@ int imdb_commit_decode_header(const uint8_t *h, size_t hlen, imdb_commit_rec *c,
     imdb_rd r;
     imdb_rd_init(&r, h, hlen);
     uint8_t ver = imdb_rd_u8(&r), alg = imdb_rd_u8(&r);
+    if (ver == 2)
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "commit: log version 2, from before the format design's version 3 "
+                         "(2026-11-07), which this version does not read");
     if (ver != IMDB_LOG_VERSION) return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: unsupported log version %u", ver);
     /* either algorithm decodes; which one a database's commits must name is its META's, which the
      * engine (imdb_apply_commit, VERIFY, the snapshot open) and the auditor compare */
