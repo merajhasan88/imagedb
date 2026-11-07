@@ -40,6 +40,7 @@
 #include "../../src/lake.h"
 #include "../../src/logdir.h"
 #include "../../src/repl.h"
+#include "../../src/rewind.h"
 #include "../../src/sql.h"
 #include "../../src/writer.h"
 #include "thelp.h"
@@ -2099,6 +2100,8 @@ static const char *check_promote_ledger(const char *run)
     return NULL;
 }
 
+static const char *check_rewind(const char *run); /* the rewind scenario's, with its setup below */
+
 static const char *check_run(const fscen *s, const char *run, const frun *r)
 {
     if (!WIFEXITED(r->status)) {
@@ -2194,6 +2197,7 @@ static const char *check_run(const fscen *s, const char *run, const frun *r)
     if (!why && strcmp(s->name, "backup") == 0) why = check_backup(run);
     if (!why && strcmp(s->name, "restore") == 0) why = check_restore(run);
     if (!why && strcmp(s->name, "backup_incr") == 0) why = check_backup_incr(run);
+    if (!why && strcmp(s->name, "rewind") == 0) why = check_rewind(run);
     return why;
 }
 
@@ -2388,6 +2392,201 @@ static void setup_erase_crashed(const char *base)
     copy_tree(p, q);
 }
 
+/* rewind (P2 R1.3): setup_promote's p and r; p commits past r's last commit F (two CHECKPOINTs among them: its lake past
+ * F), then r is promoted and commits its own. p, the old primary, is rewound onto r's history with --demote. Kept in
+ * the base: F and p's last (rewind_seqs), p's hashes F to its last (rewind_hashes), its frames past F (rewind_tail) and
+ * r's hashes from 0 (r_hashes, what the run reads). After any crash p opens, its log a prefix of its own history at
+ * least through F; still a primary, it is uncut; once the cut began, FILE holds every frame past F; rewind run again
+ * finishes it, and p then follows r to r's view token (check_rewind) */
+static void setup_rewind(const char *base)
+{
+    setup_promote(base);
+    char p[600], r[600];
+    snprintf(p, sizeof p, "%s/p", base);
+    snprintf(r, sizeof r, "%s/r", base);
+    imdb_err e = {0};
+    imdb_db *db = child_open(p, 1);
+    if (!db) return;
+    uint64_t f = db->seq;
+    int rc = ins1(db, 10, 7, 1000, "old-primary-only");
+    if (!rc) rc = imdb_checkpoint(db, &e);
+    if (!rc) rc = ins1(db, 11, 7, 1100, "old-primary-only");
+    if (!rc) rc = imdb_checkpoint(db, &e); /* two segments wholly past F: their removal's order shows */
+    if (!rc) rc = ins1(db, 12, 7, 1200, "old-primary-only");
+    uint64_t last = db->seq;
+    imdb_close(db);
+    imdb_open_opts ro = {.sync = 0, .read_only = true};
+    if (rc || imdb_open(p, &ro, &db, &e)) return;
+    uint8_t *hs = calloc((size_t)(last - f + 1), 32);
+    for (uint64_t q = f; hs && q <= last; q++) {
+        const imdb_commit_info *ci = imdb_ci_at(db, q, &e);
+        if (ci) memcpy(hs + (q - f) * 32, ci->hash, 32);
+    }
+    imdb_close(db);
+    if (!hs) return;
+    spit(dir_in(base, "rewind_hashes"), hs, (size_t)(last - f + 1) * 32);
+    free(hs);
+    uint8_t sq[16];
+    imdb_le64(sq, f);
+    imdb_le64(sq + 8, last);
+    spit(dir_in(base, "rewind_seqs"), sq, sizeof sq);
+    if (ship_to_file(p, f, dir_in(base, "rewind_tail"), &e)) return;
+    uint8_t seed[IMDB_SEED_LEN];
+    root_seed(seed);
+    imdb_promote_opts po = {.old_writer_stopped = true};
+    imdb_promote_result pr;
+    if (imdb_promote(r, seed, &po, &pr, &e) || !pr.committed || !(db = child_open(r, 1))) return;
+    ins1(db, 20, 8, 2000, "new-primary");
+    ins1(db, 21, 8, 2100, "new-primary");
+    imdb_close(db);
+    int fd = open(dir_in(base, "r_hashes"), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) return;
+    imdb_sink s = {imdb_sink_fd_write, &fd};
+    (void)imdb_ship_hashes(r, 0, &s, &e);
+    close(fd);
+}
+
+static const char *rewind_base_ok(const char *base)
+{
+    size_t n = 0, m = 0, k = 0;
+    uint8_t *s = slurp(dir_in(base, "rewind_seqs"), &n), *h = slurp(dir_in(base, "r_hashes"), &m),
+            *t = slurp(dir_in(base, "rewind_tail"), &k);
+    bool ok = s && n == 16 && imdb_get_le64(s) < imdb_get_le64(s + 8) && h && m > IMDB_HASHES_HDR && t && k;
+    free(s);
+    free(h);
+    free(t);
+    return ok ? NULL : "the setup made no fork (p past r's last, r promoted, the hashes and p's frames kept)";
+}
+
+/* the hashes read by plain read(): the transport's, not one of the copy's file system calls the faults reach */
+static int raw_read(void *ctx, void *buf, size_t n, size_t *got, imdb_err *e)
+{
+    int fd = *(const int *)ctx;
+    size_t done = 0;
+    while (done < n) {
+        ssize_t k = read(fd, (uint8_t *)buf + done, n - done);
+        if (k < 0 && errno == EINTR) continue;
+        if (k < 0) return imdb_fail(e, IMDB_ERR_IO, "read: %s", strerror(errno));
+        if (k == 0) break;
+        done += (size_t)k;
+    }
+    *got = done;
+    return IMDB_OK;
+}
+
+/* p rewound onto r from 0 (its lowest point, and the CLI's start for a short log), FILE save */
+static int rewind_p(const char *run, const char *save, bool demote_it, imdb_rewind_report *rep, imdb_err *e)
+{
+    char p[600], h[600];
+    snprintf(p, sizeof p, "%s/p", run);
+    snprintf(h, sizeof h, "%s/r_hashes", run);
+    memset(rep, 0, sizeof *rep);
+    int fd = open(h, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return imdb_fail(e, IMDB_ERR_IO, "r_hashes: %s", strerror(errno));
+    imdb_rewind *rw = NULL;
+    int rc = imdb_rewind_begin(p, &rw, rep, e);
+    if (!rc) rc = imdb_rewind_run(rw, 0, raw_read, &fd, save, demote_it, rep, e);
+    imdb_rewind_end(rw);
+    close(fd);
+    return rc;
+}
+
+static int run_rewind(const char *run)
+{
+    imdb_rewind_report rep;
+    imdb_err e = {0};
+    char save[600];
+    snprintf(save, sizeof save, "%s/rewind_file", run);
+    (void)rewind_p(run, save, true, &rep, &e);
+    return 0;
+}
+
+static const char *check_rewind(const char *run)
+{
+    size_t n = 0, hn = 0, tn = 0;
+    uint8_t *sq = slurp(dir_in(run, "rewind_seqs"), &n);
+    uint64_t f = sq && n == 16 ? imdb_get_le64(sq) : 0, last = sq && n == 16 ? imdb_get_le64(sq + 8) : 0;
+    free(sq);
+    uint8_t *hs = slurp(dir_in(run, "rewind_hashes"), &hn), *tail = slurp(dir_in(run, "rewind_tail"), &tn);
+    char p[600], r[600], file[600], again[600], st[600];
+    snprintf(p, sizeof p, "%s/p", run);
+    snprintf(r, sizeof r, "%s/r", run);
+    snprintf(file, sizeof file, "%s/rewind_file", run);
+    snprintf(again, sizeof again, "%s/rewind_file_again", run);
+    snprintf(st, sizeof st, "%s/r_stream", run);
+    const char *why = !hs || !tail || f >= last || hn != (size_t)(last - f + 1) * 32 ? "the base's records are missing" : NULL;
+    imdb_open_opts ro = {.sync = 1, .read_only = true}, wo = {.sync = 1};
+    imdb_db *db = NULL;
+    imdb_err e = {0};
+    uint64_t s = 0;
+    bool replica = false;
+    if (!why && imdb_open(p, &ro, &db, &e)) {
+        snprintf(g_why, sizeof g_why, "p does not open read-only: %s", e.msg);
+        why = g_why;
+    }
+    if (!why) {
+        s = db->seq;
+        replica = db->replica;
+        if (s < f || s > last) {
+            snprintf(g_why, sizeof g_why, "p is at commit %llu, outside its own history's %llu to %llu", (unsigned long long)s,
+                     (unsigned long long)f, (unsigned long long)last);
+            why = g_why;
+        } else if (memcmp(db->head, hs + (s - f) * 32, 32) != 0) {
+            why = "p's last commit is not its own history's";
+        }
+    }
+    if (db) imdb_close(db);
+    db = NULL;
+    if (!why && !replica && s != last) why = "p is a primary still, but its log was cut";
+    size_t fl = 0;
+    uint8_t *fb = !why && s < last ? slurp(file, &fl) : NULL;
+    if (!why && s < last && !(fb && fl == tn && memcmp(fb, tail, tn) == 0))
+        why = "the cut began, but FILE does not hold every frame past the fork";
+    free(fb);
+    imdb_rewind_report rep;
+    if (!why && !(replica && s == f)) { /* not rewound whole: run again (another FILE) finishes it */
+        memset(&e, 0, sizeof e);
+        if (rewind_p(run, again, !replica, &rep, &e) || !rep.applied || rep.fork != f) {
+            snprintf(g_why, sizeof g_why, "rewind run again does not finish it (at commit %llu, %s): %s", (unsigned long long)s,
+                     replica ? "a replica" : "a primary", e.msg);
+            why = g_why;
+        } else {
+            size_t an = 0;
+            uint8_t *ab = slurp(again, &an);
+            if (!(ab && an <= tn && memcmp(ab, tail, an) == 0 && rep.saved == s - f))
+                why = "the second FILE is not the frames past the fork the copy still held";
+            free(ab);
+        }
+    }
+    char key[600], aside[600];
+    snprintf(key, sizeof key, "%s/signing.key", p);
+    snprintf(aside, sizeof aside, "%s/signing.key.demoted", p);
+    if (!why && (access(key, F_OK) == 0 || access(aside, F_OK) != 0))
+        why = "the rewound replica still holds a signing key, or its old one is not kept aside";
+    if (!why) { /* then it follows r, to r's view token */
+        memset(&e, 0, sizeof e);
+        uint64_t applied = 0;
+        uint8_t ta[32], tb[32];
+        int rc = imdb_open(p, &wo, &db, &e);
+        if (!rc && (db->seq != f || !db->replica)) rc = imdb_fail(&e, IMDB_ERR_STATE, "not a replica at the fork");
+        if (!rc) rc = ship_to_file(r, f, st, &e);
+        if (!rc) rc = apply_file(db, st, &applied, &e);
+        if (!rc) rc = imdb_view_token(db, ta, &e);
+        if (db) imdb_close(db);
+        db = NULL;
+        if (!rc) rc = imdb_open(r, &ro, &db, &e);
+        if (!rc) rc = imdb_view_token(db, tb, &e);
+        if (db) imdb_close(db);
+        if (rc || memcmp(ta, tb, 32) != 0) {
+            snprintf(g_why, sizeof g_why, "the rewound p does not follow r to r's view token: %s", e.msg);
+            why = g_why;
+        }
+    }
+    free(hs);
+    free(tail);
+    return why;
+}
+
 static const fscen kScen[] = {
     {"commits", setup_txns, run_commits, false, NULL, NULL, false, false, false},
     {"nosync", setup_txns, run_nosync, true, NULL, NULL, false, false, false},
@@ -2420,6 +2619,7 @@ static const fscen kScen[] = {
     {"restore", setup_restore, run_restore, false, NULL, restore_base_ok, false, false, false},
     {"backup_incr", setup_backup_incr, run_backup_incr, false, NULL, backup_incr_base_ok, false, false, false},
     {"view", setup_txns, run_view, false, NULL, NULL, false, false, false}, /* P2 S7 */
+    {"rewind", setup_rewind, run_rewind, false, NULL, rewind_base_ok, false, false, false}, /* P2 R1.3 */
 };
 
 static void t_fault_commits(void) { fault_scenario(&kScen[0]); }
@@ -2453,6 +2653,7 @@ static void t_fault_backup(void) { fault_scenario(&kScen[27]); }
 static void t_fault_restore(void) { fault_scenario(&kScen[28]); }
 static void t_fault_backup_incr(void) { fault_scenario(&kScen[29]); }
 static void t_fault_view(void) { fault_scenario(&kScen[30]); }
+static void t_fault_rewind(void) { fault_scenario(&kScen[31]); }
 
 const test_case fault_tests[] = {
     {"fault_commits", t_fault_commits},     {"fault_nosync", t_fault_nosync}, {"fault_checkpoint", t_fault_checkpoint},
@@ -2481,5 +2682,6 @@ const test_case fault_tests[] = {
     {"fault_restore", t_fault_restore},
     {"fault_backup_incr", t_fault_backup_incr},
     {"fault_view", t_fault_view},
+    {"fault_rewind", t_fault_rewind},
 };
 const size_t fault_ntests = sizeof fault_tests / sizeof *fault_tests;

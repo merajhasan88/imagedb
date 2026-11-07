@@ -291,6 +291,8 @@ typedef struct imdb_stats {
     uint64_t seg_hits;
     uint64_t maint_n[IMDB_MT_N], maint_ns[IMDB_MT_N], maint_max_ns[IMDB_MT_N], maint_last_ns[IMDB_MT_N];
     uint64_t opened_us, open_ns, open_replayed; /* the open's wall time, its length, the commits it replayed */
+    uint64_t repl_heard_ns, repl_primary_seq; /* R1.2: a replica's last record from its primary (imdb_mono_ns; 0: none
+                                              * yet) and the latest commit the primary named (a keep-alive, a frame) */
 } imdb_stats;
 
 typedef struct imdb_db {
@@ -376,6 +378,8 @@ typedef struct imdb_db {
     bool strict;              /* durable_ack with sync: every DURABLE record fsynced before its commit returns */
     uint8_t db_id[16];
     bool replica;
+    bool following;           /* R1.2: a follower (imagedb follow) runs on this handle: the export counts its silence
+                               * (replication.last_heard_ms, from stats.repl_heard_ns; -1 while not following) */
     bool failed;              /* a write/apply failed: reopen to recover   */
     uint8_t writer_pk[IMDB_PUBKEY_LEN]; /* the current writer key (writer.h): the last epoch's */
     imdb_identity meta;       /* META: the db id, the epoch-0 writer key, the root key if any */
@@ -749,6 +753,8 @@ int imdb_ship(const char *path, uint64_t after_seq, int fd, bool follow, imdb_er
 typedef struct imdb_ship_opts {
     bool follow;
     int ackfd;
+    uint32_t keepalive_ms; /* R1.2: with follow and ackfd, a keep-alive (repl.h) once nothing was sent for this long; 0:
+                            * none */
 } imdb_ship_opts;
 int imdb_ship_ex(const char *path, uint64_t after_seq, int fd, const imdb_ship_opts *o, imdb_err *e);
 /* What a shipping sent (imdb_ship_to). */
@@ -758,6 +764,7 @@ typedef struct imdb_ship_result {
     uint64_t last_seq;        /* the last commit sent (0: none) */
     uint8_t last_hash[32];
     bool cut;                 /* refused: the log before what was asked for is cut here (the replica must be seeded) */
+    uint64_t alives;          /* R1.2: the keep-alives sent */
 } imdb_ship_result;
 /* imdb_ship_ex into a sink (stream.h: a backup's sealing writer), reporting what it sent (res may be NULL). */
 int imdb_ship_to(const char *path, uint64_t after_seq, const imdb_sink *out, const imdb_ship_opts *o,
@@ -786,6 +793,9 @@ typedef struct imdb_apply_opts {
     uint64_t until_seq, until_time; /* point-in-time (a restore's --until, P0 backup slice 2): apply stops before a commit
                                      * past this one, or one made after this time (microseconds; commit times rise); 0: none */
     bool stopped; /* out: it stopped there, as at a stream's end (the state checked, a point made) */
+    uint32_t silent_ms; /* R1.2: past its session record, a stream that sends nothing for this long is a dropped connection
+                         * (truncated, and silent): its shipper sends a keep-alive every second (repl.h); 0: it waits */
+    bool silent; /* out: it was */
 } imdb_apply_opts;
 int imdb_apply_stream_ex(imdb_db *db, int fd, uint64_t *applied, imdb_apply_opts *o, imdb_err *e);
 /* imdb_apply_stream_ex from a caller's source (stream.h; its end is the stream's): a source cannot tell whether more is

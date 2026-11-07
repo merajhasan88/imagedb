@@ -561,6 +561,30 @@ static void corpus(const char *dir, const char *out)
     snprintf(p, sizeof p, "%s/stream/whole-session", out);
     spit(p, ws, SEED_PREFIX + IMDB_SESSION_LEN + n);
     free(ws);
+    { /* P2 R1.2: the same with a keep-alive before each frame and after the last (repl.h), counted from 1 */
+        size_t nf = 0, off = 0, fl = 0;
+        imdb_err fe = {0};
+        while (off < n && imdb_frame_scan(log, n, off, &fl, &fe) == IMDB_SCAN_FRAME) {
+            nf++;
+            off += fl;
+        }
+        uint8_t *wa = malloc(SEED_PREFIX + IMDB_SESSION_LEN + n + (nf + 1) * IMDB_ALIVE_LEN);
+        size_t at = SEED_PREFIX + IMDB_SESSION_LEN;
+        seed_prefix(wa, g_id.writer, 1, gen);
+        imdb_session_encode(g_id.db_id, nonce, wa + SEED_PREFIX);
+        off = 0;
+        for (uint64_t k = 0;; k++) {
+            imdb_alive_encode(g_id.db_id, nonce, k, gen, k + 1, wa + at);
+            at += IMDB_ALIVE_LEN;
+            if (k == nf || imdb_frame_scan(log, n, off, &fl, &fe) != IMDB_SCAN_FRAME) break;
+            memcpy(wa + at, log + off, fl);
+            at += fl;
+            off += fl;
+        }
+        snprintf(p, sizeof p, "%s/stream/whole-alive", out);
+        spit(p, wa, at);
+        free(wa);
+    }
     free(log);
     snprintf(p, sizeof p, "%s/objects", dir);
     DIR *d = opendir(p);

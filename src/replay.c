@@ -1301,6 +1301,8 @@ int imdb_ship_to(const char *path, uint64_t after_seq, const imdb_sink *out, con
         imdb_free(fs);
     }
     uint64_t last = after_seq, cur_first = 0, cur_ino = 0, cur_off = 0, cur_prev = 0;
+    uint64_t sent_ns = imdb_mono_ns(), alive_n = 0; /* R1.2: when the stream last carried anything, and the keep-alives */
+    uint64_t alive_ns = acks && follow && o->keepalive_ms ? (uint64_t)o->keepalive_ms * 1000000u : 0;
     imdb_tseg_pos cur_pos = {0}; /* where reading a tagged segment goes on (cur_off: an untagged one) */
     bool cur_tagged = false;
     for (uint32_t nship = 0; !rc && !seeded;) {
@@ -1518,6 +1520,14 @@ int imdb_ship_to(const char *path, uint64_t after_seq, const imdb_sink *out, con
         imdb_free(segs);
         if (!rc && acks) rc = acks_drain(acks, e);
         if (rc || !follow) break;
+        if (progressed) sent_ns = imdb_mono_ns();
+        else if (alive_ns && imdb_mono_ns() - sent_ns >= alive_ns) { /* idle: word that this primary is here, at w */
+            uint8_t ka[IMDB_ALIVE_LEN];
+            imdb_alive_encode(A.db_id, A.nonce, w.seq, w.head, ++alive_n, ka);
+            if ((rc = out->write(out->ctx, ka, sizeof ka, e))) break;
+            sent_ns = imdb_mono_ns();
+            if (res) res->alives = alive_n;
+        }
         if (!progressed || stalled) {
             if (acks && acks->fd >= 0) { /* an acknowledgement, or 2 ms: a synchronous commit waits on both */
                 struct pollfd p = {.fd = acks->fd, .events = POLLIN};
@@ -1572,7 +1582,7 @@ static int ack_point(imdb_db *db, imdb_apply_opts *o, imdb_err *e)
 typedef struct apply_src {
     imdb_read_fn read;
     void *ctx;
-    const imdb_fdsrc *fd; /* NULL: a caller's source */
+    imdb_fdsrc *fd; /* NULL: a caller's source */
 } apply_src;
 
 static bool src_ready(const apply_src *a) { return a->fd ? input_ready(a->fd) : true; }
@@ -1585,11 +1595,21 @@ static int apply_check(imdb_db *db, uint64_t *applied, imdb_apply_opts *o, imdb_
         o->has_session = false;
         o->seeded = 0;
         o->stopped = false;
+        o->silent = false;
     }
     if (db->read_only) return imdb_fail(e, IMDB_ERR_STATE, "database opened read-only");
     if (!db->replica) return imdb_fail(e, IMDB_ERR_STATE, "apply is only allowed on a replica");
     if (db->failed) return imdb_fail(e, IMDB_ERR_STATE, "replica is in a failed state; reopen it");
     return IMDB_OK;
+}
+
+/* An error reading the stream: a cut (the input ended inside a record) or a silence past o->silent_ms is a dropped
+ * connection, resumable (R1.2) */
+static void note_cut(const apply_src *src, const imdb_stream *s, imdb_apply_opts *o)
+{
+    if (!o) return;
+    o->silent = src->fd && src->fd->timed_out;
+    o->truncated = s->truncated || o->silent;
 }
 
 static int apply_from(imdb_db *db, const apply_src *src, uint64_t *applied, imdb_apply_opts *o, imdb_err *e)
@@ -1601,19 +1621,21 @@ static int apply_from(imdb_db *db, const apply_src *src, uint64_t *applied, imdb
     bool session = false;
     uint8_t nonce[16];
     int rc = imdb_stream_session(&s, nonce, &session, e);
-    if (rc && o) o->truncated = s.truncated;
+    if (rc) note_cut(src, &s, o);
+    if (!rc && session) db->stats.repl_heard_ns = s.heard_ns; /* R1.2 */
     if (!rc && session && o) {
+        if (o->silent_ms && src->fd) src->fd->timeout_ms = o->silent_ms; /* R1.2: keep-alives come from here on */
         memcpy(o->nonce, nonce, sizeof nonce);
         o->has_session = true;
         if (o->applied) rc = ack_point(db, o, e); /* where this replica stands, before anything arrives */
     }
     uint8_t sp[IMDB_SEED_PREFIX];
     bool seed = false;
-    if (!rc) rc = imdb_stream_seed(&s, sp, &seed, e);
+    if (!rc && (rc = imdb_stream_seed(&s, sp, &seed, e))) note_cut(src, &s, o);
     if (!rc && seed) { /* taken into the directory; the frames come on the next connection, from its commit */
         rc = imdb_seed_take(db, &s, sp, e);
         if (o) {
-            o->truncated = rc && s.truncated;
+            if (rc) note_cut(src, &s, o);
             o->seeded = rc ? 0 : db->seeded;
         }
         imdb_stream_free(&s);
@@ -1621,9 +1643,20 @@ static int apply_from(imdb_db *db, const apply_src *src, uint64_t *applied, imdb
     }
     for (; !rc;) {
         bool eof;
-        if ((rc = imdb_stream_next(&s, db->seq + 1, db->head, &eof, e))) {
-            if (o) o->truncated = s.truncated;
+        bool alive;
+        if ((rc = imdb_stream_next_ex(&s, db->seq + 1, db->head, &eof, &alive, e))) {
+            note_cut(src, &s, o);
             break;
+        }
+        if (alive) { /* R1.2: word from the primary, and the commit it names: nothing applied */
+            db->stats.repl_heard_ns = s.heard_ns;
+            db->stats.repl_primary_seq = s.alive_seq;
+            imdb_stats_tick(db, false);
+            if (o && o->applied && since && !src_ready(src)) { /* caught up: the commits it has not acknowledged */
+                since = 0;
+                if ((rc = ack_point(db, o, e))) break;
+            }
+            continue;
         }
         if (eof) {
             /* A redacted payload is not authorised by its INSERT signature.
@@ -1678,6 +1711,8 @@ static int apply_from(imdb_db *db, const apply_src *src, uint64_t *applied, imdb
         if (rc) break;
         (*applied)++;
         db->stats.applied++; /* P1 M1: a replica's commits, and its export (apply, follow) */
+        db->stats.repl_heard_ns = s.heard_ns; /* R1.2: a frame is word from the primary too */
+        if (db->seq > db->stats.repl_primary_seq) db->stats.repl_primary_seq = db->seq;
         imdb_stats_tick(db, false);
         if (db->needs_redaction && (rc = imdb_redact_log(db, e))) {
             db->failed = true;

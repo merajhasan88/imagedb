@@ -26,6 +26,13 @@ const char *test_tmpdir(void);      /* fresh empty directory per test */
         }                                                              \
     } while (0)
 
+/* a check that reports and goes on: between a fork and its kill, or an open and its close, CHECK's return would leave
+ * a process running or a handle open (a second, misleading failure: heap drift) */
+#define SOFT(c)                                                        \
+    do {                                                               \
+        if (!(c)) test_fail(__FILE__, __LINE__, #c);                   \
+    } while (0)
+
 #define CHECK_OK(expr)                                                 \
     do {                                                               \
         int rc_ = (expr);                                              \
@@ -66,6 +73,7 @@ TESTS(retain)
 TESTS(evict)
 TESTS(segcache)
 TESTS(relay)
+TESTS(rewind)
 TESTS(conc)
 TESTS(vectors)
 TESTS(stats)

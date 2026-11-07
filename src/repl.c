@@ -84,6 +84,37 @@ int imdb_session_decode(const uint8_t b[IMDB_SESSION_LEN], const uint8_t db_id[1
     return 1;
 }
 
+/* R1.2: the keep-alive record (repl.h) */
+void imdb_alive_encode(const uint8_t db_id[16], const uint8_t nonce[IMDB_NONCE_LEN], uint64_t seq, const uint8_t head[32],
+                       uint64_t counter, uint8_t out[IMDB_ALIVE_LEN])
+{
+    memcpy(out, "IMDBALV1", 8);
+    memcpy(out + 8, db_id, 16);
+    memcpy(out + 24, nonce, IMDB_NONCE_LEN);
+    imdb_le64(out + 40, seq);
+    memcpy(out + 48, head, 32);
+    imdb_le64(out + 80, counter);
+    imdb_le32(out + 88, imdb_kern()->crc32c(0, out, 88));
+}
+
+int imdb_alive_decode(const uint8_t b[IMDB_ALIVE_LEN], const uint8_t db_id[16], const uint8_t nonce[IMDB_NONCE_LEN],
+                      uint64_t *seq, uint8_t head[32], uint64_t *counter, imdb_err *e)
+{
+    if (memcmp(b, "IMDBALV1", 8) != 0) return 0;
+    if (imdb_kern()->crc32c(0, b, 88) != imdb_get_le32(b + 88)) {
+        imdb_fail(e, IMDB_ERR_CORRUPT, "stream: damaged keep-alive");
+        return -1;
+    }
+    if (memcmp(b + 8, db_id, 16) != 0 || memcmp(b + 24, nonce, IMDB_NONCE_LEN) != 0) {
+        imdb_fail(e, IMDB_ERR_VERIFY, "stream: a keep-alive of another database or shipping session");
+        return -1;
+    }
+    *seq = imdb_get_le64(b + 40);
+    memcpy(head, b + 48, 32);
+    *counter = imdb_get_le64(b + 80);
+    return 1;
+}
+
 /* ---- the replica's key ---------------------------------------------------------- */
 
 int imdb_replica_key_create(int dirfd, imdb_err *e)

@@ -51,6 +51,11 @@ typedef struct imdb_stream {
     bool truncated;           /* the last error: the input ended inside a frame (a dropped connection) */
     uint8_t back[IMDB_FRAME_HDR]; /* bytes imdb_stream_session read ahead: the first frame's */
     size_t nback;
+    bool has_nonce;           /* R1.2: the session's challenge (imdb_stream_session), which a keep-alive carries */
+    uint8_t nonce[16];
+    uint64_t alives, alive_seq, alive_counter; /* the keep-alives read, and the last one's seq and counter */
+    uint8_t alive_head[32];
+    uint64_t heard_ns;        /* when the last record arrived (a frame, the session, a keep-alive): imdb_mono_ns */
 } imdb_stream;
 
 void imdb_stream_init(imdb_stream *s, const uint8_t writer_pk[IMDB_PUBKEY_LEN], imdb_read_fn read, void *ctx);
@@ -67,9 +72,12 @@ int imdb_stream_session(imdb_stream *s, uint8_t nonce[16], bool *have, imdb_err 
 int imdb_stream_seed(imdb_stream *s, uint8_t p[28], bool *have, imdb_err *e);
 /* Exactly n raw bytes (a seed's): the end of input inside them is an error (truncated). */
 int imdb_stream_need(imdb_stream *s, void *dst, size_t n, imdb_err *e);
-/* Reads the next frame, which must be commit expect_seq chaining to prev.
- * *eof is set at a clean end of stream (between frames). */
+/* Reads the next frame, which must be commit expect_seq chaining to prev, past any keep-alive (R1.2, repl.h).
+ * *eof is set at a clean end of stream (between records). */
 int imdb_stream_next(imdb_stream *s, uint64_t expect_seq, const uint8_t prev[32], bool *eof, imdb_err *e);
+/* The same, returning at a keep-alive too (*alive: one was read, its fields in s, and no frame): a follower's turn to
+ * say when it last heard its primary while no commit comes */
+int imdb_stream_next_ex(imdb_stream *s, uint64_t expect_seq, const uint8_t prev[32], bool *eof, bool *alive, imdb_err *e);
 
 /* imdb_read_fn over a file descriptor (ctx = int *). */
 int imdb_stream_fd_read(void *ctx, void *buf, size_t n, size_t *got, imdb_err *e);
@@ -90,6 +98,8 @@ int imdb_sink_fd_write(void *ctx, const void *p, size_t n, imdb_err *e);
 typedef struct imdb_fdsrc {
     int fd;
     size_t off, len;
+    uint32_t timeout_ms; /* R1.2: a read that waits this long for its first byte fails (timed_out); 0: it waits */
+    bool timed_out;
     uint8_t buf[1u << 16];
 } imdb_fdsrc;
 void imdb_fdsrc_init(imdb_fdsrc *s, int fd);

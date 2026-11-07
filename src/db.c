@@ -3202,6 +3202,11 @@ int imdb_tx_add_writer(imdb_db *db, uint32_t epoch, const uint8_t new_pk[IMDB_PU
 }
 
 int imdb_meta_write(imdb_db *db, bool replica, imdb_err *e) { return write_meta(db->dirfd, &db->meta, replica, e); }
+int imdb_meta_read_at(int dirfd, imdb_identity *id, bool *replica, imdb_err *e) { return read_meta(dirfd, id, replica, e); }
+int imdb_meta_write_at(int dirfd, const imdb_identity *id, bool replica, imdb_err *e)
+{
+    return write_meta(dirfd, id, replica, e);
+}
 
 static int64_t g_clock_offset; /* imdb_clock_offset: tests only */
 static uint64_t g_clock_frozen; /* imdb_clock_freeze: tests only; 0 the wall clock */
@@ -3360,6 +3365,11 @@ static int sync_log_segments(int logdirfd, const uint64_t *segs, size_t nsegs, u
         if (err) return imdb_fail(e, IMDB_ERR_IO, "fdatasync(log) failed: %s", strerror(err));
     }
     return IMDB_OK;
+}
+
+int imdb_log_sync_segments(int logdirfd, const uint64_t *segs, size_t nsegs, uint64_t from, imdb_err *e)
+{
+    return sync_log_segments(logdirfd, segs, nsegs, from, e);
 }
 
 static int sync_segments_from(imdb_db *db, uint64_t from, imdb_err *e)
@@ -4982,6 +4992,9 @@ int imdb_stats_each(imdb_db *db, imdb_stat_fn fn, void *ctx, bool walk_disk)
     STAT("commits.p99_us", imdb_hist_quantile(&s->commit_lat, 990));
     STAT("commits.max_us", s->commit_lat.max_us);
     STAT("commits.applied", s->applied);
+    /* R1.2: how long a follower has not heard its primary (any record; before the first, since it began following) */
+    STAT("replication.last_heard_ms", db->following && s->repl_heard_ns ? (int64_t)((now - s->repl_heard_ns) / 1000000u) : -1);
+    STAT("replication.primary_seq", s->repl_primary_seq);
     STAT("rollbacks", s->rollbacks);
     STAT("log.bytes_appended", s->log_bytes);
     STAT("process.syncs", syncs.n);

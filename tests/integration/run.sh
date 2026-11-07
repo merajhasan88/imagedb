@@ -230,6 +230,43 @@ start_follow
 caught_up
 stop_follow
 echo "a restored follower is refused (it went back) until re-enrolled with a new key; then on the same history again"
+# R1.2: keep-alives and silence. A follower with an export is healthy while its shipper sends keep-alives (every
+# 200 ms here); its shipper stopped (SIGSTOP), the replica is stale within 2 s, and after 3 s of silence the follower
+# drops the connection and runs a new shipper (the stopped one continued and ended): healthy again, a commit reaches it
+FS=$WORK/follow-stats
+"$BIN" follow "$F" --stats "$FS" --silent-after 3000 -- "$BIN" ship "$P" --follow --acks --keepalive 200 \
+  --after '{after}' 2>>"$WORK/follow.log" & FPID=$!
+caught_up
+fhealth() { "$BIN" health "$F" --stats "$FS" --silent-after 2000; }
+healthy_follower() { # the export says it follows (its first tick), and has heard its primary within 2 s
+  for _ in $(seq 200); do out=$(fhealth 2>&1) && case "$out" in *"the primary heard"*) return 0 ;; esac; sleep 0.05; done
+  return 1
+}
+healthy_follower || fail "a following replica is not healthy: $(fhealth)"
+shipper() { pgrep -P "$FPID" | head -1 || true; } # none while the follower waits to run the next
+SPID=$(shipper)
+[ -n "$SPID" ] || fail "no shipper under the follower"
+kill -STOP "$SPID"
+sleep 2.4
+out=$(fhealth) && fail "a replica whose shipper stopped is not stale: $out"
+expect "stale: the replica has not heard its primary for" "$out"
+NS=$SPID
+for _ in $(seq 300); do NS=$(shipper); [ -n "$NS" ] && [ "$NS" != "$SPID" ] && break; sleep 0.05; done
+[ -n "$NS" ] && [ "$NS" != "$SPID" ] || fail "the follower kept its stopped shipper: $(tail -3 "$WORK/follow.log")"
+kill -0 "$SPID" 2>/dev/null && fail "the stopped shipper was left running"
+healthy_follower || fail "the follower is not healthy again: $(fhealth)"
+"$BIN" sql "$P" -c "INSERT INTO txns VALUES (904, 7, 1.00, 'after-silence', '2026-10-22 01:00:03');" >/dev/null
+caught_up
+stop_follow
+grep -q "the stream was silent for 3000 ms" "$WORK/follow.log" || fail "the follower did not say why it reconnected"
+# a follower that never reaches its primary (its command says nothing): stale too, from the export it writes as it
+# begins following
+"$BIN" follow "$F" --stats "$FS" -- sh -c 'exec sleep 60' 2>>"$WORK/follow.log" & FPID=$!
+sleep 2.5
+out=$(fhealth) && fail "a follower that never heard its primary is not stale: $out"
+expect "stale: the replica has not heard its primary for" "$out"
+stop_follow
+echo "keep-alives: a stopped shipper is stale within 2 s and replaced after 3 s of silence, the follower caught up; one that never reached its primary is stale"
 
 step "writer epochs: a key rotation and a promotion, followed by every verifier"
 E=$WORK/epochs
@@ -265,6 +302,30 @@ if "$BIN" ship "$E/p" --after 5 | "$BIN" apply "$E/q" >/dev/null 2>&1; then
   fail "a follower of the promoted writer accepted the old writer's commit"
 fi
 echo "rotation (epoch 1) and promotion (epoch 2) verified on all three; the old writer's fork is refused"
+# P2 R1.3: the old writer rewound onto the promoted one's history: refused without --demote; with it, its commit past
+# the fork saved first, a replica that follows r to r's digest, VERIFY and the auditor; FILE, applied to a copy at
+# the fork, gives the commit back; a second rewind has nothing to do
+out=$("$BIN" rewind "$E/p" --save "$E/p-past-fork.frames" -- "$BIN" ship "$E/r" --hashes --after '{after}' 2>&1) &&
+  fail "a primary was rewound without --demote: $out"
+expect "is a primary: --demote" "$out"
+[ -e "$E/p-past-fork.frames" ] && fail "a refused rewind left FILE"
+out=$("$BIN" rewind "$E/p" --save "$E/p-past-fork.frames" --demote -- "$BIN" ship "$E/r" --hashes --after '{after}')
+expect "the last both histories hold" "$out"
+expect "the 1 commits past it are in" "$out"
+expect "role       replica" "$("$BIN" info "$E/p")"
+fork=$("$BIN" info "$E/p" | awk '/^commit/{print $2}')
+cp -a "$E/p" "$E/p-at-fork"
+eship r p
+[ "$("$BIN" info "$E/p" | awk '/^digest/{print $2}')" = "$("$BIN" info "$E/r" | awk '/^digest/{print $2}')" ] ||
+  fail "the rewound writer's digest differs from the promoted writer's"
+"$BIN" verify "$E/p" >/dev/null || fail "engine VERIFY fails on the rewound writer"
+"$AUD" verify "$E/p" >/dev/null || fail "the auditor rejects the rewound writer"
+"$BIN" apply "$E/p-at-fork" < "$E/p-past-fork.frames" >/dev/null || fail "FILE does not apply at the fork"
+expect "count=1 " "$("$AUD" count "$E/p-at-fork" acct id=9)"
+out=$("$BIN" rewind "$E/p" --save "$E/again.frames" -- "$BIN" ship "$E/r" --hashes --after '{after}' 2>&1) &&
+  fail "rewound a copy on the primary's history: $out"
+expect "nothing to rewind" "$out"
+echo "the old writer rewound to commit $fork (its commit past the fork saved), demoted, following the promoted writer"
 
 step "backup and restore: an encrypted snapshot, a test restore, a restored copy promoted"
 B=$WORK/backup

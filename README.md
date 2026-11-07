@@ -267,6 +267,19 @@ superaccumulator). The two agree bit for bit, out-of-range results included.
   confirmed by k replicas, or unknown after `sync_timeout_ms` (default 10 s,
   with a warning; the commit stands, it is durable here). Query a following
   replica with `imagedb sql /data/r --read-only`.
+- A following replica knows when its primary went quiet. `ship --follow --acks`
+  sends a keep-alive when it has had nothing to send for a second
+  (`--keepalive MS`): the primary's durable commit and head, under the session's
+  challenge. The replica records when it last heard any record and the commit its
+  primary last named (`SHOW STATS`: `replication.last_heard_ms`,
+  `replication.primary_seq`). `follow` drops a connection that says nothing for
+  10 s once its session began (`--silent-after MS`) and makes it again: a
+  half-open connection, or a stopped shipper, never leaves it waiting for ever.
+  `imagedb health /data/r --stats FILE` exits 1, stale, when the replica has not
+  heard its primary for 10 s (`--silent-after MS`), the export's own age counted.
+  A keep-alive says the primary's host and shipper are there, not that a writer
+  runs: watch the writer through its own export. A keep-alive is advisory, as the
+  acknowledgements are: nothing is promoted or applied on its word.
 - Acknowledgements are statements about the past: `SHOW REPLICAS` and `SHOW
   ERASURE` give each one's age. A replica restored from an older copy keeps its
   key but has lost acknowledged commits: re-enrol it with
@@ -302,6 +315,29 @@ superaccumulator). The two agree bit for bit, out-of-range results included.
   elsewhere is stopped at its next commit that reads the new epoch, but the
   window is not closed. **Stop and fence off the old writer before promoting**;
   this implementation does not provide exclusive failover across hosts.
+- A copy that diverged (the old writer after a promotion, with commits the
+  promoted replica never had; a replica that applied them) is put back on its
+  primary's history by `rewind`, never automatically:
+
+  ```sh
+  build/imagedb rewind /data/old-p --save /safe/old-p.frames --demote -- \
+      ssh r imagedb ship /data/r --hashes --after {after}
+  build/imagedb replica-add /data/r old-p "$(build/imagedb replica-key /data/old-p)"
+  build/imagedb follow /data/old-p -- ssh r imagedb ship /data/r --follow --acks --after {after}
+  ```
+
+  It compares the commits' hashes with the primary's (`ship --hashes`: no row
+  leaves it) to find the fork, the last commit both hold. It writes every commit
+  past the fork to FILE (made new, synced with its directory before anything is
+  cut: a stream `imagedb apply` takes on a copy at the fork, to reconcile what
+  those commits held), then cuts the log back to the fork. A lake published past
+  it is rebuilt from the log. The copy gets a new replica key (it lost commits it
+  may have acknowledged), so enrol it again. `--demote` turns an old primary into
+  a replica, its signing key kept aside as `signing.key.demoted`. It is refused,
+  the copy untouched, when there is nothing to rewind, when an ERASE or a RETIRE
+  comes past the fork (seed it again), and when its log is cut below the fork.
+  It starts at most 1,000,000 commits below the copy's last; `--from N` goes
+  further. Stop the copy's writer, follower and readers first.
 
 ## Backup and restore
 
@@ -399,9 +435,11 @@ handle failed, at most once a second (a replica's apply too) and at its close,
 and at once when its handle fails: rewritten in place,
 never synced, a CRC on its last line; a FILE that is not an export is left as
 it is (the copy keeps no export and says why). `imagedb stats FILE` prints it with its
-age. `imagedb health DIR [--stats FILE] [--max-statement-s N]` checks the
+age. `imagedb health DIR [--stats FILE] [--max-statement-s N] [--silent-after MS]`
+checks the
 directory without opening it (META, DURABLE, no replica incident recorded) and
-the export: exit 0 healthy, 1 a statement running past N seconds (60) or an
+the export: exit 0 healthy, 1 a statement running past N seconds (60), a
+following replica that has not heard its primary for MS (10000: stale) or an
 unreadable export, 2 the handle failed (reopen it), 3 the directory damaged or
 a replica incident recorded. An idle copy writes no export until its next
 statement: an old export with nothing running is idle, not hung.
@@ -458,11 +496,18 @@ Command-line options (`imagedb` with no arguments prints the commands):
 | `--after PREV` | backup | an incremental backup after backup PREV | a full one |
 | `--follow` | ship | keeps shipping new commits | stops at the end |
 | `--acks` | ship | reads the replica's acknowledgements on stdin | off |
+| `--keepalive MS` | ship | with `--follow --acks`: a keep-alive once nothing was sent for MS (0: none) | 1000 |
+| `--silent-after MS` | follow | a connection silent this long past its session is dropped and made again (0: never) | 10000 |
 | `--new` | replica-key | a new replica key: a new incarnation | the existing key |
 | `--replace` | replica-add | gives an allowlisted replica a new key | refused |
 | `--max-statement-s N` | health | a statement running longer is unhealthy (exit 1) | 60 |
+| `--silent-after MS` | health | a following replica that has not heard its primary this long is stale (exit 1; 0: never) | 10000 |
 | `--discard-tail` | recover | cuts the damaged end of the log | inspect only |
 | `--save FILE` | recover | the cut bytes, saved first | |
+| `--save FILE` | rewind | the commits past the fork, saved first (required; never written over) | |
+| `--demote` | rewind | an old primary becomes a replica of the history it is rewound onto | refused for a primary |
+| `--from N` | rewind | the comparison starts at commit N | 1,000,000 below the copy's last, or its lowest point |
+| `--hashes` | ship | only each commit's hash after N, for `rewind` | the commits |
 | `--key FILE` | backup, backup-verify, restore | the backup key | |
 | `--out FILE` | backup | the backup's file | |
 | `--scratch DIR` | backup-verify | where the test restore runs | |

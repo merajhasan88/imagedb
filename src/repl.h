@@ -7,6 +7,8 @@
  * until crypto-shredding, R6).
  *
  *   session = "IMDBSES1" | db id[16] | nonce[16] | CRC32C of the 40 bytes before it (44 bytes)
+ *   alive   = "IMDBALV1" | db id[16] | nonce[16] | u64 the primary's durable seq | head[32] | u64 a counter |
+ *             CRC32C of the 88 bytes before it (92 bytes; P2 R1.2)
  *   ack     = "IMDBACK2" | db id[16] | replica key[32] | u32 epoch | u32 0 | nonce[16] | u64 seq |
  *             head[32] | u64 cleanup | Ed25519 signature by the replica key over the 128 bytes
  *             before it (192 bytes)
@@ -31,6 +33,13 @@
  * (follow sends one before anything arrives), as far as NAME.ack shows the earlier one (it is not
  * fsynced: a primary's OS crash can tear it or leave an older one). The cleanup claim may go down (a reopened replica
  * with work outstanding restarts it), which only understates.
+ *
+ * Keep-alives (R1.2): `ship --follow --acks` sends one every --keepalive MS (1 s) when it has nothing else to send,
+ * between frames, the session's nonce in it (one from another session, or none outside a session, is refused). It is
+ * advisory, as the acknowledgements are (the transport is trusted to deliver): a replica takes its seq and head for
+ * nothing but the lag it reports (SHOW STATS replication.primary_seq), and the time it last heard any record of its
+ * primary (replication.last_heard_ms) for `health --silent-after`; no promotion rests on it (R1.1's round will). A
+ * damaged one is refused as a damaged frame is; a duplicated one changes nothing.
  *
  * Freshness: a recorded acknowledgement is the last one received, with the time the primary
  * received it; it says what the replica held then, never what it holds now (SHOW REPLICAS and
@@ -57,6 +66,7 @@
 
 #define IMDB_ACK_LEN 192
 #define IMDB_SESSION_LEN 44
+#define IMDB_ALIVE_LEN 92 /* R1.2 */
 #define IMDB_NONCE_LEN 16
 #define IMDB_REPLICA_KEY_NAME "replica.key"
 #define IMDB_REPLICAS_DIR "replicas"
@@ -79,6 +89,13 @@ void imdb_session_encode(const uint8_t db_id[16], const uint8_t nonce[IMDB_NONCE
  * magic), -1 (e) when it is one but damaged or another database's. */
 int imdb_session_decode(const uint8_t b[IMDB_SESSION_LEN], const uint8_t db_id[16], uint8_t nonce[IMDB_NONCE_LEN],
                         imdb_err *e);
+
+/* R1.2: a keep-alive (above). decode: 1 and its fields when b is one of db_id's session nonce, 0 when it is not a
+ * keep-alive (its magic), -1 (e) when it is one but damaged, another database's or another session's */
+void imdb_alive_encode(const uint8_t db_id[16], const uint8_t nonce[IMDB_NONCE_LEN], uint64_t seq, const uint8_t head[32],
+                       uint64_t counter, uint8_t out[IMDB_ALIVE_LEN]);
+int imdb_alive_decode(const uint8_t b[IMDB_ALIVE_LEN], const uint8_t db_id[16], const uint8_t nonce[IMDB_NONCE_LEN],
+                      uint64_t *seq, uint8_t head[32], uint64_t *counter, imdb_err *e);
 
 void imdb_ack_sign(const imdb_ack *a, const imdb_signer *s, uint8_t out[IMDB_ACK_LEN]);
 /* Decodes and checks the signature against the key the record names. */

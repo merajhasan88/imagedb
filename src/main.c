@@ -19,6 +19,7 @@
 #include "fsio.h"
 #include "lake.h"
 #include "repl.h"
+#include "rewind.h"
 #include "sql.h"
 #include "writer.h"
 
@@ -38,16 +39,19 @@ static int usage(void)
           "                                             run SQL (interactive when no -c/-f and stdin is a tty);\n"
           "                                             --durable-ack: the watermark synced as each commit returns,\n"
           "                                             so a damaged last frame past it is known unacknowledged;\n"
-          "  imagedb ship <primary-dir> [--after N] [--follow] [--acks]\n"
+          "  imagedb ship <primary-dir> [--after N] [--follow] [--acks] [--keepalive MS] [--hashes]\n"
           "                                             write commits after N to stdout (--acks: read the\n"
-          "                                             replica's acknowledgements on stdin)\n"
+          "                                             replica's acknowledgements on stdin; --follow --acks: a\n"
+          "                                             keep-alive when idle for MS, 1000; --hashes: only each\n"
+          "                                             commit's hash after N, for rewind)\n"
           "  imagedb apply <replica-dir> [--durable-ack] [--mem-limit BYTES] [--mem-window SECONDS|none]\n"
           "                    [--seg-cache BYTES|all] [--stats FILE] [--events FILE]\n"
           "                                             apply a commit stream from stdin\n"
           "  imagedb follow <replica-dir> [--mem-limit BYTES] [--mem-window SECONDS|none] [--seg-cache BYTES|all]\n"
-          "                    [--stats FILE] [--events FILE] -- CMD [ARG...]\n"
+          "                    [--stats FILE] [--events FILE] [--silent-after MS] -- CMD [ARG...]\n"
           "                                             run CMD ({after}: the replica's commit), apply its stream,\n"
           "                                             acknowledge on its stdin; run it again when it ends\n"
+          "                                             (--silent-after: and when it says nothing for MS, 10000)\n"
           "  imagedb replica-key <replica-dir> [--new]  print the replica's public key (made if missing); --new: a\n"
           "                                             new key, a new incarnation (after a restore from a copy)\n"
           "  imagedb replica-add <primary-dir> NAME KEY [--replace]\n"
@@ -58,7 +62,14 @@ static int usage(void)
           "                                             (COPY ... FROM STDIN, BATCH N rows a commit; 10000) and\n"
           "                                             indexes at one commit; imagedb sql NEW -f FILE restores it\n"
           "  imagedb stats <file>                       a running copy's export (--stats FILE on sql, apply, follow)\n"
-          "  imagedb health <dir> [--stats FILE] [--max-statement-s N]   0 healthy; 1 slow or unreadable; 2 failed; 3 damaged\n"
+          "  imagedb health <dir> [--stats FILE] [--max-statement-s N] [--silent-after MS]\n"
+          "                                             0 healthy; 1 slow, stale (a following replica that has\n"
+          "                                             not heard its primary) or unreadable; 2 failed; 3 damaged\n"
+          "  imagedb rewind <dir> --save FILE [--demote] [--from N] -- CMD [ARG...]\n"
+          "                                             put a diverged copy back on its primary's history: CMD\n"
+          "                                             (`ship PRIMARY --hashes --after {after}`) gives the\n"
+          "                                             primary's hashes; the commits past the fork go to FILE\n"
+          "                                             first; --demote: an old primary becomes a replica\n"
           "  imagedb recover <dir> [--discard-tail --save FILE]\n"
           "                                             inspect a damaged end of the log; with --discard-tail, cut it\n"
           "                                             (its bytes saved to FILE first) and lower DURABLE to match\n"
@@ -127,6 +138,20 @@ static bool parse_size(const char *s, uint64_t *out)
     if (shift) i++;
     if (s[i] || (shift && v > (UINT64_MAX >> shift))) return false;
     *out = v << shift;
+    return true;
+}
+
+/* MS (R1.2's intervals): decimal digits, no leading zero but 0 itself (none), at most max */
+static bool parse_ms(const char *s, uint32_t max, uint32_t *out)
+{
+    uint64_t v = 0;
+    if (!s[0] || (s[0] == '0' && s[1])) return false;
+    for (size_t i = 0; s[i]; i++) {
+        if (s[i] < '0' || s[i] > '9') return false;
+        v = v * 10 + (uint64_t)(s[i] - '0');
+        if (v > max) return false;
+    }
+    *out = (uint32_t)v;
     return true;
 }
 
@@ -674,7 +699,10 @@ static void on_stop(int sig)
 {
     (void)sig;
     g_stop = 1;
-    if (g_child > 0) kill((pid_t)g_child, SIGTERM); /* its stream then ends, and the loop with it */
+    if (g_child > 0) { /* its stream then ends, and the loop with it (SIGCONT: a stopped shipper takes it too) */
+        kill((pid_t)g_child, SIGTERM);
+        kill((pid_t)g_child, SIGCONT);
+    }
 }
 
 typedef struct follow_ctx {
@@ -751,9 +779,33 @@ static void describe_exit(int status, char *buf, size_t n)
  * --after {after}`, locally or through ssh), applies what it sends and acknowledges on its stdin;
  * when it ends, runs it again from the replica's commit, backing off from 1 to 30 seconds while
  * nothing arrives. A stream that fails authentication, or a failed handle, stops it. */
+/* The shipper's end: it exits by itself once its stream has ended; one that has not within 5 s (or one stopped, or
+ * silent, when kill) is sent SIGTERM and SIGCONT (a stopped process takes no signal but SIGKILL until continued),
+ * and SIGKILL 5 s after that */
+static int reap_shipper(pid_t pid, bool kill_now)
+{
+    int status = 0;
+    for (int stage = kill_now ? 1 : 0; stage < 3; stage++) {
+        if (stage == 1) {
+            kill(pid, SIGTERM);
+            kill(pid, SIGCONT);
+        } else if (stage == 2) {
+            kill(pid, SIGKILL);
+        }
+        for (int i = 0; i < (stage == 2 ? INT_MAX : 500); i++) {
+            pid_t w = waitpid(pid, &status, WNOHANG);
+            if (w == pid || (w < 0 && errno != EINTR)) return status;
+            struct timespec ts = {0, 10 * 1000000L};
+            nanosleep(&ts, NULL);
+        }
+    }
+    return status;
+}
+
 static int cmd_follow(int argc, char **argv)
 {
     int dd = 3; /* where "--" is, past the options */
+    uint32_t silent = 10000; /* R1.2: T, a connection silent this long past its session is dropped and made again */
     while (dd + 1 < argc && strcmp(argv[dd], "--") != 0) {
         if (strcmp(argv[dd], "--mem-limit") == 0 && parse_size(argv[dd + 1], &g_mem_limit)) dd += 2;
         else if (strcmp(argv[dd], "--events") == 0) {
@@ -766,13 +818,14 @@ static int cmd_follow(int argc, char **argv)
         }
         else if (strcmp(argv[dd], "--mem-window") == 0 && parse_window(argv[dd + 1], &g_mem_window)) dd += 2;
         else if (strcmp(argv[dd], "--seg-cache") == 0 && parse_seg_cache(argv[dd + 1], &g_seg_cache)) dd += 2;
+        else if (strcmp(argv[dd], "--silent-after") == 0 && parse_ms(argv[dd + 1], 86400000, &silent)) dd += 2;
         else if (strcmp(argv[dd], "--mem-limit") != 0 && strcmp(argv[dd], "--mem-window") != 0 && strcmp(argv[dd], "--stats") != 0 &&
-                 strcmp(argv[dd], "--events") != 0 &&
+                 strcmp(argv[dd], "--events") != 0 && strcmp(argv[dd], "--silent-after") != 0 &&
                  strcmp(argv[dd], "--seg-cache") != 0)
             return usage();
         else {
             fprintf(stderr, "imagedb: follow: --mem-limit takes BYTES (digits, then K, M or G), --mem-window SECONDS "
-                            "or none, --seg-cache BYTES or all\n");
+                            "or none, --seg-cache BYTES or all, --silent-after MS (0: wait for ever)\n");
             return 2;
         }
     }
@@ -806,6 +859,9 @@ static int cmd_follow(int argc, char **argv)
     unsigned backoff = 1;
     int rc = 0;
     while (!g_stop) {
+        db->following = true; /* R1.2: the export counts its silence (a seed's reopen made a new handle) */
+        if (!db->stats.repl_heard_ns) db->stats.repl_heard_ns = imdb_mono_ns(); /* silent since it began following */
+        imdb_stats_tick(db, true); /* said now: a follower that never reaches its primary exports nothing more, and ages */
         char **av = calloc((size_t)ncmd + 1, sizeof *av);
         bool ok = av != NULL;
         for (int i = 0; ok && i < ncmd; i++) ok = (av[i] = subst_after(argv[dd + 1 + i], db->seq)) != NULL;
@@ -841,18 +897,15 @@ static int cmd_follow(int argc, char **argv)
         close(in[1]);
         close(out[0]);
         (void)fcntl(out[1], F_SETFL, O_NONBLOCK);
-        imdb_apply_opts ao = {.applied = send_ack}; /* its first point: right after the session record */
+        imdb_apply_opts ao = {.applied = send_ack, .silent_ms = silent}; /* its first point: right after the session record */
         follow_ctx f = {.ackfd = out[1], .key = &key, .ao = &ao};
         ao.ctx = &f;
         uint64_t applied = 0;
         imdb_err ea = {0};
         int arc = imdb_apply_stream_ex(db, in[0], &applied, &ao, &ea);
-        if (arc) kill(pid, SIGTERM);
         close(in[0]);
         close(out[1]);
-        int status = 0;
-        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
-        }
+        int status = reap_shipper(pid, arc != 0);
         g_child = 0;
         if (ao.seeded || (arc && ao.truncated && db->failed && !db->seq)) {
             /* a seed taken (or cut short: the reopen removes what it left): its snapshot, then ship from there */
@@ -883,6 +936,126 @@ static int cmd_follow(int argc, char **argv)
     imdb_signer_wipe(&key);
     if (imdb_close(db)) rc = 1;
     return rc;
+}
+
+/* imagedb rewind DIR --save FILE [--demote] [--from N] -- CMD [ARG...] (P2 R1.3, rewind.h): CMD, the primary's
+ * `ship --hashes --after {after}` (through ssh as follow's shipper), run with {after} where the comparison starts (by
+ * default no more than IMDB_REWIND_WINDOW below the copy's last commit, never below its lowest rewind point; --from N);
+ * then the copy opened once, which rebuilds a dropped lake and checks where it stands */
+static int cmd_rewind(int argc, char **argv)
+{
+    const char *save = NULL;
+    bool demote = false, has_from = false;
+    uint64_t from = 0;
+    int dd = 3;
+    while (dd < argc && strcmp(argv[dd], "--") != 0) {
+        if (strcmp(argv[dd], "--save") == 0 && dd + 1 < argc) {
+            save = argv[dd + 1];
+            dd += 2;
+        } else if (strcmp(argv[dd], "--demote") == 0) {
+            demote = true;
+            dd++;
+        } else if (strcmp(argv[dd], "--from") == 0 && dd + 1 < argc) {
+            int64_t v;
+            imdb_err pe = {0};
+            if (imdb_parse_int64(argv[dd + 1], strlen(argv[dd + 1]), &v, &pe) || v < 0) return usage();
+            from = (uint64_t)v;
+            has_from = true;
+            dd += 2;
+        } else {
+            return usage();
+        }
+    }
+    if (dd + 1 >= argc || !save) return usage();
+    const char *dir = argv[2];
+    int ncmd = argc - dd - 1;
+    imdb_err e = {0};
+    imdb_rewind *rw = NULL;
+    imdb_rewind_report rep;
+    if (imdb_rewind_begin(dir, &rw, &rep, &e)) {
+        print_err("rewind", &e);
+        return 1;
+    }
+    uint64_t after = has_from ? from : rep.last > IMDB_REWIND_WINDOW ? rep.last - IMDB_REWIND_WINDOW : 0;
+    if (!has_from && after < rep.lowest) after = rep.lowest;
+    char **av = calloc((size_t)ncmd + 1, sizeof *av);
+    bool ok = av != NULL;
+    for (int i = 0; ok && i < ncmd; i++) ok = (av[i] = subst_after(argv[dd + 1 + i], after)) != NULL;
+    int in[2] = {-1, -1};
+    int rc = 0;
+    if (!ok || pipe2(in, O_CLOEXEC) != 0) {
+        fprintf(stderr, "imagedb: rewind: %s\n", ok ? strerror(errno) : "out of memory");
+        rc = 1;
+    }
+    signal(SIGPIPE, SIG_IGN);
+    fflush(NULL);
+    pid_t pid = rc ? -1 : fork();
+    if (pid == 0) {
+        signal(SIGPIPE, SIG_DFL);
+        if (dup2(in[1], 1) < 0) _exit(127);
+        execvp(av[0], av);
+        fprintf(stderr, "imagedb: rewind: cannot run %s: %s\n", av[0], strerror(errno));
+        _exit(127);
+    }
+    if (!rc && pid < 0) {
+        fprintf(stderr, "imagedb: rewind: fork: %s\n", strerror(errno));
+        rc = 1;
+    }
+    for (int i = 0; av && i < ncmd; i++) free(av[i]);
+    free(av);
+    if (in[1] >= 0) close(in[1]);
+    imdb_fdsrc *src = rc ? NULL : malloc(sizeof *src);
+    if (!rc && !src) {
+        fprintf(stderr, "imagedb: rewind: out of memory\n");
+        rc = 1;
+    }
+    int rrc = IMDB_OK;
+    if (!rc) {
+        imdb_fdsrc_init(src, in[0]);
+        rrc = imdb_rewind_run(rw, after, imdb_fdsrc_read, src, save, demote, &rep, &e);
+    }
+    free(src);
+    if (in[0] >= 0) close(in[0]);
+    if (pid > 0) {
+        int status = reap_shipper(pid, rrc != IMDB_OK);
+        if (!rrc && !(WIFEXITED(status) && WEXITSTATUS(status) == 0)) { /* its hashes were whole: said, not fatal */
+            char how[64];
+            describe_exit(status, how, sizeof how);
+            fprintf(stderr, "imagedb: rewind: warning: CMD %s after its hashes\n", how);
+        }
+    }
+    imdb_rewind_end(rw);
+    if (rc) return rc;
+    if (rrc) {
+        print_err("rewind", &e);
+        if (!rep.applied && rep.saved) /* FILE was written and the cut began or failed part way */
+            fprintf(stderr, "imagedb: rewind: %s holds the %llu commits past commit %llu; run rewind again (with "
+                            "another FILE) to finish\n", save, (unsigned long long)rep.saved, (unsigned long long)rep.fork);
+        return 1;
+    }
+    imdb_db *db = open_or_die(dir, false, 1); /* a dropped lake rebuilt from the log; where it stands checked */
+    if (!db) return 1;
+    uint64_t at = db->seq;
+    bool there = at == rep.fork;
+    imdb_close(db);
+    char hex[2 * IMDB_PUBKEY_LEN + 1];
+    imdb_hex(rep.replica_pk, IMDB_PUBKEY_LEN, hex);
+    printf("rewound %s to commit %llu, the last both histories hold (the primary is at %llu); the %llu commits past it "
+           "are in %s\n", dir, (unsigned long long)rep.fork, (unsigned long long)rep.primary, (unsigned long long)rep.saved,
+           save);
+    if (rep.lake_dropped) printf("its lake had been published past commit %llu: rebuilt from the log\n",
+                                 (unsigned long long)rep.fork);
+    if (rep.demoted) printf("demoted: a replica now (its signing key kept as signing.key.demoted, replicas/ as "
+                            "replicas.demoted)\n");
+    printf("its new replica key (a new incarnation): %s\n"
+           "enrol it on the primary (imagedb replica-add PRIMARY NAME KEY, --replace for a name it knew), then follow\n",
+           hex);
+    if (!there) {
+        fprintf(stderr, "imagedb: rewind: the copy opened at commit %llu, not %llu\n", (unsigned long long)at,
+                (unsigned long long)rep.fork);
+        return 1;
+    }
+    return 0;
 }
 
 static void print_info(imdb_db *db)
@@ -985,16 +1158,19 @@ static int cmd_stats(const char *path)
     return 0;
 }
 
-/* imagedb health DIR [--stats FILE] [--max-statement-s N]: 0 healthy; 1 a statement running longer than N seconds (60)
- * or the export unreadable; 2 the writer's handle failed (reopen it); 3 the directory damaged or unreadable, or a
+/* imagedb health DIR [--stats FILE] [--max-statement-s N] [--silent-after MS]: 0 healthy; 1 a statement running longer
+ * than N seconds (60), a following replica that has not heard its primary for MS (10000; R1.2: stale), or the export
+ * unreadable; 2 the writer's handle failed (reopen it); 3 the directory damaged or unreadable, or a
  * replica incident recorded. Cheap: no open, no replay (META, DURABLE, replicas/; then the export) */
 static int cmd_health(int argc, char **argv)
 {
     const char *stats = NULL;
     long long max_s = 60;
+    uint32_t silent_ms = 10000;
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "--stats") == 0 && i + 1 < argc) stats = argv[++i];
         else if (strcmp(argv[i], "--max-statement-s") == 0 && i + 1 < argc) max_s = atoll(argv[++i]);
+        else if (strcmp(argv[i], "--silent-after") == 0 && i + 1 < argc && parse_ms(argv[i + 1], 86400000, &silent_ms)) i++;
         else return usage();
     }
     imdb_err e = {0};
@@ -1023,7 +1199,20 @@ static int cmd_health(int argc, char **argv)
         printf("slow: a statement has run %lld s (more than %lld)\n", run / 1000 + age, max_s);
         return 1;
     }
-    printf("healthy: the export is %lld s old, commit %lld\n", age, stats_value(g_stats_buf, "commit"));
+    long long heard = stats_value(g_stats_buf, "replication.last_heard_ms"), primary = stats_value(g_stats_buf, "replication.primary_seq");
+    long long commit = stats_value(g_stats_buf, "commit");
+    if (stats_value(g_stats_buf, "replica") == 1 && heard >= 0) { /* R1.2: a following replica's silence, its export's age too */
+        long long age_ms = t > 0 && now > t ? (now - t) / 1000 : 0, quiet = heard + age_ms;
+        if (silent_ms && quiet > (long long)silent_ms) {
+            printf("stale: the replica has not heard its primary for %lld ms (more than %u); it holds commit %lld, the "
+                   "primary last named %lld\n", quiet, silent_ms, commit, primary);
+            return 1;
+        }
+        printf("healthy: the export is %lld s old, commit %lld; the primary heard %lld ms ago, at commit %lld\n", age, commit,
+               quiet, primary);
+        return 0;
+    }
+    printf("healthy: the export is %lld s old, commit %lld\n", age, commit);
     return 0;
 }
 
@@ -1268,7 +1457,8 @@ int main(int argc, char **argv)
     if (strcmp(cmd, "sql") == 0) return cmd_sql(argc, argv);
     if (strcmp(cmd, "ship") == 0 && argc >= 3) {
         uint64_t after = 0;
-        bool follow = false, acks = false;
+        bool follow = false, acks = false, hashes = false;
+        uint32_t keepalive = 1000; /* R1.2: H, a keep-alive once a second of nothing (follow and acks only) */
         for (int i = 3; i < argc; i++) {
             if (strcmp(argv[i], "--after") == 0 && i + 1 < argc) {
                 int64_t v; /* strictly a commit number: "abc" must not mean 0 and ship everything */
@@ -1279,12 +1469,26 @@ int main(int argc, char **argv)
                 follow = true;
             } else if (strcmp(argv[i], "--acks") == 0) {
                 acks = true;
+            } else if (strcmp(argv[i], "--hashes") == 0) { /* P2 R1.3: the commits' hashes, for rewind */
+                hashes = true;
+            } else if (strcmp(argv[i], "--keepalive") == 0 && i + 1 < argc) {
+                if (!parse_ms(argv[++i], 3600000, &keepalive)) return usage();
             } else {
                 return usage();
             }
         }
         signal(SIGPIPE, SIG_IGN); /* a closed reader becomes an EPIPE error, not a kill */
-        imdb_ship_opts so = {.follow = follow, .ackfd = acks ? 0 : -1};
+        if (hashes) {
+            if (follow || acks) return usage();
+            int ofd = 1;
+            imdb_sink hs = {imdb_sink_fd_write, &ofd};
+            if (imdb_ship_hashes(argv[2], after, &hs, &e)) {
+                print_err("ship", &e);
+                return 1;
+            }
+            return 0;
+        }
+        imdb_ship_opts so = {.follow = follow, .ackfd = acks ? 0 : -1, .keepalive_ms = keepalive};
         if (imdb_ship_ex(argv[2], after, 1, &so, &e)) {
             print_err("ship", &e);
             return 1;
@@ -1292,6 +1496,7 @@ int main(int argc, char **argv)
         return 0;
     }
     if (strcmp(cmd, "follow") == 0) return cmd_follow(argc, argv);
+    if (strcmp(cmd, "rewind") == 0 && argc >= 3) return cmd_rewind(argc, argv);
     if (strcmp(cmd, "replica-key") == 0 && (argc == 3 || (argc == 4 && strcmp(argv[3], "--new") == 0))) {
         bool replica = false, created = false, renew = argc == 4;
         imdb_signer s;

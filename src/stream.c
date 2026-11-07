@@ -2,6 +2,7 @@
 #include "stream.h"
 
 #include <errno.h>
+#include <poll.h>
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -41,6 +42,8 @@ void imdb_fdsrc_init(imdb_fdsrc *s, int fd)
 {
     s->fd = fd;
     s->off = s->len = 0;
+    s->timeout_ms = 0;
+    s->timed_out = false;
 }
 
 int imdb_fdsrc_read(void *ctx, void *buf, size_t n, size_t *got, imdb_err *e)
@@ -50,11 +53,31 @@ int imdb_fdsrc_read(void *ctx, void *buf, size_t n, size_t *got, imdb_err *e)
     size_t done = 0;
     while (done < n) {
         if (s->off == s->len) {
-            if (n - done >= sizeof s->buf) { /* a large row goes straight to its destination */
+            if (n - done >= sizeof s->buf && !s->timeout_ms) { /* a large row goes straight to its destination */
                 size_t g = 0;
                 if (imdb_read_all(s->fd, dst + done, n - done, &g, e)) return e->code;
                 done += g;
                 break;
+            }
+            if (s->timeout_ms) { /* R1.2: a follower's stream may go silent (a half-open connection): it waits so long */
+                int pr;
+                uint64_t t0 = imdb_mono_ns(), left = s->timeout_ms;
+                for (;;) {
+                    struct pollfd p = {.fd = s->fd, .events = POLLIN};
+                    pr = poll(&p, 1, (int)left);
+                    if (pr >= 0 || errno != EINTR) break;
+                    uint64_t el = (imdb_mono_ns() - t0) / 1000000u;
+                    if (el >= s->timeout_ms) {
+                        pr = 0;
+                        break;
+                    }
+                    left = s->timeout_ms - el;
+                }
+                if (pr < 0) return imdb_fail(e, IMDB_ERR_IO, "poll: %s", strerror(errno));
+                if (pr == 0) {
+                    s->timed_out = true;
+                    return imdb_fail(e, IMDB_ERR_IO, "the stream was silent for %u ms", s->timeout_ms);
+                }
             }
             ssize_t r;
             do r = imdb_io_read(s->fd, s->buf, sizeof s->buf);
@@ -119,6 +142,9 @@ int imdb_stream_session(imdb_stream *s, uint8_t nonce[16], bool *have, imdb_err 
     }
     if (need(s, b + IMDB_FRAME_HDR, IMDB_SESSION_LEN - IMDB_FRAME_HDR, e)) return e->code;
     if (imdb_session_decode(b, s->db_id, nonce, e) < 0) return e->code;
+    memcpy(s->nonce, nonce, sizeof s->nonce); /* R1.2: what this session's keep-alives carry */
+    s->has_nonce = true;
+    s->heard_ns = imdb_mono_ns();
     *have = true;
     return IMDB_OK;
 }
@@ -134,7 +160,17 @@ static int need_frame(imdb_stream *s, size_t n, size_t *off, imdb_err *e)
 
 int imdb_stream_next(imdb_stream *s, uint64_t expect_seq, const uint8_t prev[32], bool *eof, imdb_err *e)
 {
+    bool alive;
+    int rc;
+    do rc = imdb_stream_next_ex(s, expect_seq, prev, eof, &alive, e);
+    while (!rc && alive);
+    return rc;
+}
+
+int imdb_stream_next_ex(imdb_stream *s, uint64_t expect_seq, const uint8_t prev[32], bool *eof, bool *alive, imdb_err *e)
+{
     *eof = false;
+    *alive = false;
     s->frame.len = 0;
     s->truncated = false;
     uint8_t pre[IMDB_FRAME_HDR + IMDB_BODY_DESC];
@@ -154,6 +190,25 @@ int imdb_stream_next(imdb_stream *s, uint64_t expect_seq, const uint8_t prev[32]
     if (got < IMDB_FRAME_HDR) {
         s->truncated = true;
         return imdb_fail(e, IMDB_ERR_CORRUPT, "stream truncated inside a frame header");
+    }
+    if (!memcmp(pre, "IMDBALV1", 8)) { /* R1.2: a keep-alive between frames (repl.h): advisory, its session's alone */
+        uint8_t b[IMDB_ALIVE_LEN];
+        memcpy(b, pre, IMDB_FRAME_HDR);
+        if (need(s, b + IMDB_FRAME_HDR, IMDB_ALIVE_LEN - IMDB_FRAME_HDR, e)) return e->code;
+        if (!s->has_nonce) return imdb_fail(e, IMDB_ERR_CORRUPT, "stream: a keep-alive outside a shipping session");
+        uint64_t aseq, counter;
+        uint8_t ahead[32];
+        if (imdb_alive_decode(b, s->db_id, s->nonce, &aseq, ahead, &counter, e) < 0) return e->code;
+        if (s->alives && counter <= s->alive_counter) /* its shipper counts them from 1: one again is a relay's */
+            return imdb_fail(e, IMDB_ERR_VERIFY, "stream: a keep-alive replayed or reordered (counter %llu after %llu)",
+                             (unsigned long long)counter, (unsigned long long)s->alive_counter);
+        s->alives++;
+        s->alive_seq = aseq;
+        s->alive_counter = counter;
+        memcpy(s->alive_head, ahead, 32);
+        s->heard_ns = imdb_mono_ns();
+        *alive = true;
+        return IMDB_OK;
     }
     if (imdb_get_le32(pre) != IMDB_FRAME_MAGIC || k->crc32c(0, pre, 12) != imdb_get_le32(pre + 12))
         return imdb_fail(e, IMDB_ERR_CORRUPT, "stream: bad frame header before commit %llu", (unsigned long long)expect_seq);
@@ -263,7 +318,7 @@ int imdb_stream_next(imdb_stream *s, uint64_t expect_seq, const uint8_t prev[32]
     /* 6. the stored frame must be self-consistent for the torn-tail scanner */
     if (!rc && k->crc32c(0, s->frame.p + IMDB_FRAME_HDR, body_len) != body_crc)
         rc = imdb_fail(e, IMDB_ERR_CORRUPT, "stream: commit %llu: frame checksum mismatch", (unsigned long long)seq);
-    if (!rc) s->frames++;
+    if (!rc) s->frames++, s->heard_ns = imdb_mono_ns(); /* R1.2: a frame is word from the primary too */
     if (!rc && w) memcpy(s->writer_pk, w->new_pk, IMDB_PUBKEY_LEN); /* the next commit is signed by the new key */
 out:
     imdb_commit_free(&c);

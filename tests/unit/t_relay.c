@@ -2,14 +2,19 @@
  * 2026-11-04; docs/plan-p0.md), and a process out of file descriptors. A replica must take only what is the primary's:
  * whatever arrives, it ends at a prefix of the primary's chain (its last commit's hash the primary's for that commit),
  * refuses at or before the damage, and catches up from a clean stream to the primary's view token. A cut stream is a
- * dropped connection, never an error about the data; a damaged one is refused, never applied. */
+ * dropped connection, never an error about the data; a damaged one is refused, never applied. R1.2: the keep-alives
+ * between a session's frames (repl.h) under the same relay, ship's idle ones, and a follower's silence. */
+#include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include "../../src/log.h"
+#include "../../src/repl.h"
 #include "../../src/sql.h"
 #include "thelp.h"
 
@@ -53,6 +58,7 @@ typedef struct relay {
     size_t *frames; /* each frame's offset; frames[nf] = len */
     size_t nf;
     uint8_t token[32];          /* the primary's view token at its last commit */
+    uint8_t db_id[16];          /* the primary's (R1.2: a session's records carry it) */
     uint8_t (*hash)[32];        /* the primary's commit hashes, hash[seq] */
     uint64_t last;
     int k;                      /* replicas made */
@@ -82,6 +88,7 @@ static bool relay_setup(relay *r)
     imdb_db *db = NULL;
     if (imdb_open(r->p, &ro, &db, E)) return false;
     bool ok = !imdb_view_token(db, r->token, E);
+    memcpy(r->db_id, db->db_id, 16);
     for (uint64_t q = 1; ok && q <= r->last; q++) {
         const imdb_commit_info *ci = imdb_ci_at(db, q, E);
         ok = ci != NULL;
@@ -100,6 +107,8 @@ static void relay_free(relay *r)
 
 /* What the relay delivered, applied to a new replica; then a clean stream from where it stands. Returns NULL when the
  * replica held only a prefix of the primary's chain at every step and caught up to its token; *rc: the first apply's */
+static uint64_t g_primary_seq; /* R1.2: the last delivery's replication.primary_seq, before the clean stream */
+
 static const char *deliver(relay *r, const uint8_t *b, size_t n, int *rc_out, uint64_t *at, bool *cut)
 {
     static char why[300];
@@ -118,6 +127,7 @@ static const char *deliver(relay *r, const uint8_t *b, size_t n, int *rc_out, ui
     *rc_out = imdb_apply_stream_ex(db, fd, &applied, &ao, E);
     close(fd);
     *cut = ao.truncated; /* the stream ended inside a frame, or before an ERASE's authorisation: resumable */
+    g_primary_seq = db->stats.repl_primary_seq;
     *at = db->seq;
     const char *bad = NULL;
     if (db->seq > r->last || (db->seq && memcmp(db->head, r->hash[db->seq], 32) != 0))
@@ -331,10 +341,339 @@ static void t_relay_emfile(void)
     }
 }
 
+/* ---- R1.2: keep-alives (repl.h) --------------------------------------------------------------------------------- */
+
+typedef struct alive_stream {
+    uint8_t *b;
+    size_t len;
+    size_t ka[64];       /* each keep-alive's offset */
+    uint64_t before[64]; /* the whole frames before it */
+    size_t nka;
+    uint8_t nonce[16];
+} alive_stream;
+
+/* The stream ship --follow --acks makes: its session record, then the frames, a keep-alive before the first, after every
+ * third and after the last (that one naming last_named), each naming the commits before it and counted from 1 */
+static bool alive_make(const relay *r, alive_stream *a, uint64_t last_named)
+{
+    memset(a, 0, sizeof *a);
+    for (int i = 0; i < 16; i++) a->nonce[i] = (uint8_t)(0xA0 + i);
+    a->b = malloc(IMDB_SESSION_LEN + r->len + (r->nf / 3 + 3) * IMDB_ALIVE_LEN);
+    if (!a->b) return false;
+    imdb_session_encode(r->db_id, a->nonce, a->b);
+    a->len = IMDB_SESSION_LEN;
+    for (size_t f = 0; f <= r->nf; f++) {
+        if (f % 3 == 0 || f == r->nf) {
+            if (a->nka == 64) return false;
+            a->ka[a->nka] = a->len;
+            a->before[a->nka] = f;
+            imdb_alive_encode(r->db_id, a->nonce, f == r->nf ? last_named : f, r->hash[f], a->nka + 1, a->b + a->len);
+            a->nka++;
+            a->len += IMDB_ALIVE_LEN;
+        }
+        if (f < r->nf) {
+            size_t fl = r->frames[f + 1] - r->frames[f];
+            memcpy(a->b + a->len, r->stream + r->frames[f], fl);
+            a->len += fl;
+        }
+    }
+    return true;
+}
+
+/* Keep-alives in a shipping session's stream. Whole, it applies to the primary's last commit, the replica noting the
+ * commit the last keep-alive named; cut at every byte of one keep-alive and at the edges of the others, it is a dropped
+ * connection holding exactly the frames before the cut; a keep-alive twice or out of order is refused, as is each byte
+ * of one flipped (its checksum then disagrees), one of another database or shipping session (the checksum made again),
+ * and one outside a session; another commit or head named (the checksum made again) is taken as said, advisory: no
+ * keep-alive is ever a commit */
+static void t_relay_alive(void)
+{
+    relay r;
+    CHECK(relay_setup(&r));
+    alive_stream a;
+    CHECK(alive_make(&r, &a, r.last + 5));
+    uint8_t *b = malloc(a.len + 2 * IMDB_ALIVE_LEN);
+    CHECK(b && a.b && a.nka >= 4);
+    if (!b || !a.b || a.nka < 4) {
+        free(b);
+        free(a.b);
+        relay_free(&r);
+        return;
+    }
+    char what[120];
+    DELIVER(a.b, a.len, "keep-alives between the frames", rc_ == IMDB_OK && at_ == r.last);
+    SOFT(g_primary_seq == r.last + 5);
+    size_t mid = a.nka / 2;
+    for (size_t k = 0; k < a.nka; k++) {
+        size_t lo = a.ka[k], hi = lo + IMDB_ALIVE_LEN;
+        for (size_t c = lo; c <= hi && c <= a.len; c++) {
+            if (k != mid && c > lo + 1 && c + 1 < hi) continue;
+            int rc_ = 0;
+            uint64_t at_ = 0;
+            bool cut_ = false;
+            const char *w_ = deliver(&r, a.b, c, &rc_, &at_, &cut_);
+            bool inside = c > lo && c < hi;
+            /* the end right before or after a keep-alive is a clean end (or, between an ERASE's redactions and their
+             * authorisation, a resumable one) */
+            bool ok = !w_ && at_ == a.before[k] && (inside ? rc_ != IMDB_OK && cut_ : rc_ == IMDB_OK || cut_);
+            if (!ok) {
+                char m_[600];
+                snprintf(m_, sizeof m_, "keep-alive %zu cut at its byte %zu: %s (apply %d, cut %d, at %llu of %llu: %s)",
+                         k + 1, c - lo, w_ ? w_ : "unexpected outcome", rc_, (int)cut_, (unsigned long long)at_,
+                         (unsigned long long)a.before[k], g_e.msg);
+                test_fail(__FILE__, __LINE__, m_);
+            }
+        }
+    }
+    for (size_t k = 0; k < a.nka; k++) { /* each one twice */
+        size_t lo = a.ka[k], hi = lo + IMDB_ALIVE_LEN;
+        memcpy(b, a.b, hi);
+        memcpy(b + hi, a.b + lo, IMDB_ALIVE_LEN);
+        memcpy(b + hi + IMDB_ALIVE_LEN, a.b + hi, a.len - hi);
+        snprintf(what, sizeof what, "keep-alive %zu twice", k + 1);
+        DELIVER(b, a.len + IMDB_ALIVE_LEN, what, rc_ != IMDB_OK && !cut_ && at_ == a.before[k]);
+    }
+    { /* the first again after the third */
+        size_t at3 = a.ka[2] + IMDB_ALIVE_LEN;
+        memcpy(b, a.b, at3);
+        memcpy(b + at3, a.b + a.ka[0], IMDB_ALIVE_LEN);
+        memcpy(b + at3 + IMDB_ALIVE_LEN, a.b + at3, a.len - at3);
+        DELIVER(b, a.len + IMDB_ALIVE_LEN, "the first keep-alive again after the third",
+                rc_ != IMDB_OK && !cut_ && at_ == a.before[2]);
+    }
+    for (size_t i = 0; i < IMDB_ALIVE_LEN; i++) { /* each byte of the middle one flipped */
+        memcpy(b, a.b, a.len);
+        b[a.ka[mid] + i] ^= 0x10;
+        snprintf(what, sizeof what, "keep-alive %zu, its byte %zu flipped", mid + 1, i);
+        DELIVER(b, a.len, what, rc_ != IMDB_OK && !cut_ && at_ == a.before[mid]);
+    }
+    uint8_t other[32];
+    memset(other, 0x5A, sizeof other);
+    uint64_t named = a.before[mid];
+    memcpy(b, a.b, a.len);
+    imdb_alive_encode(other, a.nonce, named, r.hash[named], mid + 1, b + a.ka[mid]);
+    DELIVER(b, a.len, "a keep-alive of another database", rc_ != IMDB_OK && !cut_ && at_ == a.before[mid]);
+    memcpy(b, a.b, a.len);
+    imdb_alive_encode(r.db_id, other, named, r.hash[named], mid + 1, b + a.ka[mid]);
+    DELIVER(b, a.len, "a keep-alive of another shipping session", rc_ != IMDB_OK && !cut_ && at_ == a.before[mid]);
+    memcpy(b, a.b, a.len);
+    imdb_alive_encode(r.db_id, a.nonce, 7, other, a.nka, b + a.ka[a.nka - 1]);
+    DELIVER(b, a.len, "the last keep-alive naming commit 7 and another head", rc_ == IMDB_OK && at_ == r.last);
+    SOFT(g_primary_seq == 7);
+    { /* outside a session: the plain stream, a keep-alive after its second frame (a zero nonce, as a reader without a
+       * session holds: only the rule refuses it) */
+        size_t at = r.frames[2];
+        memcpy(b, r.stream, at);
+        static const uint8_t zero16[16];
+        imdb_alive_encode(r.db_id, zero16, 2, r.hash[2], 1, b + at);
+        memcpy(b + at + IMDB_ALIVE_LEN, r.stream + at, r.len - at);
+        DELIVER(b, r.len + IMDB_ALIVE_LEN, "a keep-alive outside a shipping session", rc_ != IMDB_OK && !cut_ && at_ == 2);
+    }
+    free(b);
+    free(a.b);
+    relay_free(&r);
+}
+
+/* n bytes from fd, each read waiting at most 5 s (a shipper that sends nothing fails the test, never hangs it) */
+static bool read_full(int fd, void *p, size_t n)
+{
+    size_t done = 0;
+    while (done < n) {
+        struct pollfd pl = {.fd = fd, .events = POLLIN};
+        if (poll(&pl, 1, 5000) <= 0) return false;
+        ssize_t k = read(fd, (uint8_t *)p + done, n - done);
+        if (k < 0 && errno == EINTR) continue;
+        if (k <= 0) return false;
+        done += (size_t)k;
+    }
+    return true;
+}
+
+static bool write_full(int fd, const void *p, size_t n)
+{
+    size_t done = 0;
+    while (done < n) {
+        ssize_t k = write(fd, (const uint8_t *)p + done, n - done);
+        if (k < 0 && errno == EINTR) continue;
+        if (k <= 0) return false;
+        done += (size_t)k;
+    }
+    return true;
+}
+
+/* ship --follow --acks, caught up and idle, sends a keep-alive each interval (40 ms here): its session's nonce, counted
+ * from 1, naming the primary's durable commit and its head; without --acks (no session) it sends none */
+static void t_relay_alive_ship(void)
+{
+    relay r;
+    CHECK(relay_setup(&r));
+    for (int acks = 1; acks >= 0; acks--) {
+        int so[2], ai[2];
+        CHECK(pipe(so) == 0 && pipe(ai) == 0);
+        fflush(NULL);
+        pid_t pid = fork();
+        if (pid == 0) {
+            close(so[0]);
+            close(ai[1]);
+            imdb_err e = {0};
+            imdb_ship_opts o = {.follow = true, .ackfd = acks ? ai[0] : -1, .keepalive_ms = 40};
+            (void)imdb_ship_ex(r.p, r.last, so[1], &o, &e);
+            _exit(0);
+        }
+        close(so[1]);
+        close(ai[0]);
+        if (acks) {
+            uint8_t sr[IMDB_SESSION_LEN], ka[IMDB_ALIVE_LEN], nonce[16];
+            SOFT(read_full(so[0], sr, sizeof sr) && imdb_session_decode(sr, r.db_id, nonce, E) == 1);
+            uint64_t t0 = imdb_mono_ns();
+            for (uint64_t k = 1; k <= 4; k++) {
+                uint64_t seq = 0, counter = 0;
+                uint8_t head[32];
+                SOFT(read_full(so[0], ka, sizeof ka));
+                SOFT(imdb_alive_decode(ka, r.db_id, nonce, &seq, head, &counter, E) == 1);
+                SOFT(seq == r.last && memcmp(head, r.hash[r.last], 32) == 0 && counter == k);
+            }
+            SOFT((imdb_mono_ns() - t0) / 1000000u >= 4 * 40 - 15); /* each at least the interval after the one before */
+        } else {
+            struct pollfd p = {.fd = so[0], .events = POLLIN};
+            SOFT(poll(&p, 1, 300) == 0); /* nothing in 300 ms, seven intervals */
+        }
+        kill(pid, SIGKILL);
+        int st = 0;
+        SOFT(waitpid(pid, &st, 0) == pid);
+        close(so[0]);
+        close(ai[1]);
+    }
+    relay_free(&r);
+}
+
+static int note_ack(void *ctx, imdb_db *db)
+{
+    *(uint64_t *)ctx = db->seq;
+    return 0;
+}
+
+typedef struct stat_find {
+    const char *name;
+    int64_t v;
+    bool found;
+} stat_find;
+
+static int stat_find_fn(void *ctx, const char *name, int64_t v)
+{
+    stat_find *f = ctx;
+    if (strcmp(name, f->name) == 0) {
+        f->v = v;
+        f->found = true;
+    }
+    return 0;
+}
+
+static bool stat_row(imdb_db *db, const char *name, int64_t *v)
+{
+    stat_find f = {name, 0, false};
+    (void)imdb_stats_each(db, stat_find_fn, &f, false);
+    *v = f.v;
+    return f.found;
+}
+
+/* A follower's apply (silent_ms, 300 here) drops a connection that says nothing for so long once its session began, and
+ * calls it a cut (resumable, silent), holding every frame before; keep-alives keep a quiet one open; without a session
+ * it waits for the stream's end. The replica takes the commit the keep-alives name (replication.primary_seq) and, once
+ * following, says how long since it heard any record (replication.last_heard_ms; -1 while not following). The stream
+ * arrives at once, so its last commit is read with its keep-alive behind it: that keep-alive, with nothing more ready,
+ * is the point that acknowledges the commit (none would come before the silence) */
+static void t_relay_alive_silence(void)
+{
+    relay r;
+    CHECK(relay_setup(&r));
+    alive_stream a;
+    CHECK(alive_make(&r, &a, r.last));
+    for (int mode = 0; mode < 3 && a.b; mode++) { /* 0: then silence; 1: keep-alives for 600 ms, then silence; 2: no session */
+        char rep[700];
+        snprintf(rep, sizeof rep, "%s/silent%d", r.dir, mode);
+        OK(imdb_init(rep, true, r.p, E));
+        imdb_db *db = open_db(rep);
+        CHECK(db);
+        if (!db) break;
+        int pf[2];
+        if (pipe(pf) != 0) {
+            test_fail(__FILE__, __LINE__, "pipe");
+            imdb_close(db);
+            break;
+        }
+        fflush(NULL);
+        pid_t pid = fork();
+        if (pid == 0) {
+            close(pf[0]);
+            if (!write_full(pf[1], mode == 2 ? r.stream : a.b, mode == 2 ? r.len : a.len)) _exit(1);
+            for (uint64_t k = 0; mode == 1 && k < 6; k++) {
+                struct timespec ts = {0, 100 * 1000 * 1000};
+                nanosleep(&ts, NULL);
+                uint8_t ka[IMDB_ALIVE_LEN];
+                imdb_alive_encode(r.db_id, a.nonce, r.last, r.hash[r.last], a.nka + 1 + k, ka);
+                if (!write_full(pf[1], ka, sizeof ka)) _exit(1);
+            }
+            struct timespec ts = {mode == 2 ? 0 : 3, mode == 2 ? 600 * 1000 * 1000 : 0}; /* the pipe held open */
+            nanosleep(&ts, NULL);
+            _exit(0);
+        }
+        close(pf[1]);
+        imdb_apply_opts ao;
+        memset(&ao, 0, sizeof ao);
+        ao.silent_ms = 300;
+        uint64_t acked = UINT64_MAX;
+        ao.applied = note_ack;
+        ao.ctx = &acked;
+        uint64_t applied = 0, t0 = imdb_mono_ns();
+        imdb_err_clear(E);
+        int rc = imdb_apply_stream_ex(db, pf[0], &applied, &ao, E);
+        uint64_t el = (imdb_mono_ns() - t0) / 1000000u;
+        kill(pid, SIGKILL);
+        int st = 0;
+        SOFT(waitpid(pid, &st, 0) == pid);
+        close(pf[0]);
+        SOFT(db->seq == r.last && memcmp(db->head, r.hash[r.last], 32) == 0);
+        if (mode < 2) {
+            if (!(rc != IMDB_OK && ao.silent && ao.truncated && ao.has_session)) {
+                char m[400];
+                snprintf(m, sizeof m, "mode %d: apply %d silent %d cut %d session %d after %llu ms: %s", mode, rc,
+                         (int)ao.silent, (int)ao.truncated, (int)ao.has_session, (unsigned long long)el, g_e.msg);
+                test_fail(__FILE__, __LINE__, m);
+            }
+            SOFT(el < 2500 && (mode == 0 || el >= 600 + 300 - 50)); /* before the child's end; past the keep-alives */
+        } else {
+            SOFT(rc == IMDB_OK && !ao.silent && !ao.truncated && !ao.has_session && el >= 550);
+        }
+        SOFT(db->stats.repl_primary_seq == r.last);
+        SOFT(acked == r.last); /* the last commit acknowledged before the silence (mode 2: at the stream's end) */
+        int64_t heard = 0, named = 0;
+        SOFT(stat_row(db, "replication.last_heard_ms", &heard) && heard == -1); /* not following */
+        db->following = true;
+        /* modes 0 and 1: the read that ended it waited 300 ms after the last record; mode 2: heard, the time unbounded */
+        bool hr = stat_row(db, "replication.last_heard_ms", &heard);
+        /* mode 1: heard counts from the last keep-alive, 600 ms after the frames, so well short of the whole wait */
+        if (!hr || heard < (mode == 2 ? 0 : 300) || (mode == 1 && (uint64_t)heard + 300 >= el)) {
+            char m[160];
+            snprintf(m, sizeof m, "mode %d: replication.last_heard_ms %lld (found %d), the apply %llu ms", mode,
+                     (long long)heard, (int)hr, (unsigned long long)el);
+            test_fail(__FILE__, __LINE__, m);
+        }
+        SOFT(stat_row(db, "replication.primary_seq", &named) && named == (int64_t)r.last);
+        db->following = false;
+        imdb_close(db);
+    }
+    free(a.b);
+    relay_free(&r);
+}
+
 const test_case relay_tests[] = {
     {"relay_cut", t_relay_cut},
     {"relay_order", t_relay_order},
     {"relay_garble", t_relay_garble},
     {"relay_emfile", t_relay_emfile},
+    {"relay_alive", t_relay_alive},
+    {"relay_alive_ship", t_relay_alive_ship},
+    {"relay_alive_silence", t_relay_alive_silence},
 };
 const size_t relay_ntests = sizeof relay_tests / sizeof *relay_tests;

@@ -83,6 +83,11 @@ int imdb_anchor_adopt(imdb_db *db, const char *path, imdb_err *e);
 int imdb_anchor_in_history(imdb_db *db, const char *path, const imdb_anchor *a, imdb_err *e);
 bool imdb_anchor_abandoned(const imdb_db *db, const imdb_anchor *a);
 int imdb_meta_write(imdb_db *db, bool replica, imdb_err *e);
+/* P2 R1.3 (rewind.c): META read and written on a directory no handle holds; recover's fdatasync of the log segments
+ * from the one holding commit from on (every one when from is below them) */
+int imdb_meta_read_at(int dirfd, imdb_identity *id, bool *replica, imdb_err *e);
+int imdb_meta_write_at(int dirfd, const imdb_identity *id, bool replica, imdb_err *e);
+int imdb_log_sync_segments(int logdirfd, const uint64_t *segs, size_t nsegs, uint64_t from, imdb_err *e);
 int imdb_tx_add_writer(imdb_db *db, uint32_t epoch, const uint8_t new_pk[IMDB_PUBKEY_LEN], uint8_t how, imdb_err *e);
 uint64_t imdb_now_us(void);
 void imdb_stub_version(imdb_table *t, uint64_t vid);
