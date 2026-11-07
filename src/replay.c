@@ -40,7 +40,10 @@ static int apply_insert(imdb_db *db, imdb_table *t, const imdb_op *op, uint64_t 
         imdb_err e2 = {0};
         if (imdb_row_decode(&t->s, op->row, op->row_len, vals, &e2))
             return imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: %s", (unsigned long long)seq, e2.msg);
-        uint64_t *head = imdb_hmap_get(&t->pk, &vals[t->s.pk]);
+        imdb_pkey key;
+        if (imdb_pkey_of_values(&t->s, vals, &key, e)) return e->code;
+        uint64_t *head = imdb_hmap_get(&t->pk, &key.v);
+        imdb_pkey_done(&key);
         if (head && imdb_vh(t, *head)->end == IMDB_LIVE)
             return imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: duplicate live primary key in table %s",
                              (unsigned long long)seq, t->s.name);
@@ -302,15 +305,16 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
             break;
         case IMDB_OP_UPDATE: {
             if ((rc = apply_end(t, o->vid, o->commit, seq, e))) break;
-            imdb_value oldk = {0};
-            bool old_known = imdb_version_key(t, o->vid, t->s.pk, &oldk) == IMDB_OK;
-            if (old_known && o->pkind == IMDB_PAYLOAD_ROW) {
-                imdb_value newk;
-                imdb_row_get(&t->s, o->row, o->row_len, t->s.pk, &newk);
-                if (imdb_value_cmp(&oldk, &newk) != 0) {
-                    rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: UPDATE changes the primary key", (unsigned long long)seq);
-                    break;
-                }
+            bool changed = false; /* each key column of the old version, where it can be read, against the new row's */
+            for (int kc = 0; kc < t->s.npk && o->pkind == IMDB_PAYLOAD_ROW; kc++) {
+                imdb_value oldk = {0}, newk;
+                if (imdb_version_key(t, o->vid, t->s.key[kc], &oldk) != IMDB_OK) break;
+                imdb_row_get(&t->s, o->row, o->row_len, t->s.key[kc], &newk);
+                changed |= imdb_value_cmp(&oldk, &newk) != 0;
+            }
+            if (changed) {
+                rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: UPDATE changes the primary key", (unsigned long long)seq);
+                break;
             }
             rc = apply_insert(db, t, o, o->new_vid, o->new_commit, seq, o->vid, pre && pre->payloads_checked, e);
             break;

@@ -48,6 +48,7 @@
 #define LOG_VERSION 3 /* the commit header's first byte (design.md §3; the format design's slice 1: 2 refused by name) */
 #define LIVE ((uint64_t)INT64_MAX)
 #define MAX_COLS 64
+#define MAX_KEY_COLS 8 /* PRIMARY KEY (a, b, ...): its columns (F4) */
 #define MAX_TEXT 65535u
 #define MAX_ROW (1u << 20)
 #define MAX_FRAME (1u << 30)
@@ -369,7 +370,8 @@ typedef struct col {
 typedef struct schema {
     uint32_t id;
     char name[64];
-    int ncols, pk, subject;
+    int ncols, npk, subject;
+    uint16_t key[MAX_KEY_COLS]; /* the key's columns, in key order (F4) */
     col c[MAX_COLS];
     uint8_t *raw; /* canonical encoding as it appeared in the log */
     size_t rawlen;
@@ -393,7 +395,8 @@ static int decode_schema(rd *r, schema *s)
     memcpy(s->name, nm, nl);
     s->ncols = rd_u16(r);
     if (s->ncols < 1 || s->ncols > MAX_COLS) return fail("schema: bad column count");
-    s->pk = s->subject = -1;
+    s->subject = -1;
+    int nflag = 0;
     for (int i = 0; i < s->ncols; i++) {
         col *c = &s->c[i];
         uint8_t cl = rd_u8(r);
@@ -412,20 +415,28 @@ static int decode_schema(rd *r, schema *s)
             return fail("schema: bad column type or flags");
         if (c->type == T_DECIMAL ? (c->prec < 1 || c->prec > 18 || c->scale > c->prec) : (c->prec || c->scale))
             return fail("schema: bad precision/scale");
-        if (c->flags & F_PK) {
-            if (s->pk >= 0 || (c->type != T_INT64 && c->type != T_TEXT)) return fail("schema: bad PRIMARY KEY");
-            s->pk = i;
+        if (c->flags & F_PK) { /* F4: a key column of any type held exactly: not FLOAT64 */
+            if (c->type == T_FLOAT64) return fail("schema: bad PRIMARY KEY");
+            nflag++;
         }
         if (c->flags & F_SUBJECT) {
             if (s->subject >= 0 || (c->type != T_INT64 && c->type != T_TEXT)) return fail("schema: bad SUBJECT");
             s->subject = i;
         }
     }
-    if (s->pk < 0) return fail("schema: no PRIMARY KEY");
-    uint8_t npk = rd_u8(r); /* the key list, in key order (the format design's slice 1: the one flagged column) */
-    uint16_t k0 = rd_u16(r);
+    if (!nflag) return fail("schema: no PRIMARY KEY");
+    s->npk = rd_u8(r); /* the key list, in key order: the flagged columns, each once (F4: up to MAX_KEY_COLS) */
     if (r->bad) return fail("schema: truncated");
-    if (npk != 1 || k0 != (uint16_t)s->pk) return fail("schema: the key list is not its PRIMARY KEY column");
+    if (s->npk < 1 || s->npk > (int)MAX_KEY_COLS) return fail("schema: the key list is not its PRIMARY KEY columns");
+    for (int k = 0; k < s->npk; k++) {
+        s->key[k] = rd_u16(r);
+        if (r->bad) return fail("schema: truncated");
+        bool twice = false;
+        for (int j = 0; j < k; j++) twice |= s->key[j] == s->key[k];
+        if (s->key[k] >= s->ncols || !(s->c[s->key[k]].flags & F_PK) || twice)
+            return fail("schema: the key list is not its PRIMARY KEY columns");
+    }
+    if (s->npk != nflag) return fail("schema: the key list is not its PRIMARY KEY columns");
     s->rawlen = r->o - start;
     s->raw = xcalloc(s->rawlen, 1);
     memcpy(s->raw, r->p + start, s->rawlen);
@@ -727,7 +738,7 @@ struct ukmap;
 typedef struct aidx {
     char name[64];
     uint8_t flags, ncols;
-    uint16_t cols[MAX_INDEX_COLS];
+    uint16_t cols[MAX_KEY_COLS]; /* an index's up to MAX_INDEX_COLS (aidx_ok), the primary key's up to MAX_KEY_COLS (F4) */
     struct ukmap *uk; /* unique, in the log's model: the live rows' keys (else NULL) */
 } aidx;
 
@@ -1045,6 +1056,7 @@ typedef struct table {
     uint64_t retention, retention_at_lake; /* SET_RETENTION (16): now, and at the lake snapshot commit */
     uint64_t created_at, dropped_at, dropped_at_lake; /* CREATE (1) and DROP_TABLE (19, 0: live): now; the drop at the lake */
     aidx idx[MAX_INDEXES], idx_at_lake[MAX_INDEXES]; /* sorted by name, now and at the lake snapshot */
+    aidx pkx;            /* F4: the primary key as a unique map over the live rows' keys (never in the manifest's list) */
     uint32_t nidx, nidx_at_lake;
 } table;
 
@@ -1287,6 +1299,19 @@ static bool uk_key(const schema *s, const val *vals, const aidx *x, uint8_t **ou
     return true;
 }
 
+/* F4: a table's primary key as a unique index over its key columns, its map from the live rows */
+static aidx pk_index(const schema *s)
+{
+    aidx x;
+    memset(&x, 0, sizeof x);
+    snprintf(x.name, sizeof x.name, "%s", "the primary key");
+    x.flags = 1;
+    x.ncols = (uint8_t)s->npk;
+    for (int k = 0; k < s->npk; k++) x.cols[k] = s->key[k];
+    x.uk = xcalloc(1, sizeof *x.uk);
+    return x;
+}
+
 /* version vid's row into unique index x: a live row holding its key already is a violation */
 static int uk_add(const table *t, aidx *x, const val *vals, uint64_t vid, uint64_t seq)
 {
@@ -1296,6 +1321,7 @@ static int uk_add(const table *t, aidx *x, const val *vals, uint64_t vid, uint64
     uint64_t h = uk_hash(k, n);
     if (uk_find(x->uk, k, n, h)) {
         free(k);
+        if (x == &t->pkx) return fail("commit %llu: two live rows of table %s share its primary key", (unsigned long long)seq, t->s.name);
         return fail("commit %llu: two live rows of table %s share a key of unique index %s", (unsigned long long)seq,
                     t->s.name, x->name);
     }
@@ -1310,12 +1336,13 @@ static void uk_end(table *t, uint64_t vid)
     if (!v || !v->row) return;
     val vals[MAX_COLS];
     if (!decode_row(&t->s, v->row, v->row_len, vals))
-        for (uint32_t x = 0; x < t->nidx; x++) {
+        for (uint32_t x = 0; x <= t->nidx; x++) { /* the unique indexes, then (x == nidx) the primary key */
             uint8_t *k;
             size_t n;
-            if (!t->idx[x].uk || !uk_key(&t->s, vals, &t->idx[x], &k, &n)) continue;
-            ukslot *sl = uk_find(t->idx[x].uk, k, n, uk_hash(k, n));
-            if (sl && sl->vid == vid) uk_del(t->idx[x].uk, sl);
+            aidx *ix = x < t->nidx ? &t->idx[x] : &t->pkx;
+            if (!ix->uk || !uk_key(&t->s, vals, ix, &k, &n)) continue;
+            ukslot *sl = uk_find(ix->uk, k, n, uk_hash(k, n));
+            if (sl && sl->vid == vid) uk_del(ix->uk, sl);
             free(k);
         }
     free(v->row);
@@ -1459,6 +1486,7 @@ static int apply_op(state *S, const op *o, uint64_t seq)
         memset(&S->t[S->nt], 0, sizeof S->t[S->nt]);
         S->t[S->nt].s = *o->sch;
         S->t[S->nt].created_at = seq;
+        S->t[S->nt].pkx = pk_index(o->sch);
         S->t[S->nt].s.raw = xcalloc(o->sch->rawlen, 1);
         memcpy(S->t[S->nt].s.raw, o->sch->raw, o->sch->rawlen);
         for (uint32_t i = 0; i < S->nt; i++)
@@ -1632,6 +1660,7 @@ static int apply_op(state *S, const op *o, uint64_t seq)
         if (!o->redacted) { /* the unique indexes, then the row kept while it is live */
             for (uint32_t x = 0; x < t->nidx; x++)
                 if (t->idx[x].uk && uk_add(t, &t->idx[x], vals, vid, seq)) return -1;
+            if (uk_add(t, &t->pkx, vals, vid, seq)) return -1; /* F4: the primary key's */
             v->row = xcalloc(o->row_len, 1);
             memcpy(v->row, o->row, o->row_len);
             v->row_len = o->row_len;
@@ -2798,8 +2827,13 @@ static int walk_lake_pinned(int dirfd, uint8_t alg, const uint8_t mh[32], uint64
         lt dg;
         memset(&dg, 0, sizeof dg);
         uint64_t live = 0;
-        ukey *uk[MAX_INDEXES] = {0}; /* the live rows' keys of each unique index */
-        size_t nuk[MAX_INDEXES] = {0}, capuk[MAX_INDEXES] = {0};
+        ukey *uk[MAX_INDEXES + 1] = {0}; /* the live rows' keys of each unique index, then (F4) of the primary key */
+        size_t nuk[MAX_INDEXES + 1] = {0}, capuk[MAX_INDEXES + 1] = {0};
+        aidx pkx; /* the primary key as a unique index over its columns */
+        memset(&pkx, 0, sizeof pkx);
+        pkx.flags = 1;
+        pkx.ncols = (uint8_t)t->s.npk;
+        for (int k = 0; k < t->s.npk; k++) pkx.cols[k] = t->s.key[k];
         for (uint32_t k = 0; !rc && k < t->nseg; k++) {
             uint8_t *sb;
             size_t sl;
@@ -2823,9 +2857,10 @@ static int walk_lake_pinned(int dirfd, uint8_t alg, const uint8_t mh[32], uint64
                 if (r->begin <= m->seq && m->seq < r->end) {
                     lt_add(alg, &dg, r->commit);
                     live++;
-                    for (uint32_t x = 0; x < t->nidx; x++) {
+                    for (uint32_t x = 0; x <= t->nidx; x++) {
                         ukey key;
-                        if (!(t->idx[x].flags & 1) || !ukey_of(&t->s, &g, i, &t->idx[x], &key)) continue;
+                        const aidx *ix = x < t->nidx ? &t->idx[x] : &pkx;
+                        if (!(ix->flags & 1) || !ukey_of(&t->s, &g, i, ix, &key)) continue;
                         if (nuk[x] == capuk[x]) {
                             capuk[x] = capuk[x] ? 2 * capuk[x] : 64;
                             uk[x] = xrealloc(uk[x], capuk[x], sizeof *uk[x]);
@@ -2838,11 +2873,12 @@ static int walk_lake_pinned(int dirfd, uint8_t alg, const uint8_t mh[32], uint64
             if (rows_checked) *rows_checked += g.n;
             seg_free(&g);
         }
-        for (uint32_t x = 0; x < t->nidx; x++) { /* each unique key held by one live row at most */
+        for (uint32_t x = 0; x <= t->nidx; x++) { /* each unique key held by one live row at most, the primary key's too */
             if (nuk[x]) qsort(uk[x], nuk[x], sizeof *uk[x], cmp_ukey);
             for (size_t j = 1; !rc && j < nuk[x]; j++)
                 if (cmp_ukey(&uk[x][j - 1], &uk[x][j]) == 0)
-                    rc = fail("lake: two live rows of table %s share a key of unique index %s", t->s.name, t->idx[x].name);
+                    rc = x < t->nidx ? fail("lake: two live rows of table %s share a key of unique index %s", t->s.name, t->idx[x].name)
+                                     : fail("lake: two live rows of table %s share its primary key", t->s.name);
             for (size_t j = 0; j < nuk[x]; j++) free(uk[x][j].b);
             free(uk[x]);
         }
@@ -3105,6 +3141,7 @@ static int seed_row(void *ctx, uint32_t ti, const schema *s, const seg *g, uint3
             v->row_len = (uint32_t)rl;
             for (uint32_t k = 0; k < t->nidx; k++)
                 if (t->idx[k].uk && uk_add(t, &t->idx[k], vals, r->vid, x->F)) return -1;
+            if (uk_add(t, &t->pkx, vals, r->vid, x->F)) return -1;
         }
         if (s->subject >= 0) {
             const val *sv = &vals[s->subject];
@@ -3145,6 +3182,7 @@ static int floor_seed(int dirfd, state *S, flr *f)
         memcpy(t->idx, mt->idx, sizeof t->idx);
         t->nidx = mt->nidx;
         for (uint32_t k = 0; k < t->nidx; k++) t->idx[k].uk = (t->idx[k].flags & 1) ? xcalloc(1, sizeof *t->idx[k].uk) : NULL;
+        t->pkx = pk_index(&t->s);
     }
     for (uint32_t i = 0; i < f->m.nv; i++) /* P2 S7: F's views, a live one's definition the replay's rules read */
         view_push(S, f->m.v[i].name, f->m.v[i].created_at, f->m.v[i].dropped_at, f->m.v[i].def);
@@ -3319,6 +3357,7 @@ static int cmd_verify(const char *dir, const char *anchor)
             free(S.t[i].vc[c]);
         }
         for (uint32_t k = 0; k < S.t[i].nidx; k++) uk_free(S.t[i].idx[k].uk);
+        uk_free(S.t[i].pkx.uk);
         free(S.t[i].vc);
         free(S.t[i].s.raw);
     }

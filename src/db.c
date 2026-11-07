@@ -344,7 +344,7 @@ int imdb_table_new(imdb_db *db, const imdb_schema *s, imdb_err *e)
     if (!t) return e->code;
     t->s = *s;
     imdb_buf_init(&t->arena);
-    if (imdb_hmap_init(&t->pk, s->cols[s->pk].type, e) ||
+    if (imdb_hmap_init(&t->pk, imdb_pk_map_type(s), e) ||
         (s->subject >= 0 && imdb_hmap_init(&t->subj, s->cols[s->subject].type, e))) {
         imdb_hmap_free(&t->pk);
         imdb_free(t);
@@ -756,6 +756,70 @@ int imdb_version_key(imdb_table *t, uint64_t vid, int col, imdb_value *out)
     return IMDB_OK;
 }
 
+int imdb_pkey_make(const imdb_schema *s, imdb_pkey *k, imdb_err *e)
+{
+    k->heap = NULL;
+    if (s->npk == 1) {
+        k->v = k->kv[0];
+        return IMDB_OK;
+    }
+    size_t n = imdb_key_len(s, k->kv);
+    uint8_t *p = k->kbuf;
+    if (n > sizeof k->kbuf) {
+        if (!(k->heap = imdb_alloc(n, e))) return e->code;
+        p = k->heap;
+    }
+    imdb_key_write(s, k->kv, p);
+    memset(&k->v, 0, sizeof k->v); /* no column's type: the map reads its bytes alone (IMDB_HKEY_BYTES) */
+    k->v.s = p;
+    k->v.len = (uint32_t)n;
+    return IMDB_OK;
+}
+
+int imdb_pkey_of_row(const imdb_schema *s, const uint8_t *row, size_t len, imdb_pkey *k, imdb_err *e)
+{
+    for (int i = 0; i < s->npk; i++) imdb_row_get(s, row, len, s->key[i], &k->kv[i]);
+    return imdb_pkey_make(s, k, e);
+}
+
+int imdb_pkey_of_values(const imdb_schema *s, const imdb_value *vals, imdb_pkey *k, imdb_err *e)
+{
+    for (int i = 0; i < s->npk; i++) k->kv[i] = vals[s->key[i]];
+    return imdb_pkey_make(s, k, e);
+}
+
+int imdb_version_pkey(imdb_table *t, uint64_t vid, imdb_pkey *k)
+{
+    k->heap = NULL;
+    for (int i = 0; i < t->s.npk; i++) {
+        int rc = imdb_version_key(t, vid, t->s.key[i], &k->kv[i]);
+        if (rc) return rc;
+    }
+    imdb_err e = {0};
+    return imdb_pkey_make(&t->s, k, &e);
+}
+
+void imdb_pkey_done(imdb_pkey *k)
+{
+    if (k->heap) {
+        imdb_wipe(k->heap, k->v.len); /* an erased version's key is the erased value */
+        imdb_free(k->heap);
+        k->heap = NULL;
+    }
+}
+
+const char *imdb_key_names(const imdb_schema *s, char *out, size_t cap)
+{
+    size_t o = 0;
+    out[0] = 0;
+    for (int i = 0; i < s->npk && o + 1 < cap; i++) {
+        int n = snprintf(out + o, cap - o, "%s%s", i ? ", " : "", s->cols[s->key[i]].name);
+        if (n < 0) break;
+        o += (size_t)n < cap - o ? (size_t)n : cap - o - 1;
+    }
+    return out;
+}
+
 static uint32_t subj_list_new(imdb_table *t, imdb_err *e)
 {
     if (t->nsubj == t->capsubj) {
@@ -790,13 +854,15 @@ static void unique_unlink_newest(imdb_table *t, imdb_index *ix, uint64_t vid);
 static int index_key_subject(imdb_table *t, uint64_t vid, imdb_undo *u, imdb_err *e)
 {
     imdb_version *v = imdb_vh(t, vid);
-    imdb_value key;
-    if (imdb_version_key(t, vid, t->s.pk, &key)) return imdb_fail(e, IMDB_ERR_STATE, "index: key unavailable");
-    uint64_t *head = imdb_hmap_get(&t->pk, &key);
+    imdb_pkey key;
+    if (imdb_version_pkey(t, vid, &key)) return imdb_fail(e, IMDB_ERR_STATE, "index: key unavailable");
+    uint64_t *head = imdb_hmap_get(&t->pk, &key.v);
     uint64_t prev = head ? *head : IMDB_NONE;
     v->pk_prev = prev;
     if (u) u->prev_head = prev;
-    if (imdb_hmap_put(&t->pk, &key, vid, e)) return e->code;
+    int prc = imdb_hmap_put(&t->pk, &key.v, vid, e);
+    imdb_pkey_done(&key);
+    if (prc) return e->code;
     if (u) {
         u->subj_list = UINT32_MAX;
         u->subj_created = false;
@@ -836,7 +902,7 @@ int imdb_table_reindex(imdb_table *t, imdb_err *e)
     imdb_free(t->subj_lists);
     t->subj_lists = NULL;
     t->nsubj = t->capsubj = 0;
-    if (imdb_hmap_init(&t->pk, t->s.cols[t->s.pk].type, e) ||
+    if (imdb_hmap_init(&t->pk, imdb_pk_map_type(&t->s), e) ||
         (t->s.subject >= 0 && imdb_hmap_init(&t->subj, t->s.cols[t->s.subject].type, e)))
         return e->code;
     int rc = IMDB_OK;
@@ -895,10 +961,11 @@ int imdb_index_subject(imdb_table *t, uint64_t vid, const imdb_value *sv, imdb_u
 /* Reverses imdb_index_version for the newest version (rollback). */
 static void unindex_newest(imdb_table *t, uint64_t vid, const imdb_undo *u)
 {
-    imdb_value key;
-    if (imdb_version_key(t, vid, t->s.pk, &key) == IMDB_OK) {
-        if (u->prev_head == IMDB_NONE) imdb_hmap_del(&t->pk, &key);
-        else imdb_hmap_put(&t->pk, &key, u->prev_head, NULL);
+    imdb_pkey key;
+    if (imdb_version_pkey(t, vid, &key) == IMDB_OK) {
+        if (u->prev_head == IMDB_NONE) imdb_hmap_del(&t->pk, &key.v);
+        else imdb_hmap_put(&t->pk, &key.v, u->prev_head, NULL);
+        imdb_pkey_done(&key);
     }
     if (u->subj_list != UINT32_MAX) {
         imdb_vlist *l = &t->subj_lists[u->subj_list];
@@ -973,13 +1040,14 @@ void imdb_stub_version(imdb_table *t, uint64_t vid)
         v->flags &= (uint8_t)~IMDB_V_PENDING_AUTH;
         return;
     }
-    imdb_value key;
+    imdb_pkey key;
     if ((v->flags & IMDB_V_PURGED) && t->s.subject >= 0 && (v->flags & IMDB_V_SEG)) {
         /* purged history: its tombstone still names the subject */
         imdb_value sv;
         if (imdb_seg_value(t, v, t->s.subject, &sv) == IMDB_OK) subj_remove(t, &sv, vid);
-    } else if (!(v->flags & IMDB_V_PURGED) && imdb_version_key(t, vid, t->s.pk, &key) == IMDB_OK) {
-        imdb_pk_unlink(t, vid, &key);
+    } else if (!(v->flags & IMDB_V_PURGED) && imdb_version_pkey(t, vid, &key) == IMDB_OK) {
+        imdb_pk_unlink(t, vid, &key.v);
+        imdb_pkey_done(&key);
         if (t->s.subject >= 0) {
             imdb_value sv;
             imdb_version_key(t, vid, t->s.subject, &sv);
@@ -1626,24 +1694,30 @@ int imdb_check_history(const imdb_db *db, const imdb_table *t, uint64_t snap, im
 
 /* the row of key visible at (snap, pend) among the lake's (stage 3b), or IMDB_NONE; a row is never the reader's
  * pending insert (the memtable holds those), but may be a version it ended itself (end == pend) */
-static int lake_lookup_pk(const imdb_table *t, const imdb_value *key, uint64_t snap, uint64_t pend, uint64_t *vid, imdb_err *e)
+static int lake_lookup_pk(const imdb_table *t, const imdb_value *kv, uint64_t snap, uint64_t pend, uint64_t *vid, imdb_err *e)
 {
-    uint32_t pk = (uint32_t)t->s.pk;
     *vid = IMDB_NONE;
     for (uint32_t k = 0; k < t->nseg; k++) {
         imdb_segment *g = t->seg[k];
-        const imdb_segzone *z = &g->zone[pk];
-        uint8_t ty = t->s.cols[pk].type; /* the columns whose zone map bounds values (lake.c's is_int_col) */
-        if ((ty == IMDB_T_INT64 || ty == IMDB_T_DECIMAL || ty == IMDB_T_TIMESTAMP || ty == IMDB_T_FLOAT64) &&
-            (!z->has || key->i < z->min || key->i > z->max))
-            continue; /* its zone map (flag-0 rows), from the descriptor: no image */
+        bool out = false;
+        for (int c = 0; c < t->s.npk && !out; c++) { /* each key column's zone map (flag-0 rows), from the descriptor */
+            const imdb_segzone *z = &g->zone[t->s.key[c]];
+            uint8_t ty = t->s.cols[t->s.key[c]].type; /* the columns whose zone map bounds values (lake.c's is_int_col) */
+            out = (ty == IMDB_T_INT64 || ty == IMDB_T_DECIMAL || ty == IMDB_T_TIMESTAMP || ty == IMDB_T_FLOAT64) &&
+                  (!z->has || kv[c].i < z->min || kv[c].i > z->max);
+        }
+        if (out) continue; /* no image read */
         const imdb_segimg *gi = imdb_seg_pin(t, g, e);
         if (!gi) return e->code;
         for (uint32_t r = 0; r < g->nrows; r++) {
             if (gi->flags[r] || gi->begin[r] > snap || gi->end[r] <= snap || (pend && gi->end[r] == pend)) continue;
-            imdb_value v;
-            imdb_seg_get(&t->s, gi, r, pk, &v);
-            if (imdb_value_cmp(&v, key) == 0) {
+            bool same = true;
+            for (int c = 0; c < t->s.npk && same; c++) {
+                imdb_value v;
+                imdb_seg_get(&t->s, gi, r, t->s.key[c], &v);
+                same = imdb_value_cmp(&v, &kv[c]) == 0;
+            }
+            if (same) {
                 *vid = gi->vid[r];
                 return IMDB_OK;
             }
@@ -1652,20 +1726,29 @@ static int lake_lookup_pk(const imdb_table *t, const imdb_value *key, uint64_t s
     return IMDB_OK;
 }
 
-int imdb_lookup_pk_at(imdb_db *db, imdb_table *t, const imdb_value *key, uint64_t snap, uint64_t pend, uint64_t *vid,
+int imdb_lookup_pk_at(imdb_db *db, imdb_table *t, const imdb_value *kv, uint64_t snap, uint64_t pend, uint64_t *vid,
                       imdb_err *e)
 {
     *vid = IMDB_NONE;
-    if (key->null || key->type != t->s.cols[t->s.pk].type) return IMDB_OK; /* PKs are NOT NULL */
-    uint64_t *head = imdb_hmap_get(&t->pk, key);
+    for (int c = 0; c < t->s.npk; c++) { /* a key's columns are NOT NULL: another value names no row */
+        const imdb_column *col = &t->s.cols[t->s.key[c]];
+        if (kv[c].null || kv[c].type != col->type || (col->type == IMDB_T_DECIMAL && kv[c].scale != col->scale))
+            return IMDB_OK;
+    }
+    imdb_pkey k;
+    memcpy(k.kv, kv, (size_t)t->s.npk * sizeof *kv);
+    if (imdb_pkey_make(&t->s, &k, e)) return e->code;
+    uint64_t *head = imdb_hmap_get(&t->pk, &k.v);
+    imdb_pkey_done(&k);
     for (uint64_t v = head ? *head : IMDB_NONE; v != IMDB_NONE; v = imdb_vh(t, v)->pk_prev)
         if (imdb_visible_at(imdb_vh(t, v), snap, pend)) {
             *vid = v;
             return IMDB_OK;
         }
     /* below the memory floor a key's chain holds only its versions ended past it: the lake has the rest */
-    return snap < db->mem_floor ? lake_lookup_pk(t, key, snap, pend, vid, e) : IMDB_OK;
+    return snap < db->mem_floor ? lake_lookup_pk(t, kv, snap, pend, vid, e) : IMDB_OK;
 }
+
 
 uint64_t imdb_lookup_pk(imdb_db *db, imdb_table *t, const imdb_value *key, uint64_t snap)
 {
@@ -2981,18 +3064,20 @@ static int insert_row_body(imdb_db *db, imdb_table *t, const uint8_t *row, size_
 {
     if (!db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "no transaction");
     int rc = IMDB_OK;
-    imdb_value key;
-    imdb_row_get(&t->s, row, len, t->s.pk, &key);
+    imdb_pkey key;
+    if ((rc = imdb_pkey_of_row(&t->s, row, len, &key, e))) return rc;
     /* duplicate in the writer's own view (its snapshot and pending rows); held only by a
      * row committed after that snapshot: the concurrent insert won */
     uint64_t snap, pend;
     imdb_txn_write_view(db, &snap, &pend);
-    uint64_t *head = imdb_hmap_get(&t->pk, &key);
+    uint64_t *head = imdb_hmap_get(&t->pk, &key.v);
     uint64_t dup;
-    if ((rc = imdb_lookup_pk_at(db, t, &key, snap, pend, &dup, e))) goto out;
+    if ((rc = imdb_lookup_pk_at(db, t, key.kv, snap, pend, &dup, e))) goto out;
     if (dup != IMDB_NONE) {
-        rc = imdb_fail(e, IMDB_ERR_CONSTRAINT, "duplicate primary key in table %s (column %s)", t->s.name,
-                       t->s.cols[t->s.pk].name);
+        char kn[IMDB_MAX_KEY_COLS * (IMDB_MAX_IDENT + 2) + 1];
+        imdb_key_names(&t->s, kn, sizeof kn);
+        if (t->s.npk == 1) rc = imdb_fail(e, IMDB_ERR_CONSTRAINT, "duplicate primary key in table %s (column %s)", t->s.name, kn);
+        else rc = imdb_fail(e, IMDB_ERR_CONSTRAINT, "duplicate primary key in table %s (columns %s)", t->s.name, kn);
         goto out;
     }
     if (head && imdb_vh(t, *head)->end == IMDB_LIVE) {
@@ -3025,6 +3110,7 @@ static int insert_row_body(imdb_db *db, imdb_table *t, const uint8_t *row, size_
     db->tx_row_off[db->ntx - 1] = v->row_off;
     db->tx_bytes += v->row_len;
 out:
+    imdb_pkey_done(&key);
     return rc;
 }
 
@@ -3104,12 +3190,14 @@ static int update_row_body(imdb_db *db, imdb_table *t, uint64_t vid, const uint8
         if (imdb_v_commit(t, vid, &cm, e)) return e->code;
         memcpy(oldc, cm, 32);
     }
-    imdb_value oldkey, newkey;
-    int kr = imdb_version_key(t, vid, t->s.pk, &oldkey);
-    if (kr) return imdb_fail(e, kr, "the key of the version updated cannot be read");
-    imdb_row_get(&t->s, row, len, t->s.pk, &newkey);
-    if (imdb_value_cmp(&oldkey, &newkey) != 0)
-        return imdb_fail(e, IMDB_ERR_CONSTRAINT, "UPDATE cannot change the primary key (use DELETE + INSERT)");
+    for (int c = 0; c < t->s.npk; c++) { /* no key column changes (F4: each of them) */
+        imdb_value oldkey, newkey;
+        int kr = imdb_version_key(t, vid, t->s.key[c], &oldkey);
+        if (kr) return imdb_fail(e, kr, "the key of the version updated cannot be read");
+        imdb_row_get(&t->s, row, len, t->s.key[c], &newkey);
+        if (imdb_value_cmp(&oldkey, &newkey) != 0)
+            return imdb_fail(e, IMDB_ERR_CONSTRAINT, "UPDATE cannot change the primary key (use DELETE + INSERT)");
+    }
     int rc = IMDB_OK;
     if ((rc = tx_bytes_check(db, len, e))) return rc;
     imdb_savepoint sp = imdb_savepoint_take(db);

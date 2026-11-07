@@ -74,6 +74,7 @@
 #define IMDB_RETAIN_MAX_US      (36525ull * 24 * 3600 * 1000000) /* its longest but FOREVER: a century */
 #define IMDB_MAX_INDEXES        16u          /* CREATE INDEX: indexes per table      */
 #define IMDB_MAX_INDEX_COLS     4u           /* CREATE INDEX: columns per index      */
+#define IMDB_MAX_KEY_COLS       8u           /* PRIMARY KEY (a, b, ...): its columns (F4) */
 #define IMDB_MAX_JOIN_ROWS      (1u << 22)   /* a join: build entries, joined rows   */
 #define IMDB_VERIFY_BATCH       512u         /* commits VERIFY decodes and checks at once */
 #define IMDB_VERIFY_BATCH_BYTES (64ull << 20) /* ... or fewer, once their frames reach this */

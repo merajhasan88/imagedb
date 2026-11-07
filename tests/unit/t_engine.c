@@ -547,7 +547,8 @@ static void t_erase_text_keys(void)
     sc.cols[2].type = IMDB_T_DECIMAL;
     sc.cols[2].precision = 10;
     sc.cols[2].scale = 2;
-    sc.pk = 0;
+    sc.npk = 1;
+    sc.key[0] = 0;
     sc.subject = 1;
     OK(imdb_begin(db, E));
     OK(imdb_create_table(db, &sc, E));

@@ -1500,8 +1500,11 @@ static int plan_install(imdb_db *db, imdb_lake_plan *p, imdb_err *e)
                 if (!(gi->flags[i] & IMDB_SEG_PURGED) || !imdb_v_held(t, gi->vid[i]) ||
                     (imdb_vh(t, gi->vid[i])->flags & (IMDB_V_PURGED | IMDB_V_STUB)))
                     continue;
-                imdb_value key;
-                if (imdb_version_key(t, gi->vid[i], t->s.pk, &key) == IMDB_OK) imdb_pk_unlink(t, gi->vid[i], &key);
+                imdb_pkey key;
+                if (imdb_version_pkey(t, gi->vid[i], &key) == IMDB_OK) {
+                    imdb_pk_unlink(t, gi->vid[i], &key.v);
+                    imdb_pkey_done(&key);
+                }
             }
         }
         imdb_segment **ns = imdb_alloc_array(pt->nseg ? pt->nseg : 1, sizeof *ns, e);

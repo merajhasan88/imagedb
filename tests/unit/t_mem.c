@@ -398,7 +398,7 @@ static void t_mem_vstore_chunks(void)
         imdb_value k;
         CHECK(imdb_vh(t, vid)->end == IMDB_LIVE && imdb_vh(t, vid)->begin);
         CHECK(!all_zero(imdb_vc(t, vid)->commit, 32) && !all_zero(imdb_vc(t, vid)->salt, 16));
-        OK(imdb_version_key(t, vid, t->s.pk, &k));
+        OK(imdb_version_key(t, vid, t->s.key[0], &k));
         CHECK(k.i == (int64_t)vid + 1);
     }
     imdb_mem_report m;

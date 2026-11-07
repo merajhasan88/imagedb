@@ -270,7 +270,8 @@ static void schema3(imdb_schema *s)
     s->cols[3].type = IMDB_T_BOOL;
     strcpy(s->cols[4].name, "ts");
     s->cols[4].type = IMDB_T_TIMESTAMP;
-    s->pk = 0;
+    s->npk = 1;
+    s->key[0] = 0;
     s->subject = -1;
 }
 
@@ -336,7 +337,7 @@ static void t_schema_codec(void)
     imdb_rd_init(&r, b.p, b.len);
     imdb_err e = {0};
     CHECK(imdb_schema_decode(&r, &d, &e) == 0 && imdb_rd_left(&r) == 0);
-    CHECK(d.id == 3 && d.ncols == 5 && d.pk == 0 && d.subject == -1 && strcmp(d.cols[2].name, "d") == 0);
+    CHECK(d.id == 3 && d.ncols == 5 && d.npk == 1 && d.key[0] == 0 && d.subject == -1 && strcmp(d.cols[2].name, "d") == 0);
     /* every truncation is rejected */
     for (size_t cut = 0; cut < b.len; cut++) {
         imdb_rd_init(&r, b.p, cut);
@@ -566,6 +567,7 @@ static void schema_null(imdb_schema *s)
         snprintf(s->cols[i].name, sizeof s->cols[i].name, "c%d", i);
         s->cols[i].type = ty[i];
         s->cols[i].flags = i == 0 ? IMDB_COL_PK : i == 11 ? 0 : IMDB_COL_NULLABLE;
+        s->npk = 1; /* key[0] = 0, c0: the memset */
         if (ty[i] == IMDB_T_DECIMAL) s->cols[i].precision = 10, s->cols[i].scale = 2;
     }
 }

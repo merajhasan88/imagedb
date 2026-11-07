@@ -331,6 +331,21 @@ must_fail "duplicate key in unique index" "$BIN" verify "$PY"   # the replay of 
 must_fail "share a key of unique index" "$AUD" verify "$PY"
 echo "   Y a duplicate under a unique index: the engine's replay and the auditor refuse it"
 
+echo "== FF, FG: an INSERT repeating a live row's whole primary key (two columns, then one), its state digest right,
+   signed by the writer"
+PFF=$WORK/ff; make_db "$PFF"
+"$BIN" sql "$PFF" --nosync -c "CREATE TABLE ck (a INT64, b TEXT, v INT64, PRIMARY KEY (a, b));" \
+  -c "INSERT INTO ck VALUES (1, 'x', 1), (1, 'y', 2);" >/dev/null
+"$FORGE" index-lie "$PFF" pk-dup
+must_fail "duplicate live primary key" "$BIN" verify "$PFF"   # the replay of the log's tail refuses it
+must_fail "share its primary key" "$AUD" verify "$PFF"
+PFG=$WORK/fg; make_db "$PFG"
+"$FORGE" index-lie "$PFG" pk-dup
+must_fail "duplicate live primary key" "$BIN" verify "$PFG"
+must_fail "share its primary key" "$AUD" verify "$PFG"
+echo "   FF a key of two columns, FG of one: the engine's replay and the auditor refuse each (the auditor checks a
+   table's key since F4; it had checked only the unique indexes)"
+
 echo "== Z: a commit naming the other digest algorithm, re-signed by the writer (both ways round); META naming an unknown one"
 for a in 1 2; do # explicit algorithms: under IMDB_DIGEST_ALG=2 make_db's would all be alg 2
   PZ=$WORK/z$a

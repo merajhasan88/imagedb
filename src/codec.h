@@ -43,7 +43,8 @@ typedef struct imdb_schema {
     uint32_t id;
     char name[IMDB_MAX_IDENT + 1];
     uint16_t ncols;
-    uint16_t pk;       /* column index of the primary key */
+    uint8_t npk;       /* the primary key's columns, 1..IMDB_MAX_KEY_COLS (F4) */
+    uint16_t key[IMDB_MAX_KEY_COLS]; /* their column indexes, in key order; key[npk..] zero */
     int16_t subject;   /* column index of the data-subject key, -1 if none */
     imdb_column cols[IMDB_MAX_COLS];
 } imdb_schema;
@@ -69,6 +70,12 @@ bool imdb_ident_fold(const char *s, size_t n, char out[IMDB_MAX_IDENT + 1]);
 int imdb_schema_check(const imdb_schema *s, imdb_err *e);
 void imdb_schema_encode(const imdb_schema *s, imdb_buf *b);
 int imdb_schema_decode(imdb_rd *r, imdb_schema *s, imdb_err *e);
+/* F4: the primary key's one encoding (design.md §3, the format design's section 6), of its npk values kv in key order
+ * (none NULL, each its column's type): INT64, DECIMAL and TIMESTAMP 8 bytes big-endian with the sign bit flipped, BOOL
+ * one byte, TEXT its bytes with 0x00 written 0x00 0xFF and ended 0x00 0x00; memcmp order is the tuple's order.
+ * imdb_key_len says how many bytes imdb_key_write writes. A composite key's PK map is keyed by it; it reaches no file */
+size_t imdb_key_len(const imdb_schema *s, const imdb_value *kv);
+void imdb_key_write(const imdb_schema *s, const imdb_value *kv, uint8_t *out);
 /* u8 length then the identifier, valid and folded to lowercase (schemas, index names) */
 int imdb_rd_ident(imdb_rd *r, char out[IMDB_MAX_IDENT + 1], imdb_err *e);
 int imdb_schema_col(const imdb_schema *s, const char *name); /* -1 if absent */
@@ -97,6 +104,7 @@ int imdb_row_decode(const imdb_schema *s, const uint8_t *row, size_t len, imdb_v
 void imdb_row_get(const imdb_schema *s, const uint8_t *row, size_t len, int col, imdb_value *v);
 int imdb_value_cmp(const imdb_value *a, const imdb_value *b); /* same type; bytewise for TEXT; NULL last */
 uint64_t imdb_value_hash(const imdb_value *v, uint64_t seed);
+uint64_t imdb_siphash24(const uint8_t *in, size_t n, uint64_t k0, uint64_t k1); /* SipHash-2-4, keyed by (k0, k1) */
 
 /* Row commitment: SHA256("IMDBROW1" || u32 table || salt16 || u32 len || row) */
 void imdb_row_commit(uint32_t table_id, const uint8_t salt[16], const uint8_t *row, size_t len,

@@ -97,5 +97,6 @@ TESTS(drop)
 TESTS(view) /* P2 S7 */
 TESTS(abind) /* P2 S7b */
 TESTS(qmem)
+TESTS(ckey) /* P2 F4 */
 
 #endif

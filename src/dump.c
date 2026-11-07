@@ -57,7 +57,8 @@ static int retention_text(const imdb_table *t, char *out, size_t n, imdb_err *e)
 }
 
 /* the table as CREATE TABLE made it: each name where the statement read it (a name the parser took there it takes
- * again: unreserved and folded), the type, PRIMARY KEY, SUBJECT, NOT NULL where a column is neither and not NULL */
+ * again: unreserved and folded), the type, PRIMARY KEY, SUBJECT, NOT NULL where a column is neither and not NULL;
+ * a key of several columns (F4) as the table's constraint after them, PRIMARY KEY (a, b), in key order */
 static int create_text(dumper *d, const imdb_table *t, imdb_err *e)
 {
     char ret[64];
@@ -68,9 +69,14 @@ static int create_text(dumper *d, const imdb_table *t, imdb_err *e)
         imdb_buf_printf(&d->b, "%s%s ", i ? ", " : "", c->name);
         if (c->type == IMDB_T_DECIMAL) imdb_buf_printf(&d->b, "DECIMAL(%u,%u)", c->precision, c->scale);
         else imdb_buf_put_str(&d->b, imdb_type_name(c->type));
-        if (c->flags & IMDB_COL_PK) imdb_buf_put_str(&d->b, " PRIMARY KEY");
+        if ((c->flags & IMDB_COL_PK) && t->s.npk == 1) imdb_buf_put_str(&d->b, " PRIMARY KEY");
         if (c->flags & IMDB_COL_SUBJECT) imdb_buf_put_str(&d->b, " SUBJECT");
         if (!(c->flags & (IMDB_COL_PK | IMDB_COL_SUBJECT | IMDB_COL_NULLABLE))) imdb_buf_put_str(&d->b, " NOT NULL");
+    }
+    if (t->s.npk > 1) {
+        imdb_buf_put_str(&d->b, ", PRIMARY KEY (");
+        for (int k = 0; k < t->s.npk; k++) imdb_buf_printf(&d->b, "%s%s", k ? ", " : "", t->s.cols[t->s.key[k]].name);
+        imdb_buf_put_str(&d->b, ")");
     }
     imdb_buf_printf(&d->b, ") RETENTION %s;\n", ret);
     return put(d, e);

@@ -827,12 +827,12 @@ static void manifest_lie(const char *dir, const char *kind)
         imdb_buf_put_u64(&nb, 8);
         imdb_buf_put_u32(&nb, 1);
         imdb_buf_put_u32(&nb, 0);
-    } else if (strcmp(kind, "keylist") == 0 && imdb_get_le32(man + 8) == 7 && m.nt && m.t[0].s.ncols > 1) {
+    } else if (strcmp(kind, "keylist") == 0 && imdb_get_le32(man + 8) == 7 && m.nt && m.t[0].s.npk == 1 && m.t[0].s.ncols > 1) {
         imdb_buf_put(&nb, man, mn);
         /* table 0's schema after the header (144), the tables section's frame (12), its count and the schema's length
          * (4 each); its key list (u8 1, u16 column) is the schema's last 3 bytes: another column named there */
         uint32_t sl = imdb_get_le32(man + 160);
-        uint16_t k = (uint16_t)((m.t[0].s.pk + 1) % m.t[0].s.ncols);
+        uint16_t k = (uint16_t)((m.t[0].s.key[0] + 1) % m.t[0].s.ncols); /* a one-column key's list */
         if (sl < 3 || 164 + (size_t)sl > mn) exit(1);
         nb.p[164 + sl - 2] = (uint8_t)k;
         nb.p[164 + sl - 1] = (uint8_t)(k >> 8);
@@ -900,17 +900,17 @@ static void index_lie(const char *dir, const char *kind)
         int64_t maxpk = 0;
         for (uint64_t vid = imdb_v_next(t, 0); vid < t->nver; vid = imdb_v_next(t, vid + 1)) {
             imdb_value k;
-            if (imdb_vh(t, vid)->end != IMDB_LIVE || imdb_version_key(t, vid, t->s.pk, &k) != IMDB_OK) continue;
+            if (imdb_vh(t, vid)->end != IMDB_LIVE || imdb_version_key(t, vid, t->s.key[0], &k) != IMDB_OK) continue;
             if (src == IMDB_NONE) src = vid;
             if (k.i > maxpk) maxpk = k.i;
         }
         imdb_value vals[IMDB_MAX_COLS];
         imdb_err e = {0};
-        if (src == IMDB_NONE || t->s.cols[t->s.pk].type != IMDB_T_INT64 || imdb_version_values(db, t, src, vals, &e)) {
+        if (src == IMDB_NONE || t->s.npk != 1 || t->s.cols[t->s.key[0]].type != IMDB_T_INT64 || imdb_version_values(db, t, src, vals, &e)) {
             fputs("imdb-forge: index-lie unique-dup needs a live row with an INT64 primary key\n", stderr);
             exit(1);
         }
-        vals[t->s.pk].i = maxpk + 1;
+        vals[t->s.key[0]].i = maxpk + 1;
         static imdb_buf row;
         imdb_buf_init(&row);
         if (imdb_row_encode(&t->s, vals, &row, &e) || imdb_buf_check(&row, &e)) die("row", &e);
@@ -930,8 +930,39 @@ static void index_lie(const char *dir, const char *kind)
         append_commit_digest(dir, db, &op, 1, &sg, NULL, dg);
         imdb_close(db);
         return;
+    } else if (strcmp(kind, "pk-dup") == 0) { /* F4: an INSERT repeating a live row's whole key (the last table), its digest right */
+        imdb_table *t = db->t[db->nt - 1];
+        uint64_t src = IMDB_NONE;
+        for (uint64_t vid = imdb_v_next(t, 0); vid < t->nver && src == IMDB_NONE; vid = imdb_v_next(t, vid + 1))
+            if (imdb_vh(t, vid)->end == IMDB_LIVE) src = vid;
+        imdb_value vals[IMDB_MAX_COLS];
+        imdb_err e = {0};
+        if (src == IMDB_NONE || imdb_version_values(db, t, src, vals, &e)) {
+            fputs("imdb-forge: index-lie pk-dup needs a live row in the last table\n", stderr);
+            exit(1);
+        }
+        static imdb_buf row;
+        imdb_buf_init(&row);
+        if (imdb_row_encode(&t->s, vals, &row, &e) || imdb_buf_check(&row, &e)) die("row", &e);
+        memset(op.salt, 0x5b, sizeof op.salt); /* another salt: another commitment, the same key */
+        op.code = IMDB_OP_INSERT;
+        op.table = t->s.id;
+        op.vid = t->nver;
+        op.pkind = IMDB_PAYLOAD_ROW;
+        op.row = row.p;
+        op.row_len = (uint32_t)row.len;
+        op.iname = NULL;
+        imdb_row_commit(t->s.id, op.salt, row.p, row.len, op.commit);
+        imdb_lthash g = db->global;
+        imdb_lthash_add_commit(db->meta.digest_alg, &g, op.commit);
+        uint8_t dg[32];
+        imdb_lthash_digest(db->meta.digest_alg, &g, dg);
+        append_commit_digest(dir, db, &op, 1, &sg, NULL, dg);
+        imdb_close(db);
+        return;
     } else {
-        fputs("imdb-forge: index-lie DIR column | duplicate (needs an index) | drop-absent | unique-dup (needs a unique index)\n", stderr);
+        fputs("imdb-forge: index-lie DIR column | duplicate (needs an index) | drop-absent | unique-dup (needs a unique index) | "
+              "pk-dup (a live row in the last table)\n", stderr);
         exit(1);
     }
     append_commit(dir, db, &op, 1, &sg, NULL);

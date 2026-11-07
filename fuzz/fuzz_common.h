@@ -36,7 +36,8 @@ static inline void fuzz_schema(int which, imdb_schema *s)
         s->cols[3].type = IMDB_T_TEXT;
         strcpy(s->cols[4].name, "at");
         s->cols[4].type = IMDB_T_TIMESTAMP;
-        s->pk = 0;
+        s->npk = 1; /* F4: the key list: column 0 */
+        s->key[0] = 0;
         s->subject = 1;
     } else if (which == 1) { /* flags: TEXT key, BOOL */
         strcpy(s->name, "flags");
@@ -48,7 +49,8 @@ static inline void fuzz_schema(int which, imdb_schema *s)
         s->cols[1].type = IMDB_T_BOOL;
         strcpy(s->cols[2].name, "n");
         s->cols[2].type = IMDB_T_INT64;
-        s->pk = 0;
+        s->npk = 1; /* F4: the key list: column 0 */
+        s->key[0] = 0;
         s->subject = 0;
     } else { /* meas: FLOAT64 and nullable columns (null bitmaps, VALID sections) */
         strcpy(s->name, "meas");
@@ -67,7 +69,8 @@ static inline void fuzz_schema(int which, imdb_schema *s)
         s->cols[3].flags = IMDB_COL_NULLABLE;
         strcpy(s->cols[4].name, "ok");
         s->cols[4].type = IMDB_T_BOOL;
-        s->pk = 0;
+        s->npk = 1; /* F4: the key list: column 0 */
+        s->key[0] = 0;
         s->subject = 1;
     }
 }

@@ -204,7 +204,7 @@ static void schema(imdb_schema *s)
     s->cols[2].scale = 2;
     strcpy(s->cols[3].name, "memo");
     s->cols[3].type = IMDB_T_TEXT;
-    s->pk = 0;
+    s->npk = 1; /* key[0] = 0: the memset */
     s->subject = 1;
 }
 

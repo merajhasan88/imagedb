@@ -17,15 +17,16 @@ uint64_t imdb_hash_seed(void)
     return g_seed;
 }
 
-static uint64_t khash(const imdb_value *k)
+static uint64_t khash(const imdb_hmap *m, const imdb_value *k)
 {
-    uint64_t h = imdb_value_hash(k, imdb_hash_seed());
+    uint64_t h = m->ktype == IMDB_HKEY_BYTES ? imdb_siphash24(k->s, k->len, imdb_hash_seed(), 0x5be0cd19137e2179ull)
+                                             : imdb_value_hash(k, imdb_hash_seed());
     return h ? h : 1;
 }
 
 static bool keq(const imdb_hmap *m, const imdb_hslot *s, const imdb_value *k)
 {
-    if (m->ktype == IMDB_T_TEXT) return s->slen == k->len && (k->len == 0 || memcmp(s->skey, k->s, k->len) == 0);
+    if (m->ktype != IMDB_T_INT64) return s->slen == k->len && (k->len == 0 || memcmp(s->skey, k->s, k->len) == 0);
     return s->ikey == k->i;
 }
 
@@ -33,7 +34,7 @@ int imdb_hmap_init(imdb_hmap *m, uint8_t ktype, imdb_err *e)
 {
     m->cap = 16;
     m->count = m->key_bytes = 0;
-    m->ktype = ktype == IMDB_T_TEXT ? IMDB_T_TEXT : IMDB_T_INT64;
+    m->ktype = ktype == IMDB_T_TEXT || ktype == IMDB_HKEY_BYTES ? ktype : IMDB_T_INT64;
     m->slots = imdb_alloc_array(m->cap, sizeof *m->slots, e);
     return m->slots ? IMDB_OK : e->code;
 }
@@ -64,7 +65,7 @@ static imdb_hslot *find(const imdb_hmap *m, const imdb_value *k, uint64_t h)
 
 uint64_t *imdb_hmap_get(const imdb_hmap *m, const imdb_value *k)
 {
-    imdb_hslot *s = find(m, k, khash(k));
+    imdb_hslot *s = find(m, k, khash(m, k));
     return s ? &s->val : NULL;
 }
 
@@ -90,7 +91,7 @@ static int grow(imdb_hmap *m, imdb_err *e)
 
 int imdb_hmap_put(imdb_hmap *m, const imdb_value *k, uint64_t val, imdb_err *e)
 {
-    uint64_t h = khash(k);
+    uint64_t h = khash(m, k);
     imdb_hslot *s = find(m, k, h);
     if (s) {
         s->val = val;
@@ -100,7 +101,7 @@ int imdb_hmap_put(imdb_hmap *m, const imdb_value *k, uint64_t val, imdb_err *e)
     size_t mask = m->cap - 1, i = h & mask;
     while (m->slots[i].hash) i = (i + 1) & mask;
     s = &m->slots[i];
-    if (m->ktype == IMDB_T_TEXT) {
+    if (m->ktype != IMDB_T_INT64) { /* TEXT and byte-string keys: an owned copy */
         s->skey = imdb_alloc(k->len ? k->len : 1, e);
         if (!s->skey) return e->code;
         if (k->len) memcpy(s->skey, k->s, k->len);
@@ -140,7 +141,7 @@ static void slot_remove(imdb_hmap *m, size_t i)
 
 bool imdb_hmap_del(imdb_hmap *m, const imdb_value *k)
 {
-    uint64_t h = khash(k);
+    uint64_t h = khash(m, k);
     imdb_hslot *s = find(m, k, h);
     if (!s) return false;
     slot_remove(m, (size_t)(s - m->slots));

@@ -1144,7 +1144,8 @@ typedef struct qspec {
     bpred p[IMDB_MAX_PREDICATES];
     uint16_t np;
     bool never;              /* an empty range: nothing can match */
-    int pk_pred, subj_pred;  /* index of an equality predicate on PK / SUBJECT, -1 */
+    int pk_pred, subj_pred;  /* PK: an equality on every key column (key_pred[0]); SUBJECT: one on it; -1 */
+    int key_pred[IMDB_MAX_KEY_COLS]; /* F4: each key column's first equality predicate, -1 */
     int ord_pred;            /* a predicate an ordered index serves (choose_ordered), -1 */
     const imdb_index *ord_idx;
     uint8_t ord_neq;         /* its first ord_neq columns are equalities (predicates ord_eq), */
@@ -1153,6 +1154,46 @@ typedef struct qspec {
     bool ord_only;           /* the ordered index alone answers (ordered_only) */
     const imdb_result *rset; /* P2 S4: the rows of a nested SELECT when the table is one (path_rset reads them), else NULL */
 } qspec;
+
+/* F4: an equality on column col (predicate i) counts toward the key path; once every key column has one, pk_pred is
+ * key_pred[0]. A row set's pseudo table has no key (npk 0) and so no key path */
+static void note_key_eq(const imdb_schema *s, qspec *q, int col, int i)
+{
+    if (!s->npk) return;
+    for (int k = 0; k < s->npk; k++)
+        if ((int)s->key[k] == col) {
+            if (q->key_pred[k] < 0) q->key_pred[k] = i;
+            break;
+        }
+    if (q->pk_pred >= 0) return;
+    for (int k = 0; k < s->npk; k++)
+        if (q->key_pred[k] < 0) return;
+    q->pk_pred = q->key_pred[0];
+}
+
+static void key_pred_reset(qspec *q)
+{
+    for (int k = 0; k < (int)IMDB_MAX_KEY_COLS; k++) q->key_pred[k] = -1;
+}
+
+static bool is_key_col(const imdb_schema *s, int c)
+{
+    for (int k = 0; k < s->npk; k++)
+        if ((int)s->key[k] == c) return true;
+    return false;
+}
+
+/* F4: ON CONFLICT's target names exactly the key's columns, in any order (PostgreSQL's inference) */
+static bool names_key(const imdb_schema *s, const char (*names)[IMDB_MAX_IDENT + 1], uint8_t n)
+{
+    if (n != s->npk) return false;
+    for (uint8_t i = 0; i < n; i++) {
+        if (!is_key_col(s, imdb_schema_col(s, names[i]))) return false;
+        for (uint8_t j = 0; j < i; j++)
+            if (strcmp(names[j], names[i]) == 0) return false;
+    }
+    return true;
+}
 
 /* An ordered index for the bound predicates: equalities on its first columns, then perhaps a
  * range (not a negation) on the next. The one with the most equalities wins, then one with the
@@ -1250,7 +1291,7 @@ static int bind_pred(xctx *x, const sql_cmp *c, int col, bool post, qspec *q, im
     } else if (c->op == CMP_BETWEEN && imdb_value_cmp(&b->a, &b->b) > 0) {
         q->never = true;
     }
-    if (c->op == CMP_EQ && col == t->s.pk && q->pk_pred < 0) q->pk_pred = q->np - 1;
+    if (c->op == CMP_EQ) note_key_eq(&t->s, q, col, q->np - 1);
     if (c->op == CMP_EQ && col == t->s.subject && q->subj_pred < 0) q->subj_pred = q->np - 1;
     return IMDB_OK;
 }
@@ -1318,7 +1359,7 @@ static bool corr_pred(xctx *x, const sql_stmt *st, uint16_t i, qspec *q)
         case CMP_GE: b->lo = v->i; break;
         }
     }
-    if (op == CMP_EQ && ci == q->t->s.pk && q->pk_pred < 0) q->pk_pred = q->np - 1;
+    if (op == CMP_EQ) note_key_eq(&q->t->s, q, ci, q->np - 1);
     if (op == CMP_EQ && ci == q->t->s.subject && q->subj_pred < 0) q->subj_pred = q->np - 1;
     return true;
 }
@@ -1326,6 +1367,7 @@ static bool corr_pred(xctx *x, const sql_stmt *st, uint16_t i, qspec *q)
 static int bind_preds(xctx *x, const sql_stmt *st, qspec *q, imdb_err *e)
 {
     q->pk_pred = q->subj_pred = q->ord_pred = -1;
+    key_pred_reset(q);
     for (uint16_t i = 0; i < st->nwhere; i++) {
         if (st->where[i].lx && x->upv && corr_pred(x, st, i, q)) continue; /* P2 S4b: inner op outer, on a run for a row */
         if (st->where[i].lx) continue; /* a tree's: the sink's (bind_resid) */
@@ -2067,7 +2109,7 @@ static int rset_table(xctx *x, xrset *rs, imdb_err *e)
     imdb_schema *s = &t->s;
     snprintf(s->name, sizeof s->name, "%s", rs->name);
     s->ncols = r->ncols;
-    s->pk = r->ncols; /* no column: no key path */
+    s->npk = 0; /* no key: no key path (note_key_eq); its default order is its row numbers */
     s->subject = -1;
     for (uint16_t c = 0; c < r->ncols; c++) {
         imdb_column *col = &s->cols[c];
@@ -2331,14 +2373,27 @@ static int xenv_subq(void *ctx, uint16_t k, const imdb_value *row, imdb_xval *ou
     return IMDB_OK;
 }
 
-/* the default order's key of a row: its primary key's value, or a row set's row number (P2 S4) */
-static void row_key(const xctx *x, imdb_table *t, uint64_t vid, imdb_value *key)
+/* the default order's key of a row: its primary key's value, a row set's row number (P2 S4), or (F4) several columns'
+ * encoding (codec.h imdb_key_write) as TEXT bytes in the statement's arena: its bytewise order is the key's */
+static int row_key(xctx *x, imdb_table *t, uint64_t vid, imdb_value *key, imdb_err *e)
 {
     if (x->nvis && rset_of(x, t)) {
         *key = (imdb_value){.type = IMDB_T_INT64, .i = (int64_t)vid};
-        return;
+        return IMDB_OK;
     }
-    imdb_version_key(t, vid, t->s.pk, key);
+    if (t->s.npk == 1) {
+        *key = (imdb_value){0};
+        imdb_version_key(t, vid, t->s.key[0], key);
+        return IMDB_OK;
+    }
+    imdb_value kv[IMDB_MAX_KEY_COLS] = {{0}};
+    for (int c = 0; c < t->s.npk; c++) imdb_version_key(t, vid, t->s.key[c], &kv[c]);
+    size_t n = imdb_key_len(&t->s, kv);
+    uint8_t *p = xalloc(x, n, e);
+    if (!p) return e->code;
+    imdb_key_write(&t->s, kv, p);
+    *key = (imdb_value){.type = IMDB_T_TEXT, .s = p, .len = (uint32_t)n};
+    return IMDB_OK;
 }
 
 static int fetch_row(xctx *x, imdb_table *t, uint64_t vid, imdb_value *vals, imdb_err *e)
@@ -2397,7 +2452,9 @@ static int path_index(xctx *x, const qspec *q, sink *k, imdb_err *e)
     imdb_value vals[IMDB_MAX_COLS];
     if (q->pk_pred >= 0 && !q->all_versions) {
         uint64_t vid;
-        if (imdb_lookup_pk_at(x->db, t, &q->p[q->pk_pred].a, q->snap, q->pend, &vid, e)) return e->code;
+        imdb_value kv[IMDB_MAX_KEY_COLS];
+        for (int c = 0; c < t->s.npk; c++) kv[c] = q->p[q->key_pred[c]].a;
+        if (imdb_lookup_pk_at(x->db, t, kv, q->snap, q->pend, &vid, e)) return e->code;
         if (vid == IMDB_NONE) return IMDB_OK;
         if (fetch_row(x, t, vid, vals, e)) return e->code;
         if (preds_ok(q, vals)) sink_row(k, vid, vals);
@@ -3095,8 +3152,20 @@ static int walk_keys(sink *k, uint64_t vid, const imdb_value *vals)
     if (x->nvis && rset_of(x, k->t)) {
         kv->key = (imdb_value){.type = IMDB_T_INT64, .i = (int64_t)vid};
     } else {
-        kv->key = vals[k->t->s.pk];
-        if (kv->key.type == IMDB_T_TEXT && !kv->key.null) kv->key.i = (int64_t)key_text(k, &kv->key.s, kv->key.len);
+        kv->key = vals[k->t->s.key[0]];
+        if (k->t->s.npk > 1) { /* F4: the key's encoding, held as TEXT bytes as a TEXT key is: its bytewise order is the key's */
+            imdb_value kc[IMDB_MAX_KEY_COLS];
+            for (int c = 0; c < k->t->s.npk; c++) kc[c] = vals[k->t->s.key[c]];
+            size_t n = imdb_key_len(&k->t->s, kc);
+            uint64_t off = k->kbuf.len;
+            if (imdb_buf_reserve(&k->kbuf, n)) { /* else its sticky error, which key_resolve reports */
+                imdb_key_write(&k->t->s, kc, k->kbuf.p + off);
+                k->kbuf.len += n;
+            }
+            kv->key = (imdb_value){.type = IMDB_T_TEXT, .len = (uint32_t)n, .i = (int64_t)off}; /* key_resolve points it */
+        } else if (kv->key.type == IMDB_T_TEXT && !kv->key.null) {
+            kv->key.i = (int64_t)key_text(k, &kv->key.s, kv->key.len);
+        }
     }
     if (nk) {
         imdb_xmark m = imdb_xarena_mark(&x->arena);
@@ -4474,7 +4543,7 @@ static bool join_probe_setup(jctx *j, const qspec q[2], int in)
     b->op = CMP_EQ;
     j->kp = p->np++;
     p->ord_only = false;
-    if (col == t->s.pk && p->pk_pred < 0) p->pk_pred = j->kp;
+    note_key_eq(&t->s, p, col, j->kp);
     if (col == t->s.subject && p->subj_pred < 0) p->subj_pred = j->kp;
     if (p->pk_pred >= 0 || p->subj_pred >= 0) {
         j->probe_path = IMDB_PATH_INDEX;
@@ -4871,9 +4940,18 @@ static int join_materialize(xctx *x, const sql_stmt *st, jctx *j, sink *k, imdb_
     for (uint64_t i = 0; i < j->npairs; i++) {
         kv[i].va = j->pairs[i][0];
         kv[i].vb = j->pairs[i][1];
-        if (kv[i].va != IMDB_NONE) row_key(x, j->t[0], kv[i].va, &kv[i].ka);
-        else kv[i].ka = (imdb_value){.null = true}; /* P2 S3: after every row of side 0 (NULLS LAST) */
-        if (kv[i].vb != IMDB_NONE) row_key(x, j->t[1], kv[i].vb, &kv[i].kb);
+        if (kv[i].va != IMDB_NONE) {
+            if (row_key(x, j->t[0], kv[i].va, &kv[i].ka, e)) {
+                imdb_free(kv);
+                return e->code;
+            }
+        } else {
+            kv[i].ka = (imdb_value){.null = true}; /* P2 S3: after every row of side 0 (NULLS LAST) */
+        }
+        if (kv[i].vb != IMDB_NONE && row_key(x, j->t[1], kv[i].vb, &kv[i].kb, e)) {
+            imdb_free(kv);
+            return e->code;
+        }
     }
     qsort(kv, j->npairs, sizeof *kv, cmp_jkeyed);
     int rc = IMDB_OK;
@@ -4985,7 +5063,8 @@ static void xp_single(const xctx *x, const sql_stmt *st, const qspec *q, const s
     else xp_add(xp, "why", "no index serves the conditions");
     unsigned by = 0;
     if (path == IMDB_PATH_INDEX && q->pk_pred >= 0) {
-        xp_add(xp, "index", "the primary key (%s)", s->cols[s->pk].name);
+        char kn[IMDB_MAX_KEY_COLS * (IMDB_MAX_IDENT + 2) + 1];
+        xp_add(xp, "index", "the primary key (%s)", imdb_key_names(s, kn, sizeof kn));
         by = 1;
     } else if (path == IMDB_PATH_INDEX && q->subj_pred >= 0) {
         xp_add(xp, "index", "the subject's (%s)", s->cols[s->subject].name);
@@ -5323,6 +5402,7 @@ static int exec_join(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, im
         q[s].snap = snap;
         q[s].pend = pend;
         q[s].pk_pred = q[s].subj_pred = q[s].ord_pred = -1;
+        key_pred_reset(&q[s]);
         q[s].rset = rset_res(x, t[s]); /* P2 S4 */
     }
     j->post.t = t[1];
@@ -6703,7 +6783,7 @@ static int ups_prepare(xctx *x, const sql_stmt *st, imdb_table *t, ups *u, imdb_
     memset(u, 0, sizeof *u);
     u->first = t->nver;
     if (!st->upsert) return IMDB_OK;
-    if (st->nconf && (st->nconf != 1 || imdb_schema_col(&t->s, st->conf_cols[0]) != t->s.pk)) {
+    if (st->nconf && !names_key(&t->s, st->conf_cols, st->nconf)) {
         for (uint32_t k = 0; k < t->nidx; k++) {
             const imdb_index_def *d = &t->idx[k].d;
             bool same = (d->flags & IMDB_INDEX_UNIQUE) && d->ncols == st->nconf;
@@ -6727,7 +6807,7 @@ static int ups_prepare(xctx *x, const sql_stmt *st, imdb_table *t, ups *u, imdb_
     for (uint16_t k = 0; k < st->nset; k++) {
         int c = u->cols[k] = imdb_schema_col(&t->s, st->set_cols[k]);
         if (c < 0) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no column %s in table %s", st->set_cols[k], t->s.name);
-        if (c == t->s.pk) return imdb_fail(e, IMDB_ERR_INVALID, "ON CONFLICT DO UPDATE cannot change the primary key");
+        if (is_key_col(&t->s, c)) return imdb_fail(e, IMDB_ERR_INVALID, "ON CONFLICT DO UPDATE cannot change the primary key");
         for (uint16_t j = 0; j < k; j++)
             if (u->cols[j] == c) return imdb_fail(e, IMDB_ERR_INVALID, "column %s is set twice", st->set_cols[k]);
         if (st->set_vals[k].kind == LIT_EXPR) {
@@ -6751,7 +6831,9 @@ static int ups_prepare(xctx *x, const sql_stmt *st, imdb_table *t, ups *u, imdb_
 static int write_row(xctx *x, const sql_stmt *st, imdb_table *t, imdb_value *vals, ups *u, imdb_result *r, imdb_err *e)
 {
     uint64_t vid = IMDB_NONE;
-    if (st->upsert && imdb_lookup_pk_at(x->db, t, &vals[t->s.pk], u->snap, u->pend, &vid, e)) return e->code;
+    imdb_value kv[IMDB_MAX_KEY_COLS];
+    for (int c = 0; c < t->s.npk; c++) kv[c] = vals[t->s.key[c]];
+    if (st->upsert && imdb_lookup_pk_at(x->db, t, kv, u->snap, u->pend, &vid, e)) return e->code;
     uint8_t salt[16];
     int rc;
     if (vid == IMDB_NONE) {
@@ -7254,10 +7336,29 @@ typedef struct pkrow {
     uint64_t i;
 } pkrow;
 
-static int cmp_pkrow(const void *a, const void *b)
+typedef struct pkctx {
+    const imdb_result *q;
+    const imdb_schema *s;
+} pkctx;
+
+/* two pairs' t rows by t's key: the first key column's value in k, the others (F4) from the join's cells */
+static int pkrow_keys(const pkrow *a, const pkrow *b, const pkctx *c)
+{
+    int r = imdb_x_cmp(&a->k, &b->k);
+    for (int k = 1; !r && k < c->s->npk; k++) {
+        uint16_t col = c->s->key[k];
+        imdb_xval u, v;
+        cell_xval(&c->q->cells[a->i * c->q->ncols + col], c->q->ctype[col], c->q->cscale[col], &u);
+        cell_xval(&c->q->cells[b->i * c->q->ncols + col], c->q->ctype[col], c->q->cscale[col], &v);
+        r = imdb_x_cmp(&u, &v);
+    }
+    return r;
+}
+
+static int cmp_pkrow(const void *a, const void *b, void *arg)
 {
     const pkrow *p = a, *q = b;
-    int c = imdb_x_cmp(&p->k, &q->k);
+    int c = pkrow_keys(p, q, arg);
     return c ? c : (p->i > q->i) - (p->i < q->i);
 }
 
@@ -7287,7 +7388,7 @@ static int exec_join_write(xctx *x, const sql_stmt *st, bool upd, imdb_result *r
     for (uint16_t k = 0; k < st->nset; k++) {
         cols[k] = imdb_schema_col(&t->s, st->set_cols[k]);
         if (cols[k] < 0) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no column %s in table %s", st->set_cols[k], t->s.name);
-        if (cols[k] == t->s.pk) return imdb_fail(e, IMDB_ERR_INVALID, "UPDATE cannot change the primary key (use DELETE + INSERT)");
+        if (is_key_col(&t->s, cols[k])) return imdb_fail(e, IMDB_ERR_INVALID, "UPDATE cannot change the primary key (use DELETE + INSERT)");
         for (uint16_t j = 0; j < k; j++)
             if (cols[j] == cols[k]) return imdb_fail(e, IMDB_ERR_INVALID, "column %s is set twice", st->set_cols[k]);
         if (st->set_vals[k].kind == LIT_EXPR) {
@@ -7305,12 +7406,13 @@ static int exec_join_write(xctx *x, const sql_stmt *st, bool upd, imdb_result *r
     if (!rc && q.ncols != nt + nu) rc = imdb_fail(e, IMDB_ERR_STATE, "%s's join returned %u columns", what, q.ncols);
     if (!rc && q.nrows && !(pr = imdb_alloc_array(q.nrows, sizeof *pr, e))) rc = e->code;
     for (uint64_t i = 0; !rc && i < q.nrows; i++) {
-        cell_xval(&q.cells[i * q.ncols + t->s.pk], q.ctype[t->s.pk], q.cscale[t->s.pk], &pr[i].k);
+        cell_xval(&q.cells[i * q.ncols + t->s.key[0]], q.ctype[t->s.key[0]], q.cscale[t->s.key[0]], &pr[i].k);
         pr[i].i = i;
     }
-    if (!rc && q.nrows) qsort(pr, q.nrows, sizeof *pr, cmp_pkrow);
+    pkctx pc = {&q, &t->s};
+    if (!rc && q.nrows) qsort_r(pr, q.nrows, sizeof *pr, cmp_pkrow, &pc);
     for (uint64_t i = 0; !rc && i < q.nrows; i++) { /* each t row once */
-        if (n && !imdb_x_cmp(&pr[n - 1].k, &pr[i].k)) {
+        if (n && !pkrow_keys(&pr[n - 1], &pr[i], &pc)) {
             if (upd)
                 rc = imdb_fail(e, IMDB_ERR_INVALID, "UPDATE ... FROM matched a row of %s with two rows of %s: it changes "
                                                     "each row once (narrow the WHERE)", t->s.name, u->s.name);
@@ -7334,7 +7436,9 @@ static int exec_join_write(xctx *x, const sql_stmt *st, bool upd, imdb_result *r
             cell_xval(&q.cells[row * q.ncols + c], q.ctype[c], q.cscale[c], &v);
             rc = imdb_x_assign(c < nt ? &t->s.cols[c] : &u->s.cols[c - nt], &v, &both[c], e);
         }
-        if (!rc && !(rc = imdb_lookup_pk_at(x->db, t, &both[t->s.pk], snap, pend, &vid, e)) && vid == IMDB_NONE)
+        imdb_value kv[IMDB_MAX_KEY_COLS];
+        for (int c = 0; c < t->s.npk; c++) kv[c] = both[t->s.key[c]];
+        if (!rc && !(rc = imdb_lookup_pk_at(x->db, t, kv, snap, pend, &vid, e)) && vid == IMDB_NONE)
             rc = imdb_fail(e, IMDB_ERR_STATE, "%s: a row its join read is not in the statement's view", what);
         for (uint16_t k = 0; upd && !rc && k < st->nset; k++) { /* every value before any column changes */
             imdb_xval v;
@@ -7380,7 +7484,7 @@ static int exec_update(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, 
     for (uint16_t i = 0; i < st->nset; i++) {
         cols[i] = imdb_schema_col(&t->s, st->set_cols[i]);
         if (cols[i] < 0) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no column %s in table %s", st->set_cols[i], t->s.name);
-        if (cols[i] == t->s.pk) return imdb_fail(e, IMDB_ERR_INVALID, "UPDATE cannot change the primary key (use DELETE + INSERT)");
+        if (is_key_col(&t->s, cols[i])) return imdb_fail(e, IMDB_ERR_INVALID, "UPDATE cannot change the primary key (use DELETE + INSERT)");
         for (uint16_t j = 0; j < i; j++)
             if (cols[j] == cols[i]) return imdb_fail(e, IMDB_ERR_INVALID, "column %s is set twice", st->set_cols[i]);
         if (st->set_vals[i].kind == LIT_EXPR) { /* computed per row, from the row's old values */
@@ -7588,7 +7692,9 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
                 const imdb_column *cd = &t->s.cols[c];
                 imdb_buf_printf(&cols, "%s%s %s", c ? ", " : "", cd->name, imdb_type_name(cd->type));
                 if (cd->type == IMDB_T_DECIMAL) imdb_buf_printf(&cols, "(%u,%u)", cd->precision, cd->scale);
-                if (cd->flags & IMDB_COL_PK) imdb_buf_put_str(&cols, " PK");
+                if ((cd->flags & IMDB_COL_PK) && t->s.npk == 1) imdb_buf_put_str(&cols, " PK");
+                for (int k = 0; t->s.npk > 1 && k < t->s.npk; k++) /* F4: its place in the key */
+                    if (t->s.key[k] == c) imdb_buf_printf(&cols, " PK(%d)", k + 1);
                 if (cd->flags & IMDB_COL_SUBJECT) imdb_buf_put_str(&cols, " SUBJECT");
             }
             imdb_buf_put_u8(&cols, 0);
@@ -7904,15 +8010,21 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
     if (st->kind == ST_SHOW_HISTORY) {
         imdb_table *t;
         if (read_table(x, st, st->table, &t, e)) return e->code;
-        imdb_value key;
-        if (bind_lit(x, &st->key, &t->s.cols[t->s.pk], true, &key, e)) return e->code;
+        if (st->nkeys != t->s.npk)
+            return imdb_fail(e, IMDB_ERR_INVALID, "SHOW HISTORY: table %s's PRIMARY KEY has %u columns, %u values given",
+                             t->s.name, t->s.npk, st->nkeys);
+        imdb_pkey key;
+        for (int c = 0; c < t->s.npk; c++)
+            if (bind_lit(x, &st->keys[c], &t->s.cols[t->s.key[c]], true, &key.kv[c], e)) return e->code;
+        if (imdb_pkey_make(&t->s, &key, e)) return e->code;
         res_cols(r, (uint16_t)(3 + t->s.ncols));
         res_name(r, 0, "_version");
         res_name(r, 1, "_from_commit");
         res_name(r, 2, "_until_commit");
         for (int c = 0; c < t->s.ncols; c++) res_name(r, (uint16_t)(3 + c), t->s.cols[c].name);
         /* the key's chain (the versions held), and its rows only the lake holds (stage 3b: past the memory window) */
-        uint64_t *head = imdb_hmap_get(&t->pk, &key);
+        uint64_t *head = imdb_hmap_get(&t->pk, &key.v);
+        imdb_pkey_done(&key); /* the map's key: its values, key.kv, stay */
         uint64_t nch = 0;
         for (int pass = 0; pass < 2; pass++) {
             uint64_t *chain = pass ? xalloc(x, nch * sizeof *chain, e) : NULL, n = 0;
@@ -7924,11 +8036,15 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
                 const imdb_segimg *gi = imdb_seg_pin(t, g, e);
                 if (!gi) return e->code;
                 for (uint32_t i = 0; i < g->nrows; i++) {
-                    imdb_value v;
                     if (gi->flags[i] || imdb_v_held(t, gi->vid[i])) continue;
-                    imdb_seg_get(&t->s, gi, i, (uint32_t)t->s.pk, &v);
-                    if (imdb_value_cmp(&v, &key) == 0 && pass) chain[n] = gi->vid[i];
-                    n += imdb_value_cmp(&v, &key) == 0;
+                    bool same = true;
+                    for (int c = 0; c < t->s.npk && same; c++) {
+                        imdb_value v;
+                        imdb_seg_get(&t->s, gi, i, t->s.key[c], &v);
+                        same = imdb_value_cmp(&v, &key.kv[c]) == 0;
+                    }
+                    if (same && pass) chain[n] = gi->vid[i];
+                    n += same;
                 }
             }
             if (!pass) {
@@ -7996,6 +8112,7 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
     q.t = t;
     if (resolve_snapshot(x, st, t, &q.snap, &q.pend, e)) return e->code;
     q.pk_pred = q.subj_pred = -1;
+    key_pred_reset(&q);
     if (st->has_subject) {
         if (t->s.subject < 0) return imdb_fail(e, IMDB_ERR_INVALID, "table %s has no SUBJECT column", t->s.name);
         bpred *b = &q.p[q.np++];

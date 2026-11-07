@@ -367,6 +367,7 @@ static void gen_pred(int tab, pred *p)
 static bool g_expr = true; /* --no-expr: 1a's generator, draw for draw */
 static bool g_fns = true;  /* --no-fns: the generator before P2 S1, draw for draw */
 static bool g_views = true; /* --no-views: the generator before P2 S7's views, draw for draw */
+static bool g_ckey; /* P2 F4, --ckey: u's key is (tid, id), every dialect's; ids stay unique, tid never NULL or SET */
 /* A seed names the same statements only within one stage: each P2 stage (S1 to S4) adds forms to the default
  * generator's draws, so seed N's statements differ from the stage before's (a mismatch is reproduced on its own
  * build); --no-fns and --no-expr reproduce the generators before P2 S1 and before 1a. */
@@ -1504,6 +1505,7 @@ static void gen_row(int tab, val *row)
 {
     for (int c = 0; c < ncols(tab); c++) gen_val(tab, c, &row[c], 15);
     row[0].null = false;
+    if (tab == 1 && g_ckey) row[1].null = false; /* F4: tid a key column */
     row[0].i = g_next_id++;
     if (tab == 1 && !row[1].null && g_ntids && chance(70)) row[1].i = g_tids[rnd() % (uint64_t)g_ntids];
     if (tab == 0 && g_ntids < (int)(sizeof g_tids / sizeof g_tids[0])) g_tids[g_ntids++] = row[0].i;
@@ -1881,8 +1883,8 @@ static void gen_dml(stmt *q, bool may_fail)
             q->isel = true;
             q->ikey = (long long)(++g_nisel) << 20;
             if (chance(50)) { /* a list of some columns, in an order of its own: the rest NULL */
-                for (int c = 1; c < ncols(q->tab); c++)
-                    if (chance(50)) q->icol[q->nic++] = c;
+                for (int c = 1; c < ncols(q->tab); c++) /* F4: u's tid, a key column, always named under --ckey */
+                    if (chance(50) || (g_ckey && q->tab == 1 && c == 1)) q->icol[q->nic++] = c;
                 for (int i = q->nic - 1; i > 0; i--) {
                     int j = (int)rr(0, i), c = q->icol[i];
                     q->icol[i] = q->icol[j];
@@ -1939,7 +1941,7 @@ static void gen_dml(stmt *q, bool may_fail)
         }
         q->nset = (int)rr(1, 2);
         for (int i = 0; i < q->nset; i++) {
-            q->scol[i] = (int)rr(1, ncols(q->tab) - 1);
+            q->scol[i] = (int)rr(g_ckey && q->tab == 1 ? 2 : 1, ncols(q->tab) - 1); /* never a key column */
             for (int j = 0; j < i; j++)
                 if (q->scol[j] == q->scol[i]) q->scol[i] = 0;
             if (!q->scol[i]) {
@@ -1950,9 +1952,9 @@ static void gen_dml(stmt *q, bool may_fail)
             sample(q->tab, q->scol[i], &q->sval[i]);
         }
         if (!q->nset) {
-            q->scol[0] = 1;
+            q->scol[0] = g_ckey && q->tab == 1 ? 2 : 1;
             q->nset = 1;
-            gen_val(q->tab, 1, &q->sval[0], 15);
+            gen_val(q->tab, q->scol[0], &q->sval[0], 15);
         }
         if (g_expr && q->tab == 0 && chance(40)) { /* SETs by trees of their own columns: a, d, f */
             q->nset = (int)rr(1, 2);
@@ -3142,15 +3144,32 @@ static void print_stmt_body(sb *b, int d, const stmt *q)
             put_okey(b, d, q, &q->ord[i]);
         }
         if (d != D_IMDB && !q->distinct) {
-            struct okey tb[2] = {{q->gcol >= 0 ? 0 : q->join ? 0 : q->tab, q->gcol >= 0 ? q->gcol : 0, 0, 0, false, false},
-                                 {1, 0, 0, 0, false, false}};
-            for (int i = 0; i < (q->gcol < 0 && q->join ? 2 : 1); i++) {
+            /* imagedb's default order: a group's key; else the first table's key, then a join's second side's (P2 F4:
+             * u's key is (tid, id) under --ckey), the first table's key columns bare (never NULL) */
+            struct okey tb[4];
+            bool bare[4];
+            int ntb = 0;
+            if (q->gcol >= 0) {
+                tb[ntb] = (struct okey){0, q->gcol, 0, 0, false, false};
+                bare[ntb++] = false;
+            } else {
+                int t0 = q->join ? 0 : q->tab;
+                if (t0 == 1 && g_ckey) tb[ntb] = (struct okey){1, 1, 0, 0, false, false}, bare[ntb++] = true;
+                tb[ntb] = (struct okey){t0, 0, 0, 0, false, false};
+                bare[ntb++] = true;
+                if (q->join) {
+                    if (g_ckey) tb[ntb] = (struct okey){1, 1, 0, 0, false, false}, bare[ntb++] = false;
+                    tb[ntb] = (struct okey){1, 0, 0, 0, false, false};
+                    bare[ntb++] = false;
+                }
+            }
+            for (int i = 0; i < ntb; i++) {
                 if (d == D_MS && key_seen(q, &tb[i], seen, &nseen)) continue;
-                if (q->gcol < 0 && i == 0) { /* a key: never NULL */
+                if (bare[i]) {
                     if (d == D_MS && !ms_item(b, &first)) continue;
                     if (d != D_MS && !first) sb_str(b, ", ");
                     first = false;
-                    sb_printf(b, "%s.id", tname(tb[0].tab));
+                    sb_printf(b, "%s.%s", tname(tb[i].tab), cols(tb[i].tab)[tb[i].col].name);
                     continue;
                 }
                 if (d == D_MS) {
@@ -3226,6 +3245,16 @@ static const char *ddl(int d, int tab)
         "s VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_nopad_bin, k BOOLEAN, ts DATETIME(6))",
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, g BIGINT, a BIGINT, x BIGINT, d DECIMAL(12,2), f FLOAT(53), "
         "s VARCHAR(255) COLLATE Latin1_General_100_BIN2_UTF8, k BIT, ts DATETIME2(6))"};
+    static const char *const UCK[ND] = { /* --ckey (P2 F4) */
+        "CREATE TABLE u (id INT64 NOT NULL, tid INT64 NOT NULL, v INT64, s TEXT, PRIMARY KEY (tid, id))",
+        "CREATE TABLE u (id INTEGER NOT NULL, tid INTEGER NOT NULL, v INTEGER, s TEXT, PRIMARY KEY (tid, id))",
+        "CREATE TABLE u (id BIGINT NOT NULL, tid BIGINT NOT NULL, v BIGINT, s TEXT COLLATE \"C\", PRIMARY KEY (tid, id))",
+        "CREATE TABLE u (id BIGINT NOT NULL, tid BIGINT NOT NULL, v BIGINT, s VARCHAR(255) CHARACTER SET utf8mb4 COLLATE "
+        "utf8mb4_0900_bin, PRIMARY KEY (tid, id))",
+        "CREATE TABLE u (id BIGINT NOT NULL, tid BIGINT NOT NULL, v BIGINT, s VARCHAR(255) CHARACTER SET utf8mb4 COLLATE "
+        "utf8mb4_nopad_bin, PRIMARY KEY (tid, id))",
+        "CREATE TABLE u (id BIGINT NOT NULL, tid BIGINT NOT NULL, v BIGINT, s VARCHAR(255) COLLATE "
+        "Latin1_General_100_BIN2_UTF8, PRIMARY KEY (tid, id))"};
     static const char *const U[ND] = {
         "CREATE TABLE u (id INT64 PRIMARY KEY, tid INT64, v INT64, s TEXT)",
         "CREATE TABLE u (id INTEGER PRIMARY KEY, tid INTEGER, v INTEGER, s TEXT)",
@@ -3236,7 +3265,7 @@ static const char *ddl(int d, int tab)
         "utf8mb4_nopad_bin)",
         "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, tid BIGINT, v BIGINT, s VARCHAR(255) COLLATE "
         "Latin1_General_100_BIN2_UTF8)"};
-    return tab ? U[d] : T[d];
+    return tab ? (g_ckey ? UCK[d] : U[d]) : T[d];
 }
 
 /* ---- canonical cells: every engine's answer to one text per value ------------------------------------------------ */
@@ -4510,12 +4539,13 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--no-expr")) g_expr = false;
         else if (!strcmp(argv[i], "--no-fns")) g_fns = false;
         else if (!strcmp(argv[i], "--no-views")) g_views = false; /* P2 S7 */
+        else if (!strcmp(argv[i], "--ckey")) g_ckey = true; /* P2 F4 */
         else if (!strcmp(argv[i], "--no-view-audit")) g_view_audit = false; /* P2 S7b */
         else if (!strcmp(argv[i], "--audit") && i + 1 < argc) snprintf(g_audit_bin, sizeof g_audit_bin, "%s", argv[++i]);
         else if (!strcmp(argv[i], "--ping")) ping = true; /* connect to every engine named, then stop (run.sh waits on it) */
         else if (!strcmp(argv[i], "-v")) g_verbose = true;
         else {
-            fprintf(stderr, "usage: oracle [--engines LIST] [--seeds A-B] [--steps N] [--dir DIR] [--keep-going] [--no-expr] [--no-fns] [--ping] [-v]\n");
+            fprintf(stderr, "usage: oracle [--engines LIST] [--seeds A-B] [--steps N] [--dir DIR] [--keep-going] [--no-expr] [--no-fns] [--no-views] [--ckey] [--ping] [-v]\n");
             return 2;
         }
     }

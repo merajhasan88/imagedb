@@ -148,7 +148,7 @@ int imdb_schema_check(const imdb_schema *s, imdb_err *e)
     if (!imdb_ident_valid(s->name, nl)) return imdb_fail(e, IMDB_ERR_INVALID, "invalid table name");
     if (s->ncols < 1 || s->ncols > IMDB_MAX_COLS)
         return imdb_fail(e, IMDB_ERR_LIMIT, "table must have 1..%u columns", IMDB_MAX_COLS);
-    int pk = -1, subj = -1;
+    int nflag = 0, subj = -1;
     for (int i = 0; i < s->ncols; i++) {
         const imdb_column *c = &s->cols[i];
         size_t cl = strnlen(c->name, sizeof c->name);
@@ -169,11 +169,10 @@ int imdb_schema_check(const imdb_schema *s, imdb_err *e)
             return imdb_fail(e, IMDB_ERR_INVALID, "column %s: unknown flags", c->name);
         if ((c->flags & IMDB_COL_NULLABLE) && (c->flags & (IMDB_COL_PK | IMDB_COL_SUBJECT)))
             return imdb_fail(e, IMDB_ERR_INVALID, "column %s: PRIMARY KEY and SUBJECT columns are NOT NULL", c->name);
-        if (c->flags & IMDB_COL_PK) {
-            if (pk >= 0) return imdb_fail(e, IMDB_ERR_INVALID, "only one PRIMARY KEY column is supported");
-            if (c->type != IMDB_T_INT64 && c->type != IMDB_T_TEXT)
-                return imdb_fail(e, IMDB_ERR_INVALID, "PRIMARY KEY must be INT64 or TEXT");
-            pk = i;
+        if (c->flags & IMDB_COL_PK) { /* every type held exactly: a measured FLOAT64 is no identity (F4) */
+            if (c->type == IMDB_T_FLOAT64)
+                return imdb_fail(e, IMDB_ERR_INVALID, "column %s: a PRIMARY KEY column cannot be FLOAT64", c->name);
+            nflag++;
         }
         if (c->flags & IMDB_COL_SUBJECT) {
             if (subj >= 0) return imdb_fail(e, IMDB_ERR_INVALID, "only one SUBJECT column is supported");
@@ -182,8 +181,19 @@ int imdb_schema_check(const imdb_schema *s, imdb_err *e)
             subj = i;
         }
     }
-    if (pk < 0) return imdb_fail(e, IMDB_ERR_INVALID, "table needs a PRIMARY KEY column");
-    if (s->pk != pk || s->subject != subj) return imdb_fail(e, IMDB_ERR_INVALID, "schema key indexes inconsistent");
+    if (!nflag) return imdb_fail(e, IMDB_ERR_INVALID, "table needs a PRIMARY KEY column (or PRIMARY KEY (a, b, ...))");
+    if (s->npk < 1 || s->npk > IMDB_MAX_KEY_COLS)
+        return imdb_fail(e, IMDB_ERR_LIMIT, "a PRIMARY KEY of 1..%u columns", IMDB_MAX_KEY_COLS);
+    /* the key list and the flags name one set: each listed column flagged, once, and as many as are flagged */
+    for (int k = 0; k < s->npk; k++) {
+        if (s->key[k] >= s->ncols || !(s->cols[s->key[k]].flags & IMDB_COL_PK))
+            return imdb_fail(e, IMDB_ERR_INVALID, "schema key indexes inconsistent");
+        for (int j = 0; j < k; j++)
+            if (s->key[j] == s->key[k]) return imdb_fail(e, IMDB_ERR_INVALID, "schema key indexes inconsistent");
+    }
+    for (int k = s->npk; k < (int)IMDB_MAX_KEY_COLS; k++) /* zero past the key: a schema is compared and copied whole */
+        if (s->key[k]) return imdb_fail(e, IMDB_ERR_INVALID, "schema key indexes inconsistent");
+    if (nflag != s->npk || s->subject != subj) return imdb_fail(e, IMDB_ERR_INVALID, "schema key indexes inconsistent");
     return IMDB_OK;
 }
 
@@ -204,9 +214,9 @@ void imdb_schema_encode(const imdb_schema *s, imdb_buf *b)
         imdb_buf_put_u8(b, c->scale);
         imdb_buf_put_u8(b, c->flags);
     }
-    /* the key, in key order (the format design, slice 1: one column until F4's composite keys; the PK flag stays on it) */
-    imdb_buf_put_u8(b, 1);
-    imdb_buf_put_u16(b, s->pk);
+    /* the key, in key order (the format design's slice 1; F4: up to IMDB_MAX_KEY_COLS columns; each keeps its flag) */
+    imdb_buf_put_u8(b, s->npk);
+    for (int k = 0; k < s->npk; k++) imdb_buf_put_u16(b, s->key[k]);
 }
 
 int imdb_rd_ident(imdb_rd *r, char out[IMDB_MAX_IDENT + 1], imdb_err *e)
@@ -237,15 +247,13 @@ int imdb_schema_decode(imdb_rd *r, imdb_schema *s, imdb_err *e)
         c->precision = imdb_rd_u8(r);
         c->scale = imdb_rd_u8(r);
         c->flags = imdb_rd_u8(r);
-        if (c->flags & IMDB_COL_PK) s->pk = (uint16_t)i;
         if (c->flags & IMDB_COL_SUBJECT) s->subject = (int16_t)i;
     }
-    uint8_t npk = imdb_rd_u8(r); /* the key list (slice 1: exactly the one column its flag names) */
-    uint16_t k0 = imdb_rd_u16(r);
+    s->npk = imdb_rd_u8(r); /* the key list, in key order: the schema check wants it and the flags to agree */
+    if (!r->err && (s->npk < 1 || s->npk > IMDB_MAX_KEY_COLS))
+        return imdb_fail(e, IMDB_ERR_CORRUPT, "schema: a key of %u columns", s->npk);
+    for (int k = 0; k < s->npk && !r->err; k++) s->key[k] = imdb_rd_u16(r);
     if (r->err) return imdb_fail(e, IMDB_ERR_CORRUPT, "schema: truncated");
-    if (npk != 1) return imdb_fail(e, IMDB_ERR_CORRUPT, "schema: a key of %u columns (one until composite keys)", npk);
-    if (k0 != s->pk || !(s->cols[k0 < s->ncols ? k0 : 0].flags & IMDB_COL_PK))
-        return imdb_fail(e, IMDB_ERR_CORRUPT, "schema: the key list is not its PRIMARY KEY column");
     imdb_err e2 = {0};
     if (imdb_schema_check(s, &e2)) return imdb_fail(e, IMDB_ERR_CORRUPT, "schema: %s", e2.msg);
     return IMDB_OK;
@@ -460,7 +468,6 @@ int imdb_value_cmp(const imdb_value *a, const imdb_value *b)
         v2 += v1; v1 = ROTL64(v1, 17); v1 ^= v2; v2 = ROTL64(v2, 32);     \
     } while (0)
 
-uint64_t imdb_siphash24(const uint8_t *in, size_t n, uint64_t k0, uint64_t k1);
 uint64_t imdb_siphash24(const uint8_t *in, size_t n, uint64_t k0, uint64_t k1)
 {
     uint64_t v0 = 0x736f6d6570736575ull ^ k0, v1 = 0x646f72616e646f6dull ^ k1;
@@ -782,6 +789,56 @@ void imdb_format_value_safe(const imdb_value *v, imdb_buf *out)
         } else {
             imdb_buf_put_u8(out, c);
             i++;
+        }
+    }
+}
+
+/* ---- the primary key's encoding (F4) ------------------------------------------------ */
+
+/* An INT64-like value's 8 bytes, big-endian with the sign bit flipped: unsigned order is signed order */
+static void key_put_i64(uint8_t *p, int64_t v)
+{
+    uint64_t u = (uint64_t)v ^ (1ull << 63);
+    for (int i = 7; i >= 0; i--) {
+        p[i] = (uint8_t)u;
+        u >>= 8;
+    }
+}
+
+size_t imdb_key_len(const imdb_schema *s, const imdb_value *kv)
+{
+    size_t n = 0;
+    for (int k = 0; k < s->npk; k++) {
+        const imdb_value *v = &kv[k];
+        if (v->type == IMDB_T_BOOL) {
+            n += 1;
+        } else if (v->type == IMDB_T_TEXT) {
+            n += 2; /* the terminator */
+            for (uint32_t i = 0; i < v->len; i++) n += v->s[i] == 0 ? 2 : 1;
+        } else {
+            n += 8;
+        }
+    }
+    return n;
+}
+
+void imdb_key_write(const imdb_schema *s, const imdb_value *kv, uint8_t *out)
+{
+    size_t o = 0;
+    for (int k = 0; k < s->npk; k++) {
+        const imdb_value *v = &kv[k];
+        if (v->type == IMDB_T_BOOL) {
+            out[o++] = (uint8_t)(v->i != 0);
+        } else if (v->type == IMDB_T_TEXT) { /* 0x00 written 0x00 0xFF, then 0x00 0x00: a prefix sorts first */
+            for (uint32_t i = 0; i < v->len; i++) {
+                out[o++] = (uint8_t)v->s[i];
+                if (v->s[i] == 0) out[o++] = 0xFF;
+            }
+            out[o++] = 0;
+            out[o++] = 0;
+        } else {
+            key_put_i64(out + o, v->i);
+            o += 8;
         }
     }
 }

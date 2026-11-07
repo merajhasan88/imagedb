@@ -595,6 +595,15 @@ Types: INT64, DECIMAL, TEXT, BOOL, TIMESTAMP, finite FLOAT64 (exact SUM,
 rounded once) and nullable non-key columns. Comparisons with NULL, including
 NULL parameters, are refused: use IS NULL / IS NOT NULL.
 
+Primary keys: every table has one, of one column (`id INT64 PRIMARY KEY`) or of
+up to eight (`PRIMARY KEY (region, day)`, a table constraint anywhere among the
+columns), each NOT NULL and of any type but FLOAT64. Rows come in the key's
+order when no ORDER BY says otherwise. An equality on every key column reads the
+key's map; a part of the key is a scan unless an index serves it (`CREATE
+INDEX`). No UPDATE changes a key column (DELETE and INSERT instead); `ON
+CONFLICT` names the key's columns, in any order; `SHOW HISTORY t (v1, v2)`
+lists a key's versions.
+
 TEXT is UTF-8, validated, without NUL, and compared and ordered byte by byte: there
 are no collations. Platforms: see Build and quickstart.
 

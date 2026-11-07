@@ -38,6 +38,24 @@ uint64_t imdb_ver_growth(const imdb_table *t);
 uint64_t imdb_ver_next_cap(const imdb_table *t);
 const uint8_t *imdb_mem_row(const imdb_table *t, const imdb_version *v);
 int imdb_version_key(imdb_table *t, uint64_t vid, int col, imdb_value *out);
+/* F4: a key as its table's PK map keys it (design.md §5): kv the key's values in key order; v the map's key, kv[0]
+ * itself for one column, the key's encoding (codec.h imdb_key_write) for several, in kbuf or, past it, allocated.
+ * A TEXT value points where its row's does, so a key lives as long as the row it was read from (imdb_version_values) */
+typedef struct imdb_pkey {
+    imdb_value kv[IMDB_MAX_KEY_COLS];
+    imdb_value v;
+    uint8_t *heap;
+    uint8_t kbuf[64];
+} imdb_pkey;
+int imdb_pkey_make(const imdb_schema *s, imdb_pkey *k, imdb_err *e); /* v from kv (npk of them, set by the caller) */
+int imdb_pkey_of_row(const imdb_schema *s, const uint8_t *row, size_t len, imdb_pkey *k, imdb_err *e); /* canonical bytes */
+int imdb_pkey_of_values(const imdb_schema *s, const imdb_value *vals, imdb_pkey *k, imdb_err *e); /* every column's */
+int imdb_version_pkey(imdb_table *t, uint64_t vid, imdb_pkey *k); /* IMDB_OK or the code, as imdb_version_key */
+void imdb_pkey_done(imdb_pkey *k);
+/* the key's column names, "a" or "a, b", for a message (names, never values) */
+const char *imdb_key_names(const imdb_schema *s, char *out, size_t cap);
+/* the PK map's key kind: one column's own type, or the key's encoding for several */
+static inline uint8_t imdb_pk_map_type(const imdb_schema *s) { return s->npk == 1 ? s->cols[s->key[0]].type : IMDB_HKEY_BYTES; }
 /* DML on canonical row bytes; salt is a replayed op's (its commitment stays the same) or NULL. */
 int imdb_insert_row(imdb_db *db, imdb_table *t, const uint8_t *row, size_t len, const uint8_t *salt, imdb_err *e);
 /* The snapshot and pending marker writes are checked against (the active session's, else the latest). */

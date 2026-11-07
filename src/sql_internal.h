@@ -177,7 +177,7 @@ typedef struct sql_stmt {
                                                  * (0: none); DO UPDATE's SET in set_cols / set_vals, EXCLUDED as
                                                  * table2 (join_col's side 1) */
     uint8_t nconf;                              /* its target's columns (0: the primary key) */
-    char conf_cols[IMDB_MAX_INDEX_COLS][IMDB_MAX_IDENT + 1];
+    char conf_cols[IMDB_MAX_KEY_COLS][IMDB_MAX_IDENT + 1]; /* a key's columns or a unique index's (F4: the larger, 8) */
     uint16_t upsert_where;                      /* DO UPDATE ... WHERE: a condition's tree, else 0 */
     /* P2 S9: PREPARE name [(type, ...)] AS body: the body's text in the statement's (body_off, body_len), the declared
      * types; EXECUTE name [(value, ...)]: the values in vals, rowlen of them; DEALLOCATE name | ALL (prep_all) */
@@ -220,7 +220,8 @@ typedef struct sql_stmt {
     uint64_t purge_before;
     sql_lit subject;                            /* ERASE SUBJECT, SHOW DIGEST ... SUBJECT */
     bool has_subject;
-    sql_lit key;                                /* SHOW HISTORY */
+    sql_lit keys[IMDB_MAX_KEY_COLS];            /* SHOW HISTORY: the key, a value a key column (F4: (v1, v2, ...)) */
+    uint8_t nkeys;
     char set_name[IMDB_MAX_IDENT + 1];          /* SET */
     char set_value[IMDB_MAX_IDENT + 1];
     uint64_t n;                                 /* SHOW LOG n */

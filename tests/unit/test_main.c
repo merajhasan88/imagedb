@@ -121,6 +121,7 @@ int main(int argc, char **argv)
         {"view", view_tests, &view_ntests}, /* P2 S7 */
         {"abind", abind_tests, &abind_ntests}, /* P2 S7b */
         {"qmem", qmem_tests, &qmem_ntests},
+        {"ckey", ckey_tests, &ckey_ntests}, /* P2 F4 */
     };
     int failed = 0, run = 0;
     for (size_t g = 0; g < sizeof groups / sizeof *groups; g++) {

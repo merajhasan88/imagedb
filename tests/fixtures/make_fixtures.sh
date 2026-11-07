@@ -7,7 +7,7 @@
 # an UPDATE and a DELETE, ERASE SUBJECT (redacted log payloads, rewritten segments), commits after it, and
 # a replica by ship | apply, a table dropped (op 19; the manifest's tombstone), and views (P2 S7: op 20, one on
 # another, one dropped by op 21, the manifest's tombstone; one more after the first CHECKPOINT, which the replica
-# applies from the log). Both live tables are RETENTION
+# applies from the log), and (F4) a table whose key is two columns, not in their order. The live tables are RETENTION
 # FOREVER and the dropped one is kept a century, the longest but FOREVER: a fixture is frozen data, so its history
 # never expires under the tests that open it (the 24-hour default is tested by the unit tests). Every
 # statement runs cross-checked; the engine and the auditor verify both directories, and the replica's
@@ -56,6 +56,8 @@ sql "CREATE VIEW per_acct AS SELECT acct, COUNT(*) AS n FROM ev GROUP BY acct"
 sql "CREATE VIEW top AS SELECT id FROM rich WHERE bal > 150.00" # a view on a view
 sql "CREATE VIEW kind3 AS SELECT id, note FROM ev WHERE kind = 3"
 sql "DROP VIEW kind3" # a tombstone in the manifest
+sql "CREATE TABLE pair (b TEXT, a INT64, v INT64, PRIMARY KEY (a, b)) RETENTION FOREVER" # F4: a key of two columns, not in
+sql "INSERT INTO pair VALUES ('x', 1, 10), ('y', 1, 11), ('x', 2, 12), ('', -3, NULL)"    # the columns' order
 sql "CHECKPOINT"
 ship
 sql "UPDATE acct SET balance = 1.00 WHERE id <= 10"
@@ -65,6 +67,7 @@ sql "CREATE VIEW noted AS SELECT e.id, a.name FROM ev AS e JOIN acct AS a ON e.a
 sql "INSERT INTO ev VALUES (1001, 3, 2, 'after the erase'), (1002, 4, 6, NULL)"
 sql "CHECKPOINT"
 sql "INSERT INTO acct VALUES (201, 3, 9.99, 'acct-201', '2026-10-26 06:00:00')"
+sql "UPDATE pair SET v = 13 WHERE a = 2 AND b = 'x'"; sql "DELETE FROM pair WHERE a = 1 AND b = 'y'" # by the key, from the log
 ship
 for f in "$P"/log/*.ilg "$R"/log/*.ilg; do
     [ "$(head -c 4 "$f")" = ILT1 ] || { echo "make_fixtures: $f is not a tagged segment" >&2; exit 1; }

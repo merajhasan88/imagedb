@@ -1071,8 +1071,23 @@ static int parse_create(parser *p, sql_stmt *st)
     s->subject = -1;
     if (expect_kw(p, "table") || ident(p, st->table) || expect(p, TK_LP, "(")) return p->e->code;
     strcpy(s->name, st->table);
-    int pk = -1;
+    int pk = -1;                                       /* a column's own PRIMARY KEY */
+    char kname[IMDB_MAX_KEY_COLS][IMDB_MAX_IDENT + 1]; /* F4: PRIMARY KEY (a, b, ...), resolved once every column is read */
+    int nkname = -1;
+    bool said_null[IMDB_MAX_COLS] = {false};
     do {
+        if (kw(p, "primary")) { /* the table's constraint, anywhere among the columns (PRIMARY is reserved) */
+            if (expect_kw(p, "key") || expect(p, TK_LP, "(")) return p->e->code;
+            if (pk >= 0 || nkname >= 0) return imdb_fail(p->e, IMDB_ERR_INVALID, "a table has one PRIMARY KEY");
+            nkname = 0;
+            do {
+                if (nkname >= (int)IMDB_MAX_KEY_COLS)
+                    return imdb_fail(p->e, IMDB_ERR_LIMIT, "a PRIMARY KEY takes at most %u columns", IMDB_MAX_KEY_COLS);
+                if (ident(p, kname[nkname++])) return p->e->code;
+            } while (tok(p, TK_COMMA));
+            if (expect(p, TK_RP, ")")) return p->e->code;
+            continue; /* to the list's comma */
+        }
         if (s->ncols >= IMDB_MAX_COLS) return imdb_fail(p->e, IMDB_ERR_LIMIT, "more than %u columns", IMDB_MAX_COLS);
         imdb_column *c = &s->cols[s->ncols];
         if (ident(p, c->name) || col_type(p, c)) return p->e->code;
@@ -1081,8 +1096,9 @@ static int parse_create(parser *p, sql_stmt *st)
             if (kw(p, "primary")) {
                 if (expect_kw(p, "key")) return p->e->code;
                 if (c->flags & IMDB_COL_PK) return fail_at(p, "one PRIMARY KEY per column");
+                if (pk >= 0 || nkname >= 0)
+                    return imdb_fail(p->e, IMDB_ERR_INVALID, "a table has one PRIMARY KEY (PRIMARY KEY (a, b) names several columns)");
                 c->flags |= IMDB_COL_PK;
-                if (pk >= 0) return imdb_fail(p->e, IMDB_ERR_INVALID, "only one PRIMARY KEY column is supported");
                 pk = s->ncols;
             } else if (kw(p, "subject")) {
                 if (s->subject >= 0) return imdb_fail(p->e, IMDB_ERR_INVALID, "only one SUBJECT column is supported");
@@ -1105,11 +1121,29 @@ static int parse_create(parser *p, sql_stmt *st)
         } else if (null_spec != 2) {
             c->flags |= IMDB_COL_NULLABLE; /* the SQL default */
         }
+        said_null[s->ncols] = null_spec == 1;
         s->ncols++;
     } while (tok(p, TK_COMMA));
     if (expect(p, TK_RP, ")")) return p->e->code;
-    if (pk < 0) return imdb_fail(p->e, IMDB_ERR_INVALID, "table needs a PRIMARY KEY column");
-    s->pk = (uint16_t)pk;
+    if (!s->ncols) return imdb_fail(p->e, IMDB_ERR_INVALID, "table must have 1..%u columns", IMDB_MAX_COLS);
+    if (pk >= 0) {
+        s->npk = 1;
+        s->key[0] = (uint16_t)pk;
+    } else if (nkname > 0) { /* each named column the table's, once; NOT NULL by being a key column */
+        for (int k = 0; k < nkname; k++) {
+            int ci = imdb_schema_col(s, kname[k]);
+            if (ci < 0) return imdb_fail(p->e, IMDB_ERR_INVALID, "PRIMARY KEY names column %s, which the table lacks", kname[k]);
+            if (s->cols[ci].flags & IMDB_COL_PK)
+                return imdb_fail(p->e, IMDB_ERR_INVALID, "PRIMARY KEY names column %s twice", kname[k]);
+            if (said_null[ci])
+                return imdb_fail(p->e, IMDB_ERR_INVALID, "column %s: PRIMARY KEY and SUBJECT columns are NOT NULL", kname[k]);
+            s->cols[ci].flags = (uint8_t)((s->cols[ci].flags | IMDB_COL_PK) & ~IMDB_COL_NULLABLE);
+            s->key[k] = (uint16_t)ci;
+        }
+        s->npk = (uint8_t)nkname;
+    } else {
+        return imdb_fail(p->e, IMDB_ERR_INVALID, "table needs a PRIMARY KEY column (or PRIMARY KEY (a, b, ...))");
+    }
     if (kw(p, "retention")) {
         st->has_retention = true;
         return parse_retention(p, &st->retention_us);
@@ -1346,8 +1380,8 @@ static int on_conflict(parser *p, sql_stmt *st)
     if (expect_kw(p, "conflict")) return p->e->code;
     if (tok(p, TK_LP)) {
         do {
-            if (st->nconf >= IMDB_MAX_INDEX_COLS)
-                return imdb_fail(p->e, IMDB_ERR_LIMIT, "ON CONFLICT names more than %u columns", IMDB_MAX_INDEX_COLS);
+            if (st->nconf >= IMDB_MAX_KEY_COLS)
+                return imdb_fail(p->e, IMDB_ERR_LIMIT, "ON CONFLICT names more than %u columns", IMDB_MAX_KEY_COLS);
             if (ident(p, st->conf_cols[st->nconf++])) return p->e->code;
         } while (tok(p, TK_COMMA));
         if (expect(p, TK_RP, ")")) return p->e->code;
@@ -2061,7 +2095,18 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
             if (p.t[p.i].kind == TK_INT) rc = uint_lit(&p, &st->n);
         } else if (kw(&p, "history")) {
             st->kind = ST_SHOW_HISTORY;
-            if (!(rc = ident(&p, st->table))) rc = literal(&p, &st->key);
+            if (!(rc = ident(&p, st->table)) && tok(&p, TK_LP)) { /* F4: a key of several columns, (v1, v2, ...) */
+                do {
+                    if (st->nkeys >= IMDB_MAX_KEY_COLS) {
+                        rc = imdb_fail(p.e, IMDB_ERR_LIMIT, "a key of more than %u values", IMDB_MAX_KEY_COLS);
+                        break;
+                    }
+                    rc = literal(&p, &st->keys[st->nkeys++]);
+                } while (!rc && tok(&p, TK_COMMA));
+                if (!rc) rc = expect(&p, TK_RP, ")");
+            } else if (!rc && !(rc = literal(&p, &st->keys[0]))) {
+                st->nkeys = 1;
+            }
         } else if (kw(&p, "digest")) {
             st->kind = ST_SHOW_DIGEST;
             if (p.t[p.i].kind == TK_IDENT && !is_reserved(&p, p.i)) {

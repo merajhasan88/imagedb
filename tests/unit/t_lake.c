@@ -686,7 +686,7 @@ static bool same_state(imdb_db *a, imdb_db *b, char *why, size_t wl)
         /* the indexes answer alike: every key at every snapshot from the horizon on */
         for (uint64_t vid = imdb_v_next(x, 0); vid < x->nver; vid = imdb_v_next(x, vid + 1)) { /* those held */
             imdb_value k;
-            if (imdb_version_key(x, vid, x->s.pk, &k)) continue;
+            if (imdb_version_key(x, vid, x->s.key[0], &k)) continue;
             for (uint64_t s = x->horizon; s <= a->seq; s += 1 + a->seq / 7)
                 if (imdb_lookup_pk(a, x, &k, s) != imdb_lookup_pk(b, y, &k, s)) {
                     snprintf(why, wl, "table %s key lookup at %llu", x->s.name, (unsigned long long)s);

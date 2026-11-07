@@ -794,6 +794,7 @@ static void t_copy_dump_refused(void)
     snprintf(s.cols[0].name, sizeof s.cols[0].name, "id");
     s.cols[0].type = IMDB_T_INT64;
     s.cols[0].flags = IMDB_COL_PK;
+    s.npk = 1;
     s.subject = -1;
     OK(imdb_begin(db, E));
     OK(imdb_create_table_ex(db, &s, 1500000, E));
@@ -813,6 +814,47 @@ static void t_copy_dump_refused(void)
     free(w.p);
     free(d.p);
     done(db);
+}
+
+/* F4: a key of several columns is dumped as the table's constraint after its columns, and restored (into the other
+ * digest algorithm) to the same key, rows and dump; its rows in the key's order, NULLs kept */
+static void t_copy_dump_ckey(void)
+{
+    const char *base = test_tmpdir();
+    char p[600], q[600];
+    snprintf(p, sizeof p, "%s/primary", base);
+    snprintf(q, sizeof q, "%s/restored", base);
+    OK(imdb_init(p, false, NULL, E));
+    memset(&g_io, 0, sizeof g_io);
+    g_io.outcap = 1u << 20;
+    g_io.out = malloc(g_io.outcap + 1);
+    CHECK(g_io.out);
+    imdb_db *db = open_at(p);
+    CHECK(db);
+    if (!db || !g_io.out) return;
+    CHECK(run("CREATE TABLE pair (v INT64, b TEXT, a INT64, PRIMARY KEY (a, b)) RETENTION FOREVER") == 0);
+    CHECK(run("INSERT INTO pair VALUES (1, 'y', 2), (2, 'x', 2), (3, '', -1), (NULL, 'z', 0)") == 0);
+    outb d1 = {0}, d2 = {0};
+    OK(imdb_dump(db, 0, outb_write, &d1, E));
+    CHECK(d1.p && strstr(d1.p, "CREATE TABLE pair (v INT64, b TEXT, a INT64, PRIMARY KEY (a, b)) RETENTION FOREVER;\n"));
+    CHECK(d1.p && strstr(d1.p, " (BATCH 10000);\n1,y,2\n2,x,2\n3,\"\",-1\n,z,0\n\\.\n")); /* as the scan walks them, NULL empty */
+    uint8_t other = db->meta.digest_alg == IMDB_DIGEST_ALG_LTHASH16 ? IMDB_DIGEST_ALG_LTHASH16_TREE : IMDB_DIGEST_ALG_LTHASH16;
+    imdb_session_close(&g_s);
+    imdb_close(db);
+    OK(imdb_init_primary_alg(q, NULL, other, E));
+    imdb_db *dst = open_at(q);
+    CHECK(dst);
+    if (!dst) return;
+    CHECK(restore_text(d1.p, d1.n) == 0);
+    imdb_table *t = imdb_table_by_name(dst, "pair");
+    CHECK(t && t->s.npk == 2 && t->s.key[0] == 2 && t->s.key[1] == 1);
+    OK(imdb_dump(dst, 0, outb_write, &d2, E));
+    const char *a1 = d1.p ? strchr(d1.p, '\n') : NULL, *a2 = d2.p ? strchr(d2.p, '\n') : NULL;
+    CHECK(a1 && a2 && !strcmp(a1, a2)); /* past the first line (the commit), the same dump */
+    CHECK(run("VERIFY") == 0);
+    done(dst);
+    free(d1.p);
+    free(d2.p);
 }
 
 /* the format's fixtures (tests/fixtures: tables kept FOREVER, a dropped one kept a century), each opened read-only:
@@ -880,5 +922,6 @@ const test_case copy_tests[] = {
     {"copy_dump", t_copy_dump},
     {"copy_dump_refused", t_copy_dump_refused},
     {"copy_dump_fixtures", t_copy_dump_fixtures},
+    {"copy_dump_ckey", t_copy_dump_ckey},
 };
 const size_t copy_ntests = sizeof copy_tests / sizeof copy_tests[0];
