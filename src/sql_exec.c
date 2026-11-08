@@ -2616,7 +2616,8 @@ static bool seg_skipped(const qspec *q, const imdb_segment *g)
     bool skip = false;
     for (uint16_t i = 0; i < q->np && !skip; i++) {
         const bpred *b = &q->p[i];
-        const imdb_segzone *zc = &g->zone[b->col]; /* the descriptor's: no image */
+        imdb_segzone zt;
+        const imdb_segzone *zc = imdb_seg_zone(q->t, g, b->col, &zt); /* the descriptor's: no image */
         if (b->op == CMP_ISNULL) skip = !zc->has_null;
         else if (b->type == IMDB_T_TEXT) continue; /* TEXT has no min/max */
         else if (b->op == CMP_NOTNULL || b->neg) skip = !zc->has;
@@ -2675,6 +2676,10 @@ static int path_scan(xctx *x, const qspec *q, sink *k, imdb_err *e)
         for (uint16_t i = 0; i < q->np; i++) {
             const bpred *b = &q->p[i];
             const imdb_segcol *c = &gi->col[b->col];
+            if (c->is_cst) { /* F1: a column this segment lacks, one value in every row left (all data): all pass or none */
+                if (!pred_ok(b, &c->cst)) memset(bits, 0, words * sizeof *bits);
+                continue;
+            }
             /* VALID is whole 64-bit words: the section is 8-byte aligned and its padding is zero */
             const uint64_t *vw = (const uint64_t *)(const void *)c->valid;
             if (b->op == CMP_ISNULL || b->op == CMP_NOTNULL) {
@@ -2707,6 +2712,16 @@ static int path_scan(xctx *x, const qspec *q, sink *k, imdb_err *e)
                 agg_acc *a = &k->acc[i];
                 uint8_t ag = k->st->items[i].agg;
                 const imdb_segcol *sc = ag == AGG_COUNT_STAR ? NULL : &gi->col[k->item_col[i]];
+                if (sc && sc->is_cst) { /* F1: its missing value in every row matched: counted, and summed, as many times */
+                    uint64_t cc = 0;
+                    for (size_t w = 0; w < words && !sc->cst.null; w++) cc += (uint64_t)__builtin_popcountll(bits[w]);
+                    a->count += cc;
+                    if (cc) a->has = true;
+                    if (ag == AGG_SUM && s_is_f64(t, k->item_col[i]))
+                        for (uint64_t j = 0; j < cc && !rc; j++) rc = imdb_fsum_add(&a->fsum, sc->cst.i, e); /* exact: each */
+                    else if (ag == AGG_SUM) a->sum += (__int128)sc->cst.i * (__int128)cc;
+                    continue;
+                }
                 const uint64_t *m = bits, *vw = sc ? (const uint64_t *)(const void *)sc->valid : NULL;
                 if (vw) { /* NULLs are neither counted nor summed */
                     for (size_t w = 0; w < words; w++) tmp[w] = bits[w] & vw[w];
@@ -4031,6 +4046,49 @@ static int exec_show_views(xctx *x, imdb_result *r, imdb_err *e)
     }
     snprintf(r->status, sizeof r->status, "%llu views", (unsigned long long)r->nrows);
     return res_finish(r, e);
+}
+
+
+int imdb_sql_names_ident(const char *text, size_t len, const char *ident, bool *out, imdb_err *e)
+{
+    *out = false;
+    sql_tok *tk = NULL;
+    uint32_t nt = 0;
+    int rc = imdb_sql_lex(text, len, &tk, &nt, e);
+    if (rc) return rc;
+    size_t il = strlen(ident);
+    for (uint32_t k = 0; k < nt && !*out; k++)
+        *out = tk[k].kind == TK_IDENT && tk[k].len == il && strncasecmp(text + tk[k].off, ident, il) == 0;
+    imdb_free(tk);
+    return IMDB_OK;
+}
+
+int imdb_view_names_col(const imdb_db *db, uint32_t table, const char *col, const char **name, imdb_err *e)
+{
+    *name = NULL;
+    if (!db->nviews) return IMDB_OK;
+    bool *rd = imdb_alloc_array(db->nviews, sizeof *rd, e);
+    if (!rd) return e->code;
+    for (bool more = true; more;) { /* the live views reading the table, through other views too: to a fixed point */
+        more = false;
+        for (uint32_t i = 0; i < db->nviews; i++) {
+            const imdb_view *v = &db->views[i];
+            for (uint16_t k = 0; !rd[i] && !v->dropped_at && v->def && k < v->def->ndeps; k++) {
+                const imdb_viewdep *d = &v->def->deps[k];
+                if ((d->kind == IMDB_VIEWDEP_TABLE && d->id == table) ||
+                    (d->kind == IMDB_VIEWDEP_VIEW && d->id < db->nviews && rd[d->id]))
+                    rd[i] = more = true;
+            }
+        }
+    }
+    int rc = IMDB_OK;
+    for (uint32_t i = 0; i < db->nviews && !rc && !*name; i++) {
+        bool has = false;
+        if (rd[i] && !(rc = imdb_sql_names_ident(db->views[i].def->text, db->views[i].def->text_len, col, &has, e)) && has)
+            *name = db->views[i].name;
+    }
+    imdb_free(rd);
+    return rc;
 }
 
 int imdb_view_rebind(imdb_db *db, const imdb_viewdef *def, imdb_err *e)
@@ -6916,6 +6974,17 @@ static int insert_query(xctx *x, const sql_stmt *st, imdb_table *t, const int *m
     return rc;
 }
 
+/* F1: what an INSERT (or a COPY) gives a column it leaves out: its DEFAULT, which an ADD COLUMN set (the value the
+ * rows before it read, its missing value), else NULL: a CREATE TABLE column has none before F2. PostgreSQL's ADD
+ * ... DEFAULT sets both; a later SET DEFAULT (F1's stage 4) will part them. */
+static imdb_value col_default(const imdb_table *t, uint16_t c)
+{
+    const imdb_column *col = &t->s.cols[c];
+    imdb_value v = {.type = col->type, .scale = col->scale, .null = true};
+    if (t->hist.nvers) v = t->hist.tcol[t->hist.vers[t->hist.nvers - 1].pos[c]].missing;
+    return v;
+}
+
 static int exec_insert(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
 {
     if ((st->nsub || st->src) && !x->own) wceil_set(x); /* P2 S8: what it reads */
@@ -6937,11 +7006,11 @@ static int exec_insert(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
             seen[c] = true;
             map[i] = c;
         }
-        for (uint16_t c = 0; c < t->s.ncols; c++) { /* a column left out is NULL */
+        for (uint16_t c = 0; c < t->s.ncols; c++) { /* a column left out is its DEFAULT (F1: an ADD's), else NULL */
             if (seen[c]) continue;
-            if (!(t->s.cols[c].flags & IMDB_COL_NULLABLE))
+            vals[c] = col_default(t, c);
+            if (vals[c].null && !(t->s.cols[c].flags & IMDB_COL_NULLABLE))
                 return imdb_fail(e, IMDB_ERR_CONSTRAINT, "column %s needs a value: it is NOT NULL", t->s.cols[c].name);
-            vals[c] = (imdb_value){.type = t->s.cols[c].type, .scale = t->s.cols[c].scale, .null = true};
         }
     } else {
         for (uint16_t i = 0; i < width; i++) map[i] = i;
@@ -6970,8 +7039,9 @@ static int exec_insert(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
 /* ---- P2 S10: COPY (design.md §5, Import and export) -------------------------------------------------------------- */
 static void cell_text(const imdb_cell *c, imdb_buf *out, bool safe);
 
-/* COPY's columns: a list as INSERT's (FROM: a column left out is NULL, refused when NOT NULL; TO, vals NULL: any of
- * them, P2 S17: S10 refused a TO that left out a NOT NULL column), else every column in order */
+/* COPY's columns: a list as INSERT's (FROM: a column left out is its DEFAULT, F1: an ADD's, else NULL, refused when NOT
+ * NULL; TO, vals NULL: any of them, P2 S17: S10 refused a TO that left out a NOT NULL column), else every column in
+ * order */
 static int copy_columns(imdb_table *t, const sql_stmt *st, int *map, uint16_t *width, imdb_value *vals, imdb_err *e)
 {
     *width = st->ncols ? st->ncols : t->s.ncols;
@@ -6989,9 +7059,10 @@ static int copy_columns(imdb_table *t, const sql_stmt *st, int *map, uint16_t *w
     }
     for (uint16_t c = 0; c < t->s.ncols; c++) {
         if (seen[c]) continue;
-        if (vals && !(t->s.cols[c].flags & IMDB_COL_NULLABLE))
+        if (!vals) continue;
+        vals[c] = col_default(t, c); /* F1: its DEFAULT, as INSERT's */
+        if (vals[c].null && !(t->s.cols[c].flags & IMDB_COL_NULLABLE))
             return imdb_fail(e, IMDB_ERR_CONSTRAINT, "column %s needs a value: it is NOT NULL", t->s.cols[c].name);
-        if (vals) vals[c] = (imdb_value){.type = t->s.cols[c].type, .scale = t->s.cols[c].scale, .null = true};
     }
     return IMDB_OK;
 }
@@ -8190,7 +8261,7 @@ static int check_iso(const sql_stmt *st, imdb_err *e)
 static bool is_write(uint8_t k)
 {
     return k == ST_CREATE || k == ST_INSERT || k == ST_UPDATE || k == ST_DELETE || k == ST_CREATE_INDEX ||
-           k == ST_DROP_INDEX || k == ST_ALTER_RETENTION || k == ST_DROP_TABLE || k == ST_COPY_FROM || /* P2 S10 */
+           k == ST_DROP_INDEX || k == ST_ALTER_RETENTION || k == ST_ALTER_TABLE || k == ST_DROP_TABLE || k == ST_COPY_FROM || /* P2 S10 */
            k == ST_CREATE_VIEW || k == ST_DROP_VIEW; /* P2 S7 */
 }
 
@@ -8207,7 +8278,7 @@ static int stmt_class(int kind)
     case ST_COPY_TO: return IMDB_SC_READ; /* P2 S10 */
     case ST_BEGIN: case ST_COMMIT: case ST_ROLLBACK: case ST_SAVEPOINT: case ST_ROLLBACK_TO: case ST_RELEASE:
     case ST_SET_TXN: return IMDB_SC_TXN;
-    case ST_CREATE: case ST_CREATE_INDEX: case ST_DROP_INDEX: case ST_DROP_TABLE: case ST_ALTER_RETENTION:
+    case ST_CREATE: case ST_CREATE_INDEX: case ST_DROP_INDEX: case ST_DROP_TABLE: case ST_ALTER_RETENTION: case ST_ALTER_TABLE:
     case ST_CREATE_VIEW: case ST_DROP_VIEW: /* P2 S7 */
         return IMDB_SC_DDL;
     case ST_CHECKPOINT: case ST_COMPACT: case ST_ERASE_SUBJECT: case ST_ERASE_WHERE: case ST_VERIFY: return IMDB_SC_PHYSICAL;
@@ -8480,12 +8551,12 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
      * way */
     atomic_store_explicit(&ss->cancel, false, memory_order_relaxed);
     x.checks = !physical && st->kind != ST_COMMIT && st->kind != ST_CREATE && st->kind != ST_CREATE_INDEX &&
-               st->kind != ST_DROP_INDEX && st->kind != ST_ALTER_RETENTION && st->kind != ST_DROP_TABLE &&
+               st->kind != ST_DROP_INDEX && st->kind != ST_ALTER_RETENTION && st->kind != ST_ALTER_TABLE && st->kind != ST_DROP_TABLE &&
                st->kind != ST_CREATE_VIEW && st->kind != ST_DROP_VIEW; /* each commits on its own */
     x.next_check = TICK_ROWS;
     if (x.checks && ss->stmt_timeout_ms) x.deadline_ns = mono_ns() + (uint64_t)ss->stmt_timeout_ms * 1000000u;
     if (txn && (st->kind == ST_CREATE || st->kind == ST_CREATE_INDEX || st->kind == ST_DROP_INDEX ||
-                st->kind == ST_ALTER_RETENTION || st->kind == ST_DROP_TABLE || st->kind == ST_CREATE_VIEW ||
+                st->kind == ST_ALTER_RETENTION || st->kind == ST_ALTER_TABLE || st->kind == ST_DROP_TABLE || st->kind == ST_CREATE_VIEW ||
                 st->kind == ST_DROP_VIEW)) {
         rc = imdb_fail(e, IMDB_ERR_STATE, "%s commits on its own: run it outside the transaction",
                        st->kind == ST_CREATE         ? "CREATE TABLE"
@@ -8533,6 +8604,41 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
         rc = imdb_create_table_ex(db, &st->schema, st->has_retention ? st->retention_us : IMDB_RETAIN_DEFAULT_US, e);
         if (!rc) snprintf(r->status, sizeof r->status, "CREATE TABLE %s", st->schema.name);
         break;
+    case ST_ALTER_TABLE: { /* F1: op 22 */
+        imdb_table *t = imdb_table_by_name(db, st->table);
+        if (!t) {
+            rc = imdb_fail(e, IMDB_ERR_INVALID, "no table %s", st->table);
+            break;
+        }
+        imdb_op o;
+        memset(&o, 0, sizeof o);
+        o.akind = st->alter_kind;
+        if (o.akind == IMDB_ALTER_ADD_COLUMN) {
+            o.acol = st->schema.cols[0];
+            o.adef = (imdb_value){.type = o.acol.type, .scale = o.acol.scale, .null = true};
+            imdb_err e2 = {0};
+            if (o.acol.type == IMDB_T_DECIMAL &&
+                (o.acol.precision < 1 || o.acol.precision > 18 || o.acol.scale > o.acol.precision))
+                rc = imdb_fail(e, IMDB_ERR_INVALID, "column %s: DECIMAL(p,s) needs 1<=p<=18, 0<=s<=p", o.acol.name);
+            else if (st->has_alter_def && bind_lit(&x, &st->alter_def, &o.acol, false, &o.adef, e))
+                rc = e->code;
+            else if (!o.adef.null && imdb_value_check(&o.acol, &o.adef, &e2))
+                rc = imdb_fail(e, IMDB_ERR_INVALID, "column %s: its DEFAULT: %s", o.acol.name, e2.msg);
+            else if (!(o.acol.flags & IMDB_COL_NULLABLE) && o.adef.null)
+                rc = imdb_fail(e, IMDB_ERR_INVALID, "column %s is NOT NULL: give it a DEFAULT, which the rows there read",
+                               o.acol.name);
+        } else if (o.akind == IMDB_ALTER_RENAME_COLUMN) {
+            int c = imdb_schema_col(&t->s, st->alter_old);
+            if (c < 0) rc = imdb_fail(e, IMDB_ERR_INVALID, "table %s has no column %s", st->table, st->alter_old);
+            else o.apos = t->hist.vers[t->hist.nvers - 1].pos[c];
+            o.aname = st->alter_new;
+        } else {
+            o.aname = st->alter_new;
+        }
+        if (!rc) rc = imdb_alter_table(db, t, &o, e);
+        if (!rc) snprintf(r->status, sizeof r->status, "ALTER TABLE %s", st->table);
+        break;
+    }
     case ST_ALTER_RETENTION: {
         imdb_table *t = imdb_table_by_name(db, st->table);
         rc = t ? imdb_set_retention(db, t, st->retention_us, e) : imdb_fail(e, IMDB_ERR_INVALID, "no table %s", st->table);

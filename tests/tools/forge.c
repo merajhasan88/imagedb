@@ -13,6 +13,9 @@
  *   imdb-forge lie-tombstone <dir>         move a purged tombstone to another subject, re-hash the
  *                                          lake and re-sign the log from the snapshot's commit
  *                                          (a malicious or buggy writer: everything consistent)
+ *   imdb-forge lie-missing <dir>           F1: a row older than its segment's version reads another value than its
+ *                                          missing one at a column added since (its zone map made again),
+ *                                          the lake re-hashed and the log re-signed from the snapshot's commit
  *   imdb-forge durable-rewind <dir>        DURABLE as a writer that crashed during its last append
  *                                          left it (naming the commit before the last frame)
  *   imdb-forge rotate-foreign <dir>         append a key rotation signed by a key that is not the writer's
@@ -412,7 +415,7 @@ static void lie_tombstone(const char *dir)
             uint8_t *al = aligned_alloc(32, (sn + 31) & ~(size_t)31);
             memcpy(al, raw, sn);
             imdb_segment *g;
-            if (imdb_segment_parse(&mt->s, al, sn, NULL, &g, &e)) die("segment", &e);
+            if (imdb_segment_parse_h(&mt->hist, al, sn, NULL, &g, &e)) die("segment", &e); /* F1: by its version */
             const imdb_segimg *gi = imdb_seg_pin(NULL, g, &e); /* a parse of its own: apart, resident */
             size_t at = SIZE_MAX;
             for (uint32_t r = 0; r < g->nrows && at == SIZE_MAX; r++)
@@ -457,6 +460,124 @@ static void lie_tombstone(const char *dir)
     }
     if (!done) {
         fputs("imdb-forge: no purged tombstone with an INT64 subject\n", stderr);
+        exit(1);
+    }
+    imdb_manifest_free(&m);
+    close(ofd);
+    free(man);
+    free(head);
+}
+
+/* F1: a row of an older version than its segment holds, at a column added after it, another value than its missing one
+ * (no commitment covers that value: the readers would read it): the segment's zone map recomputed for it, so that only
+ * the rule refuses it; segment, its DV, the manifest and LAKE_HEAD re-hashed, the log re-signed from the snapshot's
+ * commit. Wants an INT64 column added by an ALTER and a segment built after it holding a row from before it. */
+static void lie_missing(const char *dir)
+{
+    char p[1200];
+    snprintf(p, sizeof p, "%s/LAKE_HEAD", dir);
+    size_t hn;
+    uint8_t *head = slurp(p, &hn);
+    char *mpos = strstr((char *)head, "manifest ");
+    unsigned long long S = 0;
+    if (!mpos || sscanf((char *)head, "imagedb-lake 1\nseq %llu", &S) != 1) exit(1);
+    char mname[80];
+    memcpy(mname, mpos + 9, 64);
+    strcpy(mname + 64, ".man");
+    snprintf(p, sizeof p, "%s/objects", dir);
+    int ofd = open(p, O_RDONLY | O_DIRECTORY);
+    snprintf(p, sizeof p, "%s/objects/%s", dir, mname);
+    size_t mn;
+    uint8_t *man = slurp(p, &mn);
+    imdb_manifest m;
+    imdb_err e = {0};
+    if (imdb_manifest_parse(man, mn, &m, &e)) die("manifest", &e);
+    bool done = false;
+    for (uint32_t ti = 0; ti < m.nt && !done; ti++) {
+        const imdb_manifest_tab *mt = &m.t[ti];
+        if (mt->hist.nvers < 2) continue;
+        for (uint32_t k = 0; k < mt->nseg && !done; k++) {
+            char sname[80];
+            imdb_hex(mt->seg[k].seg, 32, sname);
+            strcat(sname, ".seg");
+            snprintf(p, sizeof p, "%s/objects/%s", dir, sname);
+            size_t sn;
+            uint8_t *raw = slurp(p, &sn);
+            uint8_t *al = aligned_alloc(32, (sn + 31) & ~(size_t)31);
+            memcpy(al, raw, sn);
+            imdb_segment *g;
+            if (imdb_segment_parse_h(&mt->hist, al, sn, NULL, &g, &e)) die("segment", &e);
+            const imdb_segimg *gi = imdb_seg_pin(NULL, g, &e); /* a parse of its own: apart, resident */
+            const imdb_sver *gv = &mt->hist.vers[gi->gver];
+            size_t at = SIZE_MAX;
+            uint32_t col = 0;
+            for (uint32_t r = 0; r < g->nrows && at == SIZE_MAX; r++) {
+                const imdb_sver *rv = imdb_hist_at(&mt->hist, gi->begin[r]);
+                for (uint16_t c = 0; !gi->flags[r] && c < gv->s.ncols && at == SIZE_MAX; c++)
+                    if (rv->at[gv->pos[c]] < 0 && gv->s.cols[c].type == IMDB_T_INT64 && gi->ocol[c].i64 &&
+                        (!gi->ocol[c].valid || (gi->ocol[c].valid[r >> 3] >> (r & 7) & 1))) {
+                        at = (size_t)((const uint8_t *)&gi->ocol[c].i64[r] - gi->bytes);
+                        col = c;
+                    }
+            }
+            if (at == SIZE_MAX) {
+                imdb_segment_free(g);
+                free(raw);
+                continue;
+            }
+            imdb_le64(raw + at, imdb_get_le64(raw + at) + 1000); /* another value than its missing one */
+            /* the zone map of that column made again from the stored values, as the builder makes it */
+            uint32_t nsec = imdb_get_le32(raw + 56);
+            const uint8_t *zd = raw + IMDB_SEG_HEADER + 24u * (nsec - 1);
+            if (imdb_get_le32(zd) != SEG_ZONEMAP) exit(1);
+            uint8_t *z = raw + imdb_get_le64(zd + 8) + 24u * col;
+            size_t base = (size_t)((const uint8_t *)gi->ocol[col].i64 - gi->bytes);
+            bool has = false;
+            int64_t mn2 = 0, mx2 = 0;
+            for (uint32_t r = 0; r < g->nrows; r++) {
+                if (gi->flags[r] || (gi->ocol[col].valid && !(gi->ocol[col].valid[r >> 3] >> (r & 7) & 1))) continue;
+                int64_t v = (int64_t)imdb_get_le64(raw + base + 8u * r);
+                if (!has || v < mn2) mn2 = v;
+                if (!has || v > mx2) mx2 = v;
+                has = true;
+            }
+            z[0] = has;
+            imdb_le64(z + 8, (uint64_t)mn2);
+            imdb_le64(z + 16, (uint64_t)mx2);
+            imdb_segment_free(g);
+            char nseg[80], nman[80];
+            if (obj_rename(ofd, sname, raw, sn, ".seg", nseg)) exit(1);
+            uint8_t nsh[32];
+            imdb_unhex(nseg, 64, nsh, 32);
+            if (memcmp(mt->seg[k].dv, (uint8_t[32]){0}, 32) != 0) { /* the DV names its segment */
+                char dname[80], ndv[80];
+                imdb_hex(mt->seg[k].dv, 32, dname);
+                strcat(dname, ".dv");
+                snprintf(p, sizeof p, "%s/objects/%s", dir, dname);
+                size_t dn;
+                uint8_t *dv = slurp(p, &dn);
+                replace_hash(dv, dn, mt->seg[k].seg, nsh);
+                if (obj_rename(ofd, dname, dv, dn, ".dv", ndv)) exit(1);
+                uint8_t ndh[32];
+                imdb_unhex(ndv, 64, ndh, 32);
+                replace_hash(man, mn, mt->seg[k].dv, ndh);
+                free(dv);
+            }
+            replace_hash(man, mn, mt->seg[k].seg, nsh);
+            if (obj_rename(ofd, mname, man, mn, ".man", nman)) exit(1);
+            man_swap sw;
+            imdb_unhex(mname, 64, sw.old, 32);
+            imdb_unhex(nman, 64, sw.new_, 32);
+            memcpy(mpos + 9, nman, 64);
+            snprintf(p, sizeof p, "%s/LAKE_HEAD", dir);
+            spit(p, head, hn);
+            resign_from(dir, S, swap_manifest, &sw);
+            free(raw);
+            done = true;
+        }
+    }
+    if (!done) {
+        fputs("imdb-forge: no segment row of an older version under an added INT64 column\n", stderr);
         exit(1);
     }
     imdb_manifest_free(&m);
@@ -809,9 +930,9 @@ static void manifest_lie(const char *dir, const char *kind)
         nb.p[136] = 1;
     } else if (strcmp(kind, "column") == 0 && m.nt && m.t[m.nt - 1].nidx && !m.nv) {
         imdb_buf_put(&nb, man, mn);
-        uint16_t c = m.t[m.nt - 1].s.ncols; /* the last index's column, little endian, before the three u64 */
-        nb.p[nb.len - 186] = (uint8_t)c; /* then the views section (12 + a count of 0) and the nine empty ones (16 each) */
-        nb.p[nb.len - 185] = (uint8_t)(c >> 8);
+        uint16_t c = m.t[m.nt - 1].s.ncols; /* the last index's column, little endian, before the three u64 and F1's u32 */
+        nb.p[nb.len - 190] = (uint8_t)c; /* then the views section (12 + a count of 0) and the nine empty ones (16 each) */
+        nb.p[nb.len - 189] = (uint8_t)(c >> 8);
     } else if (strcmp(kind, "section") == 0 && imdb_get_le32(man + 8) == 7 && mn > 144 + 144) {
         imdb_buf_put(&nb, man, mn); /* the format design's slice 1: the nine reserved sections end it, 16 bytes each */
         nb.p[nb.len - 132] = 1;     /* the sequences section's u32 count: a later format's */
@@ -836,10 +957,21 @@ static void manifest_lie(const char *dir, const char *kind)
         if (sl < 3 || 164 + (size_t)sl > mn) exit(1);
         nb.p[164 + sl - 2] = (uint8_t)k;
         nb.p[164 + sl - 1] = (uint8_t)(k >> 8);
+    } else if (strcmp(kind, "default") == 0 && imdb_get_le32(man + 8) == 7) {
+        /* F1: the history's ADD of an INT64 NOT NULL column n (u8 kind 1, u8 1, "n", type, precision, scale, flags,
+         * u8 has 1, then its u64 DEFAULT) given another DEFAULT: the history still ends at the schema */
+        imdb_buf_put(&nb, man, mn);
+        static const uint8_t pat[8] = {1, 1, 'n', IMDB_T_INT64, 0, 0, 0, 1};
+        size_t at = 0;
+        for (size_t i = mn - 16; i > 0 && !at; i--)
+            if (memcmp(nb.p + i, pat, sizeof pat) == 0) at = i + sizeof pat;
+        if (!at) exit(1);
+        imdb_le64(nb.p + at, imdb_get_le64(nb.p + at) + 1);
     } else {
         fputs("imdb-forge: manifest-lie DIR boundary (none yet) | column (an index in the last table) | section (a reserved"
               " one not empty) | nsections (ten) | order (a reserved one out of order) | later (the last one a later"
-              " format's, longer) | keylist (table 0's key list another column)\n", stderr);
+              " format's, longer) | keylist (table 0's key list another column) | default (an added column n's DEFAULT"
+              " another in the history)\n", stderr);
         exit(1);
     }
     if (nb.err) exit(1);
@@ -888,6 +1020,13 @@ static void index_lie(const char *dir, const char *kind)
     } else if (strcmp(kind, "duplicate") == 0 && db->t[0]->nidx) {
         op.code = IMDB_OP_CREATE_INDEX;
         snprintf(nm, sizeof nm, "%s", db->t[0]->idx[0].d.name);
+    } else if (strcmp(kind, "alter-view") == 0) { /* F1: ADD COLUMN k (INT64, NULL) to table 0, a name a view reading it holds */
+        op.code = IMDB_OP_ALTER_TABLE;
+        op.akind = IMDB_ALTER_ADD_COLUMN;
+        snprintf(op.acol.name, sizeof op.acol.name, "k");
+        op.acol.type = IMDB_T_INT64;
+        op.acol.flags = IMDB_COL_NULLABLE;
+        op.adef = (imdb_value){.type = IMDB_T_INT64, .null = true};
     } else if (strcmp(kind, "drop-absent") == 0) {
         op.code = IMDB_OP_DROP_INDEX;
         snprintf(nm, sizeof nm, "no_such_index");
@@ -962,7 +1101,7 @@ static void index_lie(const char *dir, const char *kind)
         return;
     } else {
         fputs("imdb-forge: index-lie DIR column | duplicate (needs an index) | drop-absent | unique-dup (needs a unique index) | "
-              "pk-dup (a live row in the last table)\n", stderr);
+              "pk-dup (a live row in the last table) | alter-view (ADD COLUMN k to table 0)\n", stderr);
         exit(1);
     }
     append_commit(dir, db, &op, 1, &sg, NULL);
@@ -1185,6 +1324,10 @@ int main(int argc, char **argv)
         durable_rewind(argv[2]);
         return 0;
     }
+    if (argc == 3 && strcmp(argv[1], "lie-missing") == 0) { /* F1 */
+        lie_missing(argv[2]);
+        return 0;
+    }
     if (argc == 3 && strcmp(argv[1], "lie-tombstone") == 0) {
         lie_tombstone(argv[2]);
         return 0;
@@ -1221,7 +1364,7 @@ int main(int argc, char **argv)
         corpus(argv[2], argv[3]);
         return 0;
     }
-    fputs("usage: imdb-forge lie-payload SEGMENT | redact-all SEGMENT | index-lie DIR KIND | view-lie DIR KIND | manifest-lie DIR KIND | lie-zonemap DIR | lie-tombstone DIR | durable-rewind DIR | "
+    fputs("usage: imdb-forge lie-payload SEGMENT | redact-all SEGMENT | index-lie DIR KIND | view-lie DIR KIND | manifest-lie DIR KIND | lie-zonemap DIR | lie-tombstone DIR | lie-missing DIR | durable-rewind DIR | "
           "rotate-foreign DIR | promote-elsewhere DIR ROOTKEY | writers-resign DIR | alg-flip DIR SEQ | corpus DIR OUT\n", stderr);
     return 2;
 }

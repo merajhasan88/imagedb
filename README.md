@@ -604,6 +604,18 @@ INDEX`). No UPDATE changes a key column (DELETE and INSERT instead); `ON
 CONFLICT` names the key's columns, in any order; `SHOW HISTORY t (v1, v2)`
 lists a key's versions.
 
+ALTER TABLE: `ADD [COLUMN] c type [NULL | NOT NULL] [DEFAULT literal]` (NOT NULL
+needs a DEFAULT; the rows already there read it, or NULL, and an INSERT or COPY
+that leaves the column out writes it, a dump writing such a column as an ALTER TABLE
+ADD after its CREATE TABLE), `RENAME [COLUMN] a TO b`, `RENAME TO u`, and `SET
+RETENTION`; each alone, outside a transaction, a metadata change that rewrites no
+row (the lake's older segments read the added column as its DEFAULT). A table
+has at most 256 schema versions and 64 column positions. A rename of a table a
+view names is refused, as is an ADD of a name a view reading the table uses (drop
+the view, alter, create it again). A transaction that wrote the table before an
+ALTER cannot commit after it. Not yet: DROP COLUMN, SET / DROP NOT NULL and
+DEFAULT, type changes.
+
 TEXT is UTF-8, validated, without NUL, and compared and ordered byte by byte: there
 are no collations. Platforms: see Build and quickstart.
 

@@ -79,6 +79,8 @@ typedef struct imdb_segcol {
     const uint32_t *off;     /* TEXT offsets (n+1) */
     const uint8_t *data;     /* TEXT bytes */
     const uint8_t *valid;    /* NULLABLE: bit i set = row i has a value; NULL for NOT NULL columns */
+    bool is_cst;             /* F1: a column the segment lacks: every row reads cst (its missing value), no array set */
+    imdb_value cst;          /* its TEXT bytes the table's (imdb_tcol.missing_text), never the image's */
 } imdb_segcol;
 
 typedef struct imdb_segzone { /* a column's zone map, kept with the descriptor: a scan skips a segment without its image */
@@ -101,6 +103,15 @@ typedef struct imdb_segimg {
     imdb_segcol col[IMDB_MAX_COLS];
     uint64_t *end;           /* mutable: end seq per row (IMDB_LIVE) */
     uint64_t *stubmask;      /* bit i set iff row i is flagged, a stub or a tombstone: no values (immutable) */
+    /* F1: col[] is laid out for the table's version `laid`, in its compact order: a position the file carries points
+     * into its sections (ocol[], the file's own layout, under version gver, which built it), one it lacks is a
+     * constant (is_cst: no memory, nothing to fail); imdb_seg_pin lays it out again when laid is not the table's last
+     * version. Every row a segment holds predates any position it lacks, so the constant is what each one reads.
+     * A re-layout never meets a reader of the old one: a table's versions grow only at an ALTER's install, alone in
+     * its commit on the engine thread (one serves every session) with no walk open, and an operation's first pin of
+     * the image after it lays it out under the cache's lock before any worker reads col[]. */
+    imdb_segcol ocol[IMDB_MAX_COLS];
+    uint32_t gver, laid;
 } imdb_segimg;
 
 /* A segment's DESCRIPTOR: what stays resident whatever the retention (a few hundred bytes); its image is img_ (NULL:
@@ -110,6 +121,8 @@ typedef struct imdb_segment {
     uint32_t table;
     uint32_t nrows;
     uint64_t vid_first, vid_last; /* its rows' vids, the first and the last: rows are in vid order */
+    uint32_t gver;           /* F1: the schema version that built it (its zone[] is in that version's compact order) */
+    uint32_t ndata;          /* F1: its rows with values (flag 0): what reads a column it lacks (imdb_seg_zone) */
     imdb_segzone zone[IMDB_MAX_COLS];
     uint8_t dv_hash[32];     /* deletion vector at the last manifest (zero if none) */
     uint64_t touched;        /* the cache's clock at its last pin: a trim drops the least recent first */
@@ -157,9 +170,29 @@ uint64_t imdb_seg_image_bytes(const imdb_segment *g); /* a resident image's byte
 static inline imdb_segimg *imdb_seg_pin(const imdb_table *t, imdb_segment *g, imdb_err *e)
 {
     imdb_segimg *gi = __atomic_load_n(&g->img_, __ATOMIC_ACQUIRE);
-    if (gi && t && __atomic_load_n(&g->touched, __ATOMIC_RELAXED) == t->segcache->clock) return gi;
+    if (gi && t && __atomic_load_n(&g->touched, __ATOMIC_ACQUIRE) == t->segcache->clock &&
+        __atomic_load_n(&gi->laid, __ATOMIC_ACQUIRE) + 1 >= t->hist.nvers) /* F1: laid out for the last version */
+        return gi;
     return imdb_seg_pin_slow(t, g, e);
 }
+/* F1: segment g's zone map for column c of t's last version: its own (in the order of the version that built it), or,
+ * for a column it lacks, what every flag-0 row there reads (its missing value): so pruning never drops rows that read
+ * a DEFAULT the segment does not store; tmp holds a made one */
+static inline const imdb_segzone *imdb_seg_zone(const imdb_table *t, const imdb_segment *g, uint32_t c, imdb_segzone *tmp)
+{
+    if (t->hist.nvers <= 1 || g->gver + 1 >= t->hist.nvers) return &g->zone[c];
+    const imdb_sver *cur = &t->hist.vers[t->hist.nvers - 1], *gv = &t->hist.vers[g->gver];
+    int k = gv->at[cur->pos[c]];
+    if (k >= 0) return &g->zone[k];
+    bool any = g->ndata > 0, text = cur->s.cols[c].type == IMDB_T_TEXT;
+    const imdb_value *m = &t->hist.tcol[cur->pos[c]].missing;
+    memset(tmp, 0, sizeof *tmp);
+    tmp->has = any && !m->null && !text; /* as a file's own: a TEXT column's has is never set */
+    tmp->has_null = any && m->null;
+    tmp->min = tmp->max = m->null || text ? 0 : m->i;
+    return tmp;
+}
+
 /* Segment g's image if it is in memory, else NULL: never a load, and no stamp either (a commit's end goes in only where
  * the image is resident, and writing it is not a use the trim's order counts) */
 imdb_segimg *imdb_seg_resident(const imdb_table *t, imdb_segment *g);
@@ -173,17 +206,22 @@ void imdb_seg_cache_check(const imdb_db *db);
  * ownership of bytes on success. Every structural rule of the canonical
  * encoding is enforced; nothing outside [bytes, bytes+len) is read. known: the bytes' SHA-256 when the caller checked
  * it already (an object read by its name: hashing a lake twice was most of a load's time); NULL: computed here. */
+/* F1: the hash a segment's header carries, of the schema version it was built under (a table's versions keep theirs) */
+int imdb_schema_hash(const imdb_schema *s, uint8_t out[32], imdb_err *e);
+/* F1: the same, by the version of h whose hash the header names: its image laid out for h's last version */
+int imdb_segment_parse_h(const imdb_schema_hist *h, uint8_t *bytes, size_t len, const uint8_t known[32], imdb_segment **out,
+                         imdb_err *e);
 int imdb_segment_parse(const imdb_schema *s, uint8_t *bytes, size_t len, const uint8_t known[32], imdb_segment **out,
                        imdb_err *e);
 void imdb_segment_free(imdb_segment *g);
 /* Recomputes every non-stub row's commitment from the columns. */
-int imdb_segment_check_commitments(const imdb_schema *s, const imdb_segment *g, const imdb_segimg *gi, imdb_err *e);
+int imdb_segment_check_commitments(const imdb_schema_hist *h, const imdb_segment *g, const imdb_segimg *gi, imdb_err *e);
 /* Column c of row `row` (non-stub; a TEXT value points into the segment). */
 void imdb_seg_get(const imdb_schema *s, const imdb_segimg *gi, uint32_t row, uint32_t c, imdb_value *v);
 /* Every column of row `row` (non-stub) of a pinned image: a walk that pinned the segment once reads its rows so */
 void imdb_seg_row_values(const imdb_schema *s, const imdb_segimg *gi, uint32_t row, imdb_value *vals);
 /* Canonical row bytes of one segment row (non-stub). */
-int imdb_segment_row(const imdb_schema *s, const imdb_segimg *gi, uint32_t row, imdb_buf *out, imdb_err *e);
+int imdb_segment_row(const imdb_schema_hist *h, const imdb_segimg *gi, uint32_t row, imdb_buf *out, imdb_err *e);
 
 typedef struct imdb_dv_ent {
     uint32_t row;
@@ -206,6 +244,12 @@ typedef struct imdb_manifest_tab {
     uint32_t nidx;
     uint64_t retention_us;
     uint64_t created_at, dropped_at; /* version 5 (1f): the commits that created and dropped it (0: live) */
+    /* F1: its schema history, made by the parse from version 1 and each ALTER at its commit (the table's entry ends
+     * with u32 nalter; when not 0, version 1's schema as u32 length and bytes, then each ALTER as u64 commit and
+     * op 22's body: imdb_alter_put), which wants each ALTER valid on the version before it (imdb_alter_schema),
+     * after the CREATE, at or before the snapshot and before a drop, and the last version to be s. A consumer may
+     * take it whole (and zero it): imdb_manifest_free frees what is left */
+    imdb_schema_hist hist;
 } imdb_manifest_tab;
 /* P2 S7: a view in a manifest (version 6): a live one's definition, a dropped one's tombstone (def NULL) */
 typedef struct imdb_manifest_view {

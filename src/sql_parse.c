@@ -1063,6 +1063,56 @@ static int parse_retention(parser *p, uint64_t *us)
     return IMDB_OK;
 }
 
+/* ALTER TABLE t, read: SET RETENTION ...; F1: ADD [COLUMN] c type [NULL | NOT NULL] [DEFAULT literal] (either order),
+ * RENAME [COLUMN] a TO b, RENAME TO n */
+static int parse_alter(parser *p, sql_stmt *st)
+{
+    if (kw(p, "set")) {
+        st->kind = ST_ALTER_RETENTION;
+        st->has_retention = true;
+        if (expect_kw(p, "retention")) return p->e->code;
+        return parse_retention(p, &st->retention_us);
+    }
+    st->kind = ST_ALTER_TABLE;
+    if (kw(p, "add")) {
+        kw(p, "column");
+        st->alter_kind = IMDB_ALTER_ADD_COLUMN;
+        imdb_column *c = &st->schema.cols[0];
+        memset(c, 0, sizeof *c);
+        if (ident(p, c->name) || col_type(p, c)) return p->e->code;
+        int null_spec = 0; /* 1 NULL, 2 NOT NULL */
+        for (;;) {
+            if (kw(p, "not")) {
+                if (expect_kw(p, "null")) return p->e->code;
+                if (null_spec) return imdb_fail(p->e, IMDB_ERR_INVALID, "column %s: NULL or NOT NULL, once", c->name);
+                null_spec = 2;
+            } else if (kw(p, "null")) {
+                if (null_spec) return imdb_fail(p->e, IMDB_ERR_INVALID, "column %s: NULL or NOT NULL, once", c->name);
+                null_spec = 1;
+            } else if (kw(p, "default")) {
+                if (st->has_alter_def) return imdb_fail(p->e, IMDB_ERR_INVALID, "column %s: one DEFAULT", c->name);
+                if (literal(p, &st->alter_def)) return p->e->code;
+                st->has_alter_def = true;
+            } else if (kw(p, "primary") || kw(p, "subject")) {
+                return imdb_fail(p->e, IMDB_ERR_INVALID, "an added column is neither a key nor a SUBJECT");
+            } else {
+                break;
+            }
+        }
+        if (null_spec != 2) c->flags |= IMDB_COL_NULLABLE;
+        return IMDB_OK;
+    }
+    if (!kw(p, "rename")) return fail_at(p, "SET RETENTION, ADD or RENAME");
+    if (kw(p, "to")) {
+        st->alter_kind = IMDB_ALTER_RENAME_TABLE;
+        return ident(p, st->alter_new);
+    }
+    kw(p, "column");
+    st->alter_kind = IMDB_ALTER_RENAME_COLUMN;
+    if (ident(p, st->alter_old) || expect_kw(p, "to")) return p->e->code;
+    return ident(p, st->alter_new);
+}
+
 static int parse_create(parser *p, sql_stmt *st)
 {
     st->kind = ST_CREATE;
@@ -1984,12 +2034,8 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
             if (!(rc = expect_kw(&p, "index"))) rc = ident(&p, st->index_name);
         }
     }
-    else if (kw(&p, "alter")) { /* ALTER TABLE t SET RETENTION ... */
-        st->kind = ST_ALTER_RETENTION;
-        st->has_retention = true;
-        if (!(rc = expect_kw(&p, "table")) && !(rc = ident(&p, st->table)) && !(rc = expect_kw(&p, "set")) &&
-            !(rc = expect_kw(&p, "retention")))
-            rc = parse_retention(&p, &st->retention_us);
+    else if (kw(&p, "alter")) { /* ALTER TABLE t SET RETENTION ... | ADD ... | RENAME ... (F1) */
+        if (!(rc = expect_kw(&p, "table")) && !(rc = ident(&p, st->table))) rc = parse_alter(&p, st);
     }
     else if (kw(&p, "insert")) rc = parse_insert(&p, st);
     else if (kw(&p, "prepare")) rc = parse_prepare(&p, st); /* P2 S9 */

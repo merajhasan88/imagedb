@@ -125,6 +125,37 @@ typedef struct imdb_segcache {
     uint64_t released;        /* P2 S15: images a releasing statement let go before its operation ended (imdb_seg_done) */
 } imdb_segcache;
 
+/* F1 (design.md §5, Schema versions): a table's column positions, every one ever used. A column keeps its position
+ * for its life, and a dropped one keeps it after, so a row of any version maps onto any later version position by
+ * position; a position a row's version lacks (added after it) reads its missing value */
+typedef struct imdb_tcol {
+    imdb_value missing;      /* its ADD's DEFAULT, or NULL (a CREATE's columns: NULL, never read) */
+    uint8_t *missing_text;   /* a TEXT DEFAULT's own bytes (missing.s points here) */
+    uint32_t added, dropped; /* the versions that added it (1: the CREATE) and dropped it (0: live) */
+} imdb_tcol;
+
+/* F1: a schema version. Rows begun at or after `since` (up to the next version's) are encoded under s, the columns
+ * live at it in position order; a version's rows are never re-encoded */
+typedef struct imdb_sver {
+    uint64_t since;              /* the commit it began at: the CREATE's, or an ALTER's (op 22) */
+    imdb_schema s;
+    uint16_t pos[IMDB_MAX_COLS]; /* s's column i is position pos[i] */
+    int8_t at[IMDB_MAX_COLS];    /* position p is s's column at[p], or -1: not live at this version */
+    uint8_t hash[32];            /* s's hash (imdb_schema_hash): a segment built under it names it */
+    uint8_t akind;               /* the ALTER that made it (0: version 1, the CREATE), and the position it named: a
+                                    manifest writes the op again from these and s (lake.c) */
+    uint16_t apos;
+} imdb_sver;
+
+/* F1: a table's schema history: its positions and versions (a table embeds one; so does VERIFY's model, which parses
+ * and checks segments of every version as the engine does) */
+typedef struct imdb_schema_hist {
+    imdb_tcol tcol[IMDB_MAX_COLS]; /* the positions ever used, ntcol of them */
+    uint16_t ntcol;
+    imdb_sver *vers;               /* by since, nvers of them; the last is the current */
+    uint32_t nvers, capvers;
+} imdb_schema_hist;
+
 typedef struct imdb_table {
     imdb_schema s;
     imdb_vchunk **ch;         /* the version store: chunk k holds vids from k << IMDB_VCHUNK_BITS (NULL: it holds none) */
@@ -152,6 +183,7 @@ typedef struct imdb_table {
     uint64_t dropped_at;      /* op 19 (1f): the commit that dropped it, its live versions ended there; 0: live */
     imdb_index idx[IMDB_MAX_INDEXES];
     uint32_t nidx;
+    imdb_schema_hist hist;    /* F1: its schema history; hist.vers[hist.nvers - 1].s is s */
     uint64_t idx_upto;        /* versions below are in the indexes' structures; the rest are the */
                               /* active transaction's own (versions are only appended) */
 } imdb_table;
@@ -538,6 +570,9 @@ imdb_table *imdb_table_at(imdb_db *db, const char *name, uint64_t snap);
  * DROP TABLE t RETENTION r), and a table kept FOREVER needs one, so its history can expire. The commit ends every
  * live version and makes the table a tombstone (imdb_table_drop_install, after its frame is durable) */
 int imdb_drop_table(imdb_db *db, imdb_table *t, uint64_t retention_us, imdb_err *e);
+/* ALTER TABLE (F1, op 22), alone in its transaction: proto's akind and payload (acol and adef, apos, aname), checked
+ * against the table now; the next schema version from the commit */
+int imdb_alter_table(imdb_db *db, imdb_table *t, const imdb_op *proto, imdb_err *e);
 void imdb_table_drop_install(imdb_db *db, imdb_table *t, uint64_t seq);
 /* each DROP_TABLE of ops: minus its table's lanes into delta (touched), beside imdb_digest_delta's */
 void imdb_digest_drops(const imdb_db *db, const imdb_op *ops, uint32_t nops, uint32_t nt, imdb_lthash *delta, bool *touched);
@@ -562,6 +597,13 @@ bool imdb_view_deps_live(const imdb_db *db, const imdb_viewdef *def);
 /* replay's and VERIFY's check of a view's text (sql_exec.c): bound against db's catalog now, it must yield def's
  * columns and dependencies exactly; IMDB_ERR_CORRUPT when it does not, or does not bind; a resource's error as it is */
 int imdb_view_rebind(imdb_db *db, const imdb_viewdef *def, imdb_err *e);
+/* F1: an ADD COLUMN's rule on the views: *name the first live view that reads table (directly or through views) and
+ * whose text holds col as an identifier, NULL when none. A view keeps its text, not a bound tree, and views refuse *:
+ * a name its text never holds cannot bind otherwise, but an added column of a name it holds could capture it (a bare
+ * name made ambiguous, an outer reference of a subquery bound inside). imdb_sql_names_ident: whether text holds
+ * ident as an identifier token (unquoted, folded to lowercase) */
+int imdb_view_names_col(const imdb_db *db, uint32_t table, const char *col, const char **name, imdb_err *e);
+int imdb_sql_names_ident(const char *text, size_t len, const char *ident, bool *out, imdb_err *e);
 
 /* ---- transactions --------------------------------------------------------- */
 int imdb_begin(imdb_db *db, imdb_err *e);
@@ -658,6 +700,7 @@ void imdb_txn_doom_erased(imdb_db *db, const imdb_erase_ent *ents, uint32_t n);
 void imdb_txn_doom_retired(imdb_db *db, uint64_t boundary);
 /* DROP TABLE (1f): every open transaction that wrote or locked rows of the table is doomed at its install */
 void imdb_txn_doom_dropped(imdb_db *db, uint32_t table, uint64_t seq);
+void imdb_txn_doom_altered(imdb_db *db, uint32_t table, uint64_t seq); /* F1: those that wrote or locked it */
 /* After a statement of x lost a write-write race: it can only roll back. */
 void imdb_txn_doom(imdb_txn *x, const char *why);
 /* A doomed transaction drops its writes at once (pending versions undone and wiped, saved

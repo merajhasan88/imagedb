@@ -66,7 +66,7 @@ static uint32_t seg_layout(const imdb_schema *s, uint32_t n, const uint64_t *tex
 }
 
 /* Fails rather than hash a short encoding: the hash goes into segments, and from them into signed manifests. */
-static int schema_hash(const imdb_schema *s, uint8_t out[32], imdb_err *e)
+int imdb_schema_hash(const imdb_schema *s, uint8_t out[32], imdb_err *e)
 {
     imdb_buf b;
     imdb_buf_init(&b);
@@ -84,6 +84,50 @@ static uint64_t seg_img_bytes(const imdb_segment *g, const imdb_segimg *gi)
 {
     return sizeof *gi + gi->len + (uint64_t)(g->nrows ? g->nrows : 1) * sizeof *gi->end +
            ((uint64_t)g->nrows + 63) / 64 * sizeof *gi->stubmask + sizeof *gi->stubmask;
+}
+
+
+/* ---- F1: an image laid out for a table's last schema version ------------------------------------------------ */
+
+/* col[] for h's last version from ocol[] (the file's, under version gi->gver): a position the file carries is its own
+ * column, one it lacks the constant its rows read there (they all predate its ADD). Allocates nothing: a pin cannot
+ * fail on it, and the image's charge to the cache does not move. */
+static void seg_relayout(const imdb_schema_hist *h, imdb_segimg *gi)
+{
+    const imdb_sver *cur = &h->vers[h->nvers - 1], *gv = &h->vers[gi->gver];
+    memset(gi->col, 0, sizeof gi->col);
+    for (uint16_t c = 0; c < cur->s.ncols; c++) {
+        uint16_t p = cur->pos[c];
+        int k = gv->at[p];
+        if (k >= 0) {
+            gi->col[c] = gi->ocol[k];
+            continue;
+        }
+        gi->col[c].is_cst = true;
+        gi->col[c].cst = h->tcol[p].missing;
+    }
+    __atomic_store_n(&gi->laid, h->nvers - 1, __ATOMIC_RELEASE);
+}
+
+int imdb_segment_parse_h(const imdb_schema_hist *h, uint8_t *b, size_t len, const uint8_t known[32], imdb_segment **out,
+                         imdb_err *e)
+{
+    *out = NULL;
+    if (len < IMDB_SEG_HEADER || memcmp(b, kSegMagic, 8) != 0) return imdb_fail(e, IMDB_ERR_CORRUPT, "segment: bad magic");
+    uint32_t v = h->nvers;
+    for (uint32_t k = h->nvers; k-- > 0;) /* the last first: most segments are the current version's */
+        if (memcmp(h->vers[k].hash, b + 16, 32) == 0) {
+            v = k;
+            break;
+        }
+    if (v == h->nvers) return imdb_fail(e, IMDB_ERR_CORRUPT, "segment: schema hash mismatch");
+    int rc = imdb_segment_parse(&h->vers[v].s, b, len, known, out, e);
+    if (rc) return rc;
+    imdb_segment *g = *out;
+    g->gver = v;
+    g->img_->gver = g->img_->laid = v;
+    if (v + 1 < h->nvers) seg_relayout(h, g->img_);
+    return IMDB_OK;
 }
 
 static void seg_img_free(imdb_segimg *gi)
@@ -155,7 +199,7 @@ int imdb_segment_parse(const imdb_schema *s, uint8_t *b, size_t len, const uint8
     if (ver != 2) return imdb_fail(e, IMDB_ERR_CORRUPT, "segment: unsupported version");
     if (table != s->id) return imdb_fail(e, IMDB_ERR_CORRUPT, "segment: belongs to another table");
     uint8_t sh[32];
-    if (schema_hash(s, sh, e)) return e->code;
+    if (imdb_schema_hash(s, sh, e)) return e->code;
     if (memcmp(sh, b + 16, 32) != 0) return imdb_fail(e, IMDB_ERR_CORRUPT, "segment: schema hash mismatch");
     if (n > IMDB_MAX_SEGMENT_ROWS) return imdb_fail(e, IMDB_ERR_CORRUPT, "segment: too many rows");
     if (ncols != s->ncols || imdb_get_le32(b + 60) != 0) return imdb_fail(e, IMDB_ERR_CORRUPT, "segment: bad header");
@@ -289,6 +333,7 @@ int imdb_segment_parse(const imdb_schema *s, uint8_t *b, size_t len, const uint8
         for (uint32_t i = 0; !rc && i < n; i++) {
             gi->end[i] = IMDB_LIVE;
             if (gi->flags[i]) gi->stubmask[i >> 6] |= 1ull << (i & 63);
+            else g->ndata++;
         }
     }
     if (rc) {
@@ -304,18 +349,22 @@ int imdb_segment_parse(const imdb_schema *s, uint8_t *b, size_t len, const uint8
         g->vid_first = gi->vid[0];
         g->vid_last = gi->vid[n - 1];
     }
+    memcpy(gi->ocol, gi->col, sizeof gi->col); /* F1: the file's own layout, under the version that built it */
     if (known) memcpy(g->hash, known, 32); /* checked by the caller against its name */
     else imdb_sha256(b, len, g->hash);
     *out = g;
     return IMDB_OK;
 }
 
-static void seg_get(const imdb_schema *s, const imdb_segimg *gi, uint32_t row, uint32_t c, imdb_value *v)
+static void segcol_get(const imdb_column *col, const imdb_segcol *sc, uint32_t row, imdb_value *v)
 {
     memset(v, 0, sizeof *v);
-    v->type = s->cols[c].type;
-    v->scale = s->cols[c].scale;
-    const imdb_segcol *sc = &gi->col[c];
+    v->type = col->type;
+    v->scale = col->scale;
+    if (sc->is_cst) { /* F1: a column the segment lacks: every row its missing value (typed as the column) */
+        *v = sc->cst;
+        return;
+    }
     if (sc->valid && !valid_bit(sc->valid, row)) {
         v->null = true;
         return;
@@ -328,6 +377,19 @@ static void seg_get(const imdb_schema *s, const imdb_segimg *gi, uint32_t row, u
     }
 }
 
+static void seg_get(const imdb_schema *s, const imdb_segimg *gi, uint32_t row, uint32_t c, imdb_value *v)
+{
+    segcol_get(&s->cols[c], &gi->col[c], row, v);
+}
+
+/* F1: two values the same in every bit a decoder distinguishes (a stored value against the missing value it must be) */
+static bool value_same(const imdb_value *a, const imdb_value *b)
+{
+    if (a->null || b->null) return a->null == b->null;
+    if (a->type == IMDB_T_TEXT) return a->len == b->len && (!a->len || memcmp(a->s, b->s, a->len) == 0);
+    return a->i == b->i;
+}
+
 void imdb_seg_get(const imdb_schema *s, const imdb_segimg *gi, uint32_t row, uint32_t c, imdb_value *v)
 {
     seg_get(s, gi, row, c, v);
@@ -338,24 +400,51 @@ void imdb_seg_row_values(const imdb_schema *s, const imdb_segimg *gi, uint32_t r
     for (uint32_t c = 0; c < s->ncols; c++) seg_get(s, gi, row, c, &vals[c]);
 }
 
-int imdb_segment_row(const imdb_schema *s, const imdb_segimg *gi, uint32_t row, imdb_buf *out, imdb_err *e)
+int imdb_segment_row(const imdb_schema_hist *h, const imdb_segimg *gi, uint32_t row, imdb_buf *out, imdb_err *e)
 {
+    /* F1: under the row's own version (its begin's), from the file's own columns (ocol, under the version that built
+     * the segment, whatever col[] is laid out for): its commitment is over those bytes. A row is never of a later
+     * version than its segment (imdb_segment_check_commitments), so each of its positions is one the file holds. */
+    const imdb_sver *gv = &h->vers[gi->gver], *rv = imdb_hist_at(h, gi->begin[row]);
     imdb_value vals[IMDB_MAX_COLS];
-    for (uint32_t c = 0; c < s->ncols; c++) seg_get(s, gi, row, c, &vals[c]);
-    return imdb_row_encode(s, vals, out, e);
+    for (uint16_t k = 0; k < rv->s.ncols; k++) {
+        int c = gv->at[rv->pos[k]];
+        if (c < 0) return imdb_fail(e, IMDB_ERR_CORRUPT, "segment: row %u has a column its segment does not hold", row);
+        segcol_get(&gv->s.cols[c], &gi->ocol[c], row, &vals[k]);
+    }
+    return imdb_row_encode(&rv->s, vals, out, e);
 }
 
-int imdb_segment_check_commitments(const imdb_schema *s, const imdb_segment *g, const imdb_segimg *gi, imdb_err *e)
+int imdb_segment_check_commitments(const imdb_schema_hist *h, const imdb_segment *g, const imdb_segimg *gi, imdb_err *e)
 {
     imdb_buf row;
     imdb_buf_init(&row);
     int rc = IMDB_OK;
+    const imdb_sver *gv = &h->vers[gi->gver];
     for (uint32_t i = 0; i < g->nrows && !rc; i++) {
         if (gi->flags[i]) continue;
+        /* F1: a value no commitment covers is still one a reader reads: a row of a version older than its segment's
+         * holds, at each position its version lacks (added since), exactly that position's missing value; and a row
+         * of a later version than its segment's no build makes (the segment predates the ALTER) */
+        const imdb_sver *rv = imdb_hist_at(h, gi->begin[i]);
+        if ((uint32_t)(rv - h->vers) > gi->gver) {
+            rc = imdb_fail(e, IMDB_ERR_VERIFY, "segment: row %u is of a later schema version than its segment", i);
+            break;
+        }
+        for (uint16_t c = 0; c < gv->s.ncols && !rc && rv != gv; c++) {
+            uint16_t p = gv->pos[c];
+            if (rv->at[p] >= 0) continue;
+            imdb_value v;
+            segcol_get(&gv->s.cols[c], &gi->ocol[c], i, &v);
+            if (!value_same(&v, &h->tcol[p].missing))
+                rc = imdb_fail(e, IMDB_ERR_VERIFY, "segment: row %u holds another value than its missing one in column %s",
+                               i, gv->s.cols[c].name);
+        }
+        if (rc) break;
         row.len = 0;
-        if ((rc = imdb_segment_row(s, gi, i, &row, e))) break;
+        if ((rc = imdb_segment_row(h, gi, i, &row, e))) break;
         uint8_t c[32];
-        imdb_row_commit(s->id, gi->salt + 16u * i, row.p, row.len, c);
+        imdb_row_commit(h->vers[0].s.id, gi->salt + 16u * i, row.p, row.len, c);
         if (memcmp(c, gi->commit + 32u * i, 32) != 0)
             rc = imdb_fail(e, IMDB_ERR_VERIFY, "segment: row %u does not match its commitment", i);
     }
@@ -422,6 +511,13 @@ static void src_get(const imdb_table *t, const seg_src *s, uint32_t c, imdb_valu
         return;
     }
     const imdb_version *ver = imdb_vh(t, s->vid);
+    const imdb_sver *rv = t->hist.nvers > 1 ? imdb_sver_at(t, ver->begin) : NULL; /* F1: by its own version */
+    if (rv && rv != &t->hist.vers[t->hist.nvers - 1]) {
+        uint16_t p = t->hist.vers[t->hist.nvers - 1].pos[c];
+        if (rv->at[p] < 0) *v = t->hist.tcol[p].missing; /* a column added after it: what it reads */
+        else imdb_row_get(&rv->s, t->arena.p + ver->row_off, ver->row_len, rv->at[p], v);
+        return;
+    }
     imdb_row_get(&t->s, t->arena.p + ver->row_off, ver->row_len, (int)c, v);
 }
 
@@ -547,7 +643,7 @@ static int seg_build(const imdb_table *t, const seg_src *src, uint32_t n, const 
     memcpy(b, kSegMagic, 8);
     imdb_le32(b + 8, 2);
     imdb_le32(b + 12, s->id);
-    if (schema_hash(s, b + 16, e)) {
+    if (imdb_schema_hash(s, b + 16, e)) {
         imdb_free(b);
         imdb_free(fl);
         return e->code;
@@ -627,6 +723,7 @@ static int seg_build(const imdb_table *t, const seg_src *src, uint32_t n, const 
         imdb_free(b);
         return rc;
     }
+    g->gver = g->img_->gver = g->img_->laid = t->hist.nvers ? t->hist.nvers - 1 : 0; /* F1: built at the last version */
     imdb_segimg *gi = imdb_seg_pin(NULL, g, e); /* a segment just built: apart from any table, resident */
     for (uint32_t i = 0; i < n; i++) gi->end[i] = src_end(t, &src[i]);
     seg_marks(g, gi);
@@ -720,7 +817,10 @@ void imdb_manifest_free(imdb_manifest *m)
 {
     for (uint32_t i = 0; i < m->nv; i++) imdb_viewdef_free(m->v[i].def); /* P2 S7 */
     imdb_free(m->v);
-    for (uint32_t i = 0; i < m->nt; i++) imdb_free(m->t[i].seg);
+    for (uint32_t i = 0; i < m->nt; i++) {
+        imdb_free(m->t[i].seg);
+        imdb_hist_free(&m->t[i].hist); /* F1: what no consumer took */
+    }
     imdb_free(m->t);
     memset(m, 0, sizeof *m);
 }
@@ -888,6 +988,49 @@ int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err
         if (r.err || !t->created_at || t->created_at > m->seq || (t->dropped_at && (t->dropped_at <= t->created_at ||
                                                                             t->dropped_at > m->seq || t->live)))
             goto bad;
+        /* F1: its schema history (lake.h): version 1, then each ALTER on the version before it, ending at s */
+        uint32_t na = imdb_rd_u32(&r);
+        if (r.err || na >= IMDB_MAX_SCHEMA_VERSIONS) goto bad;
+        imdb_schema s0 = t->s;
+        if (na) {
+            uint32_t l0 = imdb_rd_u32(&r);
+            const uint8_t *b0 = imdb_rd_bytes(&r, l0);
+            if (!b0) goto bad;
+            imdb_rd r0;
+            imdb_rd_init(&r0, b0, l0);
+            if (imdb_schema_decode(&r0, &s0, &e2) || imdb_rd_left(&r0) || s0.id != i) goto bad;
+        }
+        int hrc = imdb_hist_first(&t->hist, &s0, e);
+        if (hrc) {
+            imdb_manifest_free(m);
+            return hrc;
+        }
+        uint64_t last = t->created_at;
+        for (uint32_t k = 0; k < na; k++) {
+            uint64_t at = imdb_rd_u64(&r);
+            imdb_op o;
+            memset(&o, 0, sizeof o);
+            imdb_err ea = {0};
+            imdb_schema next;
+            bool ok = !r.err && !imdb_alter_get(&r, &o, "manifest", &ea) && !r.err && at > last && at <= m->seq &&
+                      (!t->dropped_at || at < t->dropped_at) &&
+                      !imdb_alter_schema(&t->hist.vers[t->hist.nvers - 1].s, &o, &next, &ea);
+            int prc = ok ? imdb_hist_prepare(&t->hist, &o, e) : IMDB_OK;
+            if (ok && !prc) imdb_hist_install(&t->hist, &o, at);
+            imdb_free(o.aname);
+            if (prc) {
+                imdb_manifest_free(m);
+                return prc;
+            }
+            if (!ok) goto bad;
+            last = at;
+        }
+        uint8_t hs[32];
+        if ((hrc = imdb_schema_hash(&t->s, hs, e))) {
+            imdb_manifest_free(m);
+            return hrc;
+        }
+        if (memcmp(hs, t->hist.vers[t->hist.nvers - 1].hash, 32) != 0) goto bad; /* the history ends at its schema */
     }
     if (r.err || r.off != send || man_section(&r, IMDB_MAN_VIEWS, &send)) goto bad;
     uint32_t nv = imdb_rd_u32(&r); /* P2 S7: each view by id, a live one's definition after it */
@@ -1415,6 +1558,39 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
         imdb_buf_put_u64(mb, t->retention_us);
         imdb_buf_put_u64(mb, t->created_at);
         imdb_buf_put_u64(mb, t->dropped_at);
+        /* F1: its schema history (lake.h), each ALTER written again from the version it made */
+        const imdb_schema_hist *h = &t->hist;
+        uint32_t na = h->nvers ? h->nvers - 1 : 0;
+        imdb_buf_put_u32(mb, na);
+        if (na) {
+            sch.len = 0;
+            imdb_schema_encode(&h->vers[0].s, &sch);
+            if ((rc = imdb_buf_check(&sch, e))) break;
+            imdb_buf_put_u32(mb, (uint32_t)sch.len);
+            imdb_buf_put(mb, sch.p, sch.len);
+        }
+        for (uint32_t k = 1; k <= na && !rc; k++) {
+            const imdb_sver *v = &h->vers[k];
+            if (v->since > seq) {
+                rc = imdb_fail(e, IMDB_ERR_STATE, "lake: table %s has a schema version past the snapshot", t->s.name);
+                break;
+            }
+            imdb_op o;
+            memset(&o, 0, sizeof o);
+            o.akind = v->akind;
+            o.apos = v->apos;
+            char nm[IMDB_MAX_IDENT + 1];
+            if (v->akind == IMDB_ALTER_ADD_COLUMN) {
+                o.acol = v->s.cols[v->at[v->apos]];
+                o.adef = h->tcol[v->apos].missing;
+            } else {
+                snprintf(nm, sizeof nm, "%s", v->akind == IMDB_ALTER_RENAME_TABLE ? v->s.name : v->s.cols[v->at[v->apos]].name);
+                o.aname = nm;
+            }
+            imdb_buf_put_u64(mb, v->since);
+            if (imdb_alter_put(mb, &o)) rc = imdb_fail(e, IMDB_ERR_STATE, "lake: table %s's ALTER cannot be written", t->s.name);
+        }
+        if (rc) break;
     }
     man_close(mb, sec);
     sec = man_open(mb, IMDB_MAN_VIEWS);
@@ -2359,7 +2535,7 @@ static int seg_load_body(imdb_segcache *c, const imdb_table *t, imdb_segment *g,
     size_t sl = 0;
     imdb_segment *tmp = NULL;
     int rc = read_obj(ofd, g->hash, ".seg", &sb, &sl, e);
-    if (!rc && (rc = imdb_segment_parse(&t->s, sb, sl, g->hash, &tmp, e))) imdb_free(sb); /* read_obj checked it */
+    if (!rc && (rc = imdb_segment_parse_h(&t->hist, sb, sl, g->hash, &tmp, e))) imdb_free(sb); /* read_obj checked it */
     if (!rc && (tmp->nrows != g->nrows || tmp->table != g->table || tmp->vid_first != g->vid_first ||
                 tmp->vid_last != g->vid_last))
         rc = imdb_fail(e, IMDB_ERR_STATE, "lake: a segment read again differs from its descriptor");
@@ -2452,8 +2628,13 @@ imdb_segimg *imdb_seg_pin_slow(const imdb_table *t, imdb_segment *g, imdb_err *e
     imdb_segcache *c = t ? t->segcache : NULL;
     if (gi) {
         if (c) __atomic_fetch_add(&c->db->stats.seg_hits, 1, __ATOMIC_RELAXED); /* P1 M1: an operation's first pin, resident */
+        if (c && __atomic_load_n(&gi->laid, __ATOMIC_ACQUIRE) + 1 < t->hist.nvers) { /* F1: an ALTER since its layout */
+            pthread_mutex_lock(&c->lock); /* the operation's workers pin it at once: one lays it out, before any stamp */
+            if (__atomic_load_n(&gi->laid, __ATOMIC_ACQUIRE) + 1 < t->hist.nvers) seg_relayout(&t->hist, gi);
+            pthread_mutex_unlock(&c->lock);
+        }
         if (c && __atomic_load_n(&g->touched, __ATOMIC_RELAXED) != c->clock) /* the clock moves between operations */
-            __atomic_store_n(&g->touched, c->clock, __ATOMIC_RELAXED);
+            __atomic_store_n(&g->touched, c->clock, __ATOMIC_RELEASE);
         return gi;
     }
     if (!c) {
@@ -2721,6 +2902,7 @@ static int load_table(imdb_db *db, int ofd, const imdb_manifest_tab *mt, uint32_
     t->digest = mt->digest;
     memcpy(t->idx, mt->idx, sizeof t->idx);
     t->nidx = mt->nidx;
+    if (mt->hist.nvers > 1 && imdb_hist_copy(&t->hist, &mt->hist, e)) return e->code; /* F1: s is its last version */
     if (mt->nseg) {
         t->seg = imdb_alloc_array(mt->nseg, sizeof *t->seg, e);
         if (!t->seg) return e->code;
@@ -2731,7 +2913,7 @@ static int load_table(imdb_db *db, int ofd, const imdb_manifest_tab *mt, uint32_
         size_t sl;
         if (read_obj(ofd, mt->seg[k].seg, ".seg", &sb, &sl, e)) return e->code;
         imdb_segment *g;
-        if (imdb_segment_parse(&t->s, sb, sl, mt->seg[k].seg, &g, e)) { /* read_obj checked the name */
+        if (imdb_segment_parse_h(&t->hist, sb, sl, mt->seg[k].seg, &g, e)) { /* read_obj checked the name */
             imdb_free(sb);
             return e->code;
         }

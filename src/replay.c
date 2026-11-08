@@ -227,7 +227,8 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
                             : imdb_table_by_id(db, o->table);
         if (!t && (o->code == IMDB_OP_INSERT || o->code == IMDB_OP_DELETE || o->code == IMDB_OP_UPDATE ||
                    o->code == IMDB_OP_COMPACT || o->code == IMDB_OP_CREATE_INDEX || o->code == IMDB_OP_DROP_INDEX ||
-                   o->code == IMDB_OP_SET_RETENTION || o->code == IMDB_OP_EXPIRE || o->code == IMDB_OP_DROP_TABLE)) {
+                   o->code == IMDB_OP_SET_RETENTION || o->code == IMDB_OP_EXPIRE || o->code == IMDB_OP_DROP_TABLE ||
+                   o->code == IMDB_OP_ALTER_TABLE)) {
             rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: unknown table %u", (unsigned long long)seq, o->table);
             break;
         }
@@ -258,6 +259,15 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
                                (unsigned long long)seq, o->table);
             else imdb_table_drop_install(db, t, seq);
             break;
+        case IMDB_OP_ALTER_TABLE: { /* F1: the rules against the table at the commit, then its next version */
+            imdb_err e2 = {0};
+            if (imdb_alter_check(db, t, o, &e2))
+                rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: ALTER TABLE of table %u: %s", (unsigned long long)seq,
+                               o->table, e2.msg);
+            else if (!(rc = imdb_alter_prepare(t, o, e)))
+                imdb_alter_install(t, o, seq);
+            break;
+        }
         case IMDB_OP_CREATE_VIEW: { /* P2 S7: the next id, a free name, every dependency live, the text re-bound */
             const imdb_viewdef *d = o->vdef;
             if (d->id != db->nviews)
@@ -455,7 +465,8 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
         uint8_t code = c->ops[i].code;
         if (code == IMDB_OP_INSERT || code == IMDB_OP_DELETE || code == IMDB_OP_UPDATE || code == IMDB_OP_CREATE_TABLE ||
             code == IMDB_OP_CREATE_INDEX || code == IMDB_OP_DROP_INDEX || code == IMDB_OP_SET_RETENTION ||
-            code == IMDB_OP_EXPIRE || code == IMDB_OP_DROP_TABLE || code == IMDB_OP_CREATE_VIEW || code == IMDB_OP_DROP_VIEW)
+            code == IMDB_OP_EXPIRE || code == IMDB_OP_DROP_TABLE || code == IMDB_OP_CREATE_VIEW || code == IMDB_OP_DROP_VIEW ||
+            code == IMDB_OP_ALTER_TABLE)
             db->lake_dirty = true; /* the manifest records the definitions, the retentions and the horizons */
         if (code == IMDB_OP_ERASE) db->last_erase = seq; /* a pin from before it never keeps the files (lake.h) */
         db->ended_pass += code == IMDB_OP_DELETE || code == IMDB_OP_UPDATE; /* the memory window's trigger */

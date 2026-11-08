@@ -95,7 +95,7 @@ enum {
     ST_SHOW_TABLES, ST_SHOW_DIGEST, ST_SHOW_HISTORY, ST_SHOW_LOG, ST_SHOW_LAKE, ST_SHOW_IDENTITY, ST_SHOW_REPLICAS, ST_SHOW_REPLICATION, ST_SHOW_ERASURE, ST_SHOW_MEMORY, ST_SET, ST_EMPTY,
     ST_SAVEPOINT, ST_ROLLBACK_TO, ST_RELEASE, ST_SET_TXN,
     ST_CREATE_INDEX, ST_DROP_INDEX, ST_SHOW_INDEXES, ST_DROP_TABLE,
-    ST_ALTER_RETENTION, ST_SHOW_RETENTION,
+    ST_ALTER_RETENTION, ST_SHOW_RETENTION, ST_ALTER_TABLE, /* F1: ALTER TABLE t ADD COLUMN, RENAME COLUMN, RENAME TO */
     ST_SHOW_STATS, ST_SHOW_TRANSACTIONS, /* P1 M1 */
     ST_EXPLAIN, /* P1 Q1: the plan of the statement in explained (SELECT, UPDATE or DELETE), which is not run */
     ST_PREPARE, ST_EXECUTE, ST_DEALLOCATE, ST_SHOW_PREPARED, /* P2 S9 */
@@ -222,6 +222,10 @@ typedef struct sql_stmt {
     bool has_subject;
     sql_lit keys[IMDB_MAX_KEY_COLS];            /* SHOW HISTORY: the key, a value a key column (F4: (v1, v2, ...)) */
     uint8_t nkeys;
+    uint8_t alter_kind;                         /* ST_ALTER_TABLE (F1): IMDB_ALTER_*; ADD: schema.cols[0] the column */
+    char alter_old[IMDB_MAX_IDENT + 1], alter_new[IMDB_MAX_IDENT + 1]; /* RENAME COLUMN old TO new; RENAME TO new */
+    sql_lit alter_def;                          /* ADD: its DEFAULT, when has_alter_def */
+    bool has_alter_def;
     char set_name[IMDB_MAX_IDENT + 1];          /* SET */
     char set_value[IMDB_MAX_IDENT + 1];
     uint64_t n;                                 /* SHOW LOG n */

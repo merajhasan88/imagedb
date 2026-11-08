@@ -39,4 +39,8 @@ typedef struct ab_result {
 /* 0 and *r; or -1 and the reason in err (the text refused, as the engine refuses it in a view, or not typed) */
 int ab_bind(const char *text, size_t len, ab_lookup_fn lookup, void *arg, ab_result *r, char *err, size_t errn);
 
+/* F1: 1 when the text holds ident as an identifier token (unquoted, folded to lowercase), 0 when not, -1 when it does
+ * not lex (the reason in err): an ADD COLUMN's rule on the views that read its table */
+int ab_names(const char *text, size_t len, const char *ident, char *err, size_t errn);
+
 #endif

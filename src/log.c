@@ -10,6 +10,119 @@ static const uint8_t kGenesisTag[8] = {'I', 'M', 'D', 'B', 'G', 'E', 'N', '1'};
 
 /* op 14's definition by its own rules: known flags, 1..IMDB_MAX_INDEX_COLS distinct columns (that
  * each column exists is the table's to say, at replay) */
+
+/* F1: an added column as op 22 logs it, and its DEFAULT in the row encoding of one value */
+static bool alter_col_ok(const imdb_column *c)
+{
+    size_t nl = strnlen(c->name, sizeof c->name);
+    if (!imdb_ident_valid(c->name, nl) || c->name[0] == '_') return false;
+    for (size_t i = 0; i < nl; i++)
+        if (c->name[i] >= 'A' && c->name[i] <= 'Z') return false;
+    if (c->type < IMDB_T_INT64 || c->type > IMDB_T_FLOAT64 || (c->flags & ~IMDB_COL_NULLABLE)) return false;
+    if (c->type == IMDB_T_DECIMAL) return c->precision >= 1 && c->precision <= 18 && c->scale <= c->precision;
+    return !c->precision && !c->scale;
+}
+
+static void put_default(imdb_buf *b, const imdb_column *c, const imdb_value *v)
+{
+    if (v->null) {
+        imdb_buf_put_u8(b, 0);
+        return;
+    }
+    imdb_buf_put_u8(b, 1);
+    if (c->type == IMDB_T_TEXT) {
+        imdb_buf_put_u32(b, v->len);
+        imdb_buf_put(b, v->s, v->len);
+    } else if (c->type == IMDB_T_BOOL) {
+        imdb_buf_put_u8(b, (uint8_t)v->i);
+    } else {
+        imdb_buf_put_u64(b, (uint64_t)v->i);
+    }
+}
+
+static int get_default(imdb_rd *r, const imdb_column *c, imdb_value *v, const char *what, imdb_err *e)
+{
+    memset(v, 0, sizeof *v);
+    v->type = c->type;
+    v->scale = c->scale;
+    uint8_t has = imdb_rd_u8(r);
+    if (r->err || has > 1) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad DEFAULT", what);
+    if (!has) {
+        v->null = true;
+        return IMDB_OK;
+    }
+    if (c->type == IMDB_T_TEXT) {
+        v->len = imdb_rd_u32(r);
+        if (r->err || v->len > IMDB_MAX_TEXT) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad DEFAULT", what);
+        v->s = imdb_rd_bytes(r, v->len);
+    } else if (c->type == IMDB_T_BOOL) {
+        v->i = imdb_rd_u8(r);
+    } else {
+        v->i = (int64_t)imdb_rd_u64(r);
+    }
+    imdb_err e2 = {0};
+    if (r->err || imdb_value_check(c, v, &e2)) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad DEFAULT", what);
+    return IMDB_OK;
+}
+
+int imdb_alter_put(imdb_buf *b, const imdb_op *o)
+{
+    size_t nl = o->aname ? strnlen(o->aname, IMDB_MAX_IDENT + 1) : 0;
+    bool named = o->akind == IMDB_ALTER_RENAME_COLUMN || o->akind == IMDB_ALTER_RENAME_TABLE;
+    imdb_err e2 = {0};
+    if ((named && (!nl || nl > IMDB_MAX_IDENT || !imdb_ident_valid(o->aname, nl))) ||
+        (o->akind == IMDB_ALTER_ADD_COLUMN &&
+         (!alter_col_ok(&o->acol) || (!(o->acol.flags & IMDB_COL_NULLABLE) && o->adef.null) ||
+          (!o->adef.null && imdb_value_check(&o->acol, &o->adef, &e2)))) ||
+        (o->akind < IMDB_ALTER_ADD_COLUMN || o->akind > IMDB_ALTER_RENAME_TABLE)) {
+        b->err = IMDB_ERR_INVALID;
+        return IMDB_ERR_INVALID;
+    }
+    imdb_buf_put_u8(b, o->akind);
+    if (o->akind == IMDB_ALTER_ADD_COLUMN) {
+        size_t cl = strlen(o->acol.name);
+        imdb_buf_put_u8(b, (uint8_t)cl);
+        imdb_buf_put(b, o->acol.name, cl);
+        imdb_buf_put_u8(b, o->acol.type);
+        imdb_buf_put_u8(b, o->acol.precision);
+        imdb_buf_put_u8(b, o->acol.scale);
+        imdb_buf_put_u8(b, o->acol.flags);
+        put_default(b, &o->acol, &o->adef);
+        return IMDB_OK;
+    }
+    if (o->akind == IMDB_ALTER_RENAME_COLUMN) imdb_buf_put_u16(b, o->apos);
+    imdb_buf_put_u8(b, (uint8_t)nl);
+    imdb_buf_put(b, o->aname, nl);
+    return IMDB_OK;
+}
+
+int imdb_alter_get(imdb_rd *r, imdb_op *o, const char *what, imdb_err *e)
+{
+    o->akind = imdb_rd_u8(r);
+    if (r->err) return IMDB_OK;
+    if (o->akind < IMDB_ALTER_ADD_COLUMN || o->akind > IMDB_ALTER_RENAME_TABLE)
+        return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: unknown ALTER TABLE kind %u", what, o->akind);
+    if (o->akind == IMDB_ALTER_ADD_COLUMN) {
+        imdb_err e2 = {0};
+        if (imdb_rd_ident(r, o->acol.name, &e2)) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad column name", what);
+        o->acol.type = imdb_rd_u8(r);
+        o->acol.precision = imdb_rd_u8(r);
+        o->acol.scale = imdb_rd_u8(r);
+        o->acol.flags = imdb_rd_u8(r);
+        if (!r->err && !alter_col_ok(&o->acol)) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad added column", what);
+        if (!r->err && get_default(r, &o->acol, &o->adef, what, e)) return e->code;
+        if (!r->err && !(o->acol.flags & IMDB_COL_NULLABLE) && o->adef.null)
+            return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: a NOT NULL column added without a DEFAULT", what);
+        return IMDB_OK;
+    }
+    if (o->akind == IMDB_ALTER_RENAME_COLUMN) o->apos = imdb_rd_u16(r);
+    o->aname = imdb_alloc(IMDB_MAX_IDENT + 1, e);
+    if (!o->aname) return e->code;
+    imdb_err e3 = {0};
+    if (!r->err && imdb_rd_ident(r, o->aname, &e3)) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad new name", what);
+    return IMDB_OK;
+}
+
 static bool index_cols_ok(uint8_t flags, uint8_t ncols, const uint16_t *cols)
 {
     if ((flags & ~IMDB_INDEX_UNIQUE) || !ncols || ncols > IMDB_MAX_INDEX_COLS) return false;
@@ -36,6 +149,7 @@ void imdb_commit_free(imdb_commit_rec *c)
             imdb_free(c->ops[i].erase);
             imdb_free(c->ops[i].rewrites);
             imdb_free(c->ops[i].iname);
+            imdb_free(c->ops[i].aname);
             imdb_viewdef_free(c->ops[i].vdef);
         }
         imdb_free(c->ops);
@@ -166,6 +280,14 @@ void imdb_commit_encode_header(const imdb_commit_rec *c, imdb_buf *b)
                 break;
             }
             imdb_buf_put_u32(b, o->view);
+            break;
+        case IMDB_OP_ALTER_TABLE: /* alone (log.h), its payload valid: never signed otherwise */
+            if (c->nops != 1) {
+                b->err = IMDB_ERR_INVALID;
+                break;
+            }
+            imdb_buf_put_u32(b, o->table);
+            (void)imdb_alter_put(b, o); /* the buffer's error when the op is not valid */
             break;
         case IMDB_OP_EXPIRE: /* only EXPIREs in its commit, by table, each before its commit (log.h) */
             if (!o->purge_before || o->purge_before >= c->seq ||
@@ -486,6 +608,11 @@ int imdb_commit_decode_header(const uint8_t *h, size_t hlen, imdb_commit_rec *c,
             o->view = imdb_rd_u32(&r);
             if (!r.err && (nops != 1 || o->view >= IMDB_MAX_VIEWS))
                 return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: a view op must be the only op, its view in range");
+            break;
+        case IMDB_OP_ALTER_TABLE:
+            o->table = imdb_rd_u32(&r);
+            if (!r.err && nops != 1) return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: ALTER TABLE must be the only op");
+            if (!r.err && imdb_alter_get(&r, o, "commit", e)) return e->code;
             break;
         case IMDB_OP_DROP_TABLE:
             o->table = imdb_rd_u32(&r);

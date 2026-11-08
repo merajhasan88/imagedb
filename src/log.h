@@ -112,6 +112,19 @@ enum {
                                    logged columns and dependencies; the auditor, which has no parser, checks the rest */
     IMDB_OP_DROP_VIEW = 21,     /* alone in its commit (P2 S7): u32 view: live, and no live view names it; it becomes a
                                    tombstone (its id, name and the two commits), its name free */
+    IMDB_OP_ALTER_TABLE = 22,   /* alone in its commit (F1): u32 table (live), u8 kind (IMDB_ALTER_*), the kind's
+                                   payload: ADD COLUMN a column (u8 length, name, u8 type, precision, scale, flags:
+                                   NULLABLE alone or none), u8 1 and its DEFAULT in the row encoding of one value
+                                   (u8 0: none; a NOT NULL column has one), at the next position; RENAME COLUMN u16
+                                   position (live) and the new name; RENAME TABLE the new name. Each makes the
+                                   table's next schema version; no row is re-encoded (design.md §5, Schema versions) */
+};
+
+/* op 22's kinds (F1) */
+enum {
+    IMDB_ALTER_ADD_COLUMN = 1,
+    IMDB_ALTER_RENAME_COLUMN = 2,
+    IMDB_ALTER_RENAME_TABLE = 3,
 };
 
 /* P2 S7: a view's definition, as op 20 logs it and a manifest keeps a live view's (imdb_viewdef_encode): u32 id, the
@@ -200,6 +213,13 @@ typedef struct imdb_op {
     /* CREATE_VIEW: the definition (allocated; an install takes it); DROP_VIEW: the view (P2 S7) */
     imdb_viewdef *vdef;
     uint32_t view;
+    /* ALTER_TABLE (F1): akind; ADD COLUMN: acol, adef (adef.null: no DEFAULT; a TEXT's bytes in the record); RENAME
+     * COLUMN: apos; RENAME COLUMN and TABLE: aname (allocated, IMDB_MAX_IDENT + 1) */
+    uint8_t akind;
+    imdb_column acol;
+    imdb_value adef;
+    uint16_t apos;
+    char *aname;
     /* WRITER_KEY */
     uint32_t epoch;
     uint8_t new_pk[IMDB_PUBKEY_LEN];
@@ -283,6 +303,13 @@ typedef struct imdb_writer_epoch {
  * `body` (caller keeps it alive). */
 int imdb_frame_decode_body(const uint8_t *body, size_t len, imdb_commit_rec *c, imdb_err *e);
 int imdb_commit_decode_header(const uint8_t *h, size_t hlen, imdb_commit_rec *c, imdb_err *e);
+/* F1: op 22's body after its table id: u8 kind, then ADD's column (u8 length, name, type, precision, scale, flags)
+ * and DEFAULT, RENAME COLUMN's u16 position and new name, RENAME TO's new name. The commit's codec and a manifest's
+ * schema history share it. put: IMDB_ERR_INVALID (the buffer's sticky error) unless the op is valid, nothing
+ * written then; get: strict, its messages prefixed by `what` ("commit", "manifest"), a rename's aname allocated
+ * (the caller frees it), a TEXT DEFAULT pointing into r's bytes; a truncation leaves r's error for the caller */
+int imdb_alter_put(imdb_buf *b, const imdb_op *o);
+int imdb_alter_get(imdb_rd *r, imdb_op *o, const char *what, imdb_err *e);
 /* seq from a frame's descriptor (frame = prefix + body, at least prefix+13 bytes). */
 static inline uint64_t imdb_frame_seq(const uint8_t *frame) { return imdb_get_le64(frame + IMDB_FRAME_HDR + 5); }
 /* The commit hash from a frame's descriptor (the frame passed imdb_frame_scan). */

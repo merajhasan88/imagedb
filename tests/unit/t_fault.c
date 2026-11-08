@@ -622,7 +622,7 @@ static void ack_closed(void)
 
 enum {
     VIOL_FAILSTOP = 3, VIOL_OPEN = 4, VIOL_PINNED = 5, VIOL_INDEX = 7, VIOL_ORDERED = 8, VIOL_JOIN = 9,
-    VIOL_LEAK = 10, VIOL_FILL = 11, VIOL_PUTBACK = 12, VIOL_EXPIRE = 13, VIOL_RETIRE = 14, VIOL_VIEW = 15
+    VIOL_LEAK = 10, VIOL_FILL = 11, VIOL_PUTBACK = 12, VIOL_EXPIRE = 13, VIOL_RETIRE = 14, VIOL_VIEW = 15, VIOL_ALTER = 16
 };
 
 typedef struct fscen {
@@ -1161,6 +1161,76 @@ static int run_view(const char *run)
     }
     /* not vacuous: a run nothing faulted made, read and dropped them all */
     if (!v && done == sizeof q / sizeof *q && !db->warning[0] && !db->failed && db->nviews != 3) v = VIOL_VIEW;
+    imdb_session_close(&s);
+    imdb_close(db);
+    return v;
+}
+
+
+/* P2 F1: ALTER TABLE (op 22) crashed at every point: a NOT NULL column added with its DEFAULT, a TEXT one, a row that
+ * leaves both out, a rename, CHECKPOINTs between (segments of each version, the manifest's schema history); each read
+ * against its twin, and every recovered state the acknowledged one (VERIFY and the auditor) */
+static int run_alter(const char *run)
+{
+    imdb_open_opts o = {.sync = 1};
+    imdb_db *db = NULL;
+    imdb_err e = {0};
+    if (imdb_open(dir_in(run, "p"), &o, &db, &e)) return 0;
+    db->warning[0] = 0;
+    imdb_session s;
+    imdb_session_init(&s, db);
+    s.cross_check = true;
+    static const char *const q[][2] = {
+        {"ALTER TABLE txns ADD n INT64 NOT NULL DEFAULT 5", NULL},
+        {"SELECT COUNT(*) FROM txns WHERE n = 5", "SELECT COUNT(*) FROM txns"},
+        {"CHECKPOINT", NULL},
+        {"ALTER TABLE txns ADD c TEXT DEFAULT 'q'", NULL},
+        {"INSERT INTO txns (id, user_id, amount, memo) VALUES (20, 42, 1.75, 'after')", NULL},
+        {"SELECT COUNT(*) FROM txns WHERE c = 'q' AND n = 5", "SELECT COUNT(*) FROM txns"},
+        {"ALTER TABLE txns RENAME COLUMN memo TO note", NULL},
+        {"CHECKPOINT", NULL},
+        {"SELECT SUM(n) FROM txns", "SELECT 5 * COUNT(*) FROM txns"},
+        {"SELECT note, c FROM txns WHERE user_id = 42 ORDER BY id", "SELECT note, 'q' FROM txns WHERE user_id = 42 ORDER BY id"},
+    };
+    int v = 0;
+    size_t done = 0;
+    for (size_t i = 0; i < sizeof q / sizeof *q && !v; i++) {
+        imdb_result r, t;
+        imdb_err_clear(&e);
+        int rc = imdb_exec_one(&s, q[i][0], strlen(q[i][0]), NULL, 0, &r, &e);
+        if (rc) {
+            v = after_error(db);
+            break;
+        }
+        if (q[i][1]) { /* the twin: if it runs, its rows are the statement's */
+            imdb_err_clear(&e);
+            if (!imdb_exec_one(&s, q[i][1], strlen(q[i][1]), NULL, 0, &t, &e)) {
+                imdb_buf a, b;
+                imdb_buf_init(&a);
+                imdb_buf_init(&b);
+                imdb_result_render(&r, true, &a);
+                imdb_result_render(&t, true, &b);
+                const char *pa = !a.err && a.p ? memchr(a.p, '\n', a.len) : NULL,
+                           *pb = !b.err && b.p ? memchr(b.p, '\n', b.len) : NULL;
+                if (!a.err && !b.err && (!pa || !pb || a.len - (size_t)(pa - (const char *)a.p) !=
+                                                                b.len - (size_t)(pb - (const char *)b.p) ||
+                                         memcmp(pa, pb, a.len - (size_t)(pa - (const char *)a.p))))
+                    v = VIOL_ALTER;
+                imdb_buf_free(&a);
+                imdb_buf_free(&b);
+                imdb_result_free(&t);
+            } else if (after_error(db)) {
+                v = VIOL_FAILSTOP;
+            }
+        }
+        imdb_result_free(&r);
+        if (v) break;
+        ack(db);
+        done++;
+    }
+    /* not vacuous: a run nothing faulted made every version */
+    const imdb_table *tt = imdb_table_by_name(db, "txns");
+    if (!v && done == sizeof q / sizeof *q && !db->warning[0] && !db->failed && (!tt || tt->hist.nvers != 4)) v = VIOL_ALTER;
     imdb_session_close(&s);
     imdb_close(db);
     return v;
@@ -2124,6 +2194,7 @@ static const char *check_run(const fscen *s, const char *run, const frun *r)
                  : code == VIOL_EXPIRE ? "a clean run whose policy did not expire the table once"
                  : code == VIOL_RETIRE ? "a clean run that did not retire below its boundary"
                  : code == VIOL_VIEW   ? "a view whose answer is not its inlined query's, or a clean run that did not end with its views"
+                 : code == VIOL_ALTER  ? "a read of an altered table not its twin's, or a clean run that did not make every version"
                                        : "a violation",
                  code);
         return g_why;
@@ -2732,6 +2803,7 @@ static const fscen kScen[] = {
     {"rewind", setup_rewind, run_rewind, false, NULL, rewind_base_ok, false, false, false}, /* P2 R1.3 */
     {"backup_catalogue", setup_backup_catalogue, run_backup_catalogue, false, NULL, backup_catalogue_base_ok, false, false,
      false}, /* P2 D1.1 */
+    {"alter", setup_txns, run_alter, false, NULL, NULL, false, false, false}, /* P2 F1 */
 };
 
 static void t_fault_commits(void) { fault_scenario(&kScen[0]); }
@@ -2767,6 +2839,7 @@ static void t_fault_backup_incr(void) { fault_scenario(&kScen[29]); }
 static void t_fault_view(void) { fault_scenario(&kScen[30]); }
 static void t_fault_rewind(void) { fault_scenario(&kScen[31]); }
 static void t_fault_backup_catalogue(void) { fault_scenario(&kScen[32]); }
+static void t_fault_alter(void) { fault_scenario(&kScen[33]); }
 
 const test_case fault_tests[] = {
     {"fault_commits", t_fault_commits},     {"fault_nosync", t_fault_nosync}, {"fault_checkpoint", t_fault_checkpoint},
@@ -2797,5 +2870,6 @@ const test_case fault_tests[] = {
     {"fault_view", t_fault_view},
     {"fault_rewind", t_fault_rewind},
     {"fault_backup_catalogue", t_fault_backup_catalogue},
+    {"fault_alter", t_fault_alter},
 };
 const size_t fault_ntests = sizeof fault_tests / sizeof *fault_tests;

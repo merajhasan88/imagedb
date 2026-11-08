@@ -368,6 +368,7 @@ static bool g_expr = true; /* --no-expr: 1a's generator, draw for draw */
 static bool g_fns = true;  /* --no-fns: the generator before P2 S1, draw for draw */
 static bool g_views = true; /* --no-views: the generator before P2 S7's views, draw for draw */
 static bool g_ckey; /* P2 F4, --ckey: u's key is (tid, id), every dialect's; ids stay unique, tid never NULL or SET */
+static bool g_alter; /* P2 F1, --alter: t's last five columns added after its first rows (alter_add) */
 /* A seed names the same statements only within one stage: each P2 stage (S1 to S4) adds forms to the default
  * generator's draws, so seed N's statements differ from the stage before's (a mismatch is reproduced on its own
  * build); --no-fns and --no-expr reproduce the generators before P2 S1 and before 1a. */
@@ -3230,6 +3231,32 @@ static int out_types(const stmt *q, int *ty)
     return q->nit;
 }
 
+
+/* P2 F1, --alter: t made by ALTERs. Its first rows go in on (id, g, a, x) alone, imagedb checkpointing halfway (a
+ * segment of the first version, and rows of it in memory), then d, f and s are added with a DEFAULT (what those rows
+ * read: SQL Server's WITH VALUES, which it needs for a nullable column) and k and ts without one (NULL), each dialect's
+ * type as its CREATE's; imagedb alone renames x and t away and back (versions, no name changed). Every statement
+ * after that sees t whole. */
+static const char *const ALT_TY[5][ND] = {
+    {"DECIMAL(12,2)", "INTEGER", "NUMERIC(12,2)", "DECIMAL(12,2)", "DECIMAL(12,2)", "DECIMAL(12,2)"},
+    {"FLOAT64", "REAL", "DOUBLE PRECISION", "DOUBLE", "DOUBLE", "FLOAT(53)"},
+    {"TEXT", "TEXT", "TEXT COLLATE \"C\"", "VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin",
+     "VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_nopad_bin", "VARCHAR(255) COLLATE Latin1_General_100_BIN2_UTF8"},
+    {"BOOL", "INTEGER", "BOOLEAN", "BOOLEAN", "BOOLEAN", "BIT"},
+    {"TIMESTAMP", "INTEGER", "TIMESTAMP(6)", "DATETIME(6)", "DATETIME(6)", "DATETIME2(6)"}};
+
+static const char *ddl_alter(int d, const char *whole)
+{
+    static char b[ND][600];
+    const char *cut = strstr(whole, ", d ");
+    if (!cut || (size_t)(cut - whole) + 2 > sizeof b[d]) exit(2);
+    memcpy(b[d], whole, (size_t)(cut - whole));
+    b[d][cut - whole] = ')';
+    b[d][cut - whole + 1] = 0;
+    return b[d];
+}
+
+
 static const char *ddl(int d, int tab)
 {
     static const char *const T[ND] = {
@@ -3265,7 +3292,7 @@ static const char *ddl(int d, int tab)
         "utf8mb4_nopad_bin)",
         "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, tid BIGINT, v BIGINT, s VARCHAR(255) COLLATE "
         "Latin1_General_100_BIN2_UTF8)"};
-    return tab ? (g_ckey ? UCK[d] : U[d]) : T[d];
+    return tab ? (g_ckey ? UCK[d] : U[d]) : g_alter ? ddl_alter(d, T[d]) : T[d];
 }
 
 /* ---- canonical cells: every engine's answer to one text per value ------------------------------------------------ */
@@ -3900,7 +3927,8 @@ static void reset_all(unsigned seed)
         /* indexes: on imagedb the ordered paths and the index-only aggregates answer through them */
         static const char *const IDX[] = {"CREATE INDEX t_ga ON t (g, a)", "CREATE INDEX t_s ON t (s)",
                                           "CREATE INDEX t_ts ON t (ts)", "CREATE INDEX u_tid ON u (tid)"};
-        for (size_t i = 0; i < sizeof IDX / sizeof IDX[0]; i++) must(e, IDX[i]);
+        for (size_t i = 0; i < sizeof IDX / sizeof IDX[0]; i++)
+            if (!g_alter || (i != 1 && i != 2)) must(e, IDX[i]); /* --alter: t_s and t_ts once s and ts are added */
     }
 }
 
@@ -4449,6 +4477,57 @@ static int drop_u_again(unsigned seed, int *step)
     return check_state(seed, *step);
 }
 
+static void alter_first_rows(const stmt *q)
+{
+    for (int d = 0; d < ND; d++) {
+        if (!g_eng[d].on) continue;
+        sb b = {0};
+        sb_str(&b, "INSERT INTO t (id, g, a, x) VALUES ");
+        for (int r = 0; r < q->nrow; r++) {
+            sb_str(&b, r ? ", (" : "(");
+            for (int c = 0; c < 4; c++) {
+                if (c) sb_str(&b, ", ");
+                put_lit(&b, d, TC[c].t, &q->row[r][c]);
+            }
+            sb_str(&b, ")");
+        }
+        must(&g_eng[d], b.p);
+        free(b.p);
+    }
+}
+
+static void alter_add(void)
+{
+    val dv[5];
+    memset(dv, 0, sizeof dv);
+    dv[0].i = 125; /* d 1.25 (scaled by 100) */
+    dv[1].f = 0.5;
+    snprintf(dv[2].s, sizeof dv[2].s, "q");
+    dv[3].null = dv[4].null = true;
+    for (int d = 0; d < ND; d++) {
+        if (!g_eng[d].on) continue;
+        for (int k = 0; k < 5; k++) {
+            sb b = {0};
+            sb_printf(&b, "ALTER TABLE t ADD %s%s %s", d == D_MS ? "" : "COLUMN ", TC[4 + k].name, ALT_TY[k][d]);
+            if (d == D_MS) sb_str(&b, " NULL");
+            if (!dv[k].null) {
+                sb_str(&b, " DEFAULT ");
+                put_lit(&b, d, TC[4 + k].t, &dv[k]);
+                if (d == D_MS) sb_str(&b, " WITH VALUES");
+            }
+            must(&g_eng[d], b.p);
+            free(b.p);
+        }
+        must(&g_eng[d], "CREATE INDEX t_s ON t (s)");
+        must(&g_eng[d], "CREATE INDEX t_ts ON t (ts)");
+    }
+    eng *e = &g_eng[D_IMDB];
+    must(e, "ALTER TABLE t RENAME COLUMN x TO x_was");
+    must(e, "ALTER TABLE t RENAME TO t_was");
+    must(e, "ALTER TABLE t_was RENAME TO t");
+    must(e, "ALTER TABLE t RENAME COLUMN x_was TO x");
+}
+
 static int run_seed(unsigned seed, int steps)
 {
     g_rng = 0x9E3779B97F4A7C15ull ^ ((uint64_t)seed * 0xBF58476D1CE4E5B9ull);
@@ -4470,6 +4549,12 @@ static int run_seed(unsigned seed, int steps)
             q.gcol = -1;
             q.nrow = n - i < 8 ? n - i : 8;
             for (int r = 0; r < q.nrow; r++) gen_row(tab, q.row[r]);
+            if (g_alter && !tab) { /* P2 F1: on t's first four columns alone; imagedb's rows to a segment halfway */
+                alter_first_rows(&q);
+                if (i < n / 2 && i + 8 >= n / 2) must(&g_eng[D_IMDB], "CHECKPOINT"), g_checkpoints++;
+                if (i + 8 >= n) alter_add();
+                continue;
+            }
             if (run_stmt(seed, step++, &q, false)) return -1;
         }
     }
@@ -4540,12 +4625,13 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--no-fns")) g_fns = false;
         else if (!strcmp(argv[i], "--no-views")) g_views = false; /* P2 S7 */
         else if (!strcmp(argv[i], "--ckey")) g_ckey = true; /* P2 F4 */
+        else if (!strcmp(argv[i], "--alter")) g_alter = true; /* P2 F1 */
         else if (!strcmp(argv[i], "--no-view-audit")) g_view_audit = false; /* P2 S7b */
         else if (!strcmp(argv[i], "--audit") && i + 1 < argc) snprintf(g_audit_bin, sizeof g_audit_bin, "%s", argv[++i]);
         else if (!strcmp(argv[i], "--ping")) ping = true; /* connect to every engine named, then stop (run.sh waits on it) */
         else if (!strcmp(argv[i], "-v")) g_verbose = true;
         else {
-            fprintf(stderr, "usage: oracle [--engines LIST] [--seeds A-B] [--steps N] [--dir DIR] [--keep-going] [--no-expr] [--no-fns] [--no-views] [--ckey] [--ping] [-v]\n");
+            fprintf(stderr, "usage: oracle [--engines LIST] [--seeds A-B] [--steps N] [--dir DIR] [--keep-going] [--no-expr] [--no-fns] [--no-views] [--ckey] [--alter] [--ping] [-v]\n");
             return 2;
         }
     }

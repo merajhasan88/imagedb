@@ -346,6 +346,37 @@ must_fail "share its primary key" "$AUD" verify "$PFG"
 echo "   FF a key of two columns, FG of one: the engine's replay and the auditor refuse each (the auditor checks a
    table's key since F4; it had checked only the unique indexes)"
 
+echo "== FH: a segment built after ADD COLUMN whose row from before it reads another value than its missing one there
+   (no commitment covers that value), its zone map made again, the lake re-hashed and the log re-signed by the writer"
+PFH=$WORK/fh; "$BIN" init "$PFH" >/dev/null # rows still in memory at the ALTER: the CHECKPOINT after it builds them
+"$BIN" sql "$PFH" --nosync -c "CREATE TABLE t (id INT64 PRIMARY KEY, u INT64 SUBJECT, memo TEXT);" \
+  -c "INSERT INTO t VALUES (1, 42, 'one'), (2, 7, 'two');" >/dev/null
+"$BIN" sql "$PFH" --nosync -c "ALTER TABLE t ADD n INT64 NOT NULL DEFAULT 5;" \
+  -c "INSERT INTO t VALUES (4, 9, 'four', 9);" -c "CHECKPOINT;" >/dev/null
+"$BIN" verify "$PFH" >/dev/null && "$AUD" verify "$PFH" >/dev/null || fail "the honest directory must verify"
+"$FORGE" lie-missing "$PFH"
+must_fail "holds another value than its missing one in column n" "$BIN" verify "$PFH"
+must_fail "holds another value than its missing one in column n" "$AUD" verify "$PFH"
+echo "   the engine's VERIFY and the auditor refuse it: a value its commitment does not cover is still one a reader reads"
+
+echo "== FI: an ADD COLUMN of a name a live view reading the table holds (its text would bind the name to the new column),
+   signed by the writer"
+PFI=$WORK/fi; make_db "$PFI"
+"$BIN" sql "$PFI" --nosync -c "CREATE TABLE u2 (id INT64 PRIMARY KEY, k INT64);" \
+  -c "CREATE VIEW vk AS SELECT t.id, k FROM t JOIN u2 ON t.id = u2.id;" >/dev/null
+"$FORGE" index-lie "$PFI" alter-view
+must_fail "view vk reads table t and names k" "$BIN" verify "$PFI"   # the open's replay refuses it
+must_fail "ADD COLUMN k of table t, which view vk reads and names" "$AUD" verify "$PFI"
+echo "== FJ: a manifest whose schema history gives an added column another DEFAULT (it still ends at the table's schema),
+   re-pointed and re-signed"
+PFJ=$WORK/fj; make_db "$PFJ"
+"$BIN" sql "$PFJ" --nosync -c "ALTER TABLE t ADD n INT64 NOT NULL DEFAULT 5;" -c "CHECKPOINT;" >/dev/null
+"$FORGE" manifest-lie "$PFJ" default
+must_fail "manifest schema of table t differs from the log" "$BIN" verify "$PFJ"
+must_fail "the manifest's schema history differs from the log's" "$AUD" verify "$PFJ"
+echo "   FI: the engine's replay and the auditor refuse the ADD; FJ: VERIFY and the auditor compare the history with the
+   log's (the open took the manifest's: its old rows would read 6)"
+
 echo "== Z: a commit naming the other digest algorithm, re-signed by the writer (both ways round); META naming an unknown one"
 for a in 1 2; do # explicit algorithms: under IMDB_DIGEST_ALG=2 make_db's would all be alg 2
   PZ=$WORK/z$a

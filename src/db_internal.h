@@ -38,6 +38,28 @@ uint64_t imdb_ver_growth(const imdb_table *t);
 uint64_t imdb_ver_next_cap(const imdb_table *t);
 const uint8_t *imdb_mem_row(const imdb_table *t, const imdb_version *v);
 int imdb_version_key(imdb_table *t, uint64_t vid, int col, imdb_value *out);
+/* F1: the version rows begun at commit `at` are encoded under (the last whose since is at or before it), and a row of
+ * version `from` (its values src) mapped onto the current version (dst): a position it lacks reads its missing value */
+/* F1: a schema history: version 1 of a schema; the version rows begun at `at` are encoded under; a row of version
+ * `from` mapped onto the last (its missing positions their missing values); op 22's next version made before the commit
+ * (the room, a TEXT DEFAULT's bytes, its hash) and taken after it (allocating nothing) */
+int imdb_hist_first(imdb_schema_hist *h, const imdb_schema *s, imdb_err *e);
+const imdb_sver *imdb_hist_at(const imdb_schema_hist *h, uint64_t at);
+void imdb_hist_map(const imdb_schema_hist *h, const imdb_sver *from, const imdb_value *src, imdb_value *dst);
+int imdb_hist_prepare(imdb_schema_hist *h, imdb_op *o, imdb_err *e);
+void imdb_hist_install(imdb_schema_hist *h, const imdb_op *o, uint64_t seq);
+void imdb_hist_free(imdb_schema_hist *h);
+int imdb_hist_copy(imdb_schema_hist *dst, const imdb_schema_hist *src, imdb_err *e); /* dst replaced by a deep copy */
+const imdb_sver *imdb_sver_at(const imdb_table *t, uint64_t at);
+/* F1: op 22. imdb_alter_check: its rules against the table now (the writer's and replay's); imdb_alter_prepare: the
+ * room and an added TEXT DEFAULT's bytes, before the commit; imdb_alter_install: the next version, allocating nothing */
+int imdb_alter_check(imdb_db *db, const imdb_table *t, const imdb_op *o, imdb_err *e);
+int imdb_alter_prepare(imdb_table *t, imdb_op *o, imdb_err *e);
+void imdb_alter_install(imdb_table *t, const imdb_op *o, uint64_t seq);
+/* F1: the compact schema op 22 makes of cur, alone (VERIFY's model): stage 2's kinds, a position its column's index
+ * while no column is dropped */
+int imdb_alter_schema(const imdb_schema *cur, const imdb_op *o, imdb_schema *out, imdb_err *e);
+void imdb_sver_map(const imdb_table *t, const imdb_sver *from, const imdb_value *src, imdb_value *dst);
 /* F4: a key as its table's PK map keys it (design.md §5): kv the key's values in key order; v the map's key, kv[0]
  * itself for one column, the key's encoding (codec.h imdb_key_write) for several, in kbuf or, past it, allocated.
  * A TEXT value points where its row's does, so a key lives as long as the row it was read from (imdb_version_values) */

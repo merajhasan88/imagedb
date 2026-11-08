@@ -367,31 +367,31 @@ static void t_index_manifest_strict(void)
     uint8_t *w = malloc(n);
     CHECK(w);
     if (!w) return;
-    /* an entry: u8 length, the name, u8 flags, u8 ncols, u16 per column; u_w is u's last, and u's
-     * u64 retention, u64 creation and u64 drop commits (version 5); then (manifest 7) the views section and the nine empty
-     * ones, 160 bytes, end it */
+    /* an entry: u8 length, the name, u8 flags, u8 ncols, u16 per column; u_w is u's last, and u's u64 retention,
+     * u64 creation and u64 drop commits (version 5) and F1's u32 count of ALTERs (0); then (manifest 7) the views
+     * section and the nine empty ones, 160 bytes, end it */
     memcpy(w, b, n); /* the last index (u_w) on a column u lacks */
-    w[n - 186] = 2;
-    w[n - 185] = 0;
+    w[n - 190] = 2;
+    w[n - 189] = 0;
     CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
     memcpy(w, b, n); /* an unknown flag */
-    CHECK(w[n - 188] == 0 && w[n - 187] == 1);
-    w[n - 188] = 2;
+    CHECK(w[n - 192] == 0 && w[n - 191] == 1);
+    w[n - 192] = 2;
     CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
     memcpy(w, b, n); /* no column */
-    w[n - 187] = 0;
+    w[n - 191] = 0;
     CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
     memcpy(w, b, n); /* u's retention below a second */
-    memset(w + n - 184, 0, 8);
+    memset(w + n - 188, 0, 8);
     CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
     memcpy(w, b, n); /* u created at commit 0, past the manifest's commit, or dropped at its creation (1f) */
-    memset(w + n - 176, 0, 8);
+    memset(w + n - 180, 0, 8);
     CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
     memcpy(w, b, n);
-    memset(w + n - 176, 0xff, 7);
+    memset(w + n - 180, 0xff, 7);
     CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
     memcpy(w, b, n);
-    memcpy(w + n - 168, w + n - 176, 8);
+    memcpy(w + n - 172, w + n - 180, 8);
     CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
     memcpy(w, b, n); /* t, which has a live row, marked dropped: a dropped table has none */
     {
@@ -420,14 +420,15 @@ static void t_index_manifest_strict(void)
     OK(ex(&s, "DROP INDEX t_v"));
     OK(ex(&s, "DROP INDEX t_x"));
     OK(ex(&s, "CHECKPOINT"));
-    CHECK(manifest_version(db) == 7); /* u_w remains, last: u32 1, u8 3, "u_w", u8 0, u8 1, u16, then u64 retention, creation, drop */
+    CHECK(manifest_version(db) == 7); /* u_w remains, last: u32 1, u8 3, "u_w", u8 0, u8 1, u16, then u64 retention, creation,
+                                       * drop and (F1) u32 0 ALTERs */
     b = manifest_copy(db, &n);
     CHECK(b && n > 20 && parse_bytes(b, n) == IMDB_OK);
     if (!b) return;
-    uint8_t *p = b + n - 196;
+    uint8_t *p = b + n - 200;
     CHECK(p[0] == 1 && p[1] == 0 && p[2] == 0 && p[3] == 0 && p[4] == 3);
     memset(p, 0, 4);          /* nidx = 0 */
-    memmove(p + 4, p + 12, 184); /* the entry gone; the retention, the two commits and every section after it */
+    memmove(p + 4, p + 12, 188); /* the entry gone; the retention, the two commits, F1's count and every section after it */
     imdb_le64(b + 148, imdb_get_le64(b + 148) - 8); /* the tables section's length (manifest 7: after the 144-byte header) */
     CHECK(parse_bytes(b, n - 8) == IMDB_OK);
     free(b);

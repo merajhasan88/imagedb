@@ -53,6 +53,7 @@ typedef struct vver {
 
 typedef struct vtab {
     imdb_schema s;
+    imdb_schema_hist hist; /* F1: its versions, to parse and check segments of each as the engine does */
     vver **vc;         /* versions in chunks of 2^16 as the store's (db.h): one only where a vid this model holds lands */
     uint32_t nchunk;
     uint64_t cap0;     /* chunk 0's entries: it grows from 64, so a small table stays small */
@@ -73,6 +74,7 @@ typedef struct vsnap_tab {
     uint64_t n, live, horizon, purged, retention_us, created_at, dropped_at;
     imdb_index idx[IMDB_MAX_INDEXES];
     uint32_t nidx;
+    uint32_t nvers;    /* F1: its schema versions then (the history's first nvers) */
 } vsnap_tab;
 
 /* The log's state right after the lake snapshot's commit S. */
@@ -98,6 +100,8 @@ typedef struct vview {
     uint8_t def_hash[32];   /* a live one's definition, as imdb_viewdef_encode makes it: its SHA-256 */
     imdb_viewdep *deps;     /* allocated: the drop rules' (a snapshot's copy holds none) */
     uint16_t ndeps;
+    char *text;             /* F1: a live one's query text (allocated, NUL ended; a snapshot's copy holds none) */
+    uint32_t text_len;
 } vview;
 
 typedef struct vctx {
@@ -148,6 +152,35 @@ static bool v_named(const vctx *x, uint8_t kind, uint32_t id) /* a live view nam
     return false;
 }
 
+
+/* F1: imdb_view_names_col over the model's views at this commit: the first live one reading table (directly or through
+ * views) whose text holds col as an identifier */
+static int v_names_col(const vctx *x, uint32_t table, const char *col, const char **name, imdb_err *e)
+{
+    *name = NULL;
+    if (!x->nv) return IMDB_OK;
+    bool *rd = imdb_alloc_array(x->nv, sizeof *rd, e);
+    if (!rd) return e->code;
+    for (bool more = true; more;) {
+        more = false;
+        for (uint32_t i = 0; i < x->nv; i++)
+            for (uint16_t k = 0; !rd[i] && !x->v[i].dropped_at && k < x->v[i].ndeps; k++) {
+                const imdb_viewdep *d = &x->v[i].deps[k];
+                if ((d->kind == IMDB_VIEWDEP_TABLE && d->id == table) ||
+                    (d->kind == IMDB_VIEWDEP_VIEW && d->id < x->nv && rd[d->id]))
+                    rd[i] = more = true;
+            }
+    }
+    int rc = IMDB_OK;
+    for (uint32_t i = 0; i < x->nv && !rc && !*name; i++) {
+        bool has = false;
+        if (rd[i] && x->v[i].text && !(rc = imdb_sql_names_ident(x->v[i].text, x->v[i].text_len, col, &has, e)) && has)
+            *name = x->v[i].name;
+    }
+    imdb_free(rd);
+    return rc;
+}
+
 static int v_def_hash(const imdb_viewdef *d, uint8_t out[32], imdb_err *e)
 {
     imdb_buf b;
@@ -177,12 +210,18 @@ static int v_view_push(vctx *x, const char *name, uint64_t created, uint64_t dro
         memcpy(w->deps, d->deps, d->ndeps * sizeof *w->deps);
         w->ndeps = d->ndeps;
     }
+    if (!(w->text = imdb_alloc(d->text_len + 1u, e))) return e->code; /* F1: an ADD COLUMN's rule reads it */
+    memcpy(w->text, d->text, d->text_len);
+    w->text_len = d->text_len;
     return IMDB_OK;
 }
 
 static void v_views_free(vview *v, uint32_t n)
 {
-    for (uint32_t i = 0; i < n; i++) imdb_free(v[i].deps);
+    for (uint32_t i = 0; i < n; i++) {
+        imdb_free(v[i].deps);
+        imdb_free(v[i].text);
+    }
     imdb_free(v);
 }
 
@@ -221,6 +260,11 @@ typedef struct vnewtab {     /* a table created inside the batch */
     uint32_t frame, op;
 } vnewtab;
 
+typedef struct valter {     /* F1: a table's schema after an ALTER inside the batch, for the rows after it */
+    uint32_t table, frame;
+    imdb_schema s;
+} valter;
+
 typedef struct vbatch {
     vframe *f;
     size_t nf;
@@ -230,6 +274,8 @@ typedef struct vbatch {
     uint32_t nt0;            /* tables before the batch */
     vnewtab *nt_new;
     uint32_t nnew;
+    valter *alt;
+    uint32_t nalt;
     const imdb_lthash *states; /* the running global state after each commit */
     const uint8_t *db_id, *root; /* for a promotion's certificate; root: META's, or NULL */
     uint8_t gkey[(IMDB_VERIFY_BATCH + 63) / 64][IMDB_PUBKEY_LEN]; /* the key at each group's start */
@@ -289,6 +335,8 @@ static void stage_sigs(void *ctx, size_t g)
 
 static const imdb_schema *batch_schema(const vbatch *b, uint32_t table, uint32_t frame, uint32_t op)
 {
+    for (uint32_t k = b->nalt; k-- > 0;) /* F1: the last ALTER before this frame (one is alone in its commit) */
+        if (b->alt[k].table == table && b->alt[k].frame < frame) return &b->alt[k].s;
     if (table < b->nt0) return &b->x->t[table].s;
     uint32_t k = table - b->nt0;
     if (k >= b->nnew) return NULL;
@@ -391,9 +439,11 @@ static void batch_free(vbatch *b)
     }
     imdb_free(b->ch);
     imdb_free(b->nt_new);
+    imdb_free(b->alt);
     b->ch = NULL;
     b->nt_new = NULL;
-    b->nch = b->nnew = 0;
+    b->alt = NULL;
+    b->nch = b->nnew = b->nalt = 0;
 }
 
 /* ---- d: the ordered state machine ------------------------------------------------- */
@@ -449,6 +499,7 @@ static int vt_push(vtab *t, imdb_err *e)
 
 static void vt_free(vtab *t)
 {
+    imdb_hist_free(&t->hist);
     for (uint32_t k = 0; k < t->nchunk; k++) imdb_free(t->vc[k]);
     imdb_free(t->vc);
     t->vc = NULL;
@@ -546,12 +597,14 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
         const imdb_op *o = &c->ops[k];
         bool on_table = o->code == IMDB_OP_INSERT || o->code == IMDB_OP_DELETE || o->code == IMDB_OP_UPDATE ||
                         o->code == IMDB_OP_COMPACT || o->code == IMDB_OP_CREATE_INDEX || o->code == IMDB_OP_DROP_INDEX ||
-                        o->code == IMDB_OP_SET_RETENTION || o->code == IMDB_OP_EXPIRE || o->code == IMDB_OP_DROP_TABLE;
+                        o->code == IMDB_OP_SET_RETENTION || o->code == IMDB_OP_EXPIRE || o->code == IMDB_OP_DROP_TABLE ||
+                        o->code == IMDB_OP_ALTER_TABLE;
         vtab *t = on_table && o->table < x->nt ? &x->t[o->table] : NULL;
         if (on_table && !t) return imdb_fail(e, IMDB_ERR_VERIFY, "verify: unknown table");
         if (t && t->dropped_at && /* replay's and the auditor's rule: a dropped table's history may still expire */
             (o->code == IMDB_OP_INSERT || o->code == IMDB_OP_DELETE || o->code == IMDB_OP_UPDATE || o->code == IMDB_OP_COMPACT ||
-             o->code == IMDB_OP_CREATE_INDEX || o->code == IMDB_OP_DROP_INDEX || o->code == IMDB_OP_SET_RETENTION))
+             o->code == IMDB_OP_CREATE_INDEX || o->code == IMDB_OP_DROP_INDEX || o->code == IMDB_OP_SET_RETENTION ||
+             o->code == IMDB_OP_ALTER_TABLE))
             return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: op %u on table %u, dropped at commit %llu",
                              (unsigned long long)seq, o->code, o->table, (unsigned long long)t->dropped_at);
         if (imdb_op_publishes_manifest(o->code)) *published = o->manifest;
@@ -567,6 +620,7 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
             x->t = nt;
             memset(&x->t[x->nt], 0, sizeof x->t[x->nt]);
             x->t[x->nt].s = *o->schema;
+            if (imdb_hist_first(&x->t[x->nt].hist, o->schema, e)) return e->code;
             x->t[x->nt].created_at = seq;
             x->t[x->nt].d = imdb_alloc_aligned(1, sizeof *x->t[x->nt].d, e);
             if (!x->t[x->nt].d) return e->code;
@@ -655,6 +709,31 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
                 return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: DROP VIEW of a view unknown, dropped already or "
                                  "named by a live view", (unsigned long long)seq);
             w->dropped_at = seq;
+            break;
+        }
+        case IMDB_OP_ALTER_TABLE: { /* F1: the rules the model decides; the next schema for the rows after it */
+            imdb_schema ns;
+            imdb_err e2 = {0};
+            if (o->akind != IMDB_ALTER_ADD_COLUMN && v_named(x, IMDB_VIEWDEP_TABLE, o->table))
+                return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: a rename of table %s, which a live view names",
+                                 (unsigned long long)seq, t->s.name);
+            if (o->akind == IMDB_ALTER_ADD_COLUMN) { /* a view reading the table that holds the name (db.c's rule) */
+                const char *vn = NULL;
+                if (v_names_col(x, o->table, o->acol.name, &vn, e)) return e->code;
+                if (vn)
+                    return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: ADD COLUMN %s of table %s, which view %s reads "
+                                     "and names", (unsigned long long)seq, o->acol.name, t->s.name, vn);
+            }
+            if (o->akind == IMDB_ALTER_RENAME_TABLE && v_name_live(x, o->aname))
+                return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: RENAME TO a live table's or view's name",
+                                 (unsigned long long)seq);
+            if (imdb_alter_schema(&t->s, o, &ns, &e2))
+                return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: ALTER TABLE %s: %s", (unsigned long long)seq,
+                                 t->s.name, e2.msg);
+            imdb_op oc = *o; /* the engine's prepare re-points a TEXT DEFAULT at its own copy */
+            if (imdb_hist_prepare(&t->hist, &oc, e)) return e->code;
+            imdb_hist_install(&t->hist, &oc, seq);
+            t->s = ns;
             break;
         }
         case IMDB_OP_DROP_TABLE: /* live, not kept FOREVER (its commit's op 16 first); every live version ends here */
@@ -752,11 +831,14 @@ static int snapshot_at_s(vctx *x, const imdb_commit_rec *c, const uint8_t *publi
         s->t[ti].dropped_at = x->t[ti].dropped_at;
         memcpy(s->t[ti].idx, x->t[ti].idx, sizeof s->t[ti].idx);
         s->t[ti].nidx = x->t[ti].nidx;
+        s->t[ti].nvers = x->t[ti].hist.nvers;
     }
     if (x->nv && !(s->v = imdb_alloc_array(x->nv, sizeof *s->v, e))) return e->code; /* P2 S7 */
     for (uint32_t i = 0; i < x->nv; i++) {
         s->v[i] = x->v[i];
         s->v[i].deps = NULL;
+        s->v[i].text = NULL;
+        s->v[i].text_len = 0;
         s->v[i].ndeps = 0;
     }
     s->nv = x->nv;
@@ -893,6 +975,22 @@ static int run_batch(vctx *x, vbatch *b, imdb_lthash *states, uint64_t seg_first
         if (!f->decoded || !f->sig_ok || f->bad_commit_op != NO_OP) break;
         for (uint32_t k = 0; k < f->c.nops; k++) {
             const imdb_op *o = &f->c.ops[k];
+            if (o->code == IMDB_OP_ALTER_TABLE) { /* F1: its schema for the rows after it in the batch */
+                const imdb_schema *prev = batch_schema(b, o->table, (uint32_t)i, k);
+                imdb_schema next;
+                imdb_err e2 = {0};
+                if (!prev || imdb_alter_schema(prev, o, &next, &e2)) { /* the ordered stage reports it */
+                    stop = 1;
+                    break;
+                }
+                valter *na = imdb_realloc_array(b->alt, b->nalt, b->nalt + 1, sizeof *na, e);
+                if (!na) return e->code;
+                b->alt = na;
+                b->alt[b->nalt].table = o->table;
+                b->alt[b->nalt].frame = (uint32_t)i;
+                b->alt[b->nalt++].s = next;
+                continue;
+            }
             if (o->code != IMDB_OP_CREATE_TABLE) continue;
             if (o->table != b->nt0 + b->nnew) {
                 stop = 1;
@@ -1090,7 +1188,7 @@ static void lake_item(void *ctx, size_t i)
     }
     memcpy(al, sb, sl);
     imdb_free(sb);
-    if ((it->rc = imdb_segment_parse(&vt->s, al, sl, mt->seg[it->k].seg, &it->g, e))) { /* read by its name */
+    if ((it->rc = imdb_segment_parse_h(&vt->hist, al, sl, mt->seg[it->k].seg, &it->g, e))) { /* read by its name */
         imdb_free(al);
         return;
     }
@@ -1104,7 +1202,7 @@ static void lake_item(void *ctx, size_t i)
         it->rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: segment row count mismatch");
         return;
     }
-    if ((it->rc = imdb_segment_check_commitments(&vt->s, g, gi, e))) return;
+    if ((it->rc = imdb_segment_check_commitments(&vt->hist, g, gi, e))) return;
     if (memcmp(mt->seg[it->k].dv, (uint8_t[32]){0}, 32) != 0) {
         uint8_t *dvb = NULL;
         size_t dl;
@@ -1214,6 +1312,30 @@ static int same_schema(const imdb_schema *a, const imdb_schema *b)
     return same;
 }
 
+/* F1: a manifest's schema history is the log's first n versions: each at its commit, by its hash and the ALTER that made
+ * it, and every position they added with the missing value the log gave it */
+static bool same_hist(const imdb_schema_hist *m, const imdb_schema_hist *x, uint32_t n)
+{
+    if (m->nvers != n || n > x->nvers || !n) return false;
+    for (uint32_t k = 0; k < n; k++) {
+        const imdb_sver *a = &m->vers[k], *b = &x->vers[k];
+        if (a->since != b->since || memcmp(a->hash, b->hash, 32) != 0 || a->akind != b->akind || a->apos != b->apos)
+            return false;
+    }
+    uint16_t np = 0; /* the positions the first n versions have: those added at or before version n */
+    while (np < x->ntcol && x->tcol[np].added <= n) np++;
+    if (m->ntcol != np) return false;
+    for (uint16_t p = 0; p < np; p++) {
+        const imdb_value *a = &m->tcol[p].missing, *b = &x->tcol[p].missing;
+        if (m->tcol[p].added != x->tcol[p].added || a->null != b->null || a->type != b->type || a->scale != b->scale)
+            return false;
+        if (a->null) continue;
+        if (a->type == IMDB_T_TEXT ? a->len != b->len || (a->len && memcmp(a->s, b->s, a->len) != 0) : a->i != b->i)
+            return false;
+    }
+    return true;
+}
+
 static int verify_lake(imdb_db *db, const vctx *x, imdb_verify_report *rep, imdb_err *e)
 {
     const vsnap *at = &x->at_s;
@@ -1284,7 +1406,8 @@ static int verify_lake(imdb_db *db, const vctx *x, imdb_verify_report *rep, imdb
     for (uint32_t ti = 0; ti < m.nt && !rc; ti++) {
         const imdb_manifest_tab *mt = &m.t[ti];
         const vsnap_tab *st = &at->t[ti];
-        if (!same_schema(&mt->s, &x->t[ti].s))
+        if (!st->nvers || !same_schema(&mt->s, &x->t[ti].hist.vers[st->nvers - 1].s) ||
+            !same_hist(&mt->hist, &x->t[ti].hist, st->nvers)) /* F1: at the manifest's commit, its history too */
             rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: manifest schema of table %s differs from the log", x->t[ti].s.name);
         else if (mt->versions != st->n || mt->live != st->live || mt->horizon != st->horizon ||
                  mt->retention_us != st->retention_us || mt->created_at != st->created_at ||
@@ -1571,6 +1694,10 @@ static int verify_seed(imdb_db *db, vctx *x, imdb_err *e)
     for (uint32_t i = 0; !rc && i < fm.nt; i++) {
         vtab *t = &x->t[i];
         t->s = fm.t[i].s;
+        if (imdb_hist_copy(&t->hist, &fm.t[i].hist, e)) { /* F1: the floor manifest's history */
+            rc = e->code;
+            break;
+        }
         if (!(t->d = imdb_alloc_aligned(1, sizeof *t->d, e))) {
             rc = e->code;
             break;
@@ -1603,7 +1730,9 @@ static int verify_seed(imdb_db *db, vctx *x, imdb_err *e)
             else memcpy(al, sb, sl);
             imdb_free(sb);
             sb = NULL;
-            if (!rc && (rc = imdb_segment_parse(&t->s, al, sl, m.t[ti].seg[k].seg, &g, e))) imdb_free(al);
+            /* F1: by the current manifest's history, which holds every version its segments name (F's history and
+             * any ALTER since; the positions are F's own): the model at F has F's alone */
+            if (!rc && (rc = imdb_segment_parse_h(&m.t[ti].hist, al, sl, m.t[ti].seg[k].seg, &g, e))) imdb_free(al);
             imdb_segimg *gi = rc ? NULL : imdb_seg_pin(NULL, g, e); /* its own parse: apart from any table, resident */
             /* the ends its deletion vector records at or before F: a seed's floor is its snapshot, whose lake still
              * holds history (a RETIRE's has dropped all of it); later ends are the replay's */
@@ -1642,7 +1771,15 @@ static int verify_seed(imdb_db *db, vctx *x, imdb_err *e)
                 v->stub = (gi->flags[r] & IMDB_SEG_STUB) != 0;
                 if (!v->stub && t->s.subject >= 0) {
                     imdb_value sv = {.type = t->s.cols[t->s.subject].type};
-                    const imdb_segcol *sc = &gi->col[t->s.subject];
+                    /* F1: from the file's own columns, by the subject's position (the image is laid out for the
+                     * current manifest's last version, not the model's at F) */
+                    const imdb_sver *gv = &m.t[ti].hist.vers[gi->gver];
+                    int sk = gv->at[t->hist.vers[t->hist.nvers - 1].pos[t->s.subject]];
+                    if (sk < 0) {
+                        rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: a segment of table %s lacks its SUBJECT column", t->s.name);
+                        break;
+                    }
+                    const imdb_segcol *sc = &gi->ocol[sk];
                     if (sv.type == IMDB_T_TEXT) {
                         sv.s = sc->data + sc->off[r];
                         sv.len = sc->off[r + 1] - sc->off[r];

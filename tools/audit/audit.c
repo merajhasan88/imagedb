@@ -777,6 +777,15 @@ typedef struct op {
     char iname[64];
     aviewdef *vd; /* CREATE_VIEW (20, P2 S7): the definition; DROP_VIEW (21): view */
     uint32_t view;
+    /* ALTER_TABLE (22, F1): akind; ADD: acol and its DEFAULT (has_def, def the row encoding of one value); RENAME
+     * COLUMN: apos; RENAME COLUMN and TABLE: aname */
+    uint8_t akind;
+    col acol;
+    bool has_def;
+    const uint8_t *def;
+    uint32_t def_len;
+    uint16_t apos;
+    char aname[64];
     /* payload */
     bool redacted;
     const uint8_t *salt, *row;
@@ -808,6 +817,56 @@ static void commit_free(commit *c)
  * signature over "IMDBPRO1" || db id || epoch || seq || prev || new key). The signature is checked
  * under k's current key, a promotion's under the key its root certificate names; a WRITER_KEY
  * commit moves k once everything else passed. */
+/* F1: op 22's body after its table: u8 kind, then ADD's column (u8 length, name, type, precision, scale, flags) and
+ * DEFAULT (u8 0, or 1 and the value as a one-column NOT NULL row, which decode_row checks), RENAME COLUMN's u16
+ * position and new name, RENAME TO's new name. A commit's (what: "header") and a manifest's history ("manifest"). */
+static int alter_body(rd *hr, op *o, const char *what)
+{
+    o->akind = rd_u8(hr);
+    if (!hr->bad && (o->akind < 1 || o->akind > 3)) return fail("%s: ALTER TABLE of an unknown kind", what);
+    if (!hr->bad && o->akind == 1) {
+        uint8_t cl = rd_u8(hr);
+        const uint8_t *cn = rd_bytes(hr, cl);
+        if (!cn || !ident_ok(cn, cl) || cn[0] == '_') return fail("%s: bad added column's name", what);
+        memcpy(o->acol.name, cn, cl);
+        o->acol.type = rd_u8(hr);
+        o->acol.prec = rd_u8(hr);
+        o->acol.scale = rd_u8(hr);
+        o->acol.flags = rd_u8(hr);
+        const col *ac = &o->acol;
+        if (!hr->bad && (ac->type < T_INT64 || ac->type > T_FLOAT64 || (ac->flags & ~F_NULLABLE) ||
+                         (ac->type == T_DECIMAL ? (ac->prec < 1 || ac->prec > 18 || ac->scale > ac->prec)
+                                                : (ac->prec || ac->scale))))
+            return fail("%s: bad added column", what);
+        uint8_t has = rd_u8(hr);
+        if (!hr->bad && has > 1) return fail("%s: bad DEFAULT", what);
+        o->has_def = has;
+        if (has) { /* the row encoding of one value: a one-column NOT NULL row, which decode_row checks */
+            size_t at = hr->o;
+            uint32_t dl = ac->type == T_TEXT ? 4 + rd_u32(hr) : ac->type == T_BOOL ? 1 : 8;
+            hr->o = at;
+            o->def = rd_bytes(hr, dl);
+            o->def_len = dl;
+            schema one;
+            memset(&one, 0, sizeof one);
+            one.ncols = 1;
+            one.c[0] = *ac;
+            one.c[0].flags = 0;
+            val dv;
+            if (!o->def || decode_row(&one, o->def, dl, &dv)) return fail("%s: bad DEFAULT", what);
+        }
+        if (!hr->bad && !(ac->flags & F_NULLABLE) && !has)
+            return fail("%s: a NOT NULL column added without a DEFAULT", what);
+        return 0;
+    }
+    if (o->akind == 2) o->apos = rd_u16(hr);
+    uint8_t nl = rd_u8(hr);
+    const uint8_t *nm = rd_bytes(hr, nl);
+    if (!hr->bad && (!nm || !ident_ok(nm, nl))) return fail("%s: bad new name", what);
+    if (nm) memcpy(o->aname, nm, nl);
+    return 0;
+}
+
 static int decode_body(const uint8_t *b, size_t n, const meta *m, keys *ks, commit *c)
 {
     memset(c, 0, sizeof *c);
@@ -969,6 +1028,11 @@ static int decode_body(const uint8_t *b, size_t n, const meta *m, keys *ks, comm
             o->view = rd_u32(&hr);
             if (!hr.bad && (nops != 1 || o->view >= MAX_VIEWS)) return fail("header: a view op must be the only op, in range");
             break;
+        case 22: /* ALTER_TABLE (F1): u32 table, its body (alter_body), alone */
+            o->table = rd_u32(&hr);
+            if (!hr.bad && nops != 1) return fail("header: ALTER TABLE must be the only op");
+            if (alter_body(&hr, o, "header")) return -1;
+            break;
         case 19: /* DROP_TABLE (1f): u32 table */
             o->table = rd_u32(&hr);
             break;
@@ -1050,6 +1114,7 @@ typedef struct table {
     uint32_t nchunk;
     uint64_t cap0, n, live; /* chunk 0's room, the vids handed out, the live rows */
     uint64_t floor_n, n_at_lake; /* the vids at the log floor (FLOOR), and at the lake snapshot commit */
+    uint32_t nvers_at_lake; /* F1: its schema versions at the lake snapshot commit */
     lt d, d_at_lake;     /* digest now, and at the lake snapshot commit */
     uint64_t horizon, horizon_at_lake; /* AS OF below it refused (COMPACT's PURGE BEFORE, EXPIRE): now, at the lake */
     uint64_t purged_at_lake;           /* COMPACT's alone: versions ended at or before it are tombstones */
@@ -1058,7 +1123,16 @@ typedef struct table {
     aidx idx[MAX_INDEXES], idx_at_lake[MAX_INDEXES]; /* sorted by name, now and at the lake snapshot */
     aidx pkx;            /* F4: the primary key as a unique map over the live rows' keys (never in the manifest's list) */
     uint32_t nidx, nidx_at_lake;
+    struct aver *vers;   /* F1: its schema versions by since, nvers of them (the last's schema is s) */
+    uint32_t nvers;
+    val missing[MAX_COLS]; /* F1: what a row of an older version reads for a column added after it */
+    uint8_t *missing_text[MAX_COLS];
 } table;
+
+typedef struct aver { /* F1: rows begun at or after since are encoded under s (its raw bytes its own) */
+    uint64_t since;
+    schema s;
+} aver;
 
 #define VCHUNK_BITS 16
 #define VCHUNK ((uint64_t)1 << VCHUNK_BITS)
@@ -1118,6 +1192,8 @@ typedef struct aview {
     uint32_t *dep_id;
     uint16_t ncols; /* P2 S7b: its logged columns, what a view reading it reads */
     ab_col *cols;
+    char *text;     /* F1: a live one's query text, NUL ended: an ADD COLUMN's rule reads it */
+    uint32_t text_len;
 } aview;
 
 typedef struct state {
@@ -1329,13 +1405,129 @@ static int uk_add(const table *t, aidx *x, const val *vals, uint64_t vid, uint64
     return 0;
 }
 
+
+/* ---- F1: schema versions (design.md §5, Schema versions; the auditor's own) ------------------------------------- */
+
+/* a schema's encoding by the format (u32 id | u8 length, name | u16 ncols | each column's u8 length, name, type,
+ * precision, scale, flags | u8 npk | npk u16 columns), written here rather than taken from the log once an ALTER made
+ * the schema: a segment names its version by this encoding's SHA-256 */
+static void schema_reencode(schema *s)
+{
+    size_t n = 4 + 1 + strlen(s->name) + 2 + 1 + 2u * (size_t)s->npk;
+    for (int c = 0; c < s->ncols; c++) n += 1 + strlen(s->c[c].name) + 4;
+    uint8_t *b = xcalloc(n, 1);
+    size_t o = 0;
+    put32(b, s->id);
+    o = 4;
+    size_t nl = strlen(s->name);
+    b[o++] = (uint8_t)nl;
+    memcpy(b + o, s->name, nl);
+    o += nl;
+    b[o++] = (uint8_t)s->ncols;
+    b[o++] = (uint8_t)(s->ncols >> 8);
+    for (int c = 0; c < s->ncols; c++) {
+        size_t cl = strlen(s->c[c].name);
+        b[o++] = (uint8_t)cl;
+        memcpy(b + o, s->c[c].name, cl);
+        o += cl;
+        b[o++] = s->c[c].type;
+        b[o++] = s->c[c].prec;
+        b[o++] = s->c[c].scale;
+        b[o++] = s->c[c].flags;
+    }
+    b[o++] = (uint8_t)s->npk;
+    for (int k = 0; k < s->npk; k++) {
+        b[o++] = (uint8_t)s->key[k];
+        b[o++] = (uint8_t)(s->key[k] >> 8);
+    }
+    s->raw = b;
+    s->rawlen = o;
+}
+
+/* the version rows begun at commit at are encoded under */
+static const aver *aver_at(const table *t, uint64_t at)
+{
+    uint32_t lo = 0, hi = t->nvers;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (t->vers[mid].since <= at) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo ? &t->vers[lo - 1] : &t->vers[0];
+}
+
+/* a held row's values under the current schema: decoded by its own version, a column added after it reading the
+ * value its ADD gave (or NULL); in stage 2 no column is dropped, so a version's columns are the current ones' prefix */
+static int decode_held(const table *t, const ver *v, val *vals)
+{
+    const aver *rv = t->nvers > 1 ? aver_at(t, v->begin) : NULL;
+    if (!rv || rv == &t->vers[t->nvers - 1]) return decode_row(&t->s, v->row, v->row_len, vals);
+    if (decode_row(&rv->s, v->row, v->row_len, vals)) return -1;
+    for (int c = rv->s.ncols; c < t->s.ncols; c++) vals[c] = t->missing[c];
+    return 0;
+}
+
+
+/* the version an ALTER makes from cur, by its structural rules (room for a column, a name not taken, a column there);
+ * the log's apply adds the rules on the catalog (a live view naming the table, RENAME TO a free name) before it, and a
+ * manifest's history is this alone, ending at the manifest's schema */
+static int alter_next(const schema *cur, const op *o, schema *ns, uint64_t seq)
+{
+    *ns = *cur;
+    ns->raw = NULL;
+    if (o->akind == 1) {
+        if (cur->ncols >= MAX_COLS) return fail("commit %llu: more than %u columns", (unsigned long long)seq, MAX_COLS);
+        for (int c = 0; c < cur->ncols; c++)
+            if (!strcmp(cur->c[c].name, o->acol.name))
+                return fail("commit %llu: ADD COLUMN of a name table %s has", (unsigned long long)seq, cur->name);
+        ns->c[ns->ncols++] = o->acol;
+    } else if (o->akind == 2) {
+        if (o->apos >= cur->ncols) return fail("commit %llu: RENAME COLUMN of no column", (unsigned long long)seq);
+        for (int c = 0; c < cur->ncols; c++)
+            if (!strcmp(cur->c[c].name, o->aname))
+                return fail("commit %llu: RENAME COLUMN to a name table %s has", (unsigned long long)seq, cur->name);
+        memset(ns->c[o->apos].name, 0, sizeof ns->c[o->apos].name);
+        memcpy(ns->c[o->apos].name, o->aname, strlen(o->aname));
+    } else {
+        memset(ns->name, 0, sizeof ns->name);
+        memcpy(ns->name, o->aname, strlen(o->aname));
+    }
+    schema_reencode(ns);
+    return 0;
+}
+
+/* what the rows of older versions read for an ADD's column: its DEFAULT (its row bytes copied into *text), or NULL */
+static int alter_missing(const op *o, val *m, uint8_t **text)
+{
+    memset(m, 0, sizeof *m);
+    m->null = !o->has_def;
+    if (!o->has_def) return 0;
+    schema one;
+    memset(&one, 0, sizeof one);
+    one.ncols = 1;
+    one.c[0] = o->acol;
+    one.c[0].flags = 0;
+    free(*text);
+    *text = xcalloc(o->def_len, 1);
+    memcpy(*text, o->def, o->def_len);
+    return decode_row(&one, *text, o->def_len, m) ? -1 : 0;
+}
+
+/* two values the same in every bit a decoder distinguishes, as a column of type ty */
+static bool val_same(const val *a, const val *b, uint8_t ty)
+{
+    if (a->null || b->null) return a->null == b->null;
+    if (ty == T_TEXT) return a->len == b->len && (!a->len || memcmp(a->s, b->s, a->len) == 0);
+    return a->i == b->i;
+}
+
 /* version vid ends: its key leaves the unique indexes */
 static void uk_end(table *t, uint64_t vid)
 {
     ver *v = av(t, vid);
     if (!v || !v->row) return;
     val vals[MAX_COLS];
-    if (!decode_row(&t->s, v->row, v->row_len, vals))
+    if (!decode_held(t, v, vals))
         for (uint32_t x = 0; x <= t->nidx; x++) { /* the unique indexes, then (x == nidx) the primary key */
             uint8_t *k;
             size_t n;
@@ -1387,6 +1579,9 @@ static void view_push(state *S, const char *name, uint64_t created, uint64_t dro
     w->ncols = d->ncols; /* P2 S7b */
     w->cols = xcalloc(d->ncols, sizeof *w->cols);
     memcpy(w->cols, d->cols, d->ncols * sizeof *w->cols);
+    w->text = xcalloc(d->text_len + 1u, 1);
+    memcpy(w->text, d->text, d->text_len);
+    w->text_len = d->text_len;
 }
 
 /* P2 S7b: the catalog as the model holds it now (the commit being applied's, or F's past a cut), for the binder: a live
@@ -1489,6 +1684,11 @@ static int apply_op(state *S, const op *o, uint64_t seq)
         S->t[S->nt].pkx = pk_index(o->sch);
         S->t[S->nt].s.raw = xcalloc(o->sch->rawlen, 1);
         memcpy(S->t[S->nt].s.raw, o->sch->raw, o->sch->rawlen);
+        S->t[S->nt].vers = xcalloc(4, sizeof(aver)); /* F1: version 1, the CREATE's */
+        S->t[S->nt].nvers = 1;
+        S->t[S->nt].vers[0].s = *o->sch;
+        S->t[S->nt].vers[0].s.raw = xcalloc(o->sch->rawlen, 1);
+        memcpy(S->t[S->nt].vers[0].s.raw, o->sch->raw, o->sch->rawlen);
         for (uint32_t i = 0; i < S->nt; i++)
             if (!S->t[i].dropped_at && strcmp(S->t[i].s.name, o->sch->name) == 0)
                 return fail("commit %llu: duplicate table", (unsigned long long)seq);
@@ -1496,6 +1696,55 @@ static int apply_op(state *S, const op *o, uint64_t seq)
             if (!S->v[i].dropped_at && strcmp(S->v[i].name, o->sch->name) == 0)
                 return fail("commit %llu: table %s takes a live view's name", (unsigned long long)seq, o->sch->name);
         S->nt++;
+        return 0;
+    }
+    if (o->code == 22) { /* ALTER_TABLE (F1): live; its kind's rules on the current schema; the next version */
+        if (o->table >= S->nt) return fail("commit %llu: ALTER TABLE of an unknown table", (unsigned long long)seq);
+        table *t = &S->t[o->table];
+        if (t->dropped_at) return fail("commit %llu: ALTER TABLE of table %s, dropped", (unsigned long long)seq, t->s.name);
+        if (t->nvers >= 256) return fail("commit %llu: table %s past 256 schema versions", (unsigned long long)seq, t->s.name);
+        if (o->akind == 1) { /* F1: a live view reading the table (through views too) whose text holds the name */
+            bool *rdv = xcalloc(S->nv ? S->nv : 1, sizeof *rdv);
+            for (bool more = true; more;) {
+                more = false;
+                for (uint32_t i = 0; i < S->nv; i++)
+                    for (uint16_t k = 0; !rdv[i] && !S->v[i].dropped_at && k < S->v[i].ndeps; k++)
+                        if ((S->v[i].dep_kind[k] == 1 && S->v[i].dep_id[k] == o->table) ||
+                            (S->v[i].dep_kind[k] == 2 && S->v[i].dep_id[k] < S->nv && rdv[S->v[i].dep_id[k]]))
+                            rdv[i] = more = true;
+            }
+            const aview *named = NULL;
+            char berr[160];
+            for (uint32_t i = 0; i < S->nv && !named; i++) {
+                if (!rdv[i] || !S->v[i].text) continue;
+                int h = ab_names(S->v[i].text, S->v[i].text_len, o->acol.name, berr, sizeof berr);
+                if (h < 0) {
+                    free(rdv);
+                    return fail("commit %llu: view %s's text does not lex (%s)", (unsigned long long)seq, S->v[i].name, berr);
+                }
+                if (h) named = &S->v[i];
+            }
+            free(rdv);
+            if (named)
+                return fail("commit %llu: ADD COLUMN %s of table %s, which view %s reads and names", (unsigned long long)seq,
+                            o->acol.name, t->s.name, named->name);
+        }
+        if (o->akind == 2 || o->akind == 3) {
+            if (view_naming(S, 1, o->table)) /* a rename: RESTRICT, as DROP is */
+                return fail("commit %llu: a rename of table %s, which a live view names", (unsigned long long)seq, t->s.name);
+            if (o->akind == 3 && name_live(S, o->aname)) return fail("commit %llu: RENAME TO a live name", (unsigned long long)seq);
+        }
+        schema ns;
+        if (alter_next(&t->s, o, &ns, seq)) return -1;
+        if (o->akind == 1 && alter_missing(o, &t->missing[ns.ncols - 1], &t->missing_text[ns.ncols - 1])) return -1;
+        t->vers = xrealloc(t->vers, t->nvers + 1, sizeof *t->vers);
+        t->vers[t->nvers].since = seq;
+        t->vers[t->nvers].s = ns;
+        t->nvers++;
+        free(t->s.raw);
+        t->s = ns;
+        t->s.raw = xcalloc(ns.rawlen, 1);
+        memcpy(t->s.raw, ns.raw, ns.rawlen);
         return 0;
     }
     if (o->code == 19) { /* DROP_TABLE: live, not kept FOREVER (its op 16 first); every live version ends, one by one */
@@ -1557,7 +1806,7 @@ static int apply_op(state *S, const op *o, uint64_t seq)
             const ver *v = av(t, vid);
             val vals[MAX_COLS];
             if (!v || v->end != LIVE || !v->row) continue;
-            if (decode_row(&t->s, v->row, v->row_len, vals)) return -1;
+            if (decode_held(t, v, vals)) return -1;
             if (uk_add(t, &t->idx[p], vals, vid, seq)) return -1;
         }
         return 0;
@@ -2057,6 +2306,7 @@ static int replay(state *S, int dirfd, uint64_t *commits)
                     S->t[ti].retention_at_lake = S->t[ti].retention;
                     S->t[ti].dropped_at_lake = S->t[ti].dropped_at;
                     S->t[ti].n_at_lake = S->t[ti].n;
+                    S->t[ti].nvers_at_lake = S->t[ti].nvers;
                 }
                 S->boundary_at_lake = S->boundary;
                 S->nv_at_lake = S->nv; /* P2 S7 */
@@ -2159,6 +2409,8 @@ typedef struct seg {
     const uint8_t *colp[MAX_COLS];   /* I64 / U8 / TEXT_OFF section */
     const uint8_t *tdata[MAX_COLS];  /* TEXT_DATA section */
     const uint8_t *valid[MAX_COLS];  /* VALID section of a NULLABLE column, else NULL */
+    bool cst[MAX_COLS];              /* F1: a column of the table's schema the segment lacks: every row reads cstv */
+    val cstv[MAX_COLS];
 } seg;
 
 static void seg_free(seg *g)
@@ -2170,12 +2422,20 @@ static void seg_free(seg *g)
 
 static bool is_int(uint8_t t) { return t == T_INT64 || t == T_DECIMAL || t == T_TIMESTAMP || t == T_FLOAT64; }
 
-static bool has_value(const seg *g, int c, uint32_t i) { return !g->valid[c] || (g->valid[c][i / 8] >> (i % 8) & 1); }
+static bool has_value(const seg *g, int c, uint32_t i)
+{
+    if (g->cst[c]) return !g->cstv[c].null;
+    return !g->valid[c] || (g->valid[c][i / 8] >> (i % 8) & 1);
+}
 
 /* Whatever is stored for row i of column c, read without its VALID bit. */
 static void seg_raw(const schema *s, const seg *g, uint32_t i, int c, val *v)
 {
     memset(v, 0, sizeof *v);
+    if (g->cst[c]) { /* F1: its missing value (zeros under a NULL, as stored) */
+        if (!g->cstv[c].null) *v = g->cstv[c];
+        return;
+    }
     uint8_t t = s->c[c].type;
     if (is_int(t)) v->i = (int64_t)le64(g->colp[c] + 8u * i);
     else if (t == T_BOOL) v->i = g->colp[c][i];
@@ -2234,17 +2494,28 @@ static int cmp_ukey(const void *a, const void *b)
     return x->n ? memcmp(x->b, y->b, x->n) : 0;
 }
 
-/* Strict, canonical parse; every non-stub row's commitment is recomputed. */
-static int parse_segment(const schema *s, uint8_t *b, size_t len, seg *g)
+/* Strict, canonical parse under the schema version that built the segment (its header names it by hash, among
+ * vers, a table's nvers versions); every non-stub row's commitment is recomputed under its own version (by its
+ * begin), and the columns of cur (the table's schema) the segment lacks read their missing values (F1) */
+static int parse_segment(const struct aver *vers, uint32_t nvers, const val *missing, const schema *cur, uint8_t *b,
+                         size_t len, seg *g)
 {
     memset(g, 0, sizeof *g);
+    uint32_t gk = nvers;
+    for (uint32_t k = nvers; k-- > 0;) { /* the last first: most segments are the current version's */
+        uint8_t vh[32];
+        a_sha256(vers[k].s.raw, vers[k].s.rawlen, vh);
+        if (memcmp(vh, b + 16, 32) == 0) {
+            gk = k;
+            break;
+        }
+    }
+    if (gk == nvers) return fail("segment: schema hash mismatch");
+    const schema *s = &vers[gk].s;
     if (len < 64 || memcmp(b, "IMDBSEG1", 8) != 0) return fail("segment: bad magic");
     uint32_t n = le32(b + 48), ncols = le32(b + 52), nsec = le32(b + 56);
     if (le32(b + 8) != 2 || le32(b + 12) != s->id || le32(b + 60) != 0 || ncols != (uint32_t)s->ncols)
         return fail("segment: bad header");
-    uint8_t sh[32];
-    a_sha256(s->raw, s->rawlen, sh);
-    if (memcmp(sh, b + 16, 32) != 0) return fail("segment: schema hash mismatch");
     if (n > (1u << 22)) return fail("segment: too many rows");
     uint32_t want_kind[MAX_SECTIONS], want_col[MAX_SECTIONS];
     uint64_t want_len[MAX_SECTIONS];
@@ -2342,7 +2613,25 @@ static int parse_segment(const schema *s, uint8_t *b, size_t len, seg *g)
         for (int c = 0; c < s->ncols && !rc; c++)
             if (!v[c].null) rc = check_value(&s->c[c], &v[c]);
         if (rc) break;
-        size_t rl = encode_row(s, v, &rowbuf, &rowcap);
+        /* F1: a row of an older version holds, at each column its version lacks, exactly its missing value (no
+         * commitment covers it, a reader reads it); none is of a later version than its segment (built before) */
+        uint32_t lo = 0, hi = nvers;
+        while (lo < hi) {
+            uint32_t mid = lo + (hi - lo) / 2;
+            if (vers[mid].since <= g->row[i].begin) lo = mid + 1;
+            else hi = mid;
+        }
+        uint32_t rk = lo ? lo - 1 : 0;
+        if (rk > gk) {
+            rc = fail("segment: row %u is of a later schema version than its segment", i);
+            break;
+        }
+        const schema *rs = &vers[rk].s;
+        for (int c = rs->ncols; c < s->ncols && !rc; c++)
+            if (!val_same(&v[c], &missing[c], s->c[c].type))
+                rc = fail("segment: row %u holds another value than its missing one in column %s", i, s->c[c].name);
+        if (rc) break;
+        size_t rl = encode_row(rs, v, &rowbuf, &rowcap);
         uint8_t cm[32];
         row_commit(s->id, g->row[i].salt, rowbuf, rl, cm);
         if (memcmp(cm, g->row[i].commit, 32) != 0) rc = fail("segment: row %u does not match its commitment", i);
@@ -2365,6 +2654,10 @@ static int parse_segment(const schema *s, uint8_t *b, size_t len, seg *g)
         if (z[0] != has || z[1] != has_null || !all_zero(z + 2, 6) || (int64_t)le64(z + 8) != mn ||
             (int64_t)le64(z + 16) != mx)
             rc = fail("segment: zone map does not match the data (column %s)", s->c[c].name);
+    }
+    for (int c = s->ncols; !rc && c < cur->ncols; c++) { /* F1: the table's columns added since its build */
+        g->cst[c] = true;
+        g->cstv[c] = missing[c];
     }
     if (rc) {
         free(g->row);
@@ -2405,6 +2698,10 @@ typedef struct mtable {
     uint32_t nidx;
     uint64_t retention; /* SET_RETENTION's microseconds, or all ones */
     uint64_t created_at, dropped_at; /* version 5: the commits that created and dropped it (0: live) */
+    uint32_t nvers;      /* F1: its schema versions, from the manifest's history (version 1 alone: s) */
+    struct aver *vers;
+    val missing[MAX_COLS]; /* what a row of an older version reads for a column added after it */
+    uint8_t *missing_text[MAX_COLS];
 } mtable;
 
 typedef struct mview { /* P2 S7: a manifest's view: a live one's definition, a dropped one's tombstone (def NULL) */
@@ -2430,6 +2727,9 @@ static void manifest_free(manifest *m)
         free(m->t[i].seg);
         free(m->t[i].dv);
         free(m->t[i].nrows);
+        for (uint32_t k = 0; k < m->t[i].nvers; k++) free(m->t[i].vers[k].s.raw); /* F1 */
+        free(m->t[i].vers);
+        for (int k = 0; k < MAX_COLS; k++) free(m->t[i].missing_text[k]);
     }
     free(m->t);
     for (uint32_t i = 0; i < m->nv; i++) aviewdef_free(m->v[i].def); /* P2 S7 */
@@ -2573,6 +2873,44 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
         if (r.bad || !t->created_at || t->created_at > m->seq ||
             (t->dropped_at && (t->dropped_at <= t->created_at || t->dropped_at > m->seq || t->live)))
             return fail("manifest: bad creation or drop commits");
+        /* F1: its schema history: version 1's schema, then each ALTER at its commit, by alter_next alone (the catalog's
+         * rules are the log's), after the CREATE, at or before the snapshot, before a drop, ending at its schema */
+        uint32_t na = rd_u32(&r);
+        if (r.bad || na >= 256) return fail("manifest: bad schema history");
+        t->vers = xcalloc(na + 1, sizeof *t->vers);
+        t->nvers = 1;
+        if (na) {
+            uint32_t l0 = rd_u32(&r);
+            const uint8_t *b0 = rd_bytes(&r, l0);
+            if (!b0) return fail("manifest: truncated");
+            rd r0 = {b0, l0, 0, false};
+            if (decode_schema(&r0, &t->vers[0].s) || rd_left(&r0) || t->vers[0].s.id != i)
+                return fail("manifest: bad schema history (version 1)");
+        } else {
+            t->vers[0].s = t->s;
+            t->vers[0].s.raw = xcalloc(t->s.rawlen, 1);
+            memcpy(t->vers[0].s.raw, t->s.raw, t->s.rawlen);
+        }
+        for (int c = 0; c < t->vers[0].s.ncols; c++) t->missing[c].null = true;
+        uint64_t last = t->created_at;
+        for (uint32_t k = 0; k < na; k++) {
+            uint64_t at = rd_u64(&r);
+            op o;
+            memset(&o, 0, sizeof o);
+            if (r.bad || alter_body(&r, &o, "manifest")) return r.bad ? fail("manifest: truncated") : -1;
+            if (r.bad || at <= last || at > m->seq || (t->dropped_at && at >= t->dropped_at))
+                return fail("manifest: an ALTER of table %u out of order", i);
+            schema ns;
+            if (alter_next(&t->vers[t->nvers - 1].s, &o, &ns, at)) return -1;
+            if (o.akind == 1 && alter_missing(&o, &t->missing[ns.ncols - 1], &t->missing_text[ns.ncols - 1])) return -1;
+            t->vers[t->nvers].since = at;
+            t->vers[t->nvers].s = ns;
+            t->nvers++;
+            last = at;
+        }
+        const schema *ls = &t->vers[t->nvers - 1].s;
+        if (ls->rawlen != t->s.rawlen || memcmp(ls->raw, t->s.raw, t->s.rawlen) != 0)
+            return fail("manifest: the schema history of table %s does not end at its schema", t->s.name);
     }
     if (r.bad || r.o != send || man_section(&r, 2, &send)) return fail("manifest: bad tables section");
     uint32_t nv = rd_u32(&r); /* P2 S7: every view by id, a live one's definition after it */
@@ -2839,7 +3177,7 @@ static int walk_lake_pinned(int dirfd, uint8_t alg, const uint8_t mh[32], uint64
             size_t sl;
             if ((rc = obj_read(ofd, t->seg[k], ".seg", &sb, &sl))) break;
             seg g;
-            if ((rc = parse_segment(&t->s, sb, sl, &g))) {
+            if ((rc = parse_segment(t->vers, t->nvers, t->missing, &t->s, sb, sl, &g))) {
                 free(sb);
                 break;
             }
@@ -3135,7 +3473,10 @@ static int seed_row(void *ctx, uint32_t ti, const schema *s, const seg *g, uint3
         val vals[MAX_COLS];
         for (int c = 0; c < s->ncols; c++) seg_value(s, g, i, c, &vals[c]);
         if (!r->flags && v->end == LIVE) {
-            size_t rl = encode_row(s, vals, &x->buf, &x->cap);
+            /* F1: under the row's own version, as decode_held reads it (s is the lake's schema: later versions' columns
+             * follow; in stage 2 a version's columns are a prefix of the later ones') */
+            const aver *rv = t->nvers > 1 ? aver_at(t, r->begin) : NULL;
+            size_t rl = encode_row(rv ? &rv->s : s, vals, &x->buf, &x->cap);
             v->row = xcalloc(rl ? rl : 1, 1);
             memcpy(v->row, x->buf, rl);
             v->row_len = (uint32_t)rl;
@@ -3183,6 +3524,21 @@ static int floor_seed(int dirfd, state *S, flr *f)
         t->nidx = mt->nidx;
         for (uint32_t k = 0; k < t->nidx; k++) t->idx[k].uk = (t->idx[k].flags & 1) ? xcalloc(1, sizeof *t->idx[k].uk) : NULL;
         t->pkx = pk_index(&t->s);
+        t->nvers = mt->nvers; /* F1: F's schema history: its versions and what older rows read for added columns */
+        t->vers = xcalloc(mt->nvers ? mt->nvers : 1, sizeof *t->vers);
+        for (uint32_t k = 0; k < mt->nvers; k++) {
+            t->vers[k] = mt->vers[k];
+            t->vers[k].s.raw = xcalloc(mt->vers[k].s.rawlen ? mt->vers[k].s.rawlen : 1, 1);
+            memcpy(t->vers[k].s.raw, mt->vers[k].s.raw, mt->vers[k].s.rawlen);
+        }
+        for (int c = 0; c < MAX_COLS; c++) {
+            t->missing[c] = mt->missing[c];
+            if (!mt->missing_text[c] || !mt->missing[c].s) continue; /* a TEXT one points into its bytes; others are i */
+            size_t tl = (size_t)(mt->missing[c].s - mt->missing_text[c]) + mt->missing[c].len;
+            t->missing_text[c] = xcalloc(tl ? tl : 1, 1);
+            memcpy(t->missing_text[c], mt->missing_text[c], tl);
+            t->missing[c].s = t->missing_text[c] + (mt->missing[c].s - mt->missing_text[c]);
+        }
     }
     for (uint32_t i = 0; i < f->m.nv; i++) /* P2 S7: F's views, a live one's definition the replay's rules read */
         view_push(S, f->m.v[i].name, f->m.v[i].created_at, f->m.v[i].dropped_at, f->m.v[i].def);
@@ -3223,6 +3579,7 @@ static int floor_seed(int dirfd, state *S, flr *f)
                 S->t[ti].retention_at_lake = S->t[ti].retention;
                 S->t[ti].dropped_at_lake = S->t[ti].dropped_at;
                 S->t[ti].n_at_lake = S->t[ti].n;
+                S->t[ti].nvers_at_lake = S->t[ti].nvers;
             }
             S->boundary_at_lake = S->boundary;
             memcpy(S->lake_digest, f->digest, 32);
@@ -3232,6 +3589,22 @@ static int floor_seed(int dirfd, state *S, flr *f)
         memcpy(S->head, f->hash, 32);
     }
     return rc;
+}
+
+/* F1: a manifest's schema history is the log's at the lake snapshot commit: as many versions, each at its commit and
+ * of the same schema bytes, and every column they added reading the same missing value */
+static bool same_history(const mtable *mt, const table *t)
+{
+    if (!t->nvers_at_lake || mt->nvers != t->nvers_at_lake || t->nvers < t->nvers_at_lake) return false;
+    for (uint32_t k = 0; k < mt->nvers; k++) {
+        const schema *a = &mt->vers[k].s, *b = &t->vers[k].s;
+        if (mt->vers[k].since != t->vers[k].since || a->rawlen != b->rawlen || memcmp(a->raw, b->raw, a->rawlen) != 0)
+            return false;
+    }
+    const schema *ls = &mt->vers[mt->nvers - 1].s;
+    for (int c = mt->vers[0].s.ncols; c < ls->ncols; c++)
+        if (!val_same(&mt->missing[c], &t->missing[c], ls->c[c].type)) return false;
+    return true;
 }
 
 static int cmd_verify(const char *dir, const char *anchor)
@@ -3319,8 +3692,11 @@ static int cmd_verify(const char *dir, const char *anchor)
             lt_bytes(&t->d_at_lake, at);
             uint64_t versions = 0;
             versions = t->n_at_lake; /* the vids handed out by the snapshot's commit */
-            if (mt->s.rawlen != t->s.rawlen || memcmp(mt->s.raw, t->s.raw, t->s.rawlen) != 0)
+            const schema *ls = t->nvers_at_lake ? &t->vers[t->nvers_at_lake - 1].s : &t->s; /* F1: at the lake */
+            if (mt->s.rawlen != ls->rawlen || memcmp(mt->s.raw, ls->raw, ls->rawlen) != 0)
                 rc = fail("manifest schema of %s differs from the log", t->s.name);
+            else if (!same_history(mt, t))
+                rc = fail("table %s: the manifest's schema history differs from the log's", t->s.name);
             else if (memcmp(at, mt->lthash, 2048) != 0)
                 rc = fail("table %s: manifest digest differs from the log at commit %llu", t->s.name, (unsigned long long)m.seq);
             else if (mt->versions != versions || mt->horizon != t->horizon_at_lake)
@@ -3359,11 +3735,15 @@ static int cmd_verify(const char *dir, const char *anchor)
         for (uint32_t k = 0; k < S.t[i].nidx; k++) uk_free(S.t[i].idx[k].uk);
         uk_free(S.t[i].pkx.uk);
         free(S.t[i].vc);
+        for (uint32_t k = 0; k < S.t[i].nvers; k++) free(S.t[i].vers[k].s.raw); /* F1: its versions, their schemas' bytes */
+        free(S.t[i].vers);
+        for (int k = 0; k < MAX_COLS; k++) free(S.t[i].missing_text[k]);
         free(S.t[i].s.raw);
     }
     keys_free(&S.K);
     free(S.t);
-    for (uint32_t i = 0; i < S.nv; i++) free(S.v[i].dep_kind), free(S.v[i].dep_id), free(S.v[i].cols); /* P2 S7, S7b */
+    for (uint32_t i = 0; i < S.nv; i++) /* P2 S7, S7b, F1 */
+        free(S.v[i].dep_kind), free(S.v[i].dep_id), free(S.v[i].cols), free(S.v[i].text);
     free(S.v);
     free(S.pin);
     free(S.start_seq);

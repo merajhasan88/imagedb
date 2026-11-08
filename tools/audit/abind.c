@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "abind.h"
 
@@ -2031,4 +2032,25 @@ int ab_bind(const char *text, size_t len, ab_lookup_fn lookup, void *arg, ab_res
     free(b.t);
     aq_free(q);
     return rc;
+}
+
+int ab_names(const char *text, size_t len, const char *ident, char *err, size_t errn)
+{
+    ab b;
+    memset(&b, 0, sizeof b);
+    b.s = text;
+    b.n = len;
+    b.err = err;
+    b.errn = errn;
+    if (errn) err[0] = 0;
+    if (lex(&b)) {
+        free(b.t);
+        return -1;
+    }
+    size_t il = strlen(ident);
+    int has = 0;
+    for (uint32_t k = 0; k < b.nt && !has; k++)
+        has = b.t[k].k == K_ID && b.t[k].len == il && strncasecmp(text + b.t[k].off, ident, il) == 0;
+    free(b.t);
+    return has;
 }

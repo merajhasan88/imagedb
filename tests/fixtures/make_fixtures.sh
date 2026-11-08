@@ -7,8 +7,11 @@
 # an UPDATE and a DELETE, ERASE SUBJECT (redacted log payloads, rewritten segments), commits after it, and
 # a replica by ship | apply, a table dropped (op 19; the manifest's tombstone), and views (P2 S7: op 20, one on
 # another, one dropped by op 21, the manifest's tombstone; one more after the first CHECKPOINT, which the replica
-# applies from the log), and (F4) a table whose key is two columns, not in their order. The live tables are RETENTION
-# FOREVER and the dropped one is kept a century, the longest but FOREVER: a fixture is frozen data, so its history
+# applies from the log), (F4) a table whose key is two columns, not in their order, and (F1) that table altered after
+# the first CHECKPOINT (op 22: an ADD with a TEXT DEFAULT, a NOT NULL one with its DEFAULT, a rename, an INSERT that
+# leaves the added columns out: the manifest's schema history, a segment of version 1 under version 4). The live
+# tables are RETENTION FOREVER and the dropped one is kept a century, the longest but FOREVER: a fixture is frozen
+# data, so its history
 # never expires under the tests that open it (the 24-hour default is tested by the unit tests). Every
 # statement runs cross-checked; the engine and the auditor verify both directories, and the replica's
 # digest must equal the primary's. The primary's signing key is in the tarball: it signs nothing but
@@ -60,6 +63,10 @@ sql "CREATE TABLE pair (b TEXT, a INT64, v INT64, PRIMARY KEY (a, b)) RETENTION 
 sql "INSERT INTO pair VALUES ('x', 1, 10), ('y', 1, 11), ('x', 2, 12), ('', -3, NULL)"    # the columns' order
 sql "CHECKPOINT"
 ship
+sql "ALTER TABLE pair ADD w TEXT DEFAULT 'w0'"          # F1: op 22; pair's rows so far are in a segment of version 1
+sql "ALTER TABLE pair ADD n INT64 NOT NULL DEFAULT 7"
+sql "ALTER TABLE pair RENAME COLUMN v TO val"
+sql "INSERT INTO pair (b, a, val) VALUES ('z', 9, 99)"   # w and n their DEFAULTs
 sql "UPDATE acct SET balance = 1.00 WHERE id <= 10"
 sql "DELETE FROM ev WHERE id BETWEEN 1 AND 5"
 sql "ERASE SUBJECT 7"
@@ -67,7 +74,7 @@ sql "CREATE VIEW noted AS SELECT e.id, a.name FROM ev AS e JOIN acct AS a ON e.a
 sql "INSERT INTO ev VALUES (1001, 3, 2, 'after the erase'), (1002, 4, 6, NULL)"
 sql "CHECKPOINT"
 sql "INSERT INTO acct VALUES (201, 3, 9.99, 'acct-201', '2026-10-26 06:00:00')"
-sql "UPDATE pair SET v = 13 WHERE a = 2 AND b = 'x'"; sql "DELETE FROM pair WHERE a = 1 AND b = 'y'" # by the key, from the log
+sql "UPDATE pair SET val = 13 WHERE a = 2 AND b = 'x'"; sql "DELETE FROM pair WHERE a = 1 AND b = 'y'" # by the key, from the log
 ship
 for f in "$P"/log/*.ilg "$R"/log/*.ilg; do
     [ "$(head -c 4 "$f")" = ILT1 ] || { echo "make_fixtures: $f is not a tagged segment" >&2; exit 1; }

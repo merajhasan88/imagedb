@@ -405,7 +405,7 @@ static void t_segment_decoder_strict(void)
             imdb_sha256(xi->bytes, xi->len, h);
             CHECK(memcmp(h, g->hash, 32) != 0);
             imdb_err e3 = {0};
-            if (imdb_segment_check_commitments(&t->s, x, xi, &e3) == 0) {
+            if (imdb_segment_check_commitments(&t->hist, x, xi, &e3) == 0) {
                 uint64_t vid_off = imdb_get_le64(gimg->bytes + IMDB_SEG_HEADER + 8);
                 uint64_t beg_off = imdb_get_le64(gimg->bytes + IMDB_SEG_HEADER + 24 + 8);
                 bool in_sys = (at >= vid_off && at < vid_off + 8u * g->nrows) ||
