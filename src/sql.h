@@ -127,6 +127,8 @@ void imdb_session_cancel(imdb_session *s);
 /* P2 S12, tests: a window function's moving frames each summed afresh (the reference the sliding window is checked
  * against), process-wide; off by default */
 void imdb_sql_set_window_reference(bool on);
+/* tests: the segments the scan's grouped fast path (fast_group_seg) has taken in this process, so a test can show it ran */
+uint64_t imdb_sql_fast_group_segments(void);
 void imdb_result_init(imdb_result *r);
 void imdb_result_free(imdb_result *r);
 

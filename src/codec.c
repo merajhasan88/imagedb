@@ -691,6 +691,37 @@ int imdb_parse_timestamp(const char *s, size_t n, int64_t *out, imdb_err *e)
     return IMDB_OK;
 }
 
+/* v's decimal digits, written right to left ending at end (the zone slice's speed step: printf's machinery was most of
+ * a row's output); the count */
+static size_t udigits(uint64_t v, char *end)
+{
+    char *p = end;
+    do {
+        *--p = (char)('0' + (int)(v % 10));
+        v /= 10;
+    } while (v);
+    return (size_t)(end - p);
+}
+
+/* printf's %0*lld: a '-' then digits zero-padded to width in all; written ending at end, the count */
+static size_t pad_digits(int64_t v, int width, char *end)
+{
+    uint64_t u = v < 0 ? (uint64_t)0 - (uint64_t)v : (uint64_t)v;
+    char *p = end - udigits(u, end);
+    for (int dw = width - (v < 0); end - p < dw;) *--p = '0';
+    if (v < 0) *--p = '-';
+    return (size_t)(end - p);
+}
+
+void imdb_format_int64(int64_t v, imdb_buf *out)
+{
+    char b[24];
+    size_t n = pad_digits(v, 1, b + sizeof b);
+    imdb_buf_put(out, b + sizeof b - n, n);
+}
+
+/* the text "%04lld-%02d-%02d %02lld:%02lld:%02lld" and ".%06lld" when microseconds remain made, byte for byte,
+ * without printf */
 void imdb_format_timestamp(int64_t t, imdb_buf *out)
 {
     int64_t days = t / 86400000000LL, rem = t % 86400000000LL;
@@ -702,9 +733,23 @@ void imdb_format_timestamp(int64_t t, imdb_buf *out)
     int m, d;
     civil_from_days(days, &y, &m, &d);
     int64_t secs = rem / 1000000, us = rem % 1000000;
-    imdb_buf_printf(out, "%04lld-%02d-%02d %02lld:%02lld:%02lld", (long long)y, m, d, (long long)(secs / 3600),
-                    (long long)(secs / 60 % 60), (long long)(secs % 60));
-    if (us) imdb_buf_printf(out, ".%06lld", (long long)us);
+    char b[64], *e = b + sizeof b, *p = e;
+    if (us) {
+        p -= pad_digits(us, 6, p);
+        *--p = '.';
+    }
+    p -= pad_digits(secs % 60, 2, p);
+    *--p = ':';
+    p -= pad_digits(secs / 60 % 60, 2, p);
+    *--p = ':';
+    p -= pad_digits(secs / 3600, 2, p);
+    *--p = ' ';
+    p -= pad_digits(d, 2, p);
+    *--p = '-';
+    p -= pad_digits(m, 2, p);
+    *--p = '-';
+    p -= pad_digits(y, 4, p);
+    imdb_buf_put(out, p, (size_t)(e - p));
 }
 
 void imdb_format_float64(int64_t key, imdb_buf *out)
@@ -726,10 +771,15 @@ void imdb_format_i128(__int128 v, int scale, imdb_buf *out)
     int n = 0;
     bool neg = v < 0;
     unsigned __int128 mag = neg ? (unsigned __int128)0 - (unsigned __int128)v : (unsigned __int128)v;
-    do {
+    while (mag >> 64) { /* a SUM's width: __int128's division; then 64-bit, the same digits (the speed step) */
         tmp[n++] = (char)('0' + (int)(mag % 10));
         mag /= 10;
-    } while (mag || n <= scale);
+    }
+    uint64_t m64 = (uint64_t)mag;
+    do {
+        tmp[n++] = (char)('0' + (int)(m64 % 10));
+        m64 /= 10;
+    } while (m64 || n <= scale);
     if (neg) imdb_buf_put_u8(out, '-');
     for (int i = n - 1; i >= 0; i--) {
         imdb_buf_put_u8(out, (uint8_t)tmp[i]);
@@ -746,7 +796,7 @@ void imdb_format_value(const imdb_value *v, imdb_buf *out)
         return;
     }
     switch (v->type) {
-    case IMDB_T_INT64: imdb_buf_printf(out, "%lld", (long long)v->i); break;
+    case IMDB_T_INT64: imdb_format_int64(v->i, out); break;
     case IMDB_T_DECIMAL: imdb_format_decimal(v->i, v->scale, out); break;
     case IMDB_T_BOOL: imdb_buf_put_str(out, v->i ? "true" : "false"); break;
     case IMDB_T_TIMESTAMP: imdb_format_timestamp(v->i, out); break;

@@ -120,6 +120,7 @@ int imdb_parse_float64(const char *s, size_t n, int64_t *key, imdb_err *e);
 /* 'YYYY-MM-DD[ HH:MM:SS[.ffffff]]' UTC only. */
 int imdb_parse_timestamp(const char *s, size_t n, int64_t *out, imdb_err *e);
 void imdb_format_value(const imdb_value *v, imdb_buf *out);       /* plain */
+void imdb_format_int64(int64_t v, imdb_buf *out);                  /* "%lld", without printf */
 void imdb_format_value_safe(const imdb_value *v, imdb_buf *out);  /* terminal-safe */
 void imdb_format_decimal(int64_t v, int scale, imdb_buf *out);
 void imdb_format_i128(__int128 v, int scale, imdb_buf *out);

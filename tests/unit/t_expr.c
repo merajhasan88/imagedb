@@ -1647,7 +1647,55 @@ static void t_avg_having(void)
     done(db);
 }
 
+
+/* the speed step's 64-bit division: INT64 / and % give what the __int128 division gave, quotient, remainder and error
+ * alike, over random pairs and every pair of the extremes (0, 1, -1, 2, -2, INT64_MIN, INT64_MAX and their neighbours) */
+static void t_int64_div_fast(void)
+{
+    static const int64_t ex[] = {0, 1, -1, 2, -2, 3, -3, 7, -7, INT64_MIN, INT64_MIN + 1, INT64_MAX, INT64_MAX - 1,
+                                 INT64_MIN / 2, INT64_MAX / 2, 1000000007, -1000000007};
+    const size_t ne = sizeof ex / sizeof *ex;
+    uint64_t s = 0x9E3779B97F4A7C15ull;
+    int bad = 0;
+    for (size_t i = 0; i < ne * ne + 2000000 && bad < 5; i++) {
+        int64_t x, y;
+        if (i < ne * ne) {
+            x = ex[i / ne];
+            y = ex[i % ne];
+        } else {
+            s ^= s << 13, s ^= s >> 7, s ^= s << 17;
+            x = (int64_t)s >> (s % 64);
+            s ^= s << 13, s ^= s >> 7, s ^= s << 17;
+            y = (int64_t)s >> (s % 64);
+        }
+        for (int op = 0; op < 2 && bad < 5; op++) {
+            imdb_xval a, b, r;
+            memset(&a, 0, sizeof a);
+            memset(&b, 0, sizeof b);
+            memset(&r, 0, sizeof r);
+            a.type = b.type = IMDB_T_INT64;
+            a.i = x;
+            b.i = y;
+            imdb_err ee = {0};
+            int rc = imdb_x_arith(op ? EX_MOD : EX_DIV, &a, &b, IMDB_T_INT64, 0, &r, &ee);
+            /* the reference: __int128 throughout, its errors the evaluator's (a zero divisor, a result past int64) */
+            int want_rc = 0;
+            __int128 q = 0;
+            if (!y) want_rc = IMDB_ERR_INVALID;
+            else {
+                q = op ? (__int128)x % (__int128)y : (__int128)x / (__int128)y;
+                if (q < INT64_MIN || q > INT64_MAX) want_rc = IMDB_ERR_LIMIT;
+            }
+            bool ok = want_rc ? rc != 0 : rc == 0 && r.i == q && !r.null && r.type == IMDB_T_INT64;
+            if (want_rc && rc) ok = ok && (y == 0) == (strstr(ee.msg, "zero") != NULL);
+            if (!ok) bad++;
+        }
+    }
+    CHECK(bad == 0);
+}
+
 const test_case expr_tests[] = {
+    {"expr_int64_div_fast", t_int64_div_fast},
     {"expr_int64", t_int64},
     {"expr_decimal", t_decimal},
     {"expr_float64", t_float64},

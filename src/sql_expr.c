@@ -189,11 +189,19 @@ int imdb_x_arith(uint8_t op, const imdb_xval *a, const imdb_xval *b, uint8_t rt,
             break;
         case EX_DIV:
             if (!y) return div0(e);
-            r = x / y; /* truncates toward zero, as C, PostgreSQL and SQL Server do */
+            /* both within int64 and y not -1 (INT64_MIN / -1, the one quotient past int64): the same quotient by a
+             * 64-bit division, without __divti3 (the speed step); the rest by __int128 as before */
+            if (x >= INT64_MIN && x <= INT64_MAX && y >= INT64_MIN && y <= INT64_MAX && y != -1)
+                r = (int64_t)x / (int64_t)y;
+            else
+                r = x / y; /* truncates toward zero, as C, PostgreSQL and SQL Server do */
             break;
         default:
             if (!y) return div0(e);
-            r = x % y; /* the dividend's sign; INT64_MIN % -1 is 0 here, no trap */
+            if (x >= INT64_MIN && x <= INT64_MAX && y >= INT64_MIN && y <= INT64_MAX && y != -1)
+                r = (int64_t)x % (int64_t)y; /* the same remainder by 64 bits (int64's % traps only at -1) */
+            else
+                r = x % y; /* the dividend's sign; INT64_MIN % -1 is 0 here, no trap */
             break;
         }
         if (r < INT64_MIN || r > INT64_MAX) return overflow(e, rt);

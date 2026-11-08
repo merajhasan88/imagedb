@@ -269,7 +269,103 @@ static void t_group_memory(void)
     done(db);
 }
 
+
+/* the scan's grouped fast path (fast_group_seg, the zone slice's speed step): every key it takes (a bare INT64,
+ * DECIMAL, TIMESTAMP, BOOL and FLOAT64 column with NULLs, col / c, col % c, and a column an ALTER added that the older
+ * segments lack) and every item (COUNT(*), COUNT of a TEXT column, SUM of INT64, DECIMAL and FLOAT64), over segments,
+ * versions ended in them and the memtable, against a twin whose key it does not take: the generic grouping over the
+ * same scan, so the same groups and sums byte for byte; the fast path shown to run for one and not the other, and each
+ * cross-checked against the store path */
+static void fast_twin(const char *fast, const char *twin, bool takes)
+{
+    char a[1 << 16];
+    OK(run("SET access_path = scan"));
+    uint64_t c0 = imdb_sql_fast_group_segments();
+    snprintf(a, sizeof a, "%s", csv(fast));
+    uint64_t c1 = imdb_sql_fast_group_segments();
+    const char *b = csv(twin);
+    uint64_t c2 = imdb_sql_fast_group_segments();
+    if (strncmp(a, "ERR", 3) == 0 || strcmp(body(a), body(b)) != 0 || (takes ? c1 == c0 : c1 != c0) || c2 != c1) {
+        char m[1800];
+        snprintf(m, sizeof m, "%s (fast path segments %llu -> %llu, twin's %llu)\n      fast: %.600s\n      twin: %.600s", fast,
+                 (unsigned long long)c0, (unsigned long long)c1, (unsigned long long)c2, a, b);
+        test_fail(__FILE__, __LINE__, m);
+    }
+    OK(run("SET access_path = auto"));
+    OK(run("SET cross_check = on")); /* scan (fast) against store (generic) */
+    snprintf(a, sizeof a, "%s", csv(fast));
+    CHECK(strncmp(a, "ERR", 3) != 0);
+    OK(run("SET cross_check = off"));
+}
+
+static void t_group_fast(void)
+{
+    imdb_db *db = open_fresh();
+    CHECK(db);
+    if (!db) return;
+    keep_in_memory(db); /* the store path holds every version: cross_check's other plan answers every row */
+    OK(run("CREATE TABLE g (id INT64 PRIMARY KEY, k INT64, d DECIMAL(10,2), ts TIMESTAMP, b BOOL, f FLOAT64, t TEXT, "
+           "w INT64 NOT NULL)"));
+    char q[1 << 16];
+    for (int lo = 1; lo <= 24600; lo += 300) {
+        size_t o = (size_t)snprintf(q, sizeof q, "INSERT INTO g VALUES ");
+        for (int id = lo; id < lo + 300; id++) {
+            char k[24], d[24], ts[40], b[8], f[16], t[16];
+            if (id % 11 == 0) snprintf(k, sizeof k, "NULL");
+            else snprintf(k, sizeof k, "%d", id % 37);
+            int c = id % 1300 - 650;
+            if (id % 7 == 0) snprintf(d, sizeof d, "NULL");
+            else snprintf(d, sizeof d, "%s%d.%02d", c < 0 ? "-" : "", abs(c) / 100, abs(c) % 100);
+            int h = id / 500;
+            if (id % 13 == 0) snprintf(ts, sizeof ts, "NULL");
+            else snprintf(ts, sizeof ts, "'2026-01-%02d %02d:00:00'", 1 + h / 24, h % 24);
+            snprintf(b, sizeof b, id % 3 == 0 ? "NULL" : id % 2 ? "TRUE" : "FALSE");
+            if (id % 17 == 0) snprintf(f, sizeof f, "NULL");
+            else snprintf(f, sizeof f, "%d.%02d", id % 9 / 4, id % 9 % 4 * 25);
+            if (id % 5 == 0) snprintf(t, sizeof t, "NULL");
+            else snprintf(t, sizeof t, "'t%d'", id % 7);
+            o += (size_t)snprintf(q + o, sizeof q - o, "%s(%d, %s, %s, %s, %s, %s, %s, %d)", id == lo ? "" : ", ", id, k, d, ts,
+                                  b, f, t, id * 3);
+        }
+        OK(run(q));
+        if (lo == 24001) continue;
+        if (lo + 300 > 24000 && lo <= 24000) { /* the first 24,000 rows to segments; the rest stay in memory */
+            OK(run("CHECKPOINT"));
+            OK(run("UPDATE g SET w = w + 1 WHERE id % 50 = 0")); /* versions in the segments end */
+            OK(run("DELETE FROM g WHERE id % 97 = 0"));
+        }
+    }
+    static const char *const items = "COUNT(*), COUNT(t), SUM(w), SUM(d), SUM(f)";
+    static const char *const keys[][2] = {
+        {"k", "k + 0"},           {"d", "d + 0"},          {"ts", "COALESCE(ts, ts)"}, {"b", "COALESCE(b, b)"},
+        {"f", "f + 0"},           {"w / 1000", "(w + 0) / 1000"}, {"w % 7", "(w + 0) % 7"}, {"w / -3000", "(w + 0) / -3000"},
+    };
+    char fq[600], tq[600];
+    for (size_t i = 0; i < sizeof keys / sizeof *keys; i++) {
+        snprintf(fq, sizeof fq, "SELECT %s, %s FROM g GROUP BY %s ORDER BY 1", keys[i][0], items, keys[i][0]);
+        snprintf(tq, sizeof tq, "SELECT %s, %s FROM g GROUP BY %s ORDER BY 1", keys[i][1], items, keys[i][1]);
+        fast_twin(fq, tq, true);
+    }
+    fast_twin("SELECT k, COUNT(*) FROM g GROUP BY k HAVING COUNT(*) > 600 ORDER BY 2 DESC, 1",
+              "SELECT k + 0, COUNT(*) FROM g GROUP BY k + 0 HAVING COUNT(*) > 600 ORDER BY 2 DESC, 1", false); /* an aggregate in HAVING: a slot, which the fast path leaves to the generic one */
+    /* more keys than the key cache's slots (12,300 against 4,096): slots shared, so a cache that did not compare keys
+     * would merge groups; counted through a derived table (its rows would pass the result buffer) */
+    fast_twin("SELECT COUNT(*), SUM(n), MIN(k2), MAX(k2) FROM (SELECT id / 2 AS k2, COUNT(*) AS n FROM g GROUP BY id / 2) AS x",
+              "SELECT COUNT(*), SUM(n), MIN(k2), MAX(k2) FROM (SELECT (id + 0) / 2 AS k2, COUNT(*) AS n FROM g GROUP BY (id + 0) / 2) AS x",
+              true);
+    /* a column an ALTER added: the segments before it lack it (a constant there), the rows after it carry it */
+    OK(run("ALTER TABLE g ADD z INT64 DEFAULT 4"));
+    OK(run("INSERT INTO g (id, w, z) VALUES (30001, 1, 1), (30002, 2, 2), (30003, 3, NULL)"));
+    fast_twin("SELECT z, COUNT(*), SUM(w) FROM g GROUP BY z ORDER BY 1", "SELECT z + 0, COUNT(*), SUM(w) FROM g GROUP BY z + 0 ORDER BY 1", true);
+    OK(run("CHECKPOINT"));
+    fast_twin("SELECT z, COUNT(*), SUM(w) FROM g GROUP BY z ORDER BY 1", "SELECT z + 0, COUNT(*), SUM(w) FROM g GROUP BY z + 0 ORDER BY 1", true);
+    fast_twin("SELECT w % 7, COUNT(*), SUM(d) FROM g GROUP BY w % 7 ORDER BY 1",
+              "SELECT (w + 0) % 7, COUNT(*), SUM(d) FROM g GROUP BY (w + 0) % 7 ORDER BY 1", true);
+    done(db);
+}
+
 const test_case group_tests[] = {
+    {"group_fast", t_group_fast},
     {"group_keys", t_group_keys},
     {"group_match", t_group_match},
     {"group_distinct_filter", t_group_distinct_filter},

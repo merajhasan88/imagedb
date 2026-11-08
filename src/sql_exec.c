@@ -1615,6 +1615,18 @@ typedef struct sink {
     int8_t item_key[IMDB_MAX_COLS];      /* a plain column item's key */
     imdb_xval *gkeys;        /* ngroups x ngk, a TEXT's bytes the statement's (xalloc) */
     imdb_buf kenc, denc;     /* a row's keys, a DISTINCT value: their bytes */
+    /* the last group a row went to (an index: the arrays grow) and, grouped by trees or several keys, its keys' bytes
+     * (lgk, kenc's other buffer: swapped, never copied): a row whose keys are those takes it without a hash or a probe
+     * (rows that come grouped, a time bucket over rows in time order, nearly never hash) */
+    bool lg_ok;
+    uint64_t lg;
+    imdb_buf lgk;
+    /* the scan's grouped fast path (fast_group_ok): its key's kind and column, a divisor's constant, the key cache */
+    uint8_t fg_kind;
+    int16_t fg_col;
+    int64_t fg_c;
+    struct fg_cache_ent *fg_cache;
+    bool fg_nocache;         /* its allocation failed once: the map alone for the rest of the statement */
     imdb_hmap dmap;          /* DISTINCT's set (dist_seen) */
     bool first;              /* P2 S11: EXISTS with no WHERE tree: the first row it takes stops the path (SINK_FOUND) */
     struct copy_out *co;     /* P2 S17: SINK_COPY, a table's COPY TO: each row written as the path gives it (copy_row) */
@@ -1886,6 +1898,11 @@ static void group_gen(sink *k, const imdb_value *vals)
         key_enc(&k->kenc, &kv[j]);
     }
     if (imdb_buf_check(&k->kenc, k->e)) goto fail;
+    if (k->lg_ok && k->lgk.len == k->kenc.len && !memcmp(k->lgk.p, k->kenc.p, k->kenc.len)) { /* the map's equality: the bytes */
+        group_acc(k, k->lg, vals);
+        imdb_xarena_reset(&x->arena, m);
+        return;
+    }
     imdb_value ek = {.type = IMDB_T_TEXT, .s = k->kenc.p, .len = (uint32_t)k->kenc.len};
     if ((gi = imdb_hmap_get(&k->gmap, &ek))) {
         g = *gi;
@@ -1904,6 +1921,11 @@ static void group_gen(sink *k, const imdb_value *vals)
         }
         if (imdb_hmap_put(&k->gmap, &ek, g, k->e)) goto fail;
     }
+    imdb_buf sw = k->lgk; /* this row's keys the last: the buffers swap (kenc is cleared at the next row) */
+    k->lgk = k->kenc;
+    k->kenc = sw;
+    k->lg = g;
+    k->lg_ok = true;
     group_acc(k, g, vals);
     imdb_xarena_reset(&x->arena, m);
     return;
@@ -1981,6 +2003,16 @@ static void sink_row(sink *k, uint64_t vid, const imdb_value *vals)
             return;
         }
         const imdb_value *key = &vals[k->gcol];
+        if (k->lg_ok) { /* the last row's group when this key is its key, by the map's equality (bytes, or the value) */
+            const imdb_value *lk = &k->groups[k->lg].key;
+            bool same = key->null || lk->null ? key->null == lk->null
+                        : k->gmap.ktype != IMDB_T_INT64 ? lk->len == key->len && (!key->len || !memcmp(lk->s, key->s, key->len))
+                                                         : lk->i == key->i;
+            if (same) {
+                group_acc(k, k->lg, vals);
+                return;
+            }
+        }
         uint64_t *gi = key->null ? (k->has_null_group ? &k->null_group : NULL) : imdb_hmap_get(&k->gmap, key);
         uint64_t g;
         if (gi) {
@@ -2000,6 +2032,8 @@ static void sink_row(sink *k, uint64_t vid, const imdb_value *vals)
                 return;
             }
         }
+        k->lg = g;
+        k->lg_ok = true;
         group_acc(k, g, vals);
         return;
     }
@@ -2028,6 +2062,8 @@ static void sink_free(sink *k)
     if (k->gmap.slots) imdb_hmap_free(&k->gmap);
     imdb_free(k->gkeys); /* P2 S2 */
     imdb_buf_free(&k->kenc);
+    imdb_buf_free(&k->lgk);
+    imdb_free(k->fg_cache);
     imdb_buf_free(&k->denc);
     if (k->dmap.slots) imdb_hmap_free(&k->dmap);
     imdb_free(k->wkv); /* P2 S18 */
@@ -2582,6 +2618,217 @@ static bool fast_aggregate(const sink *k)
     return true;
 }
 
+/* ---- a grouped aggregate over a segment's columns (the zone slice's speed step, 2026-11-07) ---------------------------
+ * One key, a bare column of an integer-like type (INT64, DECIMAL, TIMESTAMP, BOOL, FLOAT64's key) or P2 S2's one tree
+ * col / c or col % c over an INT64 column (c an INT64 constant, neither 0 nor -1: no row can fail it, and an int64
+ * division is the evaluator's __int128 one); every item that key, a tree over it, COUNT(*), or COUNT / SUM of a
+ * column; no residual, no aggregate inside a tree. Rows that come grouped (a time bucket over rows in time order) are
+ * accumulated a run at a time in locals and given to their group once per run, the rolling-window idea of the user's
+ * GPU work (gpuoptimizations 97350b5: a register window kept across adjacent outputs); a run's group is found through
+ * a small direct-mapped cache of keys before the SipHash map. Groups are made in the order their rows come, as
+ * sink_row makes them, and each group's accumulators take exactly acc_add's changes, so the answer is the generic
+ * path's (cross_check compares the two). */
+enum { FG_COL = 1, FG_DIV, FG_MOD };
+#define FG_CACHE 4096u
+
+typedef struct fg_cache_ent {
+    int64_t key;
+    uint64_t g1; /* the group + 1; 0: none */
+} fg_cache_ent;
+
+static bool fg_int_type(uint8_t ty)
+{
+    return ty == IMDB_T_INT64 || ty == IMDB_T_DECIMAL || ty == IMDB_T_TIMESTAMP || ty == IMDB_T_BOOL || ty == IMDB_T_FLOAT64;
+}
+
+static bool fast_group_ok(sink *k, const imdb_table *t)
+{
+    if (k->mode != SINK_GROUP || k->nresid || k->nxa) return false;
+    if (!k->gen) {
+        if (k->gcol < 0 || !fg_int_type(t->s.cols[k->gcol].type)) return false;
+        k->fg_kind = FG_COL;
+        k->fg_col = k->gcol;
+    } else {
+        if (k->ngk != 1) return false;
+        if (k->gk_col[0] >= 0) {
+            if (!fg_int_type(t->s.cols[k->gk_col[0]].type)) return false;
+            k->fg_kind = FG_COL;
+            k->fg_col = k->gk_col[0];
+        } else {
+            const sql_stmt *st = k->st;
+            const sql_expr *n = &st->ex[k->gk_ex[0]];
+            if (n->op != EX_DIV && n->op != EX_MOD) return false;
+            const sql_expr *l = &st->ex[n->l], *r = &st->ex[n->r];
+            const imdb_xnode *xl = &k->x->xn[n->l], *xr = &k->x->xn[n->r], *xn = &k->x->xn[k->gk_ex[0]];
+            if (l->op != EX_COL || r->op != EX_LIT || xl->outer || xl->col < 0 || xl->type != IMDB_T_INT64 ||
+                xr->k.type != IMDB_T_INT64 || xr->k.null || xr->k.i == 0 || xr->k.i == -1 || xr->k.i < INT64_MIN ||
+                xr->k.i > INT64_MAX || xn->type != IMDB_T_INT64)
+                return false;
+            k->fg_kind = n->op == EX_DIV ? FG_DIV : FG_MOD;
+            k->fg_col = xl->col;
+            k->fg_c = (int64_t)xr->k.i;
+        }
+    }
+    for (uint16_t i = 0; i < k->st->nitems; i++) {
+        const sql_item *it = &k->st->items[i];
+        if (it->expr || it->agg == AGG_NONE || it->agg == AGG_COUNT_STAR) continue; /* a key, or over the keys alone */
+        if (it->agg != AGG_COUNT && it->agg != AGG_SUM) return false;
+        if (k->item_col[i] < 0) return false;
+    }
+    return true;
+}
+
+/* the group of a key: the cache, then the map (sink_row's and group_gen's own steps: one map, so the memtable's rows,
+ * which take those, find the same groups) */
+static int fg_group(sink *k, const imdb_table *t, bool isnull, int64_t key, uint64_t *out, imdb_err *e)
+{
+    uint32_t h = (uint32_t)(((uint64_t)key * 0x9E3779B97F4A7C15ull) >> 52) & (FG_CACHE - 1);
+    if (!isnull && k->fg_cache && k->fg_cache[h].g1 && k->fg_cache[h].key == key) {
+        *out = k->fg_cache[h].g1 - 1;
+        return IMDB_OK;
+    }
+    const imdb_column *col = &t->s.cols[k->fg_col];
+    uint64_t g, *gi;
+    if (!k->gen) {
+        imdb_value kv = {.type = col->type, .scale = col->scale, .null = isnull, .i = isnull ? 0 : key};
+        gi = isnull ? (k->has_null_group ? &k->null_group : NULL) : imdb_hmap_get(&k->gmap, &kv);
+        if (gi) {
+            g = *gi;
+        } else {
+            if (group_add(k, &g)) return e->code;
+            k->groups[g].key = kv;
+            if (isnull) {
+                k->has_null_group = true;
+                k->null_group = g;
+            } else if (imdb_hmap_put(&k->gmap, &kv, g, e)) {
+                return e->code;
+            }
+        }
+    } else {
+        imdb_xval xv;
+        memset(&xv, 0, sizeof xv);
+        xv.type = k->fg_kind == FG_COL ? col->type : IMDB_T_INT64;
+        xv.scale = k->fg_kind == FG_COL ? col->scale : 0;
+        xv.null = isnull;
+        if (!isnull && xv.type == IMDB_T_FLOAT64) xv.f = imdb_f64_value(key); /* as imdb_x_from_value holds one */
+        else if (!isnull) xv.i = key;
+        k->kenc.len = 0;
+        key_enc(&k->kenc, &xv);
+        if (imdb_buf_check(&k->kenc, e)) return e->code;
+        imdb_value ek = {.type = IMDB_T_TEXT, .s = k->kenc.p, .len = (uint32_t)k->kenc.len};
+        if ((gi = imdb_hmap_get(&k->gmap, &ek))) {
+            g = *gi;
+        } else {
+            if (group_add(k, &g)) return e->code;
+            k->gkeys[g * k->ngk] = xv;
+            if (imdb_hmap_put(&k->gmap, &ek, g, e)) return e->code;
+        }
+    }
+    if (!isnull && k->fg_cache) k->fg_cache[h] = (fg_cache_ent){key, g + 1};
+    *out = g;
+    return IMDB_OK;
+}
+
+/* a run's rows, given to group g as acc_add would have: COUNT(*) a count, COUNT and SUM the run's non-NULL values */
+static void fg_flush(sink *k, uint64_t g, uint64_t rows, const uint64_t *cnt, const __int128 *sum)
+{
+    uint16_t ni = k->st->nitems;
+    for (uint16_t i = 0; i < ni; i++) {
+        const sql_item *it = &k->st->items[i];
+        if (it->expr || it->agg == AGG_NONE) continue;
+        agg_acc *a = &k->gacc[g * ni + i];
+        if (it->agg == AGG_COUNT_STAR) {
+            a->count += rows;
+            continue;
+        }
+        a->count += cnt[i];
+        if (cnt[i]) a->has = true;
+        a->sum += sum[i];
+    }
+}
+
+/* row r of column c has a value (any type: a TEXT one too, whose bytes are never read here) */
+static inline bool fg_has(const imdb_segcol *c, uint32_t r)
+{
+    if (c->is_cst) return !c->cst.null;
+    return !c->valid || (c->valid[r >> 3] >> (r & 7) & 1);
+}
+
+/* row r's value of an integer-like column (the stored key of a FLOAT64), false when NULL */
+static inline bool fg_val(const imdb_segcol *c, uint32_t r, int64_t *v)
+{
+    if (c->is_cst) {
+        *v = c->cst.i;
+        return !c->cst.null;
+    }
+    if (c->valid && !(c->valid[r >> 3] >> (r & 7) & 1)) return false;
+    *v = c->i64 ? c->i64[r] : c->u8[r];
+    return true;
+}
+
+static uint64_t g_fg_segments; /* tests: imdb_sql_fast_group_segments */
+uint64_t imdb_sql_fast_group_segments(void) { return __atomic_load_n(&g_fg_segments, __ATOMIC_RELAXED); }
+
+static int fast_group_seg(sink *k, const imdb_table *t, const imdb_segimg *gi, const uint64_t *bits, size_t words,
+                          imdb_err *e)
+{
+    uint16_t ni = k->st->nitems;
+    uint64_t cnt[IMDB_MAX_COLS];
+    __int128 sum[IMDB_MAX_COLS];
+    memset(cnt, 0, sizeof cnt);
+    memset(sum, 0, sizeof sum);
+    const imdb_segcol *kc = &gi->col[k->fg_col];
+    if (!k->fg_cache && !k->fg_nocache) { /* once a statement: a cache that cannot be had leaves the map alone */
+        imdb_err ce = {0};
+        if (!(k->fg_cache = imdb_alloc_array(FG_CACHE, sizeof *k->fg_cache, &ce))) k->fg_nocache = true;
+    }
+    bool f64[IMDB_MAX_COLS];
+    for (uint16_t i = 0; i < ni; i++) f64[i] = k->item_col[i] >= 0 && t->s.cols[k->item_col[i]].type == IMDB_T_FLOAT64;
+    bool open = false, cur_null = false;
+    int64_t cur = 0;
+    uint64_t g = 0, rows = 0;
+    for (size_t w = 0; w < words; w++)
+        for (uint64_t m = bits[w]; m; m &= m - 1) {
+            uint32_t r = (uint32_t)(w * 64 + (uint64_t)__builtin_ctzll(m));
+            int64_t raw = 0;
+            bool isnull = !fg_val(kc, r, &raw);
+            int64_t key = isnull ? 0 : k->fg_kind == FG_DIV ? raw / k->fg_c : k->fg_kind == FG_MOD ? raw % k->fg_c : raw;
+            if (!open || isnull != cur_null || (!isnull && key != cur)) {
+                if (open) {
+                    fg_flush(k, g, rows, cnt, sum);
+                    rows = 0;
+                    memset(cnt, 0, sizeof *cnt * ni);
+                    memset(sum, 0, sizeof *sum * ni);
+                }
+                if (fg_group(k, t, isnull, key, &g, e)) return e->code;
+                open = true;
+                cur_null = isnull;
+                cur = key;
+            }
+            rows++;
+            for (uint16_t i = 0; i < ni; i++) {
+                const sql_item *it = &k->st->items[i];
+                if (it->expr || it->agg == AGG_NONE || it->agg == AGG_COUNT_STAR) continue;
+                const imdb_segcol *ic = &gi->col[k->item_col[i]];
+                if (!fg_has(ic, r)) continue; /* aggregates ignore NULLs */
+                cnt[i]++;
+                if (it->agg != AGG_SUM) continue; /* COUNT: its presence alone (a TEXT column's too) */
+                int64_t v = 0;
+                (void)fg_val(ic, r, &v); /* SUM's columns are INT64, DECIMAL or FLOAT64 (bind's rule) */
+                if (f64[i]) {
+                    agg_acc *a = &k->gacc[g * ni + i]; /* exact: each value, as acc_add adds it */
+                    if (imdb_fsum_add(&a->fsum, v, e)) return e->code;
+                } else {
+                    sum[i] += v;
+                }
+            }
+        }
+    if (open) fg_flush(k, g, rows, cnt, sum);
+    __atomic_fetch_add(&g_fg_segments, 1, __ATOMIC_RELAXED);
+    k->lg_ok = false; /* the generic path's last group is its own to find again */
+    return IMDB_OK;
+}
+
 /* column col is one of the index's and not TEXT: its value is in the key (a TEXT word is an
  * 8-byte prefix, not the value). A nullable column after the first is not: its NULL is the word
  * 0, which is also the type's lowest value (db.c imdb_index_version_key). */
@@ -2636,6 +2883,7 @@ static int path_scan(xctx *x, const qspec *q, sink *k, imdb_err *e)
     uint64_t *bits = NULL, *tmp = NULL;
     size_t capw = 0;
     bool fast = fast_aggregate(k);
+    bool fgrp = !fast && fast_group_ok(k, t); /* the grouped one: a segment's rows a run at a time */
     int rc = IMDB_OK;
     for (uint32_t s = 0; s < t->nseg && !rc && !k->err; s++) {
         imdb_segment *g = t->seg[s];
@@ -2703,6 +2951,13 @@ static int path_scan(xctx *x, const qspec *q, sink *k, imdb_err *e)
                     }
                 }
             }
+        }
+        if (fgrp) {
+            uint64_t matched = 0; /* what the sink would have been given, as the ungrouped path counts it */
+            for (size_t w = 0; w < words; w++) matched += (uint64_t)__builtin_popcountll(bits[w]);
+            if ((rc = xtested(x, matched, e)) || (rc = fast_group_seg(k, t, gi, bits, words, e))) break;
+            if (x->release) imdb_seg_done(t, g); /* P2 S15: grouped whole; nothing points into it */
+            continue;
         }
         if (fast) {
             uint64_t matched = 0; /* what the sink would have been given: the rows past visibility and the predicates */
@@ -9242,6 +9497,47 @@ static size_t disp_width(const uint8_t *p, size_t n)
     return w;
 }
 
+
+/* a cell's display width without making its text where the text's length is the value's arithmetic (the speed step:
+ * the table's width pass made every cell's text, then its output pass made it again): a TIMESTAMP in range 19, 26 with
+ * microseconds; an INT64 or DECIMAL its digits, sign and point; a BOOL and a NULL their words. TEXT (its escapes),
+ * FLOAT64 (the shortest text that reads back) and a wide sum are made and measured as before. */
+static size_t cell_width_fast(const imdb_cell *c, imdb_buf *tmp)
+{
+    if (c->null || c->v.null) return 4; /* "null" */
+    if (!c->wide) {
+        const imdb_value *v = &c->v;
+        if (v->type == IMDB_T_BOOL) return v->i ? 4 : 5;
+        if (v->type == IMDB_T_TIMESTAMP && v->i >= -62135596800000000LL && v->i <= 253402300799999999LL)
+            return v->i % 1000000 ? 26 : 19; /* years 0001-9999: codec.c's TS_MIN, TS_MAX */
+        if (v->type == IMDB_T_INT64 || v->type == IMDB_T_DECIMAL) {
+            uint64_t u = v->i < 0 ? (uint64_t)0 - (uint64_t)v->i : (uint64_t)v->i;
+            size_t nd = 1;
+            while (u >= 10) {
+                u /= 10;
+                nd++;
+            }
+            size_t sc = v->type == IMDB_T_DECIMAL ? v->scale : 0;
+            if (sc && nd <= sc) nd = sc + 1; /* a leading 0 before the point */
+            return nd + (sc ? 1 : 0) + (v->i < 0);
+        }
+    }
+    tmp->len = 0;
+    cell_text(c, tmp, true);
+    return disp_width(tmp->p, tmp->len);
+}
+
+static size_t cell_width(const imdb_cell *c, imdb_buf *tmp)
+{
+    size_t w = cell_width_fast(c, tmp);
+#ifdef IMDB_STORE_CHECKS /* the SAN and fuzz builds: every width the arithmetic gives is the text's */
+    tmp->len = 0;
+    cell_text(c, tmp, true);
+    if (!tmp->err && w != disp_width(tmp->p, tmp->len)) abort();
+#endif
+    return w;
+}
+
 void imdb_result_render(const imdb_result *r, bool csv, imdb_buf *out)
 {
     if (!r->has_rows) {
@@ -9279,9 +9575,7 @@ void imdb_result_render(const imdb_result *r, bool csv, imdb_buf *out)
     for (uint16_t c = 0; c < nc; c++) w[c] = strlen(r->names[c]);
     for (uint64_t i = 0; i < r->nrows; i++)
         for (uint16_t c = 0; c < nc; c++) {
-            tmp.len = 0;
-            cell_text(&r->cells[i * nc + c], &tmp, true);
-            size_t dw = disp_width(tmp.p, tmp.len);
+            size_t dw = cell_width(&r->cells[i * nc + c], &tmp);
             if (dw > w[c]) w[c] = dw > 60 ? 60 : dw;
         }
     for (uint16_t c = 0; c < nc; c++) imdb_buf_printf(out, "%s %-*s", c ? " |" : "", (int)w[c], r->names[c]);

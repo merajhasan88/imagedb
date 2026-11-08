@@ -5,6 +5,7 @@
 #include <math.h>
 #include <openssl/bn.h>
 #include <stdlib.h>
+#include <time.h>
 
 #include "../../src/codec.h"
 #include "../../src/cpu.h"
@@ -845,7 +846,100 @@ static void t_fsum_exact(void)
     }
 }
 
+
+/* the zone slice's speed step: INT64, TIMESTAMP and DECIMAL text made without printf, byte for byte what printf and
+ * the earlier __int128 loop made: INT64 against %lld, TIMESTAMP against libc's gmtime_r and the same format (its whole
+ * range, each end, the microseconds' presence), DECIMAL against the earlier loop, at each scale, over random values
+ * and the extremes */
+static uint64_t g_fmt_rng = 0x2545F4914F6CDD1Dull;
+static uint64_t fmt_rnd(void)
+{
+    g_fmt_rng ^= g_fmt_rng << 13;
+    g_fmt_rng ^= g_fmt_rng >> 7;
+    g_fmt_rng ^= g_fmt_rng << 17;
+    return g_fmt_rng;
+}
+
+static void dec_ref(__int128 v, int scale, char *out, size_t cap)
+{
+    char tmp[64];
+    int n = 0;
+    bool neg = v < 0;
+    unsigned __int128 mag = neg ? (unsigned __int128)0 - (unsigned __int128)v : (unsigned __int128)v;
+    do {
+        tmp[n++] = (char)('0' + (int)(mag % 10));
+        mag /= 10;
+    } while (mag || n <= scale);
+    size_t o = 0;
+    if (neg) out[o++] = '-';
+    for (int i = n - 1; i >= 0 && o + 2 < cap; i--) {
+        out[o++] = tmp[i];
+        if (i == scale && scale > 0) out[o++] = '.';
+    }
+    out[o] = 0;
+}
+
+static bool fmt_same(const imdb_value *v, const char *want)
+{
+    imdb_buf b;
+    imdb_buf_init(&b);
+    imdb_format_value(v, &b);
+    bool ok = !b.err && b.len == strlen(want) && memcmp(b.p, want, b.len) == 0;
+    if (!ok) fprintf(stderr, "      got %.*s, want %s\n", (int)b.len, b.p ? (const char *)b.p : "", want);
+    imdb_buf_free(&b);
+    return ok;
+}
+
+static void t_format_digits(void)
+{
+    char want[96];
+    static const int64_t ie[] = {0, 1, -1, 9, 10, -10, 99, 100, 12345, -12345, INT64_MAX, INT64_MIN, INT64_MAX - 1,
+                                 INT64_MIN + 1, 1000000000000000000LL, -999999999999999999LL};
+    int bad = 0;
+    for (size_t i = 0; i < 400016 && bad < 5; i++) {
+        int64_t x = i < sizeof ie / sizeof *ie ? ie[i] : (int64_t)fmt_rnd() >> (fmt_rnd() % 64);
+        snprintf(want, sizeof want, "%lld", (long long)x);
+        imdb_value v = {.type = IMDB_T_INT64, .i = x};
+        if (!fmt_same(&v, want)) bad++;
+    }
+    CHECK(bad == 0);
+    bad = 0;
+    const int64_t lo = -62135596800000000LL, hi = 253402300799999999LL; /* codec.c's TS_MIN, TS_MAX */
+    for (size_t i = 0; i < 400000 && bad < 5; i++) {
+        int64_t t = i == 0 ? lo : i == 1 ? hi : i == 2 ? 0 : i == 3 ? -1 : lo + (int64_t)(fmt_rnd() % (uint64_t)(hi - lo + 1));
+        if (i % 3 == 0) t -= t % 1000000; /* whole seconds: no fraction written */
+        int64_t s = t >= 0 ? t / 1000000 : (t - 999999) / 1000000, us = t - s * 1000000;
+        time_t tt = (time_t)s;
+        struct tm tm;
+        CHECK(gmtime_r(&tt, &tm) != NULL);
+        int n = snprintf(want, sizeof want, "%04lld-%02d-%02d %02d:%02d:%02d", (long long)tm.tm_year + 1900, tm.tm_mon + 1,
+                         tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+        if (us) snprintf(want + n, sizeof want - (size_t)n, ".%06lld", (long long)us);
+        imdb_value v = {.type = IMDB_T_TIMESTAMP, .i = t};
+        if (!fmt_same(&v, want)) bad++;
+    }
+    CHECK(bad == 0);
+    bad = 0;
+    for (size_t i = 0; i < 400000 && bad < 5; i++) {
+        int sc = (int)(fmt_rnd() % 19);
+        int64_t x = i < sizeof ie / sizeof *ie ? ie[i] : (int64_t)fmt_rnd() >> (fmt_rnd() % 64);
+        dec_ref(x, sc, want, sizeof want);
+        imdb_value v = {.type = IMDB_T_DECIMAL, .scale = (uint8_t)sc, .i = x};
+        if (!fmt_same(&v, want)) bad++;
+        __int128 w = ((__int128)(int64_t)fmt_rnd() << 40) ^ (__int128)fmt_rnd(); /* a SUM's width, past 64 bits */
+        char wa[96];
+        dec_ref(w, sc, wa, sizeof wa);
+        imdb_buf b;
+        imdb_buf_init(&b);
+        imdb_format_i128(w, sc, &b);
+        if (b.err || b.len != strlen(wa) || memcmp(b.p, wa, b.len) != 0) bad++;
+        imdb_buf_free(&b);
+    }
+    CHECK(bad == 0);
+}
+
 const test_case codec_tests[] = {
+    {"format_digits", t_format_digits},
     {"float64_keys", t_float64_keys},
     {"float64_literals", t_float64_literals},
     {"null_rows", t_null_rows},
