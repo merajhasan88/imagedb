@@ -30,7 +30,7 @@
 
 #include "abind.h"
 
-enum { T_INT64 = 1, T_DECIMAL = 2, T_TEXT = 3, T_BOOL = 4, T_TIMESTAMP = 5, T_FLOAT64 = 6 };
+enum { T_INT64 = 1, T_DECIMAL = 2, T_TEXT = 3, T_BOOL = 4, T_TIMESTAMP = 5, T_FLOAT64 = 6, T_TIMESTAMPTZ = 7 };
 enum { DEP_TABLE = 1, DEP_VIEW = 2 };
 
 #define MAX_IDENT 63
@@ -67,12 +67,12 @@ typedef struct tk {
 
 /* ---- the tree ---------------------------------------------------------------------------------------------------- */
 
-enum { L_INT = 1, L_DEC, L_FLT, L_STR, L_PARAM, L_BOOL, L_TS, L_NULL };
+enum { L_INT = 1, L_DEC, L_FLT, L_STR, L_PARAM, L_BOOL, L_TS, L_NULL, L_TSTZ }; /* L_TSTZ: P2 */
 enum { X_LIT = 1, X_COL, X_NEG, X_ADD, X_SUB, X_MUL, X_DIV, X_MOD, X_CMP, X_AND, X_OR, X_NOT, X_FN, X_CASE, X_WHEN, X_CAST,
        X_AGG, X_WIN, X_SUBQ, X_LIST };
 enum { C_EQ = 1, C_NE, C_LT, C_LE, C_GT, C_GE, C_BETWEEN, C_ISNULL, C_NOTNULL, C_IN, C_NOTIN, C_LIKE, C_NOTLIKE };
 enum { F_ABS = 1, F_SIGN, F_ROUND, F_CEIL, F_FLOOR, F_MOD, F_LENGTH, F_SUBSTR, F_TRIM, F_LTRIM, F_RTRIM, F_POSITION,
-       F_COALESCE, F_NULLIF, F_LOWER, F_UPPER, F_REPLACE, F_CONCAT };
+       F_COALESCE, F_NULLIF, F_LOWER, F_UPPER, F_REPLACE, F_CONCAT, F_DATE_TRUNC, F_TIMEZONE }; /* the last two: P2 */
 enum { A_COUNT = 1, A_COUNT_STAR, A_SUM, A_MIN, A_MAX, A_AVG }; /* the engine's names: count, count, sum, min, max, avg */
 enum { W_ROW_NUMBER = 1, W_RANK, W_DENSE_RANK, W_NTILE, W_LAG, W_LEAD, W_FIRST, W_LAST, W_AGG };
 enum { S_VALUE = 0, S_EXISTS = 1, S_IN = 2 };
@@ -511,7 +511,7 @@ static uint8_t fn_named(const ab *b, uint32_t at)
              {"char_length", F_LENGTH}, {"character_length", F_LENGTH}, {"substr", F_SUBSTR}, {"substring", F_SUBSTR},
              {"trim", F_TRIM},        {"ltrim", F_LTRIM},       {"rtrim", F_RTRIM},     {"position", F_POSITION},
              {"coalesce", F_COALESCE}, {"nullif", F_NULLIF},    {"lower", F_LOWER},     {"upper", F_UPPER},
-             {"replace", F_REPLACE}};
+             {"replace", F_REPLACE},  {"date_trunc", F_DATE_TRUNC}, {"timezone", F_TIMEZONE}}; /* P2 */
     for (size_t i = 0; i < sizeof F / sizeof *F; i++)
         if (kwat(b, at, F[i].name)) return F[i].fn;
     return 0;
@@ -578,7 +578,14 @@ static int col_type(ab *b, uint8_t *type, uint8_t *scale) /* a CAST's type, as a
     if (kw(b, "int64") || kw(b, "bigint") || kw(b, "int") || kw(b, "integer")) *type = T_INT64;
     else if (kw(b, "text")) *type = T_TEXT;
     else if (kw(b, "bool") || kw(b, "boolean")) *type = T_BOOL;
-    else if (kw(b, "timestamp")) *type = T_TIMESTAMP;
+    else if (kw(b, "timestamptz")) *type = T_TIMESTAMPTZ; /* P2 */
+    else if (kw(b, "timestamp")) {
+        *type = T_TIMESTAMP;
+        if ((kwat(b, b->i, "with") || kwat(b, b->i, "without")) && kwat(b, b->i + 1, "time") && kwat(b, b->i + 2, "zone")) {
+            if (kwat(b, b->i, "with")) *type = T_TIMESTAMPTZ;
+            b->i += 3;
+        }
+    }
     else if (kw(b, "decimal") || kw(b, "numeric")) {
         *type = T_DECIMAL;
         uint32_t p, s = 0;
@@ -702,6 +709,17 @@ static int window_call(ab *b, uint8_t wf, uint16_t *out, unsigned d)
     return third(b, *out, a[2]);
 }
 
+/* a typed timestamp literal begins at token i: TIMESTAMP or TIMESTAMPTZ then a string; P2: TIMESTAMP WITH or WITHOUT TIME
+ * ZONE then a string (the engine's rule) */
+static bool ts_literal_at(const ab *b, uint32_t i)
+{
+    if (kwat(b, i, "timestamptz")) return kind_at(b, i + 1) == K_STR;
+    if (!kwat(b, i, "timestamp")) return false;
+    if (kind_at(b, i + 1) == K_STR) return true;
+    return (kwat(b, i + 1, "with") || kwat(b, i + 1, "without")) && kwat(b, i + 2, "time") && kwat(b, i + 3, "zone") &&
+           kind_at(b, i + 4) == K_STR;
+}
+
 static int literal(ab *b, uint16_t *out)
 {
     bool neg = false, sign = false;
@@ -717,9 +735,10 @@ static int literal(ab *b, uint16_t *out)
     else if (t->k == K_STR) lit = L_STR;
     else if (t->k == K_PARAM) lit = L_PARAM;
     else if (kwat(b, b->i, "true") || kwat(b, b->i, "false")) lit = L_BOOL;
-    else if (kwat(b, b->i, "timestamp") && kind_at(b, b->i + 1) == K_STR) {
-        lit = L_TS;
-        b->i++;
+    else if (ts_literal_at(b, b->i)) { /* P2: TIMESTAMPTZ and TIMESTAMP WITH TIME ZONE its TIMESTAMPTZ */
+        bool tz = kwat(b, b->i, "timestamptz") || kwat(b, b->i + 1, "with");
+        b->i += kwat(b, b->i, "timestamptz") || kind_at(b, b->i + 1) == K_STR ? 1 : 4;
+        lit = tz ? L_TSTZ : L_TS;
         t = &b->t[b->i];
     } else if (kwat(b, b->i, "null")) lit = L_NULL;
     else return fail(b, "expected a literal at offset %u", t->off);
@@ -788,7 +807,7 @@ static int primary(ab *b, uint16_t *out, unsigned d)
     }
     const tk *t = &b->t[b->i];
     if (t->k == K_ID && !kwat(b, b->i, "true") && !kwat(b, b->i, "false") && !kwat(b, b->i, "null") &&
-        !(kwat(b, b->i, "timestamp") && kind_at(b, b->i + 1) == K_STR)) {
+        !ts_literal_at(b, b->i)) {
         if (reserved(b, b->i)) return fail(b, "expected an identifier at offset %u", t->off);
         uint32_t qo = 0, ql = 0, co = t->off, cl = t->len;
         b->i++;
@@ -827,15 +846,29 @@ static int unary(ab *b, uint16_t *out, unsigned d)
     return primary(b, out, d);
 }
 
-static int term(ab *b, uint16_t *out, unsigned d)
+/* P2: x AT TIME ZONE z, the engine's level: below a sign, above * and /, left to right; the node timezone(z, x) */
+static int at_expr(ab *b, uint16_t *out, unsigned d)
 {
     if (unary(b, out, d)) return -1;
+    while (kwat(b, b->i, "at") && kwat(b, b->i + 1, "time") && kwat(b, b->i + 2, "zone")) {
+        b->i += 3;
+        uint16_t el[2] = {0, *out}, args;
+        if (unary(b, &el[0], d + 1) || list_n(b, el, 2, &args) || nnew(b, X_FN, args, 0, out)) return -1;
+        X(*out)->fn = F_TIMEZONE;
+        X(*out)->nargs = 2;
+    }
+    return 0;
+}
+
+static int term(ab *b, uint16_t *out, unsigned d)
+{
+    if (at_expr(b, out, d)) return -1;
     for (;;) {
         uint8_t k = b->t[b->i].k, op = k == K_STAR ? X_MUL : k == K_SLASH ? X_DIV : k == K_PCT ? X_MOD : 0;
         if (!op) return 0;
         b->i++;
         uint16_t r;
-        if (unary(b, &r, d) || nnew(b, op, *out, r, out)) return -1;
+        if (at_expr(b, &r, d) || nnew(b, op, *out, r, out)) return -1;
     }
 }
 
@@ -1332,8 +1365,8 @@ static bool num(uint8_t t) { return t == T_INT64 || t == T_DECIMAL || t == T_FLO
 
 static const char *tname(uint8_t t)
 {
-    static const char *const N[] = {"NULL", "INT64", "DECIMAL", "TEXT", "BOOL", "TIMESTAMP", "FLOAT64"};
-    return t <= T_FLOAT64 ? N[t] : "?";
+    static const char *const N[] = {"NULL", "INT64", "DECIMAL", "TEXT", "BOOL", "TIMESTAMP", "FLOAT64", "TIMESTAMPTZ"};
+    return t <= T_TIMESTAMPTZ ? N[t] : "?";
 }
 
 static int dep_note(ab *b, uint8_t kind, uint32_t id)
@@ -1603,14 +1636,14 @@ static bool str_lit(const aq *q, uint16_t k) { return QX(q, k)->op == X_LIT && Q
 static int unify_all(ab *b, const scope *sc, const uint16_t *v, unsigned n, const char *what, ty *out)
 {
     ty t[MAX_ARGS + 1];
-    bool ts = false;
+    uint8_t ts = 0; /* a TIMESTAMP or (P2) a TIMESTAMPTZ among them: a string literal is of its type */
     for (unsigned i = 0; i < n; i++) {
         if (type_of(b, sc, v[i], true, &t[i])) return -1;
-        ts |= t[i].t == T_TIMESTAMP;
+        if (t[i].t == T_TIMESTAMP || t[i].t == T_TIMESTAMPTZ) ts = t[i].t;
     }
     *out = (ty){0, 0};
     for (unsigned i = 0; i < n; i++) {
-        ty x = ts && str_lit(sc->q, v[i]) ? (ty){T_TIMESTAMP, 0} : t[i];
+        ty x = ts && str_lit(sc->q, v[i]) ? (ty){ts, 0} : t[i];
         if (unify(b, out, x, what)) return -1;
     }
     return out->t ? 0 : fail(b, "%s NULL alone has no type", what);
@@ -1685,6 +1718,28 @@ static int fn_type(ab *b, const scope *sc, const xn *x, ty *out)
         if (a[0].t != T_TEXT || a[1].t != T_TEXT) return fail(b, "POSITION takes TEXT values");
         *out = (ty){T_INT64, 0};
         return 0;
+    case F_DATE_TRUNC: { /* P2: date_trunc(unit, x [, zone]): x's type; the unit a string constant of PostgreSQL's names */
+        static const char *const U[] = {"microseconds", "microsecond", "milliseconds", "millisecond", "second", "seconds",
+                                        "minute", "minutes", "hour", "hours", "day", "days", "week", "weeks", "month",
+                                        "months", "quarter", "quarters", "year", "years", "decade", "decades", "century",
+                                        "centuries", "millennium", "millennia"};
+        if (fn_args(b, n, 2, 3)) return -1;
+        const xn *p = QX(q, v[0]);
+        bool found = false;
+        for (size_t i = 0; p->op == X_LIT && p->lit == L_STR && !found && i < sizeof U / sizeof *U; i++)
+            found = strlen(U[i]) == p->len && !strncasecmp(U[i], b->s + p->off, p->len);
+        if (!found) return fail(b, "date_trunc's unit is a string constant of a unit's name");
+        if (a[1].t != T_TIMESTAMP && a[1].t != T_TIMESTAMPTZ) return fail(b, "date_trunc takes a TIMESTAMP or a TIMESTAMPTZ");
+        if (n == 3 && (a[1].t != T_TIMESTAMPTZ || a[2].t != T_TEXT)) return fail(b, "date_trunc's zone is a TIMESTAMPTZ's");
+        *out = (ty){a[1].t, 0};
+        return 0;
+    }
+    case F_TIMEZONE: /* P2: x AT TIME ZONE z: a TIMESTAMPTZ's wall clock (TIMESTAMP), a TIMESTAMP's instant (TIMESTAMPTZ) */
+        if (fn_args(b, n, 2, 2)) return -1;
+        if (a[0].t != T_TEXT) return fail(b, "AT TIME ZONE takes a zone's name (TEXT)");
+        if (a[1].t != T_TIMESTAMP && a[1].t != T_TIMESTAMPTZ) return fail(b, "AT TIME ZONE converts a TIMESTAMP or a TIMESTAMPTZ");
+        *out = (ty){a[1].t == T_TIMESTAMP ? T_TIMESTAMPTZ : T_TIMESTAMP, 0};
+        return 0;
     case F_NULLIF:
         if (fn_args(b, n, 2, 2)) return -1;
         if (!a[0].t) return fail(b, "NULLIF of NULL has no type");
@@ -1713,7 +1768,8 @@ static int cast_type(ab *b, const scope *sc, const xn *x, ty *out)
     ty a;
     if (type_of(b, sc, x->l, true, &a)) return -1;
     bool to_num = num(x->ctype);
-    if (a.t && a.t != T_TEXT && x->ctype != T_TEXT && a.t != x->ctype && !(num(a.t) && to_num))
+    bool ts2 = (a.t == T_TIMESTAMP || a.t == T_TIMESTAMPTZ) && (x->ctype == T_TIMESTAMP || x->ctype == T_TIMESTAMPTZ); /* P2 */
+    if (a.t && a.t != T_TEXT && x->ctype != T_TEXT && a.t != x->ctype && !(num(a.t) && to_num) && !ts2)
         return fail(b, "CAST of %s to %s is not defined", tname(a.t), tname(x->ctype));
     *out = (ty){x->ctype, x->ctype == T_DECIMAL ? x->cscale : 0};
     return 0;
@@ -1818,6 +1874,7 @@ static int type_of(ab *b, const scope *sc, uint16_t k, bool null_ok, ty *out)
         case L_STR: *out = (ty){T_TEXT, 0}; return 0;
         case L_BOOL: *out = (ty){T_BOOL, 0}; return 0;
         case L_TS: *out = (ty){T_TIMESTAMP, 0}; return 0;
+        case L_TSTZ: *out = (ty){T_TIMESTAMPTZ, 0}; return 0; /* P2 */
         case L_NULL:
             if (!null_ok) return fail(b, "NULL cannot be an operand");
             *out = (ty){0, 0};

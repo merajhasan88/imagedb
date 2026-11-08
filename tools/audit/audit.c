@@ -57,7 +57,8 @@
 #define RETAIN_MIN_US 1000000ull                      /* SET_RETENTION (16): a second ... */
 #define RETAIN_MAX_US (36525ull * 24 * 3600 * 1000000) /* ... to a century, or all ones (FOREVER) */
 
-enum { T_INT64 = 1, T_DECIMAL = 2, T_TEXT = 3, T_BOOL = 4, T_TIMESTAMP = 5, T_FLOAT64 = 6 };
+enum { T_INT64 = 1, T_DECIMAL = 2, T_TEXT = 3, T_BOOL = 4, T_TIMESTAMP = 5, T_FLOAT64 = 6, T_TIMESTAMPTZ = 7 };
+#define T_LAST T_TIMESTAMPTZ /* P2: an instant (UTC microseconds), its zone only how a session shows it */
 enum { F_PK = 1, F_SUBJECT = 2, F_NULLABLE = 4 };
 #define TS_MIN (-62135596800000000LL)
 #define TS_MAX (253402300799999999LL)
@@ -324,7 +325,7 @@ static aviewdef *decode_viewdef(rd *r)
         uint8_t cl = rd_u8(r);
         const uint8_t *c = rd_bytes(r, cl);
         uint8_t type = rd_u8(r), scale = rd_u8(r);
-        if (r->bad || !ident_ok(c, cl) || type < T_INT64 || type > T_FLOAT64 || (type == T_DECIMAL ? scale > 18 : scale != 0))
+        if (r->bad || !ident_ok(c, cl) || type < T_INT64 || type > T_LAST || (type == T_DECIMAL ? scale > 18 : scale != 0))
             goto bad;
         memcpy(cn[i], c, cl);
         memcpy(d->cols[i].name, c, cl); /* P2 S7b */
@@ -410,7 +411,7 @@ static int decode_schema(rd *r, schema *s)
         c->scale = rd_u8(r);
         c->flags = rd_u8(r);
         if (r->bad) return fail("schema: truncated");
-        if (c->type < T_INT64 || c->type > T_FLOAT64 || (c->flags & ~(F_PK | F_SUBJECT | F_NULLABLE)) ||
+        if (c->type < T_INT64 || c->type > T_LAST || (c->flags & ~(F_PK | F_SUBJECT | F_NULLABLE)) ||
             ((c->flags & F_NULLABLE) && (c->flags & (F_PK | F_SUBJECT))))
             return fail("schema: bad column type or flags");
         if (c->type == T_DECIMAL ? (c->prec < 1 || c->prec > 18 || c->scale > c->prec) : (c->prec || c->scale))
@@ -478,7 +479,8 @@ static int check_value(const col *c, const val *v)
 {
     if (c->type == T_DECIMAL && (v->i > pow10i(c->prec) - 1 || v->i < -(pow10i(c->prec) - 1)))
         return fail("value out of DECIMAL range in column %s", c->name);
-    if (c->type == T_TIMESTAMP && (v->i < TS_MIN || v->i > TS_MAX)) return fail("TIMESTAMP out of range in column %s", c->name);
+    if ((c->type == T_TIMESTAMP || c->type == T_TIMESTAMPTZ) && (v->i < TS_MIN || v->i > TS_MAX))
+        return fail("TIMESTAMP out of range in column %s", c->name);
     if (c->type == T_BOOL && v->i != 0 && v->i != 1) return fail("bad BOOL in column %s", c->name);
     if (c->type == T_FLOAT64 && !float_key_ok(v->i)) return fail("not a finite FLOAT64 in column %s", c->name);
     if (c->type == T_TEXT && (v->len > MAX_TEXT || (v->len && !utf8_ok(v->s, v->len))))
@@ -834,7 +836,7 @@ static int alter_body(rd *hr, op *o, const char *what)
         o->acol.scale = rd_u8(hr);
         o->acol.flags = rd_u8(hr);
         const col *ac = &o->acol;
-        if (!hr->bad && (ac->type < T_INT64 || ac->type > T_FLOAT64 || (ac->flags & ~F_NULLABLE) ||
+        if (!hr->bad && (ac->type < T_INT64 || ac->type > T_LAST || (ac->flags & ~F_NULLABLE) ||
                          (ac->type == T_DECIMAL ? (ac->prec < 1 || ac->prec > 18 || ac->scale > ac->prec)
                                                 : (ac->prec || ac->scale))))
             return fail("%s: bad added column", what);
@@ -2420,7 +2422,10 @@ static void seg_free(seg *g)
     memset(g, 0, sizeof *g);
 }
 
-static bool is_int(uint8_t t) { return t == T_INT64 || t == T_DECIMAL || t == T_TIMESTAMP || t == T_FLOAT64; }
+static bool is_int(uint8_t t)
+{
+    return t == T_INT64 || t == T_DECIMAL || t == T_TIMESTAMP || t == T_FLOAT64 || t == T_TIMESTAMPTZ;
+}
 
 static bool has_value(const seg *g, int c, uint32_t i)
 {

@@ -862,7 +862,7 @@ static void t_copy_dump_ckey(void)
  * of the other digest algorithm, it dumps again the same past its first line, VERIFY passing */
 static void t_copy_dump_fixtures(void)
 {
-    static const char *const tgz[] = {"tests/fixtures/alg1-20261107.tar.gz", "tests/fixtures/alg2-20261107.tar.gz"};
+    static const char *const tgz[] = {"tests/fixtures/alg1-20261108.tar.gz", "tests/fixtures/alg2-20261108.tar.gz"};
     for (int f = 0; f < 2; f++) {
         char dir[600], cmd[1600], p[700], r[700], q[700];
         snprintf(dir, sizeof dir, "%s", test_tmpdir());
@@ -906,6 +906,61 @@ static void t_copy_dump_fixtures(void)
     }
 }
 
+
+/* P2: TIMESTAMPTZ through COPY: fields with an offset, a zone's name and none (the session's zone), read in pieces of
+ * every size; COPY TO writes the session's zone, and those bytes read back anywhere are the same instants; the dump
+ * writes UTC (+00) whatever the session's zone, and its restore holds the same rows */
+static void t_copy_tz(void)
+{
+    imdb_db *db = open_fresh();
+    CHECK(db);
+    CHECK(run("CREATE TABLE z (id INT64 PRIMARY KEY, tz TIMESTAMPTZ NULL, w TIMESTAMP NULL)") == 0);
+    CHECK(run("SET TIME ZONE 'Asia/Kolkata'") == 0);
+    const char *data = "1,2026-01-01 10:00:00+05:30,2026-01-01 10:00:00\n2,2026-01-01 10:00:00,2026-01-01 10:00:00\n"
+                       "3,2026-01-01 10:00:00 Europe/London,\n4,,\n5,2026-03-29 01:30:00 Europe/London,2026-03-29 01:30:00\n"
+                       "6,\"2026-06-01 12:00:00.5-04\",\n";
+    for (size_t piece = 1; piece <= strlen(data); piece += 1 + piece / 8) {
+        CHECK(run("DELETE FROM z") == 0);
+        EXPECT(copy_in("COPY z FROM STDIN", data, strlen(data), piece), "COPY 6");
+    }
+    const char *utc = "1,2026-01-01 04:30:00+00,2026-01-01 10:00:00\n2,2026-01-01 04:30:00+00,2026-01-01 10:00:00\n"
+                      "3,2026-01-01 10:00:00+00,\n4,,\n5,2026-03-29 01:30:00+00,2026-03-29 01:30:00\n"
+                      "6,2026-06-01 16:00:00.500000+00,\n";
+    CHECK(run("SET TIME ZONE 'UTC'") == 0);
+    EXPECT(copy_out("COPY (SELECT * FROM z ORDER BY id) TO STDOUT"), utc);
+    CHECK(run("SET TIME ZONE 'America/St_Johns'") == 0);
+    EXPECT(copy_out("COPY (SELECT id, tz FROM z WHERE id IN (1, 6) ORDER BY id) TO STDOUT"),
+           "1,2026-01-01 01:00:00-03:30\n6,2026-06-01 13:30:00.500000-02:30\n");
+    char *back = strdup(copy_out("COPY z TO STDOUT"));
+    CHECK(back);
+    CHECK(run("CREATE TABLE z2 (id INT64 PRIMARY KEY, tz TIMESTAMPTZ NULL, w TIMESTAMP NULL)") == 0);
+    CHECK(run("SET TIME ZONE 'Pacific/Chatham'") == 0);
+    EXPECT(copy_in("COPY z2 FROM STDIN", back, strlen(back), 7), "COPY 6");
+    free(back);
+    CHECK(run("SET TIME ZONE 'UTC'") == 0);
+    EXPECT(copy_out("COPY (SELECT * FROM z2 ORDER BY id) TO STDOUT"), utc);
+    /* the dump: its own read in UTC, whatever this session says */
+    CHECK(run("SET TIME ZONE 'Asia/Tokyo'") == 0);
+    outb d = {0};
+    OK(imdb_dump(db, 1000, outb_write, &d, E));
+    CHECK(d.p && strstr(d.p, "tz TIMESTAMPTZ") && strstr(d.p, "1,2026-01-01 04:30:00+00,2026-01-01 10:00:00\n") &&
+          !strstr(d.p, "+09"));
+    imdb_session_close(&g_s);
+    imdb_close(db);
+    char q[600];
+    snprintf(q, sizeof q, "%s/restored", test_tmpdir());
+    OK(imdb_init(q, false, NULL, E));
+    db = open_at(q);
+    CHECK(db);
+    CHECK(run("SET TIME ZONE 'America/Los_Angeles'") == 0 && restore_text(d.p, d.n) == 0);
+    CHECK(run("SET TIME ZONE 'UTC'") == 0);
+    EXPECT(copy_out("COPY (SELECT * FROM z ORDER BY id) TO STDOUT"), utc);
+    EXPECT(copy_out("COPY (SELECT * FROM z2 ORDER BY id) TO STDOUT"), utc);
+    CHECK(run("VERIFY") == 0);
+    free(d.p);
+    done(db);
+}
+
 const test_case copy_tests[] = {
     {"copy_round_trip", t_copy_round_trip},
     {"copy_refusals", t_copy_refusals},
@@ -923,5 +978,6 @@ const test_case copy_tests[] = {
     {"copy_dump_refused", t_copy_dump_refused},
     {"copy_dump_fixtures", t_copy_dump_fixtures},
     {"copy_dump_ckey", t_copy_dump_ckey},
+    {"copy_tz", t_copy_tz}, /* P2 */
 };
 const size_t copy_ntests = sizeof copy_tests / sizeof copy_tests[0];

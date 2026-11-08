@@ -222,6 +222,17 @@ static bool tok_is_kw(const parser *p, uint32_t at, const char *kw)
     return true;
 }
 
+/* a typed timestamp literal begins at token i: TIMESTAMP or TIMESTAMPTZ then a string; P2: TIMESTAMP WITH or WITHOUT TIME
+ * ZONE then a string (each token checked before the next is read: the end token stops the chain) */
+static bool ts_literal_at(const parser *p, uint32_t i)
+{
+    if (tok_is_kw(p, i, "timestamptz")) return p->t[i + 1].kind == TK_STR;
+    if (!tok_is_kw(p, i, "timestamp")) return false;
+    if (p->t[i + 1].kind == TK_STR) return true;
+    return (tok_is_kw(p, i + 1, "with") || tok_is_kw(p, i + 1, "without")) && tok_is_kw(p, i + 2, "time") &&
+           tok_is_kw(p, i + 3, "zone") && p->t[i + 4].kind == TK_STR;
+}
+
 static bool kw(parser *p, const char *k)
 {
     if (!tok_is_kw(p, p->i, k)) return false;
@@ -331,10 +342,18 @@ static int literal(parser *p, sql_lit *l)
         l->bval = tok_is_kw(p, p->i - 1, "true");
         return IMDB_OK;
     }
-    if (kw(p, "timestamp")) {
+    /* TIMESTAMP '...', TIMESTAMP WITHOUT TIME ZONE '...'; P2: TIMESTAMPTZ '...', TIMESTAMP WITH TIME ZONE '...' */
+    if (tok_is_kw(p, p->i, "timestamp") || tok_is_kw(p, p->i, "timestamptz")) {
+        bool tz = tok_is_kw(p, p->i, "timestamptz");
+        p->i++;
+        if (!tz && (tok_is_kw(p, p->i, "with") || tok_is_kw(p, p->i, "without")) && tok_is_kw(p, p->i + 1, "time") &&
+            tok_is_kw(p, p->i + 2, "zone")) {
+            tz = tok_is_kw(p, p->i, "with");
+            p->i += 3;
+        }
         const sql_tok *s = &p->t[p->i];
-        if (s->kind != TK_STR) return fail_at(p, "a string after TIMESTAMP");
-        l->kind = LIT_TS;
+        if (s->kind != TK_STR) return fail_at(p, tz ? "a string after TIMESTAMPTZ" : "a string after TIMESTAMP");
+        l->kind = tz ? LIT_TSTZ : LIT_TS;
         l->off = s->off;
         l->len = s->len;
         p->i++;
@@ -470,7 +489,8 @@ static uint8_t fn_named(const parser *p, uint32_t at)
              {"character_length", FN_LENGTH}, {"substr", FN_SUBSTR}, {"substring", FN_SUBSTR},
              {"trim", FN_TRIM},         {"ltrim", FN_LTRIM},       {"rtrim", FN_RTRIM},
              {"position", FN_POSITION}, {"coalesce", FN_COALESCE}, {"nullif", FN_NULLIF},
-             {"lower", FN_LOWER},       {"upper", FN_UPPER},       {"replace", FN_REPLACE}};
+             {"lower", FN_LOWER},       {"upper", FN_UPPER},       {"replace", FN_REPLACE},
+             {"date_trunc", FN_DATE_TRUNC}, {"timezone", FN_TIMEZONE}}; /* P2 */
     for (size_t i = 0; i < sizeof k / sizeof *k; i++)
         if (tok_is_kw(p, at, k[i].name)) return k[i].fn;
     return 0;
@@ -757,7 +777,7 @@ static int primary(parser *p, uint16_t *out, unsigned depth)
     }
     const sql_tok *t = &p->t[p->i];
     if (t->kind == TK_IDENT && !tok_is_kw(p, p->i, "true") && !tok_is_kw(p, p->i, "false") && !tok_is_kw(p, p->i, "null") &&
-        !(tok_is_kw(p, p->i, "timestamp") && p->t[p->i + 1].kind == TK_STR)) {
+        !ts_literal_at(p, p->i)) {
         char qual[IMDB_MAX_IDENT + 1], col[IMDB_MAX_IDENT + 1];
         if (qident(p, qual, col) || ex_new(p, EX_COL, 0, 0, out)) return p->e->code;
         memcpy(p->st->ex[*out].qual, qual, sizeof qual);
@@ -789,16 +809,31 @@ static int unary(parser *p, uint16_t *out, unsigned depth)
     return primary(p, out, depth);
 }
 
-static int term(parser *p, uint16_t *out, unsigned depth)
+/* P2: x AT TIME ZONE z where PostgreSQL ranks it: below a sign, above * and /, left to right (x AT TIME ZONE a AT TIME
+ * ZONE b converts twice); the zone an operand of the level above; the node is timezone(z, x), its function form */
+static int at_expr(parser *p, uint16_t *out, unsigned depth)
 {
     if (unary(p, out, depth)) return p->e->code;
+    while (tok_is_kw(p, p->i, "at") && tok_is_kw(p, p->i + 1, "time") && tok_is_kw(p, p->i + 2, "zone")) {
+        p->i += 3;
+        uint16_t el[2] = {0, *out}, args;
+        if (unary(p, &el[0], depth + 1) || list_build(p, el, 2, &args) || ex_new(p, EX_FN, args, 0, out)) return p->e->code;
+        p->st->ex[*out].fn = FN_TIMEZONE;
+        p->st->ex[*out].nargs = 2;
+    }
+    return IMDB_OK;
+}
+
+static int term(parser *p, uint16_t *out, unsigned depth)
+{
+    if (at_expr(p, out, depth)) return p->e->code;
     for (;;) {
         uint8_t k = p->t[p->i].kind;
         uint8_t op = k == TK_STAR ? EX_MUL : k == TK_SLASH ? EX_DIV : k == TK_PERCENT ? EX_MOD : 0;
         if (!op) return IMDB_OK;
         p->i++;
         uint16_t r;
-        if (unary(p, &r, depth) || ex_new(p, op, *out, r, out)) return p->e->code;
+        if (at_expr(p, &r, depth) || ex_new(p, op, *out, r, out)) return p->e->code;
     }
 }
 
@@ -925,7 +960,7 @@ static int value(parser *p, sql_lit *l)
     bool lit = k0 == TK_INT || k0 == TK_DEC || k0 == TK_FLOAT || k0 == TK_STR || k0 == TK_PARAM ||
                ((k0 == TK_MINUS || k0 == TK_PLUS) && (k1 == TK_INT || k1 == TK_DEC || k1 == TK_FLOAT)) ||
                tok_is_kw(p, p->i, "true") || tok_is_kw(p, p->i, "false") || tok_is_kw(p, p->i, "null") ||
-               (tok_is_kw(p, p->i, "timestamp") && k1 == TK_STR);
+               ts_literal_at(p, p->i);
     uint32_t at = p->i;
     if (lit) {
         if (literal(p, l)) return p->e->code;
@@ -1006,7 +1041,15 @@ static int col_type(parser *p, imdb_column *c)
     if (kw(p, "int64") || kw(p, "bigint") || kw(p, "int") || kw(p, "integer")) c->type = IMDB_T_INT64;
     else if (kw(p, "text")) c->type = IMDB_T_TEXT;
     else if (kw(p, "bool") || kw(p, "boolean")) c->type = IMDB_T_BOOL;
-    else if (kw(p, "timestamp")) c->type = IMDB_T_TIMESTAMP;
+    else if (kw(p, "timestamptz")) c->type = IMDB_T_TIMESTAMPTZ; /* P2 */
+    else if (kw(p, "timestamp")) {
+        c->type = IMDB_T_TIMESTAMP;
+        if ((tok_is_kw(p, p->i, "with") || tok_is_kw(p, p->i, "without")) && tok_is_kw(p, p->i + 1, "time") &&
+            tok_is_kw(p, p->i + 2, "zone")) {
+            if (tok_is_kw(p, p->i, "with")) c->type = IMDB_T_TIMESTAMPTZ;
+            p->i += 3;
+        }
+    }
     else if (kw(p, "decimal") || kw(p, "numeric")) {
         c->type = IMDB_T_DECIMAL;
         uint64_t prec, scale = 0;
@@ -1025,7 +1068,7 @@ static int col_type(parser *p, imdb_column *c)
     } else if (kw(p, "real") || kw(p, "float4")) {
         return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "REAL is single precision; imagedb has FLOAT64 (DOUBLE PRECISION)");
     } else {
-        return fail_at(p, "a type (INT64, DECIMAL(p,s), FLOAT64, TEXT, BOOL, TIMESTAMP)");
+        return fail_at(p, "a type (INT64, DECIMAL(p,s), FLOAT64, TEXT, BOOL, TIMESTAMP, TIMESTAMPTZ)");
     }
     return IMDB_OK;
 }
@@ -1995,6 +2038,22 @@ static int parse_create_view(parser *p, sql_stmt *st)
     return IMDB_OK;
 }
 
+/* P2: SET TIME ZONE's value (and SET timezone's): a string, the zone's name as written (its case kept: a zone file's
+ * name), or DEFAULT or LOCAL, UTC */
+static int set_zone_value(parser *p, sql_stmt *st)
+{
+    st->set_zone = true;
+    st->set_value[0] = 0;
+    if (kw(p, "default") || kw(p, "local")) return IMDB_OK;
+    const sql_tok *v = &p->t[p->i];
+    if (v->kind != TK_STR) return fail_at(p, "a time zone's name as a string, DEFAULT or LOCAL");
+    if (!v->len || v->len > IMDB_MAX_IDENT) return imdb_fail(p->e, IMDB_ERR_INVALID, "a time zone's name of 1 to %u bytes", IMDB_MAX_IDENT);
+    memcpy(st->set_value, p->s + v->off, v->len);
+    st->set_value[v->len] = 0;
+    p->i++;
+    return IMDB_OK;
+}
+
 int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
 {
     memset(st, 0, sizeof *st);
@@ -2120,6 +2179,11 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
     } else if (kw(&p, "verify")) st->kind = ST_VERIFY;
     else if (kw(&p, "show")) {
         if (kw(&p, "tables")) st->kind = ST_SHOW_TABLES;
+        else if (kw(&p, "timezone")) st->kind = ST_SHOW_TIMEZONE; /* P2 */
+        else if (tok_is_kw(&p, p.i, "time") && tok_is_kw(&p, p.i + 1, "zone")) {
+            p.i += 2;
+            st->kind = ST_SHOW_TIMEZONE;
+        }
         else if (kw(&p, "prepared")) st->kind = ST_SHOW_PREPARED; /* P2 S9 */
         else if (kw(&p, "views")) st->kind = ST_SHOW_VIEWS; /* P2 S7 */
         else if (kw(&p, "indexes")) st->kind = ST_SHOW_INDEXES;
@@ -2176,8 +2240,13 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
         if (kw(&p, "transaction")) {
             st->kind = ST_SET_TXN;
             rc = isolation(&p, st);
+        } else if (tok_is_kw(&p, p.i, "time") && tok_is_kw(&p, p.i + 1, "zone")) { /* P2: SET TIME ZONE x */
+            p.i += 2;
+            memcpy(st->set_name, "timezone", 9);
+            rc = set_zone_value(&p, st);
         } else if (!(rc = ident(&p, st->set_name))) {
             if (!tok(&p, TK_EQ) && !kw(&p, "to")) rc = fail_at(&p, "= or TO");
+            else if (!strcmp(st->set_name, "timezone")) rc = set_zone_value(&p, st); /* P2: SET timezone = x */
             else {
                 const sql_tok *v = &p.t[p.i];
                 if ((v->kind == TK_IDENT || v->kind == TK_INT) && v->len <= IMDB_MAX_IDENT) {

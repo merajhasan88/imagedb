@@ -1,6 +1,6 @@
 #!/bin/sh
-# Makes the format's fixtures (2026-11-07: META 5, log version 3, manifest version 7 (its sections, the format design's
-# slice 1), ops 16, 19, 20 and 21; alg1-20261107.tar.gz and alg2-20261107.tar.gz beside this script): a primary and
+# Makes the format's fixtures (2026-11-08: META 5, log version 3, manifest version 7 (its sections, the format design's
+# slice 1), ops 16, 19, 20 and 21; alg1-20261108.tar.gz and alg2-20261108.tar.gz beside this script): a primary and
 # its replica under digest algorithm ALG, by
 # make_alg2.sh's steps, which reach every reader of the format: a log of several segments (each manifest
 # publish ends one), CHECKPOINTs (manifests, segments, the lanes), a two-column index and a unique one,
@@ -9,7 +9,9 @@
 # another, one dropped by op 21, the manifest's tombstone; one more after the first CHECKPOINT, which the replica
 # applies from the log), (F4) a table whose key is two columns, not in their order, and (F1) that table altered after
 # the first CHECKPOINT (op 22: an ADD with a TEXT DEFAULT, a NOT NULL one with its DEFAULT, a rename, an INSERT that
-# leaves the added columns out: the manifest's schema history, a segment of version 1 under version 4). The live
+# leaves the added columns out: the manifest's schema history, a segment of version 1 under version 4), and (P2) a
+# TIMESTAMPTZ (tag 7: rows of a gap's and an overlap's literals, offsets, a NULL, one updated from the log) with a view of
+# date_trunc and AT TIME ZONE in its text. The live
 # tables are RETENTION FOREVER and the dropped one is kept a century, the longest but FOREVER: a fixture is frozen
 # data, so its history
 # never expires under the tests that open it (the 24-hour default is tested by the unit tests). Every
@@ -19,7 +21,7 @@
 # manifest version 4; alg1-20261104 and alg2-20261104, manifest version 5; alg1-20261106 and alg2-20261106, manifest
 # version 6 and log version 2) stay as directories this format refuses.
 #   sh tests/fixtures/make_fixtures.sh BIN AUDIT ALG OUTDIR   (OUTDIR must not exist)
-#   tar -czf tests/fixtures/algALG-20261107.tar.gz -C OUTDIR primary replica
+#   tar -czf tests/fixtures/algALG-20261108.tar.gz -C OUTDIR primary replica
 set -eu
 BIN=$1
 AUD=$2
@@ -61,12 +63,16 @@ sql "CREATE VIEW kind3 AS SELECT id, note FROM ev WHERE kind = 3"
 sql "DROP VIEW kind3" # a tombstone in the manifest
 sql "CREATE TABLE pair (b TEXT, a INT64, v INT64, PRIMARY KEY (a, b)) RETENTION FOREVER" # F4: a key of two columns, not in
 sql "INSERT INTO pair VALUES ('x', 1, 10), ('y', 1, 11), ('x', 2, 12), ('', -3, NULL)"    # the columns' order
+sql "CREATE TABLE stamp (id INT64 PRIMARY KEY, at TIMESTAMPTZ, local TIMESTAMP) RETENTION FOREVER" # P2: an instant
+sql "INSERT INTO stamp VALUES (1, '2026-03-29 01:30:00 Europe/London', '2026-03-29 01:30:00'), (2, '2026-10-25 01:30:00+01:00', NULL), (3, NULL, '2026-01-01 00:00:00'), (4, '1999-12-31 23:59:59.999999-05', '1999-12-31 23:59:59.999999')"
+sql "CREATE VIEW stamp_day AS SELECT id, date_trunc('day', at, 'Asia/Kathmandu') AS d, at AT TIME ZONE 'America/St_Johns' AS sj FROM stamp" # zones in a view's text
 sql "CHECKPOINT"
 ship
 sql "ALTER TABLE pair ADD w TEXT DEFAULT 'w0'"          # F1: op 22; pair's rows so far are in a segment of version 1
 sql "ALTER TABLE pair ADD n INT64 NOT NULL DEFAULT 7"
 sql "ALTER TABLE pair RENAME COLUMN v TO val"
 sql "INSERT INTO pair (b, a, val) VALUES ('z', 9, 99)"   # w and n their DEFAULTs
+sql "UPDATE stamp SET at = TIMESTAMPTZ '2030-01-01 12:00:00+05:45' WHERE id = 3" # P2: an instant from the log
 sql "UPDATE acct SET balance = 1.00 WHERE id <= 10"
 sql "DELETE FROM ev WHERE id BETWEEN 1 AND 5"
 sql "ERASE SUBJECT 7"

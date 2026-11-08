@@ -76,6 +76,13 @@
 #define IMDB_MAX_INDEX_COLS     4u           /* CREATE INDEX: columns per index      */
 #define IMDB_MAX_KEY_COLS       8u           /* PRIMARY KEY (a, b, ...): its columns (F4) */
 #define IMDB_MAX_SCHEMA_VERSIONS 256u        /* a table's schema versions (F1): past it an ALTER is refused */
+/* P2's zone slice: a zoneinfo file (TZif) read whole (the largest fat files are under 8 KiB), its transitions and time
+ * types, a zone's name (an IANA name: letters, digits, / _ - +), the zones a database handle keeps loaded */
+#define IMDB_MAX_TZ_FILE (256u * 1024u)
+#define IMDB_MAX_TZ_TRANSITIONS 2000u
+#define IMDB_MAX_TZ_TYPES 256u
+#define IMDB_MAX_TZ_NAME 63u /* = IMDB_MAX_IDENT: SET TIME ZONE keeps it */
+#define IMDB_MAX_TZ_ZONES 256u
 #define IMDB_MAX_JOIN_ROWS      (1u << 22)   /* a join: build entries, joined rows   */
 #define IMDB_VERIFY_BATCH       512u         /* commits VERIFY decodes and checks at once */
 #define IMDB_VERIFY_BATCH_BYTES (64ull << 20) /* ... or fewer, once their frames reach this */

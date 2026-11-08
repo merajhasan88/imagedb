@@ -14,6 +14,7 @@
 #include <strings.h>
 
 #include "sql_internal.h"
+#include "tz.h"
 
 #define U128_MAX (~(unsigned __int128)0)
 
@@ -515,6 +516,8 @@ static int cast_to_text(const imdb_xval *v, imdb_xenv *env, imdb_xval *out, imdb
     imdb_buf_init(&b);
     if (v->type == IMDB_T_DECIMAL || v->type == IMDB_T_INT64) {
         imdb_format_i128(v->i, v->type == IMDB_T_DECIMAL ? v->scale : 0, &b);
+    } else if (v->type == IMDB_T_TIMESTAMPTZ) { /* P2: in the session's zone, its offset written */
+        imdb_format_timestamptz((int64_t)v->i, imdb_x_tz_off(env, env ? env->zone : NULL, (int64_t)v->i), &b);
     } else {
         imdb_value iv = {.type = v->type};
         iv.i = v->type == IMDB_T_FLOAT64 ? imdb_f64_key(v->f) : (int64_t)v->i;
@@ -578,7 +581,7 @@ static const char *fn_name(uint8_t fn)
 {
     static const char *const n[] = {"?",     "ABS",    "SIGN",  "ROUND", "CEIL",     "FLOOR",    "MOD",    "LENGTH",
                                     "SUBSTR", "TRIM",  "LTRIM", "RTRIM", "POSITION", "COALESCE", "NULLIF",
-                                    "LOWER",  "UPPER", "REPLACE", "||"};
+                                    "LOWER",  "UPPER", "REPLACE", "||",     "DATE_TRUNC", "TIMEZONE"};
     return fn < sizeof n / sizeof *n ? n[fn] : "?";
 }
 
@@ -651,6 +654,27 @@ int imdb_x_fn_type(uint8_t fn, uint8_t nargs, const uint8_t *ta, const uint8_t *
         if (fn_args(fn, nargs, 2, 2, e)) return e->code;
         if (ta[0] != IMDB_T_TEXT || ta[1] != IMDB_T_TEXT) return imdb_fail(e, IMDB_ERR_INVALID, "POSITION takes TEXT values");
         *rt = IMDB_T_INT64;
+        return IMDB_OK;
+    case FN_DATE_TRUNC: { /* P2: date_trunc(unit, x [, zone]): x's type */
+        if (fn_args(fn, nargs, 2, 3, e)) return e->code;
+        uint8_t u;
+        if (ta[0] != IMDB_T_TEXT || !kv[0] || kv[0]->null)
+            return imdb_fail(e, IMDB_ERR_INVALID, "date_trunc's unit is a string constant ('day', 'hour', ...)");
+        if (imdb_x_trunc_unit(kv[0]->s, kv[0]->len, &u, e)) return e->code;
+        if (ta[1] != IMDB_T_TIMESTAMP && ta[1] != IMDB_T_TIMESTAMPTZ)
+            return imdb_fail(e, IMDB_ERR_INVALID, "date_trunc takes a TIMESTAMP or a TIMESTAMPTZ");
+        if (nargs == 3 && (ta[1] != IMDB_T_TIMESTAMPTZ || ta[2] != IMDB_T_TEXT))
+            return imdb_fail(e, IMDB_ERR_INVALID, "date_trunc's third argument is a TIMESTAMPTZ's zone: date_trunc(unit, x, zone)");
+        *rt = ta[1];
+        return IMDB_OK;
+    }
+    case FN_TIMEZONE: /* P2: x AT TIME ZONE z: a TIMESTAMPTZ's wall clock in z (a TIMESTAMP), a TIMESTAMP's instant in z */
+        if (fn_args(fn, nargs, 2, 2, e)) return e->code;
+        if (ta[0] != IMDB_T_TEXT) return imdb_fail(e, IMDB_ERR_INVALID, "AT TIME ZONE takes a zone's name (TEXT)");
+        if (ta[1] != IMDB_T_TIMESTAMP && ta[1] != IMDB_T_TIMESTAMPTZ)
+            return imdb_fail(e, IMDB_ERR_INVALID, "AT TIME ZONE converts a TIMESTAMP or a TIMESTAMPTZ (a string: write "
+                                                  "TIMESTAMP '...' or TIMESTAMPTZ '...')");
+        *rt = ta[1] == IMDB_T_TIMESTAMP ? IMDB_T_TIMESTAMPTZ : IMDB_T_TIMESTAMP;
         return IMDB_OK;
     case FN_COALESCE:
         if (fn_args(fn, nargs, 1, 255, e)) return e->code;
@@ -854,6 +878,11 @@ static int dec_fit(__int128 r, int s, const imdb_column *c, __int128 *out, imdb_
     return IMDB_OK;
 }
 
+/* P2: time zones (the end of this file) */
+static int ts_range(int64_t v, imdb_err *e);
+static int x_zone_fn(uint8_t fn, const imdb_xnode *b, const imdb_xval *a, unsigned n, imdb_xenv *env, imdb_xval *out,
+                     imdb_err *e);
+
 static int cast_bad(const imdb_column *c, imdb_err *e) /* never the text itself: a row's value (design.md §5) */
 {
     return imdb_fail(e, IMDB_ERR_INVALID, "CAST: a text that is not a valid %s", imdb_type_name(c->type));
@@ -900,6 +929,10 @@ int imdb_x_cast(const imdb_xval *v, const imdb_column *c, imdb_xenv *env, imdb_x
             if (imdb_parse_timestamp(s, v->len, &i, &pe)) return cast_bad(c, e);
             out->i = i;
             return IMDB_OK;
+        case IMDB_T_TIMESTAMPTZ: /* P2: the literal's rules: its offset, its zone, or the session's zone */
+            if (imdb_x_tstz_text(s, v->len, env, &i, e)) return e->code;
+            out->i = i;
+            return IMDB_OK;
         default: break;
         }
     }
@@ -933,7 +966,22 @@ int imdb_x_cast(const imdb_xval *v, const imdb_column *c, imdb_xenv *env, imdb_x
         out->f += 0.0;
         return IMDB_OK;
     case IMDB_T_BOOL:
+        if (v->type != c->type) break;
+        out->i = v->i;
+        return IMDB_OK;
     case IMDB_T_TIMESTAMP:
+        if (v->type == IMDB_T_TIMESTAMPTZ) { /* P2: its wall clock in the session's zone (PostgreSQL's cast) */
+            out->i = v->i + (__int128)imdb_x_tz_off(env, env ? env->zone : NULL, (int64_t)v->i) * 1000000;
+            return ts_range((int64_t)out->i, e);
+        }
+        if (v->type != c->type) break;
+        out->i = v->i;
+        return IMDB_OK;
+    case IMDB_T_TIMESTAMPTZ:
+        if (v->type == IMDB_T_TIMESTAMP) { /* P2: the session zone's wall clock read as an instant (its rule) */
+            out->i = imdb_tz_utc_of_local(env && env->zone ? env->zone : &imdb_tz_utc_zone, (int64_t)v->i);
+            return ts_range((int64_t)out->i, e);
+        }
         if (v->type != c->type) break;
         out->i = v->i;
         return IMDB_OK;
@@ -1159,6 +1207,7 @@ int imdb_x_eval(const sql_stmt *st, const imdb_xnode *xn, uint16_t k, const imdb
             out->scale = b->scale;
             return IMDB_OK;
         }
+        if (x->fn == FN_DATE_TRUNC || x->fn == FN_TIMEZONE) return x_zone_fn(x->fn, b, a, n, env, out, e); /* P2 */
         return imdb_x_fn(x->fn, a, (uint8_t)n, b->type, b->scale, env, out, e);
     }
     case EX_CASE: { /* P2 S1: the first WHEN that holds (a simple CASE's: equal to its operand), else ELSE, else NULL */
@@ -1197,4 +1246,199 @@ int imdb_x_eval(const sql_stmt *st, const imdb_xnode *xn, uint16_t k, const imdb
             return e->code;
         return imdb_x_arith(x->op, &l, &r, b->type, b->scale, out, e);
     }
+}
+
+/* ---- P2: time zones (design.md §5, Time zones) ------------------------------------------------------------------- */
+
+#define XTS_MIN (-62135596800000000LL) /* 0001-01-01 00:00:00 */
+#define XTS_MAX (253402300799999999LL) /* 9999-12-31 23:59:59.999999 */
+
+static int ts_range(int64_t v, imdb_err *e)
+{
+    if (v < XTS_MIN || v > XTS_MAX) return imdb_fail(e, IMDB_ERR_LIMIT, "a timestamp before 0001-01-01 or past 9999-12-31");
+    return IMDB_OK;
+}
+
+static int64_t fdiv64(int64_t a, int64_t b) { return a / b - ((a % b != 0) && ((a < 0) != (b < 0))); }
+
+int imdb_x_trunc_unit(const uint8_t *s, uint32_t n, uint8_t *unit, imdb_err *e)
+{
+    static const struct {
+        const char *a, *b;
+        uint8_t u;
+    } U[] = {{"microseconds", "microsecond", IMDB_TRUNC_US}, {"milliseconds", "millisecond", IMDB_TRUNC_MS},
+             {"second", "seconds", IMDB_TRUNC_SECOND},      {"minute", "minutes", IMDB_TRUNC_MINUTE},
+             {"hour", "hours", IMDB_TRUNC_HOUR},            {"day", "days", IMDB_TRUNC_DAY},
+             {"week", "weeks", IMDB_TRUNC_WEEK},            {"month", "months", IMDB_TRUNC_MONTH},
+             {"quarter", "quarters", IMDB_TRUNC_QUARTER},   {"year", "years", IMDB_TRUNC_YEAR},
+             {"decade", "decades", IMDB_TRUNC_DECADE},      {"century", "centuries", IMDB_TRUNC_CENTURY},
+             {"millennium", "millennia", IMDB_TRUNC_MILLENNIUM}};
+    for (size_t i = 0; i < sizeof U / sizeof *U; i++)
+        if ((strlen(U[i].a) == n && !strncasecmp(U[i].a, (const char *)s, n)) ||
+            (strlen(U[i].b) == n && !strncasecmp(U[i].b, (const char *)s, n))) {
+            *unit = U[i].u;
+            return IMDB_OK;
+        }
+    return imdb_fail(e, IMDB_ERR_INVALID, "date_trunc's unit: microseconds, milliseconds, second, minute, hour, day, week, "
+                                          "month, quarter, year, decade, century or millennium");
+}
+
+/* z's offset at t and its span, through env's cache (the four zones last read) */
+static int32_t x_off_span(imdb_xenv *env, const imdb_tz *z, int64_t t, int64_t *lo, int64_t *hi)
+{
+    if (env)
+        for (int i = 0; i < 4; i++) {
+            const imdb_xtzc *c = &env->tzc[i];
+            if (c->z == z && c->lo <= t && t < c->hi) {
+                *lo = c->lo, *hi = c->hi;
+                return c->off;
+            }
+        }
+    int32_t o = imdb_tz_offset_span(z, t, lo, hi);
+    if (env) {
+        imdb_xtzc *c = &env->tzc[env->tzc_next++ & 3];
+        c->z = z, c->lo = *lo, c->hi = *hi, c->off = o;
+    }
+    return o;
+}
+
+int32_t imdb_x_tz_off(imdb_xenv *env, const struct imdb_tz *z, int64_t t_us)
+{
+    int64_t lo, hi;
+    return x_off_span(env, z ? z : &imdb_tz_utc_zone, t_us, &lo, &hi);
+}
+
+/* the wall-clock unit holding l: [*s, *en), microseconds (PostgreSQL's: ISO weeks from Monday; a century and a millennium
+ * from their year 1, 2001 and 2001) */
+static void unit_span(uint8_t unit, int64_t l, int64_t *s, int64_t *en)
+{
+    static const int64_t width[] = {0, 1, 1000, 1000000, 60000000, 3600000000LL, 86400000000LL};
+    if (unit <= IMDB_TRUNC_DAY) {
+        *s = fdiv64(l, width[unit]) * width[unit];
+        *en = *s + width[unit];
+        return;
+    }
+    int64_t days = fdiv64(l, 86400000000LL);
+    if (unit == IMDB_TRUNC_WEEK) {
+        int64_t dow = ((days % 7) + 7 + 3) % 7; /* Monday 0: 1970-01-01 was a Thursday */
+        *s = (days - dow) * 86400000000LL;
+        *en = *s + 7 * 86400000000LL;
+        return;
+    }
+    int64_t y, y0, y1;
+    int m, d, m0 = 1, m1 = 1;
+    imdb_civil_from_days(days, &y, &m, &d);
+    y0 = y, y1 = y + 1;
+    switch (unit) {
+    case IMDB_TRUNC_MONTH:
+        m0 = m, m1 = m == 12 ? 1 : m + 1, y1 = m == 12 ? y + 1 : y;
+        break;
+    case IMDB_TRUNC_QUARTER:
+        m0 = (m - 1) / 3 * 3 + 1, m1 = m0 + 3 > 12 ? 1 : m0 + 3, y1 = m0 + 3 > 12 ? y + 1 : y;
+        break;
+    case IMDB_TRUNC_YEAR: break;
+    case IMDB_TRUNC_DECADE: y0 = fdiv64(y, 10) * 10, y1 = y0 + 10; break;
+    case IMDB_TRUNC_CENTURY: y0 = fdiv64(y - 1, 100) * 100 + 1, y1 = y0 + 100; break;
+    default: y0 = fdiv64(y - 1, 1000) * 1000 + 1, y1 = y0 + 1000; break; /* MILLENNIUM */
+    }
+    *s = imdb_days_from_civil(y0, m0, 1) * 86400000000LL;
+    *en = imdb_days_from_civil(y1, m1, 1) * 86400000000LL;
+}
+
+int imdb_x_trunc(uint8_t unit, bool tz, const struct imdb_tz *z, imdb_xenv *env, int64_t v, int64_t *out, int64_t *lo,
+                 int64_t *hi, imdb_err *e)
+{
+    int64_t s, en;
+    if (!tz) {
+        unit_span(unit, v, &s, &en);
+        *out = s;
+        if (lo) *lo = s, *hi = en;
+        return ts_range(s, e);
+    }
+    if (!z) z = &imdb_tz_utc_zone;
+    int64_t olo, ohi;
+    int64_t off = (int64_t)x_off_span(env, z, v, &olo, &ohi) * 1000000;
+    unit_span(unit, v + off, &s, &en);
+    /* a day or longer: the wall-clock start's instant by the zone's rule (its offset may differ from v's); shorter: v's
+     * own offset kept, so an overlap's second hour stays the second */
+    *out = unit >= IMDB_TRUNC_DAY ? imdb_tz_utc_of_local(z, s) : s - off;
+    if (lo) { /* v's offset and v's wall-clock unit both hold: the instants that map alike */
+        *lo = olo > s - off ? olo : s - off;
+        *hi = ohi < en - off ? ohi : en - off;
+    }
+    return ts_range(*out, e);
+}
+
+int imdb_x_tstz_text(const char *s, size_t n, imdb_xenv *env, int64_t *out, imdb_err *e)
+{
+    imdb_tzlit t;
+    if (imdb_parse_timestamptz(s, n, &t, e)) return e->code;
+    const imdb_tz *z = env && env->zone ? env->zone : &imdb_tz_utc_zone;
+    if (t.has_off) {
+        *out = t.local - (int64_t)t.off * 1000000;
+        return ts_range(*out, e);
+    }
+    if (t.zlen) {
+        if (!imdb_tz_builtin_utc(s + t.zoff, t.zlen) && !imdb_tz_name_ok(s + t.zoff, t.zlen))
+            return imdb_fail(e, IMDB_ERR_INVALID, "a TIMESTAMPTZ's zone is named by letters, digits and / _ - +");
+        if (!env || !env->zone_get) { /* a bind-only pass: the type alone is asked for, no zone file is read */
+            *out = 0;
+            return IMDB_OK;
+        }
+        if (env->zone_get(env->ctx, (const uint8_t *)s + t.zoff, t.zlen, &z, e)) return e->code;
+    }
+    *out = imdb_tz_utc_of_local(z, t.local);
+    return ts_range(*out, e);
+}
+
+/* a zone a value names (AT TIME ZONE col, date_trunc's third argument from a row) */
+static int x_zone_named(imdb_xenv *env, const imdb_xval *v, const imdb_tz **z, imdb_err *e)
+{
+    if (!env || !env->zone_get) return imdb_fail(e, IMDB_ERR_STATE, "a time zone named where none can be read");
+    return env->zone_get(env->ctx, v->s, v->len, z, e);
+}
+
+/* timezone(z, x) (x AT TIME ZONE z) and date_trunc(unit, x [, z]), on their arguments' values */
+static int x_zone_fn(uint8_t fn, const imdb_xnode *b, const imdb_xval *a, unsigned n, imdb_xenv *env, imdb_xval *out,
+                     imdb_err *e)
+{
+    memset(out, 0, sizeof *out);
+    out->type = b->type;
+    const imdb_tz *z = b->tz;
+    if (fn == FN_TIMEZONE) {
+        if (a[0].null || a[1].null) {
+            out->null = true;
+            return IMDB_OK;
+        }
+        if (!z && x_zone_named(env, &a[0], &z, e)) return e->code;
+        int64_t v = (int64_t)a[1].i;
+        out->i = a[1].type == IMDB_T_TIMESTAMPTZ ? v + (int64_t)imdb_x_tz_off(env, z, v) * 1000000 /* its wall clock in z */
+                                                  : imdb_tz_utc_of_local(z, v);                     /* z's wall clock's instant */
+        return ts_range((int64_t)out->i, e);
+    }
+    if (a[1].null || (n == 3 && a[2].null)) {
+        out->null = true;
+        return IMDB_OK;
+    }
+    bool tz = a[1].type == IMDB_T_TIMESTAMPTZ;
+    if (tz && n == 3 && !z && x_zone_named(env, &a[2], &z, e)) return e->code;
+    if (tz && n == 2) z = env && env->zone ? env->zone : &imdb_tz_utc_zone; /* the session's zone */
+    int64_t r;
+    if (imdb_x_trunc(b->unit, tz, z, env, (int64_t)a[1].i, &r, NULL, NULL, e)) return e->code;
+    out->i = r;
+    return IMDB_OK;
+}
+
+int imdb_x_trunc_local(uint8_t unit, const struct imdb_tz *z, imdb_xenv *env, int64_t v, int64_t *out, int64_t *lo,
+                       int64_t *hi, imdb_err *e)
+{
+    if (!z) z = &imdb_tz_utc_zone;
+    int64_t olo, ohi, s, en;
+    int64_t off = (int64_t)x_off_span(env, z, v, &olo, &ohi) * 1000000;
+    if (ts_range(v + off, e)) return e->code; /* the wall clock itself, as AT TIME ZONE's result */
+    unit_span(unit, v + off, &s, &en);
+    *out = s; /* a TIMESTAMP: the wall clock's unit */
+    *lo = olo > s - off ? olo : s - off;
+    *hi = ohi < en - off ? ohi : en - off;
+    return ts_range(s, e);
 }

@@ -25,7 +25,8 @@ static size_t align8(size_t x) { return (x + 7) & ~(size_t)7; }
 
 static bool is_int_col(uint8_t type)
 {
-    return type == IMDB_T_INT64 || type == IMDB_T_DECIMAL || type == IMDB_T_TIMESTAMP || type == IMDB_T_FLOAT64;
+    return type == IMDB_T_INT64 || type == IMDB_T_DECIMAL || type == IMDB_T_TIMESTAMP || type == IMDB_T_FLOAT64 ||
+           type == IMDB_T_TIMESTAMPTZ;
 }
 
 static bool nullable(const imdb_column *c) { return (c->flags & IMDB_COL_NULLABLE) != 0; }
@@ -275,7 +276,7 @@ int imdb_segment_parse(const imdb_schema *s, uint8_t *b, size_t len, const uint8
                 if (!seg_keeps(gi->flags[i], s, c) || (vb && !valid_bit(vb, i))) {
                     if (v) rc = imdb_fail(e, IMDB_ERR_CORRUPT, "segment: a row without a value in column %s keeps data", col->name);
                 } else if ((col->type == IMDB_T_DECIMAL && (v > lim || v < -lim)) ||
-                           (col->type == IMDB_T_TIMESTAMP && (v < TS_MIN || v > TS_MAX)) ||
+                           ((col->type == IMDB_T_TIMESTAMP || col->type == IMDB_T_TIMESTAMPTZ) && (v < TS_MIN || v > TS_MAX)) ||
                            (col->type == IMDB_T_FLOAT64 && !imdb_f64_key_valid(v))) {
                     rc = imdb_fail(e, IMDB_ERR_CORRUPT, "segment: value out of range in column %s", col->name);
                 }

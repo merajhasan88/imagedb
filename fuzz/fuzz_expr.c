@@ -140,7 +140,8 @@ static void s1(const uint8_t *data, size_t size, const imdb_xval *a, const imdb_
             imdb_xarena_reset(&arena, mk);
         }
     }
-    static const uint8_t CT[] = {IMDB_T_INT64, IMDB_T_DECIMAL, IMDB_T_FLOAT64, IMDB_T_TEXT, IMDB_T_BOOL, IMDB_T_TIMESTAMP};
+    static const uint8_t CT[] = {IMDB_T_INT64, IMDB_T_DECIMAL, IMDB_T_FLOAT64,   IMDB_T_TEXT,
+                                 IMDB_T_BOOL,  IMDB_T_TIMESTAMP, IMDB_T_TIMESTAMPTZ}; /* the last: P2, the session's zone UTC */
     for (int i = 0; i < 4; i++)
         for (size_t c = 0; c < sizeof CT; c++) {
             imdb_column col;
@@ -160,7 +161,7 @@ static void s1(const uint8_t *data, size_t size, const imdb_xval *a, const imdb_
                     if (out.scale != col.scale || out.i >= lim || out.i <= -lim) abort();
                 }
                 if (!out.null && col.type != IMDB_T_DECIMAL && col.type != IMDB_T_TEXT && col.type != IMDB_T_BOOL &&
-                    col.type != IMDB_T_TIMESTAMP)
+                    col.type != IMDB_T_TIMESTAMP && col.type != IMDB_T_TIMESTAMPTZ)
                     bounds(&out, col.type, 0);
                 if (!out.null && col.type == IMDB_T_BOOL && out.i != 0 && out.i != 1) abort();
                 if (col.type == IMDB_T_TEXT && !text_ok(&out)) abort();
@@ -177,6 +178,31 @@ static void s1(const uint8_t *data, size_t size, const imdb_xval *a, const imdb_
         int want = ref_like(sc, n, pc, m, esc);
         if (want < 0 ? rc == 0 : rc != 0 || match != (bool)want) abort();
     }
+    imdb_xarena_free(&arena);
+}
+
+/* P2: date_trunc of an instant anywhere in the range, every unit, as a TIMESTAMP and as a TIMESTAMPTZ (UTC: no zone file
+ * read): never later than the value, its span holding the value; a TIMESTAMPTZ literal of any bytes read without a
+ * fault, an instant in the range or refused */
+static void tz_props(const uint8_t *data, size_t size)
+{
+    uint64_t u = 0;
+    for (int i = 0; i < 8; i++) u = u << 8 | data[4 + i];
+    int64_t v = (int64_t)(u % 315537897600000000ULL) - 62135596800000000LL; /* 0001-01-01 .. 9999-12-31 23:59:59.999999 */
+    imdb_xarena arena = {0};
+    imdb_xenv env = {.arena = &arena};
+    imdb_err e = {0};
+    for (uint8_t unit = IMDB_TRUNC_US; unit <= IMDB_TRUNC_MILLENNIUM; unit++)
+        for (int tz = 0; tz < 2; tz++) {
+            int64_t r, lo, hi;
+            imdb_err_clear(&e);
+            if (imdb_x_trunc(unit, tz, NULL, &env, v, &r, &lo, &hi, &e) == 0 && (r > v || lo > v || v >= hi)) abort();
+        }
+    int64_t out;
+    imdb_err_clear(&e);
+    if (imdb_x_tstz_text((const char *)data + 40, size - 40, &env, &out, &e) == 0 &&
+        (out < -62135596800000000LL || out > 253402300799999999LL))
+        abort();
     imdb_xarena_free(&arena);
 }
 
@@ -213,5 +239,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     imdb_err_clear(&e);
     imdb_x_parse_decimal((const char *)data + 40, size - 40, &r, &e);
     s1(data, size, &a, &b); /* P2 S1 */
+    tz_props(data, size); /* P2: zones */
     return 0;
 }

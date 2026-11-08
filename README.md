@@ -513,6 +513,7 @@ Command-line options (`imagedb` with no arguments prints the commands):
 | `--stats FILE` | sql, apply, follow | writes the stats export (Monitoring) | none |
 | `--stats FILE` | health | reads that export too | the directory only |
 | `--events FILE` | sql, apply, follow | the event log (Monitoring) | none |
+| `--zoneinfo DIR` | sql | the IANA zone files SET TIME ZONE, AT TIME ZONE and TIMESTAMPTZ literals name (Time zones) | `/usr/share/zoneinfo` |
 | `--root KEY` | init | a root key that may certify a promotion | none |
 | `--digest-alg N` | init | the state digest's algorithm, 1 or 2 | `IMDB_DIGEST_ALG`, else 2 |
 | `--identity FILE` | init-replica | a replica from a primary's identity file | |
@@ -566,6 +567,7 @@ statement):
 | `slow_statement_ms` | 0 to 86,400,000 ms | 0 (none) | statements at least that long go to the event log |
 | `sync_replicas` | 0 to 64 | 0 | a commit waits for that many replicas' acknowledgements (a primary's) |
 | `sync_timeout_ms` | 1 to 3,600,000 ms | 10,000 | how long a commit waits for them |
+| `timezone` | a zone's name as a string, DEFAULT or LOCAL (`SET TIME ZONE 'Europe/London'`) | UTC, never the process's TZ | the zone TIMESTAMPTZ values show in and literals without an offset are read in (Time zones) |
 
 `BEGIN ISOLATION LEVEL SNAPSHOT | REPEATABLE READ | READ COMMITTED | READ
 UNCOMMITTED` (or `SET TRANSACTION ISOLATION LEVEL ...`) chooses a transaction's
@@ -591,9 +593,29 @@ rollback, savepoints, `WITH (NOLOCK)` and optimistic `SELECT ... FOR UPDATE`
 round to short ones writing the same row, so retry with backoff). SERIALIZABLE
 is refused; snapshot write skew is possible.
 
-Types: INT64, DECIMAL, TEXT, BOOL, TIMESTAMP, finite FLOAT64 (exact SUM,
+Types: INT64, DECIMAL, TEXT, BOOL, TIMESTAMP, TIMESTAMPTZ, finite FLOAT64 (exact SUM,
 rounded once) and nullable non-key columns. Comparisons with NULL, including
 NULL parameters, are refused: use IS NULL / IS NOT NULL.
+
+Time zones: TIMESTAMPTZ (`TIMESTAMP WITH TIME ZONE`) holds an instant (UTC
+microseconds) and shows it in the session's zone, `SET TIME ZONE
+'Europe/London'` (or `SET timezone = '...'`, `DEFAULT` and `LOCAL` meaning UTC;
+`SHOW TIME ZONE`), UTC by default whatever the process's TZ. TIMESTAMP keeps no
+zone. A TIMESTAMPTZ literal takes an offset (`'2026-03-29 01:30:00+01'`, `Z`,
+`+05:30`), a zone's name (`'2026-03-29 01:30:00 Europe/London'`) or neither (the
+session's zone); a time in a spring-forward gap takes the offset before it and
+one in a fall-back overlap the later instant, as PostgreSQL. `x AT TIME ZONE
+'Asia/Tokyo'` turns a TIMESTAMPTZ into Tokyo's wall clock (a TIMESTAMP) and a
+TIMESTAMP into an instant; `date_trunc('day', x [, 'zone'])` truncates in the
+session's zone or the one given (units microseconds to millennium); CAST between
+the two types uses the session's zone. The two types are never compared or
+assigned across without one of these. Zones are the IANA names of the files
+under `--zoneinfo` (`/usr/share/zoneinfo`), read by imagedb's own reader, each
+name exact (UTC, Etc/UTC, GMT and Etc/GMT in any case, with no file needed).
+Output: `2026-03-29 02:30:00+01`, `+05:45`, `-02:30`; COPY TO writes the session's
+zone, a dump UTC. A GROUP BY of `date_trunc(...)` over a column, in any zone,
+takes the grouped fast path (a cached span of instants a row). Not yet:
+EXTRACT, INTERVAL, now(), zone names in any case.
 
 Primary keys: every table has one, of one column (`id INT64 PRIMARY KEY`) or of
 up to eight (`PRIMARY KEY (region, day)`, a table constraint anywhere among the

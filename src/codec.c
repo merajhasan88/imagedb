@@ -81,6 +81,7 @@ const char *imdb_type_name(uint8_t t)
     case IMDB_T_BOOL: return "BOOL";
     case IMDB_T_TIMESTAMP: return "TIMESTAMP";
     case IMDB_T_FLOAT64: return "FLOAT64";
+    case IMDB_T_TIMESTAMPTZ: return "TIMESTAMPTZ";
     }
     return "?";
 }
@@ -157,7 +158,7 @@ int imdb_schema_check(const imdb_schema *s, imdb_err *e)
         for (int j = 0; j < i; j++)
             if (strcmp(s->cols[j].name, c->name) == 0)
                 return imdb_fail(e, IMDB_ERR_INVALID, "duplicate column name %s", c->name);
-        if (c->type < IMDB_T_INT64 || c->type > IMDB_T_FLOAT64)
+        if (c->type < IMDB_T_INT64 || c->type > IMDB_T_LAST)
             return imdb_fail(e, IMDB_ERR_INVALID, "column %s: unknown type", c->name);
         if (c->type == IMDB_T_DECIMAL) {
             if (c->precision < 1 || c->precision > 18 || c->scale > c->precision)
@@ -295,6 +296,7 @@ int imdb_value_check(const imdb_column *c, const imdb_value *v, imdb_err *e)
         if (v->i != 0 && v->i != 1) return imdb_fail(e, IMDB_ERR_INVALID, "column %s: bad BOOL", c->name);
         return IMDB_OK;
     case IMDB_T_TIMESTAMP:
+    case IMDB_T_TIMESTAMPTZ:
         if (v->i < TS_MIN || v->i > TS_MAX)
             return imdb_fail(e, IMDB_ERR_LIMIT, "column %s: timestamp out of range", c->name);
         return IMDB_OK;
@@ -646,6 +648,9 @@ static void civil_from_days(int64_t z, int64_t *y, int *m, int *d)
     *y = yoe + era * 400 + (*m <= 2);
 }
 
+int64_t imdb_days_from_civil(int64_t y, int m, int d) { return days_from_civil(y, m, d); }
+void imdb_civil_from_days(int64_t z, int64_t *y, int *m, int *d) { civil_from_days(z, y, m, d); }
+
 static bool digits(const char *s, size_t n, size_t off, size_t cnt, int64_t *v)
 {
     if (off > n || cnt > n - off) return false;
@@ -659,36 +664,107 @@ static bool digits(const char *s, size_t n, size_t off, size_t cnt, int64_t *v)
     return true;
 }
 
-int imdb_parse_timestamp(const char *s, size_t n, int64_t *out, imdb_err *e)
+/* a TIMESTAMP's text from s's start, its shape alone: the date, then a time after ' ' or 'T' (a digit next), then a
+ * fraction; *end where it stops (a zone part, a Z, or the end) */
+typedef struct dt_fields {
+    int64_t Y, M, D, h, mi, se, us;
+} dt_fields;
+
+static int scan_dt(const char *s, size_t n, size_t *end, dt_fields *f, const char *shape, imdb_err *e)
 {
-    int64_t Y, M, D, h = 0, mi = 0, se = 0, us = 0;
-    if (n > 32 || !digits(s, n, 0, 4, &Y) || n < 10 || s[4] != '-' || !digits(s, n, 5, 2, &M) || s[7] != '-' ||
-        !digits(s, n, 8, 2, &D))
-        return imdb_fail(e, IMDB_ERR_INVALID, "timestamp must look like 'YYYY-MM-DD HH:MM:SS[.ffffff]' (UTC)");
+    memset(f, 0, sizeof *f);
+    if (!digits(s, n, 0, 4, &f->Y) || n < 10 || s[4] != '-' || !digits(s, n, 5, 2, &f->M) || s[7] != '-' ||
+        !digits(s, n, 8, 2, &f->D))
+        return imdb_fail(e, IMDB_ERR_INVALID, "%s", shape);
     size_t i = 10;
-    if (i < n) {
-        if ((s[i] != ' ' && s[i] != 'T') || !digits(s, n, i + 1, 2, &h) || i + 3 >= n || s[i + 3] != ':' ||
-            !digits(s, n, i + 4, 2, &mi) || i + 6 >= n || s[i + 6] != ':' || !digits(s, n, i + 7, 2, &se))
-            return imdb_fail(e, IMDB_ERR_INVALID, "timestamp must look like 'YYYY-MM-DD HH:MM:SS[.ffffff]' (UTC)");
+    if (i < n && (s[i] == ' ' || s[i] == 'T') && i + 1 < n && s[i + 1] >= '0' && s[i + 1] <= '9') {
+        if (!digits(s, n, i + 1, 2, &f->h) || i + 3 >= n || s[i + 3] != ':' || !digits(s, n, i + 4, 2, &f->mi) ||
+            i + 6 >= n || s[i + 6] != ':' || !digits(s, n, i + 7, 2, &f->se))
+            return imdb_fail(e, IMDB_ERR_INVALID, "%s", shape);
         i += 9;
         if (i < n && s[i] == '.') {
             size_t f0 = ++i;
             while (i < n && s[i] >= '0' && s[i] <= '9') i++;
             size_t fd = i - f0;
             if (fd < 1 || fd > 6) return imdb_fail(e, IMDB_ERR_INVALID, "timestamp fraction must have 1..6 digits");
-            int64_t f;
-            digits(s, n, f0, fd, &f);
-            for (size_t k = fd; k < 6; k++) f *= 10;
-            us = f;
+            int64_t fr;
+            digits(s, n, f0, fd, &fr);
+            for (size_t k = fd; k < 6; k++) fr *= 10;
+            f->us = fr;
         }
-        if (i < n && s[i] == 'Z') i++;
-        if (i != n) return imdb_fail(e, IMDB_ERR_INVALID, "timestamp: only UTC is supported (no offsets)");
+    } else if (i < n && s[i] == 'T') {
+        return imdb_fail(e, IMDB_ERR_INVALID, "%s", shape);
     }
-    if (Y < 1 || M < 1 || M > 12 || D < 1 || D > days_in_month(Y, (int)M) || h > 23 || mi > 59 || se > 59)
-        return imdb_fail(e, IMDB_ERR_INVALID, "timestamp field out of range");
-    int64_t days = days_from_civil(Y, (int)M, (int)D);
-    *out = ((days * 86400 + h * 3600 + mi * 60 + se) * 1000000) + us;
+    *end = i;
     return IMDB_OK;
+}
+
+static int dt_value(const dt_fields *f, int64_t *out, imdb_err *e)
+{
+    if (f->Y < 1 || f->M < 1 || f->M > 12 || f->D < 1 || f->D > days_in_month(f->Y, (int)f->M) || f->h > 23 || f->mi > 59 ||
+        f->se > 59)
+        return imdb_fail(e, IMDB_ERR_INVALID, "timestamp field out of range");
+    int64_t days = days_from_civil(f->Y, (int)f->M, (int)f->D);
+    *out = ((days * 86400 + f->h * 3600 + f->mi * 60 + f->se) * 1000000) + f->us;
+    return IMDB_OK;
+}
+
+#define TS_SHAPE "timestamp must look like 'YYYY-MM-DD HH:MM:SS[.ffffff]' (UTC)"
+#define TSTZ_SHAPE "a TIMESTAMPTZ must look like 'YYYY-MM-DD HH:MM:SS[.ffffff]' with an offset (+HH:MM, Z), a zone's name or neither"
+
+int imdb_parse_timestamp(const char *s, size_t n, int64_t *out, imdb_err *e)
+{
+    dt_fields f;
+    size_t i;
+    if (n > 32) return imdb_fail(e, IMDB_ERR_INVALID, TS_SHAPE);
+    if (scan_dt(s, n, &i, &f, TS_SHAPE, e)) return e->code;
+    if (i < n && i > 10 && s[i] == 'Z') i++;
+    if (i < n && i == 10) return imdb_fail(e, IMDB_ERR_INVALID, TS_SHAPE);
+    if (i != n) return imdb_fail(e, IMDB_ERR_INVALID, "timestamp: only UTC is supported (no offsets)");
+    return dt_value(&f, out, e);
+}
+
+int imdb_parse_timestamptz(const char *s, size_t n, imdb_tzlit *o, imdb_err *e)
+{
+    memset(o, 0, sizeof *o);
+    dt_fields f;
+    size_t i;
+    if (n > 32 + 1 + IMDB_MAX_TZ_NAME) return imdb_fail(e, IMDB_ERR_INVALID, TSTZ_SHAPE);
+    if (scan_dt(s, n, &i, &f, TSTZ_SHAPE, e)) return e->code;
+    if (i < n && s[i] == 'Z') {
+        o->has_off = true;
+        i++;
+    } else if (i < n) {
+        size_t j = i + (s[i] == ' ' && i + 1 < n && (s[i + 1] == '+' || s[i + 1] == '-'));
+        if (s[j] == '+' || s[j] == '-') {
+            int sign = s[j] == '-' ? -1 : 1;
+            int64_t hh, mm = 0, ss = 0;
+            j++;
+            if (!digits(s, n, j, 2, &hh)) return imdb_fail(e, IMDB_ERR_INVALID, TSTZ_SHAPE);
+            j += 2;
+            if (j < n) {
+                bool colon = s[j] == ':';
+                j += colon;
+                if (!digits(s, n, j, 2, &mm)) return imdb_fail(e, IMDB_ERR_INVALID, TSTZ_SHAPE);
+                j += 2;
+                if (j < n) { /* seconds only after colons: +HH:MM:SS */
+                    if (!colon || s[j] != ':' || !digits(s, n, j + 1, 2, &ss)) return imdb_fail(e, IMDB_ERR_INVALID, TSTZ_SHAPE);
+                    j += 3;
+                }
+            }
+            if (mm > 59 || ss > 59 || hh * 3600 + mm * 60 + ss > 15 * 3600 + 59 * 60 + 59)
+                return imdb_fail(e, IMDB_ERR_INVALID, "a TIMESTAMPTZ offset of at most 15:59:59");
+            o->has_off = true;
+            o->off = (int32_t)(sign * (hh * 3600 + mm * 60 + ss));
+            i = j;
+        } else if (s[i] == ' ' && i + 1 < n) { /* the rest a zone's name, for the caller to look up */
+            o->zoff = (uint32_t)(i + 1);
+            o->zlen = (uint32_t)(n - i - 1);
+            i = n;
+        }
+    }
+    if (i != n) return imdb_fail(e, IMDB_ERR_INVALID, TSTZ_SHAPE);
+    return dt_value(&f, &o->local, e);
 }
 
 /* v's decimal digits, written right to left ending at end (the zone slice's speed step: printf's machinery was most of
@@ -752,6 +828,20 @@ void imdb_format_timestamp(int64_t t, imdb_buf *out)
     imdb_buf_put(out, p, (size_t)(e - p));
 }
 
+void imdb_format_timestamptz(int64_t utc_us, int32_t off, imdb_buf *out)
+{
+    imdb_format_timestamp(utc_us + (int64_t)off * 1000000, out);
+    uint32_t a = off < 0 ? (uint32_t)0 - (uint32_t)off : (uint32_t)off;
+    char b[12], *p = b;
+    *p++ = off < 0 ? '-' : '+';
+    *p++ = (char)('0' + a / 36000), *p++ = (char)('0' + a / 3600 % 10);
+    if (a % 3600) {
+        *p++ = ':', *p++ = (char)('0' + a / 60 % 60 / 10), *p++ = (char)('0' + a / 60 % 10);
+        if (a % 60) *p++ = ':', *p++ = (char)('0' + a % 60 / 10), *p++ = (char)('0' + a % 10);
+    }
+    imdb_buf_put(out, b, (size_t)(p - b));
+}
+
 void imdb_format_float64(int64_t key, imdb_buf *out)
 {
     double d = imdb_f64_value(key);
@@ -800,6 +890,7 @@ void imdb_format_value(const imdb_value *v, imdb_buf *out)
     case IMDB_T_DECIMAL: imdb_format_decimal(v->i, v->scale, out); break;
     case IMDB_T_BOOL: imdb_buf_put_str(out, v->i ? "true" : "false"); break;
     case IMDB_T_TIMESTAMP: imdb_format_timestamp(v->i, out); break;
+    case IMDB_T_TIMESTAMPTZ: imdb_format_timestamptz(v->i, 0, out); break; /* no zone here: UTC (the renderer has its cell's offset) */
     case IMDB_T_FLOAT64: imdb_format_float64(v->i, out); break;
     case IMDB_T_TEXT: imdb_buf_put(out, v->s, v->len); break;
     }

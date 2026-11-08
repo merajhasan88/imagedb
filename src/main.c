@@ -38,6 +38,7 @@ static int usage(void)
           "  imagedb sql <dir> [-c SQL]... [-f FILE] [--csv] [--cross-check] [--nosync] [--lake-sync]\n"
           "                    [--anchor FILE [--accept-rollback]] [--read-only] [--durable-ack] [--mem-limit BYTES]\n"
           "                    [--mem-window SECONDS|none] [--seg-cache BYTES|all] [--stats FILE] [--events FILE]\n"
+          "                    [--zoneinfo DIR]\n"
           "                                             run SQL (interactive when no -c/-f and stdin is a tty);\n"
           "                                             --durable-ack: the watermark synced as each commit returns,\n"
           "                                             so a damaged last frame past it is known unacknowledged;\n"
@@ -113,6 +114,7 @@ static uint64_t g_mem_window; /* --mem-window (db.h: the memory window, stage 3b
 static uint64_t g_seg_cache; /* --seg-cache (db.h: the segment cache, stage 3c-1; 0: the default) */
 static const char *g_stats_path; /* --stats FILE (P1 M1: the stats export), for the command's open */
 static const char *g_events_path; /* --events FILE (P1 M2: the event log), for the command's open */
+static const char *g_zoneinfo; /* --zoneinfo DIR (P2: the zones SET TIME ZONE, AT TIME ZONE and literals name), for the open */
 
 /* SECONDS: decimal digits, no leading zero, at most a century; or none: no version leaves memory */
 static bool parse_window(const char *s, uint64_t *out)
@@ -192,6 +194,7 @@ static imdb_db *open_anchored(const char *dir, bool ro, int sync, const char *an
     imdb_open_opts o = {.sync = sync, .read_only = ro, .anchor = anchor, .accept_rollback = accept_rollback,
                         .durable_ack = durable_ack, .mem_limit = g_mem_limit, .mem_window_us = g_mem_window,
                         .seg_cache_bytes = g_seg_cache, .stats_path = g_stats_path, .events_path = g_events_path,
+                        .zoneinfo = g_zoneinfo,
                         .progress = open_progress};
     imdb_db *db;
     imdb_err e = {0};
@@ -623,6 +626,7 @@ static int cmd_sql(int argc, char **argv)
         else if (strcmp(argv[i], "--anchor") == 0 && i + 1 < argc) anchor = argv[++i];
         else if (strcmp(argv[i], "--stats") == 0 && i + 1 < argc) g_stats_path = argv[++i];
         else if (strcmp(argv[i], "--events") == 0 && i + 1 < argc) g_events_path = argv[++i];
+        else if (strcmp(argv[i], "--zoneinfo") == 0 && i + 1 < argc) g_zoneinfo = argv[++i]; /* P2 */
         else if (strcmp(argv[i], "--accept-rollback") == 0) accept_rollback = true;
         else if (strcmp(argv[i], "--durable-ack") == 0) durable_ack = true;
         else if (strcmp(argv[i], "--mem-limit") == 0 && i + 1 < argc) {

@@ -15,6 +15,7 @@
 #include "repl.h"
 #include "sha256.h"
 #include "sql_internal.h"
+#include "tz.h"
 
 /* ---- results ---------------------------------------------------------------- */
 
@@ -127,6 +128,19 @@ static int res_finish(imdb_result *r, imdb_err *e)
     return IMDB_OK;
 }
 
+/* P2: each TIMESTAMPTZ cell's offset in the session's zone, once a result (the renderer may run after the statement, and
+ * holds no zone), through the statement's span cache: cells in time order read the transitions once a span */
+static void res_zone(imdb_result *r, imdb_xenv *env)
+{
+    bool any = false;
+    for (uint16_t c = 0; c < r->ncols && !any; c++) any = r->ctype[c] == IMDB_T_TIMESTAMPTZ || !r->ctype[c];
+    if (!any || !r->cells) return;
+    for (uint64_t i = 0; i < r->nrows * r->ncols; i++) {
+        imdb_cell *cl = &r->cells[i];
+        if (cl->v.type == IMDB_T_TIMESTAMPTZ && !cl->null && !cl->v.null) cl->tz_off = imdb_x_tz_off(env, env->zone, cl->v.i);
+    }
+}
+
 static void res_name(imdb_result *r, uint16_t i, const char *n) { snprintf(r->names[i], sizeof r->names[i], "%s", n); }
 
 /* ---- execution context -------------------------------------------------------- */
@@ -227,6 +241,13 @@ static int xcheck(xctx *x, imdb_err *e)
 }
 
 /* P2 S1: xcheck for the evaluator (imdb_xenv), which knows no xctx */
+/* P2: a zone by name for the evaluator: the handle's table (loaded once, outside the statement's ceiling) */
+static int xenv_zone(void *ctx, const uint8_t *name, uint32_t len, const struct imdb_tz **out, imdb_err *e)
+{
+    const xctx *x = ctx;
+    return imdb_db_zone(x->db, (const char *)name, len, out, e);
+}
+
 static int xenv_check(void *ctx, imdb_err *e)
 {
     return xcheck((xctx *)ctx, e);
@@ -370,6 +391,11 @@ static int bind_lit(xctx *x, const sql_lit *l, const imdb_column *c, bool compar
                 return imdb_fail(e, IMDB_ERR_INVALID, "column %s expects TIMESTAMP '...'", c->name);
             if (imdb_parse_timestamp(txt, tl, &out->i, e)) return e->code;
             break;
+        case IMDB_T_TIMESTAMPTZ: /* P2: its offset, its zone, or the session's zone */
+            if (l->kind != LIT_TSTZ && l->kind != LIT_STR)
+                return imdb_fail(e, IMDB_ERR_INVALID, "column %s expects TIMESTAMPTZ '...'", c->name);
+            if (imdb_x_tstz_text(txt, tl, &x->env, &out->i, e)) return e->code;
+            break;
         case IMDB_T_FLOAT64:
             if (l->kind != LIT_INT && l->kind != LIT_DEC && l->kind != LIT_FLOAT)
                 return imdb_fail(e, IMDB_ERR_INVALID, "column %s expects a number", c->name);
@@ -465,7 +491,7 @@ static int bind_xlit(xctx *x, const sql_lit *l, imdb_xval *v, imdb_err *e)
     if (l->kind == LIT_PARAM) {
         if (l->param > x->nparams) return imdb_fail(e, IMDB_ERR_INVALID, "parameter $%u was not supplied", (unsigned)l->param);
         const imdb_value *pv = &x->params[l->param - 1];
-        if (pv->type < IMDB_T_INT64 || pv->type > IMDB_T_FLOAT64 || (pv->type == IMDB_T_DECIMAL && pv->scale > 18))
+        if (pv->type < IMDB_T_INT64 || pv->type > IMDB_T_LAST || (pv->type == IMDB_T_DECIMAL && pv->scale > 18))
             return imdb_fail(e, IMDB_ERR_INVALID, "parameter $%u: not a value of a column type", (unsigned)l->param);
         imdb_x_from_value(pv, v); /* a NULL keeps its type: NULL + 1 is NULL */
         return IMDB_OK;
@@ -502,6 +528,11 @@ static int bind_xlit(xctx *x, const sql_lit *l, imdb_xval *v, imdb_err *e)
         v->type = IMDB_T_TIMESTAMP;
         v->i = i;
         return IMDB_OK;
+    case LIT_TSTZ: /* P2 */
+        if (imdb_x_tstz_text(txt, tl, &x->env, &i, e)) return e->code;
+        v->type = IMDB_T_TIMESTAMPTZ;
+        v->i = i;
+        return IMDB_OK;
     case LIT_STR: {
         uint8_t *buf = xalloc(x, tl, e);
         if (!buf) return e->code;
@@ -520,19 +551,24 @@ static int bind_xlit(xctx *x, const sql_lit *l, imdb_xval *v, imdb_err *e)
     }
 }
 
-/* node k, if a string literal, read again as a TIMESTAMP (a malformed one is the parse's error) */
-static int ts_lit(xctx *x, const sql_stmt *st, uint16_t k, imdb_err *e)
+/* node k, if a string literal, read again as a timestamp of type t: a TIMESTAMP, or (P2) a TIMESTAMPTZ by its literal's
+ * rules, its offset, its zone or the session's (a malformed one is the parse's error) */
+static int ts_lit(xctx *x, const sql_stmt *st, uint16_t k, uint8_t t, imdb_err *e)
 {
     const sql_expr *n = &st->ex[k];
     if (n->op != EX_LIT || n->lit.kind != LIT_STR) return IMDB_OK;
     int64_t us;
-    if (imdb_parse_timestamp(x->sql + n->lit.off, n->lit.len, &us, e)) return e->code;
+    if (t == IMDB_T_TIMESTAMPTZ ? imdb_x_tstz_text(x->sql + n->lit.off, n->lit.len, &x->env, &us, e)
+                                : imdb_parse_timestamp(x->sql + n->lit.off, n->lit.len, &us, e))
+        return e->code;
     imdb_xnode *b = &x->xn[k];
     memset(&b->k, 0, sizeof b->k);
-    b->k.type = b->type = IMDB_T_TIMESTAMP;
+    b->k.type = b->type = t;
     b->k.i = us;
     return IMDB_OK;
 }
+
+static bool is_ts(uint8_t t) { return t == IMDB_T_TIMESTAMP || t == IMDB_T_TIMESTAMPTZ; }
 
 static int xbind(xctx *x, xscope *sc, uint16_t k, imdb_err *e);
 static int xbind_node(xctx *x, xscope *sc, uint16_t k, imdb_err *e);
@@ -566,10 +602,11 @@ static void x_type_null(xctx *x, uint16_t k, uint8_t t, uint8_t s)
 static int x_unify_all(xctx *x, const sql_stmt *st, const uint16_t *v, unsigned n, const char *what, uint8_t *rt,
                        uint8_t *rs, imdb_err *e)
 {
-    bool ts = false;
-    for (unsigned i = 0; i < n; i++) ts |= x->xn[v[i]].type == IMDB_T_TIMESTAMP;
+    uint8_t ts = 0; /* a TIMESTAMP or (P2) a TIMESTAMPTZ among them: its string literals are of its type */
+    for (unsigned i = 0; i < n; i++)
+        if (is_ts(x->xn[v[i]].type)) ts = x->xn[v[i]].type;
     for (unsigned i = 0; ts && i < n; i++)
-        if (ts_lit(x, st, v[i], e)) return e->code;
+        if (ts_lit(x, st, v[i], ts, e)) return e->code;
     *rt = *rs = 0;
     for (unsigned i = 0; i < n; i++)
         if (imdb_x_unify(rt, rs, x->xn[v[i]].type, x->xn[v[i]].scale, what, e)) return e->code;
@@ -590,7 +627,8 @@ static int xbind_s1(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
         const imdb_xnode *a = &x->xn[n->l];
         bool num = a->type == IMDB_T_INT64 || a->type == IMDB_T_DECIMAL || a->type == IMDB_T_FLOAT64;
         bool to_num = n->ctype == IMDB_T_INT64 || n->ctype == IMDB_T_DECIMAL || n->ctype == IMDB_T_FLOAT64;
-        if (a->type && a->type != IMDB_T_TEXT && n->ctype != IMDB_T_TEXT && a->type != n->ctype && !(num && to_num))
+        if (a->type && a->type != IMDB_T_TEXT && n->ctype != IMDB_T_TEXT && a->type != n->ctype && !(num && to_num) &&
+            !(is_ts(a->type) && is_ts(n->ctype))) /* P2: TIMESTAMP and TIMESTAMPTZ each way, by the session's zone */
             return imdb_fail(e, IMDB_ERR_INVALID, "CAST of %s to %s is not defined", imdb_type_name(a->type),
                              imdb_type_name(n->ctype));
         x_type_null(x, n->l, n->ctype, n->cscale);
@@ -609,7 +647,7 @@ static int xbind_s1(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
             if (!n->l && x->xn[wx->l].type != IMDB_T_BOOL)
                 return imdb_fail(e, IMDB_ERR_INVALID, "CASE WHEN takes a condition");
             if (n->l) { /* a simple CASE compares its operand with each WHEN, as = does */
-                if (x->xn[n->l].type == IMDB_T_TIMESTAMP && ts_lit(x, st, wx->l, e)) return e->code;
+                if (is_ts(x->xn[n->l].type) && ts_lit(x, st, wx->l, x->xn[n->l].type, e)) return e->code;
                 if (!imdb_x_comparable(x->xn[n->l].type, x->xn[wx->l].type))
                     return imdb_fail(e, IMDB_ERR_INVALID, "a CASE of %s compared with %s: values are not converted",
                                      imdb_type_name(x->xn[n->l].type), imdb_type_name(x->xn[wx->l].type));
@@ -636,13 +674,21 @@ static int xbind_s1(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
         v[nv++] = a;
     }
     if (n->fn == FN_COALESCE) return x_unify_all(x, st, v, nv, "COALESCE of", &b->type, &b->scale, e);
-    if (n->fn == FN_NULLIF && nv == 2 && x->xn[v[0]].type == IMDB_T_TIMESTAMP && ts_lit(x, st, v[1], e)) return e->code;
+    if (n->fn == FN_NULLIF && nv == 2 && is_ts(x->xn[v[0]].type) && ts_lit(x, st, v[1], x->xn[v[0]].type, e)) return e->code;
     for (unsigned i = 0; i < nv; i++) {
         ta[i] = x->xn[v[i]].type;
         sa[i] = x->xn[v[i]].scale;
         kv[i] = st->ex[v[i]].op == EX_LIT ? &x->xn[v[i]].k : NULL;
     }
     if (imdb_x_fn_type(n->fn, (uint8_t)nv, ta, sa, kv, &b->type, &b->scale, e)) return e->code;
+    if (n->fn == FN_DATE_TRUNC && imdb_x_trunc_unit(kv[0]->s, kv[0]->len, &b->unit, e)) return e->code; /* P2 */
+    b->tz = NULL;
+    if (n->fn == FN_DATE_TRUNC || n->fn == FN_TIMEZONE) { /* P2: a constant zone looked up once, in a run alone */
+        unsigned zi = n->fn == FN_TIMEZONE ? 0 : 2;
+        if (zi < nv && kv[zi] && !kv[zi]->null && !x->probe &&
+            imdb_db_zone(x->db, (const char *)kv[zi]->s, kv[zi]->len, &b->tz, e))
+            return e->code;
+    }
     if (n->fn == FN_NULLIF) x_type_null(x, v[1], b->type, b->scale);
     return IMDB_OK;
 }
@@ -1020,7 +1066,7 @@ static int xbind_node(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
             imdb_xlist_start(&it, sc->st, n->r);
             for (uint16_t a = imdb_xlist_next(&it); a; a = imdb_xlist_next(&it)) {
                 if (xbind_v(x, sc, a, e)) return e->code;
-                if (x->xn[n->l].type == IMDB_T_TIMESTAMP && ts_lit(x, sc->st, a, e)) return e->code;
+                if (is_ts(x->xn[n->l].type) && ts_lit(x, sc->st, a, x->xn[n->l].type, e)) return e->code;
                 uint8_t ta = x->xn[n->l].type, tb = x->xn[a].type;
                 if (tb && !imdb_x_comparable(ta, tb))
                     return imdb_fail(e, IMDB_ERR_INVALID, "IN compares %s with %s: values are not converted",
@@ -1041,8 +1087,8 @@ static int xbind_node(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
             if (xbind(x, sc, ops[i], e)) return e->code;
             /* a string literal against a TIMESTAMP is a timestamp, as against a TIMESTAMP column in today's form
              * (ts >= '2026-01-01' OR k): read as one, never compared as text */
-            if (x->xn[n->l].type == IMDB_T_TIMESTAMP && ts_lit(x, sc->st, ops[i], e)) return e->code;
-            if (x->xn[ops[i]].type == IMDB_T_TIMESTAMP && ts_lit(x, sc->st, n->l, e)) return e->code;
+            if (is_ts(x->xn[n->l].type) && ts_lit(x, sc->st, ops[i], x->xn[n->l].type, e)) return e->code;
+            if (is_ts(x->xn[ops[i]].type) && ts_lit(x, sc->st, n->l, x->xn[ops[i]].type, e)) return e->code;
             uint8_t ta = x->xn[n->l].type, tb = x->xn[ops[i]].type;
             if (!imdb_x_comparable(ta, tb))
                 return imdb_fail(e, IMDB_ERR_INVALID, "a comparison of %s with %s: values are not converted",
@@ -1625,6 +1671,10 @@ typedef struct sink {
     uint8_t fg_kind;
     int16_t fg_col;
     int64_t fg_c;
+    uint8_t fg_unit, fg_type;  /* P2: FG_TRUNC's unit and its key's type (TIMESTAMP or TIMESTAMPTZ) */
+    bool fg_tz, fg_local;      /* the column a TIMESTAMPTZ truncated in fg_zone; or its wall clock in fg_zone (AT TIME ZONE) */
+    const struct imdb_tz *fg_zone;
+    int64_t fg_lo, fg_hi, fg_r; /* the last span of values, [fg_lo, fg_hi), whose key is fg_r (empty: lo > hi) */
     struct fg_cache_ent *fg_cache;
     bool fg_nocache;         /* its allocation failed once: the map alone for the rest of the statement */
     imdb_hmap dmap;          /* DISTINCT's set (dist_seen) */
@@ -2240,6 +2290,8 @@ static int run_nested(xctx *x, const sql_stmt *in, imdb_result *r, uint8_t mode,
         s.probe = true;
         s.probe_r = r;
     }
+    s.env.zone = x->ss ? x->ss->zone : NULL; /* P2: the session's; a bind-only pass reads no zone file */
+    s.env.zone_get = s.probe ? NULL : xenv_zone;
     struct xplain *xp = NULL;
     if (s.probe && !(xp = xp_scratch(e))) return e->code;
     r->byte_cap = workspace_of(x->ss);
@@ -2628,7 +2680,7 @@ static bool fast_aggregate(const sink *k)
  * a small direct-mapped cache of keys before the SipHash map. Groups are made in the order their rows come, as
  * sink_row makes them, and each group's accumulators take exactly acc_add's changes, so the answer is the generic
  * path's (cross_check compares the two). */
-enum { FG_COL = 1, FG_DIV, FG_MOD };
+enum { FG_COL = 1, FG_DIV, FG_MOD, FG_TRUNC }; /* FG_TRUNC: P2, date_trunc of a column, its span cached */
 #define FG_CACHE 4096u
 
 typedef struct fg_cache_ent {
@@ -2638,7 +2690,8 @@ typedef struct fg_cache_ent {
 
 static bool fg_int_type(uint8_t ty)
 {
-    return ty == IMDB_T_INT64 || ty == IMDB_T_DECIMAL || ty == IMDB_T_TIMESTAMP || ty == IMDB_T_BOOL || ty == IMDB_T_FLOAT64;
+    return ty == IMDB_T_INT64 || ty == IMDB_T_DECIMAL || ty == IMDB_T_TIMESTAMP || ty == IMDB_T_BOOL || ty == IMDB_T_FLOAT64 ||
+           ty == IMDB_T_TIMESTAMPTZ;
 }
 
 static bool fast_group_ok(sink *k, const imdb_table *t)
@@ -2654,6 +2707,51 @@ static bool fast_group_ok(sink *k, const imdb_table *t)
             if (!fg_int_type(t->s.cols[k->gk_col[0]].type)) return false;
             k->fg_kind = FG_COL;
             k->fg_col = k->gk_col[0];
+        } else if (k->st->ex[k->gk_ex[0]].op == EX_FN && k->st->ex[k->gk_ex[0]].fn == FN_DATE_TRUNC) {
+            /* P2: date_trunc(unit, col [, zone]) or date_trunc(unit, col AT TIME ZONE zone): constants alone beside
+             * the column, each zone already looked up (a run's bind), the column a timestamp of this table */
+            const sql_stmt *st = k->st;
+            const imdb_xnode *xn = &k->x->xn[k->gk_ex[0]];
+            imdb_xlist it;
+            uint16_t a[3];
+            unsigned na = 0;
+            imdb_xlist_start(&it, st, st->ex[k->gk_ex[0]].l);
+            for (uint16_t q = imdb_xlist_next(&it); q; q = imdb_xlist_next(&it)) {
+                if (na == 3) return false;
+                a[na++] = q;
+            }
+            if (na < 2 || st->ex[a[0]].op != EX_LIT) return false;
+            uint16_t c = a[1];
+            const struct imdb_tz *az = NULL;
+            bool local = false;
+            if (st->ex[c].op == EX_FN && st->ex[c].fn == FN_TIMEZONE) { /* (col AT TIME ZONE z): its zone a constant */
+                const imdb_xnode *xz = &k->x->xn[c];
+                imdb_xlist it2;
+                uint16_t b2[2];
+                unsigned nb = 0;
+                imdb_xlist_start(&it2, st, st->ex[c].l);
+                for (uint16_t q = imdb_xlist_next(&it2); q; q = imdb_xlist_next(&it2)) {
+                    if (nb == 2) return false;
+                    b2[nb++] = q;
+                }
+                if (nb != 2 || !xz->tz || st->ex[b2[1]].op != EX_COL) return false;
+                az = xz->tz;
+                local = true;
+                c = b2[1];
+            }
+            const imdb_xnode *xc = &k->x->xn[c];
+            if (st->ex[c].op != EX_COL || xc->outer || xc->col < 0) return false;
+            uint8_t ct = t->s.cols[xc->col].type;
+            if (local ? ct != IMDB_T_TIMESTAMPTZ : ct != IMDB_T_TIMESTAMP && ct != IMDB_T_TIMESTAMPTZ) return false;
+            if (na == 3 && (!xn->tz || st->ex[a[2]].op != EX_LIT)) return false;
+            k->fg_kind = FG_TRUNC;
+            k->fg_col = xc->col;
+            k->fg_unit = xn->unit;
+            k->fg_type = xn->type;
+            k->fg_local = local;
+            k->fg_tz = !local && ct == IMDB_T_TIMESTAMPTZ;
+            k->fg_zone = local ? az : na == 3 ? xn->tz : k->x->env.zone; /* the session's zone (NULL: UTC) */
+            k->fg_lo = 1, k->fg_hi = 0;
         } else {
             const sql_stmt *st = k->st;
             const sql_expr *n = &st->ex[k->gk_ex[0]];
@@ -2707,7 +2805,7 @@ static int fg_group(sink *k, const imdb_table *t, bool isnull, int64_t key, uint
     } else {
         imdb_xval xv;
         memset(&xv, 0, sizeof xv);
-        xv.type = k->fg_kind == FG_COL ? col->type : IMDB_T_INT64;
+        xv.type = k->fg_kind == FG_COL ? col->type : k->fg_kind == FG_TRUNC ? k->fg_type : IMDB_T_INT64;
         xv.scale = k->fg_kind == FG_COL ? col->scale : 0;
         xv.null = isnull;
         if (!isnull && xv.type == IMDB_T_FLOAT64) xv.f = imdb_f64_value(key); /* as imdb_x_from_value holds one */
@@ -2793,6 +2891,16 @@ static int fast_group_seg(sink *k, const imdb_table *t, const imdb_segimg *gi, c
             int64_t raw = 0;
             bool isnull = !fg_val(kc, r, &raw);
             int64_t key = isnull ? 0 : k->fg_kind == FG_DIV ? raw / k->fg_c : k->fg_kind == FG_MOD ? raw % k->fg_c : raw;
+            if (!isnull && k->fg_kind == FG_TRUNC) { /* P2: the last span's key, else the value's own and its span */
+                if (raw < k->fg_lo || raw >= k->fg_hi) {
+                    int rc = k->fg_local ? imdb_x_trunc_local(k->fg_unit, k->fg_zone, &k->x->env, raw, &k->fg_r, &k->fg_lo,
+                                                              &k->fg_hi, e)
+                                         : imdb_x_trunc(k->fg_unit, k->fg_tz, k->fg_zone, &k->x->env, raw, &k->fg_r,
+                                                        &k->fg_lo, &k->fg_hi, e);
+                    if (rc) return rc;
+                }
+                key = k->fg_r;
+            }
             if (!open || isnull != cur_null || (!isnull && key != cur)) {
                 if (open) {
                     fg_flush(k, g, rows, cnt, sum);
@@ -7324,7 +7432,8 @@ static int copy_columns(imdb_table *t, const sql_stmt *st, int *map, uint16_t *w
 
 /* a CSV field as a column's value: an unquoted empty field is NULL, every other one read by the column's literal rules
  * (exact or refused, never rounded); TEXT points into the reader's record. The messages name no value */
-static int copy_value(const imdb_column *col, const char *s, uint32_t n, bool quoted, imdb_value *v, imdb_err *e)
+static int copy_value(const imdb_column *col, const char *s, uint32_t n, bool quoted, imdb_xenv *env, imdb_value *v,
+                      imdb_err *e)
 {
     memset(v, 0, sizeof *v);
     v->type = col->type;
@@ -7347,6 +7456,9 @@ static int copy_value(const imdb_column *col, const char *s, uint32_t n, bool qu
         break;
     case IMDB_T_TIMESTAMP:
         if (imdb_parse_timestamp(s, n, &x, e)) return e->code;
+        break;
+    case IMDB_T_TIMESTAMPTZ: /* P2: an offset, a zone, or the session's zone, as a literal's */
+        if (imdb_x_tstz_text(s, n, env, &x, e)) return e->code;
         break;
     case IMDB_T_BOOL: /* what COPY TO writes, and nothing else */
         if (n == 4 && memcmp(s, "true", 4) == 0) x = 1;
@@ -7424,7 +7536,7 @@ static int exec_copy_from(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err 
         for (uint16_t i = 0; i < width && !rc; i++) {
             const imdb_column *col = &t->s.cols[map[i]];
             imdb_err e2 = {0};
-            if (copy_value(col, imdb_csv_field(&c, i), c.flen[i], c.fquoted[i], &vals[map[i]], &e2))
+            if (copy_value(col, imdb_csv_field(&c, i), c.flen[i], c.fquoted[i], &x->env, &vals[map[i]], &e2))
                 rc = imdb_fail(e, e2.code, "COPY line %llu, column %s: %s", line, col->name, e2.msg);
         }
         if (rc) break;
@@ -7512,6 +7624,7 @@ static void copy_row(sink *k, const imdb_value *vals)
         if (c && out_put(o, &k->cdelim, 1, k->e)) goto fail;
         if (v->null) continue; /* NULL: the empty unquoted field */
         imdb_cell cl = {.v = *v};
+        if (v->type == IMDB_T_TIMESTAMPTZ) cl.tz_off = imdb_x_tz_off(&k->x->env, k->x->env.zone, v->i); /* P2: as SELECT shows it */
         k->ctmp->len = 0;
         cell_text(&cl, k->ctmp, false);
         if (imdb_buf_check(k->ctmp, k->e) || out_field(o, (const char *)k->ctmp->p, k->ctmp->len, k->cdelim, k->e)) goto fail;
@@ -7607,6 +7720,7 @@ static int exec_copy_to(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e
     imdb_buf_init(&tmp);
     int rc;
     if ((rc = run_nested(x, st->src, &res, NEST_SOURCE, NULL, NULL, NULL, NULL, e))) goto done;
+    res_zone(&res, &x->env); /* P2: its TIMESTAMPTZ cells in the session's zone, as SELECT's */
     if (!(o.b = imdb_alloc(IMDB_COPY_BUF, e)) || out_header(&o, st, res.names, res.ncols, e)) {
         rc = e->code;
         goto done;
@@ -8541,6 +8655,7 @@ static int stmt_class(int kind)
     case ST_SHOW_IDENTITY: case ST_SHOW_REPLICAS: case ST_SHOW_REPLICATION: case ST_SHOW_ERASURE: case ST_SHOW_MEMORY:
     case ST_SHOW_INDEXES: case ST_SHOW_RETENTION: case ST_SHOW_STATS: case ST_SHOW_TRANSACTIONS: case ST_EXPLAIN:
     case ST_SHOW_PREPARED: /* P2 S9 */
+    case ST_SHOW_TIMEZONE: /* P2 */
     case ST_SHOW_VIEWS: /* P2 S7 */
         return IMDB_SC_SHOW;
     default: return IMDB_SC_OTHER;
@@ -8691,6 +8806,17 @@ static int exec_deallocate(imdb_session *ss, const sql_stmt *st, imdb_result *r,
 }
 
 /* SHOW PREPARED: the session's, by name: its declared types, its text (as written, if it is UTF-8), its runs */
+/* P2: SHOW TIME ZONE: the session's zone as SET */
+static int exec_show_timezone(const imdb_session *ss, imdb_result *r, imdb_err *e)
+{
+    res_cols(r, 1);
+    res_name(r, 0, "TimeZone");
+    imdb_cell *row = res_row(r, e);
+    if (!row) return e->code;
+    res_put_str(r, &row[0], ss->zone_name[0] ? ss->zone_name : "UTC");
+    return res_finish(r, e);
+}
+
 static int exec_show_prepared(const imdb_session *ss, imdb_result *r, imdb_err *e)
 {
     res_cols(r, 4);
@@ -8751,6 +8877,8 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
     x.env.subq = xenv_subq; /* P2 S4b */
     x.env.ctx = &x;
     x.env.arena = &x.arena;
+    x.env.zone = ss->zone; /* P2 */
+    x.env.zone_get = xenv_zone;
     imdb_db *db = ss->db;
     uint64_t seq_before = db->seq;
     if (db->failed) {
@@ -8800,7 +8928,7 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
     bool control = st->kind == ST_BEGIN || st->kind == ST_COMMIT || st->kind == ST_ROLLBACK || st->kind == ST_SET ||
                    st->kind == ST_EMPTY || st->kind == ST_SAVEPOINT || st->kind == ST_ROLLBACK_TO ||
                    st->kind == ST_RELEASE || st->kind == ST_SET_TXN || st->kind == ST_PREPARE || st->kind == ST_DEALLOCATE ||
-                   st->kind == ST_SHOW_PREPARED; /* P2 S9: the session's, no transaction's */
+                   st->kind == ST_SHOW_PREPARED || st->kind == ST_SHOW_TIMEZONE; /* P2 S9, P2: the session's, no transaction's */
     /* R1: a cancel asked for before this statement is dropped; what runs to its end (COMMIT, the statements that commit
      * on their own, the physical ones) is never checked, so neither a cancel nor the deadline cuts a logged op part
      * way */
@@ -8941,6 +9069,7 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
     case ST_PREPARE: rc = exec_prepare(ss, st, sql, r, e); break; /* P2 S9 */
     case ST_DEALLOCATE: rc = exec_deallocate(ss, st, r, e); break;
     case ST_SHOW_PREPARED: rc = exec_show_prepared(ss, r, e); break;
+    case ST_SHOW_TIMEZONE: rc = exec_show_timezone(ss, r, e); break; /* P2 */
     case ST_EXECUTE: rc = imdb_fail(e, IMDB_ERR_STATE, "EXECUTE runs in the place of its statement"); break; /* exec_one_body */
     case ST_BEGIN:
         if (txn) {
@@ -9087,7 +9216,18 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
     case ST_SHOW_STATS:
     case ST_SHOW_TRANSACTIONS: rc = exec_show(&x, st, r, e); break;
     case ST_SET:
-        if (strcmp(st->set_name, "cross_check") == 0) {
+        if (strcmp(st->set_name, "timezone") == 0) { /* P2: SET TIME ZONE 'name' (or timezone = 'name'), DEFAULT, LOCAL */
+            const struct imdb_tz *z = NULL;
+            if (!st->set_zone) {
+                rc = imdb_fail(e, IMDB_ERR_INVALID, "timezone takes a zone's name as a string ('Europe/London'), DEFAULT or LOCAL");
+            } else if (!st->set_value[0]) {
+                ss->zone = NULL;
+                ss->zone_name[0] = 0;
+            } else if (!(rc = imdb_db_zone(db, st->set_value, strlen(st->set_value), &z, e))) {
+                ss->zone = z;
+                memcpy(ss->zone_name, st->set_value, strlen(st->set_value) + 1);
+            }
+        } else if (strcmp(st->set_name, "cross_check") == 0) {
             if (strcmp(st->set_value, "on") == 0 || strcmp(st->set_value, "1") == 0 || strcmp(st->set_value, "true") == 0) ss->cross_check = true;
             else if (strcmp(st->set_value, "off") == 0 || strcmp(st->set_value, "0") == 0 || strcmp(st->set_value, "false") == 0) ss->cross_check = false;
             else rc = imdb_fail(e, IMDB_ERR_INVALID, "cross_check is on or off");
@@ -9246,6 +9386,7 @@ done:
     bool said_running = db->stmt_start_ns && db->stats_last_ns >= db->stmt_start_ns;
     db->stmt_start_ns = 0;
     imdb_stats_tick(db, said_running || (db->failed && !db->stats_said_failed));
+    if (!rc) res_zone(r, &x.env); /* P2 */
     if (rc) imdb_result_free(r);
     xfree(&x);
     stmt_drop(st, owned);
@@ -9284,6 +9425,8 @@ static int exec_execute(imdb_session *ss, const sql_stmt *st, const char *sql, c
     px.env.subq = xenv_subq;
     px.env.ctx = &px;
     px.env.arena = &px.arena;
+    px.env.zone = ss->zone; /* P2 */
+    px.env.zone_get = xenv_zone;
     imdb_value vals[IMDB_MAX_PARAMS];
     int rc = IMDB_OK;
     for (uint16_t i = 0; !rc && i < st->rowlen; i++) {
@@ -9484,6 +9627,10 @@ static void cell_text(const imdb_cell *c, imdb_buf *out, bool safe)
         imdb_format_i128(c->i128, c->v.type == IMDB_T_DECIMAL ? c->v.scale : 0, out);
         return;
     }
+    if (c->v.type == IMDB_T_TIMESTAMPTZ) { /* P2: its wall clock in the session's zone, the offset after (ASCII alone) */
+        imdb_format_timestamptz(c->v.i, c->tz_off, out);
+        return;
+    }
     if (safe) imdb_format_value_safe(&c->v, out);
     else imdb_format_value(&c->v, out);
 }
@@ -9510,6 +9657,12 @@ static size_t cell_width_fast(const imdb_cell *c, imdb_buf *tmp)
         if (v->type == IMDB_T_BOOL) return v->i ? 4 : 5;
         if (v->type == IMDB_T_TIMESTAMP && v->i >= -62135596800000000LL && v->i <= 253402300799999999LL)
             return v->i % 1000000 ? 26 : 19; /* years 0001-9999: codec.c's TS_MIN, TS_MAX */
+        if (v->type == IMDB_T_TIMESTAMPTZ) { /* P2: the wall clock's width (in range), then +HH, +HH:MM or +HH:MM:SS */
+            int64_t l = v->i + (int64_t)c->tz_off * 1000000;
+            uint32_t a = c->tz_off < 0 ? (uint32_t)0 - (uint32_t)c->tz_off : (uint32_t)c->tz_off;
+            if (l >= -62135596800000000LL && l <= 253402300799999999LL)
+                return (size_t)(l % 1000000 ? 26 : 19) + (a % 60 ? 9 : a % 3600 ? 6 : 3);
+        }
         if (v->type == IMDB_T_INT64 || v->type == IMDB_T_DECIMAL) {
             uint64_t u = v->i < 0 ? (uint64_t)0 - (uint64_t)v->i : (uint64_t)v->i;
             size_t nd = 1;
@@ -9591,7 +9744,8 @@ void imdb_result_render(const imdb_result *r, bool csv, imdb_buf *out)
             const imdb_cell *cell = &r->cells[i * nc + c];
             cell_text(cell, &tmp, true);
             size_t dw = disp_width(tmp.p, tmp.len);
-            bool right = !cell->null && cell->v.type != IMDB_T_TEXT && cell->v.type != IMDB_T_TIMESTAMP;
+            bool right = !cell->null && cell->v.type != IMDB_T_TEXT && cell->v.type != IMDB_T_TIMESTAMP &&
+                         cell->v.type != IMDB_T_TIMESTAMPTZ;
             imdb_buf_put_str(out, c ? " | " : " ");
             if (right)
                 for (size_t k = dw; k < w[c]; k++) imdb_buf_put_u8(out, ' ');

@@ -82,6 +82,9 @@ typedef struct imdb_session {
     imdb_copy_read_fn copy_rd;  /* P2 S10: the COPY stream (imdb_session_copy_io); NULL: COPY is refused */
     imdb_copy_write_fn copy_wr;
     void *copy_arg;
+    const struct imdb_tz *zone; /* P2: SET TIME ZONE: the session's zone (a TIMESTAMPTZ shown in it, a literal without an
+                                 * offset read in it; never the process's TZ); NULL: UTC */
+    char zone_name[IMDB_MAX_TZ_NAME + 1]; /* P2: its name as SET (SHOW TIME ZONE); "": UTC */
     atomic_bool cancel;       /* imdb_session_cancel: the running statement stops at its next check (cleared at
                                * each statement's start, so a request between statements is dropped) */
 } imdb_session;
@@ -90,6 +93,7 @@ typedef struct imdb_cell {
     imdb_value v;
     bool null;               /* only for aggregates over no rows */
     bool wide;               /* SUM result held in i128 */
+    int32_t tz_off;          /* P2: a TIMESTAMPTZ's offset in the session's zone, seconds east (the renderer writes its wall clock) */
     __int128 i128;
 } imdb_cell;
 

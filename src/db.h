@@ -94,6 +94,7 @@ typedef struct imdb_index_def {
 /* CREATE INDEX: a table's ordered index (a table keeps them sorted by name) */
 struct imdb_oidx;
 struct imdb_uidx;
+struct imdb_tz;
 typedef struct imdb_index {
     imdb_index_def d;
     struct imdb_oidx *ox; /* the ordered structure (oidx.h): engine tables only, NULL in models */
@@ -400,6 +401,12 @@ typedef struct imdb_db {
     bool events_said_failed, ev_open, ev_full;
     size_t ev_len;
     pthread_mutex_t events_lock; /* a line is built and appended whole */
+    /* P2's zones (tz.h): each loaded at its first use (imdb_db_zone), then read by any thread, freed at close; the lock
+     * guards the table and a load (two sessions naming a new zone at once load it once) */
+    pthread_mutex_t tz_lock;
+    char tz_root[IMDB_MAX_PATH];  /* the zoneinfo directory: --zoneinfo, else /usr/share/zoneinfo */
+    struct imdb_tz *tz[IMDB_MAX_TZ_ZONES];
+    uint32_t ntz;
     char events_buf[IMDB_EVENTS_LINE_MAX];
     void (*progress)(void *ctx, const char *phase, uint64_t done, uint64_t total);
     void *progress_ctx;
@@ -477,6 +484,7 @@ typedef struct imdb_open_opts {
     const char *anchor;       /* the external anchor file (log.h), outside the data directory; NULL: none */
     const char *stats_path;   /* P1 M1: the stats export (--stats FILE), outside the data directory; NULL: none */
     const char *events_path;  /* P1 M2: the event log (--events FILE), outside the data directory; NULL: none */
+    const char *zoneinfo;     /* P2: the zoneinfo directory zones are read from (--zoneinfo DIR); NULL: /usr/share/zoneinfo */
     /* P1 M2: the open's progress, at most once a second: its phase ("lake" segments, "replay" commits), done of total */
     void (*progress)(void *ctx, const char *phase, uint64_t done, uint64_t total);
     void *progress_ctx;
@@ -518,6 +526,9 @@ int imdb_read_role(const char *dir, bool *replica, imdb_err *e);
 int imdb_identity_format(const imdb_identity *id, char *out, size_t cap);
 int imdb_identity_parse(const char *s, size_t n, imdb_identity *id, imdb_err *e);
 int imdb_open(const char *path, const imdb_open_opts *o, imdb_db **out, imdb_err *e);
+/* P2: the zone a name names (tz.h): UTC and its aliases built in, any other a file under the zoneinfo directory, loaded
+ * once outside any statement's memory ceiling; INVALID for an unknown one (its message never naming it) */
+int imdb_db_zone(imdb_db *db, const char *name, size_t len, const struct imdb_tz **out, imdb_err *e);
 /* Frees the handle. IMDB_OK when every commit it acknowledged is durable: always
  * with sync on; under --nosync only if the closing fdatasync succeeded (a failed
  * handle skips it). IMDB_ERR_IO otherwise: --nosync commits since the last sync

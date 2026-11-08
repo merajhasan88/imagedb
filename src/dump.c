@@ -65,10 +65,11 @@ static const imdb_value *dump_default(const imdb_table *t, uint16_t c)
     return v->null ? NULL : v;
 }
 
-/* a value as a literal the column's type reads back: its text (COPY's), TEXT and TIMESTAMP quoted with '' */
+/* a value as a literal the column's type reads back: its text (COPY's), TEXT, TIMESTAMP and TIMESTAMPTZ (in UTC, +00:
+ * never the session's zone) quoted with '' */
 static int literal_text(dumper *d, const imdb_value *v, imdb_err *e)
 {
-    if (v->type != IMDB_T_TEXT && v->type != IMDB_T_TIMESTAMP) {
+    if (v->type != IMDB_T_TEXT && v->type != IMDB_T_TIMESTAMP && v->type != IMDB_T_TIMESTAMPTZ) {
         imdb_format_value(v, &d->b);
         return IMDB_OK;
     }

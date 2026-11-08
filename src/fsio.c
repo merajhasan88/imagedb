@@ -5,7 +5,9 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <linux/openat2.h>
 #include <sys/file.h>
+#include <sys/syscall.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -73,6 +75,21 @@ int imdb_io_openat(int dirfd, const char *name, int flags, ...)
     c.dirfd = dirfd, c.name = name, c.flags = flags;
     if (io_before(&c) < 0) return -1;
     int r = openat(dirfd, name, flags, mode);
+    io_after(&c, r);
+    return r;
+}
+
+/* P2's zones: path resolved beneath dirfd and never out of it (RESOLVE_BENEATH: a symlink inside the tree is followed,
+ * an absolute one or one climbing out refused, EXDEV; no /proc magic links). -1 and ENOSYS where the kernel (or a
+ * sandbox) has no openat2: the caller then walks the components itself. */
+int imdb_io_openat_beneath(int dirfd, const char *path, int flags)
+{
+    struct open_how how = {.flags = (uint64_t)(unsigned)flags, .resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS};
+    if (!HOOKED) return (int)syscall(SYS_openat2, dirfd, path, &how, sizeof how);
+    imdb_io_call c = call_of(IMDB_IO_OPEN);
+    c.dirfd = dirfd, c.name = path, c.flags = flags;
+    if (io_before(&c) < 0) return -1;
+    int r = (int)syscall(SYS_openat2, dirfd, path, &how, sizeof how);
     io_after(&c, r);
     return r;
 }

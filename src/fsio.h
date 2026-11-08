@@ -22,6 +22,8 @@
  * behaves exactly like the call it wraps. */
 int imdb_io_open(const char *path, int flags, ...);
 int imdb_io_openat(int dirfd, const char *name, int flags, ...);
+/* P2's zones: openat2 with RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS (-1, ENOSYS: none) */
+int imdb_io_openat_beneath(int dirfd, const char *path, int flags);
 ssize_t imdb_io_read(int fd, void *p, size_t n);
 ssize_t imdb_io_pread(int fd, void *p, size_t n, off_t off);
 ssize_t imdb_io_write(int fd, const void *p, size_t n);

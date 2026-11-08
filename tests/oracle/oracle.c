@@ -9,7 +9,8 @@
  *   oracle [--engines imagedb,sqlite,pg,mysql,mariadb,mssql] [--seeds A-B] [--steps N] [--dir DIR] [--keep-going]
  *          [--no-expr] [--no-fns] [--ping] [-v]   (--no-expr: 1a's generator, without arithmetic expressions, draw for draw;
  *          --no-fns: the generator before P2 S1's functions, CASE, CAST, IN, LIKE and ||, draw for draw; --no-views: before P2 S7's
- *          views, draw for draw)
+ *          views, draw for draw; --ckey, --alter and --tz: u's key two columns, t made by ALTERs, t.ts an instant in a zone a
+ *          seed: each the generator draw for draw)
  * The servers, from the environment: ORACLE_PG (a libpq conninfo), ORACLE_MYSQL and ORACLE_MARIADB ("socket user
  * password database"), ORACLE_ODBC (an ODBC connection string, out of ps). */
 #include <errno.h>
@@ -84,6 +85,11 @@ static void sb_reset(sb *b)
 
 /* ---- the schema, values, the generator ---------------------------------------------------------------------- */
 
+/* P2, --tz: t.ts a TIMESTAMPTZ (PostgreSQL timestamptz, MySQL and MariaDB TIMESTAMP in a +00:00 session, SQL Server
+ * DATETIMEOFFSET; SQLite's integers as ever), its values within MySQL's TIMESTAMP range, its literals written with
+ * +00:00 (MariaDB's without), imagedb's and PostgreSQL's sessions in the seed's zone (g_tzname), every answer an instant */
+static bool g_tz;
+static const char *g_tzname = "UTC";
 enum { CT_INT, CT_DEC, CT_FLT, CT_TXT, CT_BOOL, CT_TS };
 enum { D_IMDB, D_SQLITE, D_PG, D_MY, D_MA, D_MS, ND };
 static const char *const DNAME[ND] = {"imagedb", "sqlite", "pg", "mysql", "mariadb", "mssql"};
@@ -174,7 +180,9 @@ static void gen_val(int tab, int c, val *v, int null_pct)
     case CT_FLT: v->f = (double)rr(-40000, 40000) / 4.0; break; /* dyadic: every summation order exact */
     case CT_TXT: gen_text(v->s, sizeof v->s); break;
     case CT_BOOL: v->i = rr(0, 1); break;
-    case CT_TS: v->i = rr(0, 4102444799999999ll); break; /* 1970 to 2099, in microseconds */
+    case CT_TS: /* 1970 to 2099, in microseconds; --tz: within MySQL's TIMESTAMP (from 1970-01-01 00:00:01 to 2037), by the same draw */
+        v->i = g_tz ? 1000000 + rr(0, 4102444799999999ll) % 2145916800000000ll : rr(0, 4102444799999999ll);
+        break;
     }
 }
 
@@ -2103,6 +2111,7 @@ static void put_lit(sb *b, int d, int t, const val *v)
         else {
             sb_str(b, "'");
             put_ts(b, v->i);
+            if (g_tz && d != D_MA) sb_str(b, "+00:00"); /* --tz: an instant's literal (MariaDB's: its +00:00 session) */
             sb_str(b, "'");
         }
         break;
@@ -2928,13 +2937,14 @@ static void put_ups_my(sb *b, int d, const stmt *q)
 static void print_merge(sb *b, const stmt *q)
 {
     static const char *const MT[] = {"BIGINT", "DECIMAL(12,2)", "FLOAT(53)", "VARCHAR(255)", "BIT", "DATETIME2(6)"};
+    static const char *const MTZ[] = {"BIGINT", "DECIMAL(12,2)", "FLOAT(53)", "VARCHAR(255)", "BIT", "DATETIMEOFFSET(6)"};
     sb_str(b, "MERGE INTO t AS tgt USING (VALUES ");
     for (int r = 0; r < q->nrow; r++) {
         sb_str(b, r ? ", (" : "(");
         for (int c = 0; c < ncols(0); c++) {
             sb_str(b, c ? ", CAST(" : "CAST(");
             put_lit(b, D_MS, cols(0)[c].t, &q->row[r][c]);
-            sb_printf(b, " AS %s)", MT[cols(0)[c].t]);
+            sb_printf(b, " AS %s)", (g_tz ? MTZ : MT)[cols(0)[c].t]);
         }
         sb_str(b, ")");
     }
@@ -3257,6 +3267,20 @@ static const char *ddl_alter(int d, const char *whole)
 }
 
 
+/* --tz: ts's type in each dialect, an instant's (SQLite's integers as ever) */
+static const char *const TZ_TY[ND] = {"TIMESTAMPTZ", "INTEGER", "TIMESTAMPTZ(6)", "TIMESTAMP(6) NULL", "TIMESTAMP(6) NULL",
+                                      "DATETIMEOFFSET(6)"};
+
+/* --tz: a CREATE TABLE t with ts's type an instant's (the text up to ts kept; --alter's has no ts: ALTER adds it) */
+static const char *tz_ddl(int d, const char *s)
+{
+    static char b[ND][800];
+    const char *p = strstr(s, " ts ");
+    if (!g_tz || !p) return s;
+    snprintf(b[d], sizeof b[d], "%.*s ts %s)", (int)(p - s), s, TZ_TY[d]);
+    return b[d];
+}
+
 static const char *ddl(int d, int tab)
 {
     static const char *const T[ND] = {
@@ -3292,7 +3316,7 @@ static const char *ddl(int d, int tab)
         "utf8mb4_nopad_bin)",
         "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, tid BIGINT, v BIGINT, s VARCHAR(255) COLLATE "
         "Latin1_General_100_BIN2_UTF8)"};
-    return tab ? (g_ckey ? UCK[d] : U[d]) : g_alter ? ddl_alter(d, T[d]) : T[d];
+    return tab ? (g_ckey ? UCK[d] : U[d]) : g_alter ? ddl_alter(d, T[d]) : tz_ddl(d, T[d]);
 }
 
 /* ---- canonical cells: every engine's answer to one text per value ------------------------------------------------ */
@@ -3346,10 +3370,11 @@ static int canon_bool_text(sb *b, const char *s)
     return 0;
 }
 
-/* "YYYY-MM-DD[ HH:MM:SS[.f...]]" to microseconds */
+/* "YYYY-MM-DD[ HH:MM:SS[.f...]]" to microseconds; P2 (--tz): then an offset, Z, +HH, +HH:MM or +HH:MM:SS (SQL Server's
+ * after a space), taken off, so every engine's text of one instant is one number */
 static int canon_ts_text(sb *b, const char *s)
 {
-    int64_t y = 0, mo = 0, d = 0, h = 0, mi = 0, se = 0, us = 0;
+    int64_t y = 0, mo = 0, d = 0, h = 0, mi = 0, se = 0, us = 0, off = 0;
     int n = 0;
     if (sscanf(s, "%4" SCNd64 "-%2" SCNd64 "-%2" SCNd64 "%n", &y, &mo, &d, &n) != 3) return -1;
     s += n;
@@ -3363,8 +3388,26 @@ static int canon_ts_text(sb *b, const char *s)
             for (; k < 6; k++) us *= 10;
         }
     }
+    if (*s == ' ' && (s[1] == '+' || s[1] == '-')) s++;
+    if (*s == 'Z') s++;
+    else if (*s == '+' || *s == '-') {
+        int sign = *s == '-' ? -1 : 1;
+        int64_t oh = 0, om = 0, os = 0;
+        if (sscanf(s + 1, "%2" SCNd64 "%n", &oh, &n) != 1 || n != 2) return -1;
+        s += 3;
+        if (*s == ':') {
+            if (sscanf(s + 1, "%2" SCNd64 "%n", &om, &n) != 1 || n != 2) return -1;
+            s += 3;
+            if (*s == ':') {
+                if (sscanf(s + 1, "%2" SCNd64 "%n", &os, &n) != 1 || n != 2) return -1;
+                s += 3;
+            }
+        }
+        off = sign * (oh * 3600 + om * 60 + os);
+    }
     if (*s) return -1;
-    sb_printf(b, "%" PRId64, (days_from_civil(y, (unsigned)mo, (unsigned)d) * 86400 + h * 3600 + mi * 60 + se) * 1000000 + us);
+    sb_printf(b, "%" PRId64,
+              (days_from_civil(y, (unsigned)mo, (unsigned)d) * 86400 + h * 3600 + mi * 60 + se - off) * 1000000 + us);
     return 0;
 }
 
@@ -3842,6 +3885,7 @@ static void connect_all(void)
             must(e, "SET SESSION sql_mode = 'STRICT_ALL_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO,"
                     "ONLY_FULL_GROUP_BY,NO_ENGINE_SUBSTITUTION'");
             must(e, "SET SESSION div_precision_increment = 30"); /* a DECIMAL quotient far past imagedb's scale */
+            if (g_tz) must(e, "SET time_zone = '+00:00'"); /* --tz: TIMESTAMP read and written in UTC */
         } else if (d == D_MS) {
             const char *ci = getenv("ORACLE_ODBC");
             SQLCHAR out[1024];
@@ -3890,10 +3934,20 @@ static void imdb_up(eng *e, bool fresh)
     imdb_session_init(&e->ses, e->idb);
     e->ses_open = true;
     must(e, "SET cross_check = on");
+    if (g_tz) { /* --tz: the seed's zone (an instant shown with its offset there; the answers compared as instants) */
+        char z[96];
+        snprintf(z, sizeof z, "SET TIME ZONE '%s'", g_tzname);
+        must(e, z);
+    }
 }
 
 static void reset_all(unsigned seed)
 {
+    if (g_tz) { /* --tz: a zone a seed, each with transitions or odd offsets in the values' years (1970-2037) */
+        static const char *const TZS[] = {"UTC", "Europe/London", "America/St_Johns", "Asia/Kathmandu", "Australia/Lord_Howe",
+                                          "America/New_York", "Pacific/Chatham"};
+        g_tzname = TZS[seed % (sizeof TZS / sizeof *TZS)];
+    }
     for (int d = 0; d < ND; d++) {
         eng *e = &g_eng[d];
         if (!e->on) continue;
@@ -3913,6 +3967,11 @@ static void reset_all(unsigned seed)
             memset(&rb, 0, sizeof rb);
             exec_eng(e, d == D_MS ? "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION" : "ROLLBACK", false, NULL, 0, &rb);
             res_clear(&rb);
+            if (g_tz && d == D_PG) { /* --tz: PostgreSQL's session in the seed's zone, as imagedb's */
+                char z[96];
+                snprintf(z, sizeof z, "SET TIME ZONE '%s'", g_tzname);
+                must(e, z);
+            }
             if (d == D_MS) {
                 must(e, "DROP VIEW IF EXISTS vu; DROP VIEW IF EXISTS vt; DROP TABLE IF EXISTS u; DROP TABLE IF EXISTS t");
             } else {
@@ -4115,7 +4174,7 @@ static imdb_value par_value(int i)
     static const uint8_t IT[] = {IMDB_T_INT64, IMDB_T_DECIMAL, IMDB_T_FLOAT64, IMDB_T_TEXT, IMDB_T_BOOL, IMDB_T_TIMESTAMP};
     const val *v = &g_par[i].v;
     int t = g_par[i].t;
-    imdb_value x = {.type = IT[t], .scale = t == CT_DEC ? 2 : 0};
+    imdb_value x = {.type = g_tz && t == CT_TS ? IMDB_T_TIMESTAMPTZ : IT[t], .scale = t == CT_DEC ? 2 : 0}; /* --tz: an instant */
     if (v->null) {
         x.null = true;
         return x;
@@ -4133,6 +4192,7 @@ static imdb_value par_value(int i)
 static void exec_prepared(eng *e, sb *text, bool rows, const int *ty, int nty, res *r)
 {
     static const char *const TN[] = {"INT64", "DECIMAL(18,2)", "FLOAT64", "TEXT", "BOOL", "TIMESTAMP"};
+    static const char *const TNZ[] = {"INT64", "DECIMAL(18,2)", "FLOAT64", "TEXT", "BOOL", "TIMESTAMPTZ"}; /* --tz */
     long k = g_prep_runs++;
     bool api = k % 2 == 1, decl = !(api && k % 4 == 3);
     g_prep_last_api = api;
@@ -4140,7 +4200,7 @@ static void exec_prepared(eng *e, sb *text, bool rows, const int *ty, int nty, r
     for (int i = 0; i < g_npar; i++) g_prep_last_null |= g_par[i].v.null;
     sb p = {0}, x = {0};
     sb_str(&p, "PREPARE oq");
-    for (int i = 0; decl && i < g_npar; i++) sb_printf(&p, "%s%s", i ? ", " : " (", TN[g_par[i].t]);
+    for (int i = 0; decl && i < g_npar; i++) sb_printf(&p, "%s%s", i ? ", " : " (", (g_tz ? TNZ : TN)[g_par[i].t]);
     sb_str(&p, g_npar && decl ? ") AS " : " AS "); /* the statement whole: sb_printf takes pieces of 512 bytes (P2 S13: a
                                                     * write runs past) */
     sb_str(&p, text->p);
@@ -4508,7 +4568,8 @@ static void alter_add(void)
         if (!g_eng[d].on) continue;
         for (int k = 0; k < 5; k++) {
             sb b = {0};
-            sb_printf(&b, "ALTER TABLE t ADD %s%s %s", d == D_MS ? "" : "COLUMN ", TC[4 + k].name, ALT_TY[k][d]);
+            sb_printf(&b, "ALTER TABLE t ADD %s%s %s", d == D_MS ? "" : "COLUMN ", TC[4 + k].name,
+                      g_tz && k == 4 ? TZ_TY[d] : ALT_TY[k][d]); /* --tz: ts an instant's type */
             if (d == D_MS) sb_str(&b, " NULL");
             if (!dv[k].null) {
                 sb_str(&b, " DEFAULT ");
@@ -4626,6 +4687,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--no-views")) g_views = false; /* P2 S7 */
         else if (!strcmp(argv[i], "--ckey")) g_ckey = true; /* P2 F4 */
         else if (!strcmp(argv[i], "--alter")) g_alter = true; /* P2 F1 */
+        else if (!strcmp(argv[i], "--tz")) g_tz = true; /* P2: time zones */
         else if (!strcmp(argv[i], "--no-view-audit")) g_view_audit = false; /* P2 S7b */
         else if (!strcmp(argv[i], "--audit") && i + 1 < argc) snprintf(g_audit_bin, sizeof g_audit_bin, "%s", argv[++i]);
         else if (!strcmp(argv[i], "--ping")) ping = true; /* connect to every engine named, then stop (run.sh waits on it) */

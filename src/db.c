@@ -20,6 +20,7 @@
 #include "pool.h"
 #include "repl.h"
 #include "seed.h"
+#include "tz.h"
 #include "writer.h"
 #include "vendor/monocypher/monocypher.h"
 
@@ -1772,7 +1773,8 @@ static int lake_lookup_pk(const imdb_table *t, const imdb_value *kv, uint64_t sn
             imdb_segzone zt; /* F1: by the version that built the segment (a key column is in every version) */
             const imdb_segzone *z = imdb_seg_zone(t, g, (uint32_t)t->s.key[c], &zt);
             uint8_t ty = t->s.cols[t->s.key[c]].type; /* the columns whose zone map bounds values (lake.c's is_int_col) */
-            out = (ty == IMDB_T_INT64 || ty == IMDB_T_DECIMAL || ty == IMDB_T_TIMESTAMP || ty == IMDB_T_FLOAT64) &&
+            out = (ty == IMDB_T_INT64 || ty == IMDB_T_DECIMAL || ty == IMDB_T_TIMESTAMP || ty == IMDB_T_FLOAT64 ||
+                   ty == IMDB_T_TIMESTAMPTZ) &&
                   (!z->has || kv[c].i < z->min || kv[c].i > z->max);
         }
         if (out) continue; /* no image read */
@@ -4686,6 +4688,11 @@ int imdb_close(imdb_db *db)
     pthread_mutex_destroy(&db->events_lock);
     pthread_mutex_destroy(&db->segcache.lock);
     pthread_cond_destroy(&db->segcache.loaded); /* P2 S14 */
+    for (uint32_t i = 0; i < db->ntz; i++) { /* P2: the zones */
+        imdb_tz_free(db->tz[i]);
+        imdb_free(db->tz[i]);
+    }
+    pthread_mutex_destroy(&db->tz_lock);
     imdb_free(db);
     return rc;
 }
@@ -4765,6 +4772,26 @@ int imdb_open(const char *path, const imdb_open_opts *o, imdb_db **out, imdb_err
         pthread_mutex_destroy(&db->segcache.lock);
         imdb_free(db);
         return imdb_fail(e, IMDB_ERR_NOMEM, "cannot make the segment cache's condition");
+    }
+    if (pthread_mutex_init(&db->tz_lock, NULL) != 0) { /* P2: fourth; imdb_close destroys it too */
+        pthread_cond_destroy(&db->segcache.loaded);
+        pthread_mutex_destroy(&db->events_lock);
+        pthread_mutex_destroy(&db->segcache.lock);
+        imdb_free(db);
+        return imdb_fail(e, IMDB_ERR_NOMEM, "cannot make the zones' lock");
+    }
+    {
+        const char *zr = o && o->zoneinfo ? o->zoneinfo : "/usr/share/zoneinfo";
+        size_t zl = strlen(zr);
+        if (!zl || zl >= sizeof db->tz_root) {
+            pthread_mutex_destroy(&db->tz_lock);
+            pthread_cond_destroy(&db->segcache.loaded);
+            pthread_mutex_destroy(&db->events_lock);
+            pthread_mutex_destroy(&db->segcache.lock);
+            imdb_free(db);
+            return imdb_fail(e, IMDB_ERR_LIMIT, "--zoneinfo: a path of 1 to %u bytes", IMDB_MAX_PATH - 1);
+        }
+        memcpy(db->tz_root, zr, zl + 1);
     }
     db->dirfd = db->logfd = db->lockfd = db->logdirfd = db->durfd = db->anchorfd = db->anchor_lockfd = -1;
     db->stats_fd = -1; /* P1 M1: 0 is a file descriptor */
@@ -5663,4 +5690,38 @@ int imdb_hist_copy(imdb_schema_hist *dst, const imdb_schema_hist *src, imdb_err 
         if (txt[p]) dst->tcol[p].missing.s = txt[p];
     }
     return IMDB_OK;
+}
+
+/* P2: a zone by name (db.h). The table holds what was ever named, each zone its own allocation, never moved or freed
+ * before close, so a pointer handed out stays good while the handle lives; the load is exempt from a statement's memory
+ * ceiling (the handle's, not the statement's: a 1 MiB statement naming its first zone is not refused for it) */
+int imdb_db_zone(imdb_db *db, const char *name, size_t len, const struct imdb_tz **out, imdb_err *e)
+{
+    *out = NULL;
+    if (imdb_tz_builtin_utc(name, len)) {
+        *out = &imdb_tz_utc_zone;
+        return IMDB_OK;
+    }
+    if (!imdb_tz_name_ok(name, len))
+        return imdb_fail(e, IMDB_ERR_INVALID, "a time zone is named by letters, digits and / _ - + (at most %u bytes, no "
+                                              "empty, . or .. part)", IMDB_MAX_TZ_NAME);
+    pthread_mutex_lock(&db->tz_lock);
+    int rc = IMDB_OK;
+    for (uint32_t i = 0; i < db->ntz; i++)
+        if (strlen(db->tz[i]->name) == len && !memcmp(db->tz[i]->name, name, len)) {
+            *out = db->tz[i];
+            pthread_mutex_unlock(&db->tz_lock);
+            return IMDB_OK;
+        }
+    if (db->ntz >= IMDB_MAX_TZ_ZONES) {
+        rc = imdb_fail(e, IMDB_ERR_LIMIT, "more than %u time zones named in this database's life", IMDB_MAX_TZ_ZONES);
+    } else {
+        imdb_tz *z = NULL;
+        imdb_heap_exempt_begin();
+        rc = imdb_tz_load(db->tz_root, name, len, &z, e);
+        imdb_heap_exempt_end();
+        if (!rc) *out = db->tz[db->ntz++] = z;
+    }
+    pthread_mutex_unlock(&db->tz_lock);
+    return rc;
 }

@@ -123,6 +123,8 @@ int main(int argc, char **argv)
         {"qmem", qmem_tests, &qmem_ntests},
         {"ckey", ckey_tests, &ckey_ntests}, /* P2 F4 */
         {"alter", alter_tests, &alter_ntests}, /* P2 F1 */
+        {"tz", tz_tests, &tz_ntests}, /* P2: time zones */
+        {"tzsql", tzsql_tests, &tzsql_ntests}, /* P2: time zones through the engine */
     };
     int failed = 0, run = 0;
     for (size_t g = 0; g < sizeof groups / sizeof *groups; g++) {

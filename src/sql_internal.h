@@ -17,7 +17,7 @@ typedef struct sql_tok {
 
 /* LIT_EXPR: not a literal but an expression's tree (ex), where a value may be one: an UPDATE's SET, an INSERT's
  * VALUES (a WHERE condition that is not today's col op literal is a tree too: sql_cmp lx) */
-enum { LIT_INT = 1, LIT_DEC, LIT_STR, LIT_BOOL, LIT_TS, LIT_PARAM, LIT_FLOAT, LIT_NULL, LIT_EXPR };
+enum { LIT_INT = 1, LIT_DEC, LIT_STR, LIT_BOOL, LIT_TS, LIT_PARAM, LIT_FLOAT, LIT_NULL, LIT_EXPR, LIT_TSTZ }; /* LIT_TSTZ: P2 */
 
 typedef struct sql_lit {
     uint8_t kind;
@@ -64,7 +64,8 @@ enum { CMP_EQ = 1, CMP_NE, CMP_LT, CMP_LE, CMP_GT, CMP_GE, CMP_BETWEEN, CMP_ISNU
 
 /* P2 S1: the functions, each with one definition (design.md §5, Functions) */
 enum { FN_ABS = 1, FN_SIGN, FN_ROUND, FN_CEIL, FN_FLOOR, FN_MOD, FN_LENGTH, FN_SUBSTR, FN_TRIM, FN_LTRIM, FN_RTRIM,
-       FN_POSITION, FN_COALESCE, FN_NULLIF, FN_LOWER, FN_UPPER, FN_REPLACE, FN_CONCAT };
+       FN_POSITION, FN_COALESCE, FN_NULLIF, FN_LOWER, FN_UPPER, FN_REPLACE, FN_CONCAT,
+       FN_DATE_TRUNC, FN_TIMEZONE }; /* P2: date_trunc(unit, x [, zone]); x AT TIME ZONE z as timezone(z, x) */
 
 /* col op a (BETWEEN: a AND b), today's form, whose literals bind to the column (an index may serve it); or with lx a
  * residual: a boolean tree (1c), tested on every row that passed the bound conjuncts, kept when TRUE */
@@ -101,6 +102,7 @@ enum {
     ST_PREPARE, ST_EXECUTE, ST_DEALLOCATE, ST_SHOW_PREPARED, /* P2 S9 */
     ST_COPY_FROM, ST_COPY_TO, /* P2 S10 */
     ST_CREATE_VIEW, ST_DROP_VIEW, ST_SHOW_VIEWS, /* P2 S7 */
+    ST_SHOW_TIMEZONE, /* P2: SHOW TIME ZONE, SHOW timezone */
 };
 
 /* P2 S3: a join's kind as written (RIGHT keeps side 1's rows, FULL both sides'; CROSS and FROM a, b have no ON) */
@@ -228,6 +230,8 @@ typedef struct sql_stmt {
     bool has_alter_def;
     char set_name[IMDB_MAX_IDENT + 1];          /* SET */
     char set_value[IMDB_MAX_IDENT + 1];
+    bool set_zone;                              /* P2: SET TIME ZONE / timezone: set_value the zone's name as written, "" for
+                                                 * DEFAULT or LOCAL (UTC) */
     uint64_t n;                                 /* SHOW LOG n */
     uint8_t iso;                                /* BEGIN / SET TRANSACTION ... ISOLATION LEVEL */
     char savepoint[IMDB_MAX_IDENT + 1];         /* SAVEPOINT, ROLLBACK TO, RELEASE */
@@ -284,6 +288,9 @@ typedef struct imdb_xnode {
     uint16_t gslot;          /* P2 S2: a GROUP BY key's subtree read over a group: slots[gslot - 1], else 0 */
     const imdb_xset *set;    /* P2 S4: an EX_SUBQ of IN's values: the set */
     imdb_xval k;             /* EX_LIT: the constant */
+    uint8_t unit;            /* P2: date_trunc's unit (IMDB_TRUNC_*), from its constant at bind (a probe's too: it is lexical) */
+    const struct imdb_tz *tz; /* P2: AT TIME ZONE's or date_trunc's zone when a constant names it, looked up once a run (never
+                              * in a probe: a view's re-bind never reads the host's zones); NULL: the value's, per row */
 } imdb_xnode;
 
 #define IMDB_X_MAX_SCALE 38
@@ -328,6 +335,14 @@ void imdb_xarena_free(imdb_xarena *a);
 
 /* P2 S1: what an evaluation may need of its statement: the statement's cancel and deadline (xcheck), asked every
  * 2^16 steps of a function whose work grows with its operands (LIKE), so no single value outlasts a timeout */
+/* P2: a zone's offset where it last held (imdb_tz_offset_span): rows in time order read the transitions once a span */
+struct imdb_tz;
+typedef struct imdb_xtzc {
+    const struct imdb_tz *z;
+    int64_t lo, hi; /* [lo, hi) microseconds, UTC */
+    int32_t off;
+} imdb_xtzc;
+
 typedef struct imdb_xenv {
     int (*check)(void *ctx, imdb_err *e);
     void *ctx;
@@ -336,6 +351,12 @@ typedef struct imdb_xenv {
     /* P2 S4b: a correlated subquery's value (out), or IN's set (set), on this row: the statement's executor runs it
      * with the row's values (memoized); NULL where none can be (an internal error if needed) */
     int (*subq)(void *ctx, uint16_t k, const imdb_value *row, imdb_xval *out, const imdb_xset **set, imdb_err *e);
+    /* P2's zones: the session's (NULL: UTC), a zone by its name (the handle's table, imdb_db_zone; NULL where none can be
+     * named: an internal error if needed), the offsets last read */
+    const struct imdb_tz *zone;
+    int (*zone_get)(void *ctx, const uint8_t *name, uint32_t len, const struct imdb_tz **out, imdb_err *e);
+    imdb_xtzc tzc[4];
+    uint8_t tzc_next;
 } imdb_xenv;
 /* the tree at k on a row (columns by the bound col) and the aggregates' final values (slots); env may be NULL (no
  * cancellation: constants) */
@@ -381,6 +402,28 @@ int imdb_x_fn(uint8_t fn, const imdb_xval *a, uint8_t nargs, uint8_t rt, uint8_t
 /* P2 S1: v converted to column c's type by CAST's rule (design.md §5, CAST): exact or refused, never rounded */
 int imdb_x_cast(const imdb_xval *v, const imdb_column *c, imdb_xenv *env, imdb_xval *out, imdb_err *e);
 /* P2 S1: s LIKE p with the escape character esc (0: none): -1 when p ends in an unfinished escape */
+/* P2: date_trunc's units, finest first: an hour or shorter keeps an instant's own offset, a day or longer is truncated
+ * in the zone's wall-clock time and that time's instant found by the zone's rule (PostgreSQL's timestamptz_trunc) */
+enum { IMDB_TRUNC_US = 1, IMDB_TRUNC_MS, IMDB_TRUNC_SECOND, IMDB_TRUNC_MINUTE, IMDB_TRUNC_HOUR, IMDB_TRUNC_DAY,
+       IMDB_TRUNC_WEEK, IMDB_TRUNC_MONTH, IMDB_TRUNC_QUARTER, IMDB_TRUNC_YEAR, IMDB_TRUNC_DECADE, IMDB_TRUNC_CENTURY,
+       IMDB_TRUNC_MILLENNIUM };
+/* P2: a unit by its name (PostgreSQL's names, any case, the plural too) */
+int imdb_x_trunc_unit(const uint8_t *s, uint32_t n, uint8_t *unit, imdb_err *e);
+/* P2: zone z's offset at t (microseconds, UTC) through env's span cache (env NULL: none); z NULL: UTC */
+int32_t imdb_x_tz_off(imdb_xenv *env, const struct imdb_tz *z, int64_t t_us);
+/* P2: date_trunc of v: a TIMESTAMP's (z NULL: its wall-clock time) or a TIMESTAMPTZ's in zone z; *lo and *hi, when not
+ * NULL, the span of v's whose result is the same (a caller's cache: the GROUP BY key's); a result before 0001-01-01 or
+ * past 9999 an error */
+int imdb_x_trunc(uint8_t unit, bool tz, const struct imdb_tz *z, imdb_xenv *env, int64_t v, int64_t *out, int64_t *lo,
+                 int64_t *hi, imdb_err *e);
+/* P2: date_trunc(unit, v AT TIME ZONE z): the wall clock of instant v in z truncated (a TIMESTAMP), and the span of v's
+ * whose result is the same (the GROUP BY key's cache) */
+int imdb_x_trunc_local(uint8_t unit, const struct imdb_tz *z, imdb_xenv *env, int64_t v, int64_t *out, int64_t *lo,
+                       int64_t *hi, imdb_err *e);
+/* P2: a TIMESTAMPTZ literal's instant (imdb_parse_timestamptz): its offset, its zone named (env->zone_get), or the
+ * session's zone (env->zone); where env->zone_get is NULL (a bind-only pass) a named zone is not read and the value is
+ * 0: only its type is asked for */
+int imdb_x_tstz_text(const char *s, size_t n, imdb_xenv *env, int64_t *out, imdb_err *e);
 int imdb_x_like(const uint8_t *s, uint32_t n, const uint8_t *p, uint32_t m, uint32_t esc, imdb_xenv *env, bool *match,
                 imdb_err *e);
 

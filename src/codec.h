@@ -25,7 +25,9 @@ typedef enum imdb_type {
     IMDB_T_BOOL = 4,
     IMDB_T_TIMESTAMP = 5, /* microseconds since 1970-01-01 00:00:00 UTC */
     IMDB_T_FLOAT64 = 6,   /* finite IEEE-754 binary64, held as its order-preserving key (imdb_f64_key) */
+    IMDB_T_TIMESTAMPTZ = 7, /* P2: an instant, microseconds since 1970-01-01 00:00:00 UTC, shown in the session's zone */
 } imdb_type;
+#define IMDB_T_LAST IMDB_T_TIMESTAMPTZ /* the highest tag a schema may hold */
 
 #define IMDB_COL_PK       0x01
 #define IMDB_COL_SUBJECT  0x02
@@ -119,12 +121,28 @@ int imdb_parse_int64(const char *s, size_t n, int64_t *out, imdb_err *e);
 int imdb_parse_float64(const char *s, size_t n, int64_t *key, imdb_err *e);
 /* 'YYYY-MM-DD[ HH:MM:SS[.ffffff]]' UTC only. */
 int imdb_parse_timestamp(const char *s, size_t n, int64_t *out, imdb_err *e);
+/* P2: a TIMESTAMPTZ literal: a TIMESTAMP's text (its wall-clock time in local), then nothing (the session's zone
+ * decides), an offset (Z, +HH, +HHMM, +HH:MM or +HH:MM:SS, at most 15:59:59 as PostgreSQL's, a space before it
+ * allowed) or a space and a zone's name (zoff, zlen: where in s; the caller looks it up) */
+typedef struct imdb_tzlit {
+    int64_t local;
+    bool has_off;
+    int32_t off;     /* seconds east of UTC */
+    uint32_t zoff, zlen; /* the zone's name, when zlen */
+} imdb_tzlit;
+int imdb_parse_timestamptz(const char *s, size_t n, imdb_tzlit *out, imdb_err *e);
 void imdb_format_value(const imdb_value *v, imdb_buf *out);       /* plain */
 void imdb_format_int64(int64_t v, imdb_buf *out);                  /* "%lld", without printf */
 void imdb_format_value_safe(const imdb_value *v, imdb_buf *out);  /* terminal-safe */
 void imdb_format_decimal(int64_t v, int scale, imdb_buf *out);
 void imdb_format_i128(__int128 v, int scale, imdb_buf *out);
+/* the proleptic Gregorian calendar: days since 1970-01-01 (P2: date_trunc's) */
+int64_t imdb_days_from_civil(int64_t y, int m, int d);
+void imdb_civil_from_days(int64_t z, int64_t *y, int *m, int *d);
 void imdb_format_timestamp(int64_t us, imdb_buf *out);
+/* P2: a TIMESTAMPTZ in a zone whose offset at it is off (seconds east): its local time as a TIMESTAMP's, then the
+ * offset as PostgreSQL writes it: +HH, +HH:MM, or +HH:MM:SS (a local mean time's) */
+void imdb_format_timestamptz(int64_t utc_us, int32_t off, imdb_buf *out);
 /* The shortest of %.15g, %.16g, %.17g that reads back as the same double (C locale). */
 void imdb_format_float64(int64_t key, imdb_buf *out);
 
