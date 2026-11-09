@@ -948,7 +948,7 @@ static void manifest_lie(const char *dir, const char *kind)
         nb.p[nb.len - 191] = (uint8_t)(c >> 8);
     } else if (strcmp(kind, "section") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION && mn > 144 + 144) {
         imdb_buf_put(&nb, man, mn); /* the format design's slice 1: the nine reserved sections end it, 16 bytes each */
-        nb.p[nb.len - 132] = 1;     /* the sequences section's u32 count: a later format's */
+        nb.p[nb.len - 116] = 1;     /* the enums section's u32 count: a later format's (F2a-2: the sequences section, 3, is read now) */
     } else if (strcmp(kind, "nsections") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION && mn > 144 + 144) {
         imdb_buf_put(&nb, man, mn);
         nb.p[12] = 10; /* the header's section count: ten, with eleven there */
@@ -980,6 +980,17 @@ static void manifest_lie(const char *dir, const char *kind)
             if (memcmp(nb.p + i, pat, sizeof pat) == 0) at = i + sizeof pat;
         if (!at) exit(1);
         imdb_le64(nb.p + at, imdb_get_le64(nb.p + at) + 1);
+    } else if (strcmp(kind, "seq-state") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION) {
+        /* F2a-2: the sequence fu_seq's last value in the manifest one increment on (its definition: u32 id, u8 6,
+         * "fu_seq", u8 width, then increment, min, max and start, then last): aligned, in bounds, another state */
+        imdb_buf_put(&nb, man, mn);
+        static const uint8_t pat[7] = {6, 'f', 'u', '_', 's', 'e', 'q'};
+        size_t at = 0;
+        for (size_t i = 0; i + sizeof pat + 41 <= mn && !at; i++)
+            if (memcmp(nb.p + i, pat, sizeof pat) == 0) at = i + sizeof pat;
+        if (!at) exit(1);
+        int64_t inc = (int64_t)imdb_get_le64(nb.p + at + 1);
+        imdb_le64(nb.p + at + 33, imdb_get_le64(nb.p + at + 33) + (uint64_t)inc);
     } else if (strcmp(kind, "create-default") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION) {
         /* F2a: version 1's DEFAULTs (manifest 9) of a table with no ALTER whose column 2 is an INT64 DEFAULT 77: u32 0
          * (no ALTER), u16 1, u16 column 2, u8 kind 1, then the u64 value, made 78: the history still ends at the schema */
@@ -994,7 +1005,7 @@ static void manifest_lie(const char *dir, const char *kind)
         fputs("imdb-forge: manifest-lie DIR boundary (none yet) | column (an index in the last table) | section (a reserved"
               " one not empty) | nsections (ten) | order (a reserved one out of order) | later (the last one a later"
               " format's, longer) | keylist (table 0's key list another column) | default (an added column n's DEFAULT"
-              " another in the history) | create-default (a CREATE's DEFAULT 77 of column 2 another)\n", stderr);
+              " another in the history) | create-default (a CREATE's DEFAULT 77 of column 2 another) | seq-state (fu_seq's last on)\n", stderr);
         exit(1);
     }
     if (nb.err) exit(1);
@@ -1211,6 +1222,24 @@ static void index_lie(const char *dir, const char *kind)
         append_commit_digest(dir, db, &op, 1, &sg, NULL, dg);
         imdb_close(db);
         return;
+    } else if (strcmp(kind, "seq-back") == 0 || strcmp(kind, "seq-drop-owned") == 0) {
+        /* F2a-2: a SEQ_ADVANCE of the first sequence to a mark one increment below its last (replay's monotone rule), or
+         * a DROP SEQUENCE of the first sequence an IDENTITY owns: each signed, the encoder's places kept */
+        bool back = strcmp(kind, "seq-back") == 0;
+        const imdb_sequence *s = NULL;
+        for (uint32_t i = 0; i < db->nseqs && !s; i++)
+            if (!db->seqs[i].dropped_at && (back ? db->seqs[i].called : db->seqs[i].owner != UINT32_MAX)) s = &db->seqs[i];
+        if (!s) {
+            fputs("imdb-forge: index-lie seq-back needs a used sequence, seq-drop-owned an IDENTITY's\n", stderr);
+            exit(1);
+        }
+        op.code = back ? IMDB_OP_SEQ_ADVANCE : IMDB_OP_DROP_SEQUENCE;
+        op.seq = s->d.id;
+        op.sval = s->last - s->d.inc;
+        op.iname = NULL;
+        append_commit(dir, db, &op, 1, &sg, NULL);
+        imdb_close(db);
+        return;
     } else if (strcmp(kind, "create-default-clock") == 0) {
         /* F2a: CREATE TABLE dz (id INT64 PRIMARY KEY, at TIMESTAMPTZ) with its retention and op 23 giving at
          * CURRENT_TIMESTAMP, which the encoder takes; the kind byte then made LOCALTIME (5), a TIME's clock */
@@ -1296,7 +1325,7 @@ static void index_lie(const char *dir, const char *kind)
     } else {
         fputs("imdb-forge: index-lie DIR column | duplicate (needs an index) | drop-absent | unique-dup (needs a unique index) | "
               "pk-dup (a live row in the last table) | alter-view (ADD COLUMN k to table 0) | alter-not-null | "
-              "alter-drop-indexed | date-range (a DATE column and an INT64 key in the last table) | varchar-long (a VARCHAR(n <= 200)) | alter-varchar-default | create-default-clock | alter-clock-type (a TEXT column in table 0)\n", stderr);
+              "alter-drop-indexed | date-range (a DATE column and an INT64 key in the last table) | varchar-long (a VARCHAR(n <= 200)) | alter-varchar-default | create-default-clock | alter-clock-type (a TEXT column in table 0) | seq-back | seq-drop-owned\n", stderr);
         exit(1);
     }
     append_commit(dir, db, &op, 1, &sg, NULL);

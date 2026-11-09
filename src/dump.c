@@ -79,6 +79,13 @@ static int literal_text(dumper *d, const imdb_value *v, imdb_err *e)
 
 /* F2a: a column's write default as CREATE TABLE spells it (an INSERT leaving the column out writes it: a CREATE's, an
  * ADD's or a SET DEFAULT's), nothing when it has none: a literal, or the clock's name */
+/* F2a-2: a sequence's options as CREATE SEQUENCE and an IDENTITY spell them, each written out */
+static void seq_opts_text(dumper *d, const imdb_sequence *s)
+{
+    imdb_buf_printf(&d->b, "INCREMENT BY %lld MINVALUE %lld MAXVALUE %lld START WITH %lld", (long long)s->d.inc,
+                    (long long)s->d.min, (long long)s->d.max, (long long)s->d.start);
+}
+
 static int default_text(dumper *d, const imdb_table *t, uint16_t c, imdb_err *e)
 {
     static const char *const clock[] = {[IMDB_DEFK_CURRENT_TIMESTAMP] = "CURRENT_TIMESTAMP",
@@ -86,7 +93,18 @@ static int default_text(dumper *d, const imdb_table *t, uint16_t c, imdb_err *e)
                                         [IMDB_DEFK_CURRENT_DATE] = "CURRENT_DATE", [IMDB_DEFK_LOCALTIME] = "LOCALTIME"};
     if (!t->hist.nvers) return IMDB_OK;
     const imdb_tcol *tc = &t->hist.tcol[t->hist.vers[t->hist.nvers - 1].pos[c]];
-    if (tc->wclock > IMDB_DEFK_VALUE && tc->wclock <= IMDB_DEFK_LAST) {
+    const imdb_sequence *s = tc->wclock >= IMDB_DEFK_IDENTITY_ALWAYS && tc->wseq < d->s.db->nseqs ? &d->s.db->seqs[tc->wseq] : NULL;
+    if (s && tc->wclock != IMDB_DEFK_NEXTVAL) { /* F2a-2: an IDENTITY, its sequence's options written out */
+        imdb_buf_printf(&d->b, " GENERATED %s AS IDENTITY (", tc->wclock == IMDB_DEFK_IDENTITY_ALWAYS ? "ALWAYS" : "BY DEFAULT");
+        seq_opts_text(d, s);
+        imdb_buf_put_str(&d->b, ")");
+        return IMDB_OK;
+    }
+    if (s) { /* DEFAULT nextval('s') */
+        imdb_buf_printf(&d->b, " DEFAULT nextval('%s')", s->d.name);
+        return IMDB_OK;
+    }
+    if (tc->wclock > IMDB_DEFK_VALUE && tc->wclock <= IMDB_DEFK_CLOCK_LAST) {
         imdb_buf_printf(&d->b, " DEFAULT %s", clock[tc->wclock]);
         return IMDB_OK;
     }
@@ -189,6 +207,14 @@ int imdb_dump(imdb_db *db, uint32_t batch, imdb_copy_write_fn wr, void *arg, imd
                         (unsigned long long)d->s.txn.snap, head, (unsigned)db->meta.digest_alg);
         rc = put(d, e);
     }
+    for (uint32_t i = 0; !rc && i < db->nseqs; i++) { /* F2a-2: the sequences no column owns, before the tables naming them */
+        const imdb_sequence *s = &db->seqs[i];
+        if (s->dropped_at || s->owner != UINT32_MAX) continue;
+        imdb_buf_printf(&d->b, "CREATE SEQUENCE %s AS %s ", s->d.name, imdb_int_name(s->d.width));
+        seq_opts_text(d, s);
+        imdb_buf_put_str(&d->b, ";\n");
+        rc = put(d, e);
+    }
     for (uint32_t i = 0; !rc && i < n; i++) {
         const imdb_table *t = ts[i];
         if (create_text(d, t, e)) {
@@ -217,6 +243,12 @@ int imdb_dump(imdb_db *db, uint32_t batch, imdb_copy_write_fn wr, void *arg, imd
         imdb_buf_put_str(&d->b, ";\n");
         rc = put(d, e);
         nviews++;
+    }
+    for (uint32_t i = 0; !rc && i < db->nseqs; i++) { /* F2a-2: each sequence's state, after the rows (pg_dump's form) */
+        const imdb_sequence *s = &db->seqs[i];
+        if (s->dropped_at) continue;
+        imdb_buf_printf(&d->b, "SELECT setval('%s', %lld, %s);\n", s->d.name, (long long)s->last, s->called ? "true" : "false");
+        rc = put(d, e);
     }
     if (!rc) {
         imdb_buf_printf(&d->b, "-- the end of the dump: %u tables, %u views, %llu rows\n", (unsigned)n, (unsigned)nviews,

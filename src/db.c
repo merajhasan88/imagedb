@@ -350,6 +350,7 @@ int imdb_hist_first(imdb_schema_hist *h, const imdb_schema *s, imdb_err *e)
         h->tcol[c].missing = (imdb_value){.type = s->cols[c].type, .scale = s->cols[c].scale, .null = true};
         h->tcol[c].wdef = h->tcol[c].cdef = h->tcol[c].missing; /* F2a: a CREATE's DEFAULTs after, by imdb_hist_create_defaults */
         h->tcol[c].cclock = h->tcol[c].wclock = 0;
+        h->tcol[c].cseq = h->tcol[c].wseq = 0;
         h->tcol[c].wver = -1;
         h->tcol[c].added = 1;
     }
@@ -380,9 +381,11 @@ int imdb_hist_create_defaults(imdb_schema_hist *h, const imdb_coldef *defs, uint
         } else {
             tc->cdef = tc->missing; /* NULL, of the column's type */
             tc->cclock = d->kind;
+            tc->cseq = d->seq; /* F2a-2: the IDENTITY and NEXTVAL kinds' */
         }
         tc->wdef = tc->cdef;
         tc->wclock = tc->cclock;
+        tc->wseq = tc->cseq;
         tc->wver = -1;
     }
     return IMDB_OK;
@@ -1880,6 +1883,7 @@ int imdb_begin(imdb_db *db, imdb_err *e)
     if (writable(db, e)) return e->code;
     if (db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "transaction already open");
     db->in_txn = true;
+    db->ntxseq = 0; /* F2a-2 */
     db->ntx = 0;
     db->tx_bytes = 0;
     db->nundo = 0;
@@ -1944,6 +1948,8 @@ static void tx_op_free(imdb_op *o)
     imdb_free(o->iname);
     imdb_free(o->aname); /* F1: op 22's new name */
     imdb_free(o->defs);  /* F2a: COLUMN_DEFAULTS' */
+    imdb_free(o->sdef);  /* F2a-2: CREATE_SEQUENCE's */
+    o->sdef = NULL;
     o->defs = NULL;
     imdb_viewdef_free(o->vdef);
     o->schema = NULL;
@@ -1989,6 +1995,25 @@ static void undo_one(imdb_db *db, const imdb_undo *u)
         if (imdb_index_find(db, db->tx[u->vid].iname, &pos) == db->t[u->table]) imdb_index_remove(db->t[u->table], pos);
         break;
     }
+    case UNDO_SEQ_CREATE: /* F2a-2: this transaction's CREATE SEQUENCE (the newest) */
+        if (u->table + 1 == db->nseqs) {
+            db->nseqs--;
+            for (uint32_t k = 0; k < db->ntxseq; k++) /* the transaction's nextval of it goes too (the advisor, 16:4x: a
+                                                       * ROLLBACK TO SAVEPOINT before the CREATE) */
+                if (db->txseq[k] == u->table) {
+                    memmove(&db->txseq[k], &db->txseq[k + 1], (db->ntxseq - k - 1) * sizeof *db->txseq);
+                    db->ntxseq--;
+                    break;
+                }
+        }
+        break;
+    case UNDO_SEQ_SET: /* its setval: the state before it */
+        if (u->table < db->nseqs) {
+            db->seqs[u->table].last = (int64_t)u->vid;
+            db->seqs[u->table].base = (int64_t)u->prev_head;
+            db->seqs[u->table].called = u->subj_created;
+        }
+        break;
     case UNDO_UNINDEX: { /* its DROP INDEX: the definition comes back (it was there: there is room) */
         imdb_err e2 = {0};
         imdb_table *ut = db->t[u->table];
@@ -2023,6 +2048,7 @@ void imdb_rollback(imdb_db *db)
     imdb_savepoint sp = {0, 0};
     imdb_savepoint_restore(db, sp);
     db->in_txn = false;
+    db->ntxseq = 0; /* F2a-2: what nextval handed out stays handed out (gaps) */
     db->tx_time = 0;
 }
 
@@ -2036,8 +2062,9 @@ int imdb_create_table_ex(imdb_db *db, imdb_schema *s, uint64_t retention_us, imd
     if (!db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "no transaction");
     if (!imdb_retention_ok(retention_us))
         return imdb_fail(e, IMDB_ERR_INVALID, "RETENTION is a second to a century, or FOREVER");
-    if (imdb_view_by_name(db, s->name)) /* P2 S7: one name space for the live tables and views */
+    if (imdb_view_by_name(db, s->name)) /* P2 S7: one name space for the live tables, views (and F2a-2's sequences) */
         return imdb_fail(e, IMDB_ERR_INVALID, "view %s exists already", s->name);
+    if (imdb_seq_by_name(db, s->name)) return imdb_fail(e, IMDB_ERR_INVALID, "sequence %s exists already", s->name);
     s->id = db->nt;
     if (imdb_table_new(db, s, e)) return e->code;
     imdb_undo u = {.kind = UNDO_CREATE, .table = s->id};
@@ -2102,7 +2129,8 @@ int imdb_create_table_defs(imdb_db *db, imdb_schema *s, uint64_t retention_us, c
     op->table = s->id;
     op->defs = own;
     op->ndefs = ndefs;
-    return imdb_hist_create_defaults(&db->t[s->id]->hist, own, ndefs, e);
+    if (imdb_hist_create_defaults(&db->t[s->id]->hist, own, ndefs, e)) return e->code;
+    return imdb_seq_own(db, s->id, own, ndefs, 0, e); /* F2a-2: an IDENTITY's sequence, made in this transaction */
 }
 
 int imdb_set_retention(imdb_db *db, imdb_table *t, uint64_t retention_us, imdb_err *e)
@@ -2210,6 +2238,8 @@ int imdb_sver_next(const imdb_schema_hist *h, const imdb_sver *cur, const imdb_o
         return IMDB_OK;
     }
     case IMDB_ALTER_SET_DEFAULT: {
+        if (h && (h->tcol[o->apos].cclock == IMDB_DEFK_IDENTITY_ALWAYS || h->tcol[o->apos].cclock == IMDB_DEFK_IDENTITY))
+            return imdb_fail(e, IMDB_ERR_INVALID, "column %s is an IDENTITY: its values are its sequence's", col->name);
         imdb_err e2 = {0};
         if (o->acol.type != col->type || o->acol.precision != col->precision || o->acol.scale != col->scale ||
             o->acol.vlen != col->vlen || /* F3c */
@@ -2218,10 +2248,14 @@ int imdb_sver_next(const imdb_schema_hist *h, const imdb_sver *cur, const imdb_o
         return IMDB_OK; /* catalog state: the schema and its positions stay, so the version's hash does */
     }
     case IMDB_ALTER_DROP_DEFAULT:
+        if (h && (h->tcol[o->apos].cclock == IMDB_DEFK_IDENTITY_ALWAYS || h->tcol[o->apos].cclock == IMDB_DEFK_IDENTITY))
+            return imdb_fail(e, IMDB_ERR_INVALID, "column %s is an IDENTITY: its values are its sequence's", col->name);
         if (h && h->tcol[o->apos].wdef.null && !h->tcol[o->apos].wclock) /* F2a: a clock default is one to drop */
             return imdb_fail(e, IMDB_ERR_INVALID, "column %s has no DEFAULT", col->name);
         return IMDB_OK;
     case IMDB_ALTER_SET_DEFAULT_CLOCK: /* F2a: a clock its column's type takes */
+        if (h && (h->tcol[o->apos].cclock == IMDB_DEFK_IDENTITY_ALWAYS || h->tcol[o->apos].cclock == IMDB_DEFK_IDENTITY))
+            return imdb_fail(e, IMDB_ERR_INVALID, "column %s is an IDENTITY: its values are its sequence's", col->name);
         if (!imdb_defk_fits(o->aclock, col->type))
             return imdb_fail(e, IMDB_ERR_INVALID, "column %s: that clock value is not of its type", col->name);
         return IMDB_OK;
@@ -2286,7 +2320,7 @@ int imdb_alter_check(imdb_db *db, imdb_table *t, const imdb_op *o, imdb_err *e)
         return IMDB_OK;
     }
     case IMDB_ALTER_RENAME_TABLE:
-        if (imdb_table_by_name(db, o->aname) || imdb_view_by_name(db, o->aname))
+        if (imdb_table_by_name(db, o->aname) || imdb_view_by_name(db, o->aname) || imdb_seq_by_name(db, o->aname))
             return imdb_fail(e, IMDB_ERR_CONSTRAINT, "a table or view %s already exists", o->aname);
         /* fall through */
     case IMDB_ALTER_RENAME_COLUMN: {
@@ -2365,6 +2399,7 @@ void imdb_hist_install(imdb_schema_hist *h, const imdb_op *o, uint64_t seq)
         tc->cdef = (imdb_value){.type = o->acol.type, .scale = o->acol.scale, .null = true}; /* F2a: a CREATE's alone */
         tc->cclock = 0;
         tc->wclock = o->aclock; /* F2a: DEFAULT now(): the older rows read the ALTER's value, a write the clock's */
+        tc->wseq = tc->cseq = 0;
         if (o->aclock) tc->wdef = tc->cdef;
         tc->wver = -1;
         break;
@@ -2380,15 +2415,18 @@ void imdb_hist_install(imdb_schema_hist *h, const imdb_op *o, uint64_t seq)
         tc->wdef = nv->adef;
         tc->wver = (int16_t)h->nvers;
         tc->wclock = 0; /* F2a: a constant again */
+        tc->wseq = 0;
         break;
     case IMDB_ALTER_SET_DEFAULT_CLOCK: /* F2a: the clock, read at each write */
         tc->wdef = (imdb_value){.type = tc->missing.type, .scale = tc->missing.scale, .null = true};
         tc->wver = -1;
         tc->wclock = o->aclock;
+        tc->wseq = 0;
         break;
     case IMDB_ALTER_DROP_DEFAULT:
         tc->wdef = (imdb_value){.type = tc->missing.type, .scale = tc->missing.scale, .null = true};
         tc->wclock = 0;
+        tc->wseq = 0;
         tc->wver = -1;
         break;
     default: /* a rename, a NULL rule, a widening (its scale, so its values' tag and scale, stay) */
@@ -2411,7 +2449,7 @@ void imdb_index_remap(imdb_index *ix, uint32_t n, const imdb_sver *from, const i
 int imdb_alter_table(imdb_db *db, imdb_table *t, const imdb_op *proto, imdb_err *e)
 {
     if (!db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "no transaction");
-    if (db->ntx) return imdb_fail(e, IMDB_ERR_STATE, "ALTER TABLE commits on its own");
+    if (db->ntx || db->ntxseq) return imdb_fail(e, IMDB_ERR_STATE, "ALTER TABLE commits on its own");
     if (imdb_alter_check(db, t, proto, e)) return e->code;
     imdb_op *op = tx_push(db, e);
     if (!op) return e->code;
@@ -2441,7 +2479,7 @@ int imdb_alter_table(imdb_db *db, imdb_table *t, const imdb_op *proto, imdb_err 
 int imdb_drop_table(imdb_db *db, imdb_table *t, uint64_t retention_us, imdb_err *e)
 {
     if (!db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "no transaction");
-    if (db->ntx) return imdb_fail(e, IMDB_ERR_STATE, "DROP TABLE commits on its own");
+    if (db->ntx || db->ntxseq) return imdb_fail(e, IMDB_ERR_STATE, "DROP TABLE commits on its own");
     if (t->dropped_at) return imdb_fail(e, IMDB_ERR_NOTFOUND, "table %s was dropped already", t->s.name);
     const imdb_view *dv = imdb_view_dependent(db, IMDB_VIEWDEP_TABLE, t->s.id); /* P2 S7: PostgreSQL's RESTRICT */
     if (dv) return imdb_fail(e, IMDB_ERR_INVALID, "view %s names table %s: drop it first", dv->name, t->s.name);
@@ -2573,9 +2611,10 @@ int imdb_create_view(imdb_db *db, imdb_viewdef *def, imdb_err *e)
     int rc = IMDB_OK;
     imdb_err e2 = {0};
     if (!db->in_txn) rc = imdb_fail(e, IMDB_ERR_STATE, "no transaction");
-    else if (db->ntx) rc = imdb_fail(e, IMDB_ERR_STATE, "CREATE VIEW commits on its own");
+    else if (db->ntx || db->ntxseq) rc = imdb_fail(e, IMDB_ERR_STATE, "CREATE VIEW commits on its own");
     else if (imdb_table_by_name(db, def->name)) rc = imdb_fail(e, IMDB_ERR_INVALID, "table %s exists already", def->name);
     else if (imdb_view_by_name(db, def->name)) rc = imdb_fail(e, IMDB_ERR_INVALID, "view %s exists already", def->name);
+    else if (imdb_seq_by_name(db, def->name)) rc = imdb_fail(e, IMDB_ERR_INVALID, "sequence %s exists already", def->name);
     else if (db->nviews >= IMDB_MAX_VIEWS)
         rc = imdb_fail(e, IMDB_ERR_LIMIT, "a database holds at most %u views, dropped ones counted", IMDB_MAX_VIEWS);
     if (!rc) {
@@ -2603,7 +2642,7 @@ int imdb_create_view(imdb_db *db, imdb_viewdef *def, imdb_err *e)
 int imdb_drop_view(imdb_db *db, imdb_view *v, imdb_err *e)
 {
     if (!db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "no transaction");
-    if (db->ntx) return imdb_fail(e, IMDB_ERR_STATE, "DROP VIEW commits on its own");
+    if (db->ntx || db->ntxseq) return imdb_fail(e, IMDB_ERR_STATE, "DROP VIEW commits on its own");
     if (v->dropped_at) return imdb_fail(e, IMDB_ERR_NOTFOUND, "view %s was dropped already", v->name);
     const imdb_view *d = imdb_view_dependent(db, IMDB_VIEWDEP_VIEW, v->id);
     if (d) return imdb_fail(e, IMDB_ERR_INVALID, "view %s names view %s: drop it first", d->name, v->name);
@@ -2612,6 +2651,263 @@ int imdb_drop_view(imdb_db *db, imdb_view *v, imdb_err *e)
     op->code = IMDB_OP_DROP_VIEW;
     op->view = v->id;
     return IMDB_OK;
+}
+
+/* ---- F2a-2: sequences (design.md §5, Sequences) --------------------------------------------------------------------- */
+
+imdb_sequence *imdb_seq_by_name(imdb_db *db, const char *name)
+{
+    for (uint32_t i = 0; i < db->nseqs; i++)
+        if (!db->seqs[i].dropped_at && strcmp(db->seqs[i].d.name, name) == 0) return &db->seqs[i];
+    return NULL;
+}
+
+static int seq_reserve(imdb_db *db, imdb_err *e)
+{
+    if (db->nseqs < db->capseqs) return IMDB_OK;
+    if (db->nseqs >= IMDB_MAX_SEQUENCES)
+        return imdb_fail(e, IMDB_ERR_LIMIT, "a database holds at most %u sequences, dropped ones counted", IMDB_MAX_SEQUENCES);
+    uint32_t cap = db->capseqs ? db->capseqs * 2 : 8;
+    if (cap > IMDB_MAX_SEQUENCES) cap = IMDB_MAX_SEQUENCES;
+    imdb_sequence *n = imdb_alloc_array(cap, sizeof *n, e);
+    if (!n) return e->code;
+    if (db->nseqs) memcpy(n, db->seqs, db->nseqs * sizeof *n);
+    imdb_free(db->seqs);
+    db->seqs = n;
+    db->capseqs = cap;
+    return IMDB_OK;
+}
+
+int imdb_seq_install(imdb_db *db, const imdb_seqdef *d, uint64_t seq, imdb_err *e)
+{
+    if (seq_reserve(db, e)) return e->code;
+    imdb_sequence *s = &db->seqs[db->nseqs++];
+    memset(s, 0, sizeof *s);
+    s->d = *d;
+    s->last = s->base = d->start;
+    s->created_at = seq;
+    s->owner = UINT32_MAX;
+    return IMDB_OK;
+}
+
+static void seqs_free(imdb_db *db)
+{
+    imdb_free(db->seqs);
+    imdb_free(db->txseq);
+    db->seqs = NULL;
+    db->txseq = NULL;
+    db->nseqs = db->capseqs = db->ntxseq = db->captxseq = 0;
+}
+
+int imdb_create_sequence(imdb_db *db, imdb_seqdef *d, imdb_err *e)
+{
+    if (!db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "no transaction");
+    if (imdb_table_by_name(db, d->name) || imdb_view_by_name(db, d->name) || imdb_seq_by_name(db, d->name))
+        return imdb_fail(e, IMDB_ERR_INVALID, "a table, view or sequence %s exists already", d->name);
+    d->id = db->nseqs;
+    if (!imdb_seqdef_ok(d))
+        return imdb_fail(e, IMDB_ERR_INVALID, "sequence %s: MINVALUE below MAXVALUE, START between them, an INCREMENT, all "
+                         "within its type", d->name);
+    imdb_seqdef *own = imdb_alloc(sizeof *own, e);
+    if (!own) return e->code;
+    *own = *d;
+    imdb_undo u = {.kind = UNDO_SEQ_CREATE, .table = d->id};
+    if (imdb_seq_install(db, d, 0, e)) { /* created_at at the commit's install */
+        imdb_free(own);
+        return e->code;
+    }
+    imdb_op *op = tx_push(db, e);
+    if (!op || undo_push(db, &u, e)) {
+        if (op) db->ntx--;
+        db->nseqs--;
+        imdb_free(own);
+        return e->code;
+    }
+    op->code = IMDB_OP_CREATE_SEQUENCE;
+    op->sdef = own;
+    op->seq = d->id;
+    return IMDB_OK;
+}
+
+/* the live write default naming sequence id (IMDB_DEFK_NEXTVAL), or an owner: what DROP SEQUENCE's RESTRICT refuses */
+static const imdb_table *seq_named_by(const imdb_db *db, uint32_t id, uint16_t *pos)
+{
+    for (uint32_t i = 0; i < db->nt; i++) {
+        const imdb_table *t = db->t[i];
+        if (t->dropped_at || !t->hist.nvers) continue;
+        const imdb_sver *v = &t->hist.vers[t->hist.nvers - 1];
+        for (uint16_t c = 0; c < v->s.ncols; c++) {
+            const imdb_tcol *tc = &t->hist.tcol[v->pos[c]];
+            if (tc->wclock >= IMDB_DEFK_IDENTITY_ALWAYS && tc->wseq == id) {
+                *pos = c;
+                return t;
+            }
+        }
+    }
+    return NULL;
+}
+
+int imdb_drop_sequence(imdb_db *db, imdb_sequence *s, imdb_err *e)
+{
+    if (!db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "no transaction");
+    if (db->ntx || db->ntxseq) return imdb_fail(e, IMDB_ERR_STATE, "DROP SEQUENCE commits on its own");
+    if (s->dropped_at) return imdb_fail(e, IMDB_ERR_NOTFOUND, "sequence %s was dropped already", s->d.name);
+    uint16_t c = 0;
+    const imdb_table *t = seq_named_by(db, s->d.id, &c);
+    if (s->owner != UINT32_MAX || t)
+        return imdb_fail(e, IMDB_ERR_INVALID, "column %s of table %s takes its values from sequence %s: drop its DEFAULT, "
+                         "the column or the table first", t ? t->s.cols[c].name : "?", t ? t->s.name : "?", s->d.name);
+    imdb_op *op = tx_push(db, e);
+    if (!op) return e->code;
+    op->code = IMDB_OP_DROP_SEQUENCE;
+    op->seq = s->d.id;
+    return IMDB_OK;
+}
+
+static int txseq_add(imdb_db *db, uint32_t id, imdb_err *e)
+{
+    uint32_t lo = 0, hi = db->ntxseq;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (db->txseq[mid] < id) lo = mid + 1;
+        else hi = mid;
+    }
+    if (lo < db->ntxseq && db->txseq[lo] == id) return IMDB_OK;
+    if (db->ntxseq == db->captxseq) {
+        uint32_t nc = db->captxseq ? db->captxseq * 2 : 4;
+        uint32_t *n = imdb_realloc_array(db->txseq, db->captxseq, nc, sizeof *n, e);
+        if (!n) return e->code;
+        db->txseq = n;
+        db->captxseq = nc;
+    }
+    memmove(&db->txseq[lo + 1], &db->txseq[lo], (db->ntxseq - lo) * sizeof *db->txseq);
+    db->txseq[lo] = id;
+    db->ntxseq++;
+    return IMDB_OK;
+}
+
+int imdb_txseq_load(imdb_db *db, const uint32_t *ids, uint32_t n, imdb_err *e)
+{
+    for (uint32_t k = 0; k < n; k++)
+        if (txseq_add(db, ids[k], e)) return e->code;
+    return IMDB_OK;
+}
+
+int imdb_seq_next(imdb_db *db, imdb_sequence *s, int64_t *out, imdb_err *e)
+{
+    if (!db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "nextval outside a transaction");
+    if (s->dropped_at) return imdb_fail(e, IMDB_ERR_NOTFOUND, "sequence %s was dropped", s->d.name);
+    int64_t v = s->last;
+    if (s->called && (__builtin_add_overflow(s->last, s->d.inc, &v) || v > s->d.max || v < s->d.min))
+        return imdb_fail(e, IMDB_ERR_LIMIT, "nextval: sequence %s reached its %s value (%lld)", s->d.name,
+                         s->d.inc > 0 ? "maximum" : "minimum", (long long)(s->d.inc > 0 ? s->d.max : s->d.min));
+    if (txseq_add(db, s->d.id, e)) return e->code;
+    s->last = v;
+    s->called = true;
+    *out = v;
+    return IMDB_OK;
+}
+
+int imdb_seq_set(imdb_db *db, imdb_sequence *s, int64_t v, bool called, imdb_err *e)
+{
+    if (!db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "no transaction");
+    if (s->dropped_at) return imdb_fail(e, IMDB_ERR_NOTFOUND, "sequence %s was dropped", s->d.name);
+    if (v < s->d.min || v > s->d.max)
+        return imdb_fail(e, IMDB_ERR_INVALID, "setval: %lld is outside sequence %s's bounds", (long long)v, s->d.name);
+    for (uint32_t i = 0; i < db->ntx; i++) /* log.h: a commit of SEQ_SETs, by sequence, one each */
+        if (db->tx[i].code != IMDB_OP_SEQ_SET || db->tx[i].seq == s->d.id)
+            return imdb_fail(e, IMDB_ERR_STATE, "setval commits on its own, once a sequence");
+    imdb_undo u = {.kind = UNDO_SEQ_SET, .table = s->d.id, .vid = (uint64_t)s->last, .prev_head = (uint64_t)s->base,
+                   .subj_created = s->called};
+    imdb_op *op = tx_push(db, e);
+    if (!op || undo_push(db, &u, e)) {
+        if (op) db->ntx--;
+        return e->code;
+    }
+    op->code = IMDB_OP_SEQ_SET;
+    op->seq = s->d.id;
+    op->sval = v;
+    op->scalled = called;
+    for (uint32_t i = db->ntx - 1; i > 0 && db->tx[i - 1].seq > db->tx[i].seq; i--) { /* by sequence */
+        imdb_op t = db->tx[i - 1];
+        db->tx[i - 1] = db->tx[i];
+        db->tx[i] = t;
+    }
+    s->last = s->base = v;
+    s->called = called;
+    return IMDB_OK;
+}
+
+bool imdb_seq_mark_ok(const imdb_sequence *s, int64_t mark)
+{
+    __int128 d = (__int128)mark - s->base;
+    return mark >= s->d.min && mark <= s->d.max && (s->d.inc > 0 ? mark >= s->last : mark <= s->last) && d % s->d.inc == 0;
+}
+
+/* op 23's sequence kinds (replay and the statement): an IDENTITY's sequence made in this commit (created_at == seq; 0
+ * at the statement), live and not owned yet, becomes the column's; a NEXTVAL's live */
+int imdb_seq_own(imdb_db *db, uint32_t table, const imdb_coldef *defs, uint16_t n, uint64_t seq, imdb_err *e)
+{
+    for (uint16_t k = 0; k < n; k++) {
+        const imdb_coldef *d = &defs[k];
+        if (d->kind < IMDB_DEFK_IDENTITY_ALWAYS) continue;
+        imdb_sequence *s = d->seq < db->nseqs ? &db->seqs[d->seq] : NULL;
+        bool ident = d->kind != IMDB_DEFK_NEXTVAL;
+        if (!s || s->dropped_at || (ident && (s->created_at != seq || s->owner != UINT32_MAX)))
+            return imdb_fail(e, IMDB_ERR_CORRUPT, "a column DEFAULT of a sequence that is not %s",
+                             ident ? "made with its table" : "live");
+        if (ident) {
+            s->owner = table;
+            s->owner_pos = d->col;
+        }
+    }
+    return IMDB_OK;
+}
+
+/* the sequences a table (pos UINT16_MAX: every column) or one of its columns owns die with it, at its commit */
+void imdb_seq_drop_owned(imdb_db *db, uint32_t table, uint16_t pos, uint64_t seq)
+{
+    for (uint32_t i = 0; i < db->nseqs; i++) {
+        imdb_sequence *s = &db->seqs[i];
+        if (!s->dropped_at && s->owner == table && (pos == UINT16_MAX || s->owner_pos == pos)) s->dropped_at = seq;
+    }
+}
+
+/* replay's ops 24 to 27: op 24 in id order with a free name, op 25 of a live sequence nothing names, op 26 a mark
+ * within the bounds, from the last setval in the increment's direction and aligned, op 27 within the bounds */
+int imdb_seq_apply(imdb_db *db, const imdb_op *o, uint64_t seq, imdb_err *e)
+{
+    unsigned long long sq = (unsigned long long)seq;
+    if (o->code == IMDB_OP_CREATE_SEQUENCE) {
+        const imdb_seqdef *d = o->sdef;
+        if (d->id != db->nseqs || imdb_table_by_name(db, d->name) || imdb_view_by_name(db, d->name) ||
+            imdb_seq_by_name(db, d->name))
+            return imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: CREATE SEQUENCE out of sequence or of a name taken", sq);
+        return imdb_seq_install(db, d, seq, e);
+    }
+    imdb_sequence *s = o->seq < db->nseqs ? &db->seqs[o->seq] : NULL;
+    if (!s || s->dropped_at) return imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: a sequence op of no live sequence", sq);
+    uint16_t c = 0;
+    switch (o->code) {
+    case IMDB_OP_DROP_SEQUENCE:
+        if (s->owner != UINT32_MAX || seq_named_by(db, s->d.id, &c))
+            return imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: DROP SEQUENCE of a sequence a column takes values from", sq);
+        s->dropped_at = seq;
+        return IMDB_OK;
+    case IMDB_OP_SEQ_ADVANCE:
+        if (!imdb_seq_mark_ok(s, o->sval))
+            return imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: sequence %s's mark goes back, past its bounds or off its "
+                             "increment", sq, s->d.name);
+        s->last = o->sval;
+        s->called = true;
+        return IMDB_OK;
+    default: /* SEQ_SET */
+        if (o->sval < s->d.min || o->sval > s->d.max)
+            return imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: setval past sequence %s's bounds", sq, s->d.name);
+        s->last = s->base = o->sval;
+        s->called = o->scalled;
+        return IMDB_OK;
+    }
 }
 
 int imdb_expire_op(imdb_db *db, uint32_t table, uint64_t before, imdb_err *e)
@@ -3356,7 +3652,7 @@ static imdb_index_def op_def(const imdb_op *o)
 int imdb_create_index(imdb_db *db, imdb_table *t, const imdb_index_def *d, imdb_err *e)
 {
     if (!db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "no transaction");
-    if (db->ntx) return imdb_fail(e, IMDB_ERR_STATE, "CREATE INDEX commits on its own");
+    if (db->ntx || db->ntxseq) return imdb_fail(e, IMDB_ERR_STATE, "CREATE INDEX commits on its own");
     size_t n = strlen(d->name);
     if (!imdb_ident_valid(d->name, n)) return imdb_fail(e, IMDB_ERR_INVALID, "invalid index name");
     for (size_t i = 0; i < n; i++)
@@ -3393,7 +3689,7 @@ int imdb_create_index(imdb_db *db, imdb_table *t, const imdb_index_def *d, imdb_
 int imdb_drop_index(imdb_db *db, const char *name, imdb_err *e)
 {
     if (!db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "no transaction");
-    if (db->ntx) return imdb_fail(e, IMDB_ERR_STATE, "DROP INDEX commits on its own");
+    if (db->ntx || db->ntxseq) return imdb_fail(e, IMDB_ERR_STATE, "DROP INDEX commits on its own");
     uint32_t pos = 0;
     imdb_table *t = imdb_index_find(db, name, &pos);
     if (!t) return imdb_fail(e, IMDB_ERR_INVALID, "no index %s", name);
@@ -3754,7 +4050,7 @@ int imdb_tx_add_physical(imdb_db *db, uint8_t code, uint32_t table, uint64_t pur
 
 int imdb_tx_add_writer(imdb_db *db, uint32_t epoch, const uint8_t new_pk[IMDB_PUBKEY_LEN], uint8_t how, imdb_err *e)
 {
-    if (db->ntx) return imdb_fail(e, IMDB_ERR_STATE, "WRITER_KEY is the only op of its commit");
+    if (db->ntx || db->ntxseq) return imdb_fail(e, IMDB_ERR_STATE, "WRITER_KEY is the only op of its commit");
     imdb_op *op = tx_push(db, e);
     if (!op) return e->code;
     op->code = IMDB_OP_WRITER_KEY;
@@ -4619,6 +4915,30 @@ static int commit_body(imdb_db *db, imdb_err *e)
     if (!db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "no transaction");
     uint64_t tx_time = db->tx_time; /* this commit's alone */
     db->tx_time = 0;
+    /* F2a-2: each sequence this transaction's nextval touched logs its mark, last and by sequence (log.h); one
+     * dropped since (a parked transaction resumed after the drop) takes nothing */
+    for (uint32_t k = 0; k < db->ntxseq; k++) {
+        if (db->txseq[k] >= db->nseqs) { /* never: the undo of a CREATE SEQUENCE takes its id out (an internal error) */
+            imdb_rollback(db);
+            db->failed = true;
+            return imdb_fail(e, IMDB_ERR_STATE, "commit: a transaction's sequence %u is not in the catalog; reopen", db->txseq[k]);
+        }
+        const imdb_sequence *s = &db->seqs[db->txseq[k]];
+        int src = IMDB_OK;
+        if (s->dropped_at)
+            src = imdb_fail(e, IMDB_ERR_CONFLICT, "sequence %s was dropped at commit %llu; roll back and retry the "
+                            "transaction", s->d.name, (unsigned long long)s->dropped_at);
+        if (!src && !s->called) continue; /* a setval(..., false) since: its SEQ_SET states the whole state (the advisor) */
+        imdb_op *op = src ? NULL : tx_push(db, e);
+        if (!op) {
+            imdb_rollback(db);
+            return src ? src : e->code;
+        }
+        op->code = IMDB_OP_SEQ_ADVANCE;
+        op->seq = s->d.id;
+        op->sval = s->last;
+    }
+    db->ntxseq = 0;
     if (db->ntx == 0) {
         db->in_txn = false;
         db->nundo = 0;
@@ -4709,10 +5029,16 @@ static int commit_body(imdb_db *db, imdb_err *e)
         if (code == IMDB_OP_INSERT || code == IMDB_OP_DELETE || code == IMDB_OP_UPDATE || code == IMDB_OP_CREATE_TABLE ||
             code == IMDB_OP_CREATE_INDEX || code == IMDB_OP_DROP_INDEX || code == IMDB_OP_SET_RETENTION ||
             code == IMDB_OP_EXPIRE || code == IMDB_OP_DROP_TABLE || code == IMDB_OP_CREATE_VIEW || code == IMDB_OP_DROP_VIEW ||
-            code == IMDB_OP_ALTER_TABLE)
+            code == IMDB_OP_ALTER_TABLE || code == IMDB_OP_CREATE_SEQUENCE || code == IMDB_OP_DROP_SEQUENCE ||
+            code == IMDB_OP_SEQ_ADVANCE || code == IMDB_OP_SEQ_SET) /* F2a-2: the manifest keeps sequences too */
             db->lake_dirty = true; /* the manifest records the definitions, the retentions, the horizons, the drops,
                                     * the views (P2 S7) */
         if (code == IMDB_OP_CREATE_TABLE) db->t[db->tx[i].table]->created_at = c.seq;
+        if (code == IMDB_OP_CREATE_SEQUENCE) db->seqs[db->tx[i].seq].created_at = c.seq; /* F2a-2 */
+        if (code == IMDB_OP_DROP_SEQUENCE) db->seqs[db->tx[i].seq].dropped_at = c.seq;
+        if (code == IMDB_OP_DROP_TABLE) imdb_seq_drop_owned(db, db->tx[i].table, UINT16_MAX, c.seq);
+        if (code == IMDB_OP_ALTER_TABLE && db->tx[i].akind == IMDB_ALTER_DROP_COLUMN)
+            imdb_seq_drop_owned(db, db->tx[i].table, db->tx[i].apos, c.seq);
         if (code == IMDB_OP_SET_RETENTION) db->t[db->tx[i].table]->retention_us = db->tx[i].retention_us;
         if (code == IMDB_OP_EXPIRE) db->t[db->tx[i].table]->horizon = db->tx[i].purge_before;
         if (code == IMDB_OP_DROP_TABLE) imdb_table_drop_install(db, db->t[db->tx[i].table], c.seq);
@@ -4827,6 +5153,7 @@ void imdb_reset_state(imdb_db *db)
     imdb_lake_db_free(db);
     for (uint32_t i = 0; i < db->nt; i++) imdb_table_free(db->t[i]);
     views_free(db); /* P2 S7 */
+    seqs_free(db); /* F2a-2 */
 #ifdef IMDB_STORE_CHECKS
     if (db->segcache.resident) { /* every image charged was credited as it left (lake.c: seg_img_bytes) */
         fprintf(stderr, "imagedb: the segment cache counts %llu bytes after every table left\n",
@@ -4874,6 +5201,7 @@ int imdb_close(imdb_db *db)
     imdb_lake_db_free(db);
     for (uint32_t i = 0; i < db->nt; i++) imdb_table_free(db->t[i]);
     views_free(db); /* P2 S7 */
+    seqs_free(db); /* F2a-2 */
     imdb_free(db->t);
     for (uint32_t i = 0; i < db->ntx; i++) tx_op_free(&db->tx[i]);
     imdb_free(db->tx);

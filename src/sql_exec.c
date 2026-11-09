@@ -36,6 +36,9 @@ void imdb_session_close(imdb_session *s)
 {
     if (s->txn.open) imdb_txn_rollback(s->db, &s->txn);
     prep_all_free(s); /* P2 S9 */
+    imdb_free(s->seqcur); /* F2a-2 */
+    s->seqcur = NULL;
+    s->nseqcur = s->capseqcur = 0;
 }
 
 void imdb_result_init(imdb_result *r)
@@ -191,6 +194,7 @@ typedef struct xctx {
     bool deferred;                /* a name was not found while upscope was NULL */
     bool probe;                   /* the bind-only pass: binds, types the result, runs nothing */
     bool presence;                /* P2 S11: EXISTS' run: whether a row qualifies (presence_ok), no item computed */
+    bool noxc;                    /* F2a-2: it calls nextval or setval: one plan runs (a second would hand out values again) */
     bool own_limit;               /* P2 S11: this plan hit a limit on its own work (xc_own): its join's build over the cap
                                    * (join_charge), the row limit (xtested; the memo spares a second plan the runs the
                                    * first made); a nested run's carried out (run_nested) */
@@ -251,6 +255,113 @@ static int xenv_zone(void *ctx, const uint8_t *name, uint32_t len, const struct 
 static int xenv_check(void *ctx, imdb_err *e)
 {
     return xcheck((xctx *)ctx, e);
+}
+
+/* F2a-2: a sequence's definition from its options as written, PostgreSQL's defaults where none is given: INCREMENT 1,
+ * MINVALUE 1 (descending: the type's least), MAXVALUE the type's greatest (descending: -1), START the end it begins at */
+/* F2a-2: column c a GENERATED ALWAYS identity */
+static bool col_always(const imdb_table *t, uint16_t c)
+{
+    if (!t->hist.nvers) return false;
+    return t->hist.tcol[t->hist.vers[t->hist.nvers - 1].pos[c]].cclock == IMDB_DEFK_IDENTITY_ALWAYS;
+}
+
+static int seqdef_from(const sql_seqopt *o, const char *name, uint8_t width, imdb_seqdef *d, imdb_err *e)
+{
+    memset(d, 0, sizeof *d);
+    snprintf(d->name, sizeof d->name, "%s", name);
+    d->width = width;
+    int64_t lo = width == 16 ? INT16_MIN : width == 32 ? INT32_MIN : INT64_MIN;
+    int64_t hi = width == 16 ? INT16_MAX : width == 32 ? INT32_MAX : INT64_MAX;
+    d->inc = o->has_inc ? o->inc : 1;
+    if (!d->inc) return imdb_fail(e, IMDB_ERR_INVALID, "sequence %s: INCREMENT must not be zero", name);
+    d->min = o->has_min ? o->min : d->inc > 0 ? 1 : lo;
+    d->max = o->has_max ? o->max : d->inc > 0 ? hi : -1;
+    d->start = o->has_start ? o->start : d->inc > 0 ? d->min : d->max;
+    return IMDB_OK;
+}
+
+/* ---- F2a-2: sequences: nextval through the engine, the session's currval and lastval (design.md §5, Sequences) ---- */
+struct imdb_seqcur {
+    uint32_t id;
+    int64_t v;
+};
+
+static int seqcur_set(imdb_session *ss, uint32_t id, int64_t v, imdb_err *e)
+{
+    uint32_t lo = 0, hi = ss->nseqcur;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (ss->seqcur[mid].id < id) lo = mid + 1;
+        else hi = mid;
+    }
+    if (lo == ss->nseqcur || ss->seqcur[lo].id != id) {
+        if (ss->nseqcur == ss->capseqcur) {
+            uint32_t nc = ss->capseqcur ? ss->capseqcur * 2 : 4;
+            struct imdb_seqcur *n = imdb_realloc_array(ss->seqcur, ss->capseqcur, nc, sizeof *n, e);
+            if (!n) return e->code;
+            ss->seqcur = n;
+            ss->capseqcur = nc;
+        }
+        memmove(&ss->seqcur[lo + 1], &ss->seqcur[lo], (ss->nseqcur - lo) * sizeof *ss->seqcur);
+        ss->seqcur[lo].id = id;
+        ss->nseqcur++;
+    }
+    ss->seqcur[lo].v = v;
+    ss->has_lastval = true;
+    ss->lastval = v;
+    return IMDB_OK;
+}
+
+static int x_nextval(xctx *x, imdb_sequence *s, int64_t *v, imdb_err *e)
+{
+    if (imdb_seq_next(x->db, s, v, e)) return e->code;
+    return seqcur_set(x->ss, s->d.id, *v, e);
+}
+
+/* a sequence by the name a string gives (folded as an identifier is) */
+static int seq_named(xctx *x, const uint8_t *s, uint32_t len, imdb_sequence **out, imdb_err *e)
+{
+    char nm[IMDB_MAX_IDENT + 1];
+    if (!len || len > IMDB_MAX_IDENT) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no sequence of that name");
+    for (uint32_t i = 0; i < len; i++) nm[i] = (char)(s[i] >= 'A' && s[i] <= 'Z' ? s[i] + 32 : s[i]);
+    nm[len] = 0;
+    *out = imdb_seq_by_name(x->db, nm);
+    if (!*out) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no sequence %s", nm);
+    return IMDB_OK;
+}
+
+static int xenv_seqfn(void *ctx, uint8_t fn, const imdb_xval *a, uint8_t nargs, imdb_xval *out, imdb_err *e)
+{
+    xctx *x = ctx;
+    memset(out, 0, sizeof *out);
+    out->type = IMDB_T_INT64;
+    if (fn == FN_LASTVAL) {
+        if (!x->ss->has_lastval) return imdb_fail(e, IMDB_ERR_STATE, "lastval: no nextval in this session yet");
+        out->i = x->ss->lastval;
+        return IMDB_OK;
+    }
+    imdb_sequence *s;
+    if (seq_named(x, a[0].s, a[0].len, &s, e)) return e->code;
+    if (fn == FN_CURRVAL) {
+        for (uint32_t k = 0; k < x->ss->nseqcur; k++)
+            if (x->ss->seqcur[k].id == s->d.id) {
+                out->i = x->ss->seqcur[k].v;
+                return IMDB_OK;
+            }
+        return imdb_fail(e, IMDB_ERR_STATE, "currval of sequence %s: no nextval of it in this session yet", s->d.name);
+    }
+    if (fn == FN_NEXTVAL) {
+        int64_t v;
+        if (x_nextval(x, s, &v, e)) return e->code;
+        out->i = v;
+        return IMDB_OK;
+    }
+    if (!x->autocommit) /* SETVAL: a commit of setvals (log.h), never inside a transaction */
+        return imdb_fail(e, IMDB_ERR_STATE, "setval commits on its own: run it outside a transaction");
+    if (imdb_seq_set(x->db, s, (int64_t)a[1].i, nargs < 3 || a[2].i != 0, e)) return e->code;
+    out->i = a[1].i;
+    return IMDB_OK;
 }
 
 static int xenv_subq(void *ctx, uint16_t k, const imdb_value *row, imdb_xval *out, const imdb_xset **set, imdb_err *e);
@@ -2334,6 +2445,8 @@ static int run_nested(xctx *x, const sql_stmt *in, imdb_result *r, uint8_t mode,
     s.env.zone = x->ss ? x->ss->zone : NULL; /* P2: the session's; a bind-only pass reads no zone file */
     s.env.now_us = x->env.now_us; /* F2a: the statement around it's clock value; a probe reads none */
     s.env.has_now = x->env.has_now && !s.probe;
+    s.env.seqfn = s.probe ? NULL : x->env.seqfn; /* F2a-2: a bind-only pass calls no sequence */
+    s.noxc = x->noxc;
     s.env.zone_get = s.probe ? NULL : xenv_zone;
     struct xplain *xp = NULL;
     if (s.probe && !(xp = xp_scratch(e))) return e->code;
@@ -5680,6 +5793,7 @@ static void pres_result(imdb_result *r, bool found)
  * a WHERE tree sees only the rows past every plain predicate) */
 static bool xc_own(const xctx *x, int rc)
 {
+    if (x->noxc) return true; /* F2a-2 */
     switch (rc) {
     case IMDB_ERR_CANCELLED:
     case IMDB_ERR_NOMEM:
@@ -7273,6 +7387,8 @@ static int ups_prepare(xctx *x, const sql_stmt *st, imdb_table *t, ups *u, imdb_
         int c = u->cols[k] = imdb_schema_col(&t->s, st->set_cols[k]);
         if (c < 0) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no column %s in table %s", st->set_cols[k], t->s.name);
         if (is_key_col(&t->s, c)) return imdb_fail(e, IMDB_ERR_INVALID, "ON CONFLICT DO UPDATE cannot change the primary key");
+        if (col_always(t, (uint16_t)c)) /* F2a-2: PostgreSQL's: an ALWAYS identity is not updated */
+            return imdb_fail(e, IMDB_ERR_INVALID, "column %s is GENERATED ALWAYS AS IDENTITY: it is not updated", t->s.cols[c].name);
         for (uint16_t j = 0; j < k; j++)
             if (u->cols[j] == c) return imdb_fail(e, IMDB_ERR_INVALID, "column %s is set twice", st->set_cols[k]);
         if (st->set_vals[k].kind == LIT_EXPR) {
@@ -7342,11 +7458,54 @@ static int write_row(xctx *x, const sql_stmt *st, imdb_table *t, imdb_value *val
     return rc;
 }
 
+/* F2a-2: the columns of a write left to a sequence (IDENTITY, SERIAL, nextval), each given its next value a row
+ * (seq_fill, right before the row's write) */
+typedef struct seqfill {
+    uint16_t n;
+    uint16_t col[IMDB_MAX_COLS];
+    uint32_t seq[IMDB_MAX_COLS];
+} seqfill;
+
+/* column c's write default a sequence's (its id in *seq); *always: a GENERATED ALWAYS identity */
+static bool col_seq(const imdb_table *t, uint16_t c, uint32_t *seq, bool *always)
+{
+    *always = false;
+    if (!t->hist.nvers) return false;
+    const imdb_tcol *tc = &t->hist.tcol[t->hist.vers[t->hist.nvers - 1].pos[c]];
+    *always = tc->cclock == IMDB_DEFK_IDENTITY_ALWAYS;
+    if (tc->wclock < IMDB_DEFK_IDENTITY_ALWAYS) return false;
+    *seq = tc->wseq;
+    return true;
+}
+
+static void seqfill_add(seqfill *f, const imdb_table *t, uint16_t c)
+{
+    uint32_t s;
+    bool al;
+    if (col_seq(t, c, &s, &al)) {
+        f->col[f->n] = c;
+        f->seq[f->n++] = s;
+    }
+}
+
+static int x_nextval(xctx *x, imdb_sequence *s, int64_t *v, imdb_err *e);
+
+static int seq_fill(xctx *x, const seqfill *f, imdb_value *vals, imdb_err *e)
+{
+    for (uint16_t k = 0; f && k < f->n; k++) {
+        int64_t v;
+        if (f->seq[k] >= x->db->nseqs) return imdb_fail(e, IMDB_ERR_STATE, "a column's sequence is gone");
+        if (x_nextval(x, &x->db->seqs[f->seq[k]], &v, e)) return e->code;
+        vals[f->col[k]] = (imdb_value){.type = IMDB_T_INT64, .i = v};
+    }
+    return IMDB_OK;
+}
+
 /* P2 S8: INSERT ... query: the query's rows, made whole at the statement's snapshot before the first is written (an
  * INSERT reading its own table never reads its own rows), each assigned to its column by position as UPDATE's SET
  * assigns (exact, or refused) */
 static int insert_query(xctx *x, const sql_stmt *st, imdb_table *t, const int *map, uint16_t width, imdb_value *vals,
-                        ups *u, imdb_result *r, imdb_err *e)
+                        const seqfill *f, ups *u, imdb_result *r, imdb_err *e)
 {
     imdb_result q;
     imdb_result_init(&q);
@@ -7373,6 +7532,10 @@ static int insert_query(xctx *x, const sql_stmt *st, imdb_table *t, const int *m
         }
         if (rc) break;
         imdb_err e2 = {0};
+        if (seq_fill(x, f, vals, e)) { /* F2a-2: a sequence's value a row */
+            rc = e->code;
+            break;
+        }
         if (write_row(x, st, t, vals, u, r, &e2)) rc = imdb_fail(e, e2.code, "row %llu: %s", (unsigned long long)(row + 1), e2.msg);
     }
     if (!rc) snprintf(r->status, sizeof r->status, "INSERT %llu", (unsigned long long)u->written);
@@ -7391,6 +7554,11 @@ static int col_default(imdb_xenv *env, const imdb_table *t, uint16_t c, imdb_val
     *v = (imdb_value){.type = col->type, .scale = col->scale, .null = true};
     if (!t->hist.nvers) return IMDB_OK;
     const imdb_tcol *tc = &t->hist.tcol[t->hist.vers[t->hist.nvers - 1].pos[c]];
+    if (tc->wclock >= IMDB_DEFK_IDENTITY_ALWAYS) { /* F2a-2: the row's sequence value, given by seq_fill */
+        v->null = false;
+        v->i = 0;
+        return IMDB_OK;
+    }
     if (!tc->wclock) {
         *v = tc->wdef;
         return IMDB_OK;
@@ -7406,12 +7574,13 @@ static int exec_insert(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
     imdb_table *t = imdb_table_by_name(x->db, st->table);
     if (!t) return no_table(x, st->table, e); /* P2 S7: a view says so */
     int map[IMDB_MAX_COLS];
-    uint16_t width = st->ncols ? st->ncols : t->s.ncols;
+    uint16_t width = st->default_values ? 0 : st->ncols ? st->ncols : t->s.ncols; /* F2a-2: DEFAULT VALUES, none given */
     if (!st->src && st->rowlen != width)
         return imdb_fail(e, IMDB_ERR_INVALID, "INSERT supplies %u values per row, table %s needs %u", st->rowlen,
                          t->s.name, width);
     imdb_value vals[IMDB_MAX_COLS];
-    if (st->ncols) {
+    seqfill f = {0}; /* F2a-2 */
+    if (st->ncols || st->default_values) {
         bool seen[IMDB_MAX_COLS] = {false};
         for (uint16_t i = 0; i < st->ncols; i++) {
             int c = imdb_schema_col(&t->s, st->cols[i]);
@@ -7423,26 +7592,54 @@ static int exec_insert(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
         for (uint16_t c = 0; c < t->s.ncols; c++) { /* a column left out is its DEFAULT (F1: an ADD's), else NULL */
             if (seen[c]) continue;
             if (col_default(&x->env, t, c, &vals[c], e)) return e->code;
+            seqfill_add(&f, t, c); /* F2a-2: an IDENTITY's or a nextval's, a value each row */
             if (vals[c].null && !(t->s.cols[c].flags & IMDB_COL_NULLABLE))
                 return imdb_fail(e, IMDB_ERR_CONSTRAINT, "column %s needs a value: it is NOT NULL", t->s.cols[c].name);
         }
     } else {
         for (uint16_t i = 0; i < width; i++) map[i] = i;
     }
+    for (uint16_t i = 0; i < width; i++) { /* F2a-2: a value given an IDENTITY */
+        uint32_t sq;
+        bool always;
+        if (!col_seq(t, (uint16_t)map[i], &sq, &always) || !(always || st->overriding == 2) || st->overriding == 1) continue;
+        if (st->overriding == 2) { /* OVERRIDING USER VALUE: the value given goes, the sequence's comes */
+            const imdb_tcol *tc = &t->hist.tcol[t->hist.vers[t->hist.nvers - 1].pos[map[i]]];
+            if (tc->cclock == IMDB_DEFK_IDENTITY_ALWAYS || tc->cclock == IMDB_DEFK_IDENTITY) seqfill_add(&f, t, (uint16_t)map[i]);
+            continue;
+        }
+        return imdb_fail(e, IMDB_ERR_INVALID, "column %s is GENERATED ALWAYS AS IDENTITY: leave it out, or write "
+                         "OVERRIDING SYSTEM VALUE", t->s.cols[map[i]].name);
+    }
     if (st->returning && ret_prepare(x, st, t, NULL, r, e)) return e->code; /* P2 S8 */
     ups u; /* P2 S8 */
     if (ups_prepare(x, st, t, &u, e)) return e->code;
-    if (st->src) return insert_query(x, st, t, map, width, vals, &u, r, e); /* P2 S8 */
+    if (st->src) return insert_query(x, st, t, map, width, vals, &f, &u, r, e); /* P2 S8 */
     wceil_lift(x); /* P2 S8: its subqueries ran; what follows writes */
     for (uint32_t row = 0; row < st->nrows; row++) {
         if (st->upsert && xtick(x, 64, e)) return e->code; /* P2 S8: a lookup, a read and a write a row: cancellable */
         for (uint16_t i = 0; i < width; i++) {
             const imdb_column *c = &t->s.cols[map[i]];
             imdb_err e2 = {0};
-            if (bind_lit(x, &st->vals[(size_t)row * width + i], c, false, &vals[map[i]], &e2))
+            const sql_lit *lv = &st->vals[(size_t)row * width + i];
+            if (lv->kind == LIT_DEFAULT) { /* F2a-2: VALUES (DEFAULT): the column's, a sequence's next value too */
+                uint32_t sq;
+                bool always;
+                if (col_default(&x->env, t, (uint16_t)map[i], &vals[map[i]], &e2)) return imdb_fail(e, e2.code, "row %u: %s", row + 1, e2.msg);
+                if (col_seq(t, (uint16_t)map[i], &sq, &always)) {
+                    int64_t sv;
+                    if (x_nextval(x, &x->db->seqs[sq], &sv, e)) return e->code;
+                    vals[map[i]] = (imdb_value){.type = IMDB_T_INT64, .i = sv};
+                }
+                if (vals[map[i]].null && !(c->flags & IMDB_COL_NULLABLE))
+                    return imdb_fail(e, IMDB_ERR_CONSTRAINT, "row %u: column %s needs a value: it is NOT NULL", row + 1, c->name);
+                continue;
+            }
+            if (bind_lit(x, lv, c, false, &vals[map[i]], &e2))
                 return imdb_fail(e, e2.code, "row %u: %s", row + 1, e2.msg);
         }
         imdb_err e2 = {0};
+        if (seq_fill(x, &f, vals, e)) return e->code; /* F2a-2 */
         if (write_row(x, st, t, vals, &u, r, &e2)) return imdb_fail(e, e2.code, "row %u: %s", row + 1, e2.msg); /* P2 S8 */
     }
     snprintf(r->status, sizeof r->status, "INSERT %llu", (unsigned long long)u.written);
@@ -7457,7 +7654,7 @@ static void cell_text(const imdb_cell *c, imdb_buf *out, bool safe);
  * NULL; TO, vals NULL: any of them, P2 S17: S10 refused a TO that left out a NOT NULL column), else every column in
  * order */
 static int copy_columns(imdb_table *t, const sql_stmt *st, int *map, uint16_t *width, imdb_value *vals, imdb_xenv *env,
-                        imdb_err *e)
+                        seqfill *f, imdb_err *e)
 {
     *width = st->ncols ? st->ncols : t->s.ncols;
     if (!st->ncols) {
@@ -7476,6 +7673,7 @@ static int copy_columns(imdb_table *t, const sql_stmt *st, int *map, uint16_t *w
         if (seen[c]) continue;
         if (!vals) continue;
         if (col_default(env, t, c, &vals[c], e)) return e->code; /* F1: its DEFAULT, as INSERT's */
+        if (f) seqfill_add(f, t, c); /* F2a-2: a sequence's value a record */
         if (vals[c].null && !(t->s.cols[c].flags & IMDB_COL_NULLABLE))
             return imdb_fail(e, IMDB_ERR_CONSTRAINT, "column %s needs a value: it is NOT NULL", t->s.cols[c].name);
     }
@@ -7568,7 +7766,8 @@ static int exec_copy_from(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err 
     int map[IMDB_MAX_COLS];
     uint16_t width;
     imdb_value vals[IMDB_MAX_COLS];
-    if (copy_columns(t, st, map, &width, vals, &x->env, e)) return e->code;
+    seqfill f = {0}; /* F2a-2 */
+    if (copy_columns(t, st, map, &width, vals, &x->env, &f, e)) return e->code;
     imdb_csv c;
     if (imdb_csv_init(&c, ss->copy_rd, ss->copy_arg, st->copy_delim, e)) return e->code;
     uint64_t done = 0, committed = 0, skipped = 0;
@@ -7600,7 +7799,9 @@ static int exec_copy_from(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err 
         if (rc) break;
         uint8_t salt[16];
         imdb_err e2 = {0};
-        rc = imdb_salt_next(&x->salts, salt, &e2) || imdb_insert_salt(x->db, t, vals, salt, &e2) ? e2.code : IMDB_OK;
+        rc = seq_fill(x, &f, vals, &e2) || imdb_salt_next(&x->salts, salt, &e2) || imdb_insert_salt(x->db, t, vals, salt, &e2)
+                 ? e2.code
+                 : IMDB_OK; /* F2a-2: a sequence's value a record (COPY writes an ALWAYS identity's given value, PostgreSQL's) */
         imdb_wipe(salt, sizeof salt);
         if (rc) {
             rc = imdb_fail(e, e2.code, "COPY line %llu: %s", line, e2.msg);
@@ -7720,7 +7921,7 @@ static int copy_to_table(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *
                          st->table);
     int map[IMDB_MAX_COLS];
     uint16_t width;
-    if (copy_columns(t, st, map, &width, NULL, NULL, e)) return e->code;
+    if (copy_columns(t, st, map, &width, NULL, NULL, NULL, e)) return e->code;
     qspec q;
     memset(&q, 0, sizeof q);
     q.t = t;
@@ -7887,6 +8088,8 @@ static int exec_join_write(xctx *x, const sql_stmt *st, bool upd, imdb_result *r
         cols[k] = imdb_schema_col(&t->s, st->set_cols[k]);
         if (cols[k] < 0) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no column %s in table %s", st->set_cols[k], t->s.name);
         if (is_key_col(&t->s, cols[k])) return imdb_fail(e, IMDB_ERR_INVALID, "UPDATE cannot change the primary key (use DELETE + INSERT)");
+        if (col_always(t, (uint16_t)cols[k])) /* F2a-2: PostgreSQL's: an ALWAYS identity is not updated */
+            return imdb_fail(e, IMDB_ERR_INVALID, "column %s is GENERATED ALWAYS AS IDENTITY: it is not updated", t->s.cols[cols[k]].name);
         for (uint16_t j = 0; j < k; j++)
             if (cols[j] == cols[k]) return imdb_fail(e, IMDB_ERR_INVALID, "column %s is set twice", st->set_cols[k]);
         if (st->set_vals[k].kind == LIT_EXPR) {
@@ -7983,6 +8186,8 @@ static int exec_update(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, 
         cols[i] = imdb_schema_col(&t->s, st->set_cols[i]);
         if (cols[i] < 0) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no column %s in table %s", st->set_cols[i], t->s.name);
         if (is_key_col(&t->s, cols[i])) return imdb_fail(e, IMDB_ERR_INVALID, "UPDATE cannot change the primary key (use DELETE + INSERT)");
+        if (col_always(t, (uint16_t)cols[i])) /* F2a-2: PostgreSQL's: an ALWAYS identity is not updated */
+            return imdb_fail(e, IMDB_ERR_INVALID, "column %s is GENERATED ALWAYS AS IDENTITY: it is not updated", t->s.cols[cols[i]].name);
         for (uint16_t j = 0; j < i; j++)
             if (cols[j] == cols[i]) return imdb_fail(e, IMDB_ERR_INVALID, "column %s is set twice", st->set_cols[i]);
         if (st->set_vals[i].kind == LIT_EXPR) { /* computed per row, from the row's old values */
@@ -8693,7 +8898,8 @@ static bool is_write(uint8_t k)
 {
     return k == ST_CREATE || k == ST_INSERT || k == ST_UPDATE || k == ST_DELETE || k == ST_CREATE_INDEX ||
            k == ST_DROP_INDEX || k == ST_ALTER_RETENTION || k == ST_ALTER_TABLE || k == ST_DROP_TABLE || k == ST_COPY_FROM || /* P2 S10 */
-           k == ST_CREATE_VIEW || k == ST_DROP_VIEW; /* P2 S7 */
+           k == ST_CREATE_VIEW || k == ST_DROP_VIEW || /* P2 S7 */
+           k == ST_CREATE_SEQUENCE || k == ST_DROP_SEQUENCE; /* F2a-2 */
 }
 
 /* A read statement's workspace (P0 R2): what SET statement_memory says, else a quarter of the memory budget, at most
@@ -8943,6 +9149,8 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
     x.env.zone = ss->zone; /* P2 */
     x.env.now_us = ss->txn.open ? ss->txn.begin_us : imdb_now_us(); /* F2a: the transaction's start, or this statement's */
     x.env.has_now = true;
+    x.env.seqfn = xenv_seqfn; /* F2a-2 */
+    x.noxc = st->seq_write;
     x.env.zone_get = xenv_zone;
     imdb_db *db = ss->db;
     uint64_t seq_before = db->seq;
@@ -8968,6 +9176,7 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
         return rc;
     }
     bool autocommit = false, txn = ss->txn.open, ceiling = false; /* ceiling: R2's, below */
+    bool wr = is_write(st->kind) || st->seq_write; /* F2a-2: a statement calling nextval or setval writes (its marks) */
     /* R4: a transaction past its SET transaction_timeout, or idle past its SET idle_in_transaction_timeout, can only
      * roll back: this statement fails (cancelled) unless it is the ROLLBACK, and what the transaction holds goes now;
      * every other session's transaction past its limits, active or parked, goes the same way, whether or not its session
@@ -9000,12 +9209,13 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
     atomic_store_explicit(&ss->cancel, false, memory_order_relaxed);
     x.checks = !physical && st->kind != ST_COMMIT && st->kind != ST_CREATE && st->kind != ST_CREATE_INDEX &&
                st->kind != ST_DROP_INDEX && st->kind != ST_ALTER_RETENTION && st->kind != ST_ALTER_TABLE && st->kind != ST_DROP_TABLE &&
-               st->kind != ST_CREATE_VIEW && st->kind != ST_DROP_VIEW; /* each commits on its own */
+               st->kind != ST_CREATE_VIEW && st->kind != ST_DROP_VIEW && st->kind != ST_CREATE_SEQUENCE &&
+               st->kind != ST_DROP_SEQUENCE; /* each commits on its own (F2a-2: the sequence statements too) */
     x.next_check = TICK_ROWS;
     if (x.checks && ss->stmt_timeout_ms) x.deadline_ns = mono_ns() + (uint64_t)ss->stmt_timeout_ms * 1000000u;
     if (txn && (st->kind == ST_CREATE || st->kind == ST_CREATE_INDEX || st->kind == ST_DROP_INDEX ||
                 st->kind == ST_ALTER_RETENTION || st->kind == ST_ALTER_TABLE || st->kind == ST_DROP_TABLE || st->kind == ST_CREATE_VIEW ||
-                st->kind == ST_DROP_VIEW)) {
+                st->kind == ST_DROP_VIEW || st->kind == ST_CREATE_SEQUENCE || st->kind == ST_DROP_SEQUENCE)) {
         rc = imdb_fail(e, IMDB_ERR_STATE, "%s commits on its own: run it outside the transaction",
                        st->kind == ST_CREATE         ? "CREATE TABLE"
                        : st->kind == ST_CREATE_INDEX ? "CREATE INDEX"
@@ -9013,6 +9223,8 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
                        : st->kind == ST_DROP_TABLE   ? "DROP TABLE"
                        : st->kind == ST_CREATE_VIEW  ? "CREATE VIEW" /* P2 S7 */
                        : st->kind == ST_DROP_VIEW    ? "DROP VIEW"
+                       : st->kind == ST_CREATE_SEQUENCE ? "CREATE SEQUENCE" /* F2a-2: DDL, as CREATE TABLE is */
+                       : st->kind == ST_DROP_SEQUENCE ? "DROP SEQUENCE"
                                                      : "ALTER TABLE");
         goto done;
     }
@@ -9025,12 +9237,12 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
     if (physical) { /* its own transaction, with nobody's pending writes in the store */
         if ((rc = imdb_txn_park(db, e))) goto done;
     } else if (txn && !control) {
-        if ((rc = imdb_txn_enter(db, &ss->txn, is_write(st->kind) ? IMDB_TXN_WRITE : IMDB_TXN_READ, e))) goto done;
-    } else if (!txn && is_write(st->kind)) {
+        if ((rc = imdb_txn_enter(db, &ss->txn, wr ? IMDB_TXN_WRITE : IMDB_TXN_READ, e))) goto done;
+    } else if (!txn && wr) {
         if ((rc = imdb_txn_park(db, e)) || (rc = imdb_begin(db, e))) goto done;
         autocommit = x.autocommit = true;
     }
-    if (is_write(st->kind)) sp = imdb_savepoint_take(db); /* after the swap-in: it indexes this op list */
+    if (wr) sp = imdb_savepoint_take(db); /* after the swap-in: it indexes this op list */
     /* R2: a read statement's memory has a hard ceiling (util.h): set after the swap-in above (a parked transaction's
      * writes replayed are the store's, not this statement's), cleared at the switch's end and at done, before the
      * policies between transactions (expiry's commit, eviction's rebuild). Set once: an inner statement never moves
@@ -9057,6 +9269,28 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
             imdb_value v;
             imdb_err e2 = {0};
             if (!k) continue;
+            if (k >= IMDB_DEFK_IDENTITY_ALWAYS) { /* F2a-2: an IDENTITY's own sequence (made first: op 24 before the CREATE), or
+                                                     * nextval of a named one */
+                uint32_t sid = 0;
+                if (col->type != IMDB_T_INT64) {
+                    rc = imdb_fail(e, IMDB_ERR_INVALID, "column %s: a sequence's values are SMALLINT, INTEGER or BIGINT", col->name);
+                } else if (k == IMDB_DEFK_NEXTVAL) {
+                    imdb_sequence *s = NULL;
+                    if (!(rc = seq_named(&x, (const uint8_t *)x.sql + st->cdef[c].off, st->cdef[c].len, &s, e))) sid = s->d.id;
+                } else {
+                    imdb_seqdef d;
+                    char nm[3 * IMDB_MAX_IDENT];
+                    snprintf(nm, sizeof nm, "%s_%s_seq", st->schema.name, col->name);
+                    if (strlen(nm) > IMDB_MAX_IDENT)
+                        rc = imdb_fail(e, IMDB_ERR_LIMIT, "column %s: its sequence's name %s_%s_seq is past %u characters",
+                                       col->name, st->schema.name, col->name, IMDB_MAX_IDENT);
+                    else if (!(rc = seqdef_from(&st->idopt[c], nm, col->precision, &d, e)) &&
+                             !(rc = imdb_create_sequence(db, &d, e)))
+                        sid = d.id;
+                }
+                if (!rc) cd[ncd++] = (imdb_coldef){.col = c, .kind = k, .seq = sid};
+                continue;
+            }
             if (k != IMDB_DEFK_VALUE) {
                 if (!imdb_defk_fits(k, col->type))
                     rc = imdb_fail(e, IMDB_ERR_INVALID, "column %s: its DEFAULT's clock value is not of its type", col->name);
@@ -9074,6 +9308,19 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
             rc = imdb_create_table_defs(db, &st->schema, st->has_retention ? st->retention_us : IMDB_RETAIN_DEFAULT_US, cd,
                                         ncd, e);
         if (!rc) snprintf(r->status, sizeof r->status, "CREATE TABLE %s", st->schema.name);
+        break;
+    }
+    case ST_CREATE_SEQUENCE: { /* F2a-2: its definition from the options, PostgreSQL's defaults (op 24) */
+        imdb_seqdef d;
+        if (!(rc = seqdef_from(&st->seqopt, st->table, st->seqopt.width, &d, e)))
+            rc = imdb_create_sequence(db, &d, e);
+        if (!rc) snprintf(r->status, sizeof r->status, "CREATE SEQUENCE %s", st->table);
+        break;
+    }
+    case ST_DROP_SEQUENCE: { /* F2a-2: RESTRICT (op 25, alone) */
+        imdb_sequence *s = imdb_seq_by_name(db, st->table);
+        rc = s ? imdb_drop_sequence(db, s, e) : imdb_fail(e, IMDB_ERR_NOTFOUND, "no sequence %s", st->table);
+        if (!rc) snprintf(r->status, sizeof r->status, "DROP SEQUENCE %s", st->table);
         break;
     }
     case ST_ALTER_TABLE: { /* F1: op 22 */
@@ -9174,7 +9421,10 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
         if (!rc) snprintf(r->status, sizeof r->status, "DROP TABLE %s", st->table);
         break;
     }
-    case ST_CREATE_VIEW: rc = exec_create_view(&x, st, r, e); break; /* P2 S7 */
+    case ST_CREATE_VIEW: /* P2 S7; F2a-2: a view's text calls no nextval or setval (a read of it would write) */
+        rc = st->seq_write ? imdb_fail(e, IMDB_ERR_UNSUPPORTED, "a view's query calls no nextval or setval")
+                           : exec_create_view(&x, st, r, e);
+        break;
     case ST_DROP_VIEW: rc = exec_drop_view(&x, st, r, e); break;
     case ST_SHOW_VIEWS: rc = exec_show_views(&x, r, e); break;
     case ST_DROP_INDEX:
@@ -9430,7 +9680,7 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
     }
     if (ceiling) imdb_heap_ceiling_set(0, 0);
     wceil_lift(&x); /* P2 S8: a write that left before lifting its own (an error), before its savepoint is restored */
-    if (is_write(st->kind)) {
+    if (wr) {
         if (rc) {
             imdb_savepoint_restore(db, sp);
             if (autocommit) imdb_rollback(db);

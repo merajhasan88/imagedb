@@ -194,6 +194,7 @@ typedef struct parser {
     uint16_t narms;          /* P2 S5: the statement's set operations' arms so far (arm_new) */
     uint8_t parens;          /* P2 S5: parenthesized queries around this point (parse_operand: bounded) */
     bool win_ok;             /* P2 S6: parsing a SELECT item's expression, where a window function may stand */
+    bool seqcall;            /* F2a-2: nextval or setval called anywhere in the statement: it writes */
 } parser;
 
 static int parse_nested(parser *p, sql_stmt *outer, const char *name); /* P2 S4 */
@@ -388,6 +389,67 @@ static int uint_lit(parser *p, uint64_t *out)
     return IMDB_OK;
 }
 
+/* F2a-2: [-]n as an int64, INT64_MIN too */
+static int int64_lit(parser *p, int64_t *out)
+{
+    bool neg = tok(p, TK_MINUS);
+    if (!neg) tok(p, TK_PLUS);
+    const sql_tok *t = &p->t[p->i];
+    if (t->kind != TK_INT) return fail_at(p, "an integer");
+    char buf[32];
+    if (t->len + 1 >= sizeof buf) return imdb_fail(p->e, IMDB_ERR_LIMIT, "integer at offset %u out of range", t->off);
+    buf[0] = '-';
+    memcpy(buf + 1, p->s + t->off, t->len);
+    imdb_err e2 = {0};
+    if (imdb_parse_int64(neg ? buf : buf + 1, t->len + neg, out, &e2))
+        return imdb_fail(p->e, IMDB_ERR_LIMIT, "integer at offset %u out of range", t->off);
+    p->i++;
+    return IMDB_OK;
+}
+
+/* F2a-2: a sequence's options, PostgreSQL's spelling (create: AS type too); CYCLE, a CACHE past 1 and OWNED BY refused */
+static int seq_options(parser *p, sql_seqopt *o, bool create)
+{
+    for (;;) {
+        if (create && kw(p, "as")) {
+            if (kw(p, "bigint") || kw(p, "int8") || kw(p, "int64")) o->width = 0;
+            else if (kw(p, "integer") || kw(p, "int") || kw(p, "int4")) o->width = 32;
+            else if (kw(p, "smallint") || kw(p, "int2")) o->width = 16;
+            else return fail_at(p, "SMALLINT, INTEGER or BIGINT");
+        } else if (kw(p, "increment")) {
+            kw(p, "by");
+            if (int64_lit(p, &o->inc)) return p->e->code;
+            o->has_inc = true;
+        } else if (kw(p, "minvalue")) {
+            if (int64_lit(p, &o->min)) return p->e->code;
+            o->has_min = true;
+        } else if (kw(p, "maxvalue")) {
+            if (int64_lit(p, &o->max)) return p->e->code;
+            o->has_max = true;
+        } else if (kw(p, "start")) {
+            kw(p, "with");
+            if (int64_lit(p, &o->start)) return p->e->code;
+            o->has_start = true;
+        } else if (kw(p, "cache")) {
+            int64_t c;
+            if (int64_lit(p, &c)) return p->e->code;
+            if (c != 1) return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "CACHE %lld: a sequence's values are handed out "
+                                         "one at a time (each commit logs its mark)", (long long)c);
+        } else if (kw(p, "cycle")) {
+            return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "CYCLE: a sequence's marks only advance (deferred.md D18)");
+        } else if (tok_is_kw(p, p->i, "no")) {
+            p->i++;
+            if (kw(p, "minvalue")) o->has_min = false;
+            else if (kw(p, "maxvalue")) o->has_max = false;
+            else if (!kw(p, "cycle")) return fail_at(p, "MINVALUE, MAXVALUE or CYCLE");
+        } else if (tok_is_kw(p, p->i, "owned")) {
+            return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "OWNED BY: an IDENTITY column owns its sequence (deferred.md D18)");
+        } else {
+            return IMDB_OK;
+        }
+    }
+}
+
 /* ---- expressions (docs/plan-p0.md 1b) ----------------------------------------------------------------------------
  *   bexpr   := b_and (OR b_and)*                     one ladder, PostgreSQL's (1c): (a + 1) > 2 and (a > 1 OR b < 2)
  *   b_and   := b_not (AND b_not)*                   both parse through '(' bexpr ')'
@@ -500,7 +562,8 @@ static uint8_t fn_named(const parser *p, uint32_t at)
              {"position", FN_POSITION}, {"coalesce", FN_COALESCE}, {"nullif", FN_NULLIF},
              {"lower", FN_LOWER},       {"upper", FN_UPPER},       {"replace", FN_REPLACE},
              {"date_trunc", FN_DATE_TRUNC}, {"timezone", FN_TIMEZONE}, /* P2 */
-             {"now", FN_NOW}};                                   /* F2a */
+             {"now", FN_NOW},                                    /* F2a */
+             {"nextval", FN_NEXTVAL}, {"currval", FN_CURRVAL}, {"setval", FN_SETVAL}, {"lastval", FN_LASTVAL}}; /* F2a-2 */
     for (size_t i = 0; i < sizeof k / sizeof *k; i++)
         if (tok_is_kw(p, at, k[i].name)) return k[i].fn;
     return 0;
@@ -510,6 +573,7 @@ static uint8_t fn_named(const parser *p, uint32_t at)
 static int fn_call(parser *p, uint8_t fn, uint16_t *out, unsigned depth)
 {
     p->i += 2; /* the name and its ( */
+    if (fn == FN_NEXTVAL || fn == FN_SETVAL) p->seqcall = true; /* F2a-2: the statement writes */
     uint16_t args;
     uint32_t n;
     if (fn == FN_POSITION) {
@@ -1170,6 +1234,13 @@ static int default_value(parser *p, sql_lit *l, uint8_t *clock)
         *clock = IMDB_DEFK_CURRENT_TIMESTAMP;
         return IMDB_OK;
     }
+    if (tok_is_kw(p, p->i, "nextval") && p->t[p->i + 1].kind == TK_LP) { /* F2a-2: DEFAULT nextval('s'), the name a string */
+        p->i += 2;
+        if (literal(p, l) || expect(p, TK_RP, ")")) return p->e->code;
+        if (l->kind != LIT_STR) return imdb_fail(p->e, IMDB_ERR_INVALID, "nextval takes a sequence's name as a string");
+        *clock = IMDB_DEFK_NEXTVAL;
+        return IMDB_OK;
+    }
     if (tok_is_kw(p, p->i, "current_time"))
         return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "CURRENT_TIME is a time with a zone, which imagedb has not: write LOCALTIME");
     if (kw(p, "current_timestamp")) *clock = IMDB_DEFK_CURRENT_TIMESTAMP;
@@ -1303,7 +1374,16 @@ static int parse_create(parser *p, sql_stmt *st)
         }
         if (s->ncols >= IMDB_MAX_COLS) return imdb_fail(p->e, IMDB_ERR_LIMIT, "more than %u columns", IMDB_MAX_COLS);
         imdb_column *c = &s->cols[s->ncols];
-        if (ident(p, c->name) || col_type(p, c)) return p->e->code;
+        if (ident(p, c->name)) return p->e->code;
+        int serial = kw(p, "serial") ? 32 : kw(p, "bigserial") ? 64 : kw(p, "smallserial") ? 16 : 0; /* F2a-2 */
+        if (serial) {
+            c->type = IMDB_T_INT64;
+            c->precision = (uint8_t)(serial == 64 ? 0 : serial);
+            st->cdef_kind[s->ncols] = IMDB_DEFK_IDENTITY; /* PostgreSQL's SERIAL: a sequence of its own, a value given taken */
+            memset(&st->idopt[s->ncols], 0, sizeof st->idopt[s->ncols]);
+        } else if (col_type(p, c)) {
+            return p->e->code;
+        }
         int null_spec = 0; /* 1 NULL, 2 NOT NULL */
         for (;;) {
             if (kw(p, "primary")) {
@@ -1313,6 +1393,16 @@ static int parse_create(parser *p, sql_stmt *st)
                     return imdb_fail(p->e, IMDB_ERR_INVALID, "a table has one PRIMARY KEY (PRIMARY KEY (a, b) names several columns)");
                 c->flags |= IMDB_COL_PK;
                 pk = s->ncols;
+            } else if (kw(p, "generated")) { /* F2a-2: GENERATED {ALWAYS | BY DEFAULT} AS IDENTITY [(options)] */
+                bool always = kw(p, "always");
+                if (!always && (expect_kw(p, "by") || expect_kw(p, "default"))) return p->e->code;
+                if (expect_kw(p, "as") || expect_kw(p, "identity")) return p->e->code;
+                if (st->cdef_kind[s->ncols])
+                    return imdb_fail(p->e, IMDB_ERR_INVALID, "column %s: an IDENTITY takes no DEFAULT, once", c->name);
+                st->cdef_kind[s->ncols] = always ? IMDB_DEFK_IDENTITY_ALWAYS : IMDB_DEFK_IDENTITY;
+                memset(&st->idopt[s->ncols], 0, sizeof st->idopt[s->ncols]);
+                if (tok(p, TK_LP) && (seq_options(p, &st->idopt[s->ncols], false) || expect(p, TK_RP, ")")))
+                    return p->e->code;
             } else if (kw(p, "default")) { /* F2a: a literal (DEFAULT NULL: none) or a clock */
                 if (st->cdef_kind[s->ncols]) return imdb_fail(p->e, IMDB_ERR_INVALID, "column %s: one DEFAULT", c->name);
                 uint8_t ck = 0;
@@ -1332,6 +1422,12 @@ static int parse_create(parser *p, sql_stmt *st)
             } else {
                 break;
             }
+        }
+        if (st->cdef_kind[s->ncols] == IMDB_DEFK_IDENTITY_ALWAYS || st->cdef_kind[s->ncols] == IMDB_DEFK_IDENTITY) {
+            if (null_spec == 1) return imdb_fail(p->e, IMDB_ERR_INVALID, "column %s: an IDENTITY is NOT NULL", c->name);
+            if (c->type != IMDB_T_INT64)
+                return imdb_fail(p->e, IMDB_ERR_INVALID, "column %s: an IDENTITY is SMALLINT, INTEGER or BIGINT", c->name);
+            null_spec = 2; /* PostgreSQL's: an IDENTITY is NOT NULL */
         }
         if (c->flags & (IMDB_COL_PK | IMDB_COL_SUBJECT)) {
             if (null_spec == 1)
@@ -1666,6 +1762,18 @@ static int parse_insert(parser *p, sql_stmt *st)
         } while (tok(p, TK_COMMA));
         if (expect(p, TK_RP, ")")) return p->e->code;
     }
+    if (kw(p, "overriding")) { /* F2a-2: OVERRIDING SYSTEM VALUE (an ALWAYS IDENTITY takes the value given) or USER VALUE */
+        if (kw(p, "system")) st->overriding = 1;
+        else if (kw(p, "user")) st->overriding = 2;
+        else return fail_at(p, "SYSTEM or USER");
+        if (expect_kw(p, "value")) return p->e->code;
+    }
+    if (!st->ncols && tok_is_kw(p, p->i, "default") && tok_is_kw(p, p->i + 1, "values")) { /* F2a-2: one row of DEFAULTs */
+        p->i += 2;
+        st->default_values = true;
+        st->nrows = 1;
+        return on_conflict(p, st) ? p->e->code : returning(p, st);
+    }
     if (!kw(p, "values")) return insert_query(p, st) || on_conflict(p, st) ? p->e->code : returning(p, st); /* P2 S8 */
     uint32_t cap = 0;
     do {
@@ -1683,7 +1791,12 @@ static int parse_insert(parser *p, sql_stmt *st)
                 st->vals = nv;
                 cap = ncap;
             }
-            if (value(p, &st->vals[at])) return p->e->code;
+            if (kw(p, "default")) { /* F2a-2: the column's DEFAULT */
+                memset(&st->vals[at], 0, sizeof st->vals[at]);
+                st->vals[at].kind = LIT_DEFAULT;
+            } else if (value(p, &st->vals[at])) {
+                return p->e->code;
+            }
             w++;
         } while (tok(p, TK_COMMA));
         if (expect(p, TK_RP, ")")) return p->e->code;
@@ -2185,7 +2298,7 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
     sql_tok *t;
     uint32_t nt;
     if (imdb_sql_lex(s, n, &t, &nt, e)) return e->code;
-    parser p = {s, t, nt, 0, e, st, 0, 0, 0, false};
+    parser p = {s, t, nt, 0, e, st, 0, 0, 0, false, false};
     int rc = IMDB_OK;
     if (nt == 0 || (nt == 1 && t[0].kind == TK_SEMI)) {
         st->kind = ST_EMPTY;
@@ -2197,6 +2310,11 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
         if (tok_is_kw(&p, p.i, "or") && tok_is_kw(&p, p.i + 1, "replace")) /* P2 S7 */
             rc = imdb_fail(e, IMDB_ERR_UNSUPPORTED, "CREATE OR REPLACE: drop the view and create it again");
         else if (kw(&p, "view")) rc = parse_create_view(&p, st);
+        else if (kw(&p, "sequence")) { /* F2a-2 */
+            st->kind = ST_CREATE_SEQUENCE;
+            memset(&st->seqopt, 0, sizeof st->seqopt);
+            if (!(rc = ident(&p, st->table))) rc = seq_options(&p, &st->seqopt, true);
+        }
         else {
             bool unique = kw(&p, "unique");
             if (unique) rc = expect_kw(&p, "index");
@@ -2204,6 +2322,13 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
         }
     }
     else if (kw(&p, "drop")) {
+        if (kw(&p, "sequence")) { /* F2a-2: RESTRICT, the default and only one */
+            st->kind = ST_DROP_SEQUENCE;
+            if (!(rc = ident(&p, st->table))) {
+                if (kw(&p, "cascade")) rc = imdb_fail(e, IMDB_ERR_UNSUPPORTED, "DROP SEQUENCE ... CASCADE: drop the DEFAULT first");
+                else kw(&p, "restrict");
+            }
+        } else
         if (kw(&p, "view")) { /* P2 S7 */
             st->kind = ST_DROP_VIEW;
             rc = ident(&p, st->table);
@@ -2393,6 +2518,9 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
         tok(&p, TK_SEMI);
         if (p.t[p.i].kind != TK_EOF) rc = fail_at(&p, "end of statement");
     }
+    if (!rc) st->seq_write = p.seqcall; /* F2a-2: nextval or setval anywhere in it, a nested SELECT's too */
+    if (!rc && explain && p.seqcall) /* F2a-2: EXPLAIN runs nothing, and would hand out no value */
+        rc = imdb_fail(e, IMDB_ERR_UNSUPPORTED, "EXPLAIN of a statement calling nextval or setval");
     if (!rc && explain) { /* P1 Q1: its own kind, so no test of the inner kind (a write's autocommit, FOR UPDATE's locks) */
         if (st->kind != ST_SELECT && st->kind != ST_UPDATE && st->kind != ST_DELETE)
             rc = imdb_fail(e, IMDB_ERR_INVALID, "EXPLAIN explains SELECT, UPDATE and DELETE");

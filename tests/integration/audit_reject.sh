@@ -301,7 +301,7 @@ echo "== FA-FE: manifest 7 (the format design's slice 1) breaking one of its rul
 PFA=$WORK/fa; make_db "$PFA"
 "$FORGE" manifest-lie "$PFA" section
 must_fail "a later imagedb's format" "$BIN" verify "$PFA"
-must_fail "manifest: section 3 not empty" "$AUD" verify "$PFA"
+must_fail "manifest: section 4 not empty" "$AUD" verify "$PFA"
 PFB=$WORK/fb; make_db "$PFB"
 "$FORGE" manifest-lie "$PFB" keylist
 must_fail "physical divergence" "$BIN" verify "$PFB"   # an unreadable manifest: the open replays and rebuilds it (as X)
@@ -309,7 +309,7 @@ must_fail "schema: the key list is not its PRIMARY KEY column" "$AUD" verify "$P
 PFC=$WORK/fc; make_db "$PFC"
 "$FORGE" manifest-lie "$PFC" order
 must_fail "physical divergence" "$BIN" verify "$PFC"   # unreadable: the open replays and rebuilds it (as X)
-must_fail "manifest: section 3 missing or out of order" "$AUD" verify "$PFC"
+must_fail "manifest: the sequences section missing or out of order" "$AUD" verify "$PFC"
 PFD=$WORK/fd; make_db "$PFD"
 "$FORGE" manifest-lie "$PFD" later
 must_fail "its section 11 is not empty: a later imagedb's format" "$BIN" verify "$PFD"
@@ -437,6 +437,28 @@ must_fail "the manifest's schema history differs from the log's" "$AUD" verify "
 echo "   FP a CREATE's clock DEFAULT on a column it does not suit (LOCALTIME on a TIMESTAMPTZ), FQ SET DEFAULT CURRENT_DATE
    on a TEXT column: the replay and the auditor refuse each; FR a manifest's version 1 DEFAULT another than the
    CREATE's (no version's hash covers it): VERIFY and the auditor refuse it"
+
+echo "== FS, FT, FU: sequence ops and a manifest's sequence breaking their rules (F2a-2), each signed or re-pointed"
+PFS=$WORK/fs; make_db "$PFS"
+"$BIN" sql "$PFS" --nosync -c "CREATE SEQUENCE s;" -c "SELECT nextval('s');" -c "SELECT nextval('s');" >/dev/null
+"$FORGE" index-lie "$PFS" seq-back
+must_fail "mark goes back" "$BIN" verify "$PFS"
+must_fail "mark goes back" "$AUD" verify "$PFS"
+PFT=$WORK/ft; make_db "$PFT"
+"$BIN" sql "$PFT" --nosync -c "CREATE TABLE ident (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v TEXT);" \
+  -c "INSERT INTO ident (v) VALUES ('a');" >/dev/null
+"$FORGE" index-lie "$PFT" seq-drop-owned
+must_fail "a column takes values from" "$BIN" verify "$PFT"
+must_fail "DROP SEQUENCE of a column's IDENTITY" "$AUD" verify "$PFT"
+PFU=$WORK/fu; "$BIN" init "$PFU" >/dev/null
+"$BIN" sql "$PFU" --nosync -c "CREATE SEQUENCE fu_seq;" -c "SELECT nextval('fu_seq');" -c "CREATE TABLE z (id INT64 PRIMARY KEY);" \
+  -c "CHECKPOINT;" >/dev/null
+"$BIN" verify "$PFU" >/dev/null && "$AUD" verify "$PFU" >/dev/null || fail "the honest directory must verify"
+"$FORGE" manifest-lie "$PFU" seq-state
+must_fail "sequence fu_seq differs from the log" "$BIN" verify "$PFU"   # the snapshot open took the manifest's state
+must_fail "the manifest's state differs from the log's" "$AUD" verify "$PFU"
+echo "   FS a signed mark one increment back, FT a signed DROP SEQUENCE of an IDENTITY's: the replay and the auditor refuse
+   each; FU a manifest's sequence one value on (aligned, in bounds): VERIFY and the auditor refuse it"
 
 echo "== Z: a commit naming the other digest algorithm, re-signed by the writer (both ways round); META naming an unknown one"
 for a in 1 2; do # explicit algorithms: under IMDB_DIGEST_ALG=2 make_db's would all be alg 2

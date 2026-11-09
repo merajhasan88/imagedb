@@ -140,7 +140,9 @@ typedef struct imdb_tcol {
                                 while the history lives */
     imdb_value cdef;         /* F2a: its CREATE's DEFAULT when a constant (its TEXT in missing_text; NULL: none or a clock) */
     uint8_t cclock;          /* F2a: its CREATE's DEFAULT when a clock (IMDB_DEFK_*), else 0 */
-    uint8_t wclock;          /* F2a: the write default a clock (IMDB_DEFK_*), read at the write; 0: wdef is the default */
+    uint8_t wclock;          /* F2a: the write default a kind past a value (IMDB_DEFK_*: a clock read at the write, F2a-2's
+                                IDENTITY and nextval kinds a sequence's next value); 0: wdef is the default */
+    uint32_t cseq, wseq;     /* F2a-2: the CREATE's and the write default's sequence (the IDENTITY and nextval kinds) */
 } imdb_tcol;
 
 /* F1: a schema version. Rows begun at or after `since` (up to the next version's) are encoded under s, the columns
@@ -209,6 +211,18 @@ typedef struct imdb_table {
  * the handle closes, for a transaction older than the drop: def is NULL for a tombstone a manifest gave. Views live
  * in one array, reserved before a commit (imdb_view_reserve), so the install allocates nothing and a pointer to one is
  * good until the next CREATE VIEW. */
+/* F2a-2: a sequence (design.md §5, Sequences): its definition and state. last is the value nextval handed out last,
+ * or, while !called, the one it hands out next; a commit that called nextval logs it as the mark (op 26) */
+typedef struct imdb_sequence {
+    imdb_seqdef d;
+    int64_t last;
+    bool called;
+    int64_t base;                  /* the start, or the last setval's value: what a mark's alignment counts from */
+    uint64_t created_at, dropped_at; /* dropped_at 0: live */
+    uint32_t owner;                /* UINT32_MAX: none; else the table whose IDENTITY column (owner_pos) owns it */
+    uint16_t owner_pos;
+} imdb_sequence;
+
 typedef struct imdb_view {
     imdb_viewdef *def; /* allocated */
     char name[IMDB_MAX_IDENT + 1];
@@ -456,6 +470,10 @@ typedef struct imdb_db {
     uint32_t nt;
     imdb_view *views; /* P2 S7: views[i] is view i, a dropped one a tombstone */
     uint32_t nviews, capviews;
+    imdb_sequence *seqs; /* F2a-2: seqs[i] is sequence i, a dropped one a tombstone */
+    uint32_t nseqs, capseqs;
+    uint32_t *txseq;     /* F2a-2: the active transaction's sequences nextval touched, by id (SEQ_ADVANCE at its commit) */
+    uint32_t ntxseq, captxseq;
     imdb_lthash global;
     /* transaction */
     bool in_txn;
@@ -557,6 +575,21 @@ int imdb_create_table_ex(imdb_db *db, imdb_schema *s, uint64_t retention_us, imd
 /* F2a: the same with column DEFAULTs (op 23 in its commit) */
 int imdb_create_table_defs(imdb_db *db, imdb_schema *s, uint64_t retention_us, const struct imdb_coldef *defs,
                            uint16_t ndefs, imdb_err *e);
+/* F2a-2: sequences (design.md §5, Sequences). CREATE SEQUENCE installs it at the statement (an undo removes it, op 24
+ * at the commit); DROP SEQUENCE alone, refused while a column takes values from it; nextval hands out the next value
+ * and puts the sequence in the transaction's set, whose marks its commit logs (op 26); setval in a commit of setvals,
+ * in effect at once (an undo puts the state back) */
+imdb_sequence *imdb_seq_by_name(imdb_db *db, const char *name);
+int imdb_seq_install(imdb_db *db, const imdb_seqdef *d, uint64_t seq, imdb_err *e);
+int imdb_create_sequence(imdb_db *db, imdb_seqdef *d, imdb_err *e);
+int imdb_drop_sequence(imdb_db *db, imdb_sequence *s, imdb_err *e);
+int imdb_seq_next(imdb_db *db, imdb_sequence *s, int64_t *out, imdb_err *e);
+int imdb_txseq_load(imdb_db *db, const uint32_t *ids, uint32_t n, imdb_err *e); /* a parked transaction's set, active again */
+int imdb_seq_set(imdb_db *db, imdb_sequence *s, int64_t v, bool called, imdb_err *e);
+bool imdb_seq_mark_ok(const imdb_sequence *s, int64_t mark);
+int imdb_seq_own(imdb_db *db, uint32_t table, const struct imdb_coldef *defs, uint16_t n, uint64_t seq, imdb_err *e);
+void imdb_seq_drop_owned(imdb_db *db, uint32_t table, uint16_t pos, uint64_t seq);
+int imdb_seq_apply(imdb_db *db, const imdb_op *o, uint64_t seq, imdb_err *e);
 /* ALTER TABLE t SET RETENTION: logged in the transaction, in effect from its commit. */
 int imdb_set_retention(imdb_db *db, imdb_table *t, uint64_t retention_us, imdb_err *e);
 /* CREATE INDEX / DROP INDEX, each the only op of its transaction; names are unique per database;
@@ -694,6 +727,8 @@ typedef struct imdb_txn {
     uint64_t begin_ns, last_ns; /* R4: its BEGIN and the end of its last statement (CLOCK_MONOTONIC) */
     uint64_t begin_us;          /* F2a: its BEGIN by imdb's clock (imdb_now_us): now() and the other clock values in it */
     uint32_t timeout_ms, idle_ms; /* SET transaction_timeout and idle_in_transaction_timeout at its BEGIN (0: none) */
+    uint32_t *seqs;            /* F2a-2: its sequences nextval touched, while it is not active (db->txseq when it is) */
+    uint32_t nseqs;
     char doom[512];            /* why it can only roll back */
 } imdb_txn;
 

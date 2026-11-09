@@ -976,6 +976,7 @@ void imdb_manifest_free(imdb_manifest *m)
 {
     for (uint32_t i = 0; i < m->nv; i++) imdb_viewdef_free(m->v[i].def); /* P2 S7 */
     imdb_free(m->v);
+    imdb_free(m->sq); /* F2a-2 */
     for (uint32_t i = 0; i < m->nt; i++) {
         imdb_free(m->t[i].seg);
         imdb_hist_free(&m->t[i].hist); /* F1: what no consumer took */
@@ -1071,6 +1072,9 @@ static int old_manifest(uint32_t ver, imdb_err *e)
     if (ver == 5)
         return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 5: this lake was written by an imagedb before views' "
                          "format (manifest 6, P2 S7), which this version does not read");
+    if (ver == 9) /* F2a-2: its sequences section was reserved */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 9: this lake was written by an imagedb before "
+                         "sequences (manifest 10, 2026-11-09), which this version does not read");
     if (ver == 8) /* F2a: a CREATE's DEFAULTs were not in its history */
         return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 8: this lake was written by an imagedb before CREATE "
                          "TABLE's DEFAULTs (manifest 9, 2026-11-09), which this version does not read");
@@ -1079,6 +1083,32 @@ static int old_manifest(uint32_t ver, imdb_err *e)
                          "versions by position (manifest 8, segment format 3, 2026-11-08), which this version does not read");
     return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version %u: this lake was written by an imagedb before the format "
                      "design's sections (manifest 7, 2026-11-07), which this version does not read", ver);
+}
+
+/* F2a-2: a sequence's owner names a table whose version 1 makes that column an IDENTITY of it, and every such column
+ * of every table names a sequence owned by it (both ways: the manifest's section and its histories agree) */
+static bool manifest_owner_ok(const imdb_manifest *m, const imdb_sequence *s)
+{
+    if (s->owner >= m->nt) return false;
+    const imdb_schema_hist *h = &m->t[s->owner].hist;
+    if (!h->nvers || s->owner_pos >= h->vers[0].s.ncols) return false;
+    const imdb_tcol *tc = &h->tcol[s->owner_pos];
+    return (tc->cclock == IMDB_DEFK_IDENTITY_ALWAYS || tc->cclock == IMDB_DEFK_IDENTITY) && tc->cseq == s->d.id;
+}
+
+static bool manifest_owners_listed(const imdb_manifest *m)
+{
+    for (uint32_t i = 0; i < m->nt; i++) {
+        const imdb_schema_hist *h = &m->t[i].hist;
+        for (uint16_t p = 0; h->nvers && p < h->vers[0].s.ncols; p++) {
+            const imdb_tcol *tc = &h->tcol[p];
+            if (tc->cclock < IMDB_DEFK_IDENTITY_ALWAYS) continue;
+            if (tc->cseq >= m->nsq) return false;
+            const imdb_sequence *s = &m->sq[tc->cseq];
+            if (tc->cclock != IMDB_DEFK_NEXTVAL && (s->owner != i || s->owner_pos != p)) return false;
+        }
+    }
+    return true;
 }
 
 int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err *e)
@@ -1234,7 +1264,36 @@ int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err
         if (vrc || v->def->id != i || strcmp(v->def->name, v->name)) goto bad;
     }
     if (r.err || r.off != send) goto bad;
-    for (uint32_t k = IMDB_MAN_SEQUENCES; k <= IMDB_MAN_TRIGGERS; k++) { /* reserved: empty until their slices */
+    if (man_section(&r, IMDB_MAN_SEQUENCES, &send)) goto bad; /* F2a-2 (manifest 10): each sequence by id */
+    uint32_t nsq = imdb_rd_u32(&r);
+    if (r.err || nsq > IMDB_MAX_SEQUENCES || nsq > imdb_rd_left(&r) / 70) goto bad;
+    if (nsq && !(m->sq = imdb_alloc_array(nsq, sizeof *m->sq, e))) {
+        imdb_manifest_free(m);
+        return e->code;
+    }
+    m->nsq = nsq;
+    for (uint32_t i = 0; i < nsq; i++) {
+        imdb_sequence *s = &m->sq[i];
+        imdb_err es = {0};
+        if (imdb_seqdef_decode(&r, &s->d, "manifest", &es) || r.err) goto bad;
+        s->last = (int64_t)imdb_rd_u64(&r);
+        uint8_t called = imdb_rd_u8(&r);
+        s->base = (int64_t)imdb_rd_u64(&r);
+        s->created_at = imdb_rd_u64(&r);
+        s->dropped_at = imdb_rd_u64(&r);
+        s->owner = imdb_rd_u32(&r);
+        s->owner_pos = imdb_rd_u16(&r);
+        s->called = called == 1;
+        __int128 d = (__int128)s->last - s->base;
+        if (r.err || s->d.id != i || called > 1 || s->last < s->d.min || s->last > s->d.max || s->base < s->d.min ||
+            s->base > s->d.max || (called && d % s->d.inc != 0) || (!called && s->last != s->base) ||
+            !s->created_at || s->created_at > m->seq ||
+            (s->dropped_at && (s->dropped_at <= s->created_at || s->dropped_at > m->seq)) ||
+            (s->owner == UINT32_MAX ? s->owner_pos != 0 : !manifest_owner_ok(m, s)))
+            goto bad;
+    }
+    if (r.err || r.off != send || !manifest_owners_listed(m)) goto bad;
+    for (uint32_t k = IMDB_MAN_SEQUENCES + 1; k <= IMDB_MAN_TRIGGERS; k++) { /* reserved: empty until their slices */
         if (man_section(&r, k, &send)) goto bad;
         size_t sl = send - r.off; /* a u32 count of 0; any other count is a later format's, whatever its length */
         if (sl >= 4 && imdb_rd_u32(&r) != 0) {
@@ -1785,7 +1844,7 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
             const imdb_schema *s1 = h->nvers ? &h->vers[0].s : &t->s;
             for (uint16_t q = 0; h->nvers && q < s1->ncols; q++) {
                 const imdb_tcol *tc = &h->tcol[q];
-                if (tc->cclock) cd[ncd++] = (imdb_coldef){.col = q, .kind = tc->cclock};
+                if (tc->cclock) cd[ncd++] = (imdb_coldef){.col = q, .kind = tc->cclock, .seq = tc->cseq}; /* F2a-2: a sequence's too */
                 else if (!tc->cdef.null) cd[ncd++] = (imdb_coldef){.col = q, .kind = IMDB_DEFK_VALUE, .v = tc->cdef};
             }
             imdb_coldefs_put(mb, s1, cd, ncd);
@@ -1835,7 +1894,21 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
         if (!v->dropped_at) imdb_viewdef_encode(v->def, mb);
     }
     man_close(mb, sec);
-    for (uint32_t k = IMDB_MAN_SEQUENCES; k <= IMDB_MAN_TRIGGERS; k++) { /* reserved: present and empty */
+    sec = man_open(mb, IMDB_MAN_SEQUENCES); /* F2a-2 (manifest 10): each sequence by id, its state at the snapshot */
+    imdb_buf_put_u32(mb, db->nseqs);
+    for (uint32_t i = 0; i < db->nseqs; i++) {
+        const imdb_sequence *s = &db->seqs[i];
+        imdb_seqdef_encode(&s->d, mb);
+        imdb_buf_put_u64(mb, (uint64_t)s->last);
+        imdb_buf_put_u8(mb, s->called);
+        imdb_buf_put_u64(mb, (uint64_t)s->base);
+        imdb_buf_put_u64(mb, s->created_at);
+        imdb_buf_put_u64(mb, s->dropped_at);
+        imdb_buf_put_u32(mb, s->owner);
+        imdb_buf_put_u16(mb, s->owner == UINT32_MAX ? 0 : s->owner_pos);
+    }
+    man_close(mb, sec);
+    for (uint32_t k = IMDB_MAN_SEQUENCES + 1; k <= IMDB_MAN_TRIGGERS; k++) { /* reserved: present and empty */
         sec = man_open(mb, k);
         imdb_buf_put_u32(mb, 0);
         man_close(mb, sec);
@@ -3363,6 +3436,13 @@ int imdb_lake_load_snapshot(imdb_db *db, uint64_t *seq, bool *moved, imdb_err *e
             m.v[i].def = NULL;
         }
         if (!rc) db->nviews = db->capviews = m.nv;
+    }
+    if (!rc && m.nsq) { /* F2a-2: the sequences, their state at the snapshot (the log's tail replays the rest) */
+        if (!(db->seqs = imdb_alloc_array(m.nsq, sizeof *db->seqs, e))) rc = e->code;
+        else {
+            memcpy(db->seqs, m.sq, m.nsq * sizeof *db->seqs);
+            db->nseqs = db->capseqs = m.nsq;
+        }
     }
     db->segcache.snap_seq = 0;
     if (!rc) {

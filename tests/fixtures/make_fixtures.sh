@@ -1,7 +1,7 @@
 #!/bin/sh
-# Makes the format's fixtures (2026-11-09, second pair: META 5, log version 3, manifest version 9 and segment format 3 (F1 stage 4:
-# a segment names its schema version by its hash with positions), ops 16, 19, 20, 21, 22's kinds and 23; alg1-20261109b.tar.gz
-# and alg2-20261109b.tar.gz beside this script): a primary and its replica under digest algorithm ALG, by
+# Makes the format's fixtures (2026-11-09, third pair: META 5, log version 3, manifest version 10 and segment format 3 (F1 stage 4:
+# a segment names its schema version by its hash with positions), ops 16, 19, 20, 21, 22's kinds and 23 to 27; alg1-20261109c.tar.gz
+# and alg2-20261109c.tar.gz beside this script): a primary and its replica under digest algorithm ALG, by
 # make_alg2.sh's steps, which reach every reader of the format: a log of several segments (each manifest
 # publish ends one), CHECKPOINTs (manifests, segments, the lanes), a two-column index and a unique one,
 # an UPDATE and a DELETE, ERASE SUBJECT (redacted log payloads, rewritten segments), commits after it, and
@@ -16,7 +16,8 @@
 # widened by SET TYPE after the first CHECKPOINT, and (F3b) DATE and TIME at their ends, an index on the TIME, a view of
 # DATE arithmetic, one row updated from the log, and (F2a) a table with CREATE TABLE DEFAULTs (op 23: constants and
 # clocks), an ADD COLUMN with a clock DEFAULT, a SET DEFAULT of a clock (kind 10) and one of a constant after a clock
-# (manifest 9: version 1's DEFAULTs in the history). The live
+# (manifest 9: version 1's DEFAULTs in the history), and (F2a-2) sequences: one standalone, an IDENTITY ALWAYS, a SERIAL
+# and a DEFAULT nextval, OVERRIDING SYSTEM VALUE, setval, a mark-only commit and a dropped sequence (manifest 10). The live
 # tables are RETENTION FOREVER and the dropped one is kept a century, the longest but FOREVER: a fixture is frozen
 # data, so its history
 # never expires under the tests that open it (the 24-hour default is tested by the unit tests). Every
@@ -25,10 +26,11 @@
 # this fixture. The old fixtures (alg1-20261026, alg2-20261026, tagged-20261027; alg1-20261029 and alg2-20261029,
 # manifest version 4; alg1-20261104 and alg2-20261104, manifest version 5; alg1-20261106 and alg2-20261106, manifest
 # version 6 and log version 2; alg1-20261108 and alg2-20261108, manifest version 7 and segment format 2; alg1-20261109
-# and alg2-20261109, manifest version 8: before CREATE TABLE's DEFAULTs) stay as
+# and alg2-20261109, manifest version 8: before CREATE TABLE's DEFAULTs; alg1-20261109b and alg2-20261109b, manifest version 9:
+# before sequences) stay as
 # directories this format refuses.
 #   sh tests/fixtures/make_fixtures.sh BIN AUDIT ALG OUTDIR   (OUTDIR must not exist)
-#   tar -czf tests/fixtures/algALG-20261109b.tar.gz -C OUTDIR primary replica
+#   tar -czf tests/fixtures/algALG-20261109c.tar.gz -C OUTDIR primary replica
 set -eu
 BIN=$1
 AUD=$2
@@ -81,6 +83,10 @@ sql "CREATE INDEX days_t ON days (t)"
 sql "CREATE VIEW days_v AS SELECT d, d - e AS gap, d + t AS at, CAST(d AS TIMESTAMP) AS mid FROM days WHERE e IS NOT NULL" # DATE arithmetic in a view's text
 sql "CREATE TABLE defs (id INT64 PRIMARY KEY, s TEXT NOT NULL DEFAULT 'dflt', n INTEGER DEFAULT -5, at TIMESTAMPTZ DEFAULT now(), d DATE DEFAULT CURRENT_DATE) RETENTION FOREVER" # F2a: op 23
 sql "INSERT INTO defs (id) VALUES (1)"   # each column its DEFAULT, the clocks' the statement's
+sql "CREATE SEQUENCE ids AS INTEGER START WITH 100 INCREMENT BY 7" # F2a-2: op 24
+sql "CREATE TABLE ided (id BIGINT GENERATED ALWAYS AS IDENTITY (START WITH 10 INCREMENT BY 10) PRIMARY KEY, n SERIAL, o INTEGER DEFAULT nextval('ids'), v TEXT) RETENTION FOREVER"
+sql "INSERT INTO ided (v) VALUES ('a'), ('b')" # op 26: each sequence's mark
+sql "INSERT INTO ided OVERRIDING SYSTEM VALUE VALUES (5, DEFAULT, DEFAULT, 'given')"
 sql "CHECKPOINT"
 ship
 sql "ALTER TABLE pair ADD w TEXT DEFAULT 'w0'"          # F1: op 22; pair's rows so far are in a segment of version 1
@@ -100,6 +106,11 @@ sql "ALTER TABLE defs ADD COLUMN t TIME DEFAULT '12:00:00'"
 sql "ALTER TABLE defs ALTER COLUMN t SET DEFAULT LOCALTIME"           # op 22 kind 10
 sql "ALTER TABLE defs ALTER COLUMN d SET DEFAULT '2026-11-09'"        # a clock made a constant
 sql "INSERT INTO defs (id) VALUES (2)"
+sql "SELECT setval('ids', 500)"                      # F2a-2: op 27 alone
+sql "INSERT INTO ided (v) VALUES ('c')"              # o from 507, past the setval
+sql "CREATE SEQUENCE gone_seq"
+sql "SELECT nextval('gone_seq')"                     # a mark-only commit
+sql "DROP SEQUENCE gone_seq"                         # op 25: a tombstone in the manifest
 sql "UPDATE stamp SET at = TIMESTAMPTZ '2030-01-01 12:00:00+05:45' WHERE id = 3" # P2: an instant from the log
 sql "UPDATE acct SET balance = 1.00 WHERE id <= 10"
 sql "DELETE FROM ev WHERE id BETWEEN 1 AND 5"

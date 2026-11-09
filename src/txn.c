@@ -83,9 +83,14 @@ static int swap_out(imdb_db *db, imdb_err *e)
         if (db->tx[i].code == IMDB_OP_INSERT || db->tx[i].code == IMDB_OP_UPDATE) copy += db->tx[i].row_len;
     int arc = imdb_mem_admit(db, copy, e);
     if (arc) return arc;
+    uint32_t nsq = db->ntxseq; /* F2a-2: its sequences, saved with it (their marks are its commit's) */
+    uint32_t *sq = nsq ? imdb_alloc_array(nsq, sizeof *sq, e) : NULL;
+    if (nsq && !sq) return e->code;
+    if (nsq) memcpy(sq, db->txseq, nsq * sizeof *sq);
     uint64_t *pend = imdb_alloc_array(db->nt ? db->nt : 1, sizeof *pend, e);
     imdb_saved_op *ops = n ? imdb_alloc_array(n, sizeof *ops, e) : NULL;
     if (!pend || (n && !ops)) {
+        imdb_free(sq);
         imdb_free(pend);
         imdb_free(ops);
         return e->code;
@@ -123,6 +128,7 @@ static int swap_out(imdb_db *db, imdb_err *e)
     }
     imdb_free(pend);
     if (rc) {
+        imdb_free(sq);
         imdb_txn tmp = {.ops = ops, .nops = n, .capops = n};
         release_ops(&tmp);
         return rc;
@@ -130,6 +136,8 @@ static int swap_out(imdb_db *db, imdb_err *e)
     imdb_rollback(db); /* the pending versions go; their bytes are saved above */
     x->ops = ops;
     x->nops = x->capops = n;
+    x->seqs = sq;
+    x->nseqs = nsq;
     db->active = NULL;
     return IMDB_OK;
 }
@@ -172,6 +180,12 @@ static int swap_in(imdb_db *db, imdb_txn *x, imdb_err *e)
         }
     }
     imdb_free(start);
+    if (!rc && x->nseqs) rc = imdb_txseq_load(db, x->seqs, x->nseqs, &e2); /* F2a-2: its sequences, active again */
+    if (!rc) { /* kept on a failure: a parked transaction never loses its sequences (an out-of-memory retry) */
+        imdb_free(x->seqs);
+        x->seqs = NULL;
+        x->nseqs = 0;
+    }
     if (!rc && !locks_live(db, x)) rc = imdb_fail(&e2, IMDB_ERR_CONFLICT, "a locked row changed");
     if (rc) {
         imdb_rollback(db);
@@ -204,7 +218,7 @@ int imdb_txn_enter(imdb_db *db, imdb_txn *x, int need, imdb_err *e)
     if (db->in_txn && !db->active)
         return imdb_fail(e, IMDB_ERR_STATE, "the engine transaction of another caller is open");
     if (swap_out(db, e)) return e->code;
-    if (x->nops) return swap_in(db, x, e);
+    if (x->nops || x->nseqs) return swap_in(db, x, e); /* F2a-2: a SELECT nextval() alone has sequences, no ops */
     if (imdb_begin(db, e)) return e->code;
     db->active = x;
     return IMDB_OK;
@@ -213,6 +227,9 @@ int imdb_txn_enter(imdb_db *db, imdb_txn *x, int need, imdb_err *e)
 static void close_txn(imdb_db *db, imdb_txn *x)
 {
     release_ops(x);
+    imdb_free(x->seqs); /* F2a-2 */
+    x->seqs = NULL;
+    x->nseqs = 0;
     imdb_free(x->locks);
     x->locks = NULL;
     x->nlocks = x->caplocks = 0;
@@ -494,6 +511,9 @@ void imdb_txn_expire(imdb_db *db, imdb_txn *x, const char *why)
         db->active = NULL;
     }
     release_ops(x); /* parked: the saved copies */
+    imdb_free(x->seqs); /* F2a-2 */
+    x->seqs = NULL;
+    x->nseqs = 0;
     imdb_free(x->locks);
     x->locks = NULL;
     x->nlocks = x->caplocks = 0;

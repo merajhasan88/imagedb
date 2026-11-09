@@ -606,7 +606,8 @@ static const char *fn_name(uint8_t fn)
     static const char *const n[] = {"?",     "ABS",    "SIGN",  "ROUND", "CEIL",     "FLOOR",    "MOD",    "LENGTH",
                                     "SUBSTR", "TRIM",  "LTRIM", "RTRIM", "POSITION", "COALESCE", "NULLIF",
                                     "LOWER",  "UPPER", "REPLACE", "||",     "DATE_TRUNC", "TIMEZONE", "NOW",
-                                    "LOCALTIMESTAMP", "CURRENT_DATE", "LOCALTIME"}; /* F2a */
+                                    "LOCALTIMESTAMP", "CURRENT_DATE", "LOCALTIME", /* F2a */
+                                    "NEXTVAL", "CURRVAL", "SETVAL", "LASTVAL"}; /* F2a-2 */
     return fn < sizeof n / sizeof *n ? n[fn] : "?";
 }
 
@@ -629,6 +630,22 @@ int imdb_x_fn_type(uint8_t fn, uint8_t nargs, const uint8_t *ta, const uint8_t *
     case FN_LOCALTIME:
         if (fn_args(fn, nargs, 0, 0, e)) return e->code;
         *rt = fn == FN_NOW ? IMDB_T_TIMESTAMPTZ : fn == FN_LOCALTIMESTAMP ? IMDB_T_TIMESTAMP : fn == FN_CURRENT_DATE ? IMDB_T_DATE : IMDB_T_TIME;
+        return IMDB_OK;
+    case FN_NEXTVAL: /* F2a-2: a sequence by its name; setval's value and its called flag */
+    case FN_CURRVAL:
+        if (fn_args(fn, nargs, 1, 1, e)) return e->code;
+        if (ta[0] != IMDB_T_TEXT && ta[0]) return imdb_fail(e, IMDB_ERR_INVALID, "%s takes a sequence's name", fn_name(fn));
+        *rt = IMDB_T_INT64;
+        return IMDB_OK;
+    case FN_SETVAL:
+        if (fn_args(fn, nargs, 2, 3, e)) return e->code;
+        if ((ta[0] != IMDB_T_TEXT && ta[0]) || (ta[1] != IMDB_T_INT64 && ta[1]) || (nargs == 3 && ta[2] != IMDB_T_BOOL && ta[2]))
+            return imdb_fail(e, IMDB_ERR_INVALID, "setval takes a sequence's name, a BIGINT and a BOOL");
+        *rt = IMDB_T_INT64;
+        return IMDB_OK;
+    case FN_LASTVAL:
+        if (fn_args(fn, nargs, 0, 0, e)) return e->code;
+        *rt = IMDB_T_INT64;
         return IMDB_OK;
     case FN_ABS:
     case FN_SIGN:
@@ -799,6 +816,12 @@ static int fn_eval(uint8_t fn, const imdb_xval *a, uint8_t nargs, uint8_t rt, ui
             return IMDB_OK;
         }
     switch (fn) {
+    case FN_NEXTVAL: /* F2a-2: the executor's (the session's currval and lastval, the db's sequences) */
+    case FN_CURRVAL:
+    case FN_SETVAL:
+    case FN_LASTVAL:
+        if (!env || !env->seqfn) return imdb_fail(e, IMDB_ERR_STATE, "%s outside a statement's run", fn_name(fn));
+        return env->seqfn(env->ctx, fn, a, nargs, out, e);
     case FN_NOW: /* F2a: the transaction's start (an autocommit statement's), PostgreSQL's now(); never read in a probe */
     case FN_LOCALTIMESTAMP:
     case FN_CURRENT_DATE:

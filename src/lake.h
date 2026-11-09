@@ -73,7 +73,7 @@ enum {
 
 #define IMDB_SEG_HEADER 64u
 #define IMDB_SEG_VERSION 3u /* F1 stage 4: the header names its schema version by imdb_sver_hash (2: by the schema alone) */
-#define IMDB_MANIFEST_VERSION 9u /* F2a: a CREATE's DEFAULTs in the history (8 before it; 7: segment format 2); 2 to 8
+#define IMDB_MANIFEST_VERSION 10u /* F2a-2: the sequences section (9 before it: F2a, a CREATE's DEFAULTs; 8; 7: segment format 2); 2 to 9
                                    refused by name (old_manifest) */
 #define IMDB_SEG_STUB 1u   /* erased: vid, begin and commitment only */
 #define IMDB_SEG_PURGED 2u /* purged by COMPACT ... PURGE: vid, begin, commitment and the SUBJECT value */
@@ -277,6 +277,8 @@ typedef struct imdb_manifest {
     imdb_manifest_tab *t;
     uint32_t nt;
     imdb_manifest_view *v; /* P2 S7: every view ever created, by id */
+    imdb_sequence *sq;     /* F2a-2 (manifest 10): every sequence ever created, by id, its state at the snapshot */
+    uint32_t nsq;
     uint32_t nv;
 } imdb_manifest;
 int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err *e);

@@ -20,6 +20,9 @@ bool imdb_defk_fits(uint8_t kind, uint8_t type) /* F2a: a clock kind and the typ
     case IMDB_DEFK_LOCALTIMESTAMP: return type == IMDB_T_TIMESTAMP;
     case IMDB_DEFK_CURRENT_DATE: return type == IMDB_T_DATE;
     case IMDB_DEFK_LOCALTIME: return type == IMDB_T_TIME;
+    case IMDB_DEFK_IDENTITY_ALWAYS: /* F2a-2: a sequence's values: an integer column's */
+    case IMDB_DEFK_IDENTITY:
+    case IMDB_DEFK_NEXTVAL: return type == IMDB_T_INT64;
     default: return false;
     }
 }
@@ -70,6 +73,10 @@ bool imdb_coldefs_ok(const imdb_schema *s, const imdb_coldef *defs, uint16_t nde
         const imdb_coldef *d = &defs[k];
         imdb_err e2 = {0};
         if (d->col >= s->ncols || (k && d->col <= defs[k - 1].col)) return false;
+        bool ident = d->kind == IMDB_DEFK_IDENTITY_ALWAYS || d->kind == IMDB_DEFK_IDENTITY;
+        if ((ident && (s->cols[d->col].flags & IMDB_COL_NULLABLE)) || /* F2a-2: an IDENTITY is NOT NULL */
+            (d->kind >= IMDB_DEFK_IDENTITY_ALWAYS && d->seq >= IMDB_MAX_SEQUENCES))
+            return false;
         if (d->kind == IMDB_DEFK_VALUE ? d->v.null || imdb_value_check(&s->cols[d->col], &d->v, &e2)
                                        : !imdb_defk_fits(d->kind, s->cols[d->col].type))
             return false;
@@ -84,6 +91,7 @@ void imdb_coldefs_put(imdb_buf *b, const imdb_schema *s, const imdb_coldef *defs
         imdb_buf_put_u16(b, defs[k].col);
         imdb_buf_put_u8(b, defs[k].kind);
         if (defs[k].kind == IMDB_DEFK_VALUE) put_value(b, &s->cols[defs[k].col], &defs[k].v);
+        if (defs[k].kind >= IMDB_DEFK_IDENTITY_ALWAYS) imdb_buf_put_u32(b, defs[k].seq); /* F2a-2 */
     }
 }
 
@@ -154,6 +162,7 @@ int imdb_coldefs_get(imdb_rd *r, const imdb_schema *s, bool none_ok, imdb_coldef
         if (d[k].col >= s->ncols || (k && d[k].col <= d[k - 1].col) || d[k].kind < IMDB_DEFK_VALUE || d[k].kind > IMDB_DEFK_LAST)
             return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: a bad column default", what);
         if (d[k].kind == IMDB_DEFK_VALUE && get_value(r, &s->cols[d[k].col], &d[k].v, what, e)) return e->code;
+        if (d[k].kind >= IMDB_DEFK_IDENTITY_ALWAYS) d[k].seq = imdb_rd_u32(r); /* F2a-2 */
         if (r->err) return IMDB_OK;
     }
     if (!imdb_coldefs_ok(s, d, *n)) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: a bad column default", what);
@@ -173,7 +182,7 @@ int imdb_alter_put(imdb_buf *b, const imdb_op *o)
         (o->akind == IMDB_ALTER_SET_DEFAULT &&
          (!alter_bare_ok(&o->acol) || o->adef.null || imdb_value_check(&o->acol, &o->adef, &e2))) ||
         (o->akind == IMDB_ALTER_SET_TYPE && !alter_bare_ok(&o->acol)) ||
-        (o->akind == IMDB_ALTER_SET_DEFAULT_CLOCK && (o->aclock <= IMDB_DEFK_VALUE || o->aclock > IMDB_DEFK_LAST)) ||
+        (o->akind == IMDB_ALTER_SET_DEFAULT_CLOCK && (o->aclock <= IMDB_DEFK_VALUE || o->aclock > IMDB_DEFK_CLOCK_LAST)) ||
         (o->akind < IMDB_ALTER_ADD_COLUMN || o->akind > IMDB_ALTER_LAST)) {
         b->err = IMDB_ERR_INVALID;
         return IMDB_ERR_INVALID;
@@ -246,7 +255,7 @@ int imdb_alter_get(imdb_rd *r, imdb_op *o, const char *what, imdb_err *e)
     if (o->akind != IMDB_ALTER_RENAME_TABLE) o->apos = imdb_rd_u16(r);
     if (o->akind == IMDB_ALTER_SET_DEFAULT_CLOCK) { /* F2a: a clock kind; the type it suits is the history's check */
         o->aclock = imdb_rd_u8(r);
-        if (!r->err && (o->aclock <= IMDB_DEFK_VALUE || o->aclock > IMDB_DEFK_LAST))
+        if (!r->err && (o->aclock <= IMDB_DEFK_VALUE || o->aclock > IMDB_DEFK_CLOCK_LAST))
             return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad clock default", what);
         return IMDB_OK;
     }
@@ -299,6 +308,7 @@ void imdb_commit_free(imdb_commit_rec *c)
             imdb_free(c->ops[i].iname);
             imdb_free(c->ops[i].aname);
             imdb_free(c->ops[i].defs); /* F2a */
+            imdb_free(c->ops[i].sdef); /* F2a-2 */
             imdb_viewdef_free(c->ops[i].vdef);
         }
         imdb_free(c->ops);
@@ -307,6 +317,68 @@ void imdb_commit_free(imdb_commit_rec *c)
 }
 
 /* ---- encoding ------------------------------------------------------------ */
+
+bool imdb_seqdef_ok(const imdb_seqdef *d)
+{
+    int64_t lo = d->width == 16 ? INT16_MIN : d->width == 32 ? INT32_MIN : INT64_MIN;
+    int64_t hi = d->width == 16 ? INT16_MAX : d->width == 32 ? INT32_MAX : INT64_MAX;
+    size_t nl = strnlen(d->name, IMDB_MAX_IDENT + 1);
+    return d->id < IMDB_MAX_SEQUENCES && nl && nl <= IMDB_MAX_IDENT && imdb_ident_valid(d->name, nl) &&
+           (d->width == 0 || d->width == 16 || d->width == 32) && d->inc != 0 && lo <= d->min && d->min < d->max &&
+           d->max <= hi && d->min <= d->start && d->start <= d->max;
+}
+
+void imdb_seqdef_encode(const imdb_seqdef *d, imdb_buf *b)
+{
+    size_t nl = strnlen(d->name, IMDB_MAX_IDENT);
+    imdb_buf_put_u32(b, d->id);
+    imdb_buf_put_u8(b, (uint8_t)nl);
+    imdb_buf_put(b, d->name, nl);
+    imdb_buf_put_u8(b, d->width);
+    imdb_buf_put_u64(b, (uint64_t)d->inc);
+    imdb_buf_put_u64(b, (uint64_t)d->min);
+    imdb_buf_put_u64(b, (uint64_t)d->max);
+    imdb_buf_put_u64(b, (uint64_t)d->start);
+}
+
+int imdb_seqdef_decode(imdb_rd *r, imdb_seqdef *d, const char *what, imdb_err *e)
+{
+    memset(d, 0, sizeof *d);
+    d->id = imdb_rd_u32(r);
+    imdb_err e2 = {0};
+    if (!r->err && imdb_rd_ident(r, d->name, &e2)) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad sequence name", what);
+    d->width = imdb_rd_u8(r);
+    d->inc = (int64_t)imdb_rd_u64(r);
+    d->min = (int64_t)imdb_rd_u64(r);
+    d->max = (int64_t)imdb_rd_u64(r);
+    d->start = (int64_t)imdb_rd_u64(r);
+    if (!r->err && !imdb_seqdef_ok(d)) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad sequence definition", what);
+    return IMDB_OK;
+}
+
+/* F2a-2 (log.h): DROP_SEQUENCE alone; the SEQ_ADVANCEs last, by sequence, one each; SEQ_SETs only beside SEQ_SETs
+ * and SEQ_ADVANCEs, before them, by sequence, one each */
+static bool seq_ops_placed(const imdb_op *ops, uint32_t n)
+{
+    uint32_t first_adv = n, nset = 0, nother = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint8_t c = ops[i].code;
+        if (c == IMDB_OP_DROP_SEQUENCE && n != 1) return false;
+        if (c == IMDB_OP_SEQ_ADVANCE) {
+            if (first_adv == n) first_adv = i;
+            else if (ops[i - 1].seq >= ops[i].seq) return false;
+            continue;
+        }
+        if (first_adv != n) return false; /* nothing after the first SEQ_ADVANCE but SEQ_ADVANCEs */
+        if (c == IMDB_OP_SEQ_SET) {
+            if (i && ops[i - 1].code == IMDB_OP_SEQ_SET && ops[i - 1].seq >= ops[i].seq) return false;
+            nset++;
+        } else {
+            nother++;
+        }
+    }
+    return !nset || !nother;
+}
 
 void imdb_commit_encode_header(const imdb_commit_rec *c, imdb_buf *b)
 {
@@ -432,6 +504,24 @@ void imdb_commit_encode_header(const imdb_commit_rec *c, imdb_buf *b)
             imdb_viewdef_encode(o->vdef, b);
             break;
         }
+        case IMDB_OP_CREATE_SEQUENCE: /* F2a-2 */
+            if (!o->sdef || !imdb_seqdef_ok(o->sdef)) {
+                b->err = IMDB_ERR_INVALID;
+                break;
+            }
+            imdb_seqdef_encode(o->sdef, b);
+            break;
+        case IMDB_OP_DROP_SEQUENCE:
+        case IMDB_OP_SEQ_ADVANCE:
+        case IMDB_OP_SEQ_SET:
+            if (o->seq >= IMDB_MAX_SEQUENCES || o->scalled > 1) {
+                b->err = IMDB_ERR_INVALID;
+                break;
+            }
+            imdb_buf_put_u32(b, o->seq);
+            if (o->code != IMDB_OP_DROP_SEQUENCE) imdb_buf_put_u64(b, (uint64_t)o->sval);
+            if (o->code == IMDB_OP_SEQ_SET) imdb_buf_put_u8(b, o->scalled);
+            break;
         case IMDB_OP_DROP_VIEW:
             if (c->nops != 1 || o->view >= IMDB_MAX_VIEWS) {
                 b->err = IMDB_ERR_INVALID;
@@ -462,6 +552,7 @@ void imdb_commit_encode_header(const imdb_commit_rec *c, imdb_buf *b)
             break;
         }
     }
+    if (!seq_ops_placed(c->ops, c->nops)) b->err = IMDB_ERR_INVALID; /* F2a-2: the decoder refuses it (log.h) */
     imdb_buf_put(b, c->digest, 32);
 }
 
@@ -771,6 +862,19 @@ int imdb_commit_decode_header(const uint8_t *h, size_t hlen, imdb_commit_rec *c,
             if (imdb_viewdef_decode(&r, &o->vdef, e)) return e->code;
             if (nops != 1) return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: a view op must be the only op");
             break;
+        case IMDB_OP_CREATE_SEQUENCE: /* F2a-2 */
+            if (!(o->sdef = imdb_alloc(sizeof *o->sdef, e))) return e->code;
+            if (imdb_seqdef_decode(&r, o->sdef, "commit", e)) return e->code;
+            break;
+        case IMDB_OP_DROP_SEQUENCE:
+        case IMDB_OP_SEQ_ADVANCE:
+        case IMDB_OP_SEQ_SET:
+            o->seq = imdb_rd_u32(&r);
+            if (o->code != IMDB_OP_DROP_SEQUENCE) o->sval = (int64_t)imdb_rd_u64(&r);
+            if (o->code == IMDB_OP_SEQ_SET) o->scalled = imdb_rd_u8(&r);
+            if (!r.err && (o->seq >= IMDB_MAX_SEQUENCES || o->scalled > 1))
+                return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: a sequence op out of range");
+            break;
         case IMDB_OP_DROP_VIEW:
             o->view = imdb_rd_u32(&r);
             if (!r.err && (nops != 1 || o->view >= IMDB_MAX_VIEWS))
@@ -789,6 +893,8 @@ int imdb_commit_decode_header(const uint8_t *h, size_t hlen, imdb_commit_rec *c,
         }
         if (r.err) return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: truncated op");
     }
+    if (!seq_ops_placed(c->ops, nops)) /* F2a-2 */
+        return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: sequence ops out of their place (log.h)");
     /* a commit with an EXPIRE holds only EXPIREs, one a table at most, by table (log.h) */
     for (uint32_t i = 0; i < nops; i++) {
         bool ex = c->ops[i].code == IMDB_OP_EXPIRE, ex0 = c->ops[0].code == IMDB_OP_EXPIRE;

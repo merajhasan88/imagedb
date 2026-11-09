@@ -87,6 +87,8 @@ typedef struct vsnap {
     uint64_t boundary; /* the log's retirement boundary at that commit (0 until RETIRE, stage 3a's step (c)) */
     struct vview *v;   /* P2 S7: the views then (no dependencies kept) */
     uint32_t nv;
+    imdb_sequence *sq; /* F2a-2: the sequences then */
+    uint32_t nsq;
 } vsnap;
 
 typedef struct vstart { /* a log segment's first commit, and its time: what an EXPIRE may name (log.h) */
@@ -131,7 +133,103 @@ typedef struct vctx {
     size_t npubs, cappubs;
     vview *v;                /* P2 S7: the views the log made, by id */
     uint32_t nv;
+    imdb_sequence *sq;       /* F2a-2: the sequences the log made, by id: replay's rules (db.c imdb_seq_apply), its own */
+    uint32_t nsq, capsq;
 } vctx;
+
+/* ---- F2a-2: the sequences, by replay's rules (db.c imdb_seq_apply, imdb_seq_own) on the model -------------------- */
+
+static bool v_name_live(const vctx *x, const char *name);
+
+static bool v_seq_named(const vctx *x, uint32_t id)
+{
+    for (uint32_t i = 0; i < x->nt; i++) {
+        const vtab *t = &x->t[i];
+        if (t->dropped_at || !t->hist.nvers) continue;
+        const imdb_sver *v = &t->hist.vers[t->hist.nvers - 1];
+        for (uint16_t c = 0; c < v->s.ncols; c++) {
+            const imdb_tcol *tc = &t->hist.tcol[v->pos[c]];
+            if (tc->wclock >= IMDB_DEFK_IDENTITY_ALWAYS && tc->wseq == id) return true;
+        }
+    }
+    return false;
+}
+
+static void v_seq_drop_owned(vctx *x, uint32_t table, uint16_t pos, uint64_t seq)
+{
+    for (uint32_t i = 0; i < x->nsq; i++)
+        if (!x->sq[i].dropped_at && x->sq[i].owner == table && (pos == UINT16_MAX || x->sq[i].owner_pos == pos))
+            x->sq[i].dropped_at = seq;
+}
+
+static int v_seq_own(vctx *x, uint32_t table, const imdb_coldef *defs, uint16_t n, uint64_t seq, imdb_err *e)
+{
+    for (uint16_t k = 0; k < n; k++) {
+        const imdb_coldef *d = &defs[k];
+        if (d->kind < IMDB_DEFK_IDENTITY_ALWAYS) continue;
+        imdb_sequence *s = d->seq < x->nsq ? &x->sq[d->seq] : NULL;
+        bool ident = d->kind != IMDB_DEFK_NEXTVAL;
+        if (!s || s->dropped_at || (ident && (s->created_at != seq || s->owner != UINT32_MAX)))
+            return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: a column DEFAULT of a sequence that is not %s",
+                             (unsigned long long)seq, ident ? "made with its table" : "live");
+        if (ident) {
+            s->owner = table;
+            s->owner_pos = d->col;
+        }
+    }
+    return IMDB_OK;
+}
+
+static int v_seq_op(vctx *x, const imdb_op *o, uint64_t seq, imdb_err *e)
+{
+    unsigned long long sq = (unsigned long long)seq;
+    if (o->code == IMDB_OP_CREATE_SEQUENCE) {
+        const imdb_seqdef *d = o->sdef;
+        if (d->id != x->nsq || v_name_live(x, d->name))
+            return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: CREATE SEQUENCE out of sequence or of a name taken", sq);
+        if (x->nsq == x->capsq) {
+            uint32_t nc = x->capsq ? x->capsq * 2 : 8;
+            imdb_sequence *n = imdb_realloc_array(x->sq, x->capsq, nc, sizeof *n, e);
+            if (!n) return e->code;
+            x->sq = n;
+            x->capsq = nc;
+        }
+        imdb_sequence *s = &x->sq[x->nsq++];
+        memset(s, 0, sizeof *s);
+        s->d = *d;
+        s->last = s->base = d->start;
+        s->created_at = seq;
+        s->owner = UINT32_MAX;
+        return IMDB_OK;
+    }
+    imdb_sequence *s = o->seq < x->nsq ? &x->sq[o->seq] : NULL;
+    if (!s || s->dropped_at) return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: a sequence op of no live sequence", sq);
+    if (o->code == IMDB_OP_DROP_SEQUENCE) {
+        if (s->owner != UINT32_MAX || v_seq_named(x, s->d.id))
+            return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: DROP SEQUENCE of a sequence a column takes values from", sq);
+        s->dropped_at = seq;
+    } else if (o->code == IMDB_OP_SEQ_ADVANCE) {
+        if (!imdb_seq_mark_ok(s, o->sval))
+            return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: sequence %s's mark goes back, past its bounds or off "
+                             "its increment", sq, s->d.name);
+        s->last = o->sval;
+        s->called = true;
+    } else {
+        if (o->sval < s->d.min || o->sval > s->d.max)
+            return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: setval past sequence %s's bounds", sq, s->d.name);
+        s->last = s->base = o->sval;
+        s->called = o->scalled;
+    }
+    return IMDB_OK;
+}
+
+static bool v_seq_same(const imdb_sequence *a, const imdb_sequence *b)
+{
+    return a->d.id == b->d.id && !strcmp(a->d.name, b->d.name) && a->d.width == b->d.width && a->d.inc == b->d.inc &&
+           a->d.min == b->d.min && a->d.max == b->d.max && a->d.start == b->d.start && a->last == b->last &&
+           a->called == b->called && a->base == b->base && a->created_at == b->created_at &&
+           a->dropped_at == b->dropped_at && a->owner == b->owner && (a->owner == UINT32_MAX || a->owner_pos == b->owner_pos);
+}
 
 /* ---- P2 S7: the views ------------------------------------------------------------- */
 
@@ -141,6 +239,8 @@ static bool v_name_live(const vctx *x, const char *name)
         if (!x->t[i].dropped_at && !strcmp(x->t[i].s.name, name)) return true;
     for (uint32_t i = 0; i < x->nv; i++)
         if (!x->v[i].dropped_at && !strcmp(x->v[i].name, name)) return true;
+    for (uint32_t i = 0; i < x->nsq; i++) /* F2a-2: one name space */
+        if (!x->sq[i].dropped_at && !strcmp(x->sq[i].d.name, name)) return true;
     return false;
 }
 
@@ -650,7 +750,14 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
             break;
         }
         case IMDB_OP_COLUMN_DEFAULTS: /* F2a: its CREATE's defaults into the model's first version (the codec checked them) */
-            rc = imdb_hist_create_defaults(&t->hist, o->defs, o->ndefs, e);
+            if (!(rc = imdb_hist_create_defaults(&t->hist, o->defs, o->ndefs, e)))
+                rc = v_seq_own(x, o->table, o->defs, o->ndefs, seq, e); /* F2a-2 */
+            break;
+        case IMDB_OP_CREATE_SEQUENCE: /* F2a-2: replay's rules on the model */
+        case IMDB_OP_DROP_SEQUENCE:
+        case IMDB_OP_SEQ_ADVANCE:
+        case IMDB_OP_SEQ_SET:
+            rc = v_seq_op(x, o, seq, e);
             break;
         case IMDB_OP_CREATE_INDEX: {
             imdb_index_def d;
@@ -770,6 +877,7 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
             imdb_hist_install(&t->hist, &oc, seq);
             imdb_index_remap(t->idx, t->nidx, &t->hist.vers[t->hist.nvers - 2], &t->hist.vers[t->hist.nvers - 1]);
             t->s = t->hist.vers[t->hist.nvers - 1].s;
+            if (o->akind == IMDB_ALTER_DROP_COLUMN) v_seq_drop_owned(x, o->table, o->apos, seq); /* F2a-2 */
             break;
         }
         case IMDB_OP_DROP_TABLE: /* live, not kept FOREVER (its commit's op 16 first); every live version ends here */
@@ -787,6 +895,7 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
             }
             t->live = 0;
             t->dropped_at = seq;
+            v_seq_drop_owned(x, o->table, UINT16_MAX, seq); /* F2a-2: its IDENTITYs' sequences */
             imdb_lthash_sub(&x->global, t->d); /* all it held leaves the state: its lanes, then none */
             imdb_lthash_zero(t->d);
             break;
@@ -878,6 +987,9 @@ static int snapshot_at_s(vctx *x, const imdb_commit_rec *c, const uint8_t *publi
         s->v[i].ndeps = 0;
     }
     s->nv = x->nv;
+    if (x->nsq && !(s->sq = imdb_alloc_array(x->nsq, sizeof *s->sq, e))) return e->code; /* F2a-2 */
+    if (x->nsq) memcpy(s->sq, x->sq, x->nsq * sizeof *s->sq);
+    s->nsq = x->nsq;
     s->boundary = x->boundary;
     s->global = x->global;
     memcpy(s->prev, c->prev, 32);
@@ -1476,6 +1588,12 @@ static int verify_lake(imdb_db *db, const vctx *x, imdb_verify_report *rep, imdb
             rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: the manifest's definition of view %s differs from the log's",
                            w->name);
     }
+    if (!rc && m.nsq != at->nsq) /* F2a-2: the manifest's sequences, the log's at its commit */
+        rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: the manifest's sequences differ from the log at commit %llu",
+                       (unsigned long long)m.seq);
+    for (uint32_t i = 0; i < m.nsq && !rc; i++)
+        if (!v_seq_same(&m.sq[i], &at->sq[i]))
+            rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: sequence %s in the manifest differs from the log", at->sq[i].d.name);
     /* every segment against the log, in parallel windows; the seen-once marks in item order */
     size_t nitems = 0;
     for (uint32_t ti = 0; ti < m.nt; ti++) nitems += m.t[ti].nseg;
@@ -1623,6 +1741,10 @@ static int verify_engine(imdb_db *db, const vctx *x, imdb_verify_report *rep, im
     if (x->nt != db->nt) return imdb_fail(e, IMDB_ERR_VERIFY, "verify: table count differs");
     if (db->boundary != x->boundary)
         return imdb_fail(e, IMDB_ERR_VERIFY, "verify: the engine's retirement boundary differs from the log's");
+    if (x->nsq != db->nseqs) return imdb_fail(e, IMDB_ERR_VERIFY, "verify: sequence count differs"); /* F2a-2 */
+    for (uint32_t i = 0; i < x->nsq; i++)
+        if (!v_seq_same(&x->sq[i], &db->seqs[i]))
+            return imdb_fail(e, IMDB_ERR_VERIFY, "verify: sequence %s differs from the log", x->sq[i].d.name);
     if (x->nv != db->nviews) return imdb_fail(e, IMDB_ERR_VERIFY, "verify: view count differs"); /* P2 S7 */
     for (uint32_t i = 0; i < x->nv; i++) {
         const vview *w = &x->v[i];
@@ -1759,6 +1881,13 @@ static int verify_seed(imdb_db *db, vctx *x, imdb_err *e)
     }
     for (uint32_t i = 0; !rc && i < fm.nv; i++) /* P2 S7: F's views, a live one's definition the replay's rules read */
         rc = v_view_push(x, fm.v[i].name, fm.v[i].created_at, fm.v[i].dropped_at, fm.v[i].def, e);
+    if (!rc && fm.nsq) { /* F2a-2: F's sequences, their state at F */
+        if (!(x->sq = imdb_alloc_array(fm.nsq, sizeof *x->sq, e))) rc = e->code;
+        else {
+            memcpy(x->sq, fm.sq, fm.nsq * sizeof *x->sq);
+            x->nsq = x->capsq = fm.nsq;
+        }
+    }
     x->boundary = fm.boundary;
     uint8_t *mb = NULL, *sb = NULL;
     size_t ml = 0, sl = 0;
@@ -1987,6 +2116,8 @@ static int verify_body(imdb_db *db, imdb_verify_report *rep, imdb_err *e)
     imdb_free(x.at_s.t);
     v_views_free(x.v, x.nv); /* P2 S7 */
     imdb_free(x.at_s.v);
+    imdb_free(x.at_s.sq); /* F2a-2 */
+    imdb_free(x.sq);
     imdb_free(x.pin);
     imdb_free(x.starts);
     imdb_free(x.pubs);

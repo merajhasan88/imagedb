@@ -283,6 +283,7 @@ static bool ident_ok(const uint8_t *s, size_t n)
 
 #define MAX_TABLES 1024u
 #define MAX_VIEWS 1024u
+#define MAX_SEQUENCES 4096u /* F2a-2: per database, dropped ones counted (limits.h) */
 #define MAX_VIEW_TEXT 65536u
 #define MAX_VIEW_DEPS 256u
 
@@ -788,12 +789,26 @@ static bool aidx_same(const aidx *a, const aidx *b)
            memcmp(a->cols, b->cols, a->ncols * sizeof *a->cols) == 0;
 }
 
+/* F2a-2: a sequence: its definition (op 24's, a manifest's) and its state (last, called, base), its life and owner */
+typedef struct aseq {
+    uint32_t id;
+    char name[64];
+    uint8_t width;
+    int64_t inc, min, max, start;
+    int64_t last, base;
+    bool called;
+    uint64_t created_at, dropped_at;
+    uint32_t owner; /* UINT32_MAX: none */
+    uint16_t owner_pos;
+} aseq;
+
 /* F2a: one of a CREATE's DEFAULTs (op 23, a manifest's version 1): its column, kind (1 a value, 2-5 a clock) and value */
 typedef struct acdef {
     uint16_t col;
     uint8_t kind;
     const uint8_t *def; /* kind 1: the row encoding of one NOT NULL value of its column */
     uint32_t def_len;
+    uint32_t seq; /* F2a-2: kinds 6-8 (IDENTITY ALWAYS, BY DEFAULT, nextval): the sequence */
 } acdef;
 
 typedef struct op {
@@ -824,6 +839,10 @@ typedef struct op {
     uint8_t aclock; /* F2a: ALTER kind 10's clock kind, or an ADD's (its DEFAULT byte 2) */
     acdef *cd;      /* F2a: COLUMN_DEFAULTS (23): its CREATE's DEFAULTs */
     uint16_t ncd;
+    aseq *sd;       /* F2a-2: CREATE_SEQUENCE (24): its definition; 25-27 seq, sval, scalled */
+    uint32_t seqid;
+    int64_t sval;
+    uint8_t scalled;
     /* payload */
     bool redacted;
     const uint8_t *salt, *row;
@@ -847,6 +866,7 @@ static void commit_free(commit *c)
         free(c->ops[i].erase);
         aviewdef_free(c->ops[i].vd);
         free(c->ops[i].cd);
+        free(c->ops[i].sd); /* F2a-2 */
     }
     free(c->ops);
     memset(c, 0, sizeof *c);
@@ -863,6 +883,7 @@ static void commit_free(commit *c)
  * LOCALTIMESTAMP, 4 CURRENT_DATE, 5 LOCALTIME */
 static bool defk_fits(uint8_t k, uint8_t ty)
 {
+    if (k >= 6 && k <= 8) return ty == T_INT64; /* F2a-2: a sequence's values */
     return k == 2 ? ty == T_TIMESTAMPTZ || ty == T_TIMESTAMP : k == 3 ? ty == T_TIMESTAMP : k == 4 ? ty == T_DATE : k == 5 && ty == T_TIME;
 }
 
@@ -886,6 +907,55 @@ static int one_value(rd *hr, const col *ac, const uint8_t **def, uint32_t *len, 
 
 /* F2a: a CREATE's DEFAULTs (op 23's body after its table; a manifest's version 1, none_ok): u16 n, each a u16 column
  * (strictly increasing, the schema's), a kind, and kind 1's value of its column; a clock kind its column's type suits */
+/* F2a-2: a sequence's definition (op 24, a manifest): u32 id, u8 length and the name, u8 width (16, 32, 0), i64
+ * increment (not 0), min < max within the width, start between them */
+static int decode_seqdef(rd *r, aseq *d, const char *what)
+{
+    memset(d, 0, sizeof *d);
+    d->id = rd_u32(r);
+    uint8_t nl = rd_u8(r);
+    const uint8_t *nm = rd_bytes(r, nl);
+    if (!r->bad && (!nm || !ident_ok(nm, nl))) return fail("%s: bad sequence name", what);
+    if (nm) memcpy(d->name, nm, nl);
+    d->width = rd_u8(r);
+    d->inc = (int64_t)rd_u64(r);
+    d->min = (int64_t)rd_u64(r);
+    d->max = (int64_t)rd_u64(r);
+    d->start = (int64_t)rd_u64(r);
+    int64_t lo = d->width == 16 ? INT16_MIN : d->width == 32 ? INT32_MIN : INT64_MIN;
+    int64_t hi = d->width == 16 ? INT16_MAX : d->width == 32 ? INT32_MAX : INT64_MAX;
+    if (!r->bad && (d->id >= MAX_SEQUENCES || (d->width && d->width != 16 && d->width != 32) || !d->inc || d->min < lo ||
+                    d->min >= d->max || d->max > hi || d->start < d->min || d->start > d->max))
+        return fail("%s: bad sequence definition", what);
+    d->last = d->base = d->start;
+    d->owner = UINT32_MAX;
+    return 0;
+}
+
+/* F2a-2 (log.h): DROP_SEQUENCE (25) alone; SEQ_ADVANCEs (26) last, by sequence, one each; SEQ_SETs (27) only beside
+ * SEQ_SETs and SEQ_ADVANCEs, before them, by sequence, one each */
+static bool seq_placed(const op *ops, uint32_t n)
+{
+    uint32_t first_adv = n, nset = 0, nother = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint8_t c = ops[i].code;
+        if (c == 25 && n != 1) return false;
+        if (c == 26) {
+            if (first_adv == n) first_adv = i;
+            else if (ops[i - 1].seqid >= ops[i].seqid) return false;
+            continue;
+        }
+        if (first_adv != n) return false;
+        if (c == 27) {
+            if (i && ops[i - 1].code == 27 && ops[i - 1].seqid >= ops[i].seqid) return false;
+            nset++;
+        } else {
+            nother++;
+        }
+    }
+    return !nset || !nother;
+}
+
 static int coldefs_body(rd *hr, const schema *s, bool none_ok, acdef **out, uint16_t *n, const char *what)
 {
     *out = NULL;
@@ -899,11 +969,16 @@ static int coldefs_body(rd *hr, const schema *s, bool none_ok, acdef **out, uint
         d[k].col = rd_u16(hr);
         d[k].kind = rd_u8(hr);
         if (hr->bad) return 0;
-        if (d[k].col >= s->ncols || (k && d[k].col <= d[k - 1].col) || d[k].kind < 1 || d[k].kind > 5)
+        if (d[k].col >= s->ncols || (k && d[k].col <= d[k - 1].col) || d[k].kind < 1 || d[k].kind > 8 ||
+            ((d[k].kind == 6 || d[k].kind == 7) && (s->c[d[k].col].flags & F_NULLABLE))) /* F2a-2: an IDENTITY NOT NULL */
             return fail("%s: a bad column DEFAULT", what);
         if (d[k].kind == 1 ? one_value(hr, &s->c[d[k].col], &d[k].def, &d[k].def_len, what) != 0
                            : !defk_fits(d[k].kind, s->c[d[k].col].type))
             return d[k].kind == 1 ? -1 : fail("%s: a clock DEFAULT its column's type does not take", what);
+        if (d[k].kind >= 6) { /* F2a-2: its sequence */
+            d[k].seq = rd_u32(hr);
+            if (!hr->bad && d[k].seq >= MAX_SEQUENCES) return fail("%s: a column DEFAULT's sequence out of range", what);
+        }
     }
     return 0;
 }
@@ -935,7 +1010,8 @@ static int alter_body(rd *hr, op *o, const char *what)
         if (!hr->bad && has > 2) return fail("%s: bad DEFAULT", what);
         if (has == 2) { /* F2a: a clock kind for the writes after it; the value, the clock's at the ALTER, for the rows before */
             o->aclock = rd_u8(hr);
-            if (!hr->bad && !defk_fits(o->aclock, ac->type)) return fail("%s: a clock DEFAULT its column's type does not take", what);
+            if (!hr->bad && (o->aclock > 5 || !defk_fits(o->aclock, ac->type)))
+                return fail("%s: a clock DEFAULT its column's type does not take", what);
         }
         o->has_def = has;
         if (has) { /* the row encoding of one value: a one-column NOT NULL row, which decode_row checks */
@@ -1161,6 +1237,19 @@ static int decode_body(const uint8_t *b, size_t n, const meta *m, keys *ks, comm
             o->view = rd_u32(&hr);
             if (!hr.bad && (nops != 1 || o->view >= MAX_VIEWS)) return fail("header: a view op must be the only op, in range");
             break;
+        case 24: /* CREATE_SEQUENCE (F2a-2): its definition */
+            o->sd = xcalloc(1, sizeof *o->sd);
+            if (decode_seqdef(&hr, o->sd, "header")) return -1;
+            o->seqid = o->sd->id;
+            break;
+        case 25: /* DROP_SEQUENCE: u32 sequence; SEQ_ADVANCE: and i64 mark; SEQ_SET: and i64 value, u8 called */
+        case 26:
+        case 27:
+            o->seqid = rd_u32(&hr);
+            if (o->code != 25) o->sval = (int64_t)rd_u64(&hr);
+            if (o->code == 27) o->scalled = rd_u8(&hr);
+            if (!hr.bad && (o->seqid >= MAX_SEQUENCES || o->scalled > 1)) return fail("header: a sequence op out of range");
+            break;
         case 23: /* COLUMN_DEFAULTS (F2a): u32 table, right after its CREATE_TABLE and SET_RETENTION, its defaults */
             o->table = rd_u32(&hr);
             if (!hr.bad && (i < 2 || c->ops[i - 2].code != 1 || c->ops[i - 2].table != o->table || c->ops[i - 1].code != 16))
@@ -1186,6 +1275,7 @@ static int decode_body(const uint8_t *b, size_t n, const meta *m, keys *ks, comm
         }
         if (hr.bad) return fail("header: truncated op");
     }
+    if (!seq_placed(c->ops, nops)) return fail("header: sequence ops out of their place"); /* F2a-2 */
     /* a DROP_TABLE (19) is its commit's last op, after at most its own table's SET_RETENTION (16) */
     for (uint32_t i = 0; i < nops; i++)
         if (c->ops[i].code == 19 &&
@@ -1270,6 +1360,9 @@ typedef struct table {
     uint8_t ckind[MAX_COLS];   /* F2a: by position: its CREATE's DEFAULT's kind (op 23: 1 a value, 2-5 a clock), or 0 */
     uint8_t *cdef[MAX_COLS];   /* kind 1's value (its row encoding, the table's own) */
     uint32_t cdef_len[MAX_COLS];
+    uint8_t wkind[MAX_COLS];   /* F2a-2: by position: a write default of a sequence (6-8), and which (DROP SEQUENCE's rule) */
+    uint32_t wseqid[MAX_COLS];
+    uint32_t cseq[MAX_COLS];   /* F2a-2: the CREATE's DEFAULT's sequence (kinds 6-8) */
 } table;
 
 typedef struct aver { /* F1: rows begun at or after since are encoded under s (its raw bytes its own) */
@@ -1386,6 +1479,10 @@ typedef struct state {
     uint64_t boundary, boundary_at_lake; /* RETIRE (18): versions ended at or before it are gone; now, at the lake */
     aview *v;                /* P2 S7: the views the log made, by id; nv_at_lake of them at the lake snapshot */
     uint32_t nv, nv_at_lake;
+    aseq *sq;                /* F2a-2: the sequences the log made, by id; sq_lake their states at the lake snapshot */
+    uint32_t nsq, capsq;
+    aseq *sq_lake;
+    uint32_t nsq_lake;
     char note[200];
 } state;
 
@@ -1816,6 +1913,8 @@ static bool name_live(const state *S, const char *name)
         if (!S->t[i].dropped_at && strcmp(S->t[i].s.name, name) == 0) return true;
     for (uint32_t i = 0; i < S->nv; i++)
         if (!S->v[i].dropped_at && strcmp(S->v[i].name, name) == 0) return true;
+    for (uint32_t i = 0; i < S->nsq; i++) /* F2a-2: one name space */
+        if (!S->sq[i].dropped_at && strcmp(S->sq[i].name, name) == 0) return true;
     return false;
 }
 
@@ -1966,6 +2065,58 @@ static int apply_view_op(state *S, const op *o, uint64_t seq)
     return 0;
 }
 
+/* F2a-2: the sequences a table (pos UINT16_MAX: every column) or one of its columns owns die with it */
+static void seq_drop_owned(state *S, uint32_t tab, uint16_t pos, uint64_t seq)
+{
+    for (uint32_t i = 0; i < S->nsq; i++)
+        if (!S->sq[i].dropped_at && S->sq[i].owner == tab && (pos == UINT16_MAX || S->sq[i].owner_pos == pos))
+            S->sq[i].dropped_at = seq;
+}
+
+/* F2a-2: ops 24-27 by the rules design.md §5 states (its own code): CREATE in id order with a free name; DROP of a
+ * sequence no column takes values from; a mark within the bounds, never back from the last in the increment's
+ * direction, a whole number of increments from the last setval (or the start); a setval within the bounds */
+static int apply_seq_op(state *S, const op *o, uint64_t seq)
+{
+    unsigned long long sq = (unsigned long long)seq;
+    if (o->code == 24) {
+        if (o->sd->id != S->nsq || name_live(S, o->sd->name))
+            return fail("commit %llu: CREATE SEQUENCE out of sequence or of a name taken", sq);
+        if (S->nsq == S->capsq) {
+            S->capsq = S->capsq ? S->capsq * 2 : 8;
+            S->sq = xrealloc(S->sq, S->capsq, sizeof *S->sq);
+        }
+        S->sq[S->nsq] = *o->sd;
+        S->sq[S->nsq].created_at = seq;
+        S->nsq++;
+        return 0;
+    }
+    aseq *q = o->seqid < S->nsq ? &S->sq[o->seqid] : NULL;
+    if (!q || q->dropped_at) return fail("commit %llu: a sequence op of no live sequence", sq);
+    if (o->code == 25) {
+        if (q->owner != UINT32_MAX) return fail("commit %llu: DROP SEQUENCE of a column's IDENTITY", sq);
+        for (uint32_t i = 0; i < S->nt; i++)
+            for (int p = 0; !S->t[i].dropped_at && p < MAX_COLS; p++)
+                if (S->t[i].wkind[p] >= 6 && S->t[i].wseqid[p] == q->id)
+                    return fail("commit %llu: DROP SEQUENCE of a sequence column %s takes values from", sq,
+                                S->t[i].s.name);
+        q->dropped_at = seq;
+        return 0;
+    }
+    if (o->code == 26) {
+        __int128 d = (__int128)o->sval - q->base;
+        if (o->sval < q->min || o->sval > q->max || (q->inc > 0 ? o->sval < q->last : o->sval > q->last) || d % q->inc)
+            return fail("commit %llu: sequence %s's mark goes back, past its bounds or off its increment", sq, q->name);
+        q->last = o->sval;
+        q->called = true;
+        return 0;
+    }
+    if (o->sval < q->min || o->sval > q->max) return fail("commit %llu: setval past sequence %s's bounds", sq, q->name);
+    q->last = q->base = o->sval;
+    q->called = o->scalled;
+    return 0;
+}
+
 static int apply_op(state *S, const op *o, uint64_t seq)
 {
     if (o->code == 13) return 0; /* WRITER_KEY: keys, not data (decode_body follows it) */
@@ -1991,9 +2142,13 @@ static int apply_op(state *S, const op *o, uint64_t seq)
         for (uint32_t i = 0; i < S->nv; i++) /* P2 S7: one name space for the live tables and views */
             if (!S->v[i].dropped_at && strcmp(S->v[i].name, o->sch->name) == 0)
                 return fail("commit %llu: table %s takes a live view's name", (unsigned long long)seq, o->sch->name);
+        for (uint32_t i = 0; i < S->nsq; i++) /* F2a-2: and the sequences' */
+            if (!S->sq[i].dropped_at && strcmp(S->sq[i].name, o->sch->name) == 0)
+                return fail("commit %llu: table %s takes a live sequence's name", (unsigned long long)seq, o->sch->name);
         S->nt++;
         return 0;
     }
+    if (o->code >= 24 && o->code <= 27) return apply_seq_op(S, o, seq); /* F2a-2 */
     if (o->code == 23) { /* COLUMN_DEFAULTS (F2a): its CREATE's, in its commit (the header's rule); each a write default */
         if (o->table >= S->nt || S->t[o->table].created_at != seq)
             return fail("commit %llu: COLUMN_DEFAULTS of a table not created there", (unsigned long long)seq);
@@ -2007,6 +2162,20 @@ static int apply_op(state *S, const op *o, uint64_t seq)
                 t->cdef_len[d->col] = d->def_len;
             }
             t->has_wdef[d->col] = true;
+            if (d->kind >= 6) { /* F2a-2: a sequence's: an IDENTITY's made in this commit, unowned, becomes the column's */
+                aseq *q = d->seq < S->nsq ? &S->sq[d->seq] : NULL;
+                bool ident = d->kind != 8;
+                if (!q || q->dropped_at || (ident && (q->created_at != seq || q->owner != UINT32_MAX)))
+                    return fail("commit %llu: a column DEFAULT of a sequence that is not %s", (unsigned long long)seq,
+                                ident ? "made with its table" : "live");
+                if (ident) {
+                    q->owner = o->table;
+                    q->owner_pos = d->col;
+                }
+                t->wkind[d->col] = d->kind;
+                t->wseqid[d->col] = d->seq;
+                t->cseq[d->col] = d->seq;
+            }
         }
         return 0;
     }
@@ -2051,6 +2220,8 @@ static int apply_op(state *S, const op *o, uint64_t seq)
                           t->s.c[cc].name, t->s.name);
         }
         if (!rc) rc = alter_state(o, cur->npos, t->missing, t->missing_text, t->has_wdef);
+        if (!rc && (o->akind == 4 || o->akind == 7 || o->akind == 8 || o->akind == 10)) t->wkind[o->apos] = 0; /* F2a-2 */
+        if (!rc && o->akind == 4) seq_drop_owned(S, o->table, o->apos, seq); /* an IDENTITY's sequence with its column */
         if (rc) {
             free(nv.s.raw);
             free(nv.def);
@@ -2088,6 +2259,7 @@ static int apply_op(state *S, const op *o, uint64_t seq)
         }
         if (t->live) return fail("commit %llu: DROP of table %s leaves live rows", (unsigned long long)seq, t->s.name);
         t->dropped_at = seq;
+        seq_drop_owned(S, o->table, UINT16_MAX, seq); /* F2a-2: its IDENTITYs' sequences */
         return 0;
     }
     if ((o->code == 2 || o->code == 3 || o->code == 4 || o->code == 11 || o->code == 14 || o->code == 15 || o->code == 16) &&
@@ -2633,6 +2805,10 @@ static int replay(state *S, int dirfd, uint64_t *commits)
                 }
                 S->boundary_at_lake = S->boundary;
                 S->nv_at_lake = S->nv; /* P2 S7 */
+                free(S->sq_lake); /* F2a-2: the sequences' states at the lake snapshot */
+                S->sq_lake = S->nsq ? xcalloc(S->nsq, sizeof *S->sq_lake) : NULL;
+                if (S->nsq) memcpy(S->sq_lake, S->sq, S->nsq * sizeof *S->sq_lake);
+                S->nsq_lake = S->nsq;
                 for (uint32_t vi = 0; vi < S->nv; vi++) S->v[vi].dropped_at_lake = S->v[vi].dropped_at;
                 memcpy(S->lake_digest, c.digest, 32);
                 memcpy(S->lake_prev, c.prev, 32);
@@ -3090,6 +3266,9 @@ typedef struct mtable {
     uint8_t ckind[MAX_COLS];   /* F2a: by position: version 1's DEFAULTs (the CREATE's), as the table's */
     uint8_t *cdef[MAX_COLS];
     uint32_t cdef_len[MAX_COLS];
+    uint8_t wkind[MAX_COLS];   /* F2a-2: by position: a write default of a sequence (6-8), and which (DROP SEQUENCE's rule) */
+    uint32_t wseqid[MAX_COLS];
+    uint32_t cseq[MAX_COLS];   /* F2a-2: the CREATE's DEFAULT's sequence (kinds 6-8) */
 } mtable;
 
 typedef struct mview { /* P2 S7: a manifest's view: a live one's definition, a dropped one's tombstone (def NULL) */
@@ -3106,6 +3285,8 @@ typedef struct manifest {
     uint32_t nt;
     mview *v; /* version 6 (P2 S7): every view, by id */
     uint32_t nv;
+    aseq *sq; /* version 10 (F2a-2): every sequence, by id, its state at the snapshot */
+    uint32_t nsq;
 } manifest;
 
 static void manifest_free(manifest *m)
@@ -3123,6 +3304,7 @@ static void manifest_free(manifest *m)
     free(m->t);
     for (uint32_t i = 0; i < m->nv; i++) aviewdef_free(m->v[i].def); /* P2 S7 */
     free(m->v);
+    free(m->sq); /* F2a-2 */
     memset(m, 0, sizeof *m);
 }
 
@@ -3200,8 +3382,8 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
     rd r = {b, len, 0, false};
     const uint8_t *mg = rd_bytes(&r, 8);
     uint32_t mver = mg && memcmp(mg, "IMDBMAN1", 8) == 0 ? rd_u32(&r) : 0;
-    if (mver != 9) return fail("manifest: bad header (version 9 only: a CREATE's DEFAULTs in the history, F2a)");
-    uint32_t nsec = rd_u32(&r); /* every section, in order: 1 tables, 2 views, 3-11 reserved and empty */
+    if (mver != 10) return fail("manifest: bad header (version 10 only: the sequences, F2a-2)");
+    uint32_t nsec = rd_u32(&r); /* every section, in order: 1 tables, 2 views, 3 sequences (F2a-2), 4-11 reserved and empty */
     const uint8_t *id = rd_bytes(&r, 16);
     m->seq = rd_u64(&r);
     const uint8_t *prev = rd_bytes(&r, 32), *st = rd_bytes(&r, 32), *pm = rd_bytes(&r, 32);
@@ -3293,6 +3475,11 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
             int crc = coldefs_body(&r, &t->vers[0].s, true, &cd, &ncd, "manifest");
             for (uint16_t k = 0; !crc && !r.bad && k < ncd; k++) {
                 t->ckind[cd[k].col] = cd[k].kind;
+                t->cseq[cd[k].col] = cd[k].seq; /* F2a-2 */
+                if (cd[k].kind >= 6) {
+                    t->wkind[cd[k].col] = cd[k].kind;
+                    t->wseqid[cd[k].col] = cd[k].seq;
+                }
                 t->has_wdef[cd[k].col] = true;
                 if (cd[k].kind != 1) continue;
                 t->cdef[cd[k].col] = xcalloc(cd[k].def_len ? cd[k].def_len : 1, 1);
@@ -3313,6 +3500,7 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
                 return fail("manifest: an ALTER of table %u out of order", i);
             aver nv;
             if (alter_next(&t->vers[t->nvers - 1], &o, &nv, at, t->has_wdef)) return -1;
+            if (o.akind == 4 || o.akind == 7 || o.akind == 8 || o.akind == 10) t->wkind[o.apos] = 0; /* F2a-2 */
             if (alter_state(&o, t->vers[t->nvers - 1].npos, t->missing, t->missing_text, t->has_wdef)) {
                 free(nv.s.raw);
                 free(nv.def);
@@ -3352,7 +3540,31 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
         }
     }
     if (r.bad || r.o != send) return fail("manifest: bad views section");
-    for (uint32_t k = 3; k <= 11; k++) { /* reserved until their slices: present, in order, empty */
+    if (man_section(&r, 3, &send)) return fail("manifest: the sequences section missing or out of order"); /* F2a-2 */
+    uint32_t nsq = rd_u32(&r);
+    if (r.bad || nsq > MAX_SEQUENCES || nsq > rd_left(&r) / 70) return fail("manifest: bad sequence count");
+    m->sq = xcalloc(nsq ? nsq : 1, sizeof *m->sq);
+    m->nsq = nsq;
+    for (uint32_t i = 0; i < nsq; i++) {
+        aseq *q = &m->sq[i];
+        if (decode_seqdef(&r, q, "manifest")) return -1;
+        q->last = (int64_t)rd_u64(&r);
+        uint8_t called = rd_u8(&r);
+        q->base = (int64_t)rd_u64(&r);
+        q->created_at = rd_u64(&r);
+        q->dropped_at = rd_u64(&r);
+        q->owner = rd_u32(&r);
+        q->owner_pos = rd_u16(&r);
+        q->called = called == 1;
+        __int128 d = (__int128)q->last - q->base;
+        if (r.bad || q->id != i || called > 1 || q->last < q->min || q->last > q->max || q->base < q->min ||
+            q->base > q->max || (called && d % q->inc) || (!called && q->last != q->base) || !q->created_at ||
+            q->created_at > m->seq || (q->dropped_at && (q->dropped_at <= q->created_at || q->dropped_at > m->seq)) ||
+            (q->owner == UINT32_MAX ? q->owner_pos != 0 : q->owner >= nt))
+            return fail("manifest: bad sequence %u", i);
+    }
+    if (r.bad || r.o != send) return fail("manifest: bad sequences section");
+    for (uint32_t k = 4; k <= 11; k++) { /* reserved until their slices: present, in order, empty */
         if (man_section(&r, k, &send)) return fail("manifest: section %u missing or out of order", k);
         size_t sl = send - r.o; /* a u32 count of 0; any other count a later format's, whatever its length */
         if (sl >= 4 && rd_u32(&r) != 0) return fail("manifest: section %u not empty (a later format's)", k);
@@ -3955,6 +4167,9 @@ static int floor_seed(int dirfd, state *S, flr *f)
             t->missing[c] = mt->missing[c];
             t->has_wdef[c] = mt->has_wdef[c];
             t->ckind[c] = mt->ckind[c]; /* F2a: F's CREATE DEFAULTs */
+            t->cseq[c] = mt->cseq[c]; /* F2a-2 */
+            t->wkind[c] = mt->wkind[c];
+            t->wseqid[c] = mt->wseqid[c];
             t->cdef_len[c] = mt->cdef_len[c];
             if (mt->cdef[c]) {
                 t->cdef[c] = xcalloc(mt->cdef_len[c] ? mt->cdef_len[c] : 1, 1);
@@ -3972,6 +4187,14 @@ static int floor_seed(int dirfd, state *S, flr *f)
     for (uint32_t i = 0; i < f->m.nv; i++) /* P2 S7b: each live one's text against F's catalog, as at its own commit (what
                                           * it names is live and unchanged since: RESTRICT, no ALTER) */
         if (f->m.v[i].def && view_bind_check(S, f->m.v[i].def, "the floor's manifest")) return -1;
+    if (f->m.nsq) { /* F2a-2: F's sequences, their states at F */
+        S->sq = xcalloc(f->m.nsq, sizeof *S->sq);
+        memcpy(S->sq, f->m.sq, f->m.nsq * sizeof *S->sq);
+        S->nsq = S->capsq = f->m.nsq;
+        S->sq_lake = xcalloc(f->m.nsq, sizeof *S->sq_lake); /* the lake's snapshot may be F itself */
+        memcpy(S->sq_lake, f->m.sq, f->m.nsq * sizeof *S->sq_lake);
+        S->nsq_lake = f->m.nsq;
+    }
     S->nv_at_lake = S->nv;
     S->boundary = f->m.boundary;
     manifest m;
@@ -4033,7 +4256,7 @@ static bool same_history(const mtable *mt, const table *t)
             return false;
     }
     for (int p = 0; p < mt->vers[0].npos; p++) /* F2a: the CREATE's DEFAULTs, which no version's hash covers */
-        if (mt->ckind[p] != t->ckind[p] || mt->cdef_len[p] != t->cdef_len[p] ||
+        if (mt->ckind[p] != t->ckind[p] || mt->cdef_len[p] != t->cdef_len[p] || mt->cseq[p] != t->cseq[p] || /* F2a-2 */
             (mt->cdef_len[p] && memcmp(mt->cdef[p], t->cdef[p], mt->cdef_len[p]) != 0))
             return false;
     for (int p = mt->vers[0].npos; p < mt->vers[mt->nvers - 1].npos; p++) { /* each added position, by its ADD's type */
@@ -4114,6 +4337,15 @@ static int cmd_verify(const char *dir, const char *anchor)
             rc = fail("manifest's retirement boundary differs from the log's at its commit");
         if (!rc) rc = check_objects(dirfd, &m, &S);
         if (!rc && m.nt > S.nt) rc = fail("manifest names tables the log does not have");
+        if (!rc && m.nsq != S.nsq_lake) rc = fail("the manifest's sequences differ from the log's at its commit"); /* F2a-2 */
+        for (uint32_t qi = 0; !rc && qi < m.nsq; qi++) {
+            const aseq *qa = &m.sq[qi], *qb = &S.sq_lake[qi];
+            if (qa->id != qb->id || strcmp(qa->name, qb->name) || qa->width != qb->width || qa->inc != qb->inc || qa->min != qb->min ||
+                qa->max != qb->max || qa->start != qb->start || qa->last != qb->last || qa->called != qb->called ||
+                qa->base != qb->base || qa->created_at != qb->created_at || qa->dropped_at != qb->dropped_at ||
+                qa->owner != qb->owner || (qa->owner != UINT32_MAX && qa->owner_pos != qb->owner_pos))
+                rc = fail("sequence %s: the manifest's state differs from the log's at its commit", qb->name);
+        }
         if (!rc && m.nv != S.nv_at_lake) rc = fail("the manifest's views differ from the log's at its commit"); /* P2 S7 */
         for (uint32_t vi = 0; !rc && vi < m.nv; vi++) {
             const mview *mv = &m.v[vi];
@@ -4181,6 +4413,8 @@ static int cmd_verify(const char *dir, const char *anchor)
     }
     keys_free(&S.K);
     free(S.t);
+    free(S.sq); /* F2a-2 */
+    free(S.sq_lake);
     for (uint32_t i = 0; i < S.nv; i++) /* P2 S7, S7b, F1 */
         free(S.v[i].dep_kind), free(S.v[i].dep_id), free(S.v[i].cols), free(S.v[i].text);
     free(S.v);

@@ -85,6 +85,10 @@ typedef struct imdb_session {
     const struct imdb_tz *zone; /* P2: SET TIME ZONE: the session's zone (a TIMESTAMPTZ shown in it, a literal without an
                                  * offset read in it; never the process's TZ); NULL: UTC */
     char zone_name[IMDB_MAX_TZ_NAME + 1]; /* P2: its name as SET (SHOW TIME ZONE); "": UTC */
+    struct imdb_seqcur *seqcur; /* F2a-2: currval: each sequence's last value in this session (allocated; by id) */
+    uint32_t nseqcur, capseqcur;
+    bool has_lastval;           /* F2a-2: lastval: the last nextval in this session, of any sequence */
+    int64_t lastval;
     atomic_bool cancel;       /* imdb_session_cancel: the running statement stops at its next check (cleared at
                                * each statement's start, so a request between statements is dropped) */
 } imdb_session;

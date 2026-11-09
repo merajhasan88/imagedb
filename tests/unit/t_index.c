@@ -465,12 +465,15 @@ static void t_index_manifest_sections(void)
         return;
     }
     CHECK(imdb_get_le32(b + 12) == IMDB_MAN_SECTIONS && imdb_get_le32(b + 144) == IMDB_MAN_TABLES);
-    for (uint32_t k = IMDB_MAN_SEQUENCES; k <= IMDB_MAN_TRIGGERS; k++) { /* the reserved ones: kind, length 4, count 0 */
+    for (uint32_t k = IMDB_MAN_SEQUENCES; k <= IMDB_MAN_TRIGGERS; k++) { /* the reserved ones (and F2a-2's sequences, none here): kind, length 4, count 0 */
         const uint8_t *q = b + n - 16 * (IMDB_MAN_TRIGGERS - k + 1);
         CHECK(imdb_get_le32(q) == k && imdb_get_le64(q + 4) == 4 && imdb_get_le32(q + 12) == 0);
         memcpy(w, b, n); /* a count not 0 */
         w[q - b + 12] = 1;
-        CHECK(parse_bytes(w, n) == IMDB_ERR_UNSUPPORTED && strstr(g_e.msg, "a later imagedb's format"));
+        if (k == IMDB_MAN_SEQUENCES) /* F2a-2: read now, a count with no entry malformed */
+            CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);
+        else
+            CHECK(parse_bytes(w, n) == IMDB_ERR_UNSUPPORTED && strstr(g_e.msg, "a later imagedb's format"));
         memcpy(w, b, n); /* another kind in its place */
         w[q - b] = (uint8_t)(k == IMDB_MAN_TRIGGERS ? IMDB_MAN_SEQUENCES : k + 1);
         CHECK(parse_bytes(w, n) == IMDB_ERR_CORRUPT);

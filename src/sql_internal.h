@@ -17,7 +17,8 @@ typedef struct sql_tok {
 
 /* LIT_EXPR: not a literal but an expression's tree (ex), where a value may be one: an UPDATE's SET, an INSERT's
  * VALUES (a WHERE condition that is not today's col op literal is a tree too: sql_cmp lx) */
-enum { LIT_INT = 1, LIT_DEC, LIT_STR, LIT_BOOL, LIT_TS, LIT_PARAM, LIT_FLOAT, LIT_NULL, LIT_EXPR, LIT_TSTZ, LIT_DATE, LIT_TIME }; /* LIT_TSTZ: P2; LIT_DATE, LIT_TIME: F3b */
+enum { LIT_INT = 1, LIT_DEC, LIT_STR, LIT_BOOL, LIT_TS, LIT_PARAM, LIT_FLOAT, LIT_NULL, LIT_EXPR, LIT_TSTZ, LIT_DATE, LIT_TIME,
+       LIT_DEFAULT }; /* LIT_TSTZ: P2; LIT_DATE, LIT_TIME: F3b; LIT_DEFAULT: F2a-2, INSERT ... VALUES (DEFAULT) */
 
 typedef struct sql_lit {
     uint8_t kind;
@@ -67,7 +68,8 @@ enum { CMP_EQ = 1, CMP_NE, CMP_LT, CMP_LE, CMP_GT, CMP_GE, CMP_BETWEEN, CMP_ISNU
 enum { FN_ABS = 1, FN_SIGN, FN_ROUND, FN_CEIL, FN_FLOOR, FN_MOD, FN_LENGTH, FN_SUBSTR, FN_TRIM, FN_LTRIM, FN_RTRIM,
        FN_POSITION, FN_COALESCE, FN_NULLIF, FN_LOWER, FN_UPPER, FN_REPLACE, FN_CONCAT,
        FN_DATE_TRUNC, FN_TIMEZONE, /* P2: date_trunc(unit, x [, zone]); x AT TIME ZONE z as timezone(z, x) */
-       FN_NOW, FN_LOCALTIMESTAMP, FN_CURRENT_DATE, FN_LOCALTIME }; /* F2a: the clock (the transaction's start) */
+       FN_NOW, FN_LOCALTIMESTAMP, FN_CURRENT_DATE, FN_LOCALTIME, /* F2a: the clock (the transaction's start) */
+       FN_NEXTVAL, FN_CURRVAL, FN_SETVAL, FN_LASTVAL }; /* F2a-2: sequences (a statement calling nextval or setval writes) */
 
 /* col op a (BETWEEN: a AND b), today's form, whose literals bind to the column (an index may serve it); or with lx a
  * residual: a boolean tree (1c), tested on every row that passed the bound conjuncts, kept when TRUE */
@@ -105,6 +107,7 @@ enum {
     ST_COPY_FROM, ST_COPY_TO, /* P2 S10 */
     ST_CREATE_VIEW, ST_DROP_VIEW, ST_SHOW_VIEWS, /* P2 S7 */
     ST_SHOW_TIMEZONE, /* P2: SHOW TIME ZONE, SHOW timezone */
+    ST_CREATE_SEQUENCE, ST_DROP_SEQUENCE, /* F2a-2 */
 };
 
 /* P2 S3: a join's kind as written (RIGHT keeps side 1's rows, FULL both sides'; CROSS and FROM a, b have no ON) */
@@ -129,6 +132,13 @@ enum { SQL_UPSERT_NOTHING = 1, SQL_UPSERT_UPDATE }; /* P2 S8: ON CONFLICT DO NOT
 typedef struct sql_ptype { /* P2 S9: a parameter PREPARE declares: a column's type */
     uint8_t type, scale, precision;
 } sql_ptype;
+
+/* F2a-2: a sequence's options as written (CREATE SEQUENCE, an IDENTITY's), each with its own given flag */
+typedef struct sql_seqopt {
+    uint8_t width;                 /* AS SMALLINT (16), INTEGER (32), BIGINT (0); an IDENTITY's its column's */
+    bool has_inc, has_min, has_max, has_start;
+    int64_t inc, min, max, start;
+} sql_seqopt;
 
 typedef struct sql_stmt {
     uint8_t kind;
@@ -232,7 +242,13 @@ typedef struct sql_stmt {
     sql_lit alter_def;                          /* ADD and SET DEFAULT: the DEFAULT, when has_alter_def (a literal) */
     uint8_t alter_clock;                        /* F2a: ADD's or SET DEFAULT's clock kind (IMDB_DEFK_*) instead, or 0 */
     sql_lit cdef[IMDB_MAX_COLS];                /* F2a: CREATE TABLE: column c's DEFAULT, a literal when cdef_kind[c] is VALUE */
-    uint8_t cdef_kind[IMDB_MAX_COLS];           /* F2a: 0 none, IMDB_DEFK_VALUE a literal, else a clock kind */
+    uint8_t cdef_kind[IMDB_MAX_COLS];           /* F2a: 0 none, IMDB_DEFK_VALUE a literal, else a clock kind; F2a-2: an
+                                                   IDENTITY's (idopt its options) or NEXTVAL's (cdef the name) */
+    sql_seqopt idopt[IMDB_MAX_COLS];            /* F2a-2: an IDENTITY column's sequence options */
+    sql_seqopt seqopt;                          /* F2a-2: CREATE SEQUENCE's (its name in table) */
+    bool seq_write;                             /* F2a-2: it calls nextval or setval: a write, its commit the marks */
+    uint8_t overriding;                         /* F2a-2: INSERT ... OVERRIDING SYSTEM VALUE (1), USER VALUE (2) */
+    bool default_values;                        /* F2a-2: INSERT ... DEFAULT VALUES */
     bool has_alter_def;
     char set_name[IMDB_MAX_IDENT + 1];          /* SET */
     char set_value[IMDB_MAX_IDENT + 1];
@@ -366,6 +382,9 @@ typedef struct imdb_xenv {
      * start, or an autocommit statement's; has_now false in a bind-only pass (no clock is read there) */
     uint64_t now_us;
     bool has_now;
+    /* F2a-2: nextval, currval, setval, lastval (fn) on their arguments: the executor's (the session and the db); NULL in
+     * a bind-only pass and wherever no sequence can be called (an internal error if needed) */
+    int (*seqfn)(void *ctx, uint8_t fn, const imdb_xval *a, uint8_t nargs, imdb_xval *out, imdb_err *e);
     uint8_t tzc_next;
 } imdb_xenv;
 /* the tree at k on a row (columns by the bound col) and the aggregates' final values (slots); env may be NULL (no

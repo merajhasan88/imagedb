@@ -62,6 +62,7 @@
 #define IMDB_MAX_QUERY_PARENS   32u          /* queries parenthesized in queries, deepest (P2 S5: the parser's recursion) */
 #define IMDB_MAX_WINDOWS        8u           /* window functions in one SELECT (P2 S6) */
 #define IMDB_MAX_VIEWS          1024u        /* views per database, dropped ones counted: their ids are never reused (P2 S7) */
+#define IMDB_MAX_SEQUENCES      4096u        /* sequences per database, dropped ones counted: ids never reused (F2a-2) */
 #define IMDB_MAX_VIEW_TEXT      65536u       /* bytes in one view's query text, as logged (P2 S7) */
 #define IMDB_MAX_VIEW_DEPS      256u         /* tables and views one view's query names, each once (P2 S7) */
 #define IMDB_MAX_VIEW_DEPTH     4u           /* views expanded inside views, deepest (P2 S7) */

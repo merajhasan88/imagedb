@@ -242,13 +242,14 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
         switch (o->code) {
         case IMDB_OP_CREATE_TABLE:
             if (o->table != db->nt) rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: table id out of sequence", (unsigned long long)seq);
-            else if (imdb_view_by_name(db, o->schema->name)) /* P2 S7: one name space for the live tables and views */
+            else if (imdb_view_by_name(db, o->schema->name) || imdb_seq_by_name(db, o->schema->name)) /* P2 S7, F2a-2: one name space */
                 rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: table %u takes a live view's name", (unsigned long long)seq,
                                o->table);
             else if (!(rc = imdb_table_new(db, o->schema, e))) db->t[db->nt - 1]->created_at = seq;
             break;
         case IMDB_OP_COLUMN_DEFAULTS: /* F2a: its CREATE's defaults (the codec checked them against the CREATE's schema) */
-            rc = imdb_hist_create_defaults(&t->hist, o->defs, o->ndefs, e);
+            if (!(rc = imdb_hist_create_defaults(&t->hist, o->defs, o->ndefs, e)))
+                rc = imdb_seq_own(db, o->table, o->defs, o->ndefs, seq, e); /* F2a-2: an IDENTITY's sequence is its column's */
             break;
         case IMDB_OP_DROP_TABLE: /* live, and its history not kept FOREVER (its commit's op 16 applied first) */
             if (t->dropped_at)
@@ -260,7 +261,10 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
             else if (imdb_view_dependent(db, IMDB_VIEWDEP_TABLE, t->s.id)) /* P2 S7: RESTRICT */
                 rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: DROP of table %u, which a live view names",
                                (unsigned long long)seq, o->table);
-            else imdb_table_drop_install(db, t, seq);
+            else {
+                imdb_table_drop_install(db, t, seq);
+                imdb_seq_drop_owned(db, t->s.id, UINT16_MAX, seq); /* F2a-2: its IDENTITYs' sequences with it */
+            }
             break;
         case IMDB_OP_ALTER_TABLE: { /* F1: the rules against the table at the commit, then its next version */
             imdb_err e2 = {0};
@@ -273,13 +277,14 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
                                o->table, e2.msg);
             else if (!(rc = imdb_alter_prepare(t, o, e)))
                 imdb_alter_install(t, o, seq);
+            if (!rc && o->akind == IMDB_ALTER_DROP_COLUMN) imdb_seq_drop_owned(db, t->s.id, o->apos, seq); /* F2a-2 */
             break;
         }
         case IMDB_OP_CREATE_VIEW: { /* P2 S7: the next id, a free name, every dependency live, the text re-bound */
             const imdb_viewdef *d = o->vdef;
             if (d->id != db->nviews)
                 rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: view id out of sequence", (unsigned long long)seq);
-            else if (imdb_table_by_name(db, d->name) || imdb_view_by_name(db, d->name))
+            else if (imdb_table_by_name(db, d->name) || imdb_view_by_name(db, d->name) || imdb_seq_by_name(db, d->name))
                 rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: view %u takes a live table's or view's name",
                                (unsigned long long)seq, d->id);
             else if (!imdb_view_deps_live(db, d))
@@ -291,6 +296,12 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
             }
             break;
         }
+        case IMDB_OP_CREATE_SEQUENCE: /* F2a-2: the catalog's rules (db.c imdb_seq_apply) */
+        case IMDB_OP_DROP_SEQUENCE:
+        case IMDB_OP_SEQ_ADVANCE:
+        case IMDB_OP_SEQ_SET:
+            rc = imdb_seq_apply(db, o, seq, e);
+            break;
         case IMDB_OP_DROP_VIEW: { /* P2 S7: live, and no live view names it */
             imdb_view *v = o->view < db->nviews ? &db->views[o->view] : NULL;
             if (!v || v->dropped_at)
@@ -473,7 +484,8 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
         if (code == IMDB_OP_INSERT || code == IMDB_OP_DELETE || code == IMDB_OP_UPDATE || code == IMDB_OP_CREATE_TABLE ||
             code == IMDB_OP_CREATE_INDEX || code == IMDB_OP_DROP_INDEX || code == IMDB_OP_SET_RETENTION ||
             code == IMDB_OP_EXPIRE || code == IMDB_OP_DROP_TABLE || code == IMDB_OP_CREATE_VIEW || code == IMDB_OP_DROP_VIEW ||
-            code == IMDB_OP_ALTER_TABLE)
+            code == IMDB_OP_ALTER_TABLE || code == IMDB_OP_CREATE_SEQUENCE || code == IMDB_OP_DROP_SEQUENCE ||
+            code == IMDB_OP_SEQ_ADVANCE || code == IMDB_OP_SEQ_SET) /* F2a-2: the manifest keeps sequences too */
             db->lake_dirty = true; /* the manifest records the definitions, the retentions and the horizons */
         if (code == IMDB_OP_ERASE) db->last_erase = seq; /* a pin from before it never keeps the files (lake.h) */
         db->ended_pass += code == IMDB_OP_DELETE || code == IMDB_OP_UPDATE; /* the memory window's trigger */

@@ -4,7 +4,7 @@
 
 #include "db.h"
 
-enum { UNDO_INSERT = 1, UNDO_END = 2, UNDO_CREATE = 3, UNDO_INDEX = 4, UNDO_UNINDEX = 5 };
+enum { UNDO_INSERT = 1, UNDO_END = 2, UNDO_CREATE = 3, UNDO_INDEX = 4, UNDO_UNINDEX = 5, UNDO_SEQ_CREATE = 6, UNDO_SEQ_SET = 7 };
 
 /* tables / versions */
 int imdb_table_new(imdb_db *db, const imdb_schema *s, imdb_err *e);
