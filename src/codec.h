@@ -83,6 +83,11 @@ int imdb_rd_ident(imdb_rd *r, char out[IMDB_MAX_IDENT + 1], imdb_err *e);
 int imdb_schema_col(const imdb_schema *s, const char *name); /* -1 if absent */
 const char *imdb_type_name(uint8_t t);
 bool imdb_type_is_int(uint8_t t); /* every type but TEXT: compared as int64 */
+/* F3a: an INT64 column's width, its precision (16 SMALLINT, 32 INTEGER, 0 INT64 or BIGINT, the one spelling of each): valid,
+ * whether a value fits it, and its type's name */
+bool imdb_int_width_ok(uint8_t width);
+bool imdb_int_fits(uint8_t width, int64_t v);
+const char *imdb_int_name(uint8_t width);
 
 /* ---- FLOAT64 -------------------------------------------------------- */
 /* The order-preserving key of a finite double (-0.0 is taken as +0.0): key order is

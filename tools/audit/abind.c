@@ -575,7 +575,9 @@ static int case_expr(ab *b, uint16_t *out, unsigned d) /* CASE eaten */
 static int col_type(ab *b, uint8_t *type, uint8_t *scale) /* a CAST's type, as a column's */
 {
     *scale = 0;
-    if (kw(b, "int64") || kw(b, "bigint") || kw(b, "int") || kw(b, "integer")) *type = T_INT64;
+    if (kw(b, "int64") || kw(b, "bigint") || kw(b, "int8") || kw(b, "int") || kw(b, "integer") || kw(b, "int4") ||
+        kw(b, "smallint") || kw(b, "int2"))
+        *type = T_INT64; /* F3a: every width an INT64 value (a CAST's range is the run's, not the type's) */
     else if (kw(b, "text")) *type = T_TEXT;
     else if (kw(b, "bool") || kw(b, "boolean")) *type = T_BOOL;
     else if (kw(b, "timestamptz")) *type = T_TIMESTAMPTZ; /* P2 */

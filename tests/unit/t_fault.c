@@ -1168,8 +1168,10 @@ static int run_view(const char *run)
 
 
 /* P2 F1: ALTER TABLE (op 22) crashed at every point: a NOT NULL column added with its DEFAULT, a TEXT one, a row that
- * leaves both out, a rename, CHECKPOINTs between (segments of each version, the manifest's schema history); each read
- * against its twin, and every recovered state the acknowledged one (VERIFY and the auditor) */
+ * leaves both out, a rename, CHECKPOINTs between (segments of each version, the manifest's schema history); F1 stage 4:
+ * a column dropped before the others, a SET DEFAULT, a row taking it, a SET NOT NULL, and a CHECKPOINT whose memtable
+ * holds rows from both sides of the drop (a segment of each version); each read against its twin, and every
+ * recovered state the acknowledged one (VERIFY and the auditor) */
 static int run_alter(const char *run)
 {
     imdb_open_opts o = {.sync = 1};
@@ -1191,6 +1193,15 @@ static int run_alter(const char *run)
         {"CHECKPOINT", NULL},
         {"SELECT SUM(n) FROM txns", "SELECT 5 * COUNT(*) FROM txns"},
         {"SELECT note, c FROM txns WHERE user_id = 42 ORDER BY id", "SELECT note, 'q' FROM txns WHERE user_id = 42 ORDER BY id"},
+        {"INSERT INTO txns (id, user_id, amount, note) VALUES (22, 9, 2.50, 'before the drop')", NULL},
+        {"ALTER TABLE txns DROP COLUMN amount", NULL},
+        {"ALTER TABLE txns ALTER COLUMN c SET DEFAULT 'r'", NULL},
+        {"INSERT INTO txns (id, user_id, note) VALUES (21, 7, 'late')", NULL},
+        {"ALTER TABLE txns ALTER COLUMN c SET NOT NULL", NULL},
+        {"CHECKPOINT", NULL},
+        {"SELECT COUNT(*) FROM txns WHERE c = 'r'", "SELECT COUNT(*) FROM txns WHERE id = 21"},
+        {"SELECT note, c, n FROM txns WHERE user_id = 42 ORDER BY id", "SELECT note, 'q', 5 FROM txns WHERE user_id = 42 ORDER BY id"},
+        {"SELECT SUM(n) FROM txns", "SELECT 5 * COUNT(*) FROM txns"},
     };
     int v = 0;
     size_t done = 0;
@@ -1230,7 +1241,7 @@ static int run_alter(const char *run)
     }
     /* not vacuous: a run nothing faulted made every version */
     const imdb_table *tt = imdb_table_by_name(db, "txns");
-    if (!v && done == sizeof q / sizeof *q && !db->warning[0] && !db->failed && (!tt || tt->hist.nvers != 4)) v = VIOL_ALTER;
+    if (!v && done == sizeof q / sizeof *q && !db->warning[0] && !db->failed && (!tt || tt->hist.nvers != 7)) v = VIOL_ALTER;
     imdb_session_close(&s);
     imdb_close(db);
     return v;

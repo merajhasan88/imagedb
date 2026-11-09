@@ -116,7 +116,12 @@ enum {
                                    payload: ADD COLUMN a column (u8 length, name, u8 type, precision, scale, flags:
                                    NULLABLE alone or none), u8 1 and its DEFAULT in the row encoding of one value
                                    (u8 0: none; a NOT NULL column has one), at the next position; RENAME COLUMN u16
-                                   position (live) and the new name; RENAME TABLE the new name. Each makes the
+                                   position (live) and the new name; RENAME TABLE the new name; F1 stage 4: DROP
+                                   COLUMN, SET NOT NULL, DROP NOT NULL and DROP DEFAULT a u16 position (live); SET
+                                   DEFAULT a u16 position, its column's u8 type, precision and scale, and the value
+                                   in the row encoding of one NOT NULL value (never NULL: DROP DEFAULT is that);
+                                   SET TYPE a u16 position and the new u8 type, precision and scale (widening
+                                   alone). A position names a column for its life. Each makes the
                                    table's next schema version; no row is re-encoded (design.md §5, Schema versions) */
 };
 
@@ -125,6 +130,14 @@ enum {
     IMDB_ALTER_ADD_COLUMN = 1,
     IMDB_ALTER_RENAME_COLUMN = 2,
     IMDB_ALTER_RENAME_TABLE = 3,
+    IMDB_ALTER_DROP_COLUMN = 4,  /* F1 stage 4: the position stays consumed; the rows keep their bytes */
+    IMDB_ALTER_SET_NOT_NULL = 5, /* every live row at the commit holds a value there (replay, VERIFY, the auditor) */
+    IMDB_ALTER_DROP_NOT_NULL = 6,
+    IMDB_ALTER_SET_DEFAULT = 7,  /* the column's write default (an INSERT or COPY leaving it out); the missing value
+                                    the rows before its ADD read stays the ADD's */
+    IMDB_ALTER_DROP_DEFAULT = 8,
+    IMDB_ALTER_SET_TYPE = 9,     /* widening: every stored value stays valid as the new type */
+    IMDB_ALTER_LAST = IMDB_ALTER_SET_TYPE,
 };
 
 /* P2 S7: a view's definition, as op 20 logs it and a manifest keeps a live view's (imdb_viewdef_encode): u32 id, the
@@ -213,8 +226,9 @@ typedef struct imdb_op {
     /* CREATE_VIEW: the definition (allocated; an install takes it); DROP_VIEW: the view (P2 S7) */
     imdb_viewdef *vdef;
     uint32_t view;
-    /* ALTER_TABLE (F1): akind; ADD COLUMN: acol, adef (adef.null: no DEFAULT; a TEXT's bytes in the record); RENAME
-     * COLUMN: apos; RENAME COLUMN and TABLE: aname (allocated, IMDB_MAX_IDENT + 1) */
+    /* ALTER_TABLE (F1): akind; ADD COLUMN: acol, adef (adef.null: no DEFAULT; a TEXT's bytes in the record); every
+     * other kind but RENAME TO: apos, a position; RENAME COLUMN and TABLE: aname (allocated, IMDB_MAX_IDENT + 1); SET
+     * DEFAULT: acol's type, precision and scale (the column's), adef; SET TYPE: acol's the new ones (stage 4) */
     uint8_t akind;
     imdb_column acol;
     imdb_value adef;
@@ -304,7 +318,8 @@ typedef struct imdb_writer_epoch {
 int imdb_frame_decode_body(const uint8_t *body, size_t len, imdb_commit_rec *c, imdb_err *e);
 int imdb_commit_decode_header(const uint8_t *h, size_t hlen, imdb_commit_rec *c, imdb_err *e);
 /* F1: op 22's body after its table id: u8 kind, then ADD's column (u8 length, name, type, precision, scale, flags)
- * and DEFAULT, RENAME COLUMN's u16 position and new name, RENAME TO's new name. The commit's codec and a manifest's
+ * and DEFAULT, RENAME COLUMN's u16 position and new name, RENAME TO's new name, the other kinds' u16 position and
+ * SET DEFAULT's type and value, SET TYPE's type (log.h's op 22). The commit's codec and a manifest's
  * schema history share it. put: IMDB_ERR_INVALID (the buffer's sticky error) unless the op is valid, nothing
  * written then; get: strict, its messages prefixed by `what` ("commit", "manifest"), a rename's aname allocated
  * (the caller frees it), a TEXT DEFAULT pointing into r's bytes; a truncation leaves r's error for the caller */

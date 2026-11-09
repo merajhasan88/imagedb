@@ -343,16 +343,20 @@ int imdb_hist_first(imdb_schema_hist *h, const imdb_schema *s, imdb_err *e)
     v->since = 0;
     v->s = *s;
     memset(v->at, -1, sizeof v->at);
+    for (uint16_t p = 0; p < IMDB_MAX_COLS; p++) h->tcol[p].wver = -1; /* no SET DEFAULT has given any its bytes */
     for (uint16_t c = 0; c < s->ncols; c++) {
         v->pos[c] = c;
         v->at[c] = (int8_t)c;
         h->tcol[c].missing = (imdb_value){.type = s->cols[c].type, .scale = s->cols[c].scale, .null = true};
+        h->tcol[c].wdef = h->tcol[c].missing; /* CREATE TABLE takes no DEFAULT yet (F2) */
+        h->tcol[c].wver = -1;
         h->tcol[c].added = 1;
     }
-    h->ntcol = s->ncols;
-    if (imdb_schema_hash(&v->s, v->hash, e)) {
+    h->ntcol = v->npos = s->ncols;
+    if (imdb_sver_hash(&v->s, v->pos, v->hash, e)) {
         imdb_free(h->vers);
         h->vers = NULL;
+        h->nvers = h->capvers = 0; /* nothing a free walks: hist_free reads each version's own bytes */
         return e->code;
     }
     return IMDB_OK;
@@ -2062,73 +2066,173 @@ static int live_col(const imdb_schema *s, const char *name)
     return -1;
 }
 
-int imdb_alter_schema(const imdb_schema *cur, const imdb_op *o, imdb_schema *out, imdb_err *e)
+/* F1 stage 4: SET TYPE's one rule, a widening: every stored value stays valid as the new type and reads the same. A
+ * DECIMAL to more digits of its scale (18 at most: one encoding), F3a's integers to a wider one (SMALLINT, INTEGER,
+ * INT64: eight bytes each, so the width is the column's check alone) */
+static unsigned int_rank(uint8_t width) { return width == 16 ? 1 : width == 32 ? 2 : 3; }
+
+static bool alter_widens(const imdb_column *from, const imdb_column *to)
+{
+    if (from->type == IMDB_T_INT64 && to->type == IMDB_T_INT64) return int_rank(to->precision) > int_rank(from->precision);
+    return from->type == IMDB_T_DECIMAL && to->type == IMDB_T_DECIMAL && to->scale == from->scale &&
+           to->precision > from->precision && to->precision <= 18;
+}
+
+int imdb_sver_next(const imdb_schema_hist *h, const imdb_sver *cur, const imdb_op *o, imdb_sver *out, imdb_err *e)
 {
     *out = *cur;
+    out->atext = NULL;
+    memset(&out->adef, 0, sizeof out->adef);
+    imdb_schema *s = &out->s;
+    int c = -1; /* the column the position names: every kind but ADD and RENAME TO names one, live */
+    if (o->akind != IMDB_ALTER_ADD_COLUMN && o->akind != IMDB_ALTER_RENAME_TABLE) {
+        if (o->apos >= cur->npos || cur->at[o->apos] < 0) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no such column");
+        c = cur->at[o->apos];
+    }
+    imdb_column *col = c >= 0 ? &s->cols[c] : NULL;
     switch (o->akind) {
     case IMDB_ALTER_ADD_COLUMN:
-        if (cur->ncols >= IMDB_MAX_COLS) return imdb_fail(e, IMDB_ERR_LIMIT, "more than %u columns", IMDB_MAX_COLS);
-        if (live_col(cur, o->acol.name) >= 0) return imdb_fail(e, IMDB_ERR_CONSTRAINT, "column %s already exists", o->acol.name);
-        out->cols[out->ncols++] = o->acol;
+        if (cur->npos >= IMDB_MAX_COLS) /* positions are consumed: a dropped column keeps its own */
+            return imdb_fail(e, IMDB_ERR_LIMIT, "table %s has used %u column positions: rewrite it (CREATE TABLE ... AS "
+                             "SELECT)", cur->s.name, IMDB_MAX_COLS);
+        if (live_col(&cur->s, o->acol.name) >= 0)
+            return imdb_fail(e, IMDB_ERR_CONSTRAINT, "column %s of table %s already exists", o->acol.name, cur->s.name);
+        s->cols[s->ncols] = o->acol;
+        out->pos[s->ncols] = cur->npos;
+        out->at[cur->npos] = (int8_t)s->ncols;
+        s->ncols++;
+        out->npos++;
         return IMDB_OK;
     case IMDB_ALTER_RENAME_COLUMN:
-        if (o->apos >= cur->ncols) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no such column");
-        if (live_col(cur, o->aname) >= 0) return imdb_fail(e, IMDB_ERR_CONSTRAINT, "column %s already exists", o->aname);
-        snprintf(out->cols[o->apos].name, sizeof out->cols[0].name, "%s", o->aname);
+        if (live_col(&cur->s, o->aname) >= 0)
+            return imdb_fail(e, IMDB_ERR_CONSTRAINT, "column %s of table %s already exists", o->aname, cur->s.name);
+        snprintf(col->name, sizeof col->name, "%s", o->aname);
         return IMDB_OK;
     case IMDB_ALTER_RENAME_TABLE:
-        snprintf(out->name, sizeof out->name, "%s", o->aname);
+        snprintf(s->name, sizeof s->name, "%s", o->aname);
+        return IMDB_OK;
+    case IMDB_ALTER_DROP_COLUMN:
+        if (col->flags & IMDB_COL_PK)
+            return imdb_fail(e, IMDB_ERR_INVALID, "column %s is in the primary key of table %s", col->name, s->name);
+        if (c == s->subject)
+            return imdb_fail(e, IMDB_ERR_INVALID, "column %s is the SUBJECT of table %s: erasure finds a subject by it",
+                             col->name, s->name);
+        for (int k = c; k + 1 < s->ncols; k++) { /* the columns after it close up; each keeps its position */
+            s->cols[k] = s->cols[k + 1];
+            out->pos[k] = out->pos[k + 1];
+            out->at[out->pos[k]] = (int8_t)k;
+        }
+        s->ncols--;
+        memset(&s->cols[s->ncols], 0, sizeof s->cols[0]);
+        out->pos[s->ncols] = 0;
+        out->at[o->apos] = -1;
+        for (uint8_t k = 0; k < s->npk; k++)
+            if (s->key[k] > c) s->key[k]--;
+        if (s->subject > c) s->subject--;
+        return IMDB_OK;
+    case IMDB_ALTER_SET_NOT_NULL:
+    case IMDB_ALTER_DROP_NOT_NULL: {
+        bool set = o->akind == IMDB_ALTER_SET_NOT_NULL;
+        if (col->flags & (IMDB_COL_PK | IMDB_COL_SUBJECT)) /* never NULL (codec.h), so its rule never changes */
+            return imdb_fail(e, IMDB_ERR_INVALID, "column %s of table %s is %s: never NULL", col->name, s->name,
+                             (col->flags & IMDB_COL_PK) ? "in the primary key" : "the SUBJECT");
+        if (set != ((col->flags & IMDB_COL_NULLABLE) != 0))
+            return imdb_fail(e, IMDB_ERR_INVALID, set ? "column %s is NOT NULL already" : "column %s takes NULL already",
+                             col->name);
+        col->flags = (uint8_t)(set ? col->flags & ~IMDB_COL_NULLABLE : col->flags | IMDB_COL_NULLABLE);
+        return IMDB_OK;
+    }
+    case IMDB_ALTER_SET_DEFAULT: {
+        imdb_err e2 = {0};
+        if (o->acol.type != col->type || o->acol.precision != col->precision || o->acol.scale != col->scale ||
+            o->adef.null || imdb_value_check(col, &o->adef, &e2))
+            return imdb_fail(e, IMDB_ERR_INVALID, "column %s: its DEFAULT is not a value of its type", col->name);
+        return IMDB_OK; /* catalog state: the schema and its positions stay, so the version's hash does */
+    }
+    case IMDB_ALTER_DROP_DEFAULT:
+        if (h && h->tcol[o->apos].wdef.null) return imdb_fail(e, IMDB_ERR_INVALID, "column %s has no DEFAULT", col->name);
+        return IMDB_OK;
+    case IMDB_ALTER_SET_TYPE:
+        if (!alter_widens(col, &o->acol))
+            return imdb_fail(e, IMDB_ERR_INVALID, "column %s: only a widening keeps every stored value (a wider DECIMAL of its "
+                             "scale, a wider integer; another type: rewrite the table, CREATE TABLE ... AS SELECT)", col->name);
+        col->precision = o->acol.precision;
         return IMDB_OK;
     default:
         return imdb_fail(e, IMDB_ERR_INVALID, "unknown ALTER TABLE kind %u", o->akind);
     }
 }
 
-int imdb_alter_check(imdb_db *db, const imdb_table *t, const imdb_op *o, imdb_err *e)
+/* F1 stage 4: SET NOT NULL's rule, the one ALTER that reads every live row, a segment's too (so it is kept out of
+ * (b2)'s load counts): each reads a value at column c as the table reads it now (a row older than the column's ADD
+ * reads its missing value) */
+static int alter_not_null_check(imdb_table *t, int c, imdb_err *e)
+{
+    for (uint64_t vid = imdb_v_next(t, 0); vid < t->nver; vid = imdb_v_next(t, vid + 1)) {
+        const imdb_version *v = imdb_vh(t, vid);
+        if (v->end != IMDB_LIVE || (v->flags & (IMDB_V_STUB | IMDB_V_PURGED))) continue;
+        imdb_value x;
+        int rc = imdb_version_key(t, vid, c, &x);
+        if (rc) return imdb_fail(e, rc, "SET NOT NULL: a row of table %s could not be read", t->s.name);
+        if (x.null)
+            return imdb_fail(e, IMDB_ERR_CONSTRAINT, "column %s of table %s is NULL in a row: give every row a value first",
+                             t->s.cols[c].name, t->s.name);
+    }
+    return IMDB_OK;
+}
+
+int imdb_alter_check(imdb_db *db, imdb_table *t, const imdb_op *o, imdb_err *e)
 {
     if (t->dropped_at) return imdb_fail(e, IMDB_ERR_NOTFOUND, "table %s was dropped", t->s.name);
     if (t->hist.nvers >= IMDB_MAX_SCHEMA_VERSIONS)
         return imdb_fail(e, IMDB_ERR_LIMIT, "table %s has had %u schema versions: rewrite it (CREATE TABLE ... AS SELECT)",
                          t->s.name, IMDB_MAX_SCHEMA_VERSIONS);
     const imdb_sver *cur = &t->hist.vers[t->hist.nvers - 1];
+    imdb_sver nx;
+    if (imdb_sver_next(&t->hist, cur, o, &nx, e)) return e->code; /* the schema's and the history's rules */
+    const char *name = o->akind == IMDB_ALTER_ADD_COLUMN ? o->acol.name
+                       : o->akind == IMDB_ALTER_RENAME_TABLE ? NULL
+                                                             : t->s.cols[cur->at[o->apos]].name;
     switch (o->akind) {
     case IMDB_ALTER_ADD_COLUMN:
-        if (t->hist.ntcol >= IMDB_MAX_COLS) /* positions are consumed: a dropped column keeps its own */
-            return imdb_fail(e, IMDB_ERR_LIMIT, "table %s has used %u column positions: rewrite it", t->s.name,
-                             IMDB_MAX_COLS);
-        if (live_col(&t->s, o->acol.name) >= 0)
-            return imdb_fail(e, IMDB_ERR_CONSTRAINT, "column %s of table %s already exists", o->acol.name, t->s.name);
-        { /* a view that reads the table and holds the name could bind it to the new column (imdb_view_names_col) */
-            const char *vn = NULL;
-            int vrc = imdb_view_names_col(db, t->s.id, o->acol.name, &vn, e);
-            if (vrc) return vrc;
-            if (vn)
-                return imdb_fail(e, IMDB_ERR_INVALID, "view %s reads table %s and names %s: drop it first, then add the "
-                                 "column", vn, t->s.name, o->acol.name);
-        }
+    case IMDB_ALTER_DROP_COLUMN: { /* a view that reads the table and holds the name: an ADD's column could capture it,
+                                      a DROP's would leave its re-bind nothing (imdb_view_names_col) */
+        const char *vn = NULL;
+        int vrc = imdb_view_names_col(db, t->s.id, name, &vn, e);
+        if (vrc) return vrc;
+        if (vn)
+            return imdb_fail(e, IMDB_ERR_INVALID, "view %s reads table %s and names %s: drop it first, then %s the column",
+                             vn, t->s.name, name, o->akind == IMDB_ALTER_ADD_COLUMN ? "add" : "drop");
+        for (uint32_t k = 0; o->akind == IMDB_ALTER_DROP_COLUMN && k < t->nidx; k++)
+            for (uint8_t j = 0; j < t->idx[k].d.ncols; j++)
+                if (t->idx[k].d.cols[j] == (uint16_t)cur->at[o->apos])
+                    return imdb_fail(e, IMDB_ERR_INVALID, "index %s names column %s: drop it first, then the column",
+                                     t->idx[k].d.name, name);
         return IMDB_OK;
-    case IMDB_ALTER_RENAME_COLUMN:
-        if (o->apos >= t->hist.ntcol || cur->at[o->apos] < 0) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no such column");
-        if (live_col(&t->s, o->aname) >= 0)
-            return imdb_fail(e, IMDB_ERR_CONSTRAINT, "column %s of table %s already exists", o->aname, t->s.name);
-        break;
+    }
     case IMDB_ALTER_RENAME_TABLE:
         if (imdb_table_by_name(db, o->aname) || imdb_view_by_name(db, o->aname))
             return imdb_fail(e, IMDB_ERR_CONSTRAINT, "a table or view %s already exists", o->aname);
-        break;
-    default:
-        return imdb_fail(e, IMDB_ERR_INVALID, "unknown ALTER TABLE kind %u", o->akind);
+        /* fall through */
+    case IMDB_ALTER_RENAME_COLUMN: {
+        /* a rename: a live view's text names the old name, so its re-bind would fail (PostgreSQL rewrites the view's
+         * stored tree; imagedb keeps the text as written, so it refuses: RESTRICT, as DROP is) */
+        const imdb_view *dv = imdb_view_dependent(db, IMDB_VIEWDEP_TABLE, t->s.id);
+        if (dv)
+            return imdb_fail(e, IMDB_ERR_INVALID, "view %s names table %s: drop it first, then rename", dv->name,
+                             t->s.name);
+        return IMDB_OK;
     }
-    /* a rename: a live view's text names the old name, so its re-bind would fail (PostgreSQL rewrites the view's stored
-     * tree; imagedb keeps the text as written, so it refuses: RESTRICT, as DROP is) */
-    const imdb_view *dv = imdb_view_dependent(db, IMDB_VIEWDEP_TABLE, t->s.id);
-    if (dv) return imdb_fail(e, IMDB_ERR_INVALID, "view %s names table %s: drop it first, then rename", dv->name, t->s.name);
-    return IMDB_OK;
+    case IMDB_ALTER_SET_NOT_NULL:
+        return alter_not_null_check(t, cur->at[o->apos], e);
+    default: /* DROP NOT NULL, SET and DROP DEFAULT, a widening: no view's columns or a row's validity change */
+        return IMDB_OK;
+    }
 }
 
-/* the room a version takes and an added TEXT DEFAULT's own bytes, taken before the commit so the install allocates
- * nothing: the bytes in the next position's slot, which only that ADD's install adopts (a rollback leaves them for the
- * next ADD to free or the table's free) */
+/* the room a version takes and a TEXT DEFAULT's own bytes, taken before the commit so the install allocates nothing:
+ * an ADD's in the next position's slot, which only that ADD's install adopts; a SET DEFAULT's in the history's staging
+ * slot, which its install gives the version (a rollback leaves either for the next prepare or the table's free) */
 int imdb_hist_prepare(imdb_schema_hist *h, imdb_op *o, imdb_err *e)
 {
     if (h->nvers == h->capvers) {
@@ -2138,47 +2242,83 @@ int imdb_hist_prepare(imdb_schema_hist *h, imdb_op *o, imdb_err *e)
         h->vers = nv;
         h->capvers = nc;
     }
-    if (o->akind == IMDB_ALTER_ADD_COLUMN && o->acol.type == IMDB_T_TEXT && !o->adef.null) {
-        imdb_tcol *tc = &h->tcol[h->ntcol];
+    const imdb_sver *cur = &h->vers[h->nvers - 1];
+    imdb_sver nx;
+    if (imdb_sver_next(h, cur, o, &nx, e)) return e->code; /* its callers checked it: never here but for a broken rule */
+    bool text = o->acol.type == IMDB_T_TEXT && !o->adef.null;
+    if (o->akind == IMDB_ALTER_ADD_COLUMN && text) {
+        imdb_tcol *tc = &h->tcol[cur->npos];
         imdb_free(tc->missing_text);
         tc->missing_text = imdb_alloc(o->adef.len ? o->adef.len : 1, e);
         if (!tc->missing_text) return e->code;
         if (o->adef.len) memcpy(tc->missing_text, o->adef.s, o->adef.len);
         o->adef.s = tc->missing_text;
     }
+    if (o->akind == IMDB_ALTER_SET_DEFAULT && text) {
+        imdb_free(h->staged);
+        h->staged = imdb_alloc(o->adef.len ? o->adef.len : 1, e);
+        if (!h->staged) return e->code;
+        if (o->adef.len) memcpy(h->staged, o->adef.s, o->adef.len);
+        o->adef.s = h->staged;
+    }
     /* the next version, whole but its since, in the room just made: the install adopts it */
     imdb_sver *nv = &h->vers[h->nvers];
-    *nv = h->vers[h->nvers - 1];
+    *nv = nx;
     nv->akind = o->akind;
-    nv->apos = o->akind == IMDB_ALTER_ADD_COLUMN ? h->ntcol : o->apos;
-    if (o->akind == IMDB_ALTER_ADD_COLUMN) {
-        uint16_t p = h->ntcol;
-        nv->s.cols[nv->s.ncols] = o->acol;
-        nv->pos[nv->s.ncols] = p;
-        nv->at[p] = (int8_t)nv->s.ncols;
-        nv->s.ncols++;
-    } else if (o->akind == IMDB_ALTER_RENAME_COLUMN) {
-        snprintf(nv->s.cols[nv->at[o->apos]].name, sizeof nv->s.cols[0].name, "%s", o->aname);
-    } else {
-        snprintf(nv->s.name, sizeof nv->s.name, "%s", o->aname);
-    }
-    return imdb_schema_hash(&nv->s, nv->hash, e);
+    nv->apos = o->akind == IMDB_ALTER_ADD_COLUMN ? cur->npos : o->apos;
+    if (o->akind == IMDB_ALTER_SET_DEFAULT) nv->adef = o->adef;
+    return imdb_sver_hash(&nv->s, nv->pos, nv->hash, e);
 }
 
 void imdb_hist_install(imdb_schema_hist *h, const imdb_op *o, uint64_t seq)
 {
     imdb_sver *nv = &h->vers[h->nvers];
     nv->since = seq;
-    if (o->akind == IMDB_ALTER_ADD_COLUMN) {
-        imdb_tcol *tc = &h->tcol[h->ntcol++];
-        tc->added = h->nvers + 1;
+    uint32_t made = h->nvers + 1; /* the version this ALTER makes, numbered from 1 (the CREATE's) */
+    imdb_tcol *tc = &h->tcol[o->akind == IMDB_ALTER_ADD_COLUMN ? h->ntcol : o->apos];
+    switch (o->akind) {
+    case IMDB_ALTER_ADD_COLUMN:
+        h->ntcol++;
+        tc->added = made;
         tc->dropped = 0;
         tc->missing = o->adef;
         tc->missing.type = o->acol.type;
         tc->missing.scale = o->acol.scale;
         if (o->acol.type == IMDB_T_TEXT && !o->adef.null) tc->missing.s = tc->missing_text;
+        tc->wdef = tc->missing; /* the ADD's DEFAULT is the column's for later writes too, as in every engine */
+        tc->wver = -1;
+        break;
+    case IMDB_ALTER_DROP_COLUMN:
+        tc->dropped = made;
+        break;
+    case IMDB_ALTER_SET_DEFAULT:
+        if (nv->adef.type == IMDB_T_TEXT) {
+            nv->atext = h->staged; /* the version's own now */
+            h->staged = NULL;
+            nv->adef.s = nv->atext;
+        }
+        tc->wdef = nv->adef;
+        tc->wver = (int16_t)h->nvers;
+        break;
+    case IMDB_ALTER_DROP_DEFAULT:
+        tc->wdef = (imdb_value){.type = tc->missing.type, .scale = tc->missing.scale, .null = true};
+        tc->wver = -1;
+        break;
+    default: /* a rename, a NULL rule, a widening (its scale, so its values' tag and scale, stay) */
+        break;
     }
     h->nvers++;
+}
+
+/* F1 stage 4: index definitions by column index, carried from one version to the next by position (a DROP closes the
+ * columns after it up; no index names the dropped column: imdb_alter_check, VERIFY and the auditor refuse it) */
+void imdb_index_remap(imdb_index *ix, uint32_t n, const imdb_sver *from, const imdb_sver *to)
+{
+    for (uint32_t k = 0; k < n; k++)
+        for (uint8_t j = 0; j < ix[k].d.ncols; j++) {
+            int c = to->at[from->pos[ix[k].d.cols[j]]];
+            ix[k].d.cols[j] = (uint16_t)(c >= 0 ? c : 0);
+        }
 }
 
 int imdb_alter_table(imdb_db *db, imdb_table *t, const imdb_op *proto, imdb_err *e)
@@ -5650,16 +5790,29 @@ int imdb_alter_prepare(imdb_table *t, imdb_op *o, imdb_err *e) { return imdb_his
 
 void imdb_alter_install(imdb_table *t, const imdb_op *o, uint64_t seq)
 {
-    imdb_hist_install(&t->hist, o, seq);
-    t->s = t->hist.vers[t->hist.nvers - 1].s;
+    imdb_hist_install(&t->hist, o, seq); /* the versions' room was made at the prepare: from stays where it is */
+    const imdb_sver *to = &t->hist.vers[t->hist.nvers - 1], *from = to - 1;
+    imdb_index_remap(t->idx, t->nidx, from, to);
+    t->s = to->s;
 }
 
 void imdb_hist_free(imdb_schema_hist *h)
 {
     for (uint16_t p = 0; p < IMDB_MAX_COLS; p++) imdb_free(h->tcol[p].missing_text); /* a rolled-back ADD's staged slot too */
+    for (uint32_t k = 0; h->vers && k < h->nvers; k++) imdb_free(h->vers[k].atext);
+    imdb_free(h->staged); /* a rolled-back SET DEFAULT's */
+    h->staged = NULL;
     imdb_free(h->vers);
     h->vers = NULL;
     h->nvers = h->capvers = 0;
+}
+
+/* a copy of n bytes (one at least), or NULL with e set */
+static uint8_t *bytes_dup(const uint8_t *s, uint32_t n, imdb_err *e)
+{
+    uint8_t *d = imdb_alloc(n ? n : 1, e);
+    if (d && n) memcpy(d, s, n);
+    return d;
 }
 
 int imdb_hist_copy(imdb_schema_hist *dst, const imdb_schema_hist *src, imdb_err *e)
@@ -5667,27 +5820,35 @@ int imdb_hist_copy(imdb_schema_hist *dst, const imdb_schema_hist *src, imdb_err 
     imdb_sver *v = imdb_alloc_array(src->capvers ? src->capvers : 1, sizeof *v, e);
     if (!v) return e->code;
     uint8_t *txt[IMDB_MAX_COLS] = {0};
-    for (uint16_t p = 0; p < src->ntcol; p++) {
-        const imdb_tcol *tc = &src->tcol[p];
-        if (!tc->missing_text) continue;
-        uint32_t n = tc->missing.len;
-        if (!(txt[p] = imdb_alloc(n ? n : 1, e))) {
-            for (uint16_t q = 0; q < p; q++) imdb_free(txt[q]);
-            imdb_free(v);
-            return e->code;
+    memcpy(v, src->vers, (size_t)src->nvers * sizeof *v);
+    for (uint32_t k = 0; k < src->nvers; k++) v[k].atext = NULL;
+    int rc = IMDB_OK;
+    for (uint16_t p = 0; p < src->ntcol && !rc; p++)
+        if (src->tcol[p].missing_text && !(txt[p] = bytes_dup(src->tcol[p].missing_text, src->tcol[p].missing.len, e)))
+            rc = e->code;
+    for (uint32_t k = 0; k < src->nvers && !rc; k++) /* F1 stage 4: each SET DEFAULT's TEXT, the version's own */
+        if (src->vers[k].atext) {
+            if (!(v[k].atext = bytes_dup(src->vers[k].atext, src->vers[k].adef.len, e))) rc = e->code;
+            else v[k].adef.s = v[k].atext;
         }
-        if (n) memcpy(txt[p], tc->missing_text, n);
+    if (rc) {
+        for (uint16_t p = 0; p < IMDB_MAX_COLS; p++) imdb_free(txt[p]);
+        for (uint32_t k = 0; k < src->nvers; k++) imdb_free(v[k].atext);
+        imdb_free(v);
+        return rc;
     }
     imdb_hist_free(dst);
-    memcpy(v, src->vers, (size_t)src->nvers * sizeof *v);
     dst->vers = v;
     dst->nvers = src->nvers;
     dst->capvers = src->capvers ? src->capvers : 1;
     dst->ntcol = src->ntcol;
     for (uint16_t p = 0; p < IMDB_MAX_COLS; p++) {
-        dst->tcol[p] = p < src->ntcol ? src->tcol[p] : (imdb_tcol){0};
-        dst->tcol[p].missing_text = txt[p];
-        if (txt[p]) dst->tcol[p].missing.s = txt[p];
+        imdb_tcol *tc = &dst->tcol[p];
+        *tc = p < src->ntcol ? src->tcol[p] : (imdb_tcol){.wver = -1};
+        tc->missing_text = txt[p];
+        if (txt[p]) tc->missing.s = txt[p];
+        if (tc->wdef.type == IMDB_T_TEXT && !tc->wdef.null) /* the copy's own bytes: an ADD's or a SET DEFAULT's */
+            tc->wdef.s = tc->wver >= 0 ? v[tc->wver].atext : txt[p];
     }
     return IMDB_OK;
 }

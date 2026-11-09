@@ -683,6 +683,486 @@ static void t_alter_copies(void)
     }
 }
 
+
+/* a dump's text, gathered (test memory, not the engine's) */
+typedef struct dumpbuf {
+    char *p;
+    size_t n, cap;
+} dumpbuf;
+
+static int dumpbuf_write(void *arg, const char *b, size_t n)
+{
+    dumpbuf *o = arg;
+    if (o->n + n + 1 > o->cap) {
+        size_t c = (o->n + n + 1) * 2;
+        char *q = realloc(o->p, c);
+        if (!q) return -1;
+        o->p = q;
+        o->cap = c;
+    }
+    memcpy(o->p + o->n, b, n);
+    o->n += n;
+    o->p[o->n] = 0;
+    return 0;
+}
+
+/* ---- F1 stage 4 (docs/plan-p2.md 2026-11-08 20:5x-21:5x): DROP COLUMN, the NULL rules, the defaults, a widening ---- */
+
+/* t's and w's answers: t dropped a column before the key, the SUBJECT and both indexed columns (so every index's
+ * columns shift) and one among them, then added e; w was created with t's last columns */
+static const char *const kDropQueries[] = {
+    "SELECT * FROM {T} ORDER BY id",
+    "SELECT id, s FROM {T} WHERE n = 3 ORDER BY id",
+    "SELECT id FROM {T} WHERE x > 1200 ORDER BY id",
+    "SELECT id, n, x, e FROM {T} WHERE x = 231",
+    "SELECT id, n, x FROM {T} WHERE id = 77",
+    "SELECT COUNT(*), SUM(n), SUM(x), COUNT(e), MIN(s), MAX(s) FROM {T}",
+    "SELECT n, COUNT(*) FROM {T} GROUP BY n ORDER BY n",
+    "SELECT s, COUNT(*), SUM(x) FROM {T} GROUP BY s ORDER BY s",
+    "SELECT id FROM {T} WHERE e IS NULL AND n = 4 ORDER BY id",
+    "SELECT id, e FROM {T} WHERE e = 9 ORDER BY id",
+    "SELECT DISTINCT n FROM {T} ORDER BY n",
+    "SELECT id, n FROM {T} ORDER BY n DESC, id LIMIT 25",
+};
+
+static void compare_drop(const char *phase)
+{
+    static const char *const paths[] = {"auto", "scan", "store", "index"};
+    char qt[600], qw[600], set[64];
+    OK(run("SET cross_check = on"));
+    for (size_t pi = 0; pi < sizeof paths / sizeof *paths; pi++) {
+        snprintf(set, sizeof set, "SET access_path = %s", paths[pi]);
+        OK(run(set));
+        for (size_t i = 0; i < sizeof kDropQueries / sizeof *kDropQueries; i++) {
+            qfor(kDropQueries[i], "t", qt, sizeof qt);
+            qfor(kDropQueries[i], "w", qw, sizeof qw);
+            char *ta = strdup(csv(qt));
+            const char *b = csv(qw);
+            if (!ta || strcmp(ta, b) != 0) {
+                char m[1800];
+                snprintf(m, sizeof m, "%s, access_path %s: %s\n      t: %.500s\n      w: %.500s", phase, paths[pi], qt,
+                         ta ? ta : "?", b);
+                test_fail(__FILE__, __LINE__, m);
+            }
+            free(ta);
+        }
+    }
+    OK(run("SET access_path = auto"));
+    OK(run("SET cross_check = off"));
+}
+
+/* rows [lo, hi]: t's with the columns its phase has (0: g1 and g2 too, 1: g2, 2: e), w's with e (NULL before phase 2,
+ * the value e reads for t's older rows) */
+static void put_drop_rows(int lo, int hi, int phase)
+{
+    char qt[1 << 14], qw[1 << 14];
+    for (int s = lo; s <= hi; s += 40) {
+        size_t ot = (size_t)snprintf(qt, sizeof qt, "INSERT INTO t (id, s, n, x%s) VALUES ",
+                                     phase == 0 ? ", g1, g2" : phase == 1 ? ", g2" : ", e");
+        size_t ow = (size_t)snprintf(qw, sizeof qw, "INSERT INTO w (id, s, n, x, e) VALUES ");
+        for (int id = s; id <= hi && id < s + 40; id++) {
+            const char *sep = id == s ? "" : ", ";
+            char e[16];
+            snprintf(e, sizeof e, phase == 2 && id % 3 ? "%d" : "NULL", id % 4 + 8);
+            ot += (size_t)snprintf(qt + ot, sizeof qt - ot, "%s(%d, %d, %d, %d", sep, id, id % 5, id % 9, id * 3);
+            if (phase == 0) ot += (size_t)snprintf(qt + ot, sizeof qt - ot, ", %d, 'g%d')", id * 2, id);
+            else if (phase == 1) ot += (size_t)snprintf(qt + ot, sizeof qt - ot, ", 'g%d')", id);
+            else ot += (size_t)snprintf(qt + ot, sizeof qt - ot, ", %s)", e);
+            ow += (size_t)snprintf(qw + ow, sizeof qw - ow, "%s(%d, %d, %d, %d, %s)", sep, id, id % 5, id % 9, id * 3, e);
+        }
+        OK(run(qt));
+        OK(run(qw));
+    }
+}
+
+/* the number of t's segments built at each version (by index) */
+static void seg_versions(const imdb_table *t, uint32_t *count, uint32_t n)
+{
+    memset(count, 0, n * sizeof *count);
+    for (uint32_t i = 0; t && i < t->nseg; i++)
+        if (t->seg[i]->gver < n) count[t->seg[i]->gver]++;
+}
+
+/* DROP COLUMN against a twin: the flush of a memtable holding rows from both sides of a DROP cuts it into a segment
+ * of each version, COMPACT keeps the cut, and t reads as w on every path in memory, after a CHECKPOINT, an ERASE
+ * SUBJECT, a reopen, COMPACT and a full replay; AS OF before the drop reads no dropped column; VERIFY and the
+ * auditor pass */
+static void t_alter_drop_differential(void)
+{
+    const char *dir = test_tmpdir();
+    imdb_db *db = open_fresh(dir);
+    CHECK(db);
+    if (!db) return;
+    OK(run("CREATE TABLE t (g1 INT64, id INT64 PRIMARY KEY, s INT64 SUBJECT, g2 TEXT, n INT64, x INT64)"));
+    OK(run("CREATE TABLE w (id INT64 PRIMARY KEY, s INT64 SUBJECT, n INT64, x INT64, e INT64)"));
+    OK(run("CREATE INDEX tn ON t (n)"));
+    OK(run("CREATE UNIQUE INDEX tx ON t (x)"));
+    OK(run("CREATE INDEX wn ON w (n)"));
+    OK(run("CREATE UNIQUE INDEX wx ON w (x)"));
+    put_drop_rows(1, 300, 0);
+    OK(run("CHECKPOINT")); /* a segment of version 1 */
+    put_drop_rows(301, 400, 0);
+    uint64_t before = db->seq;
+    EXPECT("ALTER TABLE t DROP COLUMN g1", "ALTER TABLE t"); /* version 2: every column after g1 one index down */
+    put_drop_rows(401, 450, 1);
+    OK(run("CHECKPOINT")); /* the memtable holds rows of versions 1 and 2: a segment of each */
+    imdb_table *t = imdb_table_by_name(db, "t");
+    uint32_t cnt[8];
+    seg_versions(t, cnt, 8);
+    CHECK(t && t->nseg == 3 && cnt[0] == 2 && cnt[1] == 1);
+    CHECK(t && t->idx[0].d.cols[0] == 3 && t->idx[1].d.cols[0] == 4 && t->s.subject == 1 && t->s.key[0] == 0);
+    char q[200];
+    snprintf(q, sizeof q, "SELECT * FROM t AS OF %llu WHERE id = 2", (unsigned long long)before);
+    EXPECT(q, "id,s,g2,n,x\n2,2,\"g2\",2,6\n"); /* stage 3's rule: the current schema, the history's rows */
+    EXPECT("ALTER TABLE t DROP g2", "ALTER TABLE t");     /* 3 */
+    EXPECT("ALTER TABLE t ADD e INT64", "ALTER TABLE t"); /* 4: position 6 */
+    put_drop_rows(451, 500, 2);
+    for (int k = 0; k < 2; k++) { /* the same writes on both: rows of every version end, new ones at version 4 */
+        const char *tb = k ? "w" : "t";
+        snprintf(q, sizeof q, "UPDATE %s SET n = n + 1 WHERE id %% 7 = 0", tb);
+        OK(run(q));
+        snprintf(q, sizeof q, "DELETE FROM %s WHERE id %% 11 = 0", tb);
+        OK(run(q));
+        snprintf(q, sizeof q, "UPDATE %s SET e = 9 WHERE id %% 13 = 0", tb);
+        OK(run(q));
+    }
+    compare_drop("in memory");
+    OK(run("CHECKPOINT"));
+    compare_drop("after a CHECKPOINT");
+    EXPECT("SELECT * FROM t WHERE id = 2", "id,s,n,x,e\n2,2,2,6,\n");
+    OK(run("ERASE SUBJECT 3")); /* segments of versions 1, 2 and 4 rewritten, each at its own */
+    compare_drop("after ERASE SUBJECT");
+    CHECK(verify_db(db) == 0);
+    done(db);
+    db = open_at(dir, false);
+    CHECK(db);
+    if (!db) return;
+    compare_drop("after a reopen");
+    OK(run("COMPACT t"));
+    OK(run("COMPACT w"));
+    compare_drop("after COMPACT");
+    t = imdb_table_by_name(db, "t");
+    seg_versions(t, cnt, 8);
+    CHECK(t && cnt[0] >= 1 && cnt[1] >= 1 && cnt[3] >= 1 && cnt[2] == 0); /* the cut kept: g1's rows, g2's, the rest */
+    CHECK(verify_db(db) == 0);
+    done(db);
+    db = open_at(dir, true);
+    CHECK(db);
+    if (!db) return;
+    compare_drop("after a full replay");
+    CHECK(verify_db(db) == 0);
+    done(db);
+    CHECK(audit_dir(dir) == 0);
+}
+
+/* DROP then ADD of the same last column: the old schema's encoding again, at another position, so the versions'
+ * hashes differ and no read, from memory or a segment of the first version, shows the dropped values */
+static void t_alter_drop_add(void)
+{
+    const char *dir = test_tmpdir();
+    imdb_db *db = open_fresh(dir);
+    CHECK(db);
+    if (!db) return;
+    OK(run("CREATE TABLE t (id INT64 PRIMARY KEY, a INT64, c INT64)"));
+    OK(run("INSERT INTO t VALUES (1, 1, 100), (2, 2, 200), (3, 3, 300)"));
+    OK(run("CHECKPOINT")); /* its segment holds c */
+    OK(run("INSERT INTO t VALUES (4, 4, 400)"));
+    OK(run("ALTER TABLE t DROP COLUMN c"));
+    OK(run("ALTER TABLE t ADD COLUMN c INT64"));
+    imdb_table *t = imdb_table_by_name(db, "t");
+    CHECK(t && t->hist.nvers == 3);
+    if (t && t->hist.nvers == 3) {
+        uint8_t a[32], b[32];
+        OK(imdb_schema_hash(&t->hist.vers[0].s, a, E));
+        OK(imdb_schema_hash(&t->hist.vers[2].s, b, E));
+        CHECK(memcmp(a, b, 32) == 0);                                        /* one encoding */
+        CHECK(memcmp(t->hist.vers[0].hash, t->hist.vers[2].hash, 32) != 0); /* two layouts */
+    }
+    const char *want = "id,a,c\n1,1,\n2,2,\n3,3,\n4,4,\n5,5,500\n";
+    OK(run("INSERT INTO t VALUES (5, 5, 500)"));
+    EXPECT("SELECT * FROM t ORDER BY id", want);
+    EXPECT("SELECT id FROM t WHERE c = 100 OR c = 400", "id\n");
+    OK(run("CHECKPOINT")); /* the memtable: row 4 of version 1 (with c's old value), row 5 of version 3 */
+    EXPECT("SELECT * FROM t ORDER BY id", want);
+    done(db);
+    db = open_at(dir, false); /* each segment by its version's hash */
+    CHECK(db);
+    if (!db) return;
+    EXPECT("SELECT * FROM t ORDER BY id", want);
+    EXPECT("SELECT COUNT(c), SUM(c) FROM t", "count_c,sum_c\n1,500\n");
+    OK(run("COMPACT t"));
+    EXPECT("SELECT * FROM t ORDER BY id", want);
+    CHECK(verify_db(db) == 0);
+    done(db);
+    db = open_at(dir, true);
+    CHECK(db);
+    if (!db) return;
+    EXPECT("SELECT * FROM t ORDER BY id", want);
+    done(db);
+    CHECK(audit_dir(dir) == 0);
+}
+
+/* equal hashes, equal layouts: a RENAME and back gives version 1's hash again and a SET DEFAULT its predecessor's;
+ * segments built under each read alike through every reopen */
+static void t_alter_same_layout(void)
+{
+    const char *dir = test_tmpdir();
+    imdb_db *db = open_fresh(dir);
+    CHECK(db);
+    if (!db) return;
+    OK(run("CREATE TABLE t (id INT64 PRIMARY KEY, a INT64)"));
+    OK(run("INSERT INTO t VALUES (1, 10), (2, 20)"));
+    OK(run("CHECKPOINT"));
+    OK(run("ALTER TABLE t RENAME COLUMN a TO b"));
+    OK(run("INSERT INTO t VALUES (3, 30)"));
+    OK(run("CHECKPOINT"));
+    OK(run("ALTER TABLE t RENAME COLUMN b TO a"));
+    OK(run("ALTER TABLE t ALTER COLUMN a SET DEFAULT 7"));
+    OK(run("INSERT INTO t (id) VALUES (4)"));
+    imdb_table *t = imdb_table_by_name(db, "t");
+    CHECK(t && t->hist.nvers == 4);
+    if (t && t->hist.nvers == 4) {
+        CHECK(memcmp(t->hist.vers[0].hash, t->hist.vers[2].hash, 32) == 0);
+        CHECK(memcmp(t->hist.vers[2].hash, t->hist.vers[3].hash, 32) == 0);
+        CHECK(memcmp(t->hist.vers[0].hash, t->hist.vers[1].hash, 32) != 0);
+    }
+    const char *want = "id,a\n1,10\n2,20\n3,30\n4,7\n";
+    EXPECT("SELECT * FROM t ORDER BY id", want);
+    OK(run("CHECKPOINT"));
+    done(db);
+    db = open_at(dir, false);
+    CHECK(db);
+    if (!db) return;
+    EXPECT("SELECT * FROM t ORDER BY id", want);
+    EXPECT("INSERT INTO t (id) VALUES (5)", "INSERT 1"); /* the write default through the manifest's history */
+    EXPECT("SELECT a FROM t WHERE id = 5", "a\n7\n");
+    CHECK(verify_db(db) == 0);
+    done(db);
+    db = open_at(dir, true);
+    CHECK(db);
+    if (!db) return;
+    EXPECT("SELECT * FROM t WHERE id < 5 ORDER BY id", want);
+    done(db);
+    CHECK(audit_dir(dir) == 0);
+}
+
+/* the NULL rules: SET NOT NULL refused while a live row reads NULL, then allowed with an ended row holding one, whose
+ * flush cuts it into a segment of the version before; DROP NOT NULL; the key and the SUBJECT never change */
+static void t_alter_not_null(void)
+{
+    const char *dir = test_tmpdir();
+    imdb_db *db = open_fresh(dir);
+    CHECK(db);
+    if (!db) return;
+    OK(run("CREATE TABLE t (id INT64 PRIMARY KEY, s INT64 SUBJECT, a INT64, b TEXT)"));
+    OK(run("INSERT INTO t VALUES (1, 1, 10, 'x'), (2, 2, NULL, 'y'), (3, 3, 30, NULL)"));
+    OK(run("ALTER TABLE t ADD c INT64"));          /* the three rows read NULL there */
+    OK(run("ALTER TABLE t ADD k INT64 DEFAULT 5")); /* and 5 there */
+    EXPECT("ALTER TABLE t ALTER COLUMN a SET NOT NULL", "ERR column a of table t is NULL in a row");
+    EXPECT("ALTER TABLE t ALTER COLUMN c SET NOT NULL", "ERR column c of table t is NULL in a row");
+    EXPECT("ALTER TABLE t ALTER COLUMN k SET NOT NULL", "ALTER TABLE t"); /* the missing value 5 is a value */
+    EXPECT("ALTER TABLE t ALTER COLUMN k SET NOT NULL", "ERR NOT NULL already");
+    EXPECT("ALTER TABLE t ALTER COLUMN id DROP NOT NULL", "ERR never NULL");
+    EXPECT("ALTER TABLE t ALTER COLUMN s DROP NOT NULL", "ERR never NULL");
+    EXPECT("ALTER TABLE t ALTER COLUMN nosuch SET NOT NULL", "ERR no column nosuch");
+    uint64_t was = db->seq;
+    OK(run("DELETE FROM t WHERE id = 2")); /* an ended version holding a NULL in a */
+    EXPECT("ALTER TABLE t ALTER COLUMN a SET NOT NULL", "ALTER TABLE t");
+    EXPECT("INSERT INTO t VALUES (4, 4, NULL, 'z', 1, 1)", "ERR ");
+    OK(run("INSERT INTO t VALUES (5, 5, 50, 'w', 1, 1)"));
+    OK(run("CHECKPOINT")); /* rows 1-3 (version 1, a nullable: they reach the version before the SET) and row 5 */
+    imdb_table *t = imdb_table_by_name(db, "t");
+    uint32_t cnt[8];
+    seg_versions(t, cnt, 8);
+    CHECK(t && t->nseg == 2 && cnt[3] == 1 && cnt[4] == 1);
+    char q[200];
+    snprintf(q, sizeof q, "SELECT a, b FROM t AS OF %llu WHERE id = 2", (unsigned long long)was);
+    EXPECT(q, "a,b\n,\"y\"\n");
+    EXPECT("ALTER TABLE t ALTER COLUMN a DROP NOT NULL", "ALTER TABLE t");
+    EXPECT("ALTER TABLE t ALTER COLUMN a DROP NOT NULL", "ERR takes NULL already");
+    EXPECT("INSERT INTO t VALUES (6, 6, NULL, 'v', NULL, 2)", "INSERT 1");
+    const char *want = "id,s,a,b,c,k\n1,1,10,\"x\",,5\n3,3,30,,,5\n5,5,50,\"w\",1,1\n6,6,,\"v\",,2\n";
+    EXPECT("SELECT * FROM t ORDER BY id", want);
+    OK(run("CHECKPOINT"));
+    done(db);
+    db = open_at(dir, false);
+    CHECK(db);
+    if (!db) return;
+    EXPECT("SELECT * FROM t ORDER BY id", want);
+    OK(run("COMPACT t"));
+    EXPECT("SELECT * FROM t ORDER BY id", want);
+    CHECK(verify_db(db) == 0);
+    done(db);
+    db = open_at(dir, true);
+    CHECK(db);
+    if (!db) return;
+    EXPECT("SELECT * FROM t ORDER BY id", want);
+    done(db);
+    CHECK(audit_dir(dir) == 0);
+}
+
+/* the write default parted from what older rows read: SET DEFAULT and DROP DEFAULT through INSERT, a reopen and a
+ * full replay; the refusals; the dump's lines */
+static void t_alter_set_default(void)
+{
+    const char *dir = test_tmpdir();
+    imdb_db *db = open_fresh(dir);
+    CHECK(db);
+    if (!db) return;
+    OK(run("CREATE TABLE t (id INT64 PRIMARY KEY, a TEXT)"));
+    OK(run("INSERT INTO t VALUES (1, 'x')"));
+    OK(run("ALTER TABLE t ADD c TEXT DEFAULT 'old'"));
+    OK(run("INSERT INTO t (id) VALUES (2)"));
+    EXPECT("ALTER TABLE t ALTER COLUMN c SET DEFAULT 'new'", "ALTER TABLE t");
+    OK(run("INSERT INTO t (id) VALUES (3)"));
+    OK(run("ALTER TABLE t ADD n INT64 DEFAULT 1"));
+    OK(run("ALTER TABLE t ALTER COLUMN n SET DEFAULT 2"));
+    OK(run("INSERT INTO t (id) VALUES (4)"));
+    const char *want = "id,a,c,n\n1,\"x\",\"old\",1\n2,,\"old\",1\n3,,\"new\",1\n4,,\"new\",2\n";
+    EXPECT("SELECT * FROM t ORDER BY id", want);
+    EXPECT("ALTER TABLE t ALTER COLUMN c SET DEFAULT NULL", "ERR DROP DEFAULT");
+    EXPECT("ALTER TABLE t ALTER COLUMN n SET DEFAULT 'q'", "ERR ");
+    EXPECT("ALTER TABLE t ALTER COLUMN a DROP DEFAULT", "ERR column a has no DEFAULT");
+    OK(run("CHECKPOINT"));
+    done(db);
+    db = open_at(dir, false);
+    CHECK(db);
+    if (!db) return;
+    EXPECT("SELECT * FROM t ORDER BY id", want);
+    OK(run("INSERT INTO t (id) VALUES (5)"));
+    EXPECT("SELECT c, n FROM t WHERE id = 5", "c,n\n\"new\",2\n");
+    EXPECT("ALTER TABLE t ALTER COLUMN c DROP DEFAULT", "ALTER TABLE t");
+    OK(run("INSERT INTO t (id) VALUES (6)"));
+    EXPECT("SELECT c, n FROM t WHERE id = 6", "c,n\n,2\n");
+    EXPECT("SELECT c FROM t WHERE id = 1", "c\n\"old\"\n"); /* what the rows before the ADD read stays */
+    dumpbuf d = {0};
+    OK(imdb_dump(db, 1000, dumpbuf_write, &d, E));
+    CHECK(d.p && strstr(d.p, "CREATE TABLE t (id INT64 PRIMARY KEY, a TEXT, c TEXT, n INT64) RETENTION") &&
+          strstr(d.p, "ALTER TABLE t ALTER COLUMN n SET DEFAULT 2;\n") && !strstr(d.p, "COLUMN c SET DEFAULT"));
+    free(d.p);
+    CHECK(verify_db(db) == 0);
+    done(db);
+    db = open_at(dir, true);
+    CHECK(db);
+    if (!db) return;
+    OK(run("INSERT INTO t (id) VALUES (7)"));
+    EXPECT("SELECT c, n FROM t WHERE id = 7", "c,n\n,2\n");
+    done(db);
+    CHECK(audit_dir(dir) == 0);
+}
+
+/* a widening: DECIMAL(6,2) to DECIMAL(10,2), its stored values valid as they are, a view over the column unchanged
+ * (its logged types carry a scale, not a precision); a narrowing, another scale, another type refused */
+static void t_alter_widen(void)
+{
+    const char *dir = test_tmpdir();
+    imdb_db *db = open_fresh(dir);
+    CHECK(db);
+    if (!db) return;
+    OK(run("CREATE TABLE t (id INT64 PRIMARY KEY, d DECIMAL(6,2))"));
+    OK(run("INSERT INTO t VALUES (1, 1234.56)"));
+    EXPECT("INSERT INTO t VALUES (2, 123456.78)", "ERR ");
+    OK(run("CREATE VIEW v AS SELECT id, d FROM t"));
+    OK(run("CHECKPOINT"));
+    EXPECT("ALTER TABLE t ALTER COLUMN d TYPE DECIMAL(10,2)", "ALTER TABLE t");
+    EXPECT("INSERT INTO t VALUES (2, 123456.78)", "INSERT 1");
+    EXPECT("ALTER TABLE t ALTER COLUMN d SET DATA TYPE DECIMAL(8,2)", "ERR wider DECIMAL");
+    EXPECT("ALTER TABLE t ALTER COLUMN d TYPE DECIMAL(12,3)", "ERR wider DECIMAL");
+    EXPECT("ALTER TABLE t ALTER COLUMN d TYPE INT64", "ERR wider DECIMAL");
+    EXPECT("ALTER TABLE t ALTER COLUMN id TYPE DECIMAL(12,0)", "ERR wider DECIMAL");
+    const char *want = "id,d\n1,1234.56\n2,123456.78\n";
+    EXPECT("SELECT * FROM v ORDER BY id", want);
+    OK(run("CHECKPOINT"));
+    done(db);
+    db = open_at(dir, false);
+    CHECK(db);
+    if (!db) return;
+    EXPECT("SELECT * FROM v ORDER BY id", want);
+    dumpbuf d = {0};
+    OK(imdb_dump(db, 1000, dumpbuf_write, &d, E));
+    CHECK(d.p && strstr(d.p, "CREATE TABLE t (id INT64 PRIMARY KEY, d DECIMAL(10,2)) RETENTION"));
+    free(d.p);
+    CHECK(verify_db(db) == 0);
+    done(db);
+    db = open_at(dir, true); /* the view re-bound after the widening */
+    CHECK(db);
+    if (!db) return;
+    EXPECT("SELECT * FROM v ORDER BY id", want);
+    done(db);
+    CHECK(audit_dir(dir) == 0);
+}
+
+/* DROP COLUMN's rules: the key (a composite one's columns too), the SUBJECT, an indexed column, a name a view reading
+ * the table holds, a column that is not there; CASCADE is not spelled */
+static void t_alter_drop_rules(void)
+{
+    const char *dir = test_tmpdir();
+    imdb_db *db = open_fresh(dir);
+    CHECK(db);
+    if (!db) return;
+    OK(run("CREATE TABLE t (id INT64 PRIMARY KEY, s INT64 SUBJECT, a INT64, b INT64, c INT64)"));
+    OK(run("CREATE TABLE k (a INT64, b INT64, c INT64, PRIMARY KEY (b, a))"));
+    OK(run("CREATE INDEX ta ON t (a)"));
+    OK(run("CREATE VIEW v AS SELECT id, b FROM t"));
+    OK(run("INSERT INTO t VALUES (1, 1, 1, 1, 1)"));
+    EXPECT("ALTER TABLE t DROP COLUMN id", "ERR primary key");
+    EXPECT("ALTER TABLE k DROP COLUMN a", "ERR primary key");
+    EXPECT("ALTER TABLE t DROP COLUMN s", "ERR SUBJECT");
+    EXPECT("ALTER TABLE t DROP COLUMN a", "ERR index ta names column a");
+    EXPECT("ALTER TABLE t DROP COLUMN b", "ERR view v reads table t and names b");
+    EXPECT("ALTER TABLE t DROP COLUMN nosuch", "ERR no column nosuch");
+    EXPECT("ALTER TABLE t DROP COLUMN c CASCADE", "ERR ");
+    imdb_table *t = imdb_table_by_name(db, "t");
+    CHECK(t && t->hist.nvers == 1);
+    EXPECT("ALTER TABLE t DROP COLUMN c", "ALTER TABLE t");
+    EXPECT("ALTER TABLE t DROP c", "ERR no column c");
+    EXPECT("ALTER TABLE k DROP c", "ALTER TABLE k");
+    OK(run("DROP INDEX ta"));
+    EXPECT("ALTER TABLE t DROP a RESTRICT", "ALTER TABLE t");
+    EXPECT("SELECT * FROM t", "id,s,b\n1,1,1\n");
+    EXPECT("SELECT * FROM v", "id,b\n1,1\n");
+    OK(run("CHECKPOINT"));
+    CHECK(verify_db(db) == 0);
+    done(db);
+    CHECK(audit_dir(dir) == 0);
+}
+
+
+/* a row's reach is a contiguous span: rows older than a SET NOT NULL then DROP NOT NULL reach only the version before
+ * the SET, though the last could hold them again, so their flush builds them there and the newer row apart */
+static void t_alter_reach(void)
+{
+    const char *dir = test_tmpdir();
+    imdb_db *db = open_fresh(dir);
+    CHECK(db);
+    if (!db) return;
+    OK(run("CREATE TABLE t (id INT64 PRIMARY KEY, a INT64)"));
+    OK(run("INSERT INTO t VALUES (1, 10), (2, 20)"));
+    OK(run("ALTER TABLE t ALTER COLUMN a SET NOT NULL"));
+    OK(run("ALTER TABLE t ALTER COLUMN a DROP NOT NULL"));
+    OK(run("INSERT INTO t VALUES (3, NULL)"));
+    OK(run("CHECKPOINT"));
+    imdb_table *t = imdb_table_by_name(db, "t");
+    uint32_t cnt[8];
+    seg_versions(t, cnt, 8);
+    CHECK(t && t->hist.nvers == 3 && t->nseg == 2 && cnt[0] == 1 && cnt[2] == 1);
+    const char *want = "id,a\n1,10\n2,20\n3,\n";
+    EXPECT("SELECT * FROM t ORDER BY id", want);
+    done(db);
+    db = open_at(dir, false);
+    CHECK(db);
+    if (!db) return;
+    EXPECT("SELECT * FROM t ORDER BY id", want);
+    OK(run("COMPACT t")); /* the same cut: the rows of version 1 and the one of version 3 */
+    t = imdb_table_by_name(db, "t");
+    seg_versions(t, cnt, 8);
+    CHECK(t && t->nseg == 2 && cnt[0] == 1 && cnt[2] == 1);
+    EXPECT("SELECT * FROM t ORDER BY id", want);
+    CHECK(verify_db(db) == 0);
+    done(db);
+    CHECK(audit_dir(dir) == 0);
+}
+
 const test_case alter_tests[] = {
     {"alter_differential", t_alter_differential},
     {"alter_rules", t_alter_rules},
@@ -691,5 +1171,13 @@ const test_case alter_tests[] = {
     {"alter_manifest", t_alter_manifest},
     {"alter_default", t_alter_default},
     {"alter_copies", t_alter_copies},
+    {"alter_drop_differential", t_alter_drop_differential}, /* F1 stage 4 */
+    {"alter_drop_add", t_alter_drop_add},
+    {"alter_same_layout", t_alter_same_layout},
+    {"alter_not_null", t_alter_not_null},
+    {"alter_set_default", t_alter_set_default},
+    {"alter_widen", t_alter_widen},
+    {"alter_drop_rules", t_alter_drop_rules},
+    {"alter_reach", t_alter_reach},
 };
 const size_t alter_ntests = sizeof alter_tests / sizeof *alter_tests;

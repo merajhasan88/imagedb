@@ -377,6 +377,23 @@ must_fail "the manifest's schema history differs from the log's" "$AUD" verify "
 echo "   FI: the engine's replay and the auditor refuse the ADD; FJ: VERIFY and the auditor compare the history with the
    log's (the open took the manifest's: its old rows would read 6)"
 
+echo "== FK: a SET NOT NULL of a column a live row holds NULL, and FL a DROP COLUMN of a column an index names (F1 stage
+   4), each signed by the writer"
+PFK=$WORK/fk; "$BIN" init "$PFK" >/dev/null
+"$BIN" sql "$PFK" --nosync -c "CREATE TABLE t (id INT64 PRIMARY KEY, a INT64);" -c "INSERT INTO t VALUES (1, NULL), (2, 2);" \
+  >/dev/null
+"$BIN" verify "$PFK" >/dev/null && "$AUD" verify "$PFK" >/dev/null || fail "the honest directory must verify"
+"$FORGE" index-lie "$PFK" alter-not-null
+must_fail "column a of table t is NULL in a row" "$BIN" verify "$PFK"   # the open's replay refuses it
+must_fail "SET NOT NULL of column a of table t, which a live row holds NULL" "$AUD" verify "$PFK"
+PFL=$WORK/fl; "$BIN" init "$PFL" >/dev/null
+"$BIN" sql "$PFL" --nosync -c "CREATE TABLE t (id INT64 PRIMARY KEY, a INT64);" -c "CREATE INDEX ta ON t (a);" \
+  -c "INSERT INTO t VALUES (1, 1);" >/dev/null
+"$FORGE" index-lie "$PFL" alter-drop-indexed
+must_fail "index ta names column a" "$BIN" verify "$PFL"
+must_fail "DROP COLUMN of a column index ta names" "$AUD" verify "$PFL"
+echo "   the engine's replay and the auditor refuse each: SET NOT NULL by the live rows' payloads, DROP by the indexes"
+
 echo "== Z: a commit naming the other digest algorithm, re-signed by the writer (both ways round); META naming an unknown one"
 for a in 1 2; do # explicit algorithms: under IMDB_DIGEST_ALG=2 make_db's would all be alg 2
   PZ=$WORK/z$a

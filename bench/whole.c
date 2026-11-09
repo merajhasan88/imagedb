@@ -102,7 +102,7 @@ struct eng {
     imdb_session ss;
     const char *dir;
     bool strict, noindex;
-    char plan3[NQ3][96]; /* the path each Q3 statement last ran */
+    char plan3[NQ3][128]; /* the path each Q3 statement last ran (imdb_result.path's size: 96 failed -Wformat-truncation) */
     /* sqlite */
     sqlite3 *lite;
     sqlite3_stmt *s_ins, *s_get, *s_sum, *s_upd, *s_sub, *s_del, *s2[3], *s3[NQ3];

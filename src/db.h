@@ -133,6 +133,11 @@ typedef struct imdb_tcol {
     imdb_value missing;      /* its ADD's DEFAULT, or NULL (a CREATE's columns: NULL, never read) */
     uint8_t *missing_text;   /* a TEXT DEFAULT's own bytes (missing.s points here) */
     uint32_t added, dropped; /* the versions that added it (1: the CREATE) and dropped it (0: live) */
+    int16_t wver;            /* F1 stage 4: the SET DEFAULT version whose atext wdef's TEXT is (-1: the ADD's missing_text) */
+    imdb_value wdef;         /* F1 stage 4: its write default, what an INSERT or COPY leaving it out writes (NULL: none):
+                                the ADD's DEFAULT until a SET or DROP DEFAULT; its TEXT bytes are the ADD's
+                                (missing_text) or a SET DEFAULT version's (imdb_sver.atext), never moved or freed
+                                while the history lives */
 } imdb_tcol;
 
 /* F1: a schema version. Rows begun at or after `since` (up to the next version's) are encoded under s, the columns
@@ -146,6 +151,9 @@ typedef struct imdb_sver {
     uint8_t akind;               /* the ALTER that made it (0: version 1, the CREATE), and the position it named: a
                                     manifest writes the op again from these and s (lake.c) */
     uint16_t apos;
+    uint16_t npos;               /* F1 stage 4: the positions used up to it (an ADD takes position npos) */
+    imdb_value adef;             /* F1 stage 4: SET DEFAULT's value (a manifest writes the op again from it) */
+    uint8_t *atext;              /* its TEXT bytes, the version's own (adef.s and a write default point here) */
 } imdb_sver;
 
 /* F1: a table's schema history: its positions and versions (a table embeds one; so does VERIFY's model, which parses
@@ -155,6 +163,8 @@ typedef struct imdb_schema_hist {
     uint16_t ntcol;
     imdb_sver *vers;               /* by since, nvers of them; the last is the current */
     uint32_t nvers, capvers;
+    uint8_t *staged;               /* F1 stage 4: a SET DEFAULT's TEXT bytes between its prepare and its install (a
+                                      rollback leaves them for the next prepare or the free) */
 } imdb_schema_hist;
 
 typedef struct imdb_table {

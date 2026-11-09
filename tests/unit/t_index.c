@@ -150,10 +150,10 @@ static void t_index_persist(void)
     OK(ex(&s, "CREATE TABLE t (id INT64 PRIMARY KEY, v INT64, s TEXT)"));
     OK(ex(&s, "INSERT INTO t VALUES (1, 10, 'a'), (2, 20, 'b')"));
     OK(ex(&s, "CHECKPOINT"));
-    CHECK(manifest_version(db) == 7);
+    CHECK(manifest_version(db) == IMDB_MANIFEST_VERSION);
     OK(ex(&s, "CREATE INDEX t_v ON t (v)"));
     OK(ex(&s, "CHECKPOINT"));
-    CHECK(manifest_version(db) == 7);
+    CHECK(manifest_version(db) == IMDB_MANIFEST_VERSION);
     OK(ex(&s, "CREATE INDEX t_s ON t (s)")); /* in the log tail only */
     imdb_session_close(&s);
     imdb_close(db);
@@ -173,7 +173,7 @@ static void t_index_persist(void)
     OK(ex(&s, "DROP INDEX t_v"));
     OK(ex(&s, "DROP INDEX t_s"));
     OK(ex(&s, "CHECKPOINT"));
-    CHECK(manifest_version(db) == 7);
+    CHECK(manifest_version(db) == IMDB_MANIFEST_VERSION);
     imdb_session_close(&s);
     OK(verify_db(db));
     imdb_close(db);
@@ -359,7 +359,7 @@ static void t_index_manifest_strict(void)
     OK(ex(&s, "CREATE INDEX u_w ON u (w)"));
     OK(ex(&s, "INSERT INTO t VALUES (1, 10)"));
     OK(ex(&s, "CHECKPOINT"));
-    CHECK(manifest_version(db) == 7);
+    CHECK(manifest_version(db) == IMDB_MANIFEST_VERSION);
     size_t n;
     uint8_t *b = manifest_copy(db, &n);
     CHECK(b && parse_bytes(b, n) == IMDB_OK);
@@ -420,7 +420,7 @@ static void t_index_manifest_strict(void)
     OK(ex(&s, "DROP INDEX t_v"));
     OK(ex(&s, "DROP INDEX t_x"));
     OK(ex(&s, "CHECKPOINT"));
-    CHECK(manifest_version(db) == 7); /* u_w remains, last: u32 1, u8 3, "u_w", u8 0, u8 1, u16, then u64 retention, creation,
+    CHECK(manifest_version(db) == IMDB_MANIFEST_VERSION); /* u_w remains, last: u32 1, u8 3, "u_w", u8 0, u8 1, u16, then u64 retention, creation,
                                        * drop and (F1) u32 0 ALTERs */
     b = manifest_copy(db, &n);
     CHECK(b && n > 20 && parse_bytes(b, n) == IMDB_OK);
@@ -452,7 +452,7 @@ static void t_index_manifest_sections(void)
     OK(ex(&s, "CREATE TABLE t (v INT64, id INT64 PRIMARY KEY, w TEXT)")); /* the key not the first column */
     OK(ex(&s, "INSERT INTO t VALUES (1, 10, 'a')"));
     OK(ex(&s, "CHECKPOINT"));
-    CHECK(manifest_version(db) == 7);
+    CHECK(manifest_version(db) == IMDB_MANIFEST_VERSION);
     size_t n;
     uint8_t *b = manifest_copy(db, &n), *w = malloc(n + 1);
     CHECK(b && w && n > 144 + 156 && parse_bytes(b, n) == IMDB_OK);

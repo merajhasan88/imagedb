@@ -56,12 +56,12 @@ static int retention_text(const imdb_table *t, char *out, size_t n, imdb_err *e)
                      t->s.name, (unsigned long long)us);
 }
 
-/* F1: a column's DEFAULT (an ADD's: what the rows before it read, and what an INSERT leaving the column out writes),
- * NULL when it has none: a CREATE TABLE column has none before F2 */
+/* F1: a column's write default (an INSERT leaving it out writes it: an ADD's DEFAULT, or a SET DEFAULT's), NULL when it
+ * has none: a CREATE TABLE column has none before F2 */
 static const imdb_value *dump_default(const imdb_table *t, uint16_t c)
 {
     if (!t->hist.nvers) return NULL;
-    const imdb_value *v = &t->hist.tcol[t->hist.vers[t->hist.nvers - 1].pos[c]].missing;
+    const imdb_value *v = &t->hist.tcol[t->hist.vers[t->hist.nvers - 1].pos[c]].wdef;
     return v->null ? NULL : v;
 }
 
@@ -88,7 +88,7 @@ static void column_text(dumper *d, const imdb_table *t, const imdb_column *c)
 {
     imdb_buf_printf(&d->b, "%s ", c->name);
     if (c->type == IMDB_T_DECIMAL) imdb_buf_printf(&d->b, "DECIMAL(%u,%u)", c->precision, c->scale);
-    else imdb_buf_put_str(&d->b, imdb_type_name(c->type));
+    else imdb_buf_put_str(&d->b, c->type == IMDB_T_INT64 ? imdb_int_name(c->precision) : imdb_type_name(c->type)); /* F3a */
     if ((c->flags & IMDB_COL_PK) && t->s.npk == 1) imdb_buf_put_str(&d->b, " PRIMARY KEY");
     if (c->flags & IMDB_COL_SUBJECT) imdb_buf_put_str(&d->b, " SUBJECT");
     if (!(c->flags & (IMDB_COL_PK | IMDB_COL_SUBJECT | IMDB_COL_NULLABLE))) imdb_buf_put_str(&d->b, " NOT NULL");
@@ -96,21 +96,16 @@ static void column_text(dumper *d, const imdb_table *t, const imdb_column *c)
 
 /* the table as CREATE TABLE made it: each name where the statement read it (a name the parser took there it takes
  * again: unreserved and folded), the type, PRIMARY KEY, SUBJECT, NOT NULL where a column is neither and not NULL;
- * a key of several columns (F4) as the table's constraint after them, PRIMARY KEY (a, b), in key order; F1: the
- * columns from the first with a DEFAULT on as ALTER TABLE ... ADD after it, in order, each with its DEFAULT (a key
- * column is never added: all are the CREATE's) */
+ * a key of several columns (F4) as the table's constraint after them, PRIMARY KEY (a, b), in key order; F1: every
+ * live column in the CREATE (a dropped one is in no row the dump writes), then each write default as ALTER TABLE ...
+ * ALTER COLUMN ... SET DEFAULT (F1 stage 4: the restore's rows are all written whole, so the value an older row read
+ * for an added column is never needed; CREATE TABLE takes no DEFAULT before F2) */
 static int create_text(dumper *d, const imdb_table *t, imdb_err *e)
 {
     char ret[64];
     if (retention_text(t, ret, sizeof ret, e)) return e->code;
-    uint16_t nc = t->s.ncols; /* F1: the CREATE's columns: those before the first with a DEFAULT */
-    for (uint16_t i = 0; i < t->s.ncols; i++)
-        if (dump_default(t, i)) {
-            nc = i;
-            break;
-        }
     imdb_buf_printf(&d->b, "CREATE TABLE %s (", t->s.name);
-    for (uint16_t i = 0; i < nc; i++) {
+    for (uint16_t i = 0; i < t->s.ncols; i++) {
         if (i) imdb_buf_put_str(&d->b, ", ");
         column_text(d, t, &t->s.cols[i]);
     }
@@ -120,14 +115,11 @@ static int create_text(dumper *d, const imdb_table *t, imdb_err *e)
         imdb_buf_put_str(&d->b, ")");
     }
     imdb_buf_printf(&d->b, ") RETENTION %s;\n", ret);
-    for (uint16_t i = nc; i < t->s.ncols; i++) { /* F1 */
-        imdb_buf_printf(&d->b, "ALTER TABLE %s ADD ", t->s.name);
-        column_text(d, t, &t->s.cols[i]);
+    for (uint16_t i = 0; i < t->s.ncols; i++) {
         const imdb_value *dv = dump_default(t, i);
-        if (dv) {
-            imdb_buf_put_str(&d->b, " DEFAULT ");
-            if (literal_text(d, dv, e)) return e->code;
-        }
+        if (!dv) continue;
+        imdb_buf_printf(&d->b, "ALTER TABLE %s ALTER COLUMN %s SET DEFAULT ", t->s.name, t->s.cols[i].name);
+        if (literal_text(d, dv, e)) return e->code;
         imdb_buf_put_str(&d->b, ";\n");
     }
     return put(d, e);

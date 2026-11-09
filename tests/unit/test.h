@@ -99,6 +99,7 @@ TESTS(abind) /* P2 S7b */
 TESTS(qmem)
 TESTS(ckey) /* P2 F4 */
 TESTS(alter) /* P2 F1 */
+TESTS(intw) /* F3a: SMALLINT and INTEGER */
 TESTS(tz) /* P2: time zones */
 TESTS(tzsql) /* P2: time zones through the engine */
 

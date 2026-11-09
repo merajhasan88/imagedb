@@ -260,9 +260,9 @@ typedef struct vnewtab {     /* a table created inside the batch */
     uint32_t frame, op;
 } vnewtab;
 
-typedef struct valter {     /* F1: a table's schema after an ALTER inside the batch, for the rows after it */
+typedef struct valter {     /* F1: a table's version after an ALTER inside the batch, for the rows after it */
     uint32_t table, frame;
-    imdb_schema s;
+    imdb_sver v;
 } valter;
 
 typedef struct vbatch {
@@ -333,10 +333,32 @@ static void stage_sigs(void *ctx, size_t g)
     for (size_t i = 64 * g; i < b->nf && i < 64 * g + 64; i++) b->f[i].sig_ok = b->f[i].decoded && b->f[i].c.sig_ok;
 }
 
+/* F1 stage 4: the version the rows of table at (frame, op) are encoded under, its positions too (an ALTER's position
+ * names a column through them); a table created in the batch is its version 1, made in tmp */
+static const imdb_sver *batch_ver(const vbatch *b, uint32_t table, uint32_t frame, uint32_t op, imdb_sver *tmp)
+{
+    for (uint32_t k = b->nalt; k-- > 0;) /* the last ALTER before this frame (one is alone in its commit) */
+        if (b->alt[k].table == table && b->alt[k].frame < frame) return &b->alt[k].v;
+    if (table < b->nt0) {
+        const imdb_schema_hist *h = &b->x->t[table].hist;
+        return h->nvers ? &h->vers[h->nvers - 1] : NULL;
+    }
+    uint32_t k = table - b->nt0;
+    if (k >= b->nnew) return NULL;
+    const vnewtab *n = &b->nt_new[k];
+    if (!(n->frame < frame || (n->frame == frame && n->op < op))) return NULL;
+    memset(tmp, 0, sizeof *tmp);
+    tmp->s = *n->s;
+    memset(tmp->at, -1, sizeof tmp->at);
+    for (uint16_t c = 0; c < n->s->ncols; c++) tmp->pos[c] = c, tmp->at[c] = (int8_t)c;
+    tmp->npos = n->s->ncols;
+    return tmp;
+}
+
 static const imdb_schema *batch_schema(const vbatch *b, uint32_t table, uint32_t frame, uint32_t op)
 {
     for (uint32_t k = b->nalt; k-- > 0;) /* F1: the last ALTER before this frame (one is alone in its commit) */
-        if (b->alt[k].table == table && b->alt[k].frame < frame) return &b->alt[k].s;
+        if (b->alt[k].table == table && b->alt[k].frame < frame) return &b->alt[k].v.s;
     if (table < b->nt0) return &b->x->t[table].s;
     uint32_t k = table - b->nt0;
     if (k >= b->nnew) return NULL;
@@ -712,28 +734,39 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
             break;
         }
         case IMDB_OP_ALTER_TABLE: { /* F1: the rules the model decides; the next schema for the rows after it */
-            imdb_schema ns;
+            imdb_sver ns;
             imdb_err e2 = {0};
-            if (o->akind != IMDB_ALTER_ADD_COLUMN && v_named(x, IMDB_VIEWDEP_TABLE, o->table))
+            const imdb_sver *cur = &t->hist.vers[t->hist.nvers - 1];
+            if (t->hist.nvers >= IMDB_MAX_SCHEMA_VERSIONS || imdb_sver_next(&t->hist, cur, o, &ns, &e2))
+                return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: ALTER TABLE %s: %s", (unsigned long long)seq,
+                                 t->s.name, t->hist.nvers >= IMDB_MAX_SCHEMA_VERSIONS ? "too many schema versions" : e2.msg);
+            bool ren = o->akind == IMDB_ALTER_RENAME_COLUMN || o->akind == IMDB_ALTER_RENAME_TABLE;
+            if (ren && v_named(x, IMDB_VIEWDEP_TABLE, o->table))
                 return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: a rename of table %s, which a live view names",
                                  (unsigned long long)seq, t->s.name);
-            if (o->akind == IMDB_ALTER_ADD_COLUMN) { /* a view reading the table that holds the name (db.c's rule) */
-                const char *vn = NULL;
-                if (v_names_col(x, o->table, o->acol.name, &vn, e)) return e->code;
+            if (o->akind == IMDB_ALTER_ADD_COLUMN || o->akind == IMDB_ALTER_DROP_COLUMN) { /* db.c's rule on the views */
+                const char *vn = NULL, *cn = o->akind == IMDB_ALTER_ADD_COLUMN ? o->acol.name : t->s.cols[cur->at[o->apos]].name;
+                if (v_names_col(x, o->table, cn, &vn, e)) return e->code;
                 if (vn)
-                    return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: ADD COLUMN %s of table %s, which view %s reads "
-                                     "and names", (unsigned long long)seq, o->acol.name, t->s.name, vn);
+                    return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: %s COLUMN %s of table %s, which view %s reads "
+                                     "and names", (unsigned long long)seq, o->akind == IMDB_ALTER_ADD_COLUMN ? "ADD" : "DROP",
+                                     cn, t->s.name, vn);
             }
+            for (uint32_t q = 0; o->akind == IMDB_ALTER_DROP_COLUMN && q < t->nidx; q++) /* F1 stage 4: no index on it */
+                for (uint8_t j = 0; j < t->idx[q].d.ncols; j++)
+                    if (t->idx[q].d.cols[j] == (uint16_t)cur->at[o->apos])
+                        return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: DROP COLUMN of a column index %s names",
+                                         (unsigned long long)seq, t->idx[q].d.name);
             if (o->akind == IMDB_ALTER_RENAME_TABLE && v_name_live(x, o->aname))
                 return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: RENAME TO a live table's or view's name",
                                  (unsigned long long)seq);
-            if (imdb_alter_schema(&t->s, o, &ns, &e2))
-                return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: ALTER TABLE %s: %s", (unsigned long long)seq,
-                                 t->s.name, e2.msg);
+            /* SET NOT NULL's rule on the live rows needs their payloads, which this model does not keep: replay and
+             * the auditor check it (as they do a row's key) */
             imdb_op oc = *o; /* the engine's prepare re-points a TEXT DEFAULT at its own copy */
             if (imdb_hist_prepare(&t->hist, &oc, e)) return e->code;
             imdb_hist_install(&t->hist, &oc, seq);
-            t->s = ns;
+            imdb_index_remap(t->idx, t->nidx, &t->hist.vers[t->hist.nvers - 2], &t->hist.vers[t->hist.nvers - 1]);
+            t->s = t->hist.vers[t->hist.nvers - 1].s;
             break;
         }
         case IMDB_OP_DROP_TABLE: /* live, not kept FOREVER (its commit's op 16 first); every live version ends here */
@@ -976,10 +1009,10 @@ static int run_batch(vctx *x, vbatch *b, imdb_lthash *states, uint64_t seg_first
         for (uint32_t k = 0; k < f->c.nops; k++) {
             const imdb_op *o = &f->c.ops[k];
             if (o->code == IMDB_OP_ALTER_TABLE) { /* F1: its schema for the rows after it in the batch */
-                const imdb_schema *prev = batch_schema(b, o->table, (uint32_t)i, k);
-                imdb_schema next;
+                imdb_sver tmp, next;
+                const imdb_sver *prev = batch_ver(b, o->table, (uint32_t)i, k, &tmp);
                 imdb_err e2 = {0};
-                if (!prev || imdb_alter_schema(prev, o, &next, &e2)) { /* the ordered stage reports it */
+                if (!prev || imdb_sver_next(NULL, prev, o, &next, &e2)) { /* the ordered stage reports it */
                     stop = 1;
                     break;
                 }
@@ -988,7 +1021,7 @@ static int run_batch(vctx *x, vbatch *b, imdb_lthash *states, uint64_t seg_first
                 b->alt = na;
                 b->alt[b->nalt].table = o->table;
                 b->alt[b->nalt].frame = (uint32_t)i;
-                b->alt[b->nalt++].s = next;
+                b->alt[b->nalt++].v = next;
                 continue;
             }
             if (o->code != IMDB_OP_CREATE_TABLE) continue;
@@ -1314,6 +1347,14 @@ static int same_schema(const imdb_schema *a, const imdb_schema *b)
 
 /* F1: a manifest's schema history is the log's first n versions: each at its commit, by its hash and the ALTER that made
  * it, and every position they added with the missing value the log gave it */
+/* two values alike in every bit a decoder reads */
+static bool val_eq(const imdb_value *a, const imdb_value *b)
+{
+    if (a->null != b->null || a->type != b->type || a->scale != b->scale) return false;
+    if (a->null) return true;
+    return a->type == IMDB_T_TEXT ? a->len == b->len && (!a->len || memcmp(a->s, b->s, a->len) == 0) : a->i == b->i;
+}
+
 static bool same_hist(const imdb_schema_hist *m, const imdb_schema_hist *x, uint32_t n)
 {
     if (m->nvers != n || n > x->nvers || !n) return false;
@@ -1321,16 +1362,15 @@ static bool same_hist(const imdb_schema_hist *m, const imdb_schema_hist *x, uint
         const imdb_sver *a = &m->vers[k], *b = &x->vers[k];
         if (a->since != b->since || memcmp(a->hash, b->hash, 32) != 0 || a->akind != b->akind || a->apos != b->apos)
             return false;
+        if (a->akind == IMDB_ALTER_SET_DEFAULT && !val_eq(&a->adef, &b->adef)) return false; /* no hash covers it */
     }
     uint16_t np = 0; /* the positions the first n versions have: those added at or before version n */
     while (np < x->ntcol && x->tcol[np].added <= n) np++;
     if (m->ntcol != np) return false;
     for (uint16_t p = 0; p < np; p++) {
-        const imdb_value *a = &m->tcol[p].missing, *b = &x->tcol[p].missing;
-        if (m->tcol[p].added != x->tcol[p].added || a->null != b->null || a->type != b->type || a->scale != b->scale)
-            return false;
-        if (a->null) continue;
-        if (a->type == IMDB_T_TEXT ? a->len != b->len || (a->len && memcmp(a->s, b->s, a->len) != 0) : a->i != b->i)
+        uint32_t xd = x->tcol[p].dropped <= n ? x->tcol[p].dropped : 0; /* F1 stage 4: dropped by version n, or not */
+        if (m->tcol[p].added != x->tcol[p].added || m->tcol[p].dropped != xd ||
+            !val_eq(&m->tcol[p].missing, &x->tcol[p].missing))
             return false;
     }
     return true;

@@ -88,6 +88,15 @@ const char *imdb_type_name(uint8_t t)
 
 bool imdb_type_is_int(uint8_t t) { return t != IMDB_T_TEXT; }
 
+bool imdb_int_width_ok(uint8_t width) { return width == 0 || width == 16 || width == 32; }
+
+bool imdb_int_fits(uint8_t width, int64_t v)
+{
+    return width == 16 ? v >= INT16_MIN && v <= INT16_MAX : width == 32 ? v >= INT32_MIN && v <= INT32_MAX : true;
+}
+
+const char *imdb_int_name(uint8_t width) { return width == 16 ? "SMALLINT" : width == 32 ? "INTEGER" : "INT64"; }
+
 /* ---- FLOAT64 ------------------------------------------------------------- */
 
 /* Negative doubles flip their 63 magnitude bits, so they order below the
@@ -160,7 +169,10 @@ int imdb_schema_check(const imdb_schema *s, imdb_err *e)
                 return imdb_fail(e, IMDB_ERR_INVALID, "duplicate column name %s", c->name);
         if (c->type < IMDB_T_INT64 || c->type > IMDB_T_LAST)
             return imdb_fail(e, IMDB_ERR_INVALID, "column %s: unknown type", c->name);
-        if (c->type == IMDB_T_DECIMAL) {
+        if (c->type == IMDB_T_INT64) { /* F3a: SMALLINT 16, INTEGER 32, INT64 (BIGINT) 0: the one spelling of each */
+            if (!imdb_int_width_ok(c->precision) || c->scale)
+                return imdb_fail(e, IMDB_ERR_INVALID, "column %s: an integer of 16, 32 or 64 bits", c->name);
+        } else if (c->type == IMDB_T_DECIMAL) {
             if (c->precision < 1 || c->precision > 18 || c->scale > c->precision)
                 return imdb_fail(e, IMDB_ERR_INVALID, "column %s: DECIMAL(p,s) needs 1<=p<=18, 0<=s<=p", c->name);
         } else if (c->precision || c->scale) {
@@ -284,7 +296,10 @@ int imdb_value_check(const imdb_column *c, const imdb_value *v, imdb_err *e)
         return (c->flags & IMDB_COL_NULLABLE) ? IMDB_OK
                                               : imdb_fail(e, IMDB_ERR_CONSTRAINT, "column %s is NOT NULL", c->name);
     switch (c->type) {
-    case IMDB_T_INT64: return IMDB_OK;
+    case IMDB_T_INT64: /* F3a: SMALLINT's and INTEGER's ranges, the values INT64 everywhere else */
+        if (!imdb_int_fits(c->precision, v->i))
+            return imdb_fail(e, IMDB_ERR_LIMIT, "column %s: a value out of %s's range", c->name, imdb_int_name(c->precision));
+        return IMDB_OK;
     case IMDB_T_DECIMAL: {
         if (v->scale != c->scale) return imdb_fail(e, IMDB_ERR_INVALID, "column %s: decimal scale mismatch", c->name);
         int64_t lim = imdb_pow10(c->precision) - 1;

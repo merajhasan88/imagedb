@@ -376,7 +376,7 @@ static bool g_expr = true; /* --no-expr: 1a's generator, draw for draw */
 static bool g_fns = true;  /* --no-fns: the generator before P2 S1, draw for draw */
 static bool g_views = true; /* --no-views: the generator before P2 S7's views, draw for draw */
 static bool g_ckey; /* P2 F4, --ckey: u's key is (tid, id), every dialect's; ids stay unique, tid never NULL or SET */
-static bool g_alter; /* P2 F1, --alter: t's last five columns added after its first rows (alter_add) */
+static bool g_alter; /* P2 F1, --alter: t's last five columns added after its first rows and zz dropped (alter_add) */
 /* A seed names the same statements only within one stage: each P2 stage (S1 to S4) adds forms to the default
  * generator's draws, so seed N's statements differ from the stage before's (a mismatch is reproduced on its own
  * build); --no-fns and --no-expr reproduce the generators before P2 S1 and before 1a. */
@@ -657,13 +657,25 @@ static bool ma_like_tree(const stmt *q, int k)
     return ma_like_tree(q, n->l) || ma_like_tree(q, n->r) || ma_like_tree(q, n->x3); /* height-bounded */
 }
 
+/* F3a: an integer column's width in bits (t.g SMALLINT, u.v INTEGER, every other BIGINT) */
+static int int_bits(int tab, int col) { return !tab && col == 1 ? 16 : tab && col == 2 ? 32 : 64; }
+
 /* MariaDB 12.3.3: a DECIMAL remainder of a negative value is -0.00, which compares below 0 and unequal to it
- * (-5.37 % 0.01 < 0 is true; reproduced alone, 2026-11-04; its * 0 and negation give 0.00): no DECIMAL % for it */
+ * (-5.37 % 0.01 < 0 is true; reproduced alone, 2026-11-04; its * 0 and negation give 0.00): no DECIMAL % for it.
+ * And (D6, 2026-11-08) a column x [NOT] IN (SELECT y ...) whose value is past the range of y's narrower column ignores
+ * a NULL among y's values: IN is false and NOT IN true where both are NULL (v = 100000 against a SMALLINT g holding a
+ * NULL, with and without an index; a literal 100000 and an INT y are right; reproduced alone): no IN of a subquery
+ * over a narrower column for it, unless x is a column at most that wide */
 static bool ma_ok(const stmt *q, int k)
 {
     if (!k) return true;
     const xnode *n = XN(q, k);
     if (n->ty == CT_DEC && (n->op == X_MOD || (n->op == X_FN && n->fn == XF_MOD))) return false;
+    if (n->op == X_IN && n->r && XN(q, n->r)->op == X_SUBQ && XN(q, n->r)->ty == CT_INT) {
+        const xnode *s = XN(q, n->r), *x = XN(q, n->l);
+        int w = int_bits(s->tab, s->col);
+        if (w < 64 && !(x->op == X_COL && x->ty == CT_INT && int_bits(x->tab, x->col) <= w)) return false;
+    }
     return ma_ok(q, n->l) && ma_ok(q, n->r) && ma_ok(q, n->x3);
 }
 
@@ -2833,8 +2845,9 @@ static void print_rec(sb *b, int d, const stmt *q)
 {
     const char *rk = d == D_MS ? "WITH" : "WITH RECURSIVE", *op = q->rall ? "UNION ALL" : "UNION";
     if (q->rec == 3)
-        sb_printf(b, "%s r(x) AS (SELECT g FROM %s WHERE g IS NOT NULL %s SELECT x + 1 FROM r WHERE x < 6) SELECT COUNT(*), "
-                     "SUM(x) FROM r", rk, src(0), op);
+        sb_printf(b, "%s r(x) AS (SELECT %s FROM %s WHERE g IS NOT NULL %s SELECT x + 1 FROM r WHERE x < 6) SELECT "
+                     "COUNT(*), SUM(x) FROM r", rk, d == D_PG || d == D_MS ? "CAST(g AS BIGINT)" : "g", src(0), op); /* F3a: g a
+                     * SMALLINT, x + 1 an integer: PostgreSQL and SQL Server want the two parts' types alike */
     else if (q->rec == 1)
         sb_printf(b, "%s n(i) AS (SELECT 1 %s SELECT i + 1 FROM n WHERE i < %d) SELECT COUNT(*), SUM(i) FROM n", rk, op, q->rk);
     else
@@ -3255,14 +3268,18 @@ static const char *const ALT_TY[5][ND] = {
     {"BOOL", "INTEGER", "BOOLEAN", "BOOLEAN", "BOOLEAN", "BIT"},
     {"TIMESTAMP", "INTEGER", "TIMESTAMP(6)", "DATETIME(6)", "DATETIME(6)", "DATETIME2(6)"}};
 
+/* --alter: t's first columns (id, g, a, x), after F1 stage 4's zz (an integer, before the key, so every column after it
+ * moves when it is dropped: alter_add) */
 static const char *ddl_alter(int d, const char *whole)
 {
     static char b[ND][600];
     const char *cut = strstr(whole, ", d ");
-    if (!cut || (size_t)(cut - whole) + 2 > sizeof b[d]) exit(2);
-    memcpy(b[d], whole, (size_t)(cut - whole));
-    b[d][cut - whole] = ')';
-    b[d][cut - whole + 1] = 0;
+    static const char *const ZZ[ND] = {"INT64", "INTEGER", "BIGINT", "BIGINT", "BIGINT", "BIGINT"};
+    const char *open = strchr(whole, '(');
+    if (!cut || !open || open > cut) exit(2);
+    int n = snprintf(b[d], sizeof b[d], "%.*szz %s, %.*s)", (int)(open - whole + 1), whole, ZZ[d], (int)(cut - open - 1),
+                     open + 1);
+    if (n < 0 || (size_t)n >= sizeof b[d]) exit(2);
     return b[d];
 }
 
@@ -3284,37 +3301,37 @@ static const char *tz_ddl(int d, const char *s)
 static const char *ddl(int d, int tab)
 {
     static const char *const T[ND] = {
-        "CREATE TABLE t (id INT64 PRIMARY KEY, g INT64, a INT64, x INT64, d DECIMAL(12,2), f FLOAT64, s TEXT, k BOOL, "
+        "CREATE TABLE t (id INT64 PRIMARY KEY, g SMALLINT, a INT64, x INT64, d DECIMAL(12,2), f FLOAT64, s TEXT, k BOOL, "
         "ts TIMESTAMP)",
         "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, a INTEGER, x INTEGER, d INTEGER, f REAL, s TEXT, "
         "k INTEGER, ts INTEGER)",
-        "CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT, a BIGINT, x BIGINT, d NUMERIC(12,2), f DOUBLE PRECISION, "
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, g SMALLINT, a BIGINT, x BIGINT, d NUMERIC(12,2), f DOUBLE PRECISION, "
         "s TEXT COLLATE \"C\", k BOOLEAN, ts TIMESTAMP(6))",
-        "CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT, a BIGINT, x BIGINT, d DECIMAL(12,2), f DOUBLE, "
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, g SMALLINT, a BIGINT, x BIGINT, d DECIMAL(12,2), f DOUBLE, "
         "s VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin, k BOOLEAN, ts DATETIME(6))",
-        "CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT, a BIGINT, x BIGINT, d DECIMAL(12,2), f DOUBLE, "
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, g SMALLINT, a BIGINT, x BIGINT, d DECIMAL(12,2), f DOUBLE, "
         "s VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_nopad_bin, k BOOLEAN, ts DATETIME(6))",
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, g BIGINT, a BIGINT, x BIGINT, d DECIMAL(12,2), f FLOAT(53), "
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, g SMALLINT, a BIGINT, x BIGINT, d DECIMAL(12,2), f FLOAT(53), "
         "s VARCHAR(255) COLLATE Latin1_General_100_BIN2_UTF8, k BIT, ts DATETIME2(6))"};
     static const char *const UCK[ND] = { /* --ckey (P2 F4) */
-        "CREATE TABLE u (id INT64 NOT NULL, tid INT64 NOT NULL, v INT64, s TEXT, PRIMARY KEY (tid, id))",
+        "CREATE TABLE u (id INT64 NOT NULL, tid INT64 NOT NULL, v INTEGER, s TEXT, PRIMARY KEY (tid, id))",
         "CREATE TABLE u (id INTEGER NOT NULL, tid INTEGER NOT NULL, v INTEGER, s TEXT, PRIMARY KEY (tid, id))",
-        "CREATE TABLE u (id BIGINT NOT NULL, tid BIGINT NOT NULL, v BIGINT, s TEXT COLLATE \"C\", PRIMARY KEY (tid, id))",
-        "CREATE TABLE u (id BIGINT NOT NULL, tid BIGINT NOT NULL, v BIGINT, s VARCHAR(255) CHARACTER SET utf8mb4 COLLATE "
+        "CREATE TABLE u (id BIGINT NOT NULL, tid BIGINT NOT NULL, v INTEGER, s TEXT COLLATE \"C\", PRIMARY KEY (tid, id))",
+        "CREATE TABLE u (id BIGINT NOT NULL, tid BIGINT NOT NULL, v INT, s VARCHAR(255) CHARACTER SET utf8mb4 COLLATE "
         "utf8mb4_0900_bin, PRIMARY KEY (tid, id))",
-        "CREATE TABLE u (id BIGINT NOT NULL, tid BIGINT NOT NULL, v BIGINT, s VARCHAR(255) CHARACTER SET utf8mb4 COLLATE "
+        "CREATE TABLE u (id BIGINT NOT NULL, tid BIGINT NOT NULL, v INT, s VARCHAR(255) CHARACTER SET utf8mb4 COLLATE "
         "utf8mb4_nopad_bin, PRIMARY KEY (tid, id))",
-        "CREATE TABLE u (id BIGINT NOT NULL, tid BIGINT NOT NULL, v BIGINT, s VARCHAR(255) COLLATE "
+        "CREATE TABLE u (id BIGINT NOT NULL, tid BIGINT NOT NULL, v INT, s VARCHAR(255) COLLATE "
         "Latin1_General_100_BIN2_UTF8, PRIMARY KEY (tid, id))"};
     static const char *const U[ND] = {
-        "CREATE TABLE u (id INT64 PRIMARY KEY, tid INT64, v INT64, s TEXT)",
+        "CREATE TABLE u (id INT64 PRIMARY KEY, tid INT64, v INTEGER, s TEXT)",
         "CREATE TABLE u (id INTEGER PRIMARY KEY, tid INTEGER, v INTEGER, s TEXT)",
-        "CREATE TABLE u (id BIGINT PRIMARY KEY, tid BIGINT, v BIGINT, s TEXT COLLATE \"C\")",
-        "CREATE TABLE u (id BIGINT PRIMARY KEY, tid BIGINT, v BIGINT, s VARCHAR(255) CHARACTER SET utf8mb4 COLLATE "
+        "CREATE TABLE u (id BIGINT PRIMARY KEY, tid BIGINT, v INTEGER, s TEXT COLLATE \"C\")",
+        "CREATE TABLE u (id BIGINT PRIMARY KEY, tid BIGINT, v INT, s VARCHAR(255) CHARACTER SET utf8mb4 COLLATE "
         "utf8mb4_0900_bin)",
-        "CREATE TABLE u (id BIGINT PRIMARY KEY, tid BIGINT, v BIGINT, s VARCHAR(255) CHARACTER SET utf8mb4 COLLATE "
+        "CREATE TABLE u (id BIGINT PRIMARY KEY, tid BIGINT, v INT, s VARCHAR(255) CHARACTER SET utf8mb4 COLLATE "
         "utf8mb4_nopad_bin)",
-        "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, tid BIGINT, v BIGINT, s VARCHAR(255) COLLATE "
+        "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, tid BIGINT, v INT, s VARCHAR(255) COLLATE "
         "Latin1_General_100_BIN2_UTF8)"};
     return tab ? (g_ckey ? UCK[d] : U[d]) : g_alter ? ddl_alter(d, T[d]) : tz_ddl(d, T[d]);
 }
@@ -4542,9 +4559,10 @@ static void alter_first_rows(const stmt *q)
     for (int d = 0; d < ND; d++) {
         if (!g_eng[d].on) continue;
         sb b = {0};
-        sb_str(&b, "INSERT INTO t (id, g, a, x) VALUES ");
+        sb_str(&b, "INSERT INTO t (zz, id, g, a, x) VALUES "); /* F1 stage 4: zz from the id, no draw of its own */
         for (int r = 0; r < q->nrow; r++) {
             sb_str(&b, r ? ", (" : "(");
+            sb_printf(&b, "%lld, ", (long long)(q->row[r][0].i * 7 + 3));
             for (int c = 0; c < 4; c++) {
                 if (c) sb_str(&b, ", ");
                 put_lit(&b, d, TC[c].t, &q->row[r][c]);
@@ -4566,6 +4584,7 @@ static void alter_add(void)
     dv[3].null = dv[4].null = true;
     for (int d = 0; d < ND; d++) {
         if (!g_eng[d].on) continue;
+        must(&g_eng[d], "ALTER TABLE t DROP COLUMN zz"); /* F1 stage 4: its values stay in imagedb's rows and segments */
         for (int k = 0; k < 5; k++) {
             sb b = {0};
             sb_printf(&b, "ALTER TABLE t ADD %s%s %s", d == D_MS ? "" : "COLUMN ", TC[4 + k].name,
@@ -4587,6 +4606,9 @@ static void alter_add(void)
     must(e, "ALTER TABLE t RENAME TO t_was");
     must(e, "ALTER TABLE t_was RENAME TO t");
     must(e, "ALTER TABLE t RENAME COLUMN x_was TO x");
+    must(e, "ALTER TABLE t ALTER COLUMN s SET DEFAULT 'zz'"); /* F1 stage 4: three versions, the write default 'q' again */
+    must(e, "ALTER TABLE t ALTER COLUMN s DROP DEFAULT");
+    must(e, "ALTER TABLE t ALTER COLUMN s SET DEFAULT 'q'");
 }
 
 static int run_seed(unsigned seed, int steps)

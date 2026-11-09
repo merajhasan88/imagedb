@@ -11,6 +11,16 @@ static const uint8_t kGenesisTag[8] = {'I', 'M', 'D', 'B', 'G', 'E', 'N', '1'};
 /* op 14's definition by its own rules: known flags, 1..IMDB_MAX_INDEX_COLS distinct columns (that
  * each column exists is the table's to say, at replay) */
 
+/* F1: a column's type as op 22 logs it (an ADD's column, SET DEFAULT's and SET TYPE's): a known tag, a DECIMAL's
+ * precision 1 to 18 and a scale within it, no precision or scale for another type */
+static bool alter_type_ok(const imdb_column *c)
+{
+    if (c->type < IMDB_T_INT64 || c->type > IMDB_T_LAST) return false;
+    if (c->type == IMDB_T_DECIMAL) return c->precision >= 1 && c->precision <= 18 && c->scale <= c->precision;
+    if (c->type == IMDB_T_INT64) return imdb_int_width_ok(c->precision) && !c->scale; /* F3a: SMALLINT, INTEGER, INT64 */
+    return !c->precision && !c->scale;
+}
+
 /* F1: an added column as op 22 logs it, and its DEFAULT in the row encoding of one value */
 static bool alter_col_ok(const imdb_column *c)
 {
@@ -18,18 +28,18 @@ static bool alter_col_ok(const imdb_column *c)
     if (!imdb_ident_valid(c->name, nl) || c->name[0] == '_') return false;
     for (size_t i = 0; i < nl; i++)
         if (c->name[i] >= 'A' && c->name[i] <= 'Z') return false;
-    if (c->type < IMDB_T_INT64 || c->type > IMDB_T_LAST || (c->flags & ~IMDB_COL_NULLABLE)) return false;
-    if (c->type == IMDB_T_DECIMAL) return c->precision >= 1 && c->precision <= 18 && c->scale <= c->precision;
-    return !c->precision && !c->scale;
+    return !(c->flags & ~IMDB_COL_NULLABLE) && alter_type_ok(c);
 }
 
-static void put_default(imdb_buf *b, const imdb_column *c, const imdb_value *v)
+/* F1 stage 4: SET DEFAULT's and SET TYPE's column, a type alone: no name, no flags */
+static bool alter_bare_ok(const imdb_column *c)
 {
-    if (v->null) {
-        imdb_buf_put_u8(b, 0);
-        return;
-    }
-    imdb_buf_put_u8(b, 1);
+    return !c->name[0] && !c->flags && alter_type_ok(c);
+}
+
+/* a value of column c, not NULL, in the row encoding */
+static void put_value(imdb_buf *b, const imdb_column *c, const imdb_value *v)
+{
     if (c->type == IMDB_T_TEXT) {
         imdb_buf_put_u32(b, v->len);
         imdb_buf_put(b, v->s, v->len);
@@ -40,17 +50,21 @@ static void put_default(imdb_buf *b, const imdb_column *c, const imdb_value *v)
     }
 }
 
-static int get_default(imdb_rd *r, const imdb_column *c, imdb_value *v, const char *what, imdb_err *e)
+static void put_default(imdb_buf *b, const imdb_column *c, const imdb_value *v)
+{
+    if (v->null) {
+        imdb_buf_put_u8(b, 0);
+        return;
+    }
+    imdb_buf_put_u8(b, 1);
+    put_value(b, c, v);
+}
+
+static int get_value(imdb_rd *r, const imdb_column *c, imdb_value *v, const char *what, imdb_err *e)
 {
     memset(v, 0, sizeof *v);
     v->type = c->type;
     v->scale = c->scale;
-    uint8_t has = imdb_rd_u8(r);
-    if (r->err || has > 1) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad DEFAULT", what);
-    if (!has) {
-        v->null = true;
-        return IMDB_OK;
-    }
     if (c->type == IMDB_T_TEXT) {
         v->len = imdb_rd_u32(r);
         if (r->err || v->len > IMDB_MAX_TEXT) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad DEFAULT", what);
@@ -65,6 +79,20 @@ static int get_default(imdb_rd *r, const imdb_column *c, imdb_value *v, const ch
     return IMDB_OK;
 }
 
+static int get_default(imdb_rd *r, const imdb_column *c, imdb_value *v, const char *what, imdb_err *e)
+{
+    memset(v, 0, sizeof *v);
+    v->type = c->type;
+    v->scale = c->scale;
+    uint8_t has = imdb_rd_u8(r);
+    if (r->err || has > 1) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad DEFAULT", what);
+    if (!has) {
+        v->null = true;
+        return IMDB_OK;
+    }
+    return get_value(r, c, v, what, e);
+}
+
 int imdb_alter_put(imdb_buf *b, const imdb_op *o)
 {
     size_t nl = o->aname ? strnlen(o->aname, IMDB_MAX_IDENT + 1) : 0;
@@ -74,12 +102,16 @@ int imdb_alter_put(imdb_buf *b, const imdb_op *o)
         (o->akind == IMDB_ALTER_ADD_COLUMN &&
          (!alter_col_ok(&o->acol) || (!(o->acol.flags & IMDB_COL_NULLABLE) && o->adef.null) ||
           (!o->adef.null && imdb_value_check(&o->acol, &o->adef, &e2)))) ||
-        (o->akind < IMDB_ALTER_ADD_COLUMN || o->akind > IMDB_ALTER_RENAME_TABLE)) {
+        (o->akind == IMDB_ALTER_SET_DEFAULT &&
+         (!alter_bare_ok(&o->acol) || o->adef.null || imdb_value_check(&o->acol, &o->adef, &e2))) ||
+        (o->akind == IMDB_ALTER_SET_TYPE && !alter_bare_ok(&o->acol)) ||
+        (o->akind < IMDB_ALTER_ADD_COLUMN || o->akind > IMDB_ALTER_LAST)) {
         b->err = IMDB_ERR_INVALID;
         return IMDB_ERR_INVALID;
     }
     imdb_buf_put_u8(b, o->akind);
-    if (o->akind == IMDB_ALTER_ADD_COLUMN) {
+    switch (o->akind) {
+    case IMDB_ALTER_ADD_COLUMN: {
         size_t cl = strlen(o->acol.name);
         imdb_buf_put_u8(b, (uint8_t)cl);
         imdb_buf_put(b, o->acol.name, cl);
@@ -90,7 +122,20 @@ int imdb_alter_put(imdb_buf *b, const imdb_op *o)
         put_default(b, &o->acol, &o->adef);
         return IMDB_OK;
     }
-    if (o->akind == IMDB_ALTER_RENAME_COLUMN) imdb_buf_put_u16(b, o->apos);
+    case IMDB_ALTER_RENAME_TABLE:
+        break;
+    case IMDB_ALTER_SET_DEFAULT:
+    case IMDB_ALTER_SET_TYPE:
+        imdb_buf_put_u16(b, o->apos);
+        imdb_buf_put_u8(b, o->acol.type);
+        imdb_buf_put_u8(b, o->acol.precision);
+        imdb_buf_put_u8(b, o->acol.scale);
+        if (o->akind == IMDB_ALTER_SET_DEFAULT) put_value(b, &o->acol, &o->adef);
+        return IMDB_OK;
+    default:
+        imdb_buf_put_u16(b, o->apos);
+        if (o->akind != IMDB_ALTER_RENAME_COLUMN) return IMDB_OK;
+    }
     imdb_buf_put_u8(b, (uint8_t)nl);
     imdb_buf_put(b, o->aname, nl);
     return IMDB_OK;
@@ -100,7 +145,7 @@ int imdb_alter_get(imdb_rd *r, imdb_op *o, const char *what, imdb_err *e)
 {
     o->akind = imdb_rd_u8(r);
     if (r->err) return IMDB_OK;
-    if (o->akind < IMDB_ALTER_ADD_COLUMN || o->akind > IMDB_ALTER_RENAME_TABLE)
+    if (o->akind < IMDB_ALTER_ADD_COLUMN || o->akind > IMDB_ALTER_LAST)
         return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: unknown ALTER TABLE kind %u", what, o->akind);
     if (o->akind == IMDB_ALTER_ADD_COLUMN) {
         imdb_err e2 = {0};
@@ -115,7 +160,17 @@ int imdb_alter_get(imdb_rd *r, imdb_op *o, const char *what, imdb_err *e)
             return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: a NOT NULL column added without a DEFAULT", what);
         return IMDB_OK;
     }
-    if (o->akind == IMDB_ALTER_RENAME_COLUMN) o->apos = imdb_rd_u16(r);
+    if (o->akind != IMDB_ALTER_RENAME_TABLE) o->apos = imdb_rd_u16(r);
+    if (o->akind == IMDB_ALTER_SET_DEFAULT || o->akind == IMDB_ALTER_SET_TYPE) {
+        memset(&o->acol, 0, sizeof o->acol);
+        o->acol.type = imdb_rd_u8(r);
+        o->acol.precision = imdb_rd_u8(r);
+        o->acol.scale = imdb_rd_u8(r);
+        if (!r->err && !alter_bare_ok(&o->acol)) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad column type", what);
+        if (!r->err && o->akind == IMDB_ALTER_SET_DEFAULT) return get_value(r, &o->acol, &o->adef, what, e);
+        return IMDB_OK;
+    }
+    if (o->akind != IMDB_ALTER_RENAME_COLUMN && o->akind != IMDB_ALTER_RENAME_TABLE) return IMDB_OK;
     o->aname = imdb_alloc(IMDB_MAX_IDENT + 1, e);
     if (!o->aname) return e->code;
     imdb_err e3 = {0};

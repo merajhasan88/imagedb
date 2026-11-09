@@ -888,6 +888,13 @@ static int cast_bad(const imdb_column *c, imdb_err *e) /* never the text itself:
     return imdb_fail(e, IMDB_ERR_INVALID, "CAST: a text that is not a valid %s", imdb_type_name(c->type));
 }
 
+/* F3a: a CAST's integer within its target's width (SMALLINT, INTEGER), refused past it as PostgreSQL does */
+static int int_width(const imdb_column *c, int64_t v, imdb_err *e)
+{
+    if (imdb_int_fits(c->precision, v)) return IMDB_OK;
+    return imdb_fail(e, IMDB_ERR_LIMIT, "CAST: the value exceeds %s", imdb_int_name(c->precision));
+}
+
 int imdb_x_cast(const imdb_xval *v, const imdb_column *c, imdb_xenv *env, imdb_xval *out, imdb_err *e)
 {
     memset(out, 0, sizeof *out);
@@ -905,7 +912,7 @@ int imdb_x_cast(const imdb_xval *v, const imdb_column *c, imdb_xenv *env, imdb_x
         case IMDB_T_INT64:
             if (imdb_parse_int64(s, v->len, &i, &pe)) return cast_bad(c, e);
             out->i = i;
-            return IMDB_OK;
+            return int_width(c, (int64_t)out->i, e); /* F3a: SMALLINT's and INTEGER's ranges, as PostgreSQL's */
         case IMDB_T_DECIMAL: {
             imdb_xval d;
             if (!imdb_parse_int64(s, v->len, &i, &pe)) {
@@ -950,7 +957,7 @@ int imdb_x_cast(const imdb_xval *v, const imdb_column *c, imdb_xenv *env, imdb_x
                 return imdb_fail(e, IMDB_ERR_INVALID, "CAST to INT64 of a value with a fraction: ROUND, FLOOR or CEIL it first");
             out->i = (int64_t)v->f;
         } else break;
-        return out->i < INT64_MIN || out->i > INT64_MAX ? overflow(e, IMDB_T_INT64) : IMDB_OK;
+        return out->i < INT64_MIN || out->i > INT64_MAX ? overflow(e, IMDB_T_INT64) : int_width(c, (int64_t)out->i, e);
     case IMDB_T_DECIMAL:
         if (v->type == IMDB_T_INT64 || v->type == IMDB_T_DECIMAL)
             return dec_fit(v->i, v->type == IMDB_T_DECIMAL ? v->scale : 0, c, &out->i, e);

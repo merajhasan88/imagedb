@@ -1038,7 +1038,9 @@ static int preds(parser *p, sql_stmt *st)
 
 static int col_type(parser *p, imdb_column *c)
 {
-    if (kw(p, "int64") || kw(p, "bigint") || kw(p, "int") || kw(p, "integer")) c->type = IMDB_T_INT64;
+    if (kw(p, "int64") || kw(p, "bigint") || kw(p, "int8")) c->type = IMDB_T_INT64;
+    else if (kw(p, "integer") || kw(p, "int") || kw(p, "int4")) c->type = IMDB_T_INT64, c->precision = 32; /* F3a */
+    else if (kw(p, "smallint") || kw(p, "int2")) c->type = IMDB_T_INT64, c->precision = 16;
     else if (kw(p, "text")) c->type = IMDB_T_TEXT;
     else if (kw(p, "bool") || kw(p, "boolean")) c->type = IMDB_T_BOOL;
     else if (kw(p, "timestamptz")) c->type = IMDB_T_TIMESTAMPTZ; /* P2 */
@@ -1145,7 +1147,49 @@ static int parse_alter(parser *p, sql_stmt *st)
         if (null_spec != 2) c->flags |= IMDB_COL_NULLABLE;
         return IMDB_OK;
     }
-    if (!kw(p, "rename")) return fail_at(p, "SET RETENTION, ADD or RENAME");
+    if (kw(p, "drop")) { /* F1 stage 4: DROP [COLUMN] c (RESTRICT, the default and only one) */
+        kw(p, "column");
+        st->alter_kind = IMDB_ALTER_DROP_COLUMN;
+        if (ident(p, st->alter_old)) return p->e->code;
+        if (kw(p, "cascade")) return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "DROP COLUMN ... CASCADE: drop the index or view first");
+        kw(p, "restrict");
+        return IMDB_OK;
+    }
+    if (kw(p, "alter")) { /* F1 stage 4: ALTER [COLUMN] c SET NOT NULL | DROP NOT NULL | SET DEFAULT v | DROP DEFAULT |
+                             [SET DATA] TYPE t */
+        kw(p, "column");
+        if (ident(p, st->alter_old)) return p->e->code;
+        bool set = kw(p, "set");
+        if (!set && kw(p, "drop")) {
+            if (kw(p, "default")) {
+                st->alter_kind = IMDB_ALTER_DROP_DEFAULT;
+                return IMDB_OK;
+            }
+            if (expect_kw(p, "not") || expect_kw(p, "null")) return p->e->code;
+            st->alter_kind = IMDB_ALTER_DROP_NOT_NULL;
+            return IMDB_OK;
+        }
+        if (set && kw(p, "not")) {
+            if (expect_kw(p, "null")) return p->e->code;
+            st->alter_kind = IMDB_ALTER_SET_NOT_NULL;
+            return IMDB_OK;
+        }
+        if (set && kw(p, "default")) {
+            st->alter_kind = IMDB_ALTER_SET_DEFAULT;
+            if (literal(p, &st->alter_def)) return p->e->code;
+            if (st->alter_def.kind == LIT_NULL) /* one state, one spelling: no DEFAULT is DROP DEFAULT */
+                return imdb_fail(p->e, IMDB_ERR_INVALID, "SET DEFAULT NULL: write DROP DEFAULT");
+            st->has_alter_def = true;
+            return IMDB_OK;
+        }
+        if (set) kw(p, "data");
+        if (!kw(p, "type")) return fail_at(p, "SET NOT NULL, DROP NOT NULL, SET DEFAULT, DROP DEFAULT or TYPE");
+        st->alter_kind = IMDB_ALTER_SET_TYPE;
+        imdb_column *c = &st->schema.cols[0];
+        memset(c, 0, sizeof *c);
+        return col_type(p, c);
+    }
+    if (!kw(p, "rename")) return fail_at(p, "SET RETENTION, ADD, DROP, ALTER or RENAME");
     if (kw(p, "to")) {
         st->alter_kind = IMDB_ALTER_RENAME_TABLE;
         return ident(p, st->alter_new);

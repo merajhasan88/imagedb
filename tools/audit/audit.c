@@ -385,6 +385,12 @@ static int64_t pow10i(int n)
     return v;
 }
 
+/* F3a: an INT64 column's width (16 SMALLINT, 32 INTEGER, 0 INT64), each spelled one way, and whether a value fits it */
+static bool int_width_ok(uint8_t w) { return w == 0 || w == 16 || w == 32; }
+static bool int_fits(uint8_t w, int64_t v)
+{
+    return w == 16 ? v >= -32768 && v <= 32767 : w == 32 ? v >= -2147483648ll && v <= 2147483647ll : true;
+}
 static int decode_schema(rd *r, schema *s)
 {
     size_t start = r->o;
@@ -414,7 +420,8 @@ static int decode_schema(rd *r, schema *s)
         if (c->type < T_INT64 || c->type > T_LAST || (c->flags & ~(F_PK | F_SUBJECT | F_NULLABLE)) ||
             ((c->flags & F_NULLABLE) && (c->flags & (F_PK | F_SUBJECT))))
             return fail("schema: bad column type or flags");
-        if (c->type == T_DECIMAL ? (c->prec < 1 || c->prec > 18 || c->scale > c->prec) : (c->prec || c->scale))
+        if (c->type == T_DECIMAL ? (c->prec < 1 || c->prec > 18 || c->scale > c->prec)
+                                 : c->type == T_INT64 ? !int_width_ok(c->prec) || c->scale : (c->prec || c->scale))
             return fail("schema: bad precision/scale");
         if (c->flags & F_PK) { /* F4: a key column of any type held exactly: not FLOAT64 */
             if (c->type == T_FLOAT64) return fail("schema: bad PRIMARY KEY");
@@ -475,8 +482,10 @@ static int count_nullable(const schema *s)
     return k;
 }
 
+
 static int check_value(const col *c, const val *v)
 {
+    if (c->type == T_INT64 && !int_fits(c->prec, v->i)) return fail("value out of its integer's range in column %s", c->name);
     if (c->type == T_DECIMAL && (v->i > pow10i(c->prec) - 1 || v->i < -(pow10i(c->prec) - 1)))
         return fail("value out of DECIMAL range in column %s", c->name);
     if ((c->type == T_TIMESTAMP || c->type == T_TIMESTAMPTZ) && (v->i < TS_MIN || v->i > TS_MAX))
@@ -825,7 +834,7 @@ static void commit_free(commit *c)
 static int alter_body(rd *hr, op *o, const char *what)
 {
     o->akind = rd_u8(hr);
-    if (!hr->bad && (o->akind < 1 || o->akind > 3)) return fail("%s: ALTER TABLE of an unknown kind", what);
+    if (!hr->bad && (o->akind < 1 || o->akind > 9)) return fail("%s: ALTER TABLE of an unknown kind", what);
     if (!hr->bad && o->akind == 1) {
         uint8_t cl = rd_u8(hr);
         const uint8_t *cn = rd_bytes(hr, cl);
@@ -838,6 +847,7 @@ static int alter_body(rd *hr, op *o, const char *what)
         const col *ac = &o->acol;
         if (!hr->bad && (ac->type < T_INT64 || ac->type > T_LAST || (ac->flags & ~F_NULLABLE) ||
                          (ac->type == T_DECIMAL ? (ac->prec < 1 || ac->prec > 18 || ac->scale > ac->prec)
+                          : ac->type == T_INT64  ? !int_width_ok(ac->prec) || ac->scale
                                                 : (ac->prec || ac->scale))))
             return fail("%s: bad added column", what);
         uint8_t has = rd_u8(hr);
@@ -861,7 +871,34 @@ static int alter_body(rd *hr, op *o, const char *what)
             return fail("%s: a NOT NULL column added without a DEFAULT", what);
         return 0;
     }
-    if (o->akind == 2) o->apos = rd_u16(hr);
+    if (o->akind != 3) o->apos = rd_u16(hr); /* F1 stage 4: every kind but RENAME TO names a position */
+    if (o->akind == 7 || o->akind == 9) { /* SET DEFAULT, SET TYPE: a column's type alone, then SET DEFAULT's value */
+        memset(&o->acol, 0, sizeof o->acol);
+        o->acol.type = rd_u8(hr);
+        o->acol.prec = rd_u8(hr);
+        o->acol.scale = rd_u8(hr);
+        const col *ac = &o->acol;
+        if (!hr->bad && (ac->type < T_INT64 || ac->type > T_LAST ||
+                         (ac->type == T_DECIMAL ? (ac->prec < 1 || ac->prec > 18 || ac->scale > ac->prec)
+                          : ac->type == T_INT64  ? !int_width_ok(ac->prec) || ac->scale
+                                                : (ac->prec || ac->scale))))
+            return fail("%s: bad column type", what);
+        if (o->akind == 9 || hr->bad) return 0;
+        o->has_def = true; /* never NULL: no marker, the row encoding of one NOT NULL value */
+        size_t at = hr->o;
+        uint32_t dl = ac->type == T_TEXT ? 4 + rd_u32(hr) : ac->type == T_BOOL ? 1 : 8;
+        hr->o = at;
+        o->def = rd_bytes(hr, dl);
+        o->def_len = dl;
+        schema one;
+        memset(&one, 0, sizeof one);
+        one.ncols = 1;
+        one.c[0] = *ac;
+        val dv;
+        if (!o->def || decode_row(&one, o->def, dl, &dv)) return fail("%s: bad DEFAULT", what);
+        return 0;
+    }
+    if (o->akind != 2 && o->akind != 3) return 0;
     uint8_t nl = rd_u8(hr);
     const uint8_t *nm = rd_bytes(hr, nl);
     if (!hr->bad && (!nm || !ident_ok(nm, nl))) return fail("%s: bad new name", what);
@@ -1127,13 +1164,23 @@ typedef struct table {
     uint32_t nidx, nidx_at_lake;
     struct aver *vers;   /* F1: its schema versions by since, nvers of them (the last's schema is s) */
     uint32_t nvers;
-    val missing[MAX_COLS]; /* F1: what a row of an older version reads for a column added after it */
+    val missing[MAX_COLS]; /* F1: by position: what a row of an older version reads for a column added after it */
     uint8_t *missing_text[MAX_COLS];
+    bool has_wdef[MAX_COLS]; /* F1 stage 4: by position: whether the column has a write default (DROP DEFAULT's rule) */
 } table;
 
 typedef struct aver { /* F1: rows begun at or after since are encoded under s (its raw bytes its own) */
     uint64_t since;
     schema s;
+    uint16_t pos[MAX_COLS]; /* F1 stage 4: s's column c is at position pos[c], the column's identity for its life */
+    int at[MAX_COLS];       /* position p is s's column at[p], or -1 (not live at this version) */
+    int npos;               /* the positions used up to it (an ADD takes position npos) */
+    uint8_t akind;          /* the ALTER that made it (0: the CREATE), the position it named, a SET DEFAULT's value
+                               (its row encoding, the version's own) */
+    uint16_t apos;
+    uint8_t *def;
+    uint32_t def_len;
+    uint8_t hash[32];       /* SHA-256("IMDBSVR1", raw, each column's position as a u16): a segment names it */
 } aver;
 
 #define VCHUNK_BITS 16
@@ -1458,45 +1505,143 @@ static const aver *aver_at(const table *t, uint64_t at)
     return lo ? &t->vers[lo - 1] : &t->vers[0];
 }
 
-/* a held row's values under the current schema: decoded by its own version, a column added after it reading the
- * value its ADD gave (or NULL); in stage 2 no column is dropped, so a version's columns are the current ones' prefix */
+/* F1 stage 4: a version's identity, by design.md §5 (Schema versions): SHA-256 over "IMDBSVR1", its schema's
+ * encoding and each column's position as a u16, so a segment's header names one layout (a DROP COLUMN then an ADD of
+ * the same column would give the old encoding alone at another position) */
+static void aver_hash(aver *v)
+{
+    size_t n = 8 + v->s.rawlen + 2u * (size_t)v->s.ncols;
+    uint8_t *b = xcalloc(n, 1);
+    memcpy(b, "IMDBSVR1", 8);
+    memcpy(b + 8, v->s.raw, v->s.rawlen);
+    for (int c = 0; c < v->s.ncols; c++) {
+        b[8 + v->s.rawlen + 2u * (size_t)c] = (uint8_t)v->pos[c];
+        b[9 + v->s.rawlen + 2u * (size_t)c] = (uint8_t)(v->pos[c] >> 8);
+    }
+    a_sha256(b, n, v->hash);
+    free(b);
+}
+
+/* version 1 of a table, its schema s (raw: the caller's own copy): each column at its own position */
+static void aver_first(aver *v, const schema *s)
+{
+    memset(v, 0, sizeof *v);
+    v->s = *s;
+    for (int p = 0; p < MAX_COLS; p++) v->at[p] = -1;
+    for (int c = 0; c < s->ncols; c++) v->pos[c] = (uint16_t)c, v->at[c] = c;
+    v->npos = s->ncols;
+    aver_hash(v);
+}
+
+/* a held row's values under the current version: decoded by its own, each column by position, one added after it
+ * reading the value its ADD gave (or NULL); a column dropped since is not the current version's */
 static int decode_held(const table *t, const ver *v, val *vals)
 {
-    const aver *rv = t->nvers > 1 ? aver_at(t, v->begin) : NULL;
-    if (!rv || rv == &t->vers[t->nvers - 1]) return decode_row(&t->s, v->row, v->row_len, vals);
-    if (decode_row(&rv->s, v->row, v->row_len, vals)) return -1;
-    for (int c = rv->s.ncols; c < t->s.ncols; c++) vals[c] = t->missing[c];
+    const aver *cv = &t->vers[t->nvers - 1], *rv = t->nvers > 1 ? aver_at(t, v->begin) : NULL;
+    if (!rv || rv == cv) return decode_row(&t->s, v->row, v->row_len, vals);
+    val own[MAX_COLS];
+    if (decode_row(&rv->s, v->row, v->row_len, own)) return -1;
+    for (int c = 0; c < cv->s.ncols; c++) {
+        int k = rv->at[cv->pos[c]];
+        vals[c] = k >= 0 ? own[k] : t->missing[cv->pos[c]];
+    }
     return 0;
 }
 
-
-/* the version an ALTER makes from cur, by its structural rules (room for a column, a name not taken, a column there);
- * the log's apply adds the rules on the catalog (a live view naming the table, RENAME TO a free name) before it, and a
- * manifest's history is this alone, ending at the manifest's schema */
-static int alter_next(const schema *cur, const op *o, schema *ns, uint64_t seq)
+/* the version an ALTER makes from cur, by the rules a schema and its positions decide (a position live, room for a
+ * column, a name not taken, a key or SUBJECT column never dropped nor made NULL, a DEFAULT of the column's type, a
+ * widening), and with has_wdef the history's (DROP DEFAULT drops one); the log's apply adds the catalog's (views,
+ * indexes, the live rows) before it, and a manifest's history is this alone, ending at the manifest's schema */
+static int alter_next(const aver *cur, const op *o, aver *nv, uint64_t seq, const bool *has_wdef)
 {
-    *ns = *cur;
-    ns->raw = NULL;
-    if (o->akind == 1) {
-        if (cur->ncols >= MAX_COLS) return fail("commit %llu: more than %u columns", (unsigned long long)seq, MAX_COLS);
-        for (int c = 0; c < cur->ncols; c++)
-            if (!strcmp(cur->c[c].name, o->acol.name))
-                return fail("commit %llu: ADD COLUMN of a name table %s has", (unsigned long long)seq, cur->name);
-        ns->c[ns->ncols++] = o->acol;
-    } else if (o->akind == 2) {
-        if (o->apos >= cur->ncols) return fail("commit %llu: RENAME COLUMN of no column", (unsigned long long)seq);
-        for (int c = 0; c < cur->ncols; c++)
-            if (!strcmp(cur->c[c].name, o->aname))
-                return fail("commit %llu: RENAME COLUMN to a name table %s has", (unsigned long long)seq, cur->name);
-        memset(ns->c[o->apos].name, 0, sizeof ns->c[o->apos].name);
-        memcpy(ns->c[o->apos].name, o->aname, strlen(o->aname));
-    } else {
+    *nv = *cur;
+    nv->s.raw = NULL;
+    nv->def = NULL;
+    nv->def_len = 0;
+    nv->akind = o->akind;
+    nv->apos = o->akind == 1 ? (uint16_t)cur->npos : o->apos;
+    schema *ns = &nv->s;
+    const schema *cs = &cur->s;
+    unsigned long long sq = (unsigned long long)seq;
+    int c = -1;
+    if (o->akind != 1 && o->akind != 3) {
+        if (o->apos >= cur->npos || cur->at[o->apos] < 0) return fail("commit %llu: ALTER TABLE of no column", sq);
+        c = cur->at[o->apos];
+    }
+    col *cc = c >= 0 ? &ns->c[c] : NULL;
+    if (o->akind == 1 || o->akind == 2) {
+        const char *nm = o->akind == 1 ? o->acol.name : o->aname;
+        if (o->akind == 1 && cur->npos >= MAX_COLS) return fail("commit %llu: past %u column positions", sq, MAX_COLS);
+        for (int k = 0; k < cs->ncols; k++)
+            if (!strcmp(cs->c[k].name, nm)) return fail("commit %llu: a column name table %s has", sq, cs->name);
+    }
+    switch (o->akind) {
+    case 1:
+        ns->c[ns->ncols] = o->acol;
+        nv->pos[ns->ncols] = (uint16_t)cur->npos;
+        nv->at[cur->npos] = ns->ncols;
+        ns->ncols++;
+        nv->npos++;
+        break;
+    case 2:
+        memset(cc->name, 0, sizeof cc->name);
+        memcpy(cc->name, o->aname, strlen(o->aname));
+        break;
+    case 3:
         memset(ns->name, 0, sizeof ns->name);
         memcpy(ns->name, o->aname, strlen(o->aname));
+        break;
+    case 4: /* DROP COLUMN: the columns after it close up, each keeping its position */
+        if (cc->flags & (F_PK | F_SUBJECT)) return fail("commit %llu: DROP COLUMN of a key or SUBJECT column", sq);
+        for (int k = c; k + 1 < ns->ncols; k++) {
+            ns->c[k] = ns->c[k + 1];
+            nv->pos[k] = nv->pos[k + 1];
+            nv->at[nv->pos[k]] = k;
+        }
+        ns->ncols--;
+        memset(&ns->c[ns->ncols], 0, sizeof ns->c[0]);
+        nv->pos[ns->ncols] = 0;
+        nv->at[o->apos] = -1;
+        for (int k = 0; k < ns->npk; k++)
+            if (ns->key[k] > c) ns->key[k]--;
+        if (ns->subject > c) ns->subject--;
+        break;
+    case 5: /* SET NOT NULL */
+    case 6: /* DROP NOT NULL */
+        if ((cc->flags & (F_PK | F_SUBJECT)) || (o->akind == 5) != ((cc->flags & F_NULLABLE) != 0))
+            return fail("commit %llu: a NULL rule a column of table %s cannot take", sq, cs->name);
+        cc->flags = (uint8_t)(o->akind == 5 ? cc->flags & ~F_NULLABLE : cc->flags | F_NULLABLE);
+        break;
+    case 7: /* SET DEFAULT: of the column's type (alter_body decoded its value as one) */
+        if (o->acol.type != cc->type || o->acol.prec != cc->prec || o->acol.scale != cc->scale)
+            return fail("commit %llu: SET DEFAULT of another type than its column's", sq);
+        nv->def = xcalloc(o->def_len ? o->def_len : 1, 1);
+        memcpy(nv->def, o->def, o->def_len);
+        nv->def_len = o->def_len;
+        break;
+    case 8: /* DROP DEFAULT */
+        if (has_wdef && !has_wdef[o->apos]) return fail("commit %llu: DROP DEFAULT of a column without one", sq);
+        break;
+    case 9: { /* SET TYPE, a widening: a wider DECIMAL of its scale, a wider integer (F3a), every stored value valid */
+        unsigned rf = cc->prec == 16 ? 1 : cc->prec == 32 ? 2 : 3, rt = o->acol.prec == 16 ? 1 : o->acol.prec == 32 ? 2 : 3;
+        bool wide = cc->type == T_INT64 && o->acol.type == T_INT64 ? rt > rf
+                    : cc->type == T_DECIMAL && o->acol.type == T_DECIMAL && o->acol.scale == cc->scale &&
+                          o->acol.prec > cc->prec && o->acol.prec <= 18;
+        if (!wide) return fail("commit %llu: SET TYPE that is not a widening", sq);
+        cc->prec = o->acol.prec;
+        break;
+    }
+    default:
+        return fail("commit %llu: ALTER TABLE of an unknown kind", sq);
     }
     schema_reencode(ns);
+    aver_hash(nv);
     return 0;
 }
+
+/* the column state an ALTER leaves (missing and has_wdef by position): an ADD's missing value, its DEFAULT (the
+ * write default too), a SET or DROP DEFAULT's write default */
+static int alter_state(const op *o, int npos_before, val *missing, uint8_t **missing_text, bool *has_wdef);
 
 /* what the rows of older versions read for an ADD's column: its DEFAULT (its row bytes copied into *text), or NULL */
 static int alter_missing(const op *o, val *m, uint8_t **text)
@@ -1513,6 +1658,17 @@ static int alter_missing(const op *o, val *m, uint8_t **text)
     *text = xcalloc(o->def_len, 1);
     memcpy(*text, o->def, o->def_len);
     return decode_row(&one, *text, o->def_len, m) ? -1 : 0;
+}
+
+static int alter_state(const op *o, int npos_before, val *missing, uint8_t **missing_text, bool *has_wdef)
+{
+    if (o->akind == 1) {
+        has_wdef[npos_before] = o->has_def;
+        return alter_missing(o, &missing[npos_before], &missing_text[npos_before]);
+    }
+    if (o->akind == 7) has_wdef[o->apos] = true;
+    if (o->akind == 8) has_wdef[o->apos] = false;
+    return 0;
 }
 
 /* two values the same in every bit a decoder distinguishes, as a column of type ty */
@@ -1560,6 +1716,33 @@ static const aview *view_naming(const state *S, uint8_t kind, uint32_t id)
         for (uint16_t k = 0; !S->v[i].dropped_at && k < S->v[i].ndeps; k++)
             if (S->v[i].dep_kind[k] == kind && S->v[i].dep_id[k] == id) return &S->v[i];
     return NULL;
+}
+
+/* F1: *named the first live view reading table (directly or through views) whose text holds name as an identifier
+ * (abind.c's ab_names: a name its text never holds cannot bind, and views refuse *), NULL when none; -1 when a view's
+ * text does not lex */
+static int view_holding(const state *S, uint32_t tid, const char *name, const aview **named, uint64_t seq)
+{
+    *named = NULL;
+    bool *rdv = xcalloc(S->nv ? S->nv : 1, sizeof *rdv);
+    for (bool more = true; more;) {
+        more = false;
+        for (uint32_t i = 0; i < S->nv; i++)
+            for (uint16_t k = 0; !rdv[i] && !S->v[i].dropped_at && k < S->v[i].ndeps; k++)
+                if ((S->v[i].dep_kind[k] == 1 && S->v[i].dep_id[k] == tid) ||
+                    (S->v[i].dep_kind[k] == 2 && S->v[i].dep_id[k] < S->nv && rdv[S->v[i].dep_id[k]]))
+                    rdv[i] = more = true;
+    }
+    char berr[160];
+    int rc = 0;
+    for (uint32_t i = 0; i < S->nv && !*named && !rc; i++) {
+        if (!rdv[i] || !S->v[i].text) continue;
+        int h = ab_names(S->v[i].text, S->v[i].text_len, name, berr, sizeof berr);
+        if (h < 0) rc = fail("commit %llu: view %s's text does not lex (%s)", (unsigned long long)seq, S->v[i].name, berr);
+        else if (h) *named = &S->v[i];
+    }
+    free(rdv);
+    return rc;
 }
 
 /* P2 S7: the next view of the model (op 20, or F's manifest past a cut: dropped then a tombstone, d NULL) */
@@ -1688,9 +1871,10 @@ static int apply_op(state *S, const op *o, uint64_t seq)
         memcpy(S->t[S->nt].s.raw, o->sch->raw, o->sch->rawlen);
         S->t[S->nt].vers = xcalloc(4, sizeof(aver)); /* F1: version 1, the CREATE's */
         S->t[S->nt].nvers = 1;
-        S->t[S->nt].vers[0].s = *o->sch;
-        S->t[S->nt].vers[0].s.raw = xcalloc(o->sch->rawlen, 1);
-        memcpy(S->t[S->nt].vers[0].s.raw, o->sch->raw, o->sch->rawlen);
+        schema s1 = *o->sch; /* the version's own raw bytes */
+        s1.raw = xcalloc(o->sch->rawlen, 1);
+        memcpy(s1.raw, o->sch->raw, o->sch->rawlen);
+        aver_first(&S->t[S->nt].vers[0], &s1);
         for (uint32_t i = 0; i < S->nt; i++)
             if (!S->t[i].dropped_at && strcmp(S->t[i].s.name, o->sch->name) == 0)
                 return fail("commit %llu: duplicate table", (unsigned long long)seq);
@@ -1700,53 +1884,64 @@ static int apply_op(state *S, const op *o, uint64_t seq)
         S->nt++;
         return 0;
     }
-    if (o->code == 22) { /* ALTER_TABLE (F1): live; its kind's rules on the current schema; the next version */
+    if (o->code == 22) { /* ALTER_TABLE (F1): live; its kind's rules on the current version; the next version */
         if (o->table >= S->nt) return fail("commit %llu: ALTER TABLE of an unknown table", (unsigned long long)seq);
         table *t = &S->t[o->table];
         if (t->dropped_at) return fail("commit %llu: ALTER TABLE of table %s, dropped", (unsigned long long)seq, t->s.name);
         if (t->nvers >= 256) return fail("commit %llu: table %s past 256 schema versions", (unsigned long long)seq, t->s.name);
-        if (o->akind == 1) { /* F1: a live view reading the table (through views too) whose text holds the name */
-            bool *rdv = xcalloc(S->nv ? S->nv : 1, sizeof *rdv);
-            for (bool more = true; more;) {
-                more = false;
-                for (uint32_t i = 0; i < S->nv; i++)
-                    for (uint16_t k = 0; !rdv[i] && !S->v[i].dropped_at && k < S->v[i].ndeps; k++)
-                        if ((S->v[i].dep_kind[k] == 1 && S->v[i].dep_id[k] == o->table) ||
-                            (S->v[i].dep_kind[k] == 2 && S->v[i].dep_id[k] < S->nv && rdv[S->v[i].dep_id[k]]))
-                            rdv[i] = more = true;
-            }
+        const aver *cur = &t->vers[t->nvers - 1];
+        aver nv;
+        if (alter_next(cur, o, &nv, seq, t->has_wdef)) return -1;
+        int cc = o->akind == 1 || o->akind == 3 ? -1 : cur->at[o->apos]; /* the column it names (live: alter_next) */
+        int rc = 0;
+        if (o->akind == 1 || o->akind == 4) { /* a live view reading the table that holds the name: an ADD's column could
+                                                 capture its reference, a DROP's leave it unbound */
+            const char *nm = o->akind == 1 ? o->acol.name : t->s.c[cc].name;
             const aview *named = NULL;
-            char berr[160];
-            for (uint32_t i = 0; i < S->nv && !named; i++) {
-                if (!rdv[i] || !S->v[i].text) continue;
-                int h = ab_names(S->v[i].text, S->v[i].text_len, o->acol.name, berr, sizeof berr);
-                if (h < 0) {
-                    free(rdv);
-                    return fail("commit %llu: view %s's text does not lex (%s)", (unsigned long long)seq, S->v[i].name, berr);
-                }
-                if (h) named = &S->v[i];
-            }
-            free(rdv);
-            if (named)
-                return fail("commit %llu: ADD COLUMN %s of table %s, which view %s reads and names", (unsigned long long)seq,
-                            o->acol.name, t->s.name, named->name);
+            rc = view_holding(S, o->table, nm, &named, seq);
+            if (!rc && named)
+                rc = fail("commit %llu: %s COLUMN %s of table %s, which view %s reads and names", (unsigned long long)seq,
+                          o->akind == 1 ? "ADD" : "DROP", nm, t->s.name, named->name);
         }
-        if (o->akind == 2 || o->akind == 3) {
+        for (uint32_t k = 0; !rc && o->akind == 4 && k < t->nidx; k++) /* F1 stage 4: no index names a dropped column */
+            for (int j = 0; !rc && j < t->idx[k].ncols; j++)
+                if (t->idx[k].cols[j] == cc)
+                    rc = fail("commit %llu: DROP COLUMN of a column index %s names", (unsigned long long)seq, t->idx[k].name);
+        if (!rc && (o->akind == 2 || o->akind == 3)) {
             if (view_naming(S, 1, o->table)) /* a rename: RESTRICT, as DROP is */
-                return fail("commit %llu: a rename of table %s, which a live view names", (unsigned long long)seq, t->s.name);
-            if (o->akind == 3 && name_live(S, o->aname)) return fail("commit %llu: RENAME TO a live name", (unsigned long long)seq);
+                rc = fail("commit %llu: a rename of table %s, which a live view names", (unsigned long long)seq, t->s.name);
+            else if (o->akind == 3 && name_live(S, o->aname))
+                rc = fail("commit %llu: RENAME TO a live name", (unsigned long long)seq);
         }
-        schema ns;
-        if (alter_next(&t->s, o, &ns, seq)) return -1;
-        if (o->akind == 1 && alter_missing(o, &t->missing[ns.ncols - 1], &t->missing_text[ns.ncols - 1])) return -1;
+        /* F1 stage 4: SET NOT NULL, every live row reading a value there as the table reads it now (one older than the
+         * column's ADD reads its missing value) */
+        for (uint64_t vid = av_skip(t, 0); !rc && o->akind == 5 && vid < t->n; vid = av_skip(t, vid + 1)) {
+            ver *v = av(t, vid);
+            if (!v || v->end != LIVE || !v->row) continue;
+            val vals[MAX_COLS];
+            if (decode_held(t, v, vals)) rc = fail("commit %llu: a live row of table %s does not decode", (unsigned long long)seq, t->s.name);
+            else if (vals[cc].null)
+                rc = fail("commit %llu: SET NOT NULL of column %s of table %s, which a live row holds NULL", (unsigned long long)seq,
+                          t->s.c[cc].name, t->s.name);
+        }
+        if (!rc) rc = alter_state(o, cur->npos, t->missing, t->missing_text, t->has_wdef);
+        if (rc) {
+            free(nv.s.raw);
+            free(nv.def);
+            return rc;
+        }
+        for (uint32_t k = 0; k <= t->nidx; k++) { /* the indexes and the primary key, carried by position (F1 stage 4) */
+            aidx *x = k < t->nidx ? &t->idx[k] : &t->pkx;
+            for (int j = 0; j < x->ncols; j++) x->cols[j] = (uint16_t)nv.at[cur->pos[x->cols[j]]];
+        }
         t->vers = xrealloc(t->vers, t->nvers + 1, sizeof *t->vers);
-        t->vers[t->nvers].since = seq;
-        t->vers[t->nvers].s = ns;
+        nv.since = seq;
+        t->vers[t->nvers] = nv;
         t->nvers++;
         free(t->s.raw);
-        t->s = ns;
-        t->s.raw = xcalloc(ns.rawlen, 1);
-        memcpy(t->s.raw, ns.raw, ns.rawlen);
+        t->s = nv.s;
+        t->s.raw = xcalloc(nv.s.rawlen, 1);
+        memcpy(t->s.raw, nv.s.raw, nv.s.rawlen);
         return 0;
     }
     if (o->code == 19) { /* DROP_TABLE: live, not kept FOREVER (its op 16 first); every live version ends, one by one */
@@ -2413,6 +2608,10 @@ typedef struct seg {
     const uint8_t *valid[MAX_COLS];  /* VALID section of a NULLABLE column, else NULL */
     bool cst[MAX_COLS];              /* F1: a column of the table's schema the segment lacks: every row reads cstv */
     val cstv[MAX_COLS];
+    const uint8_t *ocolp[MAX_COLS], *otdata[MAX_COLS], *ovalid[MAX_COLS]; /* F1 stage 4: its own columns, under
+                                                                             its version gk (a dropped one's too) */
+    uint32_t gk;
+    const struct aver *gv; /* that version, in the history it was parsed against (the walked manifest's) */
 } seg;
 
 static void seg_free(seg *g)
@@ -2460,6 +2659,35 @@ static void seg_value(const schema *s, const seg *g, uint32_t i, int c, val *v)
     }
 }
 
+/* F1 stage 4: column c of row i as the segment holds it under its own version gv (a column dropped since too) */
+static void seg_own_value(const struct aver *gv, const seg *g, uint32_t i, int c, val *v)
+{
+    memset(v, 0, sizeof *v);
+    if (g->ovalid[c] && !(g->ovalid[c][i / 8] >> (i % 8) & 1)) {
+        v->null = true;
+        return;
+    }
+    uint8_t t = gv->s.c[c].type;
+    if (is_int(t)) v->i = (int64_t)le64(g->ocolp[c] + 8u * i);
+    else if (t == T_BOOL) v->i = g->ocolp[c][i];
+    else {
+        uint32_t a = le32(g->ocolp[c] + 4u * i), z = le32(g->ocolp[c] + 4u * (i + 1));
+        v->s = g->otdata[c] + a;
+        v->len = z - a;
+    }
+}
+
+/* row i's values under its own version rv, by position from the segment's own columns (parse_segment refused a row
+ * of a position its segment does not hold) */
+static void seg_own_row(const struct aver *gv, const seg *g, uint32_t i, const struct aver *rv, val *out)
+{
+    for (int k = 0; k < rv->s.ncols; k++) {
+        int c = gv->at[rv->pos[k]];
+        if (c >= 0) seg_own_value(gv, g, i, c, &out[k]);
+        else memset(&out[k], 0, sizeof out[k]);
+    }
+}
+
 /* A live row's key in a unique index: each column in 8 bytes, a TEXT as a u32 length and its bytes;
  * false when a column is NULL (the row is exempt, as in SQL). */
 typedef struct ukey {
@@ -2499,18 +2727,18 @@ static int cmp_ukey(const void *a, const void *b)
     return x->n ? memcmp(x->b, y->b, x->n) : 0;
 }
 
-/* Strict, canonical parse under the schema version that built the segment (its header names it by hash, among
- * vers, a table's nvers versions); every non-stub row's commitment is recomputed under its own version (by its
- * begin), and the columns of cur (the table's schema) the segment lacks read their missing values (F1) */
-static int parse_segment(const struct aver *vers, uint32_t nvers, const val *missing, const schema *cur, uint8_t *b,
+/* Strict, canonical parse under the schema version that built the segment (its header names it by its version hash,
+ * among vers, a table's nvers versions); every non-stub row's commitment is recomputed under its own version (by its
+ * begin), each column by position; then laid out for cur, the version its caller reads with: a column cur has and the
+ * segment lacks reads its missing value (F1), and one the segment holds and cur lacks (dropped since) stays in the own
+ * columns, for a row's own encoding (F1 stage 4) */
+static int parse_segment(const struct aver *vers, uint32_t nvers, const val *missing, const struct aver *cur, uint8_t *b,
                          size_t len, seg *g)
 {
     memset(g, 0, sizeof *g);
     uint32_t gk = nvers;
     for (uint32_t k = nvers; k-- > 0;) { /* the last first: most segments are the current version's */
-        uint8_t vh[32];
-        a_sha256(vers[k].s.raw, vers[k].s.rawlen, vh);
-        if (memcmp(vh, b + 16, 32) == 0) {
+        if (memcmp(vers[k].hash, b + 16, 32) == 0) {
             gk = k;
             break;
         }
@@ -2519,7 +2747,8 @@ static int parse_segment(const struct aver *vers, uint32_t nvers, const val *mis
     const schema *s = &vers[gk].s;
     if (len < 64 || memcmp(b, "IMDBSEG1", 8) != 0) return fail("segment: bad magic");
     uint32_t n = le32(b + 48), ncols = le32(b + 52), nsec = le32(b + 56);
-    if (le32(b + 8) != 2 || le32(b + 12) != s->id || le32(b + 60) != 0 || ncols != (uint32_t)s->ncols)
+    if (le32(b + 8) == 2) return fail("segment: version 2, before schema versions by position, is not read");
+    if (le32(b + 8) != 3 || le32(b + 12) != s->id || le32(b + 60) != 0 || ncols != (uint32_t)s->ncols)
         return fail("segment: bad header");
     if (n > (1u << 22)) return fail("segment: too many rows");
     uint32_t want_kind[MAX_SECTIONS], want_col[MAX_SECTIONS];
@@ -2631,12 +2860,19 @@ static int parse_segment(const struct aver *vers, uint32_t nvers, const val *mis
             rc = fail("segment: row %u is of a later schema version than its segment", i);
             break;
         }
-        const schema *rs = &vers[rk].s;
-        for (int c = rs->ncols; c < s->ncols && !rc; c++)
-            if (!val_same(&v[c], &missing[c], s->c[c].type))
+        const struct aver *rv = &vers[rk], *gv = &vers[gk];
+        val own[MAX_COLS]; /* the row's values under its own version: every position it has, its segment's has */
+        for (int c = 0; c < rv->s.ncols && !rc; c++) {
+            int j = gv->at[rv->pos[c]];
+            if (j < 0) rc = fail("segment: row %u has a column its segment does not hold", i);
+            else own[c] = v[j];
+        }
+        /* at each position the segment's version has and the row's lacks (added since the row), its missing value */
+        for (int c = 0; c < s->ncols && !rc; c++)
+            if (rv->at[gv->pos[c]] < 0 && !val_same(&v[c], &missing[gv->pos[c]], s->c[c].type))
                 rc = fail("segment: row %u holds another value than its missing one in column %s", i, s->c[c].name);
         if (rc) break;
-        size_t rl = encode_row(rs, v, &rowbuf, &rowcap);
+        size_t rl = encode_row(&rv->s, own, &rowbuf, &rowcap);
         uint8_t cm[32];
         row_commit(s->id, g->row[i].salt, rowbuf, rl, cm);
         if (memcmp(cm, g->row[i].commit, 32) != 0) rc = fail("segment: row %u does not match its commitment", i);
@@ -2660,9 +2896,26 @@ static int parse_segment(const struct aver *vers, uint32_t nvers, const val *mis
             (int64_t)le64(z + 16) != mx)
             rc = fail("segment: zone map does not match the data (column %s)", s->c[c].name);
     }
-    for (int c = s->ncols; !rc && c < cur->ncols; c++) { /* F1: the table's columns added since its build */
-        g->cst[c] = true;
-        g->cstv[c] = missing[c];
+    if (!rc) { /* F1: laid out for cur by position (the own columns kept: a row's own encoding reads them) */
+        memcpy(g->ocolp, g->colp, sizeof g->colp);
+        memcpy(g->otdata, g->tdata, sizeof g->tdata);
+        memcpy(g->ovalid, g->valid, sizeof g->valid);
+        memset(g->colp, 0, sizeof g->colp);
+        memset(g->tdata, 0, sizeof g->tdata);
+        memset(g->valid, 0, sizeof g->valid);
+        g->gk = gk;
+        g->gv = &vers[gk];
+        for (int c = 0; c < cur->s.ncols; c++) {
+            int j = vers[gk].at[cur->pos[c]];
+            if (j >= 0) {
+                g->colp[c] = g->ocolp[j];
+                g->tdata[c] = g->otdata[j];
+                g->valid[c] = g->ovalid[j];
+                continue;
+            }
+            g->cst[c] = true;
+            g->cstv[c] = missing[cur->pos[c]];
+        }
     }
     if (rc) {
         free(g->row);
@@ -2705,8 +2958,9 @@ typedef struct mtable {
     uint64_t created_at, dropped_at; /* version 5: the commits that created and dropped it (0: live) */
     uint32_t nvers;      /* F1: its schema versions, from the manifest's history (version 1 alone: s) */
     struct aver *vers;
-    val missing[MAX_COLS]; /* what a row of an older version reads for a column added after it */
+    val missing[MAX_COLS]; /* by position: what a row of an older version reads for a column added after it */
     uint8_t *missing_text[MAX_COLS];
+    bool has_wdef[MAX_COLS]; /* F1 stage 4: by position: a write default (DROP DEFAULT's rule) */
 } mtable;
 
 typedef struct mview { /* P2 S7: a manifest's view: a live one's definition, a dropped one's tombstone (def NULL) */
@@ -2732,7 +2986,7 @@ static void manifest_free(manifest *m)
         free(m->t[i].seg);
         free(m->t[i].dv);
         free(m->t[i].nrows);
-        for (uint32_t k = 0; k < m->t[i].nvers; k++) free(m->t[i].vers[k].s.raw); /* F1 */
+        for (uint32_t k = 0; k < m->t[i].nvers; k++) free(m->t[i].vers[k].s.raw), free(m->t[i].vers[k].def); /* F1 */
         free(m->t[i].vers);
         for (int k = 0; k < MAX_COLS; k++) free(m->t[i].missing_text[k]);
     }
@@ -2816,7 +3070,7 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
     rd r = {b, len, 0, false};
     const uint8_t *mg = rd_bytes(&r, 8);
     uint32_t mver = mg && memcmp(mg, "IMDBMAN1", 8) == 0 ? rd_u32(&r) : 0;
-    if (mver != 7) return fail("manifest: bad header (version 7 only: the format design's sections)");
+    if (mver != 8) return fail("manifest: bad header (version 8 only: schema versions by position, F1 stage 4)");
     uint32_t nsec = rd_u32(&r); /* every section, in order: 1 tables, 2 views, 3-11 reserved and empty */
     const uint8_t *id = rd_bytes(&r, 16);
     m->seq = rd_u64(&r);
@@ -2889,12 +3143,18 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
             const uint8_t *b0 = rd_bytes(&r, l0);
             if (!b0) return fail("manifest: truncated");
             rd r0 = {b0, l0, 0, false};
-            if (decode_schema(&r0, &t->vers[0].s) || rd_left(&r0) || t->vers[0].s.id != i)
+            schema s1;
+            memset(&s1, 0, sizeof s1);
+            if (decode_schema(&r0, &s1) || rd_left(&r0) || s1.id != i) {
+                free(s1.raw);
                 return fail("manifest: bad schema history (version 1)");
+            }
+            aver_first(&t->vers[0], &s1);
         } else {
-            t->vers[0].s = t->s;
-            t->vers[0].s.raw = xcalloc(t->s.rawlen, 1);
-            memcpy(t->vers[0].s.raw, t->s.raw, t->s.rawlen);
+            schema s1 = t->s;
+            s1.raw = xcalloc(t->s.rawlen, 1);
+            memcpy(s1.raw, t->s.raw, t->s.rawlen);
+            aver_first(&t->vers[0], &s1);
         }
         for (int c = 0; c < t->vers[0].s.ncols; c++) t->missing[c].null = true;
         uint64_t last = t->created_at;
@@ -2905,12 +3165,15 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
             if (r.bad || alter_body(&r, &o, "manifest")) return r.bad ? fail("manifest: truncated") : -1;
             if (r.bad || at <= last || at > m->seq || (t->dropped_at && at >= t->dropped_at))
                 return fail("manifest: an ALTER of table %u out of order", i);
-            schema ns;
-            if (alter_next(&t->vers[t->nvers - 1].s, &o, &ns, at)) return -1;
-            if (o.akind == 1 && alter_missing(&o, &t->missing[ns.ncols - 1], &t->missing_text[ns.ncols - 1])) return -1;
-            t->vers[t->nvers].since = at;
-            t->vers[t->nvers].s = ns;
-            t->nvers++;
+            aver nv;
+            if (alter_next(&t->vers[t->nvers - 1], &o, &nv, at, t->has_wdef)) return -1;
+            if (alter_state(&o, t->vers[t->nvers - 1].npos, t->missing, t->missing_text, t->has_wdef)) {
+                free(nv.s.raw);
+                free(nv.def);
+                return -1;
+            }
+            nv.since = at;
+            t->vers[t->nvers++] = nv;
             last = at;
         }
         const schema *ls = &t->vers[t->nvers - 1].s;
@@ -3182,7 +3445,7 @@ static int walk_lake_pinned(int dirfd, uint8_t alg, const uint8_t mh[32], uint64
             size_t sl;
             if ((rc = obj_read(ofd, t->seg[k], ".seg", &sb, &sl))) break;
             seg g;
-            if ((rc = parse_segment(t->vers, t->nvers, t->missing, &t->s, sb, sl, &g))) {
+            if ((rc = parse_segment(t->vers, t->nvers, t->missing, &t->vers[t->nvers - 1], sb, sl, &g))) {
                 free(sb);
                 break;
             }
@@ -3478,10 +3741,12 @@ static int seed_row(void *ctx, uint32_t ti, const schema *s, const seg *g, uint3
         val vals[MAX_COLS];
         for (int c = 0; c < s->ncols; c++) seg_value(s, g, i, c, &vals[c]);
         if (!r->flags && v->end == LIVE) {
-            /* F1: under the row's own version, as decode_held reads it (s is the lake's schema: later versions' columns
-             * follow; in stage 2 a version's columns are a prefix of the later ones') */
-            const aver *rv = t->nvers > 1 ? aver_at(t, r->begin) : NULL;
-            size_t rl = encode_row(rv ? &rv->s : s, vals, &x->buf, &x->cap);
+            /* F1: under the row's own version, from the segment's own columns by position (a column dropped since
+             * is still in the row's bytes and its commitment) */
+            const aver *rv = t->nvers > 1 ? aver_at(t, r->begin) : &t->vers[0];
+            val own[MAX_COLS];
+            seg_own_row(g->gv, g, i, rv, own); /* the walked manifest's version: F's history may end before it */
+            size_t rl = encode_row(&rv->s, own, &x->buf, &x->cap);
             v->row = xcalloc(rl ? rl : 1, 1);
             memcpy(v->row, x->buf, rl);
             v->row_len = (uint32_t)rl;
@@ -3535,9 +3800,14 @@ static int floor_seed(int dirfd, state *S, flr *f)
             t->vers[k] = mt->vers[k];
             t->vers[k].s.raw = xcalloc(mt->vers[k].s.rawlen ? mt->vers[k].s.rawlen : 1, 1);
             memcpy(t->vers[k].s.raw, mt->vers[k].s.raw, mt->vers[k].s.rawlen);
+            if (mt->vers[k].def) { /* F1 stage 4: a SET DEFAULT's value, the version's own */
+                t->vers[k].def = xcalloc(mt->vers[k].def_len ? mt->vers[k].def_len : 1, 1);
+                memcpy(t->vers[k].def, mt->vers[k].def, mt->vers[k].def_len);
+            }
         }
         for (int c = 0; c < MAX_COLS; c++) {
             t->missing[c] = mt->missing[c];
+            t->has_wdef[c] = mt->has_wdef[c];
             if (!mt->missing_text[c] || !mt->missing[c].s) continue; /* a TEXT one points into its bytes; others are i */
             size_t tl = (size_t)(mt->missing[c].s - mt->missing_text[c]) + mt->missing[c].len;
             t->missing_text[c] = xcalloc(tl ? tl : 1, 1);
@@ -3596,19 +3866,25 @@ static int floor_seed(int dirfd, state *S, flr *f)
     return rc;
 }
 
-/* F1: a manifest's schema history is the log's at the lake snapshot commit: as many versions, each at its commit and
- * of the same schema bytes, and every column they added reading the same missing value */
+/* F1: a manifest's schema history is the log's at the lake snapshot commit: as many versions, each at its commit, of
+ * the same schema bytes and positions (its hash), made by the same ALTER (a SET DEFAULT's value too: no hash covers
+ * it), and every position they added reading the same missing value */
 static bool same_history(const mtable *mt, const table *t)
 {
     if (!t->nvers_at_lake || mt->nvers != t->nvers_at_lake || t->nvers < t->nvers_at_lake) return false;
     for (uint32_t k = 0; k < mt->nvers; k++) {
-        const schema *a = &mt->vers[k].s, *b = &t->vers[k].s;
-        if (mt->vers[k].since != t->vers[k].since || a->rawlen != b->rawlen || memcmp(a->raw, b->raw, a->rawlen) != 0)
+        const aver *a = &mt->vers[k], *b = &t->vers[k];
+        if (a->since != b->since || a->s.rawlen != b->s.rawlen || memcmp(a->s.raw, b->s.raw, a->s.rawlen) != 0 ||
+            memcmp(a->hash, b->hash, 32) != 0 || a->akind != b->akind || a->apos != b->apos || a->def_len != b->def_len ||
+            (a->def_len && memcmp(a->def, b->def, a->def_len) != 0))
             return false;
     }
-    const schema *ls = &mt->vers[mt->nvers - 1].s;
-    for (int c = mt->vers[0].s.ncols; c < ls->ncols; c++)
-        if (!val_same(&mt->missing[c], &t->missing[c], ls->c[c].type)) return false;
+    for (int p = mt->vers[0].npos; p < mt->vers[mt->nvers - 1].npos; p++) { /* each added position, by its ADD's type */
+        uint8_t ty = 0;
+        for (uint32_t k = 0; k < mt->nvers && !ty; k++)
+            if (mt->vers[k].at[p] >= 0) ty = mt->vers[k].s.c[mt->vers[k].at[p]].type;
+        if (!val_same(&mt->missing[p], &t->missing[p], ty)) return false;
+    }
     return true;
 }
 
@@ -3740,7 +4016,7 @@ static int cmd_verify(const char *dir, const char *anchor)
         for (uint32_t k = 0; k < S.t[i].nidx; k++) uk_free(S.t[i].idx[k].uk);
         uk_free(S.t[i].pkx.uk);
         free(S.t[i].vc);
-        for (uint32_t k = 0; k < S.t[i].nvers; k++) free(S.t[i].vers[k].s.raw); /* F1: its versions, their schemas' bytes */
+        for (uint32_t k = 0; k < S.t[i].nvers; k++) free(S.t[i].vers[k].s.raw), free(S.t[i].vers[k].def); /* F1: its versions' bytes */
         free(S.t[i].vers);
         for (int k = 0; k < MAX_COLS; k++) free(S.t[i].missing_text[k]);
         free(S.t[i].s.raw);

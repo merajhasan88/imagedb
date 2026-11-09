@@ -224,9 +224,10 @@ typedef struct sql_stmt {
     bool has_subject;
     sql_lit keys[IMDB_MAX_KEY_COLS];            /* SHOW HISTORY: the key, a value a key column (F4: (v1, v2, ...)) */
     uint8_t nkeys;
-    uint8_t alter_kind;                         /* ST_ALTER_TABLE (F1): IMDB_ALTER_*; ADD: schema.cols[0] the column */
+    uint8_t alter_kind;                         /* ST_ALTER_TABLE (F1): IMDB_ALTER_*; ADD: schema.cols[0] the column (SET TYPE:
+                                                   its new type); the other kinds but RENAME TO: alter_old the column */
     char alter_old[IMDB_MAX_IDENT + 1], alter_new[IMDB_MAX_IDENT + 1]; /* RENAME COLUMN old TO new; RENAME TO new */
-    sql_lit alter_def;                          /* ADD: its DEFAULT, when has_alter_def */
+    sql_lit alter_def;                          /* ADD and SET DEFAULT: the DEFAULT, when has_alter_def */
     bool has_alter_def;
     char set_name[IMDB_MAX_IDENT + 1];          /* SET */
     char set_value[IMDB_MAX_IDENT + 1];

@@ -4,8 +4,9 @@
  * canonical encoding, so the same logical content always produces the same
  * bytes on the primary, on every replica, and in any re-encoding.
  *
- * Segment ("IMDBSEG1", version 2), little-endian:
- *   header (64 B): magic[8] u32 version (2) u32 table schema_hash[32] u32 nrows
+ * Segment ("IMDBSEG1", version 3: F1 stage 4), little-endian:
+ *   header (64 B): magic[8] u32 version (3) u32 table version_hash[32] (imdb_sver_hash: the schema version that built
+ *                  it, its encoding and positions) u32 nrows
  *                  u32 ncols u32 nsections u32 reserved
  *   directory: nsections x { u32 kind, u32 col, u64 offset, u64 length }
  *   sections in canonical order, each 8-byte aligned, zero padding:
@@ -24,7 +25,7 @@
  *   Every version of a table is in exactly one segment of the manifest.
  *
  * Deletion vector ("IMDBDV01"): seg_hash[32] u32 count u32 0 | count x { u32 row, u32 0, u64 end }
- * Manifest ("IMDBMAN1"): u32 version (7) u32 nsections (11) db_id[16] u64 seq prev_hash[32] state_digest[32]
+ * Manifest ("IMDBMAN1"): u32 version (8) u32 nsections (11) db_id[16] u64 seq prev_hash[32] state_digest[32]
  *   prev_manifest[32] (the generation GC keeps beside this one; zero for the first manifest and
  *   after an ERASE, which keeps nothing) u64 boundary (the commit at or below which the log is retired; 0: none)
  *   then nsections sections, each u32 kind | u64 length | its bytes, the kinds 1 to 11 in order, each once (the format
@@ -39,13 +40,14 @@
  *     definition, log.h imdb_viewdef);
  *   3 sequences, 4 enums, 5 roles, 6 grants, 7 the replica set, 8 partition specs, 9 materialized views, 10 procedures,
  *     11 triggers: each u32 0 until its slice fills it (a non-zero count is a later format's: refused);
- *   nothing after the last. Versions 2 to 6 are refused by name (no reader before the freeze).
+ *   nothing after the last. Versions 2 to 7 are refused by name (no reader before the freeze; 7 named its segments'
+ *   versions by the schema alone, F1 stage 4).
  * LAKE_HEAD: "imagedb-lake 1\nseq <n>\nmanifest <64 hex>\n"
  */
 #ifndef IMDB_LAKE_H
 #define IMDB_LAKE_H
 
-/* manifest 7's sections, in their order (above) */
+/* a manifest's sections (since version 7), in their order (above) */
 enum {
     IMDB_MAN_TABLES = 1,
     IMDB_MAN_VIEWS,
@@ -70,6 +72,8 @@ enum {
 };
 
 #define IMDB_SEG_HEADER 64u
+#define IMDB_SEG_VERSION 3u /* F1 stage 4: the header names its schema version by imdb_sver_hash (2: by the schema alone) */
+#define IMDB_MANIFEST_VERSION 8u /* F1 stage 4 (7 before it: segment format 2); 2 to 7 refused by name (old_manifest) */
 #define IMDB_SEG_STUB 1u   /* erased: vid, begin and commitment only */
 #define IMDB_SEG_PURGED 2u /* purged by COMPACT ... PURGE: vid, begin, commitment and the SUBJECT value */
 
@@ -206,13 +210,18 @@ void imdb_seg_cache_check(const imdb_db *db);
  * ownership of bytes on success. Every structural rule of the canonical
  * encoding is enforced; nothing outside [bytes, bytes+len) is read. known: the bytes' SHA-256 when the caller checked
  * it already (an object read by its name: hashing a lake twice was most of a load's time); NULL: computed here. */
-/* F1: the hash a segment's header carries, of the schema version it was built under (a table's versions keep theirs) */
+/* F1: the hash of a schema's encoding alone (the manifest's "history ends at its schema") */
 int imdb_schema_hash(const imdb_schema *s, uint8_t out[32], imdb_err *e);
+/* F1 stage 4: a version's identity, the hash a segment's header names it by: SHA-256 over "IMDBSVR1", the schema's
+ * encoding and each column's position (u16; pos NULL: version 1's, column c at position c). Equal hashes mean equal
+ * layouts: a DROP COLUMN then an ADD COLUMN of the same column gives the old encoding at another position */
+int imdb_sver_hash(const imdb_schema *s, const uint16_t *pos, uint8_t out[32], imdb_err *e);
 /* F1: the same, by the version of h whose hash the header names: its image laid out for h's last version */
 int imdb_segment_parse_h(const imdb_schema_hist *h, uint8_t *bytes, size_t len, const uint8_t known[32], imdb_segment **out,
                          imdb_err *e);
-int imdb_segment_parse(const imdb_schema *s, uint8_t *bytes, size_t len, const uint8_t known[32], imdb_segment **out,
-                       imdb_err *e);
+/* vhash: the version hash the header must carry (imdb_sver_hash of the version s is) */
+int imdb_segment_parse(const imdb_schema *s, const uint8_t vhash[32], uint8_t *bytes, size_t len, const uint8_t known[32],
+                       imdb_segment **out, imdb_err *e);
 void imdb_segment_free(imdb_segment *g);
 /* Recomputes every non-stub row's commitment from the columns. */
 int imdb_segment_check_commitments(const imdb_schema_hist *h, const imdb_segment *g, const imdb_segimg *gi, imdb_err *e);
@@ -246,7 +255,7 @@ typedef struct imdb_manifest_tab {
     uint64_t created_at, dropped_at; /* version 5 (1f): the commits that created and dropped it (0: live) */
     /* F1: its schema history, made by the parse from version 1 and each ALTER at its commit (the table's entry ends
      * with u32 nalter; when not 0, version 1's schema as u32 length and bytes, then each ALTER as u64 commit and
-     * op 22's body: imdb_alter_put), which wants each ALTER valid on the version before it (imdb_alter_schema),
+     * op 22's body: imdb_alter_put), which wants each ALTER valid on the version before it (imdb_sver_next),
      * after the CREATE, at or before the snapshot and before a drop, and the last version to be s. A consumer may
      * take it whole (and zero it): imdb_manifest_free frees what is left */
     imdb_schema_hist hist;

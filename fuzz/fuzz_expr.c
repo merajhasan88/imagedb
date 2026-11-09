@@ -149,6 +149,7 @@ static void s1(const uint8_t *data, size_t size, const imdb_xval *a, const imdb_
             strcpy(col.name, "c");
             col.type = CT[c];
             col.precision = (uint8_t)(1 + data[38] % 18);
+            if (col.type == IMDB_T_INT64) col.precision = (uint8_t)(data[38] % 3 == 1 ? 16 : data[38] % 3 == 2 ? 32 : 0); /* F3a */
             col.scale = (uint8_t)(data[39] % (col.precision + 1u));
             imdb_xval out;
             imdb_xmark mk = imdb_xarena_mark(&arena);
@@ -164,6 +165,7 @@ static void s1(const uint8_t *data, size_t size, const imdb_xval *a, const imdb_
                     col.type != IMDB_T_TIMESTAMP && col.type != IMDB_T_TIMESTAMPTZ)
                     bounds(&out, col.type, 0);
                 if (!out.null && col.type == IMDB_T_BOOL && out.i != 0 && out.i != 1) abort();
+                if (!out.null && col.type == IMDB_T_INT64 && !imdb_int_fits(col.precision, (int64_t)out.i)) abort(); /* F3a */
                 if (col.type == IMDB_T_TEXT && !text_ok(&out)) abort();
             }
             imdb_xarena_reset(&arena, mk);
@@ -231,6 +233,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     strcpy(c.name, "c");
     c.type = CT[data[37] % 4];
     c.precision = (uint8_t)(1 + data[38] % 18);
+    if (c.type == IMDB_T_INT64) c.precision = (uint8_t)(data[38] % 3 == 1 ? 16 : data[38] % 3 == 2 ? 32 : 0); /* F3a */
     c.scale = (uint8_t)(data[39] % (c.precision + 1u));
     c.flags = IMDB_COL_NULLABLE;
     imdb_value out;

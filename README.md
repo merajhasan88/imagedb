@@ -593,9 +593,15 @@ rollback, savepoints, `WITH (NOLOCK)` and optimistic `SELECT ... FOR UPDATE`
 round to short ones writing the same row, so retry with backoff). SERIALIZABLE
 is refused; snapshot write skew is possible.
 
-Types: INT64, DECIMAL, TEXT, BOOL, TIMESTAMP, TIMESTAMPTZ, finite FLOAT64 (exact SUM,
-rounded once) and nullable non-key columns. Comparisons with NULL, including
-NULL parameters, are refused: use IS NULL / IS NOT NULL.
+Types: INT64 (BIGINT, INT8), INTEGER (INT, INT4: 32 bits), SMALLINT (INT2: 16 bits),
+DECIMAL, TEXT, BOOL, TIMESTAMP, TIMESTAMPTZ, finite FLOAT64 (exact SUM, rounded
+once) and nullable non-key columns. SMALLINT and INTEGER are INT64 values checked
+against their range at every write (INSERT, UPDATE, COPY, a DEFAULT) and in
+`CAST(x AS SMALLINT)`; arithmetic over them is INT64's (a SMALLINT sum past 32767
+is a value until it is written back). INT and INTEGER were INT64 before; they are
+32 bits now. `ALTER TABLE ... ALTER COLUMN c TYPE INTEGER` widens a SMALLINT (and
+either to BIGINT) as metadata. Comparisons with NULL, including NULL parameters,
+are refused: use IS NULL / IS NOT NULL.
 
 Time zones: TIMESTAMPTZ (`TIMESTAMP WITH TIME ZONE`) holds an instant (UTC
 microseconds) and shows it in the session's zone, `SET TIME ZONE
@@ -628,15 +634,24 @@ lists a key's versions.
 
 ALTER TABLE: `ADD [COLUMN] c type [NULL | NOT NULL] [DEFAULT literal]` (NOT NULL
 needs a DEFAULT; the rows already there read it, or NULL, and an INSERT or COPY
-that leaves the column out writes it, a dump writing such a column as an ALTER TABLE
-ADD after its CREATE TABLE), `RENAME [COLUMN] a TO b`, `RENAME TO u`, and `SET
+that leaves the column out writes it), `DROP [COLUMN] c`, `ALTER [COLUMN] c` with
+`SET NOT NULL` (every row must hold a value), `DROP NOT NULL`, `SET DEFAULT
+literal` (what later INSERTs and COPYs write; the rows already there keep what
+they read), `DROP DEFAULT` or `[SET DATA] TYPE t` (a widening alone: a DECIMAL to a wider precision of
+the same scale, an integer to a wider one), `RENAME [COLUMN] a TO b`, `RENAME TO u`, and `SET
 RETENTION`; each alone, outside a transaction, a metadata change that rewrites no
-row (the lake's older segments read the added column as its DEFAULT). A table
-has at most 256 schema versions and 64 column positions. A rename of a table a
-view names is refused, as is an ADD of a name a view reading the table uses (drop
-the view, alter, create it again). A transaction that wrote the table before an
-ALTER cannot commit after it. Not yet: DROP COLUMN, SET / DROP NOT NULL and
-DEFAULT, type changes.
+row. A table has at most 256 schema versions and 64 column positions (a dropped
+column keeps its own). A key column and the SUBJECT are never dropped and stay
+NOT NULL; a column an index names is not dropped (drop the index first). A
+rename of a table a view names is refused, as are an ADD and a DROP of a name a
+view reading the table uses (drop the view, alter, create it again). A
+transaction that wrote the table before an ALTER cannot commit after it. AS OF
+reads the current schema: older rows read an added column's DEFAULT (or NULL), a
+renamed column by its new name, and a dropped column is in no read, past ones
+included. DROP COLUMN erases nothing: the values stay in the history (the log and
+the lake) until those versions are retired or erased, as any row's do; to remove a
+person's data use ERASE SUBJECT. A dump writes each table's columns in its CREATE
+TABLE and each DEFAULT as `ALTER TABLE ... ALTER COLUMN ... SET DEFAULT`.
 
 TEXT is UTF-8, validated, without NUL, and compared and ordered byte by byte: there
 are no collations. Platforms: see Build and quickstart.

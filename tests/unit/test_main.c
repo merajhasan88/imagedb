@@ -123,6 +123,7 @@ int main(int argc, char **argv)
         {"qmem", qmem_tests, &qmem_ntests},
         {"ckey", ckey_tests, &ckey_ntests}, /* P2 F4 */
         {"alter", alter_tests, &alter_ntests}, /* P2 F1 */
+        {"intw", intw_tests, &intw_ntests}, /* F3a: SMALLINT and INTEGER */
         {"tz", tz_tests, &tz_ntests}, /* P2: time zones */
         {"tzsql", tzsql_tests, &tzsql_ntests}, /* P2: time zones through the engine */
     };

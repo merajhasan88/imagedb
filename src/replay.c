@@ -261,7 +261,11 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
             break;
         case IMDB_OP_ALTER_TABLE: { /* F1: the rules against the table at the commit, then its next version */
             imdb_err e2 = {0};
-            if (imdb_alter_check(db, t, o, &e2))
+            int arc = imdb_alter_check(db, t, o, &e2); /* SET NOT NULL reads the live rows: a failed read is not the log's */
+            if (arc == IMDB_ERR_IO || arc == IMDB_ERR_NOMEM)
+                rc = imdb_fail(e, arc, "commit %llu: ALTER TABLE of table %u: %s", (unsigned long long)seq, o->table,
+                               e2.msg);
+            else if (arc)
                 rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: ALTER TABLE of table %u: %s", (unsigned long long)seq,
                                o->table, e2.msg);
             else if (!(rc = imdb_alter_prepare(t, o, e)))

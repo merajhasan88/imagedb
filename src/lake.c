@@ -66,12 +66,40 @@ static uint32_t seg_layout(const imdb_schema *s, uint32_t n, const uint64_t *tex
     return k;
 }
 
-/* Fails rather than hash a short encoding: the hash goes into segments, and from them into signed manifests. */
+/* Fails rather than hash a short encoding: the hash goes into signed manifests. */
 int imdb_schema_hash(const imdb_schema *s, uint8_t out[32], imdb_err *e)
 {
     imdb_buf b;
     imdb_buf_init(&b);
     imdb_schema_encode(s, &b);
+    int rc = imdb_buf_check(&b, e);
+    if (!rc) imdb_sha256(b.p, b.len, out);
+    imdb_buf_free(&b);
+    return rc;
+}
+
+/* two schemas of one encoding, field by field (what imdb_schema_encode writes), allocating nothing */
+static bool schema_same(const imdb_schema *a, const imdb_schema *b)
+{
+    if (a->id != b->id || strcmp(a->name, b->name) != 0 || a->ncols != b->ncols || a->npk != b->npk) return false;
+    for (uint16_t c = 0; c < a->ncols; c++) {
+        const imdb_column *x = &a->cols[c], *y = &b->cols[c];
+        if (strcmp(x->name, y->name) != 0 || x->type != y->type || x->precision != y->precision || x->scale != y->scale ||
+            x->flags != y->flags)
+            return false;
+    }
+    for (uint8_t k = 0; k < a->npk; k++)
+        if (a->key[k] != b->key[k]) return false;
+    return true;
+}
+
+int imdb_sver_hash(const imdb_schema *s, const uint16_t *pos, uint8_t out[32], imdb_err *e)
+{
+    imdb_buf b;
+    imdb_buf_init(&b);
+    imdb_buf_put(&b, "IMDBSVR1", 8);
+    imdb_schema_encode(s, &b);
+    for (uint16_t c = 0; c < s->ncols; c++) imdb_buf_put_u16(&b, pos ? pos[c] : c);
     int rc = imdb_buf_check(&b, e);
     if (!rc) imdb_sha256(b.p, b.len, out);
     imdb_buf_free(&b);
@@ -110,6 +138,42 @@ static void seg_relayout(const imdb_schema_hist *h, imdb_segimg *gi)
     __atomic_store_n(&gi->laid, h->nvers - 1, __ATOMIC_RELEASE);
 }
 
+/* F1 stage 4: whether version u holds every position version w has (no DROP COLUMN of one between them: positions
+ * are never reused, so one dropped never comes back) */
+static bool seg_holds(const imdb_schema_hist *h, uint32_t w, uint32_t u)
+{
+    const imdb_sver *wv = &h->vers[w], *uv = &h->vers[u];
+    for (uint16_t k = 0; k < wv->s.ncols; k++)
+        if (uv->at[wv->pos[k]] < 0) return false;
+    return true;
+}
+
+/* F1 stage 4: whether a segment of version u can be built with a row of version w (design.md §5, Schema versions):
+ * u not older, holding w's positions, and every value a w row reads at a position of u (its own, or the missing
+ * value where w lacks the position) storable there: u's column nullable, or that reading never NULL. A row's values
+ * are not consulted, so the grouping is the history's alone */
+static bool seg_feasible(const imdb_schema_hist *h, uint32_t w, uint32_t u)
+{
+    if (u < w || !seg_holds(h, w, u)) return false;
+    const imdb_sver *wv = &h->vers[w], *uv = &h->vers[u];
+    for (uint16_t c = 0; c < uv->s.ncols; c++) {
+        if (uv->s.cols[c].flags & IMDB_COL_NULLABLE) continue;
+        uint16_t p = uv->pos[c];
+        int k = wv->at[p];
+        if (k >= 0 ? (wv->s.cols[k].flags & IMDB_COL_NULLABLE) != 0 : h->tcol[p].missing.null) return false;
+    }
+    return true;
+}
+
+/* the last version a w row can be built into: the one before the first infeasible one after w (a DROP NOT NULL can
+ * make a later one feasible again, but a run is built at one version every row of it reaches: a contiguous span) */
+static uint32_t seg_reach(const imdb_schema_hist *h, uint32_t w)
+{
+    uint32_t u = w;
+    while (u + 1 < h->nvers && seg_feasible(h, w, u + 1)) u++;
+    return u;
+}
+
 int imdb_segment_parse_h(const imdb_schema_hist *h, uint8_t *b, size_t len, const uint8_t known[32], imdb_segment **out,
                          imdb_err *e)
 {
@@ -122,9 +186,25 @@ int imdb_segment_parse_h(const imdb_schema_hist *h, uint8_t *b, size_t len, cons
             break;
         }
     if (v == h->nvers) return imdb_fail(e, IMDB_ERR_CORRUPT, "segment: schema hash mismatch");
-    int rc = imdb_segment_parse(&h->vers[v].s, b, len, known, out, e);
+    int rc = imdb_segment_parse(&h->vers[v].s, h->vers[v].hash, b, len, known, out, e);
     if (rc) return rc;
     imdb_segment *g = *out;
+    /* F1 stage 4: no row with values of a later version than its segment, or of a position it does not hold (a DROP
+     * between them): a rebuild reads a row through the file's own columns at its version's positions (src_get), so
+     * this is the load's, not only VERIFY's. The bytes stay the caller's on a refusal, as on any other */
+    for (uint32_t i = 0, w = UINT32_MAX; h->nvers > 1 && i < g->nrows; i++) {
+        if (g->img_->flags[i]) continue;
+        uint64_t at = g->img_->begin[i]; /* rows nearly in version order: the row before's version first */
+        if (w != UINT32_MAX && at >= h->vers[w].since && (w + 1 == h->nvers || at < h->vers[w + 1].since)) continue;
+        uint32_t rw = (uint32_t)(imdb_hist_at(h, at) - h->vers);
+        if (rw > v || !seg_holds(h, rw, v)) {
+            g->img_->bytes = NULL;
+            imdb_segment_free(g);
+            *out = NULL;
+            return imdb_fail(e, IMDB_ERR_CORRUPT, "segment: row %u is of a schema version its segment cannot hold", i);
+        }
+        w = rw;
+    }
     g->gver = v;
     g->img_->gver = g->img_->laid = v;
     if (v + 1 < h->nvers) seg_relayout(h, g->img_);
@@ -189,19 +269,20 @@ static bool seg_keeps(uint8_t flags, const imdb_schema *s, uint32_t c)
     return flags == 0 || (flags == IMDB_SEG_PURGED && (int)c == s->subject);
 }
 
-int imdb_segment_parse(const imdb_schema *s, uint8_t *b, size_t len, const uint8_t known[32], imdb_segment **out,
-                       imdb_err *e)
+int imdb_segment_parse(const imdb_schema *s, const uint8_t vhash[32], uint8_t *b, size_t len, const uint8_t known[32],
+                       imdb_segment **out, imdb_err *e)
 {
     *out = NULL;
     if (len < IMDB_SEG_HEADER || memcmp(b, kSegMagic, 8) != 0) return imdb_fail(e, IMDB_ERR_CORRUPT, "segment: bad magic");
     if (((uintptr_t)b & 7) != 0) return imdb_fail(e, IMDB_ERR_INVALID, "segment: buffer not 8-byte aligned");
     uint32_t ver = imdb_get_le32(b + 8), table = imdb_get_le32(b + 12);
     uint32_t n = imdb_get_le32(b + 48), ncols = imdb_get_le32(b + 52), nsec = imdb_get_le32(b + 56);
-    if (ver != 2) return imdb_fail(e, IMDB_ERR_CORRUPT, "segment: unsupported version");
+    if (ver == 2) /* F1 stage 4: the header named its version by the schema's hash alone (refused by name, as the
+                     formats before the format design's slice 1 are) */
+        return imdb_fail(e, IMDB_ERR_CORRUPT, "segment: version 2, before schema versions by position, is not read");
+    if (ver != IMDB_SEG_VERSION) return imdb_fail(e, IMDB_ERR_CORRUPT, "segment: unsupported version");
     if (table != s->id) return imdb_fail(e, IMDB_ERR_CORRUPT, "segment: belongs to another table");
-    uint8_t sh[32];
-    if (imdb_schema_hash(s, sh, e)) return e->code;
-    if (memcmp(sh, b + 16, 32) != 0) return imdb_fail(e, IMDB_ERR_CORRUPT, "segment: schema hash mismatch");
+    if (memcmp(vhash, b + 16, 32) != 0) return imdb_fail(e, IMDB_ERR_CORRUPT, "segment: schema hash mismatch");
     if (n > IMDB_MAX_SEGMENT_ROWS) return imdb_fail(e, IMDB_ERR_CORRUPT, "segment: too many rows");
     if (ncols != s->ncols || imdb_get_le32(b + 60) != 0) return imdb_fail(e, IMDB_ERR_CORRUPT, "segment: bad header");
     secdesc want[SEG_MAX_SECTIONS];
@@ -276,6 +357,7 @@ int imdb_segment_parse(const imdb_schema *s, uint8_t *b, size_t len, const uint8
                 if (!seg_keeps(gi->flags[i], s, c) || (vb && !valid_bit(vb, i))) {
                     if (v) rc = imdb_fail(e, IMDB_ERR_CORRUPT, "segment: a row without a value in column %s keeps data", col->name);
                 } else if ((col->type == IMDB_T_DECIMAL && (v > lim || v < -lim)) ||
+                           (col->type == IMDB_T_INT64 && !imdb_int_fits(col->precision, v)) || /* F3a */
                            ((col->type == IMDB_T_TIMESTAMP || col->type == IMDB_T_TIMESTAMPTZ) && (v < TS_MIN || v > TS_MAX)) ||
                            (col->type == IMDB_T_FLOAT64 && !imdb_f64_key_valid(v))) {
                     rc = imdb_fail(e, IMDB_ERR_CORRUPT, "segment: value out of range in column %s", col->name);
@@ -504,22 +586,26 @@ static const uint8_t *src_commit(const imdb_table *t, const seg_src *s)
     return s->g ? s->g->commit + 32u * s->r : imdb_vc(t, s->vid)->commit;
 }
 
-/* column c of a (non-stub) row */
-static void src_get(const imdb_table *t, const seg_src *s, uint32_t c, imdb_value *v)
+/* column c of a segment of version bv being built, for a row (a stub: its SUBJECT alone) of version rv: by position,
+ * its own value where rv has the position, else the missing value (a column added after it). rv's positions are
+ * bv's (seg_feasible), and a source segment's are its rows' (imdb_segment_parse_h refuses any other) */
+static void src_get(const imdb_table *t, const seg_src *s, const imdb_sver *rv, const imdb_sver *bv, uint32_t c,
+                    imdb_value *v)
 {
+    uint16_t p = bv->pos[c];
+    int k = rv->at[p];
+    if (k < 0) {
+        *v = t->hist.tcol[p].missing;
+        return;
+    }
     if (s->g) {
-        seg_get(&t->s, s->g, s->r, c, v);
+        const imdb_sver *gv = &t->hist.vers[s->g->gver];
+        int j = gv->at[p];
+        segcol_get(&gv->s.cols[j], &s->g->ocol[j], s->r, v);
         return;
     }
     const imdb_version *ver = imdb_vh(t, s->vid);
-    const imdb_sver *rv = t->hist.nvers > 1 ? imdb_sver_at(t, ver->begin) : NULL; /* F1: by its own version */
-    if (rv && rv != &t->hist.vers[t->hist.nvers - 1]) {
-        uint16_t p = t->hist.vers[t->hist.nvers - 1].pos[c];
-        if (rv->at[p] < 0) *v = t->hist.tcol[p].missing; /* a column added after it: what it reads */
-        else imdb_row_get(&rv->s, t->arena.p + ver->row_off, ver->row_len, rv->at[p], v);
-        return;
-    }
-    imdb_row_get(&t->s, t->arena.p + ver->row_off, ver->row_len, (int)c, v);
+    imdb_row_get(&rv->s, t->arena.p + ver->row_off, ver->row_len, k, v);
 }
 
 /* Row flags of a version in a segment being built (lake.h): erased before or by this ERASE, purged before or by
@@ -601,21 +687,71 @@ static void src_rows(const imdb_segment *g, const imdb_segimg *gi, seg_src *out)
     for (uint32_t i = 0; i < g->nrows; i++) out[i] = (seg_src){gi, i, gi->vid[i]};
 }
 
-static int seg_build(const imdb_table *t, const seg_src *src, uint32_t n, const erased_set *es,
+_Static_assert(IMDB_MAX_SCHEMA_VERSIONS <= 256, "a row's version index is a byte in seg_build");
+
+/* a row's schema version, as an index into the table's history */
+static uint32_t src_ver(const imdb_table *t, const seg_src *s)
+{
+    return (uint32_t)(imdb_hist_at(&t->hist, src_begin(t, s)) - t->hist.vers);
+}
+
+/* F1 stage 4: the runs src[0..n) is built in (design.md §5, Schema versions): rows in vid order, each run the longest
+ * prefix, at most max rows, whose rows with values (a stub keeps only its SUBJECT, which no ALTER drops or changes)
+ * all reach one version (max w <= min reach), built at the least reach (the last version when nothing cuts: every
+ * build before stage 4 was). Writes run k's end and version at end[k], ver[k] when they are not NULL; returns the
+ * runs. One pass, the same for every copy: a replica builds the same segments */
+static uint64_t seg_runs(const imdb_table *t, const seg_src *src, uint64_t n, const erased_set *es, uint64_t purge_before,
+                         uint32_t max, uint64_t *end, uint32_t *ver)
+{
+    const imdb_schema_hist *h = &t->hist;
+    uint32_t last = h->nvers - 1;
+    uint64_t nr = 0;
+    uint8_t reach[IMDB_MAX_SCHEMA_VERSIONS];
+    for (uint32_t w = 0; w < h->nvers && last; w++) reach[w] = (uint8_t)seg_reach(h, w);
+    for (uint64_t i = 0; i < n;) {
+        uint32_t lo = 0, hi = last; /* the run's max w and min reach so far */
+        uint64_t j = i;
+        for (; j < n && j - i < max; j++) {
+            if (!last || src_flags(t, &src[j], es, purge_before)) continue; /* one version: only the row limit cuts */
+            uint32_t rw = src_ver(t, &src[j]), nlo = rw > lo ? rw : lo, nhi = reach[rw] < hi ? reach[rw] : hi;
+            if (nlo > nhi) break; /* row j begins the next run */
+            lo = nlo, hi = nhi;
+        }
+        if (end) end[nr] = j, ver[nr] = hi;
+        nr++;
+        i = j;
+    }
+    return nr;
+}
+
+static int seg_build(const imdb_table *t, uint32_t gver, const seg_src *src, uint32_t n, const erased_set *es,
                      uint64_t purge_before, imdb_segment **out, imdb_err *e)
 {
-    const imdb_schema *s = &t->s;
+    if (!t->hist.nvers || gver >= t->hist.nvers) return imdb_fail(e, IMDB_ERR_STATE, "segment build: no such schema version");
+    const imdb_sver *bv = &t->hist.vers[gver];
+    const imdb_schema *s = &bv->s;
     if (n > IMDB_MAX_SEGMENT_ROWS) return imdb_fail(e, IMDB_ERR_LIMIT, "segment would exceed %u rows", IMDB_MAX_SEGMENT_ROWS);
-    uint8_t *fl = imdb_alloc(n ? n : 1, e);
+    uint8_t *fl = imdb_alloc(2u * (size_t)(n ? n : 1), e), *rver = fl + (n ? n : 1); /* each row's flags, its version */
     if (!fl) return e->code;
-    for (uint32_t i = 0; i < n; i++) fl[i] = src_flags(t, &src[i], es, purge_before);
+    for (uint32_t i = 0, w = UINT32_MAX; i < n; i++) {
+        fl[i] = src_flags(t, &src[i], es, purge_before);
+        uint32_t rw = src_ver(t, &src[i]);
+        rver[i] = (uint8_t)rw;
+        if (fl[i] || rw == w) continue;
+        if (!seg_feasible(&t->hist, rw, gver)) { /* seg_runs made the run: never its rows' versions' miss */
+            imdb_free(fl);
+            return imdb_fail(e, IMDB_ERR_STATE, "segment build: a row of schema version %u in a segment of version %u",
+                             rw + 1, gver + 1);
+        }
+        w = rw;
+    }
     uint64_t text_len[IMDB_MAX_COLS] = {0};
     for (uint32_t c = 0; c < s->ncols; c++) {
         if (s->cols[c].type != IMDB_T_TEXT) continue;
         for (uint32_t i = 0; i < n; i++) {
             if (!seg_keeps(fl[i], s, c)) continue;
             imdb_value v;
-            src_get(t, &src[i], c, &v);
+            src_get(t, &src[i], &t->hist.vers[rver[i]], bv, c, &v);
             text_len[c] += v.len;
         }
         if (text_len[c] > UINT32_MAX) {
@@ -642,13 +778,9 @@ static int seg_build(const imdb_table *t, const seg_src *src, uint32_t n, const 
         return e->code;
     }
     memcpy(b, kSegMagic, 8);
-    imdb_le32(b + 8, 2);
+    imdb_le32(b + 8, IMDB_SEG_VERSION);
     imdb_le32(b + 12, s->id);
-    if (imdb_schema_hash(s, b + 16, e)) {
-        imdb_free(b);
-        imdb_free(fl);
-        return e->code;
-    }
+    memcpy(b + 16, bv->hash, 32); /* F1 stage 4: the version's hash (imdb_sver_hash), not the schema's alone */
     imdb_le32(b + 48, n);
     imdb_le32(b + 52, s->ncols);
     imdb_le32(b + 56, nsec);
@@ -668,6 +800,7 @@ static int seg_build(const imdb_table *t, const seg_src *src, uint32_t n, const 
         memcpy(b + off[4] + 32u * i, src_commit(t, si), 32);
     }
     uint32_t k = 5;
+    bool lost = false; /* a NULL where the column has no validity section: seg_feasible rules it out */
     uint8_t *zm = b + off[nsec - 1];
     for (uint32_t c = 0; c < s->ncols; c++) {
         bool has = false, has_null = false;
@@ -680,8 +813,9 @@ static int seg_build(const imdb_table *t, const seg_src *src, uint32_t n, const 
                 imdb_le32(o + 4u * i, at);
                 if (!seg_keeps(fl[i], s, c)) continue;
                 imdb_value v;
-                src_get(t, &src[i], c, &v);
+                src_get(t, &src[i], &t->hist.vers[rver[i]], bv, c, &v);
                 if (v.null) {
+                    lost |= !vb;
                     has_null |= !fl[i];
                     continue;
                 }
@@ -695,8 +829,9 @@ static int seg_build(const imdb_table *t, const seg_src *src, uint32_t n, const 
             for (uint32_t i = 0; i < n; i++) {
                 if (!seg_keeps(fl[i], s, c)) continue;
                 imdb_value v;
-                src_get(t, &src[i], c, &v);
+                src_get(t, &src[i], &t->hist.vers[rver[i]], bv, c, &v);
                 if (v.null) {
+                    lost |= !vb;
                     has_null |= !fl[i];
                     continue;
                 }
@@ -717,19 +852,37 @@ static int seg_build(const imdb_table *t, const seg_src *src, uint32_t n, const 
         imdb_le64(zm + 24u * c + 16, (uint64_t)mx);
     }
     imdb_free(fl);
+    if (lost) {
+        imdb_free(b);
+        return imdb_fail(e, IMDB_ERR_STATE, "segment build: a NULL in a column without NULLs");
+    }
     /* Parse our own output: the encoder is always checked by the strict decoder. */
     imdb_segment *g;
-    int rc = imdb_segment_parse(s, b, pos, NULL, &g, e); /* built here: hashed here */
+    int rc = imdb_segment_parse(s, bv->hash, b, pos, NULL, &g, e); /* built here: hashed here */
     if (rc) {
         imdb_free(b);
         return rc;
     }
-    g->gver = g->img_->gver = g->img_->laid = t->hist.nvers ? t->hist.nvers - 1 : 0; /* F1: built at the last version */
+    g->gver = g->img_->gver = g->img_->laid = gver; /* F1: built at its run's version (seg_runs) */
+    if (gver + 1 < t->hist.nvers) seg_relayout(&t->hist, g->img_);
     imdb_segimg *gi = imdb_seg_pin(NULL, g, e); /* a segment just built: apart from any table, resident */
     for (uint32_t i = 0; i < n; i++) gi->end[i] = src_end(t, &src[i]);
     seg_marks(g, gi);
     *out = g;
     return IMDB_OK;
+}
+
+/* One segment's rows built again (RETIRE's split, ERASE's rewrite, whose record maps one segment to one): one run,
+ * since the rows were together at their segment's version and each reaches at least that far; refused, not trusted */
+static int seg_build_one(const imdb_table *t, const seg_src *src, uint32_t n, const erased_set *es, imdb_segment **out,
+                         imdb_err *e)
+{
+    uint64_t end;
+    uint32_t ver;
+    if (!n || seg_runs(t, src, n, es, 0, IMDB_MAX_SEGMENT_ROWS, NULL, NULL) != 1)
+        return imdb_fail(e, IMDB_ERR_STATE, "segment rebuild: its rows do not fit one schema version");
+    seg_runs(t, src, n, es, 0, IMDB_MAX_SEGMENT_ROWS, &end, &ver);
+    return seg_build(t, ver, src, n, es, 0, out, e);
 }
 
 /* ---- deletion vectors ----------------------------------------------------- */
@@ -913,6 +1066,9 @@ static int old_manifest(uint32_t ver, imdb_err *e)
     if (ver == 5)
         return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 5: this lake was written by an imagedb before views' "
                          "format (manifest 6, P2 S7), which this version does not read");
+    if (ver == 7) /* F1 stage 4: its segments named their versions by the schema alone (segment format 2) */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 7: this lake was written by an imagedb before schema "
+                         "versions by position (manifest 8, segment format 3, 2026-11-08), which this version does not read");
     return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version %u: this lake was written by an imagedb before the format "
                      "design's sections (manifest 7, 2026-11-07), which this version does not read", ver);
 }
@@ -924,10 +1080,10 @@ int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err
     imdb_rd_init(&r, b, len);
     const uint8_t *mg = imdb_rd_bytes(&r, 8);
     if (!mg || memcmp(mg, kManMagic, 8) != 0) return imdb_fail(e, IMDB_ERR_CORRUPT, "manifest: bad magic");
-    uint32_t ver = imdb_rd_u32(&r); /* 7: 6's tables and views, then the format design's sections, all present (no reader
-                                     * for 2-6) */
-    if (ver >= 2 && ver <= 6) return old_manifest(ver, e);
-    if (ver != 7) return imdb_fail(e, IMDB_ERR_CORRUPT, "manifest: unsupported version");
+    uint32_t ver = imdb_rd_u32(&r); /* 8 (F1 stage 4; 7 before it): 6's tables and views, then the format design's
+                                     * sections, all present (no reader for 2-7) */
+    if (ver >= 2 && ver <= IMDB_MANIFEST_VERSION - 1) return old_manifest(ver, e);
+    if (ver != IMDB_MANIFEST_VERSION) return imdb_fail(e, IMDB_ERR_CORRUPT, "manifest: unsupported version");
     uint32_t nsec = imdb_rd_u32(&r); /* manifest 7: the sections after the header, every one (lake.h) */
     imdb_rd_copy(&r, m->db_id, 16);
     m->seq = imdb_rd_u64(&r);
@@ -1012,10 +1168,10 @@ int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err
             imdb_op o;
             memset(&o, 0, sizeof o);
             imdb_err ea = {0};
-            imdb_schema next;
+            imdb_sver next;
             bool ok = !r.err && !imdb_alter_get(&r, &o, "manifest", &ea) && !r.err && at > last && at <= m->seq &&
                       (!t->dropped_at || at < t->dropped_at) &&
-                      !imdb_alter_schema(&t->hist.vers[t->hist.nvers - 1].s, &o, &next, &ea);
+                      !imdb_sver_next(&t->hist, &t->hist.vers[t->hist.nvers - 1], &o, &next, &ea);
             int prc = ok ? imdb_hist_prepare(&t->hist, &o, e) : IMDB_OK;
             if (ok && !prc) imdb_hist_install(&t->hist, &o, at);
             imdb_free(o.aname);
@@ -1026,12 +1182,7 @@ int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err
             if (!ok) goto bad;
             last = at;
         }
-        uint8_t hs[32];
-        if ((hrc = imdb_schema_hash(&t->s, hs, e))) {
-            imdb_manifest_free(m);
-            return hrc;
-        }
-        if (memcmp(hs, t->hist.vers[t->hist.nvers - 1].hash, 32) != 0) goto bad; /* the history ends at its schema */
+        if (!schema_same(&t->s, &t->hist.vers[t->hist.nvers - 1].s)) goto bad; /* the history ends at its schema */
     }
     if (r.err || r.off != send || man_section(&r, IMDB_MAN_VIEWS, &send)) goto bad;
     uint32_t nv = imdb_rd_u32(&r); /* P2 S7: each view by id, a live one's definition after it */
@@ -1361,7 +1512,7 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
                 for (uint32_t i = 0, n = 0; i < g->nrows; i++)
                     if (!ended_by(gi->end[i], purge_before)) srcs[n++] = (seg_src){gi, i, gi->vid[i]}; /* vid order kept */
                 imdb_segment *ng;
-                if ((rc = seg_build(t, srcs, keep, NULL, 0, &ng, e))) break;
+                if ((rc = seg_build_one(t, srcs, keep, NULL, &ng, e))) break;
                 if ((rc = pt_push(pt, ng, true, e))) {
                     imdb_segment_free(ng);
                     break;
@@ -1382,7 +1533,7 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
             }
             src_rows(g, gi, srcs);
             imdb_segment *ng;
-            if ((rc = seg_build(t, srcs, g->nrows, es, 0, &ng, e))) break;
+            if ((rc = seg_build_one(t, srcs, g->nrows, es, &ng, e))) break;
             if ((rc = pt_push(pt, ng, true, e))) {
                 imdb_segment_free(ng);
                 break;
@@ -1420,12 +1571,32 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
                 break;
             }
             for (uint64_t i = 0; i < cnt; i++) srcs[i] = (seg_src){NULL, 0, t->mem_first + i};
-            imdb_segment *ng;
-            if ((rc = seg_build(t, srcs, (uint32_t)cnt, es, 0, &ng, e))) break;
-            if ((rc = pt_push(pt, ng, true, e))) {
-                imdb_segment_free(ng);
-                break;
+            /* F1 stage 4: one segment, or one a run when a DROP COLUMN or a SET NOT NULL cuts them (seg_runs); a few
+             * runs' ends on the stack, so a flush allocates no more than it did */
+            uint64_t nr = seg_runs(t, srcs, cnt, es, 0, IMDB_MAX_SEGMENT_ROWS, NULL, NULL), at = 0, end4[4];
+            uint32_t ver4[4];
+            uint64_t *rend = end4;
+            uint32_t *rver = ver4;
+            if (nr > 4) {
+                rend = imdb_alloc_array(nr, sizeof *rend, e);
+                rver = rend ? imdb_alloc_array(nr, sizeof *rver, e) : NULL;
+                if (!rver) {
+                    imdb_free(rend);
+                    rc = e->code;
+                    break;
+                }
             }
+            seg_runs(t, srcs, cnt, es, 0, IMDB_MAX_SEGMENT_ROWS, rend, rver);
+            for (uint64_t k = 0; k < nr && !rc; at = rend[k++]) {
+                imdb_segment *ng;
+                if ((rc = seg_build(t, rver[k], srcs + at, (uint32_t)(rend[k] - at), es, 0, &ng, e))) break;
+                if ((rc = pt_push(pt, ng, true, e))) imdb_segment_free(ng);
+            }
+            if (rend != end4) {
+                imdb_free(rend);
+                imdb_free(rver);
+            }
+            if (rc) break;
             pt->flushed = true;
         }
         /* compaction: merge every version into as few segments as the row limit
@@ -1450,16 +1621,33 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
                 src_rows(pt->seg[k], gk, srcs + m);
                 m += pt->seg[k]->nrows;
             }
-            imdb_segment **merged = imdb_alloc_array(m / IMDB_MAX_SEGMENT_ROWS + 1, sizeof *merged, e);
-            if (!merged) {
+            if (rc) break;
+            /* the runs first (F1 stage 4: the row limit's, and a DROP COLUMN's or SET NOT NULL's cuts), then the room; a
+             * few runs' ends on the stack */
+            uint64_t nr = seg_runs(t, srcs, m, es, purge_before, IMDB_MAX_SEGMENT_ROWS, NULL, NULL), end4[4];
+            uint32_t ver4[4];
+            uint64_t *rend = end4;
+            uint32_t *rver = ver4;
+            imdb_segment **merged = imdb_alloc_array(nr ? nr : 1, sizeof *merged, e);
+            if (merged && nr > 4) {
+                rend = imdb_alloc_array(nr, sizeof *rend, e);
+                rver = rend ? imdb_alloc_array(nr, sizeof *rver, e) : NULL;
+            }
+            if (!merged || !rver) {
+                imdb_free(merged);
+                if (rend != end4) imdb_free(rend);
                 rc = e->code;
                 break;
             }
+            seg_runs(t, srcs, m, es, purge_before, IMDB_MAX_SEGMENT_ROWS, rend, rver);
             uint32_t nm = 0;
-            for (uint64_t at = 0; at < m && !rc; at += IMDB_MAX_SEGMENT_ROWS) {
-                uint64_t cnt = m - at < IMDB_MAX_SEGMENT_ROWS ? m - at : IMDB_MAX_SEGMENT_ROWS;
-                rc = seg_build(t, srcs + at, (uint32_t)cnt, es, purge_before, &merged[nm], e);
+            for (uint64_t k = 0, at = 0; k < nr && !rc; at = rend[k++]) {
+                rc = seg_build(t, rver[k], srcs + at, (uint32_t)(rend[k] - at), es, purge_before, &merged[nm], e);
                 if (!rc) nm++;
+            }
+            if (rend != end4) {
+                imdb_free(rend);
+                imdb_free(rver);
             }
             for (uint32_t k = 0; k < pt->nseg; k++)
                 if (pt->owned[k]) imdb_segment_free(pt->seg[k]);
@@ -1513,7 +1701,7 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
     /* manifest */
     imdb_buf *mb = &p->manifest;
     imdb_buf_put(mb, kManMagic, 8);
-    imdb_buf_put_u32(mb, 7); /* lake.h: 6's tables and views, then the format design's sections */
+    imdb_buf_put_u32(mb, IMDB_MANIFEST_VERSION); /* lake.h: 6's tables and views, then the format design's sections */
     imdb_buf_put_u32(mb, IMDB_MAN_SECTIONS);
     imdb_buf_put(mb, db->db_id, 16);
     imdb_buf_put_u64(mb, seq);
@@ -1584,10 +1772,16 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
             if (v->akind == IMDB_ALTER_ADD_COLUMN) {
                 o.acol = v->s.cols[v->at[v->apos]];
                 o.adef = h->tcol[v->apos].missing;
-            } else {
+            } else if (v->akind == IMDB_ALTER_RENAME_COLUMN || v->akind == IMDB_ALTER_RENAME_TABLE) {
                 snprintf(nm, sizeof nm, "%s", v->akind == IMDB_ALTER_RENAME_TABLE ? v->s.name : v->s.cols[v->at[v->apos]].name);
                 o.aname = nm;
-            }
+            } else if (v->akind == IMDB_ALTER_SET_DEFAULT || v->akind == IMDB_ALTER_SET_TYPE) { /* F1 stage 4: a type */
+                const imdb_column *c = &v->s.cols[v->at[v->apos]];
+                o.acol.type = c->type;
+                o.acol.precision = c->precision;
+                o.acol.scale = c->scale;
+                o.adef = v->adef;
+            } /* DROP COLUMN, SET and DROP NOT NULL, DROP DEFAULT: the position alone */
             imdb_buf_put_u64(mb, v->since);
             if (imdb_alter_put(mb, &o)) rc = imdb_fail(e, IMDB_ERR_STATE, "lake: table %s's ALTER cannot be written", t->s.name);
         }
@@ -3062,7 +3256,8 @@ int imdb_lake_format_check(imdb_db *db, imdb_err *e)
         imdb_rd_init(&r, mb, ml);
         const uint8_t *mg = imdb_rd_bytes(&r, 8);
         uint32_t ver = imdb_rd_u32(&r);
-        if (mg && !r.err && memcmp(mg, kManMagic, 8) == 0 && ver >= 2 && ver <= 6) rc = old_manifest(ver, e); /* 6: slice 1 */
+        if (mg && !r.err && memcmp(mg, kManMagic, 8) == 0 && ver >= 2 && ver <= IMDB_MANIFEST_VERSION - 1)
+            rc = old_manifest(ver, e); /* 7: before F1 stage 4; 6: before slice 1 */
     }
     imdb_free(mb);
     close(ofd);

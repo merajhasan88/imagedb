@@ -387,7 +387,7 @@ static void t_segment_decoder_strict(void)
         memcpy(b, gimg->bytes, cut);
         imdb_segment *x;
         imdb_err e2 = {0};
-        CHECK(imdb_segment_parse(&t->s, b, cut, NULL, &x, &e2) != 0);
+        CHECK(imdb_segment_parse(&t->s, t->hist.vers[0].hash, b, cut, NULL, &x, &e2) != 0);
         imdb_free(b);
     }
     for (size_t at = 0; at < n; at++) {
@@ -396,7 +396,7 @@ static void t_segment_decoder_strict(void)
         b[at] ^= 0x01;
         imdb_segment *x;
         imdb_err e2 = {0};
-        if (imdb_segment_parse(&t->s, b, n, NULL, &x, &e2) == 0) {
+        if (imdb_segment_parse(&t->s, t->hist.vers[0].hash, b, n, NULL, &x, &e2) == 0) {
             /* A structurally valid mutation always changes the content hash.
              * If it also survives the commitment check it can only be in the
              * VID or BEGIN columns, which VERIFY compares with the version store. */

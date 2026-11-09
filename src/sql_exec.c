@@ -416,7 +416,8 @@ static int bind_lit(xctx *x, const sql_lit *l, const imdb_column *c, bool compar
         }
         }
     }
-    if (compare && c->type == IMDB_T_DECIMAL) return IMDB_OK; /* ranges may exceed the column precision */
+    if (compare && (c->type == IMDB_T_DECIMAL || (c->type == IMDB_T_INT64 && c->precision)))
+        return IMDB_OK; /* ranges may exceed the column precision (F3a: a SMALLINT compared with 100000 is false, never an error) */
     return imdb_value_check(c, out, e);
 }
 
@@ -7337,14 +7338,14 @@ static int insert_query(xctx *x, const sql_stmt *st, imdb_table *t, const int *m
     return rc;
 }
 
-/* F1: what an INSERT (or a COPY) gives a column it leaves out: its DEFAULT, which an ADD COLUMN set (the value the
- * rows before it read, its missing value), else NULL: a CREATE TABLE column has none before F2. PostgreSQL's ADD
- * ... DEFAULT sets both; a later SET DEFAULT (F1's stage 4) will part them. */
+/* F1: what an INSERT (or a COPY) gives a column it leaves out: its write default (F1 stage 4: an ADD COLUMN's DEFAULT
+ * until a SET or DROP DEFAULT parts it from the value the rows before the ADD read), else NULL: a CREATE TABLE
+ * column has none before F2. */
 static imdb_value col_default(const imdb_table *t, uint16_t c)
 {
     const imdb_column *col = &t->s.cols[c];
     imdb_value v = {.type = col->type, .scale = col->scale, .null = true};
-    if (t->hist.nvers) v = t->hist.tcol[t->hist.vers[t->hist.nvers - 1].pos[c]].missing;
+    if (t->hist.nvers) v = t->hist.tcol[t->hist.vers[t->hist.nvers - 1].pos[c]].wdef;
     return v;
 }
 
@@ -8130,7 +8131,8 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
             imdb_buf_init(&cols);
             for (int c = 0; c < t->s.ncols; c++) {
                 const imdb_column *cd = &t->s.cols[c];
-                imdb_buf_printf(&cols, "%s%s %s", c ? ", " : "", cd->name, imdb_type_name(cd->type));
+                imdb_buf_printf(&cols, "%s%s %s", c ? ", " : "", cd->name,
+                                cd->type == IMDB_T_INT64 ? imdb_int_name(cd->precision) : imdb_type_name(cd->type)); /* F3a */
                 if (cd->type == IMDB_T_DECIMAL) imdb_buf_printf(&cols, "(%u,%u)", cd->precision, cd->scale);
                 if ((cd->flags & IMDB_COL_PK) && t->s.npk == 1) imdb_buf_put_str(&cols, " PK");
                 for (int k = 0; t->s.npk > 1 && k < t->s.npk; k++) /* F4: its place in the key */
@@ -8841,7 +8843,8 @@ static int exec_show_prepared(const imdb_session *ss, imdb_result *r, imdb_err *
             const sql_ptype *pt = &p->ptypes[a];
             k += (size_t)(pt->type == IMDB_T_DECIMAL
                               ? snprintf(ty + k, sizeof ty - k, "%sDECIMAL(%u,%u)", a ? ", " : "", pt->precision, pt->scale)
-                              : snprintf(ty + k, sizeof ty - k, "%s%s", a ? ", " : "", imdb_type_name(pt->type)));
+                              : snprintf(ty + k, sizeof ty - k, "%s%s", a ? ", " : "",
+                                         pt->type == IMDB_T_INT64 ? imdb_int_name(pt->precision) : imdb_type_name(pt->type)));
         }
         size_t bad;
         res_put_str(r, &row[0], p->name);
@@ -9010,13 +9013,32 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
             else if (!(o.acol.flags & IMDB_COL_NULLABLE) && o.adef.null)
                 rc = imdb_fail(e, IMDB_ERR_INVALID, "column %s is NOT NULL: give it a DEFAULT, which the rows there read",
                                o.acol.name);
-        } else if (o.akind == IMDB_ALTER_RENAME_COLUMN) {
+        } else if (o.akind == IMDB_ALTER_RENAME_TABLE) {
+            o.aname = st->alter_new;
+        } else { /* a column by name, logged by its position (F1 stage 4: a position names a column for its life) */
             int c = imdb_schema_col(&t->s, st->alter_old);
-            if (c < 0) rc = imdb_fail(e, IMDB_ERR_INVALID, "table %s has no column %s", st->table, st->alter_old);
+            const imdb_column *col = c >= 0 ? &t->s.cols[c] : NULL;
+            imdb_err e2 = {0};
+            if (!col) rc = imdb_fail(e, IMDB_ERR_INVALID, "table %s has no column %s", st->table, st->alter_old);
             else o.apos = t->hist.vers[t->hist.nvers - 1].pos[c];
-            o.aname = st->alter_new;
-        } else {
-            o.aname = st->alter_new;
+            if (!rc && o.akind == IMDB_ALTER_RENAME_COLUMN) o.aname = st->alter_new;
+            if (!rc && o.akind == IMDB_ALTER_SET_DEFAULT) { /* a value of the column's type, never NULL (the parser's) */
+                o.acol.type = col->type;
+                o.acol.precision = col->precision;
+                o.acol.scale = col->scale;
+                if (bind_lit(&x, &st->alter_def, col, false, &o.adef, e)) rc = e->code;
+                else if (o.adef.null || imdb_value_check(col, &o.adef, &e2))
+                    rc = imdb_fail(e, IMDB_ERR_INVALID, "column %s: its DEFAULT: %s", col->name,
+                                   o.adef.null ? "NULL (write DROP DEFAULT)" : e2.msg);
+            }
+            if (!rc && o.akind == IMDB_ALTER_SET_TYPE) { /* the new type alone: its name and NULL rule stay the column's */
+                const imdb_column *nt = &st->schema.cols[0];
+                o.acol.type = nt->type;
+                o.acol.precision = nt->precision;
+                o.acol.scale = nt->scale;
+                if (nt->type == IMDB_T_DECIMAL && (nt->precision < 1 || nt->precision > 18 || nt->scale > nt->precision))
+                    rc = imdb_fail(e, IMDB_ERR_INVALID, "column %s: DECIMAL(p,s) needs 1<=p<=18, 0<=s<=p", col->name);
+            }
         }
         if (!rc) rc = imdb_alter_table(db, t, &o, e);
         if (!rc) snprintf(r->status, sizeof r->status, "ALTER TABLE %s", st->table);
