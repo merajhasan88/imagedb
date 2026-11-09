@@ -897,6 +897,7 @@ static void commit_free(commit *c)
  * LOCALTIMESTAMP, 4 CURRENT_DATE, 5 LOCALTIME */
 static bool defk_fits(uint8_t k, uint8_t ty)
 {
+    if (k == 9) return ty != T_FLOAT64; /* F2c: a generated column's expression: no FLOAT64 (a double's rounding) */
     if (k >= 6 && k <= 8) return ty == T_INT64; /* F2a-2: a sequence's values */
     return k == 2 ? ty == T_TIMESTAMPTZ || ty == T_TIMESTAMP : k == 3 ? ty == T_TIMESTAMP : k == 4 ? ty == T_DATE : k == 5 && ty == T_TIME;
 }
@@ -979,16 +980,29 @@ static int coldefs_body(rd *hr, const schema *s, bool none_ok, acdef **out, uint
     if (!*n) return 0;
     acdef *d = xcalloc(*n, sizeof *d);
     *out = d;
+    uint32_t gbytes = 0; /* F2c */
     for (uint16_t k = 0; k < *n; k++) {
         d[k].col = rd_u16(hr);
         d[k].kind = rd_u8(hr);
         if (hr->bad) return 0;
-        if (d[k].col >= s->ncols || (k && d[k].col <= d[k - 1].col) || d[k].kind < 1 || d[k].kind > 8 ||
+        if (d[k].col >= s->ncols || (k && d[k].col <= d[k - 1].col) || d[k].kind < 1 || d[k].kind > 9 ||
             ((d[k].kind == 6 || d[k].kind == 7) && (s->c[d[k].col].flags & F_NULLABLE))) /* F2a-2: an IDENTITY NOT NULL */
             return fail("%s: a bad column DEFAULT", what);
         if (d[k].kind == 1 ? one_value(hr, &s->c[d[k].col], &d[k].def, &d[k].def_len, what) != 0
                            : !defk_fits(d[k].kind, s->c[d[k].col].type))
             return d[k].kind == 1 ? -1 : fail("%s: a clock DEFAULT its column's type does not take", what);
+        if (d[k].kind == 9) { /* F2c: a generated column's expression: no key or SUBJECT, its text one a CHECK's could be,
+                               * the texts MAX_CHECK_TEXT bytes together at most */
+            uint32_t tl = rd_u32(hr);
+            if (!hr->bad && (!tl || tl > MAX_CHECK_TEXT - gbytes || (s->c[d[k].col].flags & (F_PK | F_SUBJECT))))
+                return fail("%s: a bad generated column", what);
+            d[k].def = rd_bytes(hr, tl);
+            d[k].def_len = tl;
+            if (!hr->bad && (!d[k].def || !utf8_ok(d[k].def, tl) || memchr(d[k].def, 0, tl)))
+                return fail("%s: a generated column's text is not UTF-8 without NUL", what);
+            gbytes += tl;
+            continue;
+        }
         if (d[k].kind >= 6) { /* F2a-2: its sequence */
             d[k].seq = rd_u32(hr);
             if (!hr->bad && d[k].seq >= MAX_SEQUENCES) return fail("%s: a column DEFAULT's sequence out of range", what);
@@ -1443,6 +1457,8 @@ typedef struct table {
     uint16_t nck0, nlck;
     achk lck[MAX_CHECKS];      /* the live ones by name: each text version 1's or an ADD CHECK version's (not owned) */
     struct ab_check *cc[MAX_CHECKS]; /* the live ones bound against the schema now (NULL: not yet, or since an ALTER) */
+    struct ab_check *gc[MAX_COLS]; /* F2c: by column of the schema now: a generated one's expression bound (NULL: not yet,
+                                      or since an ALTER); its text is cdef[its position], ckind 9 */
 } table;
 
 typedef struct aver { /* F1: rows begun at or after since are encoded under s (its raw bytes its own) */
@@ -2294,6 +2310,98 @@ static int ck_row(table *t, const val *vals, uint64_t seq)
     return 0;
 }
 
+
+/* ---- F2c: generated columns (design.md §5, Generated columns): each a CREATE's (op 23 kind 9: its text in cdef at its
+ * position), bound by abind.c's own binder against the table's schema now, its value on every row a commit writes
+ * computed by abind.c's own evaluator, assigned to its column by INSERT's rules and held to the row's ---- */
+
+static uint64_t gen_mask(const table *t) /* the schema now's generated columns */
+{
+    uint64_t m = 0;
+    if (!t->nvers) return 0;
+    const aver *cur = &t->vers[t->nvers - 1];
+    for (int c = 0; c < t->s.ncols && c < 64; c++)
+        if (t->ckind[cur->pos[c]] == 9) m |= 1ull << c;
+    return m;
+}
+
+static void gen_unbind(table *t)
+{
+    for (int c = 0; c < MAX_COLS; c++) {
+        ab_check_free(t->gc[c]);
+        t->gc[c] = NULL;
+    }
+}
+
+static int gen_bind(table *t, int c, uint64_t gm, uint64_t seq)
+{
+    if (t->gc[c]) return 0;
+    const aver *cur = &t->vers[t->nvers - 1];
+    ab_col cols[MAX_COLS];
+    char err[256];
+    ck_cols(&t->s, cols);
+    uint16_t p = cur->pos[c];
+    if (ab_gen_bind((const char *)t->cdef[p], t->cdef_len[p], cols, (uint16_t)t->s.ncols, (uint16_t)c, gm, &t->gc[c], err, sizeof err))
+        return fail("commit %llu: generated column %s of table %s does not bind: %s", (unsigned long long)seq, t->s.c[c].name,
+                    t->s.name, err);
+    return 0;
+}
+
+static int gen_bind_all(table *t, uint64_t seq)
+{
+    uint64_t gm = gen_mask(t);
+    for (int c = 0; c < t->s.ncols; c++)
+        if ((gm >> c & 1) && gen_bind(t, c, gm, seq)) return -1;
+    return 0;
+}
+
+/* a row (vals: t's schema now) holding in each generated column the value its expression gives */
+static int gen_row(table *t, const val *vals, uint64_t seq)
+{
+    uint64_t gm = gen_mask(t);
+    if (!gm) return 0;
+    ab_val av[MAX_COLS];
+    for (int c = 0; c < t->s.ncols; c++) av[c] = (ab_val){.i = vals[c].i, .s = vals[c].s, .len = vals[c].len, .null = vals[c].null};
+    for (int c = 0; c < t->s.ncols; c++) {
+        if (!(gm >> c & 1)) continue;
+        if (gen_bind(t, c, gm, seq)) return -1;
+        const col *cc = &t->s.c[c];
+        ab_gcol g = {.type = cc->type, .prec = cc->prec, .scale = cc->scale, .vlen = cc->type == T_TEXT ? cc->vlen : 0,
+                     .nullable = (cc->flags & F_NULLABLE) != 0};
+        ab_val out;
+        uint8_t *tb = NULL;
+        char err[256];
+        int r = ab_gen_eval(t->gc[c], av, &g, &out, &tb, err, sizeof err);
+        if (r < 0)
+            return fail("commit %llu: a row of table %s: generated column %s %s: %s", (unsigned long long)seq, t->s.name, cc->name,
+                        r == -1 ? "fails to evaluate" : "takes no value its expression gives", err);
+        bool same = out.null == vals[c].null &&
+                    (out.null || (cc->type == T_TEXT ? out.len == vals[c].len && (!out.len || !memcmp(out.s, vals[c].s, out.len))
+                                                     : out.i == vals[c].i));
+        free(tb);
+        if (!same)
+            return fail("commit %llu: a row of table %s holds another value in generated column %s than its expression gives",
+                        (unsigned long long)seq, t->s.name, cc->name);
+    }
+    return 0;
+}
+
+/* RESTRICT: the first live generated column but column self whose text names ident, or NULL (-1: a text that does not
+ * lex) */
+static int gen_naming(const table *t, const char *ident, int self, const char **which)
+{
+    *which = NULL;
+    uint64_t gm = gen_mask(t);
+    const aver *cur = &t->vers[t->nvers - 1];
+    for (int c = 0; c < t->s.ncols && !*which; c++) {
+        if (!(gm >> c & 1) || c == self) continue;
+        char err[128];
+        int has = ab_names((const char *)t->cdef[cur->pos[c]], t->cdef_len[cur->pos[c]], ident, err, sizeof err);
+        if (has < 0) return -1;
+        if (has) *which = t->s.c[c].name;
+    }
+    return 0;
+}
 static achk *checks_dup(const achk *c, uint16_t n)
 {
     achk *d = xcalloc(n ? n : 1, sizeof *d);
@@ -2350,13 +2458,13 @@ static int apply_op(state *S, const op *o, uint64_t seq)
         for (uint16_t k = 0; k < o->ncd; k++) {
             const acdef *d = &o->cd[k];
             t->ckind[d->col] = d->kind;
-            if (d->kind == 1) {
+            if (d->kind == 1 || d->kind == 9) { /* F2c: a generated column's text, the table's own likewise */
                 t->cdef[d->col] = xcalloc(d->def_len ? d->def_len : 1, 1);
                 memcpy(t->cdef[d->col], d->def, d->def_len);
                 t->cdef_len[d->col] = d->def_len;
             }
-            t->has_wdef[d->col] = true;
-            if (d->kind >= 6) { /* F2a-2: a sequence's: an IDENTITY's made in this commit, unowned, becomes the column's */
+            t->has_wdef[d->col] = d->kind != 9; /* F2c: a generated column has no DEFAULT */
+            if (d->kind >= 6 && d->kind <= 8) { /* F2a-2: a sequence's: an IDENTITY's made in this commit, unowned, becomes the column's */
                 aseq *q = d->seq < S->nsq ? &S->sq[d->seq] : NULL;
                 bool ident = d->kind != 8;
                 if (!q || q->dropped_at || (ident && (q->created_at != seq || q->owner != UINT32_MAX)))
@@ -2371,6 +2479,7 @@ static int apply_op(state *S, const op *o, uint64_t seq)
                 t->cseq[d->col] = d->seq;
             }
         }
+        if (gen_bind_all(t, seq)) return -1; /* F2c: each generated column's text binds against the CREATE's schema */
         return 0;
     }
     if (o->code == 28) { /* TABLE_CHECKS (F2b-1): its CREATE's, in its commit (the header's rule); each binds against its schema */
@@ -2398,6 +2507,15 @@ static int apply_op(state *S, const op *o, uint64_t seq)
         if (alter_next(cur, o, &nv, seq, t->has_wdef)) return -1;
         int cc = o->akind == 1 || o->akind == 3 ? -1 : cur->at[o->apos]; /* the column it names (live: alter_next) */
         int rc = 0;
+        if ((o->akind == 7 || o->akind == 8 || o->akind == 10) && t->ckind[o->apos] == 9) /* F2c: no DEFAULT */
+            rc = fail("commit %llu: a DEFAULT of generated column %s of table %s", (unsigned long long)seq, t->s.c[cc].name, t->s.name);
+        if (!rc && (o->akind == 2 || o->akind == 4)) { /* F2c: a generated column's text holds its column's name: RESTRICT */
+            const char *gn = NULL;
+            if (gen_naming(t, t->s.c[cc].name, cc, &gn)) rc = fail("commit %llu: a generated column's text does not lex", (unsigned long long)seq);
+            else if (gn)
+                rc = fail("commit %llu: a rename or drop of column %s of table %s, which generated column %s names",
+                          (unsigned long long)seq, t->s.c[cc].name, t->s.name, gn);
+        }
         if (o->akind == 1 || o->akind == 4) { /* a live view reading the table that holds the name: an ADD's column could
                                                  capture its reference, a DROP's leave it unbound */
             const char *nm = o->akind == 1 ? o->acol.name : t->s.c[cc].name;
@@ -2488,6 +2606,7 @@ static int apply_op(state *S, const op *o, uint64_t seq)
         t->s.raw = xcalloc(nv.s.rawlen, 1);
         memcpy(t->s.raw, nv.s.raw, nv.s.rawlen);
         live_rebuild(t); /* F2b-1: the live CHECKs, each bound again against the new schema when a row needs it */
+        gen_unbind(t); /* F2c: likewise the generated columns */
         return 0;
     }
     if (o->code == 19) { /* DROP_TABLE: live, not kept FOREVER (its op 16 first); every live version ends, one by one */
@@ -2642,6 +2761,7 @@ static int apply_op(state *S, const op *o, uint64_t seq)
             row_commit(o->table, o->salt, o->row, o->row_len, chk);
             if (memcmp(chk, cm, 32) != 0) return fail("commit %llu: payload does not match its commitment", (unsigned long long)seq);
             if (decode_row(&t->s, o->row, o->row_len, vals)) return -1;
+            if (gen_row(t, vals, seq)) return -1; /* F2c: its generated columns, as the writer computed them */
             if (ck_row(t, vals, seq)) return -1; /* F2b-1: its table's CHECKs, as the writer evaluated them */
             S->payload_rows++;
         }
@@ -3636,7 +3756,7 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
     rd r = {b, len, 0, false};
     const uint8_t *mg = rd_bytes(&r, 8);
     uint32_t mver = mg && memcmp(mg, "IMDBMAN1", 8) == 0 ? rd_u32(&r) : 0;
-    if (mver != 11) return fail("manifest: bad header (version 11 only: CHECK constraints, F2b-1)");
+    if (mver != 12) return fail("manifest: bad header (version 12 only: generated columns, F2c)");
     uint32_t nsec = rd_u32(&r); /* every section, in order: 1 tables, 2 views, 3 sequences (F2a-2), 4-11 reserved and empty */
     const uint8_t *id = rd_bytes(&r, 16);
     m->seq = rd_u64(&r);
@@ -3730,12 +3850,12 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
             for (uint16_t k = 0; !crc && !r.bad && k < ncd; k++) {
                 t->ckind[cd[k].col] = cd[k].kind;
                 t->cseq[cd[k].col] = cd[k].seq; /* F2a-2 */
-                if (cd[k].kind >= 6) {
+                if (cd[k].kind >= 6 && cd[k].kind <= 8) {
                     t->wkind[cd[k].col] = cd[k].kind;
                     t->wseqid[cd[k].col] = cd[k].seq;
                 }
-                t->has_wdef[cd[k].col] = true;
-                if (cd[k].kind != 1) continue;
+                t->has_wdef[cd[k].col] = cd[k].kind != 9; /* F2c: a generated column has no DEFAULT */
+                if (cd[k].kind != 1 && cd[k].kind != 9) continue; /* F2c: its text kept as kind 1's value is */
                 t->cdef[cd[k].col] = xcalloc(cd[k].def_len ? cd[k].def_len : 1, 1);
                 memcpy(t->cdef[cd[k].col], cd[k].def, cd[k].def_len);
                 t->cdef_len[cd[k].col] = cd[k].def_len;
@@ -4680,6 +4800,7 @@ static int cmd_verify(const char *dir, const char *anchor)
         for (uint32_t k = 0; k < S.t[i].nvers; k++) free(S.t[i].vers[k].ctext); /* F2b-1 */
         checks_free(S.t[i].ck0, S.t[i].nck0);
         ck_unbind(&S.t[i]);
+        gen_unbind(&S.t[i]); /* F2c */
         for (uint32_t k = 0; k < S.t[i].nvers; k++) free(S.t[i].vers[k].s.raw), free(S.t[i].vers[k].def); /* F1: its versions' bytes */
         free(S.t[i].vers);
         for (int k = 0; k < MAX_COLS; k++) free(S.t[i].missing_text[k]);

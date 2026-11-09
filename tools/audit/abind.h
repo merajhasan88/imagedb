@@ -60,4 +60,21 @@ typedef struct ab_val {
 /* 1: the row passes (TRUE or NULL), 0: it fails (FALSE), -1: its evaluation fails (an overflow, a zero divisor ...) */
 int ab_check_eval(const ab_check *c, const ab_val *row, char *err, size_t errn);
 
+/* F2c: a generated column's expression bound as a CHECK's text is (the same subset, the same strictness), its value of a type
+ * column target takes (an integer column INT64; a DECIMAL INT64 or DECIMAL; any other its own type, never FLOAT64),
+ * naming no column of genmask: 0 and *out, or -1 and the reason */
+int ab_gen_bind(const char *text, size_t len, const ab_col *cols, uint16_t ncols, uint16_t target, uint64_t genmask,
+                ab_check **out, char *err, size_t errn);
+/* the column a value is assigned to: its type, an integer's width (16, 32, 0) or a DECIMAL's precision, its scale, a
+ * VARCHAR's length (0 none), NULL allowed */
+typedef struct ab_gcol {
+    uint8_t type, prec, scale;
+    uint32_t vlen;
+    bool nullable;
+} ab_gcol;
+/* its value on a row assigned to its column by INSERT's rules: 0 and *out (a TEXT's bytes in *tbuf, malloc'd, the
+ * caller's to free), -1 an evaluation the engine fails (an overflow, a zero divisor ...), -2 an assignment it refuses
+ * (a range, a precision, a length, NOT NULL); the reason in err */
+int ab_gen_eval(const ab_check *c, const ab_val *row, const ab_gcol *col, ab_val *out, uint8_t **tbuf, char *err, size_t errn);
+
 #endif

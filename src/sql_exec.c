@@ -4595,6 +4595,7 @@ int imdb_sql_names_ident(const char *text, size_t len, const char *ident, bool *
 struct imdb_chkc {
     uint32_t ver; /* the history length it was compiled at */
     uint16_t n;
+    uint16_t col[IMDB_MAX_COLS]; /* F2c: a generated set's: item i computes column col[i] of the schema */
     char *sql;
     sql_stmt st;
     imdb_xnode *xn;
@@ -4613,7 +4614,7 @@ void imdb_check_free(struct imdb_chkc *c)
 
 /* the text alone lexes, its parentheses balance (never below its start) and it holds no ';', parameter or ',' outside
  * them: so in the wrapper it is one operand, its own tree */
-static int chk_lex(const char *text, uint32_t len, imdb_err *e)
+static int chk_lex(const char *text, uint32_t len, const char *w, imdb_err *e)
 {
     sql_tok *tk = NULL;
     uint32_t nt = 0;
@@ -4622,18 +4623,18 @@ static int chk_lex(const char *text, uint32_t len, imdb_err *e)
     for (uint32_t i = 0; i < nt && !rc; i++) {
         uint8_t k = tk[i].kind;
         if (k == TK_LP) depth++;
-        else if (k == TK_RP && --depth < 0) rc = imdb_fail(e, IMDB_ERR_INVALID, "a CHECK's parentheses do not balance");
+        else if (k == TK_RP && --depth < 0) rc = imdb_fail(e, IMDB_ERR_INVALID, "%s: its parentheses do not balance", w);
         else if (k == TK_SEMI || k == TK_PARAM || (k == TK_COMMA && !depth))
-            rc = imdb_fail(e, IMDB_ERR_INVALID, "a CHECK is one condition: no ';', ',' or parameter outside its parentheses");
+            rc = imdb_fail(e, IMDB_ERR_INVALID, "%s: no ';', ',' or parameter outside its parentheses", w);
     }
-    if (!rc && depth) rc = imdb_fail(e, IMDB_ERR_INVALID, "a CHECK's parentheses do not balance");
-    if (!rc && !nt) rc = imdb_fail(e, IMDB_ERR_INVALID, "a CHECK holds no condition");
+    if (!rc && depth) rc = imdb_fail(e, IMDB_ERR_INVALID, "%s: its parentheses do not balance", w);
+    if (!rc && !nt) rc = imdb_fail(e, IMDB_ERR_INVALID, "%s is empty", w);
     imdb_free(tk);
     return rc;
 }
 
 /* the subset's shapes, before binding */
-static int chk_shape(const sql_stmt *st, uint16_t k, imdb_err *e)
+static int chk_shape(const sql_stmt *st, uint16_t k, const char *w, imdb_err *e)
 {
     if (!k) return IMDB_OK;
     const sql_expr *x = &st->ex[k];
@@ -4642,52 +4643,64 @@ static int chk_shape(const sql_stmt *st, uint16_t k, imdb_err *e)
         if (x->lit.kind == LIT_INT || x->lit.kind == LIT_DEC || x->lit.kind == LIT_STR || x->lit.kind == LIT_BOOL ||
             x->lit.kind == LIT_NULL || x->lit.kind == LIT_TS || x->lit.kind == LIT_DATE || x->lit.kind == LIT_TIME)
             return IMDB_OK;
-        return imdb_fail(e, IMDB_ERR_INVALID, "a CHECK's literal is an integer, a DECIMAL, a string, TRUE, FALSE, NULL, a DATE, "
-                                              "a TIME or a TIMESTAMP (FLOAT64 and TIMESTAMPTZ values are a later step)");
+        return imdb_fail(e, IMDB_ERR_INVALID, "%s: its literals are integers, DECIMALs, strings, TRUE, FALSE, NULL, DATEs, "
+                                              "TIMEs and TIMESTAMPs (FLOAT64 and TIMESTAMPTZ values are a later step)", w);
     case EX_COL:
-        if (x->qual[0]) return imdb_fail(e, IMDB_ERR_INVALID, "a CHECK names its table's columns bare (%s, not %s.%s)", x->col, x->qual, x->col);
+        if (x->qual[0]) return imdb_fail(e, IMDB_ERR_INVALID, "%s names its table's columns bare (%s, not %s.%s)", w, x->col, x->qual, x->col);
         return IMDB_OK;
     case EX_FN:
         if (x->fn != FN_ABS && x->fn != FN_LENGTH && x->fn != FN_COALESCE && x->fn != FN_NULLIF && x->fn != FN_LOWER &&
             x->fn != FN_UPPER && x->fn != FN_CONCAT)
-            return imdb_fail(e, IMDB_ERR_INVALID, "a CHECK calls ABS, LENGTH, LOWER, UPPER, COALESCE, NULLIF and || alone (a "
-                                                  "clock, a sequence or a zone would make its verdict one of its moment)");
+            return imdb_fail(e, IMDB_ERR_INVALID, "%s calls ABS, LENGTH, LOWER, UPPER, COALESCE, NULLIF and || alone (a "
+                                                  "clock, a sequence or a zone would make it a value of its moment)", w);
         break;
     case EX_NEG: case EX_ADD: case EX_SUB: case EX_MUL: case EX_DIV: case EX_MOD:
     case EX_CMP: case EX_AND: case EX_OR: case EX_NOT: case EX_LIST: case EX_CASE: case EX_WHEN:
         break;
     default:
-        return imdb_fail(e, IMDB_ERR_INVALID, "a CHECK is a condition on its row: no subquery, aggregate, window function or CAST");
+        return imdb_fail(e, IMDB_ERR_INVALID, "%s reads its row alone: no subquery, aggregate, window function or CAST", w);
     }
-    if (chk_shape(st, x->l, e) || chk_shape(st, x->r, e) || chk_shape(st, x->x3, e)) return e->code; /* height-bounded */
+    if (chk_shape(st, x->l, w, e) || chk_shape(st, x->r, w, e) || chk_shape(st, x->x3, w, e)) return e->code; /* height-bounded */
     return IMDB_OK;
 }
 
 /* the subset's types, once bound; the columns it reads into *cols */
-static int chk_types(const sql_stmt *st, const imdb_xnode *xn, uint16_t k, uint64_t *cols, imdb_err *e)
+static int chk_types(const sql_stmt *st, const imdb_xnode *xn, uint16_t k, uint64_t *cols, const char *w, imdb_err *e)
 {
     if (!k) return IMDB_OK;
     const sql_expr *x = &st->ex[k];
     if (x->op != EX_LIST && x->op != EX_WHEN) {
         if (xn[k].type == IMDB_T_FLOAT64)
-            return imdb_fail(e, IMDB_ERR_INVALID, "a CHECK computes no FLOAT64 value: a later step (deferred.md D19)");
+            return imdb_fail(e, IMDB_ERR_INVALID, "%s computes no FLOAT64 value: a later step (deferred.md D19)", w);
         if (x->op == EX_LIT && x->lit.kind != LIT_NULL && xn[k].type == IMDB_T_TIMESTAMPTZ) /* a NULL is no instant */
-            return imdb_fail(e, IMDB_ERR_INVALID, "a CHECK reads no TIMESTAMPTZ literal: it would be read in a session's zone");
+            return imdb_fail(e, IMDB_ERR_INVALID, "%s reads no TIMESTAMPTZ literal: it would be read in a session's zone", w);
     }
     if (x->op == EX_COL && xn[k].col >= 0 && xn[k].col < 64) *cols |= 1ull << xn[k].col;
-    if (chk_types(st, xn, x->l, cols, e) || chk_types(st, xn, x->r, cols, e) || chk_types(st, xn, x->x3, cols, e)) return e->code;
+    if (chk_types(st, xn, x->l, cols, w, e) || chk_types(st, xn, x->r, cols, w, e) || chk_types(st, xn, x->x3, cols, w, e))
+        return e->code;
     return IMDB_OK;
 }
 
 /* texts (n of them) against schema s: one statement, each item's left operand bound as a CHECK; cols[i] its columns */
-static int chk_compile(const imdb_schema *s, const char *const *text, const uint32_t *len, uint16_t n,
-                       struct imdb_chkc **out, uint64_t *cols, imdb_err *e)
+/* F2c: a generated column's value may be of a type the assignment takes into its column */
+static bool gen_assignable(uint8_t ty, const imdb_column *c)
+{
+    if (c->type == IMDB_T_INT64) return ty == IMDB_T_INT64;
+    if (c->type == IMDB_T_DECIMAL) return ty == IMDB_T_INT64 || ty == IMDB_T_DECIMAL;
+    return ty == c->type && c->type != IMDB_T_FLOAT64;
+}
+
+/* target NULL: CHECKs, each root a BOOL; else F2c's generated columns, root i's value assignable to column target[i]
+ * and naming no column of genmask */
+static int chk_compile_ex(const imdb_schema *s, const char *const *text, const uint32_t *len, uint16_t n, const uint16_t *target,
+                          uint64_t genmask, struct imdb_chkc **out, uint64_t *cols, imdb_err *e)
 {
     *out = NULL;
+    const char *w = target ? "a generation expression" : "a CHECK", *noun = target ? "expression" : "condition";
     size_t total = 8;
     for (uint16_t i = 0; i < n; i++) {
-        if (!imdb_check_text_ok(text[i], len[i])) return imdb_fail(e, IMDB_ERR_INVALID, "a CHECK's text is 1 to %u bytes of UTF-8", IMDB_MAX_CHECK_TEXT);
-        if (chk_lex(text[i], len[i], e)) return e->code;
+        if (!imdb_check_text_ok(text[i], len[i])) return imdb_fail(e, IMDB_ERR_INVALID, "%s: its text is 1 to %u bytes of UTF-8", w, IMDB_MAX_CHECK_TEXT);
+        if (chk_lex(text[i], len[i], w, e)) return e->code;
         total += (size_t)len[i] + 16;
     }
     struct imdb_chkc *c = imdb_alloc(sizeof *c, e);
@@ -4713,16 +4726,16 @@ static int chk_compile(const imdb_schema *s, const char *const *text, const uint
     }
     const sql_stmt *st = &c->st;
     if (!rc && st->nsub)
-        rc = imdb_fail(e, IMDB_ERR_INVALID, "a CHECK is a condition on its row: no subquery, aggregate, window function or CAST");
+        rc = imdb_fail(e, IMDB_ERR_INVALID, "%s reads its row alone: no subquery, aggregate, window function or CAST", w);
     if (!rc && (st->kind != ST_SELECT || st->nitems != n || !st->no_from || st->nsub || st->narm || st->star || st->distinct ||
                 st->has_group || st->norder || st->has_limit || st->has_offset))
-        rc = imdb_fail(e, IMDB_ERR_INVALID, "a CHECK is one condition");
+        rc = imdb_fail(e, IMDB_ERR_INVALID, "%s is one %s", w, noun);
     for (uint16_t i = 0; !rc && i < n; i++) {
         uint16_t a = st->items[i].expr;
         if (!a || st->ex[a].op != EX_AND || st->ex[st->ex[a].r].op != EX_LIT || st->ex[st->ex[a].r].lit.kind != LIT_BOOL)
-            rc = imdb_fail(e, IMDB_ERR_INVALID, "a CHECK is one condition");
+            rc = imdb_fail(e, IMDB_ERR_INVALID, "%s is one %s", w, noun);
         else
-            rc = chk_shape(st, st->ex[a].l, e);
+            rc = chk_shape(st, st->ex[a].l, w, e);
     }
     if (!rc && !(c->xn = imdb_alloc_array((size_t)st->nex + 1, sizeof *c->xn, e))) rc = e->code;
     if (!rc && !(pt = imdb_alloc(sizeof *pt, e))) rc = e->code;
@@ -4739,10 +4752,17 @@ static int chk_compile(const imdb_schema *s, const char *const *text, const uint
             uint16_t k = st->ex[st->items[i].expr].l;
             uint64_t cm = 0;
             if (xbind(&x, &sc, k, e)) rc = e->code;
-            else if (c->xn[k].type != IMDB_T_BOOL)
+            else if (!target && c->xn[k].type != IMDB_T_BOOL)
                 rc = imdb_fail(e, IMDB_ERR_INVALID, "a CHECK is a condition: its value a BOOL, not %s", imdb_type_name(c->xn[k].type));
-            else if (!(rc = chk_types(st, c->xn, k, &cm, e)) && cols)
+            else if (target && !gen_assignable(c->xn[k].type, &s->cols[target[i]]))
+                rc = imdb_fail(e, IMDB_ERR_INVALID, "it computes %s, which column %s (%s) does not take", imdb_type_name(c->xn[k].type),
+                               s->cols[target[i]].name, imdb_type_name(s->cols[target[i]].type));
+            else if (!(rc = chk_types(st, c->xn, k, &cm, w, e)) && target && (cm & genmask))
+                rc = imdb_fail(e, IMDB_ERR_INVALID, "it names a generated column (%s), which it may not",
+                               s->cols[__builtin_ctzll(cm & genmask)].name);
+            else if (!rc && cols)
                 cols[i] = cm;
+            if (!rc && target) c->col[i] = target[i];
         }
         size_t lt = 0; /* the string literals' bytes, the compiled checks' own: the binder's go with xfree */
         for (uint16_t k = 1; !rc && k <= st->nex; k++)
@@ -4766,6 +4786,12 @@ static int chk_compile(const imdb_schema *s, const char *const *text, const uint
     return IMDB_OK;
 }
 
+static int chk_compile(const imdb_schema *s, const char *const *text, const uint32_t *len, uint16_t n,
+                       struct imdb_chkc **out, uint64_t *cols, imdb_err *e)
+{
+    return chk_compile_ex(s, text, len, n, NULL, 0, out, cols, e);
+}
+
 int imdb_check_bind(const imdb_schema *s, const char *text, uint32_t len, uint64_t *cols, imdb_err *e)
 {
     struct imdb_chkc *c;
@@ -4775,6 +4801,108 @@ int imdb_check_bind(const imdb_schema *s, const char *text, uint32_t len, uint64
     imdb_heap_exempt_end();
     if (!rc && cols) *cols = cm[0];
     imdb_check_free(c);
+    return rc;
+}
+
+/* ---- F2c: generated columns (design.md §5, Generated columns): each expression in CHECK's subset, bound alone against
+ * the table's columns (no generated one named), its value assigned to its column by INSERT's rules; a table's
+ * compiled together as its CHECKs are, computed by the SQL layer once the row is otherwise whole and verified by the
+ * engine at every write and by replay ---- */
+
+bool imdb_col_generated(const imdb_table *t, uint16_t c)
+{
+    if (!t->hist.ngen || !t->hist.nvers || c >= t->s.ncols) return false;
+    return t->hist.tcol[t->hist.vers[t->hist.nvers - 1].pos[c]].gtext != NULL;
+}
+
+int imdb_gen_bind(const imdb_schema *s, uint16_t c, uint64_t genmask, const char *text, uint32_t len, imdb_err *e)
+{
+    struct imdb_chkc *cc;
+    imdb_err e2 = {0};
+    imdb_heap_exempt_begin();
+    int rc = chk_compile_ex(s, &text, &len, 1, &c, genmask, &cc, NULL, &e2);
+    imdb_heap_exempt_end();
+    imdb_check_free(cc);
+    if (rc) return imdb_fail(e, rc, "generated column %s: %s", s->cols[c].name, e2.msg);
+    return IMDB_OK;
+}
+
+/* t's live generated columns compiled for its history as it is (the first write after it changed compiles them) */
+static int gen_ready(imdb_table *t, imdb_err *e)
+{
+    const imdb_schema_hist *h = &t->hist;
+    if (t->genc && t->genc->ver == h->nvers) return IMDB_OK;
+    imdb_check_free(t->genc);
+    t->genc = NULL;
+    const char *tx[IMDB_MAX_COLS];
+    uint32_t tl[IMDB_MAX_COLS];
+    uint16_t tg[IMDB_MAX_COLS], n = 0;
+    uint64_t gm = 0;
+    const imdb_sver *v = &h->vers[h->nvers - 1];
+    for (uint16_t c = 0; c < t->s.ncols; c++) {
+        const imdb_tcol *tc = &h->tcol[v->pos[c]];
+        if (!tc->gtext) continue;
+        tx[n] = tc->gtext, tl[n] = tc->glen, tg[n++] = c;
+        gm |= 1ull << c;
+    }
+    struct imdb_chkc *c;
+    imdb_heap_exempt_begin(); /* the table's, kept past the statement */
+    int rc = IMDB_OK;
+    if (n) rc = chk_compile_ex(&t->s, tx, tl, n, tg, gm, &c, NULL, e);
+    else if (!(c = imdb_alloc(sizeof *c, e))) rc = e->code; /* every generated column dropped: none to compute */
+    imdb_heap_exempt_end();
+    if (rc) return rc;
+    c->ver = h->nvers;
+    t->genc = c;
+    return IMDB_OK;
+}
+
+/* item i of a generated set on a row, assigned to its column: *out the column's value (a TEXT in ar) */
+static int gen_eval(const imdb_table *t, const struct imdb_chkc *c, uint16_t i, const imdb_value *vals, imdb_xarena *ar,
+                    imdb_value *out, imdb_err *e)
+{
+    imdb_xenv env;
+    memset(&env, 0, sizeof env);
+    env.arena = ar;
+    imdb_xval v;
+    imdb_err e2 = {0};
+    if (imdb_x_eval(&c->st, c->xn, c->st.ex[c->st.items[i].expr].l, vals, NULL, &env, &v, &e2) ||
+        imdb_x_assign(&t->s.cols[c->col[i]], &v, out, &e2))
+        return imdb_fail(e, e2.code, "generated column %s: %s", t->s.cols[c->col[i]].name, e2.msg);
+    return IMDB_OK;
+}
+
+int imdb_gen_compute(imdb_db *db, imdb_table *t, imdb_value *vals, struct imdb_xarena *ar, imdb_err *e)
+{
+    (void)db;
+    if (!t->hist.ngen) return IMDB_OK;
+    if (gen_ready(t, e)) return e->code;
+    for (uint16_t i = 0; i < t->genc->n; i++) /* no expression reads a generated column: any order is the one */
+        if (gen_eval(t, t->genc, i, vals, ar, &vals[t->genc->col[i]], e)) return e->code;
+    return IMDB_OK;
+}
+
+static bool gen_same(const imdb_value *a, const imdb_value *b)
+{
+    if (a->null || b->null) return a->null == b->null;
+    if (a->type == IMDB_T_TEXT) return a->len == b->len && (!a->len || !memcmp(a->s, b->s, a->len));
+    return a->i == b->i;
+}
+
+int imdb_gen_verify(imdb_db *db, imdb_table *t, const imdb_value *vals, imdb_err *e)
+{
+    (void)db;
+    if (!t->hist.ngen) return IMDB_OK;
+    if (gen_ready(t, e)) return e->code;
+    imdb_xarena ar = {0};
+    int rc = IMDB_OK;
+    for (uint16_t i = 0; i < t->genc->n && !rc; i++) {
+        imdb_value g;
+        if (!(rc = gen_eval(t, t->genc, i, vals, &ar, &g, e)) && !gen_same(&g, &vals[t->genc->col[i]]))
+            rc = imdb_fail(e, IMDB_ERR_CONSTRAINT, "generated column %s holds another value than its expression gives",
+                           t->s.cols[t->genc->col[i]].name);
+    }
+    imdb_xarena_free(&ar);
     return rc;
 }
 
@@ -4842,6 +4970,37 @@ int imdb_check_eval_text(const imdb_schema *s, const char *text, uint32_t len, c
         imdb_xarena_free(&ar);
     }
     imdb_check_free(c);
+    return IMDB_OK;
+}
+
+/* F2c, the tests': text bound as column c's generation expression of s (genmask: s's generated columns), then on each of
+ * nrows rows: out[r] 0 and vals[r] the value assigned (a TEXT in ar), 1 its evaluation failed, 2 its assignment */
+int imdb_gen_eval_text(const imdb_schema *s, uint16_t c, uint64_t genmask, const char *text, uint32_t len, const imdb_value *rows,
+                       uint32_t nrows, int *out, imdb_value *vals, struct imdb_xarena *ar, imdb_err *e)
+{
+    struct imdb_chkc *cc;
+    int rc = chk_compile_ex(s, &text, &len, 1, &c, genmask, &cc, NULL, e);
+    if (rc) return rc;
+    imdb_xenv env;
+    memset(&env, 0, sizeof env);
+    env.arena = ar;
+    for (uint32_t r = 0; r < nrows; r++) {
+        imdb_xval v;
+        imdb_err e2 = {0};
+        memset(&vals[r], 0, sizeof vals[r]);
+        if (imdb_x_eval(&cc->st, cc->xn, cc->st.ex[cc->st.items[0].expr].l, rows + (size_t)r * s->ncols, NULL, &env, &v, &e2)) out[r] = 1;
+        else out[r] = imdb_x_assign(&s->cols[c], &v, &vals[r], &e2) ? 2 : 0;
+        if (!out[r] && vals[r].type == IMDB_T_TEXT && !vals[r].null && vals[r].len) { /* a literal's bytes are the compiled set's */
+            uint8_t *p = imdb_xarena_alloc(ar, vals[r].len, e);
+            if (!p) {
+                imdb_check_free(cc);
+                return e->code;
+            }
+            memcpy(p, vals[r].s, vals[r].len);
+            vals[r].s = p;
+        }
+    }
+    imdb_check_free(cc);
     return IMDB_OK;
 }
 
@@ -7755,6 +7914,8 @@ static int ups_prepare(xctx *x, const sql_stmt *st, imdb_table *t, ups *u, imdb_
         if (is_key_col(&t->s, c)) return imdb_fail(e, IMDB_ERR_INVALID, "ON CONFLICT DO UPDATE cannot change the primary key");
         if (col_always(t, (uint16_t)c)) /* F2a-2: PostgreSQL's: an ALWAYS identity is not updated */
             return imdb_fail(e, IMDB_ERR_INVALID, "column %s is GENERATED ALWAYS AS IDENTITY: it is not updated", t->s.cols[c].name);
+        if (imdb_col_generated(t, (uint16_t)c)) /* F2c: computed, never set */
+            return imdb_fail(e, IMDB_ERR_INVALID, "column %s is generated: it is computed, never set", t->s.cols[c].name);
         for (uint16_t j = 0; j < k; j++)
             if (u->cols[j] == c) return imdb_fail(e, IMDB_ERR_INVALID, "column %s is set twice", st->set_cols[k]);
         if (st->set_vals[k].kind == LIT_EXPR) {
@@ -7780,6 +7941,10 @@ static int write_row(xctx *x, const sql_stmt *st, imdb_table *t, imdb_value *val
     uint64_t vid = IMDB_NONE;
     imdb_value kv[IMDB_MAX_KEY_COLS];
     for (int c = 0; c < t->s.npk; c++) kv[c] = vals[t->s.key[c]];
+    /* F2c: the generated columns, the row otherwise whole, before its CHECKs and RETURNING (PostgreSQL's order); a
+     * computed TEXT lives in the statement's arena until the row is written */
+    imdb_xmark gm = imdb_xarena_mark(&x->arena);
+    if (t->hist.ngen && imdb_gen_compute(x->db, t, vals, &x->arena, e)) return e->code;
     /* F2b-1: the proposed row passes the table's CHECKs before its conflict is looked for, whichever way it resolves
      * (PostgreSQL's ExecConstraints before the speculative insertion; SQLite's alike) */
     if (st->upsert && imdb_check_row(x->db, t, vals, e)) return e->code;
@@ -7791,6 +7956,7 @@ static int write_row(xctx *x, const sql_stmt *st, imdb_table *t, imdb_value *val
         rc = imdb_salt_next(&x->salts, salt, e) || imdb_insert_salt(x->db, t, vals, salt, e) ? e->code : IMDB_OK;
         imdb_wipe(salt, sizeof salt);
         u->written += !rc;
+        imdb_xarena_reset(&x->arena, gm);
         return rc;
     }
     if (st->upsert == SQL_UPSERT_NOTHING) return IMDB_OK;
@@ -7817,13 +7983,15 @@ static int write_row(xctx *x, const sql_stmt *st, imdb_table *t, imdb_value *val
     }
     if (go) {
         for (uint16_t k = 0; k < st->nset; k++) both[u->cols[k]] = set[k];
-        if (!(st->returning && (rc = ret_row(x, st, t, NULL, both, r, e)))) {
+        if (t->hist.ngen) rc = imdb_gen_compute(x->db, t, both, &x->arena, e); /* F2c: the row as updated */
+        if (!rc && !(st->returning && (rc = ret_row(x, st, t, NULL, both, r, e)))) {
             rc = imdb_salt_next(&x->salts, salt, e) || imdb_update_salt(x->db, t, vid, both, salt, e) ? e->code : IMDB_OK;
             imdb_wipe(salt, sizeof salt);
             u->written += !rc;
         }
     }
     imdb_xarena_reset(&x->arena, m);
+    imdb_xarena_reset(&x->arena, gm);
     return rc;
 }
 
@@ -7936,6 +8104,14 @@ static int col_default(imdb_xenv *env, const imdb_table *t, uint16_t c, imdb_val
     return imdb_x_clock(env, tc->wclock, col->type, &v->i, e);
 }
 
+/* F2c: every row of an INSERT ... VALUES gives column i DEFAULT */
+static bool gen_defaults(const sql_stmt *st, uint16_t width, uint16_t i)
+{
+    for (uint32_t row = 0; row < st->nrows; row++)
+        if (st->vals[(size_t)row * width + i].kind != LIT_DEFAULT) return false;
+    return true;
+}
+
 static int exec_insert(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
 {
     if ((st->nsub || st->src) && !x->own) wceil_set(x); /* P2 S8: what it reads */
@@ -7962,12 +8138,16 @@ static int exec_insert(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
             if (seen[c]) continue;
             if (col_default(&x->env, t, c, &vals[c], e)) return e->code;
             seqfill_add(&f, t, c); /* F2a-2: an IDENTITY's or a nextval's, a value each row */
-            if (vals[c].null && !(t->s.cols[c].flags & IMDB_COL_NULLABLE))
+            if (vals[c].null && !(t->s.cols[c].flags & IMDB_COL_NULLABLE) && !imdb_col_generated(t, c)) /* F2c: computed at the write */
                 return imdb_fail(e, IMDB_ERR_CONSTRAINT, "column %s needs a value: it is NOT NULL", t->s.cols[c].name);
         }
     } else {
         for (uint16_t i = 0; i < width; i++) map[i] = i;
     }
+    for (uint16_t i = 0; i < width; i++) /* F2c: a generated column given a value: refused (VALUES' DEFAULT alone is taken) */
+        if (imdb_col_generated(t, (uint16_t)map[i]) && (st->src || !gen_defaults(st, width, i)))
+            return imdb_fail(e, IMDB_ERR_INVALID, "column %s is generated: it takes no value (leave it out, or write DEFAULT)",
+                             t->s.cols[map[i]].name);
     for (uint16_t i = 0; i < width; i++) { /* F2a-2: a value given an IDENTITY */
         uint32_t sq;
         bool always;
@@ -8000,7 +8180,7 @@ static int exec_insert(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
                     if (x_nextval(x, &x->db->seqs[sq], &sv, e)) return e->code;
                     vals[map[i]] = (imdb_value){.type = IMDB_T_INT64, .i = sv};
                 }
-                if (vals[map[i]].null && !(c->flags & IMDB_COL_NULLABLE))
+                if (vals[map[i]].null && !(c->flags & IMDB_COL_NULLABLE) && !imdb_col_generated(t, (uint16_t)map[i]))
                     return imdb_fail(e, IMDB_ERR_CONSTRAINT, "row %u: column %s needs a value: it is NOT NULL", row + 1, c->name);
                 continue;
             }
@@ -8021,29 +8201,38 @@ static void cell_text(const imdb_cell *c, imdb_buf *out, bool safe);
 
 /* COPY's columns: a list as INSERT's (FROM: a column left out is its DEFAULT, F1: an ADD's, else NULL, refused when NOT
  * NULL; TO, vals NULL: any of them, P2 S17: S10 refused a TO that left out a NOT NULL column), else every column in
- * order */
+ * order; F2c: but the generated ones, both ways (PostgreSQL's: the dump's COPY TO and its restore's COPY FROM agree, the
+ * restore computing them), and a FROM's list naming one refused */
 static int copy_columns(imdb_table *t, const sql_stmt *st, int *map, uint16_t *width, imdb_value *vals, imdb_xenv *env,
                         seqfill *f, imdb_err *e)
 {
-    *width = st->ncols ? st->ncols : t->s.ncols;
-    if (!st->ncols) {
-        for (uint16_t i = 0; i < *width; i++) map[i] = i;
-        return IMDB_OK;
-    }
     bool seen[IMDB_MAX_COLS] = {false};
-    for (uint16_t i = 0; i < st->ncols; i++) {
-        int c = imdb_schema_col(&t->s, st->cols[i]);
-        if (c < 0) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no column %s in table %s", st->cols[i], t->s.name);
-        if (seen[c]) return imdb_fail(e, IMDB_ERR_INVALID, "column %s listed twice", st->cols[i]);
-        seen[c] = true;
-        map[i] = c;
+    if (!st->ncols) {
+        uint16_t w = 0;
+        for (uint16_t c = 0; c < t->s.ncols; c++)
+            if (!imdb_col_generated(t, c)) {
+                map[w++] = c;
+                seen[c] = true;
+            }
+        *width = w;
+    } else {
+        *width = st->ncols;
+        for (uint16_t i = 0; i < st->ncols; i++) {
+            int c = imdb_schema_col(&t->s, st->cols[i]);
+            if (c < 0) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no column %s in table %s", st->cols[i], t->s.name);
+            if (seen[c]) return imdb_fail(e, IMDB_ERR_INVALID, "column %s listed twice", st->cols[i]);
+            if (vals && imdb_col_generated(t, (uint16_t)c))
+                return imdb_fail(e, IMDB_ERR_INVALID, "column %s is generated: COPY FROM takes no value for it", st->cols[i]);
+            seen[c] = true;
+            map[i] = c;
+        }
     }
     for (uint16_t c = 0; c < t->s.ncols; c++) {
         if (seen[c]) continue;
         if (!vals) continue;
         if (col_default(env, t, c, &vals[c], e)) return e->code; /* F1: its DEFAULT, as INSERT's */
         if (f) seqfill_add(f, t, c); /* F2a-2: a sequence's value a record */
-        if (vals[c].null && !(t->s.cols[c].flags & IMDB_COL_NULLABLE))
+        if (vals[c].null && !(t->s.cols[c].flags & IMDB_COL_NULLABLE) && !imdb_col_generated(t, c)) /* F2c: computed */
             return imdb_fail(e, IMDB_ERR_CONSTRAINT, "column %s needs a value: it is NOT NULL", t->s.cols[c].name);
     }
     return IMDB_OK;
@@ -8168,9 +8357,13 @@ static int exec_copy_from(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err 
         if (rc) break;
         uint8_t salt[16];
         imdb_err e2 = {0};
-        rc = seq_fill(x, &f, vals, &e2) || imdb_salt_next(&x->salts, salt, &e2) || imdb_insert_salt(x->db, t, vals, salt, &e2)
+        imdb_xmark gm = imdb_xarena_mark(&x->arena); /* F2c: a computed TEXT lives until the record is written */
+        rc = seq_fill(x, &f, vals, &e2) || (t->hist.ngen && imdb_gen_compute(x->db, t, vals, &x->arena, &e2)) ||
+                     imdb_salt_next(&x->salts, salt, &e2) || imdb_insert_salt(x->db, t, vals, salt, &e2)
                  ? e2.code
-                 : IMDB_OK; /* F2a-2: a sequence's value a record (COPY writes an ALWAYS identity's given value, PostgreSQL's) */
+                 : IMDB_OK; /* F2a-2: a sequence's value a record (COPY writes an ALWAYS identity's given value, PostgreSQL's);
+                             * F2c: then the generated columns */
+        imdb_xarena_reset(&x->arena, gm);
         imdb_wipe(salt, sizeof salt);
         if (rc) {
             rc = imdb_fail(e, e2.code, "COPY line %llu: %s", line, e2.msg);
@@ -8459,6 +8652,8 @@ static int exec_join_write(xctx *x, const sql_stmt *st, bool upd, imdb_result *r
         if (is_key_col(&t->s, cols[k])) return imdb_fail(e, IMDB_ERR_INVALID, "UPDATE cannot change the primary key (use DELETE + INSERT)");
         if (col_always(t, (uint16_t)cols[k])) /* F2a-2: PostgreSQL's: an ALWAYS identity is not updated */
             return imdb_fail(e, IMDB_ERR_INVALID, "column %s is GENERATED ALWAYS AS IDENTITY: it is not updated", t->s.cols[cols[k]].name);
+        if (imdb_col_generated(t, (uint16_t)cols[k])) /* F2c: computed, never set */
+            return imdb_fail(e, IMDB_ERR_INVALID, "column %s is generated: it is computed, never set", t->s.cols[cols[k]].name);
         for (uint16_t j = 0; j < k; j++)
             if (cols[j] == cols[k]) return imdb_fail(e, IMDB_ERR_INVALID, "column %s is set twice", st->set_cols[k]);
         if (st->set_vals[k].kind == LIT_EXPR) {
@@ -8517,6 +8712,7 @@ static int exec_join_write(xctx *x, const sql_stmt *st, bool upd, imdb_result *r
                 rc = imdb_x_assign(&t->s.cols[cols[k]], &v, &set[k], e);
         }
         for (uint16_t k = 0; upd && !rc && k < st->nset; k++) both[cols[k]] = set[k];
+        if (upd && !rc && t->hist.ngen) rc = imdb_gen_compute(x->db, t, both, &x->arena, e); /* F2c: the row as updated */
         if (!rc && st->returning) rc = ret_row(x, st, t, u, both, r, e);
         if (!rc && upd) {
             uint8_t salt[16];
@@ -8557,6 +8753,8 @@ static int exec_update(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, 
         if (is_key_col(&t->s, cols[i])) return imdb_fail(e, IMDB_ERR_INVALID, "UPDATE cannot change the primary key (use DELETE + INSERT)");
         if (col_always(t, (uint16_t)cols[i])) /* F2a-2: PostgreSQL's: an ALWAYS identity is not updated */
             return imdb_fail(e, IMDB_ERR_INVALID, "column %s is GENERATED ALWAYS AS IDENTITY: it is not updated", t->s.cols[cols[i]].name);
+        if (imdb_col_generated(t, (uint16_t)cols[i])) /* F2c: computed, never set */
+            return imdb_fail(e, IMDB_ERR_INVALID, "column %s is generated: it is computed, never set", t->s.cols[cols[i]].name);
         for (uint16_t j = 0; j < i; j++)
             if (cols[j] == cols[i]) return imdb_fail(e, IMDB_ERR_INVALID, "column %s is set twice", st->set_cols[i]);
         if (st->set_vals[i].kind == LIT_EXPR) { /* computed per row, from the row's old values */
@@ -8586,6 +8784,7 @@ static int exec_update(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, 
         }
         if (rc) break;
         for (uint16_t k = 0; k < st->nset; k++) vals[cols[k]] = newv[k];
+        if (t->hist.ngen && (rc = imdb_gen_compute(x->db, t, vals, &x->arena, e))) break; /* F2c: the row as updated */
         if (st->returning && (rc = ret_row(x, st, t, NULL, vals, r, e))) break; /* P2 S8: the row as written */
         uint8_t salt[16];
         if (!rc && !(rc = imdb_salt_next(&x->salts, salt, e))) rc = imdb_update_salt(x->db, t, vids[i], vals, salt, e);
@@ -9632,12 +9831,25 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
     case ST_CREATE: { /* F2a: its columns' DEFAULTs (op 23): each a value of its column, or a clock its type suits */
         imdb_coldef cd[IMDB_MAX_COLS];
         uint16_t ncd = 0;
+        uint64_t genmask = 0; /* F2c: the generated columns, which no generated column's expression names */
+        for (uint16_t c = 0; c < st->schema.ncols; c++)
+            if (st->cdef_kind[c] == IMDB_DEFK_GENERATED) genmask |= 1ull << c;
         for (uint16_t c = 0; !rc && c < st->schema.ncols; c++) {
             const imdb_column *col = &st->schema.cols[c];
             uint8_t k = st->cdef_kind[c];
             imdb_value v;
             imdb_err e2 = {0};
             if (!k) continue;
+            if (k == IMDB_DEFK_GENERATED) { /* F2c: its expression bound against the CREATE's columns, its text as written */
+                if (col->flags & (IMDB_COL_PK | IMDB_COL_SUBJECT))
+                    rc = imdb_fail(e, IMDB_ERR_INVALID, "column %s: a key or SUBJECT column is not generated", col->name);
+                else if (col->type == IMDB_T_FLOAT64)
+                    rc = imdb_fail(e, IMDB_ERR_INVALID, "column %s: a FLOAT64 column is not generated (a later step: deferred.md D20)",
+                                   col->name);
+                else if (!(rc = imdb_gen_bind(&st->schema, c, genmask, x.sql + st->cdef[c].off, st->cdef[c].len, e)))
+                    cd[ncd++] = (imdb_coldef){.col = c, .kind = k, .text = x.sql + st->cdef[c].off, .tlen = st->cdef[c].len};
+                continue;
+            }
             if (k >= IMDB_DEFK_IDENTITY_ALWAYS) { /* F2a-2: an IDENTITY's own sequence (made first: op 24 before the CREATE), or
                                                      * nextval of a named one */
                 uint32_t sid = 0;

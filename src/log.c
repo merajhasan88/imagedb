@@ -23,6 +23,7 @@ bool imdb_defk_fits(uint8_t kind, uint8_t type) /* F2a: a clock kind and the typ
     case IMDB_DEFK_IDENTITY_ALWAYS: /* F2a-2: a sequence's values: an integer column's */
     case IMDB_DEFK_IDENTITY:
     case IMDB_DEFK_NEXTVAL: return type == IMDB_T_INT64;
+    case IMDB_DEFK_GENERATED: return type != IMDB_T_FLOAT64; /* F2c: a double's rounding is no verifier's to recompute */
     default: return false;
     }
 }
@@ -69,14 +70,20 @@ static void put_value(imdb_buf *b, const imdb_column *c, const imdb_value *v)
 bool imdb_coldefs_ok(const imdb_schema *s, const imdb_coldef *defs, uint16_t ndefs)
 {
     if (!s || !ndefs || ndefs > s->ncols) return false;
+    uint32_t gtext = 0; /* F2c: the generated columns' texts together */
     for (uint16_t k = 0; k < ndefs; k++) {
         const imdb_coldef *d = &defs[k];
         imdb_err e2 = {0};
         if (d->col >= s->ncols || (k && d->col <= defs[k - 1].col)) return false;
         bool ident = d->kind == IMDB_DEFK_IDENTITY_ALWAYS || d->kind == IMDB_DEFK_IDENTITY;
         if ((ident && (s->cols[d->col].flags & IMDB_COL_NULLABLE)) || /* F2a-2: an IDENTITY is NOT NULL */
-            (d->kind >= IMDB_DEFK_IDENTITY_ALWAYS && d->seq >= IMDB_MAX_SEQUENCES))
+            (d->kind >= IMDB_DEFK_IDENTITY_ALWAYS && d->kind <= IMDB_DEFK_NEXTVAL && d->seq >= IMDB_MAX_SEQUENCES))
             return false;
+        if (d->kind == IMDB_DEFK_GENERATED && /* F2c: no key or SUBJECT; its text one a CHECK's could be */
+            ((s->cols[d->col].flags & (IMDB_COL_PK | IMDB_COL_SUBJECT)) || d->seq || !d->text ||
+             !imdb_check_text_ok(d->text, d->tlen) || d->tlen > IMDB_MAX_CHECK_TEXT - gtext))
+            return false;
+        if (d->kind == IMDB_DEFK_GENERATED) gtext += d->tlen;
         if (d->kind == IMDB_DEFK_VALUE ? d->v.null || imdb_value_check(&s->cols[d->col], &d->v, &e2)
                                        : !imdb_defk_fits(d->kind, s->cols[d->col].type))
             return false;
@@ -91,7 +98,11 @@ void imdb_coldefs_put(imdb_buf *b, const imdb_schema *s, const imdb_coldef *defs
         imdb_buf_put_u16(b, defs[k].col);
         imdb_buf_put_u8(b, defs[k].kind);
         if (defs[k].kind == IMDB_DEFK_VALUE) put_value(b, &s->cols[defs[k].col], &defs[k].v);
-        if (defs[k].kind >= IMDB_DEFK_IDENTITY_ALWAYS) imdb_buf_put_u32(b, defs[k].seq); /* F2a-2 */
+        if (defs[k].kind >= IMDB_DEFK_IDENTITY_ALWAYS && defs[k].kind <= IMDB_DEFK_NEXTVAL) imdb_buf_put_u32(b, defs[k].seq); /* F2a-2 */
+        if (defs[k].kind == IMDB_DEFK_GENERATED) { /* F2c: its expression's text */
+            imdb_buf_put_u32(b, defs[k].tlen);
+            imdb_buf_put(b, defs[k].text, defs[k].tlen);
+        }
     }
 }
 
@@ -162,7 +173,13 @@ int imdb_coldefs_get(imdb_rd *r, const imdb_schema *s, bool none_ok, imdb_coldef
         if (d[k].col >= s->ncols || (k && d[k].col <= d[k - 1].col) || d[k].kind < IMDB_DEFK_VALUE || d[k].kind > IMDB_DEFK_LAST)
             return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: a bad column default", what);
         if (d[k].kind == IMDB_DEFK_VALUE && get_value(r, &s->cols[d[k].col], &d[k].v, what, e)) return e->code;
-        if (d[k].kind >= IMDB_DEFK_IDENTITY_ALWAYS) d[k].seq = imdb_rd_u32(r); /* F2a-2 */
+        if (d[k].kind >= IMDB_DEFK_IDENTITY_ALWAYS && d[k].kind <= IMDB_DEFK_NEXTVAL) d[k].seq = imdb_rd_u32(r); /* F2a-2 */
+        if (d[k].kind == IMDB_DEFK_GENERATED) { /* F2c: its text in r's bytes, its length bounded before it is read */
+            d[k].tlen = imdb_rd_u32(r);
+            if (!r->err && (!d[k].tlen || d[k].tlen > IMDB_MAX_CHECK_TEXT))
+                return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: a generated column's text of %u bytes", what, d[k].tlen);
+            d[k].text = (const char *)imdb_rd_bytes(r, d[k].tlen);
+        }
         if (r->err) return IMDB_OK;
     }
     if (!imdb_coldefs_ok(s, d, *n)) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: a bad column default", what);

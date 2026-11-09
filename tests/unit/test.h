@@ -105,6 +105,7 @@ TESTS(vc)   /* F3c: VARCHAR(n) */
 TESTS(def)  /* F2a: clock values and column DEFAULTs */
 TESTS(seq)  /* F2a-2: sequences, IDENTITY and SERIAL */
 TESTS(check) /* F2b-1: CHECK constraints */
+TESTS(gen)   /* F2c: generated columns */
 TESTS(tz) /* P2: time zones */
 TESTS(tzsql) /* P2: time zones through the engine */
 

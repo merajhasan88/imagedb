@@ -670,6 +670,18 @@ sequence, a zone, a FLOAT64 value, a TIMESTAMPTZ literal, a subquery and CAST ar
 refused. A column a CHECK names is not renamed or dropped until the CHECK is
 dropped. Not yet: NOT VALID, the other functions, FOREIGN KEY.
 
+Generated columns: `c type GENERATED ALWAYS AS (expression) STORED` in CREATE TABLE.
+The expression reads the row's other columns by CHECK's rules (the same literals,
+operators and functions; no other generated column) and its value is of a type the
+column takes; every INSERT, UPDATE, ON CONFLICT and COPY computes it once the row
+is otherwise whole, assigns it as an INSERT would (a DECIMAL rounded, a VARCHAR's
+length, NOT NULL), then checks the CHECKs. A value given it is refused (but
+`DEFAULT` in VALUES), as is `SET c = ...`; COPY without a column list leaves it
+out both ways, and the dump's restore computes it again. Every replica and the
+auditor recompute it for every row. A column an expression names is not renamed
+or dropped until the generated column is dropped. Not yet: VIRTUAL, ADD COLUMN ...
+GENERATED, a FLOAT64 generated column.
+
 Primary keys: every table has one, of one column (`id INT64 PRIMARY KEY`) or of
 up to eight (`PRIMARY KEY (region, day)`, a table constraint anywhere among the
 columns), each NOT NULL and of any type but FLOAT64. Rows come in the key's

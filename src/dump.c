@@ -93,6 +93,12 @@ static int default_text(dumper *d, const imdb_table *t, uint16_t c, imdb_err *e)
                                         [IMDB_DEFK_CURRENT_DATE] = "CURRENT_DATE", [IMDB_DEFK_LOCALTIME] = "LOCALTIME"};
     if (!t->hist.nvers) return IMDB_OK;
     const imdb_tcol *tc = &t->hist.tcol[t->hist.vers[t->hist.nvers - 1].pos[c]];
+    if (tc->gtext) { /* F2c: its expression as written; no DEFAULT beside it */
+        imdb_buf_put_str(&d->b, " GENERATED ALWAYS AS (");
+        imdb_buf_put(&d->b, tc->gtext, tc->glen);
+        imdb_buf_put_str(&d->b, ") STORED");
+        return IMDB_OK;
+    }
     const imdb_sequence *s = tc->wclock >= IMDB_DEFK_IDENTITY_ALWAYS && tc->wseq < d->s.db->nseqs ? &d->s.db->seqs[tc->wseq] : NULL;
     if (s && tc->wclock != IMDB_DEFK_NEXTVAL) { /* F2a-2: an IDENTITY, its sequence's options written out */
         imdb_buf_printf(&d->b, " GENERATED %s AS IDENTITY (", tc->wclock == IMDB_DEFK_IDENTITY_ALWAYS ? "ALWAYS" : "BY DEFAULT");

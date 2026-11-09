@@ -2208,6 +2208,7 @@ struct ab_check {
     aq *q;
     uint16_t root;
     cnode *nd;
+    uint64_t cols; /* F2c: the columns it names (the first 64) */
     uint8_t *sbuf; /* its string literals' bytes */
     size_t sused;
 };
@@ -2652,6 +2653,7 @@ static int ck_bind(ck *x, uint16_t k, bool null_ok)
         for (uint16_t c = 0; c < x->ncols; c++)
             if (!strcmp(x->cols[c].name, nm)) {
                 d->col = (int16_t)c;
+                if (c < 64) x->c->cols |= 1ull << c;
                 d->t = x->cols[c].type;
                 d->s = x->cols[c].type == T_DECIMAL ? x->cols[c].scale : 0;
                 if (d->t == T_FLOAT64) return fail(x->b, "a CHECK computes no FLOAT64 value");
@@ -2700,7 +2702,10 @@ void ab_check_free(ab_check *c)
     free(c);
 }
 
-int ab_check_bind(const char *text, size_t len, const ab_col *cols, uint16_t ncols, ab_check **out, char *err, size_t errn)
+/* the subset bound alone against cols: cond, a CHECK (its value a BOOL); else F2c's generation expression (any type: its
+ * caller decides) */
+static int cbind(const char *text, size_t len, const ab_col *cols, uint16_t ncols, bool cond, ab_check **out, char *err,
+                 size_t errn)
 {
     *out = NULL;
     ab b;
@@ -2731,7 +2736,7 @@ int ab_check_bind(const char *text, size_t len, const ab_col *cols, uint16_t nco
     if (!rc) {
         ck x = {&b, c, cols, ncols};
         rc = ck_bind(&x, c->root, false);
-        if (!rc && c->nd[c->root].t != T_BOOL) rc = fail(&b, "a CHECK is a condition: its value a BOOL");
+        if (!rc && cond && c->nd[c->root].t != T_BOOL) rc = fail(&b, "a CHECK is a condition: its value a BOOL");
     }
     free(b.t);
     if (rc) {
@@ -3196,4 +3201,115 @@ int ab_check_eval(const ab_check *c, const ab_val *row, char *err, size_t errn)
     for (unsigned i = 0; i < e.ntbuf; i++) free(e.tbuf[i]);
     if (rc) return -1;
     return v.null || v.i != 0;
+}
+
+int ab_check_bind(const char *text, size_t len, const ab_col *cols, uint16_t ncols, ab_check **out, char *err, size_t errn)
+{
+    return cbind(text, len, cols, ncols, true, out, err, errn);
+}
+
+/* ---- F2c: a generated column's expression (design.md §5, Generated columns): CHECK's subset bound alone, its value of a
+ * type its column takes, naming no generated column; computed by the evaluator above and assigned by INSERT's rules ---- */
+
+int ab_gen_bind(const char *text, size_t len, const ab_col *cols, uint16_t ncols, uint16_t target, uint64_t genmask,
+                ab_check **out, char *err, size_t errn)
+{
+    *out = NULL;
+    if (target >= ncols) {
+        if (errn) snprintf(err, errn, "no column at %u", target);
+        return -1;
+    }
+    ab_check *c = NULL;
+    if (cbind(text, len, cols, ncols, false, &c, err, errn)) return -1;
+    uint8_t t = c->nd[c->root].t, ct = cols[target].type;
+    bool ok = ct == T_INT64 ? t == T_INT64 : ct == T_DECIMAL ? t == T_INT64 || t == T_DECIMAL : ct != T_FLOAT64 && t == ct;
+    const char *why = !ok ? "its value of a type its column does not take" : (c->cols & genmask) ? "it names a generated column" : NULL;
+    if (why) {
+        if (errn) snprintf(err, errn, "%s", why);
+        ab_check_free(c);
+        return -1;
+    }
+    *out = c;
+    return 0;
+}
+
+/* the column's assignment of a computed value (sql_expr.c's imdb_x_assign and codec.c's value check, from design.md
+ * §5): 0 and *out, or -2 */
+static int gassign(cx *e, const cv *v, const ab_gcol *col, ab_val *out)
+{
+    memset(out, 0, sizeof *out);
+    if (v->null) {
+        out->null = true;
+        return col->nullable ? 0 : (cfail(e, "NULL in a NOT NULL column"), -2);
+    }
+    switch (col->type) {
+    case T_INT64: {
+        __int128 lo = col->prec == 16 ? INT16_MIN : col->prec == 32 ? INT32_MIN : INT64_MIN;
+        __int128 hi = col->prec == 16 ? INT16_MAX : col->prec == 32 ? INT32_MAX : INT64_MAX;
+        if (v->t != T_INT64) return cfail(e, "not an integer"), -2;
+        if (v->i < lo || v->i > hi) return cfail(e, "a value out of its integer's range"), -2;
+        out->i = (int64_t)v->i;
+        return 0;
+    }
+    case T_DECIMAL: {
+        if (v->t != T_INT64 && v->t != T_DECIMAL) return cfail(e, "not a number"), -2;
+        int s = v->t == T_DECIMAL ? v->s : 0;
+        __int128 r = v->i;
+        if (s < col->scale) {
+            if (__builtin_mul_overflow(r, (__int128)cp10(col->scale - s), &r)) return cfail(e, "past its DECIMAL"), -2;
+        } else if (s > col->scale) { /* PostgreSQL's assignment: half away from zero */
+            unsigned __int128 d = cp10(s - col->scale), m = cmag(r), q = m / d, rem = m % d;
+            if (rem >= d - rem) q++;
+            r = r < 0 ? -(__int128)q : (__int128)q;
+        }
+        if (cmag(r) >= cp10(18) || cmag(r) > cp10(col->prec) - 1) return cfail(e, "past its DECIMAL"), -2;
+        out->i = (int64_t)r;
+        return 0;
+    }
+    case T_TEXT: {
+        if (v->t != T_TEXT) return cfail(e, "not a TEXT"), -2;
+        if (v->n > 65535u || (v->n && !utf8_ok((const char *)v->p, v->n))) return cfail(e, "not a TEXT value"), -2;
+        uint32_t chars = 0;
+        for (uint32_t i = 0; i < v->n; i++) chars += (v->p[i] & 0xC0) != 0x80;
+        if (col->vlen && chars > col->vlen) return cfail(e, "longer than its VARCHAR"), -2;
+        out->s = v->p;
+        out->len = v->n;
+        return 0;
+    }
+    default:
+        if (v->t != col->type || col->type == T_FLOAT64) return cfail(e, "another type"), -2;
+        if ((col->type == T_BOOL && v->i != 0 && v->i != 1) ||
+            ((col->type == T_TIMESTAMP || col->type == T_TIMESTAMPTZ) &&
+             (v->i < -62135596800000000LL || v->i > 253402300799999999LL)) ||
+            (col->type == T_DATE && (v->i < CK_DATE_MIN || v->i > CK_DATE_MAX)) ||
+            (col->type == T_TIME && (v->i < 0 || v->i >= CK_DAY_US)))
+            return cfail(e, "out of its type's range"), -2;
+        out->i = (int64_t)v->i;
+        return 0;
+    }
+}
+
+int ab_gen_eval(const ab_check *c, const ab_val *row, const ab_gcol *col, ab_val *out, uint8_t **tbuf, char *err, size_t errn)
+{
+    cx e = {c, row, err, errn, {0}, 0};
+    if (errn) err[0] = 0;
+    *tbuf = NULL;
+    memset(out, 0, sizeof *out);
+    cv v;
+    int rc = ceval(&e, c->root, &v);
+    if (!rc && !v.null && v.t == T_TEXT) { /* its bytes outlive the evaluation's buffers */
+        if (!(*tbuf = malloc(v.n ? v.n : 1))) {
+            rc = cfail(&e, "out of memory");
+        } else {
+            if (v.n) memcpy(*tbuf, v.p, v.n);
+            v.p = *tbuf;
+        }
+    }
+    if (!rc) rc = gassign(&e, &v, col, out);
+    for (unsigned i = 0; i < e.ntbuf; i++) free(e.tbuf[i]);
+    if (rc && *tbuf) {
+        free(*tbuf);
+        *tbuf = NULL;
+    }
+    return rc;
 }

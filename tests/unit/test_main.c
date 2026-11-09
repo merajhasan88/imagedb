@@ -129,6 +129,7 @@ int main(int argc, char **argv)
         {"def", def_tests, &def_ntests},    /* F2a: clock values and column DEFAULTs */
         {"seq", seq_tests, &seq_ntests},    /* F2a-2: sequences, IDENTITY and SERIAL */
         {"check", check_tests, &check_ntests}, /* F2b-1: CHECK constraints */
+        {"gen", gen_tests, &gen_ntests},       /* F2c: generated columns */
         {"tz", tz_tests, &tz_ntests}, /* P2: time zones */
         {"tzsql", tzsql_tests, &tzsql_ntests}, /* P2: time zones through the engine */
     };

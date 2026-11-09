@@ -1171,7 +1171,7 @@ static int run_view(const char *run)
  * leaves both out, a rename, CHECKPOINTs between (segments of each version, the manifest's schema history); F1 stage 4:
  * a column dropped before the others, a SET DEFAULT, a row taking it, a SET NOT NULL, and a CHECKPOINT whose memtable
  * holds rows from both sides of the drop (a segment of each version); F2a: a table of CREATE DEFAULTs (op 23) and a
- * SET DEFAULT of a clock (kind 10) before that CHECKPOINT; each read against its twin, and every
+ * SET DEFAULT of a clock (kind 10) before that CHECKPOINT; F2b-1: a table of CHECKs; F2c: a table of generated columns; each read against its twin, and every
  * recovered state the acknowledged one (VERIFY and the auditor) */
 static int run_alter(const char *run)
 {
@@ -1211,6 +1211,12 @@ static int run_alter(const char *run)
         {"ALTER TABLE ck ADD CONSTRAINT a_small CHECK (a < 100)", NULL},
         {"ALTER TABLE ck DROP CONSTRAINT s_ok", NULL},
         {"INSERT INTO ck VALUES (3, 3, '')", NULL},
+        /* F2c: a CREATE's generated columns (op 23 kind 9), rows computing them and an UPDATE computing again, the next
+         * CHECKPOINT's manifest version 1's */
+        {"CREATE TABLE gz (id INT64 PRIMARY KEY, a INT64, s TEXT, w INT64 GENERATED ALWAYS AS (a * 2) STORED, "
+         "u TEXT GENERATED ALWAYS AS (s || '!') STORED)", NULL},
+        {"INSERT INTO gz (id, a, s) VALUES (1, 1, 'x'), (2, NULL, 'y')", NULL},
+        {"UPDATE gz SET a = 5 WHERE id = 2", NULL},
         {"CHECKPOINT", NULL},
         {"SELECT COUNT(*) FROM txns WHERE c = 'r'", "SELECT COUNT(*) FROM txns WHERE id = 21"},
         {"SELECT note, c, n FROM txns WHERE user_id = 42 ORDER BY id", "SELECT note, 'q', 5 FROM txns WHERE user_id = 42 ORDER BY id"},
@@ -1221,6 +1227,8 @@ static int run_alter(const char *run)
         {"SELECT COUNT(*) FROM dz WHERE s = 'd' AND t IS NOT NULL", "SELECT COUNT(*) FROM dz WHERE id >= 2"},
         {"SELECT COUNT(*) FROM ck WHERE a < 100 AND a > 0", "SELECT COUNT(*) FROM ck"},
         {"INSERT INTO ck VALUES (4, 4, NULL)", NULL},
+        {"SELECT w, u FROM gz ORDER BY id", "SELECT a * 2, s || '!' FROM gz ORDER BY id"},
+        {"INSERT INTO gz (id, a, s) VALUES (3, 3, 'z')", NULL},
     };
     int v = 0;
     size_t done = 0;
@@ -1261,8 +1269,10 @@ static int run_alter(const char *run)
     /* not vacuous: a run nothing faulted made every version */
     const imdb_table *tt = imdb_table_by_name(db, "txns");
     const imdb_table *dz = imdb_table_by_name(db, "dz");
+    const imdb_table *gz = imdb_table_by_name(db, "gz");
     if (!v && done == sizeof q / sizeof *q && !db->warning[0] && !db->failed &&
-        (!tt || tt->hist.nvers != 7 || !dz || dz->hist.nvers != 2 || dz->hist.tcol[3].wclock != IMDB_DEFK_LOCALTIME))
+        (!tt || tt->hist.nvers != 7 || !dz || dz->hist.nvers != 2 || dz->hist.tcol[3].wclock != IMDB_DEFK_LOCALTIME ||
+         !gz || gz->hist.ngen != 2))
         v = VIOL_ALTER;
     imdb_session_close(&s);
     imdb_close(db);

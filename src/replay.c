@@ -22,6 +22,24 @@
 
 /* ---- applying one commit (replay and replicas) ---------------------------- */
 
+/* F2c: a CREATE's generated columns' texts (op 23 kind 9), each bound against its schema as the writer bound it */
+static int gen_texts_bind(const imdb_schema *s, const imdb_coldef *defs, uint16_t n, uint64_t seq, imdb_err *e)
+{
+    uint64_t genmask = 0;
+    for (uint16_t k = 0; k < n; k++)
+        if (defs[k].kind == IMDB_DEFK_GENERATED) genmask |= 1ull << defs[k].col;
+    for (uint16_t k = 0; k < n; k++) {
+        if (defs[k].kind != IMDB_DEFK_GENERATED) continue;
+        imdb_err e2 = {0};
+        int brc = imdb_gen_bind(s, defs[k].col, genmask, defs[k].text, defs[k].tlen, &e2);
+        if (brc == IMDB_ERR_NOMEM) return imdb_fail(e, brc, "%s", e2.msg);
+        if (brc)
+            return imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: generated column %s: %s", (unsigned long long)seq,
+                             s->cols[defs[k].col].name, e2.msg);
+    }
+    return IMDB_OK;
+}
+
 static int apply_insert(imdb_db *db, imdb_table *t, const imdb_op *op, uint64_t vid, const uint8_t commit[32],
                         uint64_t seq, uint64_t pk_link, bool commit_checked, imdb_err *e)
 {
@@ -48,6 +66,12 @@ static int apply_insert(imdb_db *db, imdb_table *t, const imdb_op *op, uint64_t 
             return imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: duplicate live primary key in table %s",
                              (unsigned long long)seq, t->s.name);
         if (imdb_index_unique_replay(t, vals, seq, e)) return e->code; /* an UPDATE's old version ended already */
+        if (t->hist.ngen) { /* F2c: each generated column the value its expression gives, as the writer computed it */
+            imdb_err e4 = {0};
+            int grc = imdb_gen_verify(db, t, vals, &e4);
+            if (grc == IMDB_ERR_NOMEM) return imdb_fail(e, grc, "%s", e4.msg);
+            if (grc) return imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: %s", (unsigned long long)seq, e4.msg);
+        }
         if (t->hist.nchk) { /* F2b-1: the row passes its table's CHECKs, as the writer's did */
             imdb_err e3 = {0};
             int crc = imdb_check_row(db, t, vals, &e3);
@@ -255,7 +279,8 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
             else if (!(rc = imdb_table_new(db, o->schema, e))) db->t[db->nt - 1]->created_at = seq;
             break;
         case IMDB_OP_COLUMN_DEFAULTS: /* F2a: its CREATE's defaults (the codec checked them against the CREATE's schema) */
-            if (!(rc = imdb_hist_create_defaults(&t->hist, o->defs, o->ndefs, e)))
+            rc = gen_texts_bind(&t->s, o->defs, o->ndefs, seq, e); /* F2c: each generated column's text binds */
+            if (!rc && !(rc = imdb_hist_create_defaults(&t->hist, o->defs, o->ndefs, e)))
                 rc = imdb_seq_own(db, o->table, o->defs, o->ndefs, seq, e); /* F2a-2: an IDENTITY's sequence is its column's */
             break;
         case IMDB_OP_TABLE_CHECKS: { /* F2b-1: each text binds against the CREATE's schema (the codec checked the list) */

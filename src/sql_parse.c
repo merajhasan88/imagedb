@@ -1257,6 +1257,29 @@ static int default_value(parser *p, sql_lit *l, uint8_t *clock)
 
 /* ALTER TABLE t, read: SET RETENTION ...; F1: ADD [COLUMN] c type [NULL | NOT NULL] [DEFAULT literal] (either order),
  * RENAME [COLUMN] a TO b, RENAME TO n */
+/* F2c: (text) at p's token: the text's span as written, from its first token to the end of its last (balanced
+ * parentheses, no ';' or parameter), at most IMDB_MAX_CHECK_TEXT bytes; the parentheses read */
+static int paren_span(parser *p, uint32_t *off, uint32_t *len, const char *what)
+{
+    if (expect(p, TK_LP, "(")) return p->e->code;
+    uint32_t t0 = p->i;
+    int depth = 0;
+    for (;; p->i++) {
+        uint8_t k = p->t[p->i].kind;
+        if (k == TK_EOF || k == TK_SEMI) return fail_at(p, "the closing )");
+        if (k == TK_PARAM) return imdb_fail(p->e, IMDB_ERR_INVALID, "%s takes no parameter ($n)", what);
+        if (k == TK_LP) depth++;
+        if (k == TK_RP && !depth--) break;
+    }
+    if (p->i == t0) return imdb_fail(p->e, IMDB_ERR_SYNTAX, "%s is empty", what);
+    const sql_tok *a = &p->t[t0], *z = &p->t[p->i - 1];
+    *off = a->off - (a->kind == TK_STR);
+    *len = z->off + z->len + (z->kind == TK_STR) - *off;
+    if (*len > IMDB_MAX_CHECK_TEXT) return imdb_fail(p->e, IMDB_ERR_LIMIT, "%s of more than %u bytes", what, IMDB_MAX_CHECK_TEXT);
+    p->i++; /* its ) */
+    return IMDB_OK;
+}
+
 /* F2b-1: CHECK (condition), CHECK already read: the condition's text kept as written, from its first token to the end
  * of its last (balanced parentheses; the engine binds it on its own, as replay and the auditor do: design.md §5, CHECK
  * constraints); name: CONSTRAINT's, or "" for the engine to choose */
@@ -1339,6 +1362,9 @@ static int parse_alter(parser *p, sql_stmt *st)
                 st->has_alter_def = true;
             } else if (kw(p, "primary") || kw(p, "subject")) {
                 return imdb_fail(p->e, IMDB_ERR_INVALID, "an added column is neither a key nor a SUBJECT");
+            } else if (kw(p, "generated")) { /* F2c */
+                return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "ADD COLUMN ... GENERATED would compute a value for every row "
+                                                            "there: a later step (CREATE the table with it)");
             } else {
                 break;
             }
@@ -1459,7 +1485,19 @@ static int parse_create(parser *p, sql_stmt *st)
             } else if (kw(p, "generated")) { /* F2a-2: GENERATED {ALWAYS | BY DEFAULT} AS IDENTITY [(options)] */
                 bool always = kw(p, "always");
                 if (!always && (expect_kw(p, "by") || expect_kw(p, "default"))) return p->e->code;
-                if (expect_kw(p, "as") || expect_kw(p, "identity")) return p->e->code;
+                if (expect_kw(p, "as")) return p->e->code;
+                if (always && p->t[p->i].kind == TK_LP) { /* F2c: GENERATED ALWAYS AS (expr) STORED, its text as written */
+                    if (st->cdef_kind[s->ncols])
+                        return imdb_fail(p->e, IMDB_ERR_INVALID, "column %s: a generated column takes no DEFAULT or IDENTITY", c->name);
+                    if (paren_span(p, &st->cdef[s->ncols].off, &st->cdef[s->ncols].len, "a generated column's expression"))
+                        return p->e->code;
+                    if (kw(p, "virtual"))
+                        return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "column %s: a VIRTUAL generated column is a later step: write STORED", c->name);
+                    if (expect_kw(p, "stored")) return p->e->code;
+                    st->cdef_kind[s->ncols] = IMDB_DEFK_GENERATED;
+                    continue;
+                }
+                if (expect_kw(p, "identity")) return p->e->code;
                 if (st->cdef_kind[s->ncols])
                     return imdb_fail(p->e, IMDB_ERR_INVALID, "column %s: an IDENTITY takes no DEFAULT, once", c->name);
                 st->cdef_kind[s->ncols] = always ? IMDB_DEFK_IDENTITY_ALWAYS : IMDB_DEFK_IDENTITY;

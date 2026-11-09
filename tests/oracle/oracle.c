@@ -385,6 +385,8 @@ static bool g_ckey; /* P2 F4, --ckey: u's key is (tid, id), every dialect's; ids
 static bool g_alter; /* P2 F1, --alter: t's last five columns added after its first rows and zz dropped (alter_add) */
 static bool g_defaults; /* F2a, --defaults: t's g, x and s with constant DEFAULTs in every dialect (ddl_defaults), which
                          * INSERT ... SELECT's column lists leaving them out write; the generator draw for draw */
+static bool g_gen; /* F2c, --generated: u given w GENERATED ALWAYS AS (v + tid) STORED in every dialect (ddl_gen): every write to u
+                     * names its columns, SELECT * of u lists them, and u's state compares w (check_gen) */
 static bool g_checks; /* F2b-1, --checks: t with two CHECKs in every dialect (ddl_checks): writes some rows fail, refused whole by
                        * every engine, the states compared after each; the generator draw for draw */
 /* A seed names the same statements only within one stage: each P2 stage (S1 to S4) adds forms to the default
@@ -3034,8 +3036,10 @@ static void print_stmt_body(sb *b, int d, const stmt *q)
     case Q_INSERT:
         if (q->isel) { /* P2 S8: t's rows below 2^20 (never a copy) copied at keys of their own, the columns by a list */
             sb_printf(b, "INSERT INTO %s", tname(q->tab));
+            bool all = !q->nic && g_gen && q->tab == 1; /* F2c: u's generated w takes no value: every other column named */
             for (int i = 0; q->nic && i <= q->nic; i++) sb_printf(b, "%s%s", i ? ", " : " (", i ? cols(q->tab)[q->icol[i - 1]].name : "id");
-            sb_printf(b, "%s SELECT id + %lld", q->nic ? ")" : "", (long long)q->ikey);
+            for (int c = 0; all && c < ncols(q->tab); c++) sb_printf(b, "%s%s", c ? ", " : " (", cols(q->tab)[c].name);
+            sb_printf(b, "%s SELECT id + %lld", q->nic || all ? ")" : "", (long long)q->ikey);
             for (int c = 1; c < (q->nic ? q->nic + 1 : ncols(q->tab)); c++)
                 sb_printf(b, ", %s", cols(q->tab)[q->nic ? q->icol[c - 1] : c].name);
             sb_printf(b, " FROM %s", tname(q->tab));
@@ -3050,6 +3054,11 @@ static void print_stmt_body(sb *b, int d, const stmt *q)
         }
         bool my = d == D_MY || d == D_MA;
         sb_printf(b, "INSERT %sINTO %s VALUES ", q->ups && q->ups < 3 && my ? "IGNORE " : "", tname(q->tab));
+        if (g_gen && q->tab == 1) { /* F2c: u's columns named, its generated w left out */
+            b->n -= 8, b->p[b->n] = 0;
+            for (int c = 0; c < ncols(1); c++) sb_printf(b, "%s%s", c ? ", " : " (", cols(1)[c].name);
+            sb_str(b, ") VALUES ");
+        }
         for (int r = 0; r < q->nrow; r++) {
             sb_str(b, r ? ", (" : "(");
             for (int c = 0; c < ncols(q->tab); c++) {
@@ -3121,7 +3130,9 @@ static void print_stmt_body(sb *b, int d, const stmt *q)
     }
     sb_str(b, "SELECT ");
     if (q->distinct) sb_str(b, "DISTINCT ");
-    if (q->star) sb_str(b, "*");
+    if (q->star && g_gen && q->tab == 1) /* F2c: u's columns but its generated w, as the answer is typed */
+        for (int c = 0; c < ncols(1); c++) sb_printf(b, "%s%s", c ? ", " : "", cols(1)[c].name);
+    else if (q->star) sb_str(b, "*");
     for (int i = 0; i < q->nit; i++) {
         const item *it = &q->it[i];
         if (i) sb_str(b, ", ");
@@ -3377,6 +3388,23 @@ static const char *ddl_checks(int d, const char *s)
     return b[d];
 }
 
+/* --generated (F2c): u's CREATE TABLE given its generated column before the closing parenthesis, in each dialect's words
+ * (SQL Server's a computed column PERSISTED, its type v + tid's, BIGINT) */
+static const char *ddl_gen(int d, const char *s)
+{
+    static char b[ND][800];
+    static const char *const W[ND] = {", w INT64 GENERATED ALWAYS AS (v + tid) STORED", ", w INTEGER GENERATED ALWAYS AS (v + tid) STORED",
+                                      ", w BIGINT GENERATED ALWAYS AS (v + tid) STORED", ", w BIGINT GENERATED ALWAYS AS (v + tid) STORED",
+                                      ", w BIGINT GENERATED ALWAYS AS (v + tid) STORED", ", w AS (v + tid) PERSISTED"};
+    if (!g_gen) return s;
+    size_t n = strlen(s);
+    const char *pk = strstr(s, ", PRIMARY KEY ("); /* --ckey's table constraint: SQLite takes the columns before it */
+    size_t at = pk ? (size_t)(pk - s) : n - 1;
+    if (n + strlen(W[d]) >= sizeof b[d] || s[n - 1] != ')') return s;
+    snprintf(b[d], sizeof b[d], "%.*s%s%s", (int)at, s, W[d], s + at);
+    return b[d];
+}
+
 static const char *ddl(int d, int tab)
 {
     static const char *const T[ND] = {
@@ -3412,7 +3440,7 @@ static const char *ddl(int d, int tab)
         "utf8mb4_nopad_bin)",
         "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, tid BIGINT, v INT, s VARCHAR(255) COLLATE "
         "Latin1_General_100_BIN2_UTF8)"};
-    return tab ? (g_ckey ? UCK[d] : U[d]) : g_alter ? ddl_alter(d, T[d]) : ddl_checks(d, ddl_defaults(d, tz_ddl(d, T[d])));
+    return tab ? ddl_gen(d, g_ckey ? UCK[d] : U[d]) : g_alter ? ddl_alter(d, T[d]) : ddl_checks(d, ddl_defaults(d, tz_ddl(d, T[d])));
 }
 
 /* ---- canonical cells: every engine's answer to one text per value ------------------------------------------------ */
@@ -4590,6 +4618,36 @@ static int run_stmt(unsigned seed, int step, const stmt *q, bool state)
     return 0;
 }
 
+/* --generated (F2c): u's generated w, each engine's by its own expression, against imagedb's, row by row */
+static unsigned long g_gen_compared;
+static int check_gen(unsigned seed, int step)
+{
+    static res out[ND];
+    int ty[2] = {TY(CT_INT, 0), TY(CT_INT, 0)};
+    const char *sql = g_ckey ? "SELECT id, w FROM u ORDER BY tid, id" : "SELECT id, w FROM u ORDER BY id";
+    for (int d = 0; d < ND; d++)
+        if (g_eng[d].on) exec_eng(&g_eng[d], sql, true, ty, 2, &out[d]);
+    const res *base = &out[D_IMDB];
+    for (int d = 1; d < ND; d++) {
+        if (!g_eng[d].on) continue;
+        g_gen_compared++;
+        const res *o = &out[d];
+        const char *why = base->err != o->err ? "one refused it" : base->err ? NULL : base->n != o->n ? "another number of rows" : NULL;
+        size_t at = 0;
+        for (at = 0; !why && !base->err && at < base->n; at++)
+            if (strcmp(base->rows[at], o->rows[at])) why = "another row";
+        if (!why) continue;
+        g_mismatches++;
+        fprintf(stderr, "MISMATCH seed %u step %d (u's generated w), imagedb against %s: %s\n  %s\n", seed, step, DNAME[d], why, sql);
+        fprintf(stderr, "  imagedb: %s (%zu rows)\n", base->err ? base->msg : "ok", base->n);
+        if (!base->err) show_rows(base, at ? at - 1 : 0);
+        fprintf(stderr, "  %s: %s (%zu rows)\n", DNAME[d], o->err ? o->msg : "ok", o->n);
+        if (!o->err) show_rows(o, at ? at - 1 : 0);
+        return -1;
+    }
+    return 0;
+}
+
 static int check_state(unsigned seed, int step)
 {
     for (int tab = 0; tab < 2; tab++) {
@@ -4601,7 +4659,7 @@ static int check_state(unsigned seed, int step)
         q.gcol = -1;
         if (run_stmt(seed, step, &q, true)) return -1;
     }
-    return 0;
+    return g_gen ? check_gen(seed, step) : 0;
 }
 
 /* ---- the driver ---------------------------------------------------------------------------------------------------- */
@@ -4818,6 +4876,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--alter")) g_alter = true; /* P2 F1 */
         else if (!strcmp(argv[i], "--defaults")) g_defaults = true; /* F2a */
         else if (!strcmp(argv[i], "--checks")) g_checks = true; /* F2b-1 */
+        else if (!strcmp(argv[i], "--generated")) g_gen = true; /* F2c */
         else if (!strcmp(argv[i], "--tz")) g_tz = true; /* P2: time zones */
         else if (!strcmp(argv[i], "--date")) g_dt = 1; /* F3b */
         else if (!strcmp(argv[i], "--time")) g_dt = 2;
@@ -4911,6 +4970,7 @@ int main(int argc, char **argv)
     printf("oracle: %ld comparisons of P2 S8's UPDATE ... FROM and DELETE ... USING%s\n", g_ufrom_compared,
            "");
     printf("oracle: %ld comparisons of P2 S5's set operations, %ld of its WITH RECURSIVE\n", g_set_compared, g_rec_compared);
+    if (g_gen) printf("oracle: %lu comparisons of F2c's generated column u.w (each engine's by its own expression), after every change\n", g_gen_compared);
     printf("oracle: %ld comparisons of P2 S4b's correlated subqueries\n", g_corr_compared);
     printf("oracle: %ld comparisons of P2 S7's SELECTs over the views vt and vu (t's and u's rows through a predicate)\n",
            g_view_compared);

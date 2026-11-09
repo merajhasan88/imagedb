@@ -166,7 +166,7 @@ static int v_seq_own(vctx *x, uint32_t table, const imdb_coldef *defs, uint16_t 
 {
     for (uint16_t k = 0; k < n; k++) {
         const imdb_coldef *d = &defs[k];
-        if (d->kind < IMDB_DEFK_IDENTITY_ALWAYS) continue;
+        if (d->kind < IMDB_DEFK_IDENTITY_ALWAYS || d->kind > IMDB_DEFK_NEXTVAL) continue; /* F2c: kind 9 names none */
         imdb_sequence *s = d->seq < x->nsq ? &x->sq[d->seq] : NULL;
         bool ident = d->kind != IMDB_DEFK_NEXTVAL;
         if (!s || s->dropped_at || (ident && (s->created_at != seq || s->owner != UINT32_MAX)))
@@ -751,6 +751,18 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
             break;
         }
         case IMDB_OP_COLUMN_DEFAULTS: /* F2a: its CREATE's defaults into the model's first version (the codec checked them) */
+            for (uint16_t q = 0; q < o->ndefs; q++) { /* F2c: each generated column's text binds against the CREATE's schema */
+                if (o->defs[q].kind != IMDB_DEFK_GENERATED) continue;
+                uint64_t gm = 0;
+                for (uint16_t q2 = 0; q2 < o->ndefs; q2++)
+                    if (o->defs[q2].kind == IMDB_DEFK_GENERATED) gm |= 1ull << o->defs[q2].col;
+                imdb_err e2 = {0};
+                int brc = imdb_gen_bind(&t->s, o->defs[q].col, gm, o->defs[q].text, o->defs[q].tlen, &e2);
+                if (brc == IMDB_ERR_NOMEM) return imdb_fail(e, brc, "%s", e2.msg);
+                if (brc)
+                    return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: generated column %s: %s", (unsigned long long)seq,
+                                     t->s.cols[o->defs[q].col].name, e2.msg);
+            }
             if (!(rc = imdb_hist_create_defaults(&t->hist, o->defs, o->ndefs, e)))
                 rc = v_seq_own(x, o->table, o->defs, o->ndefs, seq, e); /* F2a-2 */
             break;
@@ -888,6 +900,10 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
                 if (imdb_checks_name_col(&t->hist, t->s.cols[cur->at[o->apos]].name, &cn, e)) return e->code;
                 if (cn)
                     return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: a rename or drop of a column check %s names",
+                                     (unsigned long long)seq, cn);
+                if (imdb_gens_name_col(&t->hist, t->s.cols[cur->at[o->apos]].name, o->apos, &cn, e)) return e->code; /* F2c */
+                if (cn)
+                    return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: a rename or drop of a column generated column %s names",
                                      (unsigned long long)seq, cn);
             }
             if (o->akind == IMDB_ALTER_ADD_CHECK) { /* F2b-1: its text binds (its rows: replay's and the auditor's) */
@@ -1522,7 +1538,9 @@ static bool same_hist(const imdb_schema_hist *m, const imdb_schema_hist *x, uint
         uint32_t xd = x->tcol[p].dropped <= n ? x->tcol[p].dropped : 0; /* F1 stage 4: dropped by version n, or not */
         if (m->tcol[p].added != x->tcol[p].added || m->tcol[p].dropped != xd ||
             !val_eq(&m->tcol[p].missing, &x->tcol[p].missing) || !val_eq(&m->tcol[p].cdef, &x->tcol[p].cdef) ||
-            m->tcol[p].cclock != x->tcol[p].cclock) /* F2a: a CREATE's DEFAULTs, which no version holds */
+            m->tcol[p].cclock != x->tcol[p].cclock || /* F2a: a CREATE's DEFAULTs, which no version holds */
+            m->tcol[p].glen != x->tcol[p].glen || !m->tcol[p].gtext != !x->tcol[p].gtext || /* F2c: nor a generation text */
+            (m->tcol[p].glen && memcmp(m->tcol[p].gtext, x->tcol[p].gtext, m->tcol[p].glen)))
             return false;
     }
     return true;
@@ -1817,6 +1835,12 @@ static int verify_engine(imdb_db *db, const vctx *x, imdb_verify_report *rep, im
                   !memcmp(vt->hist.chk[q].text, et->hist.chk[q].text, vt->hist.chk[q].len);
         if (!cks)
             return imdb_fail(e, IMDB_ERR_VERIFY, "verify: the engine's CHECKs of table %s differ from the log's", et->s.name);
+        bool gens = vt->hist.ntcol == et->hist.ntcol && vt->hist.ngen == et->hist.ngen; /* F2c: its generation texts */
+        for (uint16_t p = 0; gens && p < vt->hist.ntcol; p++)
+            gens = vt->hist.tcol[p].glen == et->hist.tcol[p].glen && !vt->hist.tcol[p].gtext == !et->hist.tcol[p].gtext &&
+                   (!vt->hist.tcol[p].glen || !memcmp(vt->hist.tcol[p].gtext, et->hist.tcol[p].gtext, vt->hist.tcol[p].glen));
+        if (!gens)
+            return imdb_fail(e, IMDB_ERR_VERIFY, "verify: the engine's generated columns of table %s differ from the log's", et->s.name);
         /* from scratch, independent of the delta arithmetic */
         imdb_lthash re;
         if (imdb_recompute_digest(db, et, db->seq, &re, e)) return e->code;

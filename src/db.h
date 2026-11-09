@@ -150,6 +150,9 @@ typedef struct imdb_tcol {
     uint8_t wclock;          /* F2a: the write default a kind past a value (IMDB_DEFK_*: a clock read at the write, F2a-2's
                                 IDENTITY and nextval kinds a sequence's next value); 0: wdef is the default */
     uint32_t cseq, wseq;     /* F2a-2: the CREATE's and the write default's sequence (the IDENTITY and nextval kinds) */
+    char *gtext;             /* F2c: GENERATED ALWAYS AS (gtext) STORED, its CREATE's (op 23 kind 9): glen bytes, the history's own;
+                                NULL: not generated */
+    uint32_t glen;
 } imdb_tcol;
 
 /* F1: a schema version. Rows begun at or after `since` (up to the next version's) are encoded under s, the columns
@@ -191,6 +194,8 @@ typedef struct imdb_schema_hist {
     uint16_t nchk;
     imdb_chkref chk[IMDB_MAX_CHECKS];
     uint32_t chkbytes;            /* the live texts' bytes together: IMDB_MAX_CHECK_TEXT at most */
+    uint16_t ngen;                /* F2c: the columns the CREATE generated, ever (a DROP COLUMN leaves it: 0 means no write
+                                     computes or verifies one; the live ones are those whose tcol has a gtext) */
     char *cstaged;
 } imdb_schema_hist;
 
@@ -223,6 +228,7 @@ typedef struct imdb_table {
     uint32_t nidx;
     imdb_schema_hist hist;    /* F1: its schema history; hist.vers[hist.nvers - 1].s is s */
     struct imdb_chkc *chkc;   /* F2b-1: its live CHECKs compiled (sql_exec.c), for the history length it names; NULL: none yet */
+    struct imdb_chkc *genc;   /* F2c: its live generated columns' expressions compiled, likewise */
     uint64_t idx_upto;        /* versions below are in the indexes' structures; the rest are the */
                               /* active transaction's own (versions are only appended) */
 } imdb_table;
@@ -699,6 +705,11 @@ int imdb_check_bind(const imdb_schema *s, const char *text, uint32_t len, uint64
 int imdb_check_row(imdb_db *db, imdb_table *t, const imdb_value *vals, imdb_err *e);
 /* every live row of t against one CHECK (an ADD's): IMDB_ERR_CONSTRAINT at a FALSE */
 int imdb_check_rows(imdb_db *db, imdb_table *t, const char *name, const char *text, uint32_t len, imdb_err *e);
+struct imdb_xarena; /* F2c: sql_internal.h's, a statement's computed TEXT */
+/* F2c, the tests': text as column c's generation expression of s (genmask: its generated columns) on nrows rows: out[r] 0
+ * and vals[r] the value assigned (a TEXT in ar), 1 its evaluation failed, 2 its assignment */
+int imdb_gen_eval_text(const imdb_schema *s, uint16_t c, uint64_t genmask, const char *text, uint32_t len, const imdb_value *rows,
+                       uint32_t nrows, int *out, imdb_value *vals, struct imdb_xarena *ar, imdb_err *e);
 /* the tests': text bound alone against s (its error), then evaluated on nrows rows of s's values (rows[r * ncols + c]):
  * out[r] 1 (TRUE or NULL), 0 (FALSE) or the evaluation's negative error code */
 int imdb_check_eval_text(const imdb_schema *s, const char *text, uint32_t len, const imdb_value *rows, uint32_t nrows,
@@ -711,6 +722,18 @@ int imdb_hist_create_checks(imdb_schema_hist *h, const imdb_check *c, uint16_t n
 int imdb_hist_check(const imdb_schema_hist *h, const char *name);
 /* the first live CHECK whose text holds ident as an identifier (a RENAME's or DROP COLUMN's rule), or NULL */
 int imdb_checks_name_col(const imdb_schema_hist *h, const char *ident, const char **which, imdb_err *e);
+/* F2c: the first live generated column but the one at position self whose expression holds ident, or NULL */
+int imdb_gens_name_col(const imdb_schema_hist *h, const char *ident, uint16_t self, const char **which, imdb_err *e);
+/* F2c: generated columns, computed and verified by the SQL layer (sql_exec.c): the expression at position's column c of
+ * s (genmask: s's generated columns, which it may not name) bound alone, its value assignable to the column's type */
+int imdb_gen_bind(const imdb_schema *s, uint16_t c, uint64_t genmask, const char *text, uint32_t len, imdb_err *e);
+/* every generated column of t's row (vals, t's current schema) computed from the rest and assigned to its column, a
+ * computed TEXT in ar (it lives as long as ar's mark) */
+int imdb_gen_compute(imdb_db *db, imdb_table *t, imdb_value *vals, struct imdb_xarena *ar, imdb_err *e);
+/* every generated column of the row holding the value its expression gives: IMDB_ERR_CONSTRAINT otherwise */
+int imdb_gen_verify(imdb_db *db, imdb_table *t, const imdb_value *vals, imdb_err *e);
+/* column c of t's current schema generated */
+bool imdb_col_generated(const imdb_table *t, uint16_t c);
 
 /* ---- transactions --------------------------------------------------------- */
 int imdb_begin(imdb_db *db, imdb_err *e);

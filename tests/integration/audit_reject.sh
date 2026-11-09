@@ -483,6 +483,29 @@ must_fail "differs from the log" "$AUD" verify "$PFX"
 echo "   FV a signed INSERT of a row a CHECK refuses, FW a signed ADD CHECK a live row fails: the replay and the auditor
    refuse each; FX a manifest's version 1 CHECK of another text: VERIFY and the auditor refuse it"
 
+echo "== FY, FZ: generated columns broken (F2c): a signed row whose generated value its expression does not give, a manifest's text"
+PFY=$WORK/fy; "$BIN" init "$PFY" >/dev/null
+"$BIN" sql "$PFY" --nosync -c "CREATE TABLE z (id INT64 PRIMARY KEY, a INT64, w INT64 GENERATED ALWAYS AS (a * 2) STORED);" \
+  -c "INSERT INTO z (id, a) VALUES (1, 2), (2, 5);" >/dev/null
+"$BIN" verify "$PFY" >/dev/null && "$AUD" verify "$PFY" >/dev/null || fail "the honest directory must verify"
+cp -r "$PFY" "$WORK/fy2"
+"$FORGE" index-lie "$PFY" gen-row
+must_fail "generated column w holds another value than its expression gives" "$BIN" verify "$PFY"   # the open's replay
+must_fail "holds another value in generated column w than its expression gives" "$AUD" verify "$PFY"
+PFY2=$WORK/fy2
+"$FORGE" index-lie "$PFY2" gen-update
+must_fail "generated column w holds another value than its expression gives" "$BIN" verify "$PFY2"
+must_fail "holds another value in generated column w than its expression gives" "$AUD" verify "$PFY2"
+PFZ=$WORK/fz; "$BIN" init "$PFZ" >/dev/null
+"$BIN" sql "$PFZ" --nosync -c "CREATE TABLE z (id INT64 PRIMARY KEY, a INT64, w INT64 GENERATED ALWAYS AS (a * 2) STORED);" \
+  -c "INSERT INTO z (id, a) VALUES (1, 2);" -c "CHECKPOINT;" >/dev/null
+"$BIN" verify "$PFZ" >/dev/null && "$AUD" verify "$PFZ" >/dev/null || fail "the honest directory must verify"
+"$FORGE" manifest-lie "$PFZ" gen-text
+must_fail "differ" "$BIN" verify "$PFZ"   # the snapshot open took the manifest's expression
+must_fail "differs from the log" "$AUD" verify "$PFZ"
+echo "   FY a signed INSERT and a signed UPDATE of a row whose generated column holds another value than its expression gives:
+   the replay and the auditor refuse each; FZ a manifest's version 1 generation text another: VERIFY and the auditor refuse it"
+
 echo "== Z: a commit naming the other digest algorithm, re-signed by the writer (both ways round); META naming an unknown one"
 for a in 1 2; do # explicit algorithms: under IMDB_DIGEST_ALG=2 make_db's would all be alg 2
   PZ=$WORK/z$a

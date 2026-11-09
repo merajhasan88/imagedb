@@ -746,18 +746,19 @@ static void fixture_check(const char *tgz, uint8_t alg, const char *meta_head, b
     free(m);
 }
 
-/* The format's fixtures (make_fixtures.sh, 2026-11-09's fourth pair: META 5, log version 3, manifest version 11 with F1's
- * schema history, F2a's CREATE DEFAULTs (op 23), F2a-2's sequences (ops 24-27) and F2b-1's CHECKs (op 28, op 22 kinds 11 and 12)
+/* The format's fixtures (make_fixtures.sh, 2026-11-09's fifth pair: META 5, log version 3, manifest version 12 with F1's
+ * schema history, F2a's CREATE DEFAULTs (op 23), F2a-2's sequences (ops 24-27), F2b-1's CHECKs (op 28, op 22 kinds 11 and 12)
+ * and F2c's generated columns (op 23 kind 9)
  * (a DROP COLUMN and a SET DEFAULT since stage 4, a clock's since F2a), segment format 3, ops 16, 19 to 23, tagged segments), one a
  * digest algorithm: they pin the format, so a change to it fails here first */
 static void t_round3_alg1_fixture(void)
 {
-    fixture_check("tests/fixtures/alg1-20261109d.tar.gz", IMDB_DIGEST_ALG_LTHASH16, "imagedb-meta 5\n", true, 69);
+    fixture_check("tests/fixtures/alg1-20261109e.tar.gz", IMDB_DIGEST_ALG_LTHASH16, "imagedb-meta 5\n", true, 74);
 }
 
 static void t_round3_alg2_fixture(void)
 {
-    fixture_check("tests/fixtures/alg2-20261109d.tar.gz", IMDB_DIGEST_ALG_LTHASH16_TREE, "imagedb-meta 5\n", true, 69);
+    fixture_check("tests/fixtures/alg2-20261109e.tar.gz", IMDB_DIGEST_ALG_LTHASH16_TREE, "imagedb-meta 5\n", true, 74);
 }
 
 /* The fixtures of the formats before the current one (alg1-20261026: META 2; alg2-20261026 and
@@ -794,7 +795,8 @@ static void t_round3_old_fixtures(void)
      * (alg1-20261104, alg2-20261104: before views, P2 S7), 6 with log version 2 (alg1-20261106, alg2-20261106: before
      * the format design's slice 1), 7 (alg1-20261108, alg2-20261108: before F1 stage 4's schema versions by position) and 8
      * (alg1-20261109, alg2-20261109: before CREATE TABLE's DEFAULTs, F2a) and 9 (alg1-20261109b, alg2-20261109b: before
-     * sequences, F2a-2) and 10 (alg1-20261109c, alg2-20261109c: before CHECK constraints, F2b-1):
+     * sequences, F2a-2), 10 (alg1-20261109c, alg2-20261109c: before CHECK constraints, F2b-1) and 11 (alg1-20261109d,
+     * alg2-20261109d: before generated columns, F2c):
      * META reads, and the open refuses the lake (or the log) by name, never replaying past it to a rebuilt manifest of
      * another version */
     static const char *const tgz4[] = {"tests/fixtures/alg1-20261029.tar.gz", "tests/fixtures/alg2-20261029.tar.gz",
@@ -803,12 +805,14 @@ static void t_round3_old_fixtures(void)
                                        "tests/fixtures/alg1-20261108.tar.gz", "tests/fixtures/alg2-20261108.tar.gz",
                                        "tests/fixtures/alg1-20261109.tar.gz", "tests/fixtures/alg2-20261109.tar.gz",
                                        "tests/fixtures/alg1-20261109b.tar.gz", "tests/fixtures/alg2-20261109b.tar.gz",
-                                       "tests/fixtures/alg1-20261109c.tar.gz", "tests/fixtures/alg2-20261109c.tar.gz"};
+                                       "tests/fixtures/alg1-20261109c.tar.gz", "tests/fixtures/alg2-20261109c.tar.gz",
+                                       "tests/fixtures/alg1-20261109d.tar.gz", "tests/fixtures/alg2-20261109d.tar.gz"};
     static const char *const why4[] = {"before DROP TABLE", "before DROP TABLE", "before views", "before views",
                                        "before the format design", "before the format design",
                                        "before schema versions by position", "before schema versions by position",
                                        "before CREATE TABLE's DEFAULTs", "before CREATE TABLE's DEFAULTs",
-                                       "before sequences", "before sequences", "before CHECK constraints", "before CHECK constraints"};
+                                       "before sequences", "before sequences", "before CHECK constraints", "before CHECK constraints",
+                                       "before generated columns", "before generated columns"};
     for (size_t i = 0; i < sizeof tgz4 / sizeof *tgz4; i++) {
         struct stat st;
         if (stat(tgz4[i], &st) != 0) {

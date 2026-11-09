@@ -1072,6 +1072,9 @@ static int old_manifest(uint32_t ver, imdb_err *e)
     if (ver == 5)
         return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 5: this lake was written by an imagedb before views' "
                          "format (manifest 6, P2 S7), which this version does not read");
+    if (ver == 11) /* F2c: a CREATE's generated columns were not in its history */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 11: this lake was written by an imagedb before generated "
+                         "columns (manifest 12, 2026-11-09), which this version does not read");
     if (ver == 10) /* F2b-1: version 1's CHECKs were not in its history */
         return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 10: this lake was written by an imagedb before CHECK "
                          "constraints (manifest 11, 2026-11-09), which this version does not read");
@@ -1861,7 +1864,9 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
             const imdb_schema *s1 = h->nvers ? &h->vers[0].s : &t->s;
             for (uint16_t q = 0; h->nvers && q < s1->ncols; q++) {
                 const imdb_tcol *tc = &h->tcol[q];
-                if (tc->cclock) cd[ncd++] = (imdb_coldef){.col = q, .kind = tc->cclock, .seq = tc->cseq}; /* F2a-2: a sequence's too */
+                if (tc->gtext) /* F2c (manifest 12): a generated column's expression */
+                    cd[ncd++] = (imdb_coldef){.col = q, .kind = IMDB_DEFK_GENERATED, .text = tc->gtext, .tlen = tc->glen};
+                else if (tc->cclock) cd[ncd++] = (imdb_coldef){.col = q, .kind = tc->cclock, .seq = tc->cseq}; /* F2a-2: a sequence's too */
                 else if (!tc->cdef.null) cd[ncd++] = (imdb_coldef){.col = q, .kind = IMDB_DEFK_VALUE, .v = tc->cdef};
             }
             imdb_coldefs_put(mb, s1, cd, ncd);
@@ -3233,7 +3238,7 @@ static int load_table(imdb_db *db, int ofd, const imdb_manifest_tab *mt, uint32_
     t->nidx = mt->nidx;
     bool cdefs = false; /* F2a: a CREATE's DEFAULTs, which version 1 alone (the table's own first) lacks */
     for (uint16_t p = 0; p < mt->hist.ntcol && !cdefs; p++)
-        cdefs = mt->hist.tcol[p].added == 1 && (mt->hist.tcol[p].cclock || !mt->hist.tcol[p].cdef.null);
+        cdefs = mt->hist.tcol[p].added == 1 && (mt->hist.tcol[p].cclock || !mt->hist.tcol[p].cdef.null || mt->hist.tcol[p].gtext);
     if ((mt->hist.nvers > 1 || cdefs || mt->hist.nchk0) && /* F2b-1: version 1's CHECKs, likewise */
         imdb_hist_copy(&t->hist, &mt->hist, e))
         return e->code; /* F1: s is its last version */
