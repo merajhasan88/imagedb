@@ -138,6 +138,9 @@ typedef struct imdb_tcol {
                                 the ADD's DEFAULT until a SET or DROP DEFAULT; its TEXT bytes are the ADD's
                                 (missing_text) or a SET DEFAULT version's (imdb_sver.atext), never moved or freed
                                 while the history lives */
+    imdb_value cdef;         /* F2a: its CREATE's DEFAULT when a constant (its TEXT in missing_text; NULL: none or a clock) */
+    uint8_t cclock;          /* F2a: its CREATE's DEFAULT when a clock (IMDB_DEFK_*), else 0 */
+    uint8_t wclock;          /* F2a: the write default a clock (IMDB_DEFK_*), read at the write; 0: wdef is the default */
 } imdb_tcol;
 
 /* F1: a schema version. Rows begun at or after `since` (up to the next version's) are encoded under s, the columns
@@ -154,6 +157,8 @@ typedef struct imdb_sver {
     uint16_t npos;               /* F1 stage 4: the positions used up to it (an ADD takes position npos) */
     imdb_value adef;             /* F1 stage 4: SET DEFAULT's value (a manifest writes the op again from it) */
     uint8_t *atext;              /* its TEXT bytes, the version's own (adef.s and a write default point here) */
+    uint8_t aclock;              /* F2a: SET DEFAULT's clock kind (IMDB_ALTER_SET_DEFAULT_CLOCK), or an ADD's write default's
+                                    (its missing value then the clock's at the ALTER); 0: none */
 } imdb_sver;
 
 /* F1: a table's schema history: its positions and versions (a table embeds one; so does VERIFY's model, which parses
@@ -549,6 +554,9 @@ int imdb_close(imdb_db *db);
 /* A table with the default retention (IMDB_RETAIN_DEFAULT_US), or the one given; either is logged with it (op 16). */
 int imdb_create_table(imdb_db *db, imdb_schema *s, imdb_err *e);
 int imdb_create_table_ex(imdb_db *db, imdb_schema *s, uint64_t retention_us, imdb_err *e);
+/* F2a: the same with column DEFAULTs (op 23 in its commit) */
+int imdb_create_table_defs(imdb_db *db, imdb_schema *s, uint64_t retention_us, const struct imdb_coldef *defs,
+                           uint16_t ndefs, imdb_err *e);
 /* ALTER TABLE t SET RETENTION: logged in the transaction, in effect from its commit. */
 int imdb_set_retention(imdb_db *db, imdb_table *t, uint64_t retention_us, imdb_err *e);
 /* CREATE INDEX / DROP INDEX, each the only op of its transaction; names are unique per database;
@@ -684,6 +692,7 @@ typedef struct imdb_txn {
     imdb_txn_sp *sps;
     uint32_t nsps, capsps;
     uint64_t begin_ns, last_ns; /* R4: its BEGIN and the end of its last statement (CLOCK_MONOTONIC) */
+    uint64_t begin_us;          /* F2a: its BEGIN by imdb's clock (imdb_now_us): now() and the other clock values in it */
     uint32_t timeout_ms, idle_ms; /* SET transaction_timeout and idle_in_transaction_timeout at its BEGIN (0: none) */
     char doom[512];            /* why it can only roll back */
 } imdb_txn;

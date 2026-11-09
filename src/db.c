@@ -348,7 +348,8 @@ int imdb_hist_first(imdb_schema_hist *h, const imdb_schema *s, imdb_err *e)
         v->pos[c] = c;
         v->at[c] = (int8_t)c;
         h->tcol[c].missing = (imdb_value){.type = s->cols[c].type, .scale = s->cols[c].scale, .null = true};
-        h->tcol[c].wdef = h->tcol[c].missing; /* CREATE TABLE takes no DEFAULT yet (F2) */
+        h->tcol[c].wdef = h->tcol[c].cdef = h->tcol[c].missing; /* F2a: a CREATE's DEFAULTs after, by imdb_hist_create_defaults */
+        h->tcol[c].cclock = h->tcol[c].wclock = 0;
         h->tcol[c].wver = -1;
         h->tcol[c].added = 1;
     }
@@ -358,6 +359,31 @@ int imdb_hist_first(imdb_schema_hist *h, const imdb_schema *s, imdb_err *e)
         h->vers = NULL;
         h->nvers = h->capvers = 0; /* nothing a free walks: hist_free reads each version's own bytes */
         return e->code;
+    }
+    return IMDB_OK;
+}
+
+int imdb_hist_create_defaults(imdb_schema_hist *h, const imdb_coldef *defs, uint16_t ndefs, imdb_err *e)
+{
+    for (uint16_t k = 0; k < ndefs; k++) {
+        const imdb_coldef *d = &defs[k];
+        imdb_tcol *tc = &h->tcol[d->col];
+        if (d->kind == IMDB_DEFK_VALUE) {
+            tc->cdef = d->v;
+            if (d->v.type == IMDB_T_TEXT) { /* its own bytes, as an ADD's DEFAULT keeps them */
+                imdb_free(tc->missing_text);
+                if (!(tc->missing_text = imdb_alloc(d->v.len ? d->v.len : 1, e))) return e->code;
+                if (d->v.len) memcpy(tc->missing_text, d->v.s, d->v.len);
+                tc->cdef.s = tc->missing_text;
+            }
+            tc->cclock = 0;
+        } else {
+            tc->cdef = tc->missing; /* NULL, of the column's type */
+            tc->cclock = d->kind;
+        }
+        tc->wdef = tc->cdef;
+        tc->wclock = tc->cclock;
+        tc->wver = -1;
     }
     return IMDB_OK;
 }
@@ -1917,6 +1943,8 @@ static void tx_op_free(imdb_op *o)
     imdb_free(o->rewrites);
     imdb_free(o->iname);
     imdb_free(o->aname); /* F1: op 22's new name */
+    imdb_free(o->defs);  /* F2a: COLUMN_DEFAULTS' */
+    o->defs = NULL;
     imdb_viewdef_free(o->vdef);
     o->schema = NULL;
     o->erase = NULL;
@@ -2044,6 +2072,39 @@ int imdb_create_table_ex(imdb_db *db, imdb_schema *s, uint64_t retention_us, imd
     return IMDB_OK;
 }
 
+/* F2a: CREATE TABLE with column DEFAULTs: the CREATE and its retention, then op 23 with the defaults (their TEXT in
+ * the op's own block), applied to the new table's first version at once (the undo of the CREATE takes them too) */
+int imdb_create_table_defs(imdb_db *db, imdb_schema *s, uint64_t retention_us, const imdb_coldef *defs, uint16_t ndefs,
+                           imdb_err *e)
+{
+    if (ndefs && !imdb_coldefs_ok(s, defs, ndefs))
+        return imdb_fail(e, IMDB_ERR_INVALID, "a column's DEFAULT is not a value of its type");
+    if (imdb_create_table_ex(db, s, retention_us, e) || !ndefs) return e->code;
+    size_t text = 0;
+    for (uint16_t k = 0; k < ndefs; k++)
+        if (defs[k].kind == IMDB_DEFK_VALUE && defs[k].v.type == IMDB_T_TEXT) text += defs[k].v.len;
+    imdb_coldef *own = imdb_alloc((size_t)ndefs * sizeof *own + text + 1, e);
+    imdb_op *op = own ? tx_push(db, e) : NULL;
+    if (!op) { /* the CREATE and its retention stay pushed: the statement's failure rolls the whole back */
+        imdb_free(own);
+        return e->code;
+    }
+    uint8_t *tb = (uint8_t *)(own + ndefs);
+    for (uint16_t k = 0; k < ndefs; k++) {
+        own[k] = defs[k];
+        if (own[k].kind == IMDB_DEFK_VALUE && own[k].v.type == IMDB_T_TEXT) {
+            if (own[k].v.len) memcpy(tb, own[k].v.s, own[k].v.len);
+            own[k].v.s = tb;
+            tb += own[k].v.len;
+        }
+    }
+    op->code = IMDB_OP_COLUMN_DEFAULTS;
+    op->table = s->id;
+    op->defs = own;
+    op->ndefs = ndefs;
+    return imdb_hist_create_defaults(&db->t[s->id]->hist, own, ndefs, e);
+}
+
 int imdb_set_retention(imdb_db *db, imdb_table *t, uint64_t retention_us, imdb_err *e)
 {
     if (!db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "no transaction");
@@ -2086,6 +2147,7 @@ int imdb_sver_next(const imdb_schema_hist *h, const imdb_sver *cur, const imdb_o
     *out = *cur;
     out->atext = NULL;
     memset(&out->adef, 0, sizeof out->adef);
+    out->aclock = 0; /* F2a: the ALTER's own, set by the prepare */
     imdb_schema *s = &out->s;
     int c = -1; /* the column the position names: every kind but ADD and RENAME TO names one, live */
     if (o->akind != IMDB_ALTER_ADD_COLUMN && o->akind != IMDB_ALTER_RENAME_TABLE) {
@@ -2098,6 +2160,8 @@ int imdb_sver_next(const imdb_schema_hist *h, const imdb_sver *cur, const imdb_o
         if (cur->npos >= IMDB_MAX_COLS) /* positions are consumed: a dropped column keeps its own */
             return imdb_fail(e, IMDB_ERR_LIMIT, "table %s has used %u column positions: rewrite it (CREATE TABLE ... AS "
                              "SELECT)", cur->s.name, IMDB_MAX_COLS);
+        if (o->aclock && (!imdb_defk_fits(o->aclock, o->acol.type) || o->adef.null)) /* F2a: the clock's value at the ALTER */
+            return imdb_fail(e, IMDB_ERR_INVALID, "column %s: that clock value is not of its type", o->acol.name);
         if (live_col(&cur->s, o->acol.name) >= 0)
             return imdb_fail(e, IMDB_ERR_CONSTRAINT, "column %s of table %s already exists", o->acol.name, cur->s.name);
         s->cols[s->ncols] = o->acol;
@@ -2154,7 +2218,12 @@ int imdb_sver_next(const imdb_schema_hist *h, const imdb_sver *cur, const imdb_o
         return IMDB_OK; /* catalog state: the schema and its positions stay, so the version's hash does */
     }
     case IMDB_ALTER_DROP_DEFAULT:
-        if (h && h->tcol[o->apos].wdef.null) return imdb_fail(e, IMDB_ERR_INVALID, "column %s has no DEFAULT", col->name);
+        if (h && h->tcol[o->apos].wdef.null && !h->tcol[o->apos].wclock) /* F2a: a clock default is one to drop */
+            return imdb_fail(e, IMDB_ERR_INVALID, "column %s has no DEFAULT", col->name);
+        return IMDB_OK;
+    case IMDB_ALTER_SET_DEFAULT_CLOCK: /* F2a: a clock its column's type takes */
+        if (!imdb_defk_fits(o->aclock, col->type))
+            return imdb_fail(e, IMDB_ERR_INVALID, "column %s: that clock value is not of its type", col->name);
         return IMDB_OK;
     case IMDB_ALTER_SET_TYPE:
         if (!alter_widens(col, &o->acol))
@@ -2273,6 +2342,7 @@ int imdb_hist_prepare(imdb_schema_hist *h, imdb_op *o, imdb_err *e)
     nv->akind = o->akind;
     nv->apos = o->akind == IMDB_ALTER_ADD_COLUMN ? cur->npos : o->apos;
     if (o->akind == IMDB_ALTER_SET_DEFAULT) nv->adef = o->adef;
+    if (o->akind == IMDB_ALTER_SET_DEFAULT_CLOCK || o->akind == IMDB_ALTER_ADD_COLUMN) nv->aclock = o->aclock; /* F2a */
     return imdb_sver_hash(&nv->s, nv->pos, nv->hash, e);
 }
 
@@ -2292,6 +2362,10 @@ void imdb_hist_install(imdb_schema_hist *h, const imdb_op *o, uint64_t seq)
         tc->missing.scale = o->acol.scale;
         if (o->acol.type == IMDB_T_TEXT && !o->adef.null) tc->missing.s = tc->missing_text;
         tc->wdef = tc->missing; /* the ADD's DEFAULT is the column's for later writes too, as in every engine */
+        tc->cdef = (imdb_value){.type = o->acol.type, .scale = o->acol.scale, .null = true}; /* F2a: a CREATE's alone */
+        tc->cclock = 0;
+        tc->wclock = o->aclock; /* F2a: DEFAULT now(): the older rows read the ALTER's value, a write the clock's */
+        if (o->aclock) tc->wdef = tc->cdef;
         tc->wver = -1;
         break;
     case IMDB_ALTER_DROP_COLUMN:
@@ -2305,9 +2379,16 @@ void imdb_hist_install(imdb_schema_hist *h, const imdb_op *o, uint64_t seq)
         }
         tc->wdef = nv->adef;
         tc->wver = (int16_t)h->nvers;
+        tc->wclock = 0; /* F2a: a constant again */
+        break;
+    case IMDB_ALTER_SET_DEFAULT_CLOCK: /* F2a: the clock, read at each write */
+        tc->wdef = (imdb_value){.type = tc->missing.type, .scale = tc->missing.scale, .null = true};
+        tc->wver = -1;
+        tc->wclock = o->aclock;
         break;
     case IMDB_ALTER_DROP_DEFAULT:
         tc->wdef = (imdb_value){.type = tc->missing.type, .scale = tc->missing.scale, .null = true};
+        tc->wclock = 0;
         tc->wver = -1;
         break;
     default: /* a rename, a NULL rule, a widening (its scale, so its values' tag and scale, stay) */
@@ -2340,6 +2421,7 @@ int imdb_alter_table(imdb_db *db, imdb_table *t, const imdb_op *proto, imdb_err 
     op->acol = proto->acol;
     op->adef = proto->adef;
     op->apos = proto->apos;
+    op->aclock = proto->aclock; /* F2a */
     if (proto->aname) {
         if (!(op->aname = imdb_alloc(IMDB_MAX_IDENT + 1, e))) {
             db->ntx--;
@@ -5830,7 +5912,8 @@ int imdb_hist_copy(imdb_schema_hist *dst, const imdb_schema_hist *src, imdb_err 
     for (uint32_t k = 0; k < src->nvers; k++) v[k].atext = NULL;
     int rc = IMDB_OK;
     for (uint16_t p = 0; p < src->ntcol && !rc; p++)
-        if (src->tcol[p].missing_text && !(txt[p] = bytes_dup(src->tcol[p].missing_text, src->tcol[p].missing.len, e)))
+        if (src->tcol[p].missing_text &&
+            !(txt[p] = bytes_dup(src->tcol[p].missing_text, src->tcol[p].added == 1 ? src->tcol[p].cdef.len : src->tcol[p].missing.len, e)))
             rc = e->code;
     for (uint32_t k = 0; k < src->nvers && !rc; k++) /* F1 stage 4: each SET DEFAULT's TEXT, the version's own */
         if (src->vers[k].atext) {
@@ -5853,6 +5936,7 @@ int imdb_hist_copy(imdb_schema_hist *dst, const imdb_schema_hist *src, imdb_err 
         *tc = p < src->ntcol ? src->tcol[p] : (imdb_tcol){.wver = -1};
         tc->missing_text = txt[p];
         if (txt[p]) tc->missing.s = txt[p];
+        if (txt[p] && tc->added == 1) tc->cdef.s = txt[p]; /* F2a: a CREATE's TEXT DEFAULT, its bytes there */
         if (tc->wdef.type == IMDB_T_TEXT && !tc->wdef.null) /* the copy's own bytes: an ADD's or a SET DEFAULT's */
             tc->wdef.s = tc->wver >= 0 ? v[tc->wver].atext : txt[p];
     }

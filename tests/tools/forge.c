@@ -936,31 +936,32 @@ static void manifest_lie(const char *dir, const char *kind)
     if (imdb_manifest_parse(man, mn, &m, &e)) die("manifest", &e);
     imdb_buf nb;
     imdb_buf_init(&nb);
-    if (strcmp(kind, "boundary") == 0 && imdb_get_le32(man + 8) == 8 && S > 1 && m.boundary == 0) {
+    if (strcmp(kind, "boundary") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION && S > 1 && m.boundary == 0) {
         imdb_buf_put(&nb, man, mn);
         /* after magic, version, nsections, db id, seq, prev, state digest, prev manifest: the u64 boundary */
         nb.p[136] = 1;
     } else if (strcmp(kind, "column") == 0 && m.nt && m.t[m.nt - 1].nidx && !m.nv) {
         imdb_buf_put(&nb, man, mn);
-        uint16_t c = m.t[m.nt - 1].s.ncols; /* the last index's column, little endian, before the three u64 and F1's u32 */
-        nb.p[nb.len - 190] = (uint8_t)c; /* then the views section (12 + a count of 0) and the nine empty ones (16 each) */
-        nb.p[nb.len - 189] = (uint8_t)(c >> 8);
-    } else if (strcmp(kind, "section") == 0 && imdb_get_le32(man + 8) == 8 && mn > 144 + 144) {
+        uint16_t c = m.t[m.nt - 1].s.ncols; /* the last index's column, little endian, before the three u64, F1's u32 and
+                                             * F2a's u16 (manifest 9: version 1's DEFAULTs, none) */
+        nb.p[nb.len - 192] = (uint8_t)c; /* then the views section (12 + a count of 0) and the nine empty ones (16 each) */
+        nb.p[nb.len - 191] = (uint8_t)(c >> 8);
+    } else if (strcmp(kind, "section") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION && mn > 144 + 144) {
         imdb_buf_put(&nb, man, mn); /* the format design's slice 1: the nine reserved sections end it, 16 bytes each */
         nb.p[nb.len - 132] = 1;     /* the sequences section's u32 count: a later format's */
-    } else if (strcmp(kind, "nsections") == 0 && imdb_get_le32(man + 8) == 8 && mn > 144 + 144) {
+    } else if (strcmp(kind, "nsections") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION && mn > 144 + 144) {
         imdb_buf_put(&nb, man, mn);
         nb.p[12] = 10; /* the header's section count: ten, with eleven there */
-    } else if (strcmp(kind, "order") == 0 && imdb_get_le32(man + 8) == 8 && mn > 144 + 144) {
+    } else if (strcmp(kind, "order") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION && mn > 144 + 144) {
         imdb_buf_put(&nb, man, mn);
         nb.p[nb.len - 144] = 4; /* the sequences section given the enums' kind: out of order */
-    } else if (strcmp(kind, "later") == 0 && imdb_get_le32(man + 8) == 8 && mn > 144 + 144) {
+    } else if (strcmp(kind, "later") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION && mn > 144 + 144) {
         imdb_buf_put(&nb, man, mn - 16); /* the triggers section, last, as a later format would write it: a count and */
         imdb_buf_put_u32(&nb, 11);        /* its entry (4 bytes here), so its length is not 4 */
         imdb_buf_put_u64(&nb, 8);
         imdb_buf_put_u32(&nb, 1);
         imdb_buf_put_u32(&nb, 0);
-    } else if (strcmp(kind, "keylist") == 0 && imdb_get_le32(man + 8) == 8 && m.nt && m.t[0].s.npk == 1 && m.t[0].s.ncols > 1) {
+    } else if (strcmp(kind, "keylist") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION && m.nt && m.t[0].s.npk == 1 && m.t[0].s.ncols > 1) {
         imdb_buf_put(&nb, man, mn);
         /* table 0's schema after the header (144), the tables section's frame (12), its count and the schema's length
          * (4 each); its key list (u8 1, u16 column) is the schema's last 3 bytes: another column named there */
@@ -969,7 +970,7 @@ static void manifest_lie(const char *dir, const char *kind)
         if (sl < 3 || 164 + (size_t)sl > mn) exit(1);
         nb.p[164 + sl - 2] = (uint8_t)k;
         nb.p[164 + sl - 1] = (uint8_t)(k >> 8);
-    } else if (strcmp(kind, "default") == 0 && imdb_get_le32(man + 8) == 8) {
+    } else if (strcmp(kind, "default") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION) {
         /* F1: the history's ADD of an INT64 NOT NULL column n (u8 kind 1, u8 1, "n", type, precision, scale, flags,
          * u8 has 1, then its u64 DEFAULT) given another DEFAULT: the history still ends at the schema */
         imdb_buf_put(&nb, man, mn);
@@ -979,11 +980,21 @@ static void manifest_lie(const char *dir, const char *kind)
             if (memcmp(nb.p + i, pat, sizeof pat) == 0) at = i + sizeof pat;
         if (!at) exit(1);
         imdb_le64(nb.p + at, imdb_get_le64(nb.p + at) + 1);
+    } else if (strcmp(kind, "create-default") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION) {
+        /* F2a: version 1's DEFAULTs (manifest 9) of a table with no ALTER whose column 2 is an INT64 DEFAULT 77: u32 0
+         * (no ALTER), u16 1, u16 column 2, u8 kind 1, then the u64 value, made 78: the history still ends at the schema */
+        imdb_buf_put(&nb, man, mn);
+        static const uint8_t pat[13] = {0, 0, 0, 0, 1, 0, 2, 0, IMDB_DEFK_VALUE, 77, 0, 0, 0};
+        size_t at = 0;
+        for (size_t i = mn - 16; i > 0 && !at; i--)
+            if (memcmp(nb.p + i, pat, sizeof pat) == 0) at = i + 9;
+        if (!at) exit(1);
+        nb.p[at] = 78;
     } else {
         fputs("imdb-forge: manifest-lie DIR boundary (none yet) | column (an index in the last table) | section (a reserved"
               " one not empty) | nsections (ten) | order (a reserved one out of order) | later (the last one a later"
               " format's, longer) | keylist (table 0's key list another column) | default (an added column n's DEFAULT"
-              " another in the history)\n", stderr);
+              " another in the history) | create-default (a CREATE's DEFAULT 77 of column 2 another)\n", stderr);
         exit(1);
     }
     if (nb.err) exit(1);
@@ -1200,6 +1211,58 @@ static void index_lie(const char *dir, const char *kind)
         append_commit_digest(dir, db, &op, 1, &sg, NULL, dg);
         imdb_close(db);
         return;
+    } else if (strcmp(kind, "create-default-clock") == 0) {
+        /* F2a: CREATE TABLE dz (id INT64 PRIMARY KEY, at TIMESTAMPTZ) with its retention and op 23 giving at
+         * CURRENT_TIMESTAMP, which the encoder takes; the kind byte then made LOCALTIME (5), a TIME's clock */
+        static imdb_schema s;
+        memset(&s, 0, sizeof s);
+        snprintf(s.name, sizeof s.name, "dz");
+        s.id = db->nt;
+        s.ncols = 2;
+        s.subject = -1;
+        snprintf(s.cols[0].name, sizeof s.cols[0].name, "id");
+        s.cols[0].type = IMDB_T_INT64;
+        s.cols[0].flags = IMDB_COL_PK;
+        snprintf(s.cols[1].name, sizeof s.cols[1].name, "at");
+        s.cols[1].type = IMDB_T_TIMESTAMPTZ;
+        s.cols[1].flags = IMDB_COL_NULLABLE;
+        s.npk = 1;
+        s.key[0] = 0;
+        static imdb_coldef cd = {.col = 1, .kind = IMDB_DEFK_CURRENT_TIMESTAMP};
+        imdb_op ops[3];
+        memset(ops, 0, sizeof ops);
+        ops[0] = (imdb_op){.code = IMDB_OP_CREATE_TABLE, .table = s.id, .schema = &s};
+        ops[1] = (imdb_op){.code = IMDB_OP_SET_RETENTION, .table = s.id, .retention_us = IMDB_RETAIN_DEFAULT_US};
+        ops[2] = (imdb_op){.code = IMDB_OP_COLUMN_DEFAULTS, .table = s.id, .defs = &cd, .ndefs = 1};
+        static uint8_t pat[10];
+        pat[0] = IMDB_OP_COLUMN_DEFAULTS;
+        imdb_le32(pat + 1, s.id);
+        pat[5] = 1; /* u16 n, u16 column 1, the kind */
+        pat[7] = 1;
+        pat[9] = IMDB_DEFK_CURRENT_TIMESTAMP;
+        g_find = pat;
+        g_find_len = sizeof pat;
+        g_at = 9;
+        g_to = IMDB_DEFK_LOCALTIME;
+        append_commit(dir, db, ops, 3, &sg, NULL);
+        imdb_close(db);
+        return;
+    } else if (strcmp(kind, "alter-clock-type") == 0) { /* F2a: SET DEFAULT CURRENT_DATE (kind 10) on table 0's first TEXT
+                                                         * column: a clock its type does not take (the history's rule) */
+        imdb_table *t = db->t[0];
+        int c = -1;
+        for (uint16_t k = 0; k < t->s.ncols && c < 0; k++)
+            if (t->s.cols[k].type == IMDB_T_TEXT) c = k;
+        if (c < 0) {
+            fputs("imdb-forge: index-lie alter-clock-type needs a TEXT column in table 0\n", stderr);
+            exit(1);
+        }
+        op.code = IMDB_OP_ALTER_TABLE;
+        op.table = t->s.id;
+        op.akind = IMDB_ALTER_SET_DEFAULT_CLOCK;
+        op.apos = t->hist.vers[t->hist.nvers - 1].pos[c];
+        op.aclock = IMDB_DEFK_CURRENT_DATE;
+        op.iname = NULL;
     } else if (strcmp(kind, "pk-dup") == 0) { /* F4: an INSERT repeating a live row's whole key (the last table), its digest right */
         imdb_table *t = db->t[db->nt - 1];
         uint64_t src = IMDB_NONE;
@@ -1233,7 +1296,7 @@ static void index_lie(const char *dir, const char *kind)
     } else {
         fputs("imdb-forge: index-lie DIR column | duplicate (needs an index) | drop-absent | unique-dup (needs a unique index) | "
               "pk-dup (a live row in the last table) | alter-view (ADD COLUMN k to table 0) | alter-not-null | "
-              "alter-drop-indexed | date-range (a DATE column and an INT64 key in the last table) | varchar-long (a VARCHAR(n <= 200)) | alter-varchar-default\n", stderr);
+              "alter-drop-indexed | date-range (a DATE column and an INT64 key in the last table) | varchar-long (a VARCHAR(n <= 200)) | alter-varchar-default | create-default-clock | alter-clock-type (a TEXT column in table 0)\n", stderr);
         exit(1);
     }
     append_commit(dir, db, &op, 1, &sg, NULL);

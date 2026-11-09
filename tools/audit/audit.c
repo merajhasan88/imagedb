@@ -788,6 +788,14 @@ static bool aidx_same(const aidx *a, const aidx *b)
            memcmp(a->cols, b->cols, a->ncols * sizeof *a->cols) == 0;
 }
 
+/* F2a: one of a CREATE's DEFAULTs (op 23, a manifest's version 1): its column, kind (1 a value, 2-5 a clock) and value */
+typedef struct acdef {
+    uint16_t col;
+    uint8_t kind;
+    const uint8_t *def; /* kind 1: the row encoding of one NOT NULL value of its column */
+    uint32_t def_len;
+} acdef;
+
 typedef struct op {
     uint8_t code;
     uint32_t table;
@@ -813,6 +821,9 @@ typedef struct op {
     uint32_t def_len;
     uint16_t apos;
     char aname[64];
+    uint8_t aclock; /* F2a: ALTER kind 10's clock kind, or an ADD's (its DEFAULT byte 2) */
+    acdef *cd;      /* F2a: COLUMN_DEFAULTS (23): its CREATE's DEFAULTs */
+    uint16_t ncd;
     /* payload */
     bool redacted;
     const uint8_t *salt, *row;
@@ -835,6 +846,7 @@ static void commit_free(commit *c)
         free(c->ops[i].sch);
         free(c->ops[i].erase);
         aviewdef_free(c->ops[i].vd);
+        free(c->ops[i].cd);
     }
     free(c->ops);
     memset(c, 0, sizeof *c);
@@ -847,10 +859,59 @@ static void commit_free(commit *c)
 /* F1: op 22's body after its table: u8 kind, then ADD's column (u8 length, name, type, precision, scale, flags) and
  * DEFAULT (u8 0, or 1 and the value as a one-column NOT NULL row, which decode_row checks), RENAME COLUMN's u16
  * position and new name, RENAME TO's new name. A commit's (what: "header") and a manifest's history ("manifest"). */
+/* F2a: a clock kind and the column types it writes: 2 CURRENT_TIMESTAMP (a TIMESTAMPTZ, or a TIMESTAMP's wall clock), 3
+ * LOCALTIMESTAMP, 4 CURRENT_DATE, 5 LOCALTIME */
+static bool defk_fits(uint8_t k, uint8_t ty)
+{
+    return k == 2 ? ty == T_TIMESTAMPTZ || ty == T_TIMESTAMP : k == 3 ? ty == T_TIMESTAMP : k == 4 ? ty == T_DATE : k == 5 && ty == T_TIME;
+}
+
+/* the row encoding of one NOT NULL value of column ac (a one-column row, which decode_row checks) */
+static int one_value(rd *hr, const col *ac, const uint8_t **def, uint32_t *len, const char *what)
+{
+    size_t at = hr->o;
+    uint32_t dl = ac->type == T_TEXT ? 4 + rd_u32(hr) : ac->type == T_BOOL ? 1 : 8;
+    hr->o = at;
+    *def = rd_bytes(hr, dl);
+    *len = dl;
+    schema one;
+    memset(&one, 0, sizeof one);
+    one.ncols = 1;
+    one.c[0] = *ac;
+    one.c[0].flags = 0;
+    val dv;
+    if (!*def || decode_row(&one, *def, dl, &dv)) return fail("%s: bad DEFAULT", what);
+    return 0;
+}
+
+/* F2a: a CREATE's DEFAULTs (op 23's body after its table; a manifest's version 1, none_ok): u16 n, each a u16 column
+ * (strictly increasing, the schema's), a kind, and kind 1's value of its column; a clock kind its column's type suits */
+static int coldefs_body(rd *hr, const schema *s, bool none_ok, acdef **out, uint16_t *n, const char *what)
+{
+    *out = NULL;
+    *n = rd_u16(hr);
+    if (hr->bad) return 0;
+    if ((!*n && !none_ok) || *n > s->ncols) return fail("%s: a bad count of column DEFAULTs", what);
+    if (!*n) return 0;
+    acdef *d = xcalloc(*n, sizeof *d);
+    *out = d;
+    for (uint16_t k = 0; k < *n; k++) {
+        d[k].col = rd_u16(hr);
+        d[k].kind = rd_u8(hr);
+        if (hr->bad) return 0;
+        if (d[k].col >= s->ncols || (k && d[k].col <= d[k - 1].col) || d[k].kind < 1 || d[k].kind > 5)
+            return fail("%s: a bad column DEFAULT", what);
+        if (d[k].kind == 1 ? one_value(hr, &s->c[d[k].col], &d[k].def, &d[k].def_len, what) != 0
+                           : !defk_fits(d[k].kind, s->c[d[k].col].type))
+            return d[k].kind == 1 ? -1 : fail("%s: a clock DEFAULT its column's type does not take", what);
+    }
+    return 0;
+}
+
 static int alter_body(rd *hr, op *o, const char *what)
 {
     o->akind = rd_u8(hr);
-    if (!hr->bad && (o->akind < 1 || o->akind > 9)) return fail("%s: ALTER TABLE of an unknown kind", what);
+    if (!hr->bad && (o->akind < 1 || o->akind > 10)) return fail("%s: ALTER TABLE of an unknown kind", what);
     if (!hr->bad && o->akind == 1) {
         uint8_t cl = rd_u8(hr);
         const uint8_t *cn = rd_bytes(hr, cl);
@@ -871,7 +932,11 @@ static int alter_body(rd *hr, op *o, const char *what)
                                                 : (ac->prec || ac->scale))))
             return fail("%s: bad added column", what);
         uint8_t has = rd_u8(hr);
-        if (!hr->bad && has > 1) return fail("%s: bad DEFAULT", what);
+        if (!hr->bad && has > 2) return fail("%s: bad DEFAULT", what);
+        if (has == 2) { /* F2a: a clock kind for the writes after it; the value, the clock's at the ALTER, for the rows before */
+            o->aclock = rd_u8(hr);
+            if (!hr->bad && !defk_fits(o->aclock, ac->type)) return fail("%s: a clock DEFAULT its column's type does not take", what);
+        }
         o->has_def = has;
         if (has) { /* the row encoding of one value: a one-column NOT NULL row, which decode_row checks */
             size_t at = hr->o;
@@ -892,6 +957,11 @@ static int alter_body(rd *hr, op *o, const char *what)
         return 0;
     }
     if (o->akind != 3) o->apos = rd_u16(hr); /* F1 stage 4: every kind but RENAME TO names a position */
+    if (o->akind == 10) { /* F2a: SET DEFAULT of a clock: its kind (alter_next checks the column's type) */
+        o->aclock = rd_u8(hr);
+        if (!hr->bad && (o->aclock < 2 || o->aclock > 5)) return fail("%s: bad clock DEFAULT", what);
+        return 0;
+    }
     if (o->akind == 7 || o->akind == 9) { /* SET DEFAULT, SET TYPE: a column's type alone, then SET DEFAULT's value */
         memset(&o->acol, 0, sizeof o->acol);
         o->acol.type = rd_u8(hr);
@@ -1091,6 +1161,12 @@ static int decode_body(const uint8_t *b, size_t n, const meta *m, keys *ks, comm
             o->view = rd_u32(&hr);
             if (!hr.bad && (nops != 1 || o->view >= MAX_VIEWS)) return fail("header: a view op must be the only op, in range");
             break;
+        case 23: /* COLUMN_DEFAULTS (F2a): u32 table, right after its CREATE_TABLE and SET_RETENTION, its defaults */
+            o->table = rd_u32(&hr);
+            if (!hr.bad && (i < 2 || c->ops[i - 2].code != 1 || c->ops[i - 2].table != o->table || c->ops[i - 1].code != 16))
+                return fail("header: COLUMN_DEFAULTS not right after its table's CREATE_TABLE");
+            if (!hr.bad && coldefs_body(&hr, c->ops[i - 2].sch, false, &o->cd, &o->ncd, "header")) return -1;
+            break;
         case 22: /* ALTER_TABLE (F1): u32 table, its body (alter_body), alone */
             o->table = rd_u32(&hr);
             if (!hr.bad && nops != 1) return fail("header: ALTER TABLE must be the only op");
@@ -1191,6 +1267,9 @@ typedef struct table {
     val missing[MAX_COLS]; /* F1: by position: what a row of an older version reads for a column added after it */
     uint8_t *missing_text[MAX_COLS];
     bool has_wdef[MAX_COLS]; /* F1 stage 4: by position: whether the column has a write default (DROP DEFAULT's rule) */
+    uint8_t ckind[MAX_COLS];   /* F2a: by position: its CREATE's DEFAULT's kind (op 23: 1 a value, 2-5 a clock), or 0 */
+    uint8_t *cdef[MAX_COLS];   /* kind 1's value (its row encoding, the table's own) */
+    uint32_t cdef_len[MAX_COLS];
 } table;
 
 typedef struct aver { /* F1: rows begun at or after since are encoded under s (its raw bytes its own) */
@@ -1204,6 +1283,7 @@ typedef struct aver { /* F1: rows begun at or after since are encoded under s (i
     uint16_t apos;
     uint8_t *def;
     uint32_t def_len;
+    uint8_t aclock;         /* F2a: kind 10's clock kind, or an ADD's (its write default a clock), else 0 */
     uint8_t hash[32];       /* SHA-256("IMDBSVR1", raw, each column's position as a u16): a segment names it */
 } aver;
 
@@ -1584,6 +1664,7 @@ static int alter_next(const aver *cur, const op *o, aver *nv, uint64_t seq, cons
     nv->def_len = 0;
     nv->akind = o->akind;
     nv->apos = o->akind == 1 ? (uint16_t)cur->npos : o->apos;
+    nv->aclock = o->akind == 1 || o->akind == 10 ? o->aclock : 0; /* F2a */
     schema *ns = &nv->s;
     const schema *cs = &cur->s;
     unsigned long long sq = (unsigned long long)seq;
@@ -1643,6 +1724,9 @@ static int alter_next(const aver *cur, const op *o, aver *nv, uint64_t seq, cons
         memcpy(nv->def, o->def, o->def_len);
         nv->def_len = o->def_len;
         break;
+    case 10: /* F2a: SET DEFAULT of a clock its column's type takes */
+        if (!defk_fits(o->aclock, cc->type)) return fail("commit %llu: a clock DEFAULT its column's type does not take", sq);
+        break;
     case 8: /* DROP DEFAULT */
         if (has_wdef && !has_wdef[o->apos]) return fail("commit %llu: DROP DEFAULT of a column without one", sq);
         break;
@@ -1692,7 +1776,7 @@ static int alter_state(const op *o, int npos_before, val *missing, uint8_t **mis
         has_wdef[npos_before] = o->has_def;
         return alter_missing(o, &missing[npos_before], &missing_text[npos_before]);
     }
-    if (o->akind == 7) has_wdef[o->apos] = true;
+    if (o->akind == 7 || o->akind == 10) has_wdef[o->apos] = true; /* F2a: a clock too */
     if (o->akind == 8) has_wdef[o->apos] = false;
     return 0;
 }
@@ -1908,6 +1992,22 @@ static int apply_op(state *S, const op *o, uint64_t seq)
             if (!S->v[i].dropped_at && strcmp(S->v[i].name, o->sch->name) == 0)
                 return fail("commit %llu: table %s takes a live view's name", (unsigned long long)seq, o->sch->name);
         S->nt++;
+        return 0;
+    }
+    if (o->code == 23) { /* COLUMN_DEFAULTS (F2a): its CREATE's, in its commit (the header's rule); each a write default */
+        if (o->table >= S->nt || S->t[o->table].created_at != seq)
+            return fail("commit %llu: COLUMN_DEFAULTS of a table not created there", (unsigned long long)seq);
+        table *t = &S->t[o->table];
+        for (uint16_t k = 0; k < o->ncd; k++) {
+            const acdef *d = &o->cd[k];
+            t->ckind[d->col] = d->kind;
+            if (d->kind == 1) {
+                t->cdef[d->col] = xcalloc(d->def_len ? d->def_len : 1, 1);
+                memcpy(t->cdef[d->col], d->def, d->def_len);
+                t->cdef_len[d->col] = d->def_len;
+            }
+            t->has_wdef[d->col] = true;
+        }
         return 0;
     }
     if (o->code == 22) { /* ALTER_TABLE (F1): live; its kind's rules on the current version; the next version */
@@ -2987,6 +3087,9 @@ typedef struct mtable {
     val missing[MAX_COLS]; /* by position: what a row of an older version reads for a column added after it */
     uint8_t *missing_text[MAX_COLS];
     bool has_wdef[MAX_COLS]; /* F1 stage 4: by position: a write default (DROP DEFAULT's rule) */
+    uint8_t ckind[MAX_COLS];   /* F2a: by position: version 1's DEFAULTs (the CREATE's), as the table's */
+    uint8_t *cdef[MAX_COLS];
+    uint32_t cdef_len[MAX_COLS];
 } mtable;
 
 typedef struct mview { /* P2 S7: a manifest's view: a live one's definition, a dropped one's tombstone (def NULL) */
@@ -3015,6 +3118,7 @@ static void manifest_free(manifest *m)
         for (uint32_t k = 0; k < m->t[i].nvers; k++) free(m->t[i].vers[k].s.raw), free(m->t[i].vers[k].def); /* F1 */
         free(m->t[i].vers);
         for (int k = 0; k < MAX_COLS; k++) free(m->t[i].missing_text[k]);
+        for (int k = 0; k < MAX_COLS; k++) free(m->t[i].cdef[k]); /* F2a */
     }
     free(m->t);
     for (uint32_t i = 0; i < m->nv; i++) aviewdef_free(m->v[i].def); /* P2 S7 */
@@ -3096,7 +3200,7 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
     rd r = {b, len, 0, false};
     const uint8_t *mg = rd_bytes(&r, 8);
     uint32_t mver = mg && memcmp(mg, "IMDBMAN1", 8) == 0 ? rd_u32(&r) : 0;
-    if (mver != 8) return fail("manifest: bad header (version 8 only: schema versions by position, F1 stage 4)");
+    if (mver != 9) return fail("manifest: bad header (version 9 only: a CREATE's DEFAULTs in the history, F2a)");
     uint32_t nsec = rd_u32(&r); /* every section, in order: 1 tables, 2 views, 3-11 reserved and empty */
     const uint8_t *id = rd_bytes(&r, 16);
     m->seq = rd_u64(&r);
@@ -3183,6 +3287,22 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
             aver_first(&t->vers[0], &s1);
         }
         for (int c = 0; c < t->vers[0].s.ncols; c++) t->missing[c].null = true;
+        { /* F2a (manifest 9): version 1's DEFAULTs, the CREATE's, before the ALTERs */
+            acdef *cd = NULL;
+            uint16_t ncd = 0;
+            int crc = coldefs_body(&r, &t->vers[0].s, true, &cd, &ncd, "manifest");
+            for (uint16_t k = 0; !crc && !r.bad && k < ncd; k++) {
+                t->ckind[cd[k].col] = cd[k].kind;
+                t->has_wdef[cd[k].col] = true;
+                if (cd[k].kind != 1) continue;
+                t->cdef[cd[k].col] = xcalloc(cd[k].def_len ? cd[k].def_len : 1, 1);
+                memcpy(t->cdef[cd[k].col], cd[k].def, cd[k].def_len);
+                t->cdef_len[cd[k].col] = cd[k].def_len;
+            }
+            free(cd);
+            if (crc) return -1;
+            if (r.bad) return fail("manifest: truncated");
+        }
         uint64_t last = t->created_at;
         for (uint32_t k = 0; k < na; k++) {
             uint64_t at = rd_u64(&r);
@@ -3834,6 +3954,12 @@ static int floor_seed(int dirfd, state *S, flr *f)
         for (int c = 0; c < MAX_COLS; c++) {
             t->missing[c] = mt->missing[c];
             t->has_wdef[c] = mt->has_wdef[c];
+            t->ckind[c] = mt->ckind[c]; /* F2a: F's CREATE DEFAULTs */
+            t->cdef_len[c] = mt->cdef_len[c];
+            if (mt->cdef[c]) {
+                t->cdef[c] = xcalloc(mt->cdef_len[c] ? mt->cdef_len[c] : 1, 1);
+                memcpy(t->cdef[c], mt->cdef[c], mt->cdef_len[c]);
+            }
             if (!mt->missing_text[c] || !mt->missing[c].s) continue; /* a TEXT one points into its bytes; others are i */
             size_t tl = (size_t)(mt->missing[c].s - mt->missing_text[c]) + mt->missing[c].len;
             t->missing_text[c] = xcalloc(tl ? tl : 1, 1);
@@ -3902,9 +4028,14 @@ static bool same_history(const mtable *mt, const table *t)
         const aver *a = &mt->vers[k], *b = &t->vers[k];
         if (a->since != b->since || a->s.rawlen != b->s.rawlen || memcmp(a->s.raw, b->s.raw, a->s.rawlen) != 0 ||
             memcmp(a->hash, b->hash, 32) != 0 || a->akind != b->akind || a->apos != b->apos || a->def_len != b->def_len ||
+            a->aclock != b->aclock || /* F2a */
             (a->def_len && memcmp(a->def, b->def, a->def_len) != 0))
             return false;
     }
+    for (int p = 0; p < mt->vers[0].npos; p++) /* F2a: the CREATE's DEFAULTs, which no version's hash covers */
+        if (mt->ckind[p] != t->ckind[p] || mt->cdef_len[p] != t->cdef_len[p] ||
+            (mt->cdef_len[p] && memcmp(mt->cdef[p], t->cdef[p], mt->cdef_len[p]) != 0))
+            return false;
     for (int p = mt->vers[0].npos; p < mt->vers[mt->nvers - 1].npos; p++) { /* each added position, by its ADD's type */
         uint8_t ty = 0;
         for (uint32_t k = 0; k < mt->nvers && !ty; k++)
@@ -4045,6 +4176,7 @@ static int cmd_verify(const char *dir, const char *anchor)
         for (uint32_t k = 0; k < S.t[i].nvers; k++) free(S.t[i].vers[k].s.raw), free(S.t[i].vers[k].def); /* F1: its versions' bytes */
         free(S.t[i].vers);
         for (int k = 0; k < MAX_COLS; k++) free(S.t[i].missing_text[k]);
+        for (int k = 0; k < MAX_COLS; k++) free(S.t[i].cdef[k]); /* F2a */
         free(S.t[i].s.raw);
     }
     keys_free(&S.K);

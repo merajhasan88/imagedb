@@ -228,7 +228,7 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
         if (!t && (o->code == IMDB_OP_INSERT || o->code == IMDB_OP_DELETE || o->code == IMDB_OP_UPDATE ||
                    o->code == IMDB_OP_COMPACT || o->code == IMDB_OP_CREATE_INDEX || o->code == IMDB_OP_DROP_INDEX ||
                    o->code == IMDB_OP_SET_RETENTION || o->code == IMDB_OP_EXPIRE || o->code == IMDB_OP_DROP_TABLE ||
-                   o->code == IMDB_OP_ALTER_TABLE)) {
+                   o->code == IMDB_OP_ALTER_TABLE || o->code == IMDB_OP_COLUMN_DEFAULTS)) {
             rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: unknown table %u", (unsigned long long)seq, o->table);
             break;
         }
@@ -246,6 +246,9 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
                 rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: table %u takes a live view's name", (unsigned long long)seq,
                                o->table);
             else if (!(rc = imdb_table_new(db, o->schema, e))) db->t[db->nt - 1]->created_at = seq;
+            break;
+        case IMDB_OP_COLUMN_DEFAULTS: /* F2a: its CREATE's defaults (the codec checked them against the CREATE's schema) */
+            rc = imdb_hist_create_defaults(&t->hist, o->defs, o->ndefs, e);
             break;
         case IMDB_OP_DROP_TABLE: /* live, and its history not kept FOREVER (its commit's op 16 applied first) */
             if (t->dropped_at)

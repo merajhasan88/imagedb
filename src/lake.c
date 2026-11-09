@@ -1071,6 +1071,9 @@ static int old_manifest(uint32_t ver, imdb_err *e)
     if (ver == 5)
         return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 5: this lake was written by an imagedb before views' "
                          "format (manifest 6, P2 S7), which this version does not read");
+    if (ver == 8) /* F2a: a CREATE's DEFAULTs were not in its history */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 8: this lake was written by an imagedb before CREATE "
+                         "TABLE's DEFAULTs (manifest 9, 2026-11-09), which this version does not read");
     if (ver == 7) /* F1 stage 4: its segments named their versions by the schema alone (segment format 2) */
         return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 7: this lake was written by an imagedb before schema "
                          "versions by position (manifest 8, segment format 3, 2026-11-08), which this version does not read");
@@ -1085,8 +1088,8 @@ int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err
     imdb_rd_init(&r, b, len);
     const uint8_t *mg = imdb_rd_bytes(&r, 8);
     if (!mg || memcmp(mg, kManMagic, 8) != 0) return imdb_fail(e, IMDB_ERR_CORRUPT, "manifest: bad magic");
-    uint32_t ver = imdb_rd_u32(&r); /* 8 (F1 stage 4; 7 before it): 6's tables and views, then the format design's
-                                     * sections, all present (no reader for 2-7) */
+    uint32_t ver = imdb_rd_u32(&r); /* 9 (F2a; 8 F1 stage 4's, 7 before): 6's tables and views, then the format design's
+                                     * sections, all present (no reader for 2-8) */
     if (ver >= 2 && ver <= IMDB_MANIFEST_VERSION - 1) return old_manifest(ver, e);
     if (ver != IMDB_MANIFEST_VERSION) return imdb_fail(e, IMDB_ERR_CORRUPT, "manifest: unsupported version");
     uint32_t nsec = imdb_rd_u32(&r); /* manifest 7: the sections after the header, every one (lake.h) */
@@ -1166,6 +1169,19 @@ int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err
         if (hrc) {
             imdb_manifest_free(m);
             return hrc;
+        }
+        { /* F2a (manifest 9): version 1's DEFAULTs, the CREATE's (op 23), before the ALTERs as the log has them */
+            imdb_coldef *cd = NULL;
+            uint16_t ncd = 0;
+            imdb_err ec = {0};
+            bool cok = !imdb_coldefs_get(&r, &s0, true, &cd, &ncd, "manifest", &ec) && !r.err;
+            int crc = cok ? imdb_hist_create_defaults(&t->hist, cd, ncd, e) : IMDB_OK;
+            imdb_free(cd);
+            if (crc) {
+                imdb_manifest_free(m);
+                return crc;
+            }
+            if (!cok) goto bad;
         }
         uint64_t last = t->created_at;
         for (uint32_t k = 0; k < na; k++) {
@@ -1763,6 +1779,17 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
             imdb_buf_put_u32(mb, (uint32_t)sch.len);
             imdb_buf_put(mb, sch.p, sch.len);
         }
+        { /* F2a (manifest 9): version 1's DEFAULTs (a CREATE's: op 23), against version 1's schema */
+            imdb_coldef cd[IMDB_MAX_COLS];
+            uint16_t ncd = 0;
+            const imdb_schema *s1 = h->nvers ? &h->vers[0].s : &t->s;
+            for (uint16_t q = 0; h->nvers && q < s1->ncols; q++) {
+                const imdb_tcol *tc = &h->tcol[q];
+                if (tc->cclock) cd[ncd++] = (imdb_coldef){.col = q, .kind = tc->cclock};
+                else if (!tc->cdef.null) cd[ncd++] = (imdb_coldef){.col = q, .kind = IMDB_DEFK_VALUE, .v = tc->cdef};
+            }
+            imdb_coldefs_put(mb, s1, cd, ncd);
+        }
         for (uint32_t k = 1; k <= na && !rc; k++) {
             const imdb_sver *v = &h->vers[k];
             if (v->since > seq) {
@@ -1773,6 +1800,7 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
             memset(&o, 0, sizeof o);
             o.akind = v->akind;
             o.apos = v->apos;
+            o.aclock = v->aclock; /* F2a: SET DEFAULT now()'s kind, or an ADD's */
             char nm[IMDB_MAX_IDENT + 1];
             if (v->akind == IMDB_ALTER_ADD_COLUMN) {
                 o.acol = v->s.cols[v->at[v->apos]];
@@ -3103,7 +3131,10 @@ static int load_table(imdb_db *db, int ofd, const imdb_manifest_tab *mt, uint32_
     t->digest = mt->digest;
     memcpy(t->idx, mt->idx, sizeof t->idx);
     t->nidx = mt->nidx;
-    if (mt->hist.nvers > 1 && imdb_hist_copy(&t->hist, &mt->hist, e)) return e->code; /* F1: s is its last version */
+    bool cdefs = false; /* F2a: a CREATE's DEFAULTs, which version 1 alone (the table's own first) lacks */
+    for (uint16_t p = 0; p < mt->hist.ntcol && !cdefs; p++)
+        cdefs = mt->hist.tcol[p].added == 1 && (mt->hist.tcol[p].cclock || !mt->hist.tcol[p].cdef.null);
+    if ((mt->hist.nvers > 1 || cdefs) && imdb_hist_copy(&t->hist, &mt->hist, e)) return e->code; /* F1: s is its last version */
     if (mt->nseg) {
         t->seg = imdb_alloc_array(mt->nseg, sizeof *t->seg, e);
         if (!t->seg) return e->code;

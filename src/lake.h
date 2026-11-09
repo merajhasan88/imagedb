@@ -73,7 +73,8 @@ enum {
 
 #define IMDB_SEG_HEADER 64u
 #define IMDB_SEG_VERSION 3u /* F1 stage 4: the header names its schema version by imdb_sver_hash (2: by the schema alone) */
-#define IMDB_MANIFEST_VERSION 8u /* F1 stage 4 (7 before it: segment format 2); 2 to 7 refused by name (old_manifest) */
+#define IMDB_MANIFEST_VERSION 9u /* F2a: a CREATE's DEFAULTs in the history (8 before it; 7: segment format 2); 2 to 8
+                                   refused by name (old_manifest) */
 #define IMDB_SEG_STUB 1u   /* erased: vid, begin and commitment only */
 #define IMDB_SEG_PURGED 2u /* purged by COMPACT ... PURGE: vid, begin, commitment and the SUBJECT value */
 
@@ -254,7 +255,8 @@ typedef struct imdb_manifest_tab {
     uint64_t retention_us;
     uint64_t created_at, dropped_at; /* version 5 (1f): the commits that created and dropped it (0: live) */
     /* F1: its schema history, made by the parse from version 1 and each ALTER at its commit (the table's entry ends
-     * with u32 nalter; when not 0, version 1's schema as u32 length and bytes, then each ALTER as u64 commit and
+     * with u32 nalter; when not 0, version 1's schema as u32 length and bytes; F2a (manifest 9): then version 1's
+     * DEFAULTs, the CREATE's (op 23's encoding, imdb_coldefs_put: n may be 0); then each ALTER as u64 commit and
      * op 22's body: imdb_alter_put), which wants each ALTER valid on the version before it (imdb_sver_next),
      * after the CREATE, at or before the snapshot and before a drop, and the last version to be s. A consumer may
      * take it whole (and zero it): imdb_manifest_free frees what is left */

@@ -2332,6 +2332,8 @@ static int run_nested(xctx *x, const sql_stmt *in, imdb_result *r, uint8_t mode,
         s.probe_r = r;
     }
     s.env.zone = x->ss ? x->ss->zone : NULL; /* P2: the session's; a bind-only pass reads no zone file */
+    s.env.now_us = x->env.now_us; /* F2a: the statement around it's clock value; a probe reads none */
+    s.env.has_now = x->env.has_now && !s.probe;
     s.env.zone_get = s.probe ? NULL : xenv_zone;
     struct xplain *xp = NULL;
     if (s.probe && !(xp = xp_scratch(e))) return e->code;
@@ -7380,14 +7382,21 @@ static int insert_query(xctx *x, const sql_stmt *st, imdb_table *t, const int *m
 }
 
 /* F1: what an INSERT (or a COPY) gives a column it leaves out: its write default (F1 stage 4: an ADD COLUMN's DEFAULT
- * until a SET or DROP DEFAULT parts it from the value the rows before the ADD read), else NULL: a CREATE TABLE
- * column has none before F2. */
-static imdb_value col_default(const imdb_table *t, uint16_t c)
+ * until a SET or DROP DEFAULT parts it from the value the rows before the ADD read; F2a: a CREATE TABLE's, or a clock
+ * read at the write: the statement's clock, the transaction's start, so one value for every row of the statement),
+ * else NULL */
+static int col_default(imdb_xenv *env, const imdb_table *t, uint16_t c, imdb_value *v, imdb_err *e)
 {
     const imdb_column *col = &t->s.cols[c];
-    imdb_value v = {.type = col->type, .scale = col->scale, .null = true};
-    if (t->hist.nvers) v = t->hist.tcol[t->hist.vers[t->hist.nvers - 1].pos[c]].wdef;
-    return v;
+    *v = (imdb_value){.type = col->type, .scale = col->scale, .null = true};
+    if (!t->hist.nvers) return IMDB_OK;
+    const imdb_tcol *tc = &t->hist.tcol[t->hist.vers[t->hist.nvers - 1].pos[c]];
+    if (!tc->wclock) {
+        *v = tc->wdef;
+        return IMDB_OK;
+    }
+    v->null = false;
+    return imdb_x_clock(env, tc->wclock, col->type, &v->i, e);
 }
 
 static int exec_insert(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
@@ -7413,7 +7422,7 @@ static int exec_insert(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
         }
         for (uint16_t c = 0; c < t->s.ncols; c++) { /* a column left out is its DEFAULT (F1: an ADD's), else NULL */
             if (seen[c]) continue;
-            vals[c] = col_default(t, c);
+            if (col_default(&x->env, t, c, &vals[c], e)) return e->code;
             if (vals[c].null && !(t->s.cols[c].flags & IMDB_COL_NULLABLE))
                 return imdb_fail(e, IMDB_ERR_CONSTRAINT, "column %s needs a value: it is NOT NULL", t->s.cols[c].name);
         }
@@ -7447,7 +7456,8 @@ static void cell_text(const imdb_cell *c, imdb_buf *out, bool safe);
 /* COPY's columns: a list as INSERT's (FROM: a column left out is its DEFAULT, F1: an ADD's, else NULL, refused when NOT
  * NULL; TO, vals NULL: any of them, P2 S17: S10 refused a TO that left out a NOT NULL column), else every column in
  * order */
-static int copy_columns(imdb_table *t, const sql_stmt *st, int *map, uint16_t *width, imdb_value *vals, imdb_err *e)
+static int copy_columns(imdb_table *t, const sql_stmt *st, int *map, uint16_t *width, imdb_value *vals, imdb_xenv *env,
+                        imdb_err *e)
 {
     *width = st->ncols ? st->ncols : t->s.ncols;
     if (!st->ncols) {
@@ -7465,7 +7475,7 @@ static int copy_columns(imdb_table *t, const sql_stmt *st, int *map, uint16_t *w
     for (uint16_t c = 0; c < t->s.ncols; c++) {
         if (seen[c]) continue;
         if (!vals) continue;
-        vals[c] = col_default(t, c); /* F1: its DEFAULT, as INSERT's */
+        if (col_default(env, t, c, &vals[c], e)) return e->code; /* F1: its DEFAULT, as INSERT's */
         if (vals[c].null && !(t->s.cols[c].flags & IMDB_COL_NULLABLE))
             return imdb_fail(e, IMDB_ERR_CONSTRAINT, "column %s needs a value: it is NOT NULL", t->s.cols[c].name);
     }
@@ -7558,7 +7568,7 @@ static int exec_copy_from(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err 
     int map[IMDB_MAX_COLS];
     uint16_t width;
     imdb_value vals[IMDB_MAX_COLS];
-    if (copy_columns(t, st, map, &width, vals, e)) return e->code;
+    if (copy_columns(t, st, map, &width, vals, &x->env, e)) return e->code;
     imdb_csv c;
     if (imdb_csv_init(&c, ss->copy_rd, ss->copy_arg, st->copy_delim, e)) return e->code;
     uint64_t done = 0, committed = 0, skipped = 0;
@@ -7710,7 +7720,7 @@ static int copy_to_table(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *
                          st->table);
     int map[IMDB_MAX_COLS];
     uint16_t width;
-    if (copy_columns(t, st, map, &width, NULL, e)) return e->code;
+    if (copy_columns(t, st, map, &width, NULL, NULL, e)) return e->code;
     qspec q;
     memset(&q, 0, sizeof q);
     q.t = t;
@@ -8931,6 +8941,8 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
     x.env.ctx = &x;
     x.env.arena = &x.arena;
     x.env.zone = ss->zone; /* P2 */
+    x.env.now_us = ss->txn.open ? ss->txn.begin_us : imdb_now_us(); /* F2a: the transaction's start, or this statement's */
+    x.env.has_now = true;
     x.env.zone_get = xenv_zone;
     imdb_db *db = ss->db;
     uint64_t seq_before = db->seq;
@@ -9036,10 +9048,34 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
     if (ceiling) imdb_heap_ceiling_set(imdb_heap_bytes() + workspace_of(ss), workspace_of(ss));
     switch (st->kind) {
     case ST_EMPTY: break;
-    case ST_CREATE:
-        rc = imdb_create_table_ex(db, &st->schema, st->has_retention ? st->retention_us : IMDB_RETAIN_DEFAULT_US, e);
+    case ST_CREATE: { /* F2a: its columns' DEFAULTs (op 23): each a value of its column, or a clock its type suits */
+        imdb_coldef cd[IMDB_MAX_COLS];
+        uint16_t ncd = 0;
+        for (uint16_t c = 0; !rc && c < st->schema.ncols; c++) {
+            const imdb_column *col = &st->schema.cols[c];
+            uint8_t k = st->cdef_kind[c];
+            imdb_value v;
+            imdb_err e2 = {0};
+            if (!k) continue;
+            if (k != IMDB_DEFK_VALUE) {
+                if (!imdb_defk_fits(k, col->type))
+                    rc = imdb_fail(e, IMDB_ERR_INVALID, "column %s: its DEFAULT's clock value is not of its type", col->name);
+                else
+                    cd[ncd++] = (imdb_coldef){.col = c, .kind = k};
+            } else if (bind_lit(&x, &st->cdef[c], col, false, &v, e)) {
+                rc = e->code;
+            } else if (!v.null && imdb_value_check(col, &v, &e2)) {
+                rc = imdb_fail(e, IMDB_ERR_INVALID, "column %s: its DEFAULT: %s", col->name, e2.msg);
+            } else if (!v.null) { /* DEFAULT NULL is none */
+                cd[ncd++] = (imdb_coldef){.col = c, .kind = IMDB_DEFK_VALUE, .v = v};
+            }
+        }
+        if (!rc)
+            rc = imdb_create_table_defs(db, &st->schema, st->has_retention ? st->retention_us : IMDB_RETAIN_DEFAULT_US, cd,
+                                        ncd, e);
         if (!rc) snprintf(r->status, sizeof r->status, "CREATE TABLE %s", st->schema.name);
         break;
+    }
     case ST_ALTER_TABLE: { /* F1: op 22 */
         imdb_table *t = imdb_table_by_name(db, st->table);
         if (!t) {
@@ -9056,7 +9092,13 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
             if (o.acol.type == IMDB_T_DECIMAL &&
                 (o.acol.precision < 1 || o.acol.precision > 18 || o.acol.scale > o.acol.precision))
                 rc = imdb_fail(e, IMDB_ERR_INVALID, "column %s: DECIMAL(p,s) needs 1<=p<=18, 0<=s<=p", o.acol.name);
-            else if (st->has_alter_def && bind_lit(&x, &st->alter_def, &o.acol, false, &o.adef, e))
+            else if (st->has_alter_def && st->alter_clock && !imdb_defk_fits(st->alter_clock, o.acol.type))
+                rc = imdb_fail(e, IMDB_ERR_INVALID, "column %s: its DEFAULT's clock value is not of its type", o.acol.name);
+            else if (st->has_alter_def && st->alter_clock) { /* F2a: the rows before it read the clock's value now */
+                o.aclock = st->alter_clock;
+                o.adef.null = false;
+                if (imdb_x_clock(&x.env, o.aclock, o.acol.type, &o.adef.i, e)) rc = e->code;
+            } else if (st->has_alter_def && bind_lit(&x, &st->alter_def, &o.acol, false, &o.adef, e))
                 rc = e->code;
             else if (!o.adef.null && imdb_value_check(&o.acol, &o.adef, &e2))
                 rc = imdb_fail(e, IMDB_ERR_INVALID, "column %s: its DEFAULT: %s", o.acol.name, e2.msg);
@@ -9072,6 +9114,12 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
             if (!col) rc = imdb_fail(e, IMDB_ERR_INVALID, "table %s has no column %s", st->table, st->alter_old);
             else o.apos = t->hist.vers[t->hist.nvers - 1].pos[c];
             if (!rc && o.akind == IMDB_ALTER_RENAME_COLUMN) o.aname = st->alter_new;
+            if (!rc && o.akind == IMDB_ALTER_SET_DEFAULT && st->alter_clock) { /* F2a: a clock its type suits */
+                o.akind = IMDB_ALTER_SET_DEFAULT_CLOCK;
+                o.aclock = st->alter_clock;
+                if (!imdb_defk_fits(o.aclock, col->type))
+                    rc = imdb_fail(e, IMDB_ERR_INVALID, "column %s: its DEFAULT's clock value is not of its type", col->name);
+            }
             if (!rc && o.akind == IMDB_ALTER_SET_DEFAULT) { /* a value of the column's type, never NULL (the parser's) */
                 o.acol.type = col->type;
                 o.acol.precision = col->precision;
@@ -9153,6 +9201,7 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
         if ((rc = check_iso(st, e))) break;
         imdb_txn_begin(db, &ss->txn, st->iso == SQL_ISO_READ_COMMITTED ? IMDB_ISO_READ_COMMITTED : IMDB_ISO_SNAPSHOT);
         ss->txn.begin_ns = ss->txn.last_ns = now_ns; /* R4 */
+        ss->txn.begin_us = imdb_now_us(); /* F2a: the transaction's now() */
         ss->txn.timeout_ms = ss->txn_timeout_ms;
         ss->txn.idle_ms = ss->idle_timeout_ms;
         snprintf(r->status, sizeof r->status, "BEGIN");
@@ -9500,6 +9549,8 @@ static int exec_execute(imdb_session *ss, const sql_stmt *st, const char *sql, c
     px.env.ctx = &px;
     px.env.arena = &px.arena;
     px.env.zone = ss->zone; /* P2 */
+    px.env.now_us = ss->txn.open ? ss->txn.begin_us : imdb_now_us(); /* F2a */
+    px.env.has_now = true;
     px.env.zone_get = xenv_zone;
     imdb_value vals[IMDB_MAX_PARAMS];
     int rc = IMDB_OK;

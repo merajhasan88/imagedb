@@ -605,7 +605,8 @@ static const char *fn_name(uint8_t fn)
 {
     static const char *const n[] = {"?",     "ABS",    "SIGN",  "ROUND", "CEIL",     "FLOOR",    "MOD",    "LENGTH",
                                     "SUBSTR", "TRIM",  "LTRIM", "RTRIM", "POSITION", "COALESCE", "NULLIF",
-                                    "LOWER",  "UPPER", "REPLACE", "||",     "DATE_TRUNC", "TIMEZONE"};
+                                    "LOWER",  "UPPER", "REPLACE", "||",     "DATE_TRUNC", "TIMEZONE", "NOW",
+                                    "LOCALTIMESTAMP", "CURRENT_DATE", "LOCALTIME"}; /* F2a */
     return fn < sizeof n / sizeof *n ? n[fn] : "?";
 }
 
@@ -622,6 +623,13 @@ int imdb_x_fn_type(uint8_t fn, uint8_t nargs, const uint8_t *ta, const uint8_t *
     *rt = 0;
     *rs = 0;
     switch (fn) {
+    case FN_NOW: /* F2a: the clock: now() and CURRENT_TIMESTAMP an instant, the rest the session zone's wall clock */
+    case FN_LOCALTIMESTAMP:
+    case FN_CURRENT_DATE:
+    case FN_LOCALTIME:
+        if (fn_args(fn, nargs, 0, 0, e)) return e->code;
+        *rt = fn == FN_NOW ? IMDB_T_TIMESTAMPTZ : fn == FN_LOCALTIMESTAMP ? IMDB_T_TIMESTAMP : fn == FN_CURRENT_DATE ? IMDB_T_DATE : IMDB_T_TIME;
+        return IMDB_OK;
     case FN_ABS:
     case FN_SIGN:
     case FN_CEIL:
@@ -764,6 +772,21 @@ static uint32_t u8_byte(const uint8_t *s, uint32_t n, uint64_t ch) /* the byte w
     return i;
 }
 
+int imdb_x_clock(imdb_xenv *env, uint8_t kind, uint8_t type, int64_t *out, imdb_err *e)
+{
+    if (!env || !env->has_now) return imdb_fail(e, IMDB_ERR_STATE, "a clock value outside a statement's run");
+    if (!imdb_defk_fits(kind, type)) return imdb_fail(e, IMDB_ERR_INVALID, "that clock value is not of the column's type");
+    int64_t u = (int64_t)env->now_us;
+    if (type == IMDB_T_TIMESTAMPTZ) {
+        *out = u;
+        return IMDB_OK;
+    }
+    int64_t l = u + (int64_t)imdb_x_tz_off(env, env->zone, u) * 1000000; /* the session zone's wall clock */
+    int64_t day = l / IMDB_DAY_US - (l % IMDB_DAY_US < 0), tod = l - day * IMDB_DAY_US;
+    *out = type == IMDB_T_TIMESTAMP ? l : type == IMDB_T_DATE ? day : tod;
+    return IMDB_OK;
+}
+
 static int fn_eval(uint8_t fn, const imdb_xval *a, uint8_t nargs, uint8_t rt, uint8_t rs, imdb_xenv *env, imdb_xval *out,
               imdb_err *e)
 {
@@ -776,6 +799,17 @@ static int fn_eval(uint8_t fn, const imdb_xval *a, uint8_t nargs, uint8_t rt, ui
             return IMDB_OK;
         }
     switch (fn) {
+    case FN_NOW: /* F2a: the transaction's start (an autocommit statement's), PostgreSQL's now(); never read in a probe */
+    case FN_LOCALTIMESTAMP:
+    case FN_CURRENT_DATE:
+    case FN_LOCALTIME: {
+        uint8_t k = fn == FN_NOW ? IMDB_DEFK_CURRENT_TIMESTAMP : fn == FN_LOCALTIMESTAMP ? IMDB_DEFK_LOCALTIMESTAMP
+                  : fn == FN_CURRENT_DATE ? IMDB_DEFK_CURRENT_DATE : IMDB_DEFK_LOCALTIME;
+        int64_t cv = 0;
+        if (imdb_x_clock(env, k, out->type, &cv, e)) return e->code;
+        out->i = cv;
+        return IMDB_OK;
+    }
     case FN_ABS:
         if (a[0].type == IMDB_T_FLOAT64) {
             out->f = a[0].f < 0 ? -a[0].f : a[0].f + 0.0; /* -0.0 becomes 0.0 */

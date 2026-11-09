@@ -102,6 +102,7 @@ TESTS(alter) /* P2 F1 */
 TESTS(intw) /* F3a: SMALLINT and INTEGER */
 TESTS(dt)   /* F3b: DATE and TIME */
 TESTS(vc)   /* F3c: VARCHAR(n) */
+TESTS(def)  /* F2a: clock values and column DEFAULTs */
 TESTS(tz) /* P2: time zones */
 TESTS(tzsql) /* P2: time zones through the engine */
 

@@ -1170,7 +1170,8 @@ static int run_view(const char *run)
 /* P2 F1: ALTER TABLE (op 22) crashed at every point: a NOT NULL column added with its DEFAULT, a TEXT one, a row that
  * leaves both out, a rename, CHECKPOINTs between (segments of each version, the manifest's schema history); F1 stage 4:
  * a column dropped before the others, a SET DEFAULT, a row taking it, a SET NOT NULL, and a CHECKPOINT whose memtable
- * holds rows from both sides of the drop (a segment of each version); each read against its twin, and every
+ * holds rows from both sides of the drop (a segment of each version); F2a: a table of CREATE DEFAULTs (op 23) and a
+ * SET DEFAULT of a clock (kind 10) before that CHECKPOINT; each read against its twin, and every
  * recovered state the acknowledged one (VERIFY and the auditor) */
 static int run_alter(const char *run)
 {
@@ -1198,10 +1199,19 @@ static int run_alter(const char *run)
         {"ALTER TABLE txns ALTER COLUMN c SET DEFAULT 'r'", NULL},
         {"INSERT INTO txns (id, user_id, note) VALUES (21, 7, 'late')", NULL},
         {"ALTER TABLE txns ALTER COLUMN c SET NOT NULL", NULL},
+        /* F2a: a CREATE's DEFAULTs (op 23) and a clock's SET DEFAULT (kind 10), the next CHECKPOINT's manifest version 1's */
+        {"CREATE TABLE dz (id INT64 PRIMARY KEY, s TEXT NOT NULL DEFAULT 'd', at TIMESTAMPTZ DEFAULT now(), t TIME)", NULL},
+        {"INSERT INTO dz (id) VALUES (1)", NULL},
+        {"ALTER TABLE dz ALTER COLUMN t SET DEFAULT LOCALTIME", NULL},
+        {"INSERT INTO dz (id) VALUES (2)", NULL},
         {"CHECKPOINT", NULL},
         {"SELECT COUNT(*) FROM txns WHERE c = 'r'", "SELECT COUNT(*) FROM txns WHERE id = 21"},
         {"SELECT note, c, n FROM txns WHERE user_id = 42 ORDER BY id", "SELECT note, 'q', 5 FROM txns WHERE user_id = 42 ORDER BY id"},
         {"SELECT SUM(n) FROM txns", "SELECT 5 * COUNT(*) FROM txns"},
+        {"SELECT COUNT(*) FROM dz WHERE s = 'd' AND at IS NOT NULL", "SELECT COUNT(*) FROM dz"},
+        {"SELECT COUNT(*) FROM dz WHERE t IS NOT NULL", "SELECT COUNT(*) FROM dz WHERE id = 2"},
+        {"INSERT INTO dz (id) VALUES (3)", NULL},
+        {"SELECT COUNT(*) FROM dz WHERE s = 'd' AND t IS NOT NULL", "SELECT COUNT(*) FROM dz WHERE id >= 2"},
     };
     int v = 0;
     size_t done = 0;
@@ -1241,7 +1251,10 @@ static int run_alter(const char *run)
     }
     /* not vacuous: a run nothing faulted made every version */
     const imdb_table *tt = imdb_table_by_name(db, "txns");
-    if (!v && done == sizeof q / sizeof *q && !db->warning[0] && !db->failed && (!tt || tt->hist.nvers != 7)) v = VIOL_ALTER;
+    const imdb_table *dz = imdb_table_by_name(db, "dz");
+    if (!v && done == sizeof q / sizeof *q && !db->warning[0] && !db->failed &&
+        (!tt || tt->hist.nvers != 7 || !dz || dz->hist.nvers != 2 || dz->hist.tcol[3].wclock != IMDB_DEFK_LOCALTIME))
+        v = VIOL_ALTER;
     imdb_session_close(&s);
     imdb_close(db);
     return v;

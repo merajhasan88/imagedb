@@ -66,7 +66,8 @@ enum { CMP_EQ = 1, CMP_NE, CMP_LT, CMP_LE, CMP_GT, CMP_GE, CMP_BETWEEN, CMP_ISNU
 /* P2 S1: the functions, each with one definition (design.md §5, Functions) */
 enum { FN_ABS = 1, FN_SIGN, FN_ROUND, FN_CEIL, FN_FLOOR, FN_MOD, FN_LENGTH, FN_SUBSTR, FN_TRIM, FN_LTRIM, FN_RTRIM,
        FN_POSITION, FN_COALESCE, FN_NULLIF, FN_LOWER, FN_UPPER, FN_REPLACE, FN_CONCAT,
-       FN_DATE_TRUNC, FN_TIMEZONE }; /* P2: date_trunc(unit, x [, zone]); x AT TIME ZONE z as timezone(z, x) */
+       FN_DATE_TRUNC, FN_TIMEZONE, /* P2: date_trunc(unit, x [, zone]); x AT TIME ZONE z as timezone(z, x) */
+       FN_NOW, FN_LOCALTIMESTAMP, FN_CURRENT_DATE, FN_LOCALTIME }; /* F2a: the clock (the transaction's start) */
 
 /* col op a (BETWEEN: a AND b), today's form, whose literals bind to the column (an index may serve it); or with lx a
  * residual: a boolean tree (1c), tested on every row that passed the bound conjuncts, kept when TRUE */
@@ -228,7 +229,10 @@ typedef struct sql_stmt {
     uint8_t alter_kind;                         /* ST_ALTER_TABLE (F1): IMDB_ALTER_*; ADD: schema.cols[0] the column (SET TYPE:
                                                    its new type); the other kinds but RENAME TO: alter_old the column */
     char alter_old[IMDB_MAX_IDENT + 1], alter_new[IMDB_MAX_IDENT + 1]; /* RENAME COLUMN old TO new; RENAME TO new */
-    sql_lit alter_def;                          /* ADD and SET DEFAULT: the DEFAULT, when has_alter_def */
+    sql_lit alter_def;                          /* ADD and SET DEFAULT: the DEFAULT, when has_alter_def (a literal) */
+    uint8_t alter_clock;                        /* F2a: ADD's or SET DEFAULT's clock kind (IMDB_DEFK_*) instead, or 0 */
+    sql_lit cdef[IMDB_MAX_COLS];                /* F2a: CREATE TABLE: column c's DEFAULT, a literal when cdef_kind[c] is VALUE */
+    uint8_t cdef_kind[IMDB_MAX_COLS];           /* F2a: 0 none, IMDB_DEFK_VALUE a literal, else a clock kind */
     bool has_alter_def;
     char set_name[IMDB_MAX_IDENT + 1];          /* SET */
     char set_value[IMDB_MAX_IDENT + 1];
@@ -358,6 +362,10 @@ typedef struct imdb_xenv {
     const struct imdb_tz *zone;
     int (*zone_get)(void *ctx, const uint8_t *name, uint32_t len, const struct imdb_tz **out, imdb_err *e);
     imdb_xtzc tzc[4];
+    /* F2a: the statement's clock value (now(), CURRENT_TIMESTAMP, LOCALTIMESTAMP, CURRENT_DATE, LOCALTIME): its transaction's
+     * start, or an autocommit statement's; has_now false in a bind-only pass (no clock is read there) */
+    uint64_t now_us;
+    bool has_now;
     uint8_t tzc_next;
 } imdb_xenv;
 /* the tree at k on a row (columns by the bound col) and the aggregates' final values (slots); env may be NULL (no
@@ -413,6 +421,9 @@ enum { IMDB_TRUNC_US = 1, IMDB_TRUNC_MS, IMDB_TRUNC_SECOND, IMDB_TRUNC_MINUTE, I
 int imdb_x_trunc_unit(const uint8_t *s, uint32_t n, uint8_t *unit, imdb_err *e);
 /* P2: zone z's offset at t (microseconds, UTC) through env's span cache (env NULL: none); z NULL: UTC */
 int32_t imdb_x_tz_off(imdb_xenv *env, const struct imdb_tz *z, int64_t t_us);
+/* F2a: a clock kind's value (IMDB_DEFK_*) as a column type it suits (imdb_defk_fits): the statement's clock, the
+ * transaction's start (env->now_us), the wall-clock kinds in the session's zone; an error outside a run (a probe) */
+int imdb_x_clock(imdb_xenv *env, uint8_t kind, uint8_t type, int64_t *out, imdb_err *e);
 /* P2: date_trunc of v: a TIMESTAMP's (z NULL: its wall-clock time) or a TIMESTAMPTZ's in zone z; *lo and *hi, when not
  * NULL, the span of v's whose result is the same (a caller's cache: the GROUP BY key's); a result before 0001-01-01 or
  * past 9999 an error */

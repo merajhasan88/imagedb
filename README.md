@@ -627,7 +627,23 @@ name exact (UTC, Etc/UTC, GMT and Etc/GMT in any case, with no file needed).
 Output: `2026-03-29 02:30:00+01`, `+05:45`, `-02:30`; COPY TO writes the session's
 zone, a dump UTC. A GROUP BY of `date_trunc(...)` over a column, in any zone,
 takes the grouped fast path (a cached span of instants a row). Not yet:
-EXTRACT, INTERVAL, now(), zone names in any case.
+EXTRACT, INTERVAL, zone names in any case.
+
+The clock: `now()` and `CURRENT_TIMESTAMP` (a TIMESTAMPTZ), `LOCALTIMESTAMP` (a
+TIMESTAMP, the session zone's wall clock), `CURRENT_DATE` and `LOCALTIME` (the
+same zone's date and time of day). Each is the transaction's start, or an
+autocommit statement's own, so one value through a transaction, as PostgreSQL's
+now(). `CURRENT_TIME` (a time with a zone) and a precision (`CURRENT_TIMESTAMP(3)`)
+are refused.
+
+DEFAULTs: CREATE TABLE takes `c type ... DEFAULT v` on any column, a key's too,
+where v is a literal of the column's type (`DEFAULT NULL` is none) or a clock its
+type takes: `now()` or `CURRENT_TIMESTAMP` for a TIMESTAMPTZ (or a TIMESTAMP, its
+wall clock), `LOCALTIMESTAMP` for a TIMESTAMP, `CURRENT_DATE` for a DATE,
+`LOCALTIME` for a TIME. An INSERT, INSERT ... SELECT or COPY that leaves the
+column out writes it, a clock's value read at the write (the statement's, the
+transaction's start). Not yet: an expression as a DEFAULT, `VALUES (DEFAULT)` and
+`DEFAULT VALUES`.
 
 Primary keys: every table has one, of one column (`id INT64 PRIMARY KEY`) or of
 up to eight (`PRIMARY KEY (region, day)`, a table constraint anywhere among the
@@ -638,11 +654,12 @@ INDEX`). No UPDATE changes a key column (DELETE and INSERT instead); `ON
 CONFLICT` names the key's columns, in any order; `SHOW HISTORY t (v1, v2)`
 lists a key's versions.
 
-ALTER TABLE: `ADD [COLUMN] c type [NULL | NOT NULL] [DEFAULT literal]` (NOT NULL
+ALTER TABLE: `ADD [COLUMN] c type [NULL | NOT NULL] [DEFAULT v]` (NOT NULL
 needs a DEFAULT; the rows already there read it, or NULL, and an INSERT or COPY
-that leaves the column out writes it), `DROP [COLUMN] c`, `ALTER [COLUMN] c` with
+that leaves the column out writes it; `DEFAULT now()` and the other clocks: the rows
+already there read the ALTER's value, a write the clock's), `DROP [COLUMN] c`, `ALTER [COLUMN] c` with
 `SET NOT NULL` (every row must hold a value), `DROP NOT NULL`, `SET DEFAULT
-literal` (what later INSERTs and COPYs write; the rows already there keep what
+v` (a literal or a clock: what later INSERTs and COPYs write; the rows already there keep what
 they read), `DROP DEFAULT` or `[SET DATA] TYPE t` (a widening alone: a DECIMAL to a wider precision of
 the same scale, an integer to a wider one), `RENAME [COLUMN] a TO b`, `RENAME TO u`, and `SET
 RETENTION`; each alone, outside a transaction, a metadata change that rewrites no
@@ -657,7 +674,7 @@ renamed column by its new name, and a dropped column is in no read, past ones
 included. DROP COLUMN erases nothing: the values stay in the history (the log and
 the lake) until those versions are retired or erased, as any row's do; to remove a
 person's data use ERASE SUBJECT. A dump writes each table's columns in its CREATE
-TABLE and each DEFAULT as `ALTER TABLE ... ALTER COLUMN ... SET DEFAULT`.
+TABLE, each with its DEFAULT.
 
 TEXT is UTF-8, validated, without NUL, and compared and ordered byte by byte: there
 are no collations. Platforms: see Build and quickstart.

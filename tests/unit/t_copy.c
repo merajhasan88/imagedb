@@ -861,12 +861,65 @@ static void t_copy_dump_ckey(void)
     free(d2.p);
 }
 
+/* F2a: COPY FROM leaving columns out writes their DEFAULTs, a clock's the statement's value (BATCH's commits inside it
+ * too: one statement, one value); the dump spells each DEFAULT in CREATE TABLE, and the restored table writes them */
+static void t_copy_defaults(void)
+{
+    const char *base = test_tmpdir();
+    char p[600], q[600];
+    snprintf(p, sizeof p, "%s/primary", base);
+    snprintf(q, sizeof q, "%s/restored", base);
+    OK(imdb_init(p, false, NULL, E));
+    memset(&g_io, 0, sizeof g_io);
+    g_io.outcap = 1u << 20;
+    g_io.out = malloc(g_io.outcap + 1);
+    CHECK(g_io.out);
+    imdb_db *db = open_at(p);
+    CHECK(db);
+    if (!db || !g_io.out) return;
+    imdb_clock_freeze(1772953198ull * 1000000ull); /* 2026-03-08 06:59:58 UTC */
+    CHECK(run("CREATE TABLE d (id INT64 PRIMARY KEY, s TEXT DEFAULT 'x,y', at TIMESTAMPTZ DEFAULT now(), "
+              "n INT64 NOT NULL DEFAULT 3, cd DATE DEFAULT CURRENT_DATE) RETENTION FOREVER") == 0);
+    EXPECT(copy_in("COPY d (id) FROM STDIN", "1\n2\n", 4, 1), "COPY 2");
+    imdb_clock_offset(1000000);
+    EXPECT(copy_in("COPY d (id, s) FROM STDIN (BATCH 1)", "3,a\n4,\n", 7, 3), "COPY 2"); /* each row its own commit */
+    imdb_clock_offset(2000000);
+    CHECK(run("INSERT INTO d (id, n) VALUES (5, 0)") == 0);
+    const char *want = "id,s,at,n,cd\n1,\"x,y\",2026-03-08 06:59:58+00,3,2026-03-08\n"
+                       "2,\"x,y\",2026-03-08 06:59:58+00,3,2026-03-08\n3,\"a\",2026-03-08 06:59:59+00,3,2026-03-08\n"
+                       "4,,2026-03-08 06:59:59+00,3,2026-03-08\n5,\"x,y\",2026-03-08 07:00:00+00,0,2026-03-08\n";
+    EXPECT(csv("SELECT * FROM d ORDER BY id"), want);
+    outb d1 = {0}, d2 = {0};
+    OK(imdb_dump(db, 0, outb_write, &d1, E));
+    CHECK(d1.p && strstr(d1.p, "CREATE TABLE d (id INT64 PRIMARY KEY, s TEXT DEFAULT 'x,y', at TIMESTAMPTZ DEFAULT "
+                               "CURRENT_TIMESTAMP, n INT64 NOT NULL DEFAULT 3, cd DATE DEFAULT CURRENT_DATE) RETENTION "
+                               "FOREVER;\n"));
+    imdb_session_close(&g_s);
+    imdb_close(db);
+    OK(imdb_init(q, false, NULL, E));
+    imdb_db *dst = open_at(q);
+    CHECK(dst);
+    if (!dst) return;
+    imdb_clock_offset(3000000);
+    CHECK(restore_text(d1.p, d1.n) == 0); /* the rows whole: their values, not the clock's now */
+    EXPECT(csv("SELECT * FROM d ORDER BY id"), want);
+    OK(imdb_dump(dst, 0, outb_write, &d2, E));
+    const char *a1 = d1.p ? strchr(d1.p, '\n') : NULL, *a2 = d2.p ? strchr(d2.p, '\n') : NULL;
+    CHECK(a1 && a2 && !strcmp(a1, a2));
+    EXPECT(copy_in("COPY d (id) FROM STDIN", "6\n", 2, 2), "COPY 1");
+    EXPECT(csv("SELECT * FROM d WHERE id = 6"), "id,s,at,n,cd\n6,\"x,y\",2026-03-08 07:00:01+00,3,2026-03-08\n");
+    CHECK(run("VERIFY") == 0);
+    done(dst);
+    free(d1.p);
+    free(d2.p);
+}
+
 /* the format's fixtures (tests/fixtures: tables kept FOREVER, a dropped one kept a century), each opened read-only:
  * the primary's dump is its replica's at the same commit and names no dropped table; restored into an empty database
  * of the other digest algorithm, it dumps again the same past its first line, VERIFY passing */
 static void t_copy_dump_fixtures(void)
 {
-    static const char *const tgz[] = {"tests/fixtures/alg1-20261109.tar.gz", "tests/fixtures/alg2-20261109.tar.gz"};
+    static const char *const tgz[] = {"tests/fixtures/alg1-20261109b.tar.gz", "tests/fixtures/alg2-20261109b.tar.gz"};
     for (int f = 0; f < 2; f++) {
         char dir[600], cmd[1600], p[700], r[700], q[700];
         snprintf(dir, sizeof dir, "%s", test_tmpdir());
@@ -982,6 +1035,7 @@ const test_case copy_tests[] = {
     {"copy_dump_refused", t_copy_dump_refused},
     {"copy_dump_fixtures", t_copy_dump_fixtures},
     {"copy_dump_ckey", t_copy_dump_ckey},
+    {"copy_defaults", t_copy_defaults}, /* F2a */
     {"copy_tz", t_copy_tz}, /* P2 */
 };
 const size_t copy_ntests = sizeof copy_tests / sizeof copy_tests[0];

@@ -620,7 +620,7 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
         bool on_table = o->code == IMDB_OP_INSERT || o->code == IMDB_OP_DELETE || o->code == IMDB_OP_UPDATE ||
                         o->code == IMDB_OP_COMPACT || o->code == IMDB_OP_CREATE_INDEX || o->code == IMDB_OP_DROP_INDEX ||
                         o->code == IMDB_OP_SET_RETENTION || o->code == IMDB_OP_EXPIRE || o->code == IMDB_OP_DROP_TABLE ||
-                        o->code == IMDB_OP_ALTER_TABLE;
+                        o->code == IMDB_OP_ALTER_TABLE || o->code == IMDB_OP_COLUMN_DEFAULTS;
         vtab *t = on_table && o->table < x->nt ? &x->t[o->table] : NULL;
         if (on_table && !t) return imdb_fail(e, IMDB_ERR_VERIFY, "verify: unknown table");
         if (t && t->dropped_at && /* replay's and the auditor's rule: a dropped table's history may still expire */
@@ -649,6 +649,9 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
             x->nt++;
             break;
         }
+        case IMDB_OP_COLUMN_DEFAULTS: /* F2a: its CREATE's defaults into the model's first version (the codec checked them) */
+            rc = imdb_hist_create_defaults(&t->hist, o->defs, o->ndefs, e);
+            break;
         case IMDB_OP_CREATE_INDEX: {
             imdb_index_def d;
             memset(&d, 0, sizeof d);
@@ -1363,6 +1366,7 @@ static bool same_hist(const imdb_schema_hist *m, const imdb_schema_hist *x, uint
         if (a->since != b->since || memcmp(a->hash, b->hash, 32) != 0 || a->akind != b->akind || a->apos != b->apos)
             return false;
         if (a->akind == IMDB_ALTER_SET_DEFAULT && !val_eq(&a->adef, &b->adef)) return false; /* no hash covers it */
+        if (a->aclock != b->aclock) return false; /* F2a: a clock DEFAULT, nor this */
     }
     uint16_t np = 0; /* the positions the first n versions have: those added at or before version n */
     while (np < x->ntcol && x->tcol[np].added <= n) np++;
@@ -1370,7 +1374,8 @@ static bool same_hist(const imdb_schema_hist *m, const imdb_schema_hist *x, uint
     for (uint16_t p = 0; p < np; p++) {
         uint32_t xd = x->tcol[p].dropped <= n ? x->tcol[p].dropped : 0; /* F1 stage 4: dropped by version n, or not */
         if (m->tcol[p].added != x->tcol[p].added || m->tcol[p].dropped != xd ||
-            !val_eq(&m->tcol[p].missing, &x->tcol[p].missing))
+            !val_eq(&m->tcol[p].missing, &x->tcol[p].missing) || !val_eq(&m->tcol[p].cdef, &x->tcol[p].cdef) ||
+            m->tcol[p].cclock != x->tcol[p].cclock) /* F2a: a CREATE's DEFAULTs, which no version holds */
             return false;
     }
     return true;

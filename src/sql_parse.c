@@ -499,7 +499,8 @@ static uint8_t fn_named(const parser *p, uint32_t at)
              {"trim", FN_TRIM},         {"ltrim", FN_LTRIM},       {"rtrim", FN_RTRIM},
              {"position", FN_POSITION}, {"coalesce", FN_COALESCE}, {"nullif", FN_NULLIF},
              {"lower", FN_LOWER},       {"upper", FN_UPPER},       {"replace", FN_REPLACE},
-             {"date_trunc", FN_DATE_TRUNC}, {"timezone", FN_TIMEZONE}}; /* P2 */
+             {"date_trunc", FN_DATE_TRUNC}, {"timezone", FN_TIMEZONE}, /* P2 */
+             {"now", FN_NOW}};                                   /* F2a */
     for (size_t i = 0; i < sizeof k / sizeof *k; i++)
         if (tok_is_kw(p, at, k[i].name)) return k[i].fn;
     return 0;
@@ -517,6 +518,10 @@ static int fn_call(parser *p, uint8_t fn, uint16_t *out, unsigned depth)
             list_build(p, el, 2, &args))
             return p->e->code;
         n = 2;
+    } else if (p->t[p->i].kind == TK_RP) { /* F2a: now(), no arguments */
+        p->i++;
+        args = 0;
+        n = 0;
     } else if (expr_list(p, depth, &args, &n)) {
         return p->e->code;
     }
@@ -779,6 +784,20 @@ static int primary(parser *p, uint16_t *out, unsigned depth)
     }
     if (kw(p, "case")) return case_expr(p, out, depth); /* P2 S1 */
     if (kw(p, "cast")) return cast_expr(p, out, depth);
+    /* F2a: the SQL standard's clock values, written without parentheses (a column of one of these names cannot be read) */
+    static const struct {
+        const char *name;
+        uint8_t fn;
+    } ck[] = {{"current_timestamp", FN_NOW}, {"localtimestamp", FN_LOCALTIMESTAMP}, {"current_date", FN_CURRENT_DATE},
+              {"localtime", FN_LOCALTIME}};
+    for (size_t i = 0; i < sizeof ck / sizeof *ck; i++)
+        if (kw(p, ck[i].name)) {
+            if (ex_new(p, EX_FN, 0, 0, out)) return p->e->code;
+            p->st->ex[*out].fn = ck[i].fn;
+            return IMDB_OK;
+        }
+    if (tok_is_kw(p, p->i, "current_time"))
+        return imdb_fail(p->e, IMDB_ERR_INVALID, "CURRENT_TIME is a time with a zone, which imagedb has not: write LOCALTIME");
     if (p->t[p->i].kind == TK_IDENT && p->t[p->i + 1].kind == TK_LP) { /* an identifier is not the end: i + 1 exists */
         uint8_t wf = wf_named(p, p->i); /* P2 S6 */
         if (wf) return window_call(p, wf, out, depth);
@@ -1139,6 +1158,32 @@ static int parse_retention(parser *p, uint64_t *us)
     return IMDB_OK;
 }
 
+/* F2a: a DEFAULT's value: a literal, or a clock read at each write (now() or CURRENT_TIMESTAMP, LOCALTIMESTAMP,
+ * CURRENT_DATE, LOCALTIME: *clock its kind); CURRENT_TIME refused as in an expression */
+static int default_value(parser *p, sql_lit *l, uint8_t *clock)
+{
+    *clock = 0;
+    memset(l, 0, sizeof *l);
+    if (tok_is_kw(p, p->i, "now") && p->t[p->i + 1].kind == TK_LP) {
+        p->i++;
+        if (expect(p, TK_LP, "(") || expect(p, TK_RP, ")")) return p->e->code;
+        *clock = IMDB_DEFK_CURRENT_TIMESTAMP;
+        return IMDB_OK;
+    }
+    if (tok_is_kw(p, p->i, "current_time"))
+        return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "CURRENT_TIME is a time with a zone, which imagedb has not: write LOCALTIME");
+    if (kw(p, "current_timestamp")) *clock = IMDB_DEFK_CURRENT_TIMESTAMP;
+    else if (kw(p, "localtimestamp")) *clock = IMDB_DEFK_LOCALTIMESTAMP;
+    else if (kw(p, "current_date")) *clock = IMDB_DEFK_CURRENT_DATE;
+    else if (kw(p, "localtime")) *clock = IMDB_DEFK_LOCALTIME;
+    if (*clock) {
+        if (p->t[p->i].kind == TK_LP) /* PostgreSQL's precision: imagedb keeps microseconds */
+            return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "a clock value's precision: imagedb keeps microseconds");
+        return IMDB_OK;
+    }
+    return literal(p, l);
+}
+
 /* ALTER TABLE t, read: SET RETENTION ...; F1: ADD [COLUMN] c type [NULL | NOT NULL] [DEFAULT literal] (either order),
  * RENAME [COLUMN] a TO b, RENAME TO n */
 static int parse_alter(parser *p, sql_stmt *st)
@@ -1167,7 +1212,7 @@ static int parse_alter(parser *p, sql_stmt *st)
                 null_spec = 1;
             } else if (kw(p, "default")) {
                 if (st->has_alter_def) return imdb_fail(p->e, IMDB_ERR_INVALID, "column %s: one DEFAULT", c->name);
-                if (literal(p, &st->alter_def)) return p->e->code;
+                if (default_value(p, &st->alter_def, &st->alter_clock)) return p->e->code;
                 st->has_alter_def = true;
             } else if (kw(p, "primary") || kw(p, "subject")) {
                 return imdb_fail(p->e, IMDB_ERR_INVALID, "an added column is neither a key nor a SUBJECT");
@@ -1207,8 +1252,8 @@ static int parse_alter(parser *p, sql_stmt *st)
         }
         if (set && kw(p, "default")) {
             st->alter_kind = IMDB_ALTER_SET_DEFAULT;
-            if (literal(p, &st->alter_def)) return p->e->code;
-            if (st->alter_def.kind == LIT_NULL) /* one state, one spelling: no DEFAULT is DROP DEFAULT */
+            if (default_value(p, &st->alter_def, &st->alter_clock)) return p->e->code;
+            if (!st->alter_clock && st->alter_def.kind == LIT_NULL) /* one state, one spelling: no DEFAULT is DROP DEFAULT */
                 return imdb_fail(p->e, IMDB_ERR_INVALID, "SET DEFAULT NULL: write DROP DEFAULT");
             st->has_alter_def = true;
             return IMDB_OK;
@@ -1268,6 +1313,11 @@ static int parse_create(parser *p, sql_stmt *st)
                     return imdb_fail(p->e, IMDB_ERR_INVALID, "a table has one PRIMARY KEY (PRIMARY KEY (a, b) names several columns)");
                 c->flags |= IMDB_COL_PK;
                 pk = s->ncols;
+            } else if (kw(p, "default")) { /* F2a: a literal (DEFAULT NULL: none) or a clock */
+                if (st->cdef_kind[s->ncols]) return imdb_fail(p->e, IMDB_ERR_INVALID, "column %s: one DEFAULT", c->name);
+                uint8_t ck = 0;
+                if (default_value(p, &st->cdef[s->ncols], &ck)) return p->e->code;
+                st->cdef_kind[s->ncols] = ck ? ck : IMDB_DEFK_VALUE;
             } else if (kw(p, "subject")) {
                 if (s->subject >= 0) return imdb_fail(p->e, IMDB_ERR_INVALID, "only one SUBJECT column is supported");
                 c->flags |= IMDB_COL_SUBJECT;

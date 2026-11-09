@@ -44,6 +44,9 @@ int imdb_version_key(imdb_table *t, uint64_t vid, int col, imdb_value *out);
  * `from` mapped onto the last (its missing positions their missing values); op 22's next version made before the commit
  * (the room, a TEXT DEFAULT's bytes, its hash) and taken after it (allocating nothing) */
 int imdb_hist_first(imdb_schema_hist *h, const imdb_schema *s, imdb_err *e);
+/* F2a: a CREATE's column defaults (op 23's, checked) into its first version's columns: each its cdef or cclock, and the
+ * write default it starts as */
+int imdb_hist_create_defaults(imdb_schema_hist *h, const imdb_coldef *defs, uint16_t ndefs, imdb_err *e);
 const imdb_sver *imdb_hist_at(const imdb_schema_hist *h, uint64_t at);
 void imdb_hist_map(const imdb_schema_hist *h, const imdb_sver *from, const imdb_value *src, imdb_value *dst);
 int imdb_hist_prepare(imdb_schema_hist *h, imdb_op *o, imdb_err *e);

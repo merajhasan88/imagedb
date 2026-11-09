@@ -13,6 +13,17 @@ static const uint8_t kGenesisTag[8] = {'I', 'M', 'D', 'B', 'G', 'E', 'N', '1'};
 
 /* F1: a column's type as op 22 logs it (an ADD's column, SET DEFAULT's and SET TYPE's): a known tag, a DECIMAL's
  * precision 1 to 18 and a scale within it, no precision or scale for another type */
+bool imdb_defk_fits(uint8_t kind, uint8_t type) /* F2a: a clock kind and the types it writes */
+{
+    switch (kind) {
+    case IMDB_DEFK_CURRENT_TIMESTAMP: return type == IMDB_T_TIMESTAMPTZ || type == IMDB_T_TIMESTAMP;
+    case IMDB_DEFK_LOCALTIMESTAMP: return type == IMDB_T_TIMESTAMP;
+    case IMDB_DEFK_CURRENT_DATE: return type == IMDB_T_DATE;
+    case IMDB_DEFK_LOCALTIME: return type == IMDB_T_TIME;
+    default: return false;
+    }
+}
+
 static bool alter_type_ok(const imdb_column *c)
 {
     if (c->type < IMDB_T_INT64 || c->type > IMDB_T_LAST) return false;
@@ -50,6 +61,32 @@ static void put_value(imdb_buf *b, const imdb_column *c, const imdb_value *v)
     }
 }
 
+/* F2a: a CREATE's defaults against its schema: each a NOT NULL value of its column, or a clock kind its type suits (the
+ * encoder's, the decoder's and the engine's one rule) */
+bool imdb_coldefs_ok(const imdb_schema *s, const imdb_coldef *defs, uint16_t ndefs)
+{
+    if (!s || !ndefs || ndefs > s->ncols) return false;
+    for (uint16_t k = 0; k < ndefs; k++) {
+        const imdb_coldef *d = &defs[k];
+        imdb_err e2 = {0};
+        if (d->col >= s->ncols || (k && d->col <= defs[k - 1].col)) return false;
+        if (d->kind == IMDB_DEFK_VALUE ? d->v.null || imdb_value_check(&s->cols[d->col], &d->v, &e2)
+                                       : !imdb_defk_fits(d->kind, s->cols[d->col].type))
+            return false;
+    }
+    return true;
+}
+
+void imdb_coldefs_put(imdb_buf *b, const imdb_schema *s, const imdb_coldef *defs, uint16_t n)
+{
+    imdb_buf_put_u16(b, n);
+    for (uint16_t k = 0; k < n; k++) {
+        imdb_buf_put_u16(b, defs[k].col);
+        imdb_buf_put_u8(b, defs[k].kind);
+        if (defs[k].kind == IMDB_DEFK_VALUE) put_value(b, &s->cols[defs[k].col], &defs[k].v);
+    }
+}
+
 static void put_default(imdb_buf *b, const imdb_column *c, const imdb_value *v)
 {
     if (v->null) {
@@ -79,18 +116,48 @@ static int get_value(imdb_rd *r, const imdb_column *c, imdb_value *v, const char
     return IMDB_OK;
 }
 
-static int get_default(imdb_rd *r, const imdb_column *c, imdb_value *v, const char *what, imdb_err *e)
+/* an ADD's DEFAULT: u8 0 none, 1 a value, F2a: 2 a clock kind (its column's type suits it) and the value the clock gave
+ * at the ALTER (what the rows before it read) */
+static int get_default(imdb_rd *r, const imdb_column *c, imdb_value *v, uint8_t *clock, const char *what, imdb_err *e)
 {
     memset(v, 0, sizeof *v);
     v->type = c->type;
     v->scale = c->scale;
     uint8_t has = imdb_rd_u8(r);
-    if (r->err || has > 1) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad DEFAULT", what);
+    if (r->err || has > 2) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad DEFAULT", what);
     if (!has) {
         v->null = true;
         return IMDB_OK;
     }
+    if (has == 2) {
+        *clock = imdb_rd_u8(r);
+        if (!r->err && !imdb_defk_fits(*clock, c->type)) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad clock default", what);
+    }
     return get_value(r, c, v, what, e);
+}
+
+int imdb_coldefs_get(imdb_rd *r, const imdb_schema *s, bool none_ok, imdb_coldef **out, uint16_t *n, const char *what,
+                     imdb_err *e)
+{
+    *out = NULL;
+    *n = imdb_rd_u16(r);
+    if (r->err) return IMDB_OK; /* the caller's truncation */
+    if ((!*n && !none_ok) || *n > s->ncols) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: a bad column default", what);
+    if (!*n) return IMDB_OK;
+    imdb_coldef *d = imdb_alloc_array(*n, sizeof *d, e);
+    if (!d) return e->code;
+    *out = d; /* the caller's to free, whatever follows */
+    for (uint16_t k = 0; k < *n; k++) {
+        d[k].col = imdb_rd_u16(r);
+        d[k].kind = imdb_rd_u8(r);
+        if (r->err) return IMDB_OK;
+        if (d[k].col >= s->ncols || (k && d[k].col <= d[k - 1].col) || d[k].kind < IMDB_DEFK_VALUE || d[k].kind > IMDB_DEFK_LAST)
+            return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: a bad column default", what);
+        if (d[k].kind == IMDB_DEFK_VALUE && get_value(r, &s->cols[d[k].col], &d[k].v, what, e)) return e->code;
+        if (r->err) return IMDB_OK;
+    }
+    if (!imdb_coldefs_ok(s, d, *n)) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: a bad column default", what);
+    return IMDB_OK;
 }
 
 int imdb_alter_put(imdb_buf *b, const imdb_op *o)
@@ -101,10 +168,12 @@ int imdb_alter_put(imdb_buf *b, const imdb_op *o)
     if ((named && (!nl || nl > IMDB_MAX_IDENT || !imdb_ident_valid(o->aname, nl))) ||
         (o->akind == IMDB_ALTER_ADD_COLUMN &&
          (!alter_col_ok(&o->acol) || (!(o->acol.flags & IMDB_COL_NULLABLE) && o->adef.null) ||
-          (!o->adef.null && imdb_value_check(&o->acol, &o->adef, &e2)))) ||
+          (!o->adef.null && imdb_value_check(&o->acol, &o->adef, &e2)) ||
+          (o->aclock && (!imdb_defk_fits(o->aclock, o->acol.type) || o->adef.null)))) || /* F2a */
         (o->akind == IMDB_ALTER_SET_DEFAULT &&
          (!alter_bare_ok(&o->acol) || o->adef.null || imdb_value_check(&o->acol, &o->adef, &e2))) ||
         (o->akind == IMDB_ALTER_SET_TYPE && !alter_bare_ok(&o->acol)) ||
+        (o->akind == IMDB_ALTER_SET_DEFAULT_CLOCK && (o->aclock <= IMDB_DEFK_VALUE || o->aclock > IMDB_DEFK_LAST)) ||
         (o->akind < IMDB_ALTER_ADD_COLUMN || o->akind > IMDB_ALTER_LAST)) {
         b->err = IMDB_ERR_INVALID;
         return IMDB_ERR_INVALID;
@@ -119,11 +188,21 @@ int imdb_alter_put(imdb_buf *b, const imdb_op *o)
         imdb_buf_put_u8(b, o->acol.type == IMDB_T_TEXT ? (uint8_t)(o->acol.vlen & 0xff) : o->acol.precision); /* F3c */
         imdb_buf_put_u8(b, o->acol.type == IMDB_T_TEXT ? (uint8_t)(o->acol.vlen >> 8) : o->acol.scale);
         imdb_buf_put_u8(b, o->acol.flags);
-        put_default(b, &o->acol, &o->adef);
+        if (o->aclock) { /* F2a: the clock's value at the ALTER, which the rows before it read, and the kind writes use */
+            imdb_buf_put_u8(b, 2);
+            imdb_buf_put_u8(b, o->aclock);
+            put_value(b, &o->acol, &o->adef);
+        } else {
+            put_default(b, &o->acol, &o->adef);
+        }
         return IMDB_OK;
     }
     case IMDB_ALTER_RENAME_TABLE:
         break;
+    case IMDB_ALTER_SET_DEFAULT_CLOCK: /* F2a: the position and the clock kind */
+        imdb_buf_put_u16(b, o->apos);
+        imdb_buf_put_u8(b, o->aclock);
+        return IMDB_OK;
     case IMDB_ALTER_SET_DEFAULT:
     case IMDB_ALTER_SET_TYPE:
         imdb_buf_put_u16(b, o->apos);
@@ -159,12 +238,18 @@ int imdb_alter_get(imdb_rd *r, imdb_op *o, const char *what, imdb_err *e)
         }
         o->acol.flags = imdb_rd_u8(r);
         if (!r->err && !alter_col_ok(&o->acol)) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad added column", what);
-        if (!r->err && get_default(r, &o->acol, &o->adef, what, e)) return e->code;
+        if (!r->err && get_default(r, &o->acol, &o->adef, &o->aclock, what, e)) return e->code;
         if (!r->err && !(o->acol.flags & IMDB_COL_NULLABLE) && o->adef.null)
             return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: a NOT NULL column added without a DEFAULT", what);
         return IMDB_OK;
     }
     if (o->akind != IMDB_ALTER_RENAME_TABLE) o->apos = imdb_rd_u16(r);
+    if (o->akind == IMDB_ALTER_SET_DEFAULT_CLOCK) { /* F2a: a clock kind; the type it suits is the history's check */
+        o->aclock = imdb_rd_u8(r);
+        if (!r->err && (o->aclock <= IMDB_DEFK_VALUE || o->aclock > IMDB_DEFK_LAST))
+            return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad clock default", what);
+        return IMDB_OK;
+    }
     if (o->akind == IMDB_ALTER_SET_DEFAULT || o->akind == IMDB_ALTER_SET_TYPE) {
         memset(&o->acol, 0, sizeof o->acol);
         o->acol.type = imdb_rd_u8(r);
@@ -213,6 +298,7 @@ void imdb_commit_free(imdb_commit_rec *c)
             imdb_free(c->ops[i].rewrites);
             imdb_free(c->ops[i].iname);
             imdb_free(c->ops[i].aname);
+            imdb_free(c->ops[i].defs); /* F2a */
             imdb_viewdef_free(c->ops[i].vdef);
         }
         imdb_free(c->ops);
@@ -311,6 +397,15 @@ void imdb_commit_encode_header(const imdb_commit_rec *c, imdb_buf *b)
             imdb_buf_put_u32(b, o->epoch);
             imdb_buf_put(b, o->new_pk, IMDB_PUBKEY_LEN);
             imdb_buf_put_u8(b, o->how);
+            break;
+        case IMDB_OP_COLUMN_DEFAULTS: /* F2a: right after its CREATE_TABLE and SET_RETENTION, each a valid default */
+            if (i < 2 || c->ops[i - 2].code != IMDB_OP_CREATE_TABLE || c->ops[i - 2].table != o->table ||
+                c->ops[i - 1].code != IMDB_OP_SET_RETENTION || !imdb_coldefs_ok(c->ops[i - 2].schema, o->defs, o->ndefs)) {
+                b->err = IMDB_ERR_INVALID;
+                break;
+            }
+            imdb_buf_put_u32(b, o->table);
+            imdb_coldefs_put(b, c->ops[i - 2].schema, o->defs, o->ndefs);
             break;
         case IMDB_OP_SET_RETENTION:
             if (!imdb_retention_ok(o->retention_us)) {
@@ -651,6 +746,15 @@ int imdb_commit_decode_header(const uint8_t *h, size_t hlen, imdb_commit_rec *c,
             if (!r.err && (nops != 1 || o->epoch == 0 || (o->how != IMDB_WRITER_ROTATE && o->how != IMDB_WRITER_PROMOTE)))
                 return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: WRITER_KEY must be the only op, with epoch >= 1 and how 1 or 2");
             break;
+        case IMDB_OP_COLUMN_DEFAULTS: { /* F2a: its CREATE's schema the op two before; each default checked against it */
+            o->table = imdb_rd_u32(&r);
+            if (r.err) break;
+            if (i < 2 || c->ops[i - 2].code != IMDB_OP_CREATE_TABLE || c->ops[i - 2].table != o->table ||
+                c->ops[i - 1].code != IMDB_OP_SET_RETENTION)
+                return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: COLUMN_DEFAULTS not right after its table's CREATE_TABLE");
+            if (imdb_coldefs_get(&r, c->ops[i - 2].schema, false, &o->defs, &o->ndefs, "commit", e)) return e->code;
+            break;
+        }
         case IMDB_OP_SET_RETENTION:
             o->table = imdb_rd_u32(&r);
             o->retention_us = imdb_rd_u64(&r);

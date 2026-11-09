@@ -1037,8 +1037,8 @@ static void t_alter_set_default(void)
     EXPECT("SELECT c FROM t WHERE id = 1", "c\n\"old\"\n"); /* what the rows before the ADD read stays */
     dumpbuf d = {0};
     OK(imdb_dump(db, 1000, dumpbuf_write, &d, E));
-    CHECK(d.p && strstr(d.p, "CREATE TABLE t (id INT64 PRIMARY KEY, a TEXT, c TEXT, n INT64) RETENTION") &&
-          strstr(d.p, "ALTER TABLE t ALTER COLUMN n SET DEFAULT 2;\n") && !strstr(d.p, "COLUMN c SET DEFAULT"));
+    CHECK(d.p && strstr(d.p, "CREATE TABLE t (id INT64 PRIMARY KEY, a TEXT, c TEXT, n INT64 DEFAULT 2) RETENTION") && /* F2a */
+          !strstr(d.p, "SET DEFAULT") && !strstr(d.p, "c TEXT DEFAULT"));
     free(d.p);
     CHECK(verify_db(db) == 0);
     done(db);

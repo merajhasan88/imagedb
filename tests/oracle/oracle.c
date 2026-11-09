@@ -383,6 +383,8 @@ static bool g_fns = true;  /* --no-fns: the generator before P2 S1, draw for dra
 static bool g_views = true; /* --no-views: the generator before P2 S7's views, draw for draw */
 static bool g_ckey; /* P2 F4, --ckey: u's key is (tid, id), every dialect's; ids stay unique, tid never NULL or SET */
 static bool g_alter; /* P2 F1, --alter: t's last five columns added after its first rows and zz dropped (alter_add) */
+static bool g_defaults; /* F2a, --defaults: t's g, x and s with constant DEFAULTs in every dialect (ddl_defaults), which
+                         * INSERT ... SELECT's column lists leaving them out write; the generator draw for draw */
 /* A seed names the same statements only within one stage: each P2 stage (S1 to S4) adds forms to the default
  * generator's draws, so seed N's statements differ from the stage before's (a mismatch is reproduced on its own
  * build); --no-fns and --no-expr reproduce the generators before P2 S1 and before 1a. */
@@ -3331,6 +3333,33 @@ static const char *tz_ddl(int d, const char *s)
     return b[d];
 }
 
+/* --defaults: col's definition in s given " DEFAULT v" before the comma that ends it */
+static void put_default(char *s, size_t cap, const char *col, const char *v)
+{
+    char key[40];
+    snprintf(key, sizeof key, ", %s ", col);
+    char *p = strstr(s, key);
+    char *c = p ? strchr(p + 2, ',') : NULL;
+    size_t vl = strlen(v), n = strlen(s);
+    if (!c || n + vl + 10 >= cap) return;
+    memmove(c + 9 + vl, c, n - (size_t)(c - s) + 1);
+    memcpy(c, " DEFAULT ", 9);
+    memcpy(c + 9, v, vl);
+}
+
+static const char *ddl_defaults(int d, const char *s)
+{
+    static char b[ND][900];
+    if (!g_defaults) return s;
+    size_t n = strlen(s);
+    if (n >= sizeof b[d]) return s;
+    memcpy(b[d], s, n + 1);
+    put_default(b[d], sizeof b[d], "g", "3");
+    put_default(b[d], sizeof b[d], "x", "-4");
+    put_default(b[d], sizeof b[d], "s", "'dv'");
+    return b[d];
+}
+
 static const char *ddl(int d, int tab)
 {
     static const char *const T[ND] = {
@@ -3366,7 +3395,7 @@ static const char *ddl(int d, int tab)
         "utf8mb4_nopad_bin)",
         "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, tid BIGINT, v INT, s VARCHAR(255) COLLATE "
         "Latin1_General_100_BIN2_UTF8)"};
-    return tab ? (g_ckey ? UCK[d] : U[d]) : g_alter ? ddl_alter(d, T[d]) : tz_ddl(d, T[d]);
+    return tab ? (g_ckey ? UCK[d] : U[d]) : g_alter ? ddl_alter(d, T[d]) : ddl_defaults(d, tz_ddl(d, T[d]));
 }
 
 /* ---- canonical cells: every engine's answer to one text per value ------------------------------------------------ */
@@ -4768,6 +4797,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--no-views")) g_views = false; /* P2 S7 */
         else if (!strcmp(argv[i], "--ckey")) g_ckey = true; /* P2 F4 */
         else if (!strcmp(argv[i], "--alter")) g_alter = true; /* P2 F1 */
+        else if (!strcmp(argv[i], "--defaults")) g_defaults = true; /* F2a */
         else if (!strcmp(argv[i], "--tz")) g_tz = true; /* P2: time zones */
         else if (!strcmp(argv[i], "--date")) g_dt = 1; /* F3b */
         else if (!strcmp(argv[i], "--time")) g_dt = 2;
@@ -4776,9 +4806,13 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--ping")) ping = true; /* connect to every engine named, then stop (run.sh waits on it) */
         else if (!strcmp(argv[i], "-v")) g_verbose = true;
         else {
-            fprintf(stderr, "usage: oracle [--engines LIST] [--seeds A-B] [--steps N] [--dir DIR] [--keep-going] [--no-expr] [--no-fns] [--no-views] [--ckey] [--alter] [--ping] [-v]\n");
+            fprintf(stderr, "usage: oracle [--engines LIST] [--seeds A-B] [--steps N] [--dir DIR] [--keep-going] [--no-expr] [--no-fns] [--no-views] [--ckey] [--alter] [--defaults] [--ping] [-v]\n");
             return 2;
         }
+    }
+    if (g_defaults && g_alter) {
+        fprintf(stderr, "oracle: --defaults gives t's CREATE TABLE DEFAULTs, --alter makes t by ALTERs: one of them\n");
+        return 2;
     }
     if (g_tz && g_dt) {
         fprintf(stderr, "oracle: --tz and --date or --time each type t.ts: one of them\n");

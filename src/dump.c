@@ -56,14 +56,6 @@ static int retention_text(const imdb_table *t, char *out, size_t n, imdb_err *e)
                      t->s.name, (unsigned long long)us);
 }
 
-/* F1: a column's write default (an INSERT leaving it out writes it: an ADD's DEFAULT, or a SET DEFAULT's), NULL when it
- * has none: a CREATE TABLE column has none before F2 */
-static const imdb_value *dump_default(const imdb_table *t, uint16_t c)
-{
-    if (!t->hist.nvers) return NULL;
-    const imdb_value *v = &t->hist.tcol[t->hist.vers[t->hist.nvers - 1].pos[c]].wdef;
-    return v->null ? NULL : v;
-}
 
 /* a value as a literal the column's type reads back: its text (COPY's), TEXT, TIMESTAMP and TIMESTAMPTZ (in UTC, +00:
  * never the session's zone) quoted with '' */
@@ -85,8 +77,27 @@ static int literal_text(dumper *d, const imdb_value *v, imdb_err *e)
     return rc;
 }
 
-static void column_text(dumper *d, const imdb_table *t, const imdb_column *c)
+/* F2a: a column's write default as CREATE TABLE spells it (an INSERT leaving the column out writes it: a CREATE's, an
+ * ADD's or a SET DEFAULT's), nothing when it has none: a literal, or the clock's name */
+static int default_text(dumper *d, const imdb_table *t, uint16_t c, imdb_err *e)
 {
+    static const char *const clock[] = {[IMDB_DEFK_CURRENT_TIMESTAMP] = "CURRENT_TIMESTAMP",
+                                        [IMDB_DEFK_LOCALTIMESTAMP] = "LOCALTIMESTAMP",
+                                        [IMDB_DEFK_CURRENT_DATE] = "CURRENT_DATE", [IMDB_DEFK_LOCALTIME] = "LOCALTIME"};
+    if (!t->hist.nvers) return IMDB_OK;
+    const imdb_tcol *tc = &t->hist.tcol[t->hist.vers[t->hist.nvers - 1].pos[c]];
+    if (tc->wclock > IMDB_DEFK_VALUE && tc->wclock <= IMDB_DEFK_LAST) {
+        imdb_buf_printf(&d->b, " DEFAULT %s", clock[tc->wclock]);
+        return IMDB_OK;
+    }
+    if (tc->wdef.null) return IMDB_OK;
+    imdb_buf_put_str(&d->b, " DEFAULT ");
+    return literal_text(d, &tc->wdef, e);
+}
+
+static int column_text(dumper *d, const imdb_table *t, uint16_t i, imdb_err *e)
+{
+    const imdb_column *c = &t->s.cols[i];
     imdb_buf_printf(&d->b, "%s ", c->name);
     if (c->type == IMDB_T_DECIMAL) imdb_buf_printf(&d->b, "DECIMAL(%u,%u)", c->precision, c->scale);
     else if (c->type == IMDB_T_TEXT && c->vlen) imdb_buf_printf(&d->b, "VARCHAR(%u)", c->vlen); /* F3c */
@@ -94,14 +105,15 @@ static void column_text(dumper *d, const imdb_table *t, const imdb_column *c)
     if ((c->flags & IMDB_COL_PK) && t->s.npk == 1) imdb_buf_put_str(&d->b, " PRIMARY KEY");
     if (c->flags & IMDB_COL_SUBJECT) imdb_buf_put_str(&d->b, " SUBJECT");
     if (!(c->flags & (IMDB_COL_PK | IMDB_COL_SUBJECT | IMDB_COL_NULLABLE))) imdb_buf_put_str(&d->b, " NOT NULL");
+    return default_text(d, t, i, e);
 }
 
 /* the table as CREATE TABLE made it: each name where the statement read it (a name the parser took there it takes
  * again: unreserved and folded), the type, PRIMARY KEY, SUBJECT, NOT NULL where a column is neither and not NULL;
  * a key of several columns (F4) as the table's constraint after them, PRIMARY KEY (a, b), in key order; F1: every
- * live column in the CREATE (a dropped one is in no row the dump writes), then each write default as ALTER TABLE ...
- * ALTER COLUMN ... SET DEFAULT (F1 stage 4: the restore's rows are all written whole, so the value an older row read
- * for an added column is never needed; CREATE TABLE takes no DEFAULT before F2) */
+ * live column in the CREATE (a dropped one is in no row the dump writes), each with its write default (F2a: CREATE
+ * TABLE's DEFAULT, a literal or a clock; the restore's rows are all written whole, so the value an older row read for
+ * an added column is never needed) */
 static int create_text(dumper *d, const imdb_table *t, imdb_err *e)
 {
     char ret[64];
@@ -109,7 +121,7 @@ static int create_text(dumper *d, const imdb_table *t, imdb_err *e)
     imdb_buf_printf(&d->b, "CREATE TABLE %s (", t->s.name);
     for (uint16_t i = 0; i < t->s.ncols; i++) {
         if (i) imdb_buf_put_str(&d->b, ", ");
-        column_text(d, t, &t->s.cols[i]);
+        if (column_text(d, t, i, e)) return e->code;
     }
     if (t->s.npk > 1) {
         imdb_buf_put_str(&d->b, ", PRIMARY KEY (");
@@ -117,13 +129,6 @@ static int create_text(dumper *d, const imdb_table *t, imdb_err *e)
         imdb_buf_put_str(&d->b, ")");
     }
     imdb_buf_printf(&d->b, ") RETENTION %s;\n", ret);
-    for (uint16_t i = 0; i < t->s.ncols; i++) {
-        const imdb_value *dv = dump_default(t, i);
-        if (!dv) continue;
-        imdb_buf_printf(&d->b, "ALTER TABLE %s ALTER COLUMN %s SET DEFAULT ", t->s.name, t->s.cols[i].name);
-        if (literal_text(d, dv, e)) return e->code;
-        imdb_buf_put_str(&d->b, ";\n");
-    }
     return put(d, e);
 }
 

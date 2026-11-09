@@ -47,6 +47,7 @@ void imdb_txn_begin(imdb_db *db, imdb_txn *x, uint8_t iso)
 {
     memset(x, 0, sizeof *x);
     x->begin_ns = x->last_ns = imdb_mono_ns(); /* SHOW TRANSACTIONS' ages, the C API's too (R4 restamps at BEGIN) */
+    x->begin_us = imdb_now_us();               /* F2a: the transaction's now(), by imdb's clock */
     x->open = true;
     x->iso = iso;
     x->next = db->txns;

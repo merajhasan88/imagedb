@@ -72,7 +72,8 @@ enum { X_LIT = 1, X_COL, X_NEG, X_ADD, X_SUB, X_MUL, X_DIV, X_MOD, X_CMP, X_AND,
        X_AGG, X_WIN, X_SUBQ, X_LIST };
 enum { C_EQ = 1, C_NE, C_LT, C_LE, C_GT, C_GE, C_BETWEEN, C_ISNULL, C_NOTNULL, C_IN, C_NOTIN, C_LIKE, C_NOTLIKE };
 enum { F_ABS = 1, F_SIGN, F_ROUND, F_CEIL, F_FLOOR, F_MOD, F_LENGTH, F_SUBSTR, F_TRIM, F_LTRIM, F_RTRIM, F_POSITION,
-       F_COALESCE, F_NULLIF, F_LOWER, F_UPPER, F_REPLACE, F_CONCAT, F_DATE_TRUNC, F_TIMEZONE }; /* the last two: P2 */
+       F_COALESCE, F_NULLIF, F_LOWER, F_UPPER, F_REPLACE, F_CONCAT, F_DATE_TRUNC, F_TIMEZONE, /* the last two: P2 */
+       F_NOW, F_LOCALTIMESTAMP, F_CURRENT_DATE, F_LOCALTIME }; /* F2a: the clock */
 enum { A_COUNT = 1, A_COUNT_STAR, A_SUM, A_MIN, A_MAX, A_AVG }; /* the engine's names: count, count, sum, min, max, avg */
 enum { W_ROW_NUMBER = 1, W_RANK, W_DENSE_RANK, W_NTILE, W_LAG, W_LEAD, W_FIRST, W_LAST, W_AGG };
 enum { S_VALUE = 0, S_EXISTS = 1, S_IN = 2 };
@@ -154,6 +155,8 @@ typedef struct ab {
     char *err;
     size_t errn;
     bool failed;
+    bool in_win; /* inside a window's definition: no window function there (the engine's win_ok; fuzz_abind found an
+                  * overflow of a window's keys by one nested in them, 2026-11-09) */
     aq *q; /* the statement whose nodes are being made */
     uint8_t depth, parens;
     uint16_t narms;
@@ -511,7 +514,8 @@ static uint8_t fn_named(const ab *b, uint32_t at)
              {"char_length", F_LENGTH}, {"character_length", F_LENGTH}, {"substr", F_SUBSTR}, {"substring", F_SUBSTR},
              {"trim", F_TRIM},        {"ltrim", F_LTRIM},       {"rtrim", F_RTRIM},     {"position", F_POSITION},
              {"coalesce", F_COALESCE}, {"nullif", F_NULLIF},    {"lower", F_LOWER},     {"upper", F_UPPER},
-             {"replace", F_REPLACE},  {"date_trunc", F_DATE_TRUNC}, {"timezone", F_TIMEZONE}}; /* P2 */
+             {"replace", F_REPLACE},  {"date_trunc", F_DATE_TRUNC}, {"timezone", F_TIMEZONE}, /* P2 */
+             {"now", F_NOW}};                                                                /* F2a */
     for (size_t i = 0; i < sizeof F / sizeof *F; i++)
         if (kwat(b, at, F[i].name)) return F[i].fn;
     return 0;
@@ -540,6 +544,10 @@ static int fn_call(ab *b, uint8_t fn, uint16_t *out, unsigned d)
             list_n(b, el, 2, &args))
             return -1;
         n = 2;
+    } else if (kind_at(b, b->i) == K_RP) { /* F2a: now() */
+        b->i++;
+        args = 0;
+        n = 0;
     } else if (expr_list(b, d, &args, &n)) {
         return -1;
     }
@@ -670,10 +678,12 @@ static int frame_bound(ab *b)
 static int window_spec(ab *b, uint8_t *out, unsigned d)
 {
     aq *q = b->q;
+    if (b->in_win) return fail(b, "a window function inside a window's definition");
     if (q->nwin >= MAX_WINDOWS) return fail(b, "more than %u window functions in one SELECT", MAX_WINDOWS);
     if (expect(b, K_LP, "(")) return -1;
     uint8_t w = q->nwin;
     memset(&q->win[w], 0, sizeof q->win[w]);
+    b->in_win = true;
     if (kw(b, "partition")) {
         if (expect_kw(b, "by")) return -1;
         do {
@@ -702,6 +712,7 @@ static int window_spec(ab *b, uint8_t *out, unsigned d)
         }
     }
     if (expect(b, K_RP, ")")) return -1;
+    b->in_win = false;
     *out = b->q->nwin++;
     return 0;
 }
@@ -824,6 +835,18 @@ static int primary(ab *b, uint16_t *out, unsigned d)
     }
     if (kw(b, "case")) return case_expr(b, out, d);
     if (kw(b, "cast")) return cast_expr(b, out, d);
+    static const struct { /* F2a: the standard's clock values without parentheses (the engine's rule) */
+        const char *name;
+        uint8_t fn;
+    } ck[] = {{"current_timestamp", F_NOW}, {"localtimestamp", F_LOCALTIMESTAMP}, {"current_date", F_CURRENT_DATE},
+              {"localtime", F_LOCALTIME}};
+    for (size_t i = 0; i < sizeof ck / sizeof *ck; i++)
+        if (kw(b, ck[i].name)) {
+            if (nnew(b, X_FN, 0, 0, out)) return -1;
+            X(*out)->fn = ck[i].fn;
+            return 0;
+        }
+    if (kwat(b, b->i, "current_time")) return fail(b, "CURRENT_TIME is a time with a zone");
     if (b->t[b->i].k == K_ID && kind_at(b, b->i + 1) == K_LP) {
         uint8_t wf = wf_named(b, b->i);
         if (wf) return window_call(b, wf, out, d);
@@ -1700,6 +1723,13 @@ static int fn_type(ab *b, const scope *sc, const xn *x, ty *out)
         if (type_of(b, sc, v[i], x->fn == F_NULLIF && i == 1, &a[i])) return -1;
     *out = (ty){0, 0};
     switch (x->fn) {
+    case F_NOW: /* F2a: the clock's types; their values are a run's, never a bind's */
+    case F_LOCALTIMESTAMP:
+    case F_CURRENT_DATE:
+    case F_LOCALTIME:
+        if (fn_args(b, n, 0, 0)) return -1;
+        *out = (ty){x->fn == F_NOW ? T_TIMESTAMPTZ : x->fn == F_LOCALTIMESTAMP ? T_TIMESTAMP : x->fn == F_CURRENT_DATE ? T_DATE : T_TIME, 0};
+        return 0;
     case F_ABS:
     case F_SIGN:
     case F_CEIL:

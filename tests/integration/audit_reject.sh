@@ -418,6 +418,26 @@ must_fail "bad DEFAULT" "$BIN" verify "$PFO"
 must_fail "a value longer than VARCHAR(2) in column k" "$AUD" verify "$PFO"
 echo "   the engine's replay and the auditor refuse each: SET NOT NULL by the live rows' payloads, DROP by the indexes"
 
+echo "== FP, FQ, FR: a CREATE's DEFAULT (op 23) and a clock DEFAULT (F2a) breaking their rules, each signed"
+PFP=$WORK/fp; make_db "$PFP"
+"$FORGE" index-lie "$PFP" create-default-clock
+must_fail "a bad column default" "$BIN" verify "$PFP"
+must_fail "a clock DEFAULT its column's type does not take" "$AUD" verify "$PFP"
+PFQ=$WORK/fq; make_db "$PFQ"
+"$FORGE" index-lie "$PFQ" alter-clock-type
+must_fail "that clock value is not of its type" "$BIN" verify "$PFQ"
+must_fail "a clock DEFAULT its column's type does not take" "$AUD" verify "$PFQ"
+PFR=$WORK/fr; "$BIN" init "$PFR" >/dev/null
+"$BIN" sql "$PFR" --nosync -c "CREATE TABLE dv (id INT64 PRIMARY KEY, a TEXT, n INT64 DEFAULT 77);" \
+  -c "INSERT INTO dv (id) VALUES (1);" -c "CHECKPOINT;" >/dev/null
+"$BIN" verify "$PFR" >/dev/null && "$AUD" verify "$PFR" >/dev/null || fail "the honest directory must verify"
+"$FORGE" manifest-lie "$PFR" create-default
+must_fail "manifest schema of table dv differs from the log" "$BIN" verify "$PFR"
+must_fail "the manifest's schema history differs from the log's" "$AUD" verify "$PFR"
+echo "   FP a CREATE's clock DEFAULT on a column it does not suit (LOCALTIME on a TIMESTAMPTZ), FQ SET DEFAULT CURRENT_DATE
+   on a TEXT column: the replay and the auditor refuse each; FR a manifest's version 1 DEFAULT another than the
+   CREATE's (no version's hash covers it): VERIFY and the auditor refuse it"
+
 echo "== Z: a commit naming the other digest algorithm, re-signed by the writer (both ways round); META naming an unknown one"
 for a in 1 2; do # explicit algorithms: under IMDB_DIGEST_ALG=2 make_db's would all be alg 2
   PZ=$WORK/z$a

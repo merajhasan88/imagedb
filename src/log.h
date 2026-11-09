@@ -123,6 +123,10 @@ enum {
                                    SET TYPE a u16 position and the new u8 type, precision and scale (widening
                                    alone). A position names a column for its life. Each makes the
                                    table's next schema version; no row is re-encoded (design.md §5, Schema versions) */
+    IMDB_OP_COLUMN_DEFAULTS = 23, /* F2a: right after its table's CREATE_TABLE and SET_RETENTION, in their commit: u32
+                                     table, u16 n (1 to the columns), each a u16 column (strictly increasing), u8 kind
+                                     (IMDB_DEFK_*) and, for IMDB_DEFK_VALUE, the value in the row encoding of one NOT
+                                     NULL value of the column; a clock kind suits its column's type (imdb_defk_fits) */
 };
 
 /* op 22's kinds (F1) */
@@ -137,8 +141,35 @@ enum {
                                     the rows before its ADD read stays the ADD's */
     IMDB_ALTER_DROP_DEFAULT = 8,
     IMDB_ALTER_SET_TYPE = 9,     /* widening: every stored value stays valid as the new type */
-    IMDB_ALTER_LAST = IMDB_ALTER_SET_TYPE,
+    IMDB_ALTER_SET_DEFAULT_CLOCK = 10, /* F2a: a u16 position and a clock kind (IMDB_DEFK_* past VALUE) its type suits */
+    IMDB_ALTER_LAST = IMDB_ALTER_SET_DEFAULT_CLOCK,
 };
+
+/* F2a: a column default's kind: a constant, or the clock read when a row is written (PostgreSQL's: the transaction's
+ * start, design.md §5, Clock values); a clock kind suits a column type by imdb_defk_fits */
+enum {
+    IMDB_DEFK_VALUE = 1,
+    IMDB_DEFK_CURRENT_TIMESTAMP = 2, /* a TIMESTAMPTZ (the instant) or a TIMESTAMP (its wall clock in the session's zone) */
+    IMDB_DEFK_LOCALTIMESTAMP = 3,    /* a TIMESTAMP */
+    IMDB_DEFK_CURRENT_DATE = 4,      /* a DATE */
+    IMDB_DEFK_LOCALTIME = 5,         /* a TIME */
+    IMDB_DEFK_LAST = IMDB_DEFK_LOCALTIME,
+};
+bool imdb_defk_fits(uint8_t kind, uint8_t type);
+
+/* F2a: one of a CREATE TABLE's column defaults (op 23) */
+typedef struct imdb_coldef {
+    uint16_t col;  /* the column, by its index in the CREATE's schema (its position) */
+    uint8_t kind;  /* IMDB_DEFK_* */
+    imdb_value v;  /* IMDB_DEFK_VALUE: the value (a TEXT's bytes in the record) */
+} imdb_coldef;
+bool imdb_coldefs_ok(const imdb_schema *s, const imdb_coldef *defs, uint16_t ndefs);
+/* op 23's body after its table, and a manifest's version 1 (lake.h): u16 n, each a u16 column (strictly increasing), u8
+ * kind and, for a value, its row encoding; get: strict (none_ok: n may be 0), a TEXT pointing into r's bytes, *defs the
+ * caller's to free whatever it returns */
+void imdb_coldefs_put(imdb_buf *b, const imdb_schema *s, const imdb_coldef *defs, uint16_t n);
+int imdb_coldefs_get(imdb_rd *r, const imdb_schema *s, bool none_ok, imdb_coldef **defs, uint16_t *n, const char *what,
+                     imdb_err *e);
 
 /* P2 S7: a view's definition, as op 20 logs it and a manifest keeps a live view's (imdb_viewdef_encode): u32 id, the
  * name (u8 length, bytes), u16 columns each a name, a type (IMDB_T_*) and a scale (a DECIMAL's, else 0), u16
@@ -234,6 +265,10 @@ typedef struct imdb_op {
     imdb_value adef;
     uint16_t apos;
     char *aname;
+    uint8_t aclock;            /* F2a: SET_DEFAULT_CLOCK's kind (IMDB_DEFK_*) */
+    /* COLUMN_DEFAULTS (F2a): its CREATE's defaults (allocated), in column order */
+    imdb_coldef *defs;
+    uint16_t ndefs;
     /* WRITER_KEY */
     uint32_t epoch;
     uint8_t new_pk[IMDB_PUBKEY_LEN];

@@ -312,6 +312,9 @@ static void t_abind_refusals(void)
         {"SELECT CASE WHEN id > 0 THEN d ELSE ts END AS x FROM dt", "not converted"},
         {"SELECT CAST(s AS VARCHAR(0)) AS x FROM t", "VARCHAR(n) needs"}, /* F3c */
         {"SELECT CAST(s AS VARCHAR(65536)) AS x FROM t", "VARCHAR(n) needs"},
+        /* fuzz_abind's find (2026-11-09): a window function inside a window's keys overflowed them */
+        {"SELECT LAG(d, 1) OVER (PARTITION BY s, LAG(d, 6) OVER (PARTITION BY g)) AS x FROM t",
+         "a window function inside a window's definition"},
     };
     char e[256], m[600];
     ab_result *r = calloc(1, sizeof *r);
