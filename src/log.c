@@ -169,8 +169,103 @@ int imdb_coldefs_get(imdb_rd *r, const imdb_schema *s, bool none_ok, imdb_coldef
     return IMDB_OK;
 }
 
+/* ---- F2b-1: CHECK constraints (log.h) ---------------------------------------------------------------------------- */
+
+bool imdb_check_text_ok(const char *s, uint32_t len)
+{
+    size_t bad;
+    if (!len || len > IMDB_MAX_CHECK_TEXT || !imdb_utf8_valid((const uint8_t *)s, len, &bad)) return false;
+    return memchr(s, 0, len) == NULL;
+}
+
+bool imdb_checks_ok(const imdb_check *c, uint16_t n)
+{
+    uint32_t total = 0;
+    if (n > IMDB_MAX_CHECKS) return false;
+    for (uint16_t k = 0; k < n; k++) {
+        size_t nl = strnlen(c[k].name, IMDB_MAX_IDENT + 1);
+        if (!nl || nl > IMDB_MAX_IDENT || !imdb_ident_valid(c[k].name, nl) || !c[k].text ||
+            !imdb_check_text_ok(c[k].text, c[k].len) || (k && strcmp(c[k - 1].name, c[k].name) >= 0))
+            return false;
+        total += c[k].len; /* each at most IMDB_MAX_CHECK_TEXT: no overflow in 32 of them */
+    }
+    return total <= IMDB_MAX_CHECK_TEXT;
+}
+
+void imdb_checks_put(imdb_buf *b, const imdb_check *c, uint16_t n)
+{
+    if (!imdb_checks_ok(c, n)) {
+        b->err = IMDB_ERR_INVALID;
+        return;
+    }
+    imdb_buf_put_u16(b, n);
+    for (uint16_t k = 0; k < n; k++) {
+        size_t nl = strlen(c[k].name);
+        imdb_buf_put_u8(b, (uint8_t)nl);
+        imdb_buf_put(b, c[k].name, nl);
+        imdb_buf_put_u32(b, c[k].len);
+        imdb_buf_put(b, c[k].text, c[k].len);
+    }
+}
+
+int imdb_checks_get(imdb_rd *r, bool none_ok, imdb_check **out, uint16_t *n, const char *what, imdb_err *e)
+{
+    *out = NULL;
+    *n = imdb_rd_u16(r);
+    if (r->err) return IMDB_OK; /* the caller's truncation */
+    if ((!*n && !none_ok) || *n > IMDB_MAX_CHECKS) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: a bad CHECK list", what);
+    if (!*n) return IMDB_OK;
+    /* the texts are bounded together before any is copied: the block is the array and IMDB_MAX_CHECK_TEXT + n bytes */
+    imdb_check *c = imdb_alloc((size_t)*n * sizeof *c + IMDB_MAX_CHECK_TEXT + *n, e);
+    if (!c) return e->code;
+    *out = c;
+    char *tp = (char *)(c + *n);
+    uint32_t total = 0;
+    for (uint16_t k = 0; k < *n; k++) {
+        imdb_err e2 = {0};
+        if (imdb_rd_ident(r, c[k].name, &e2)) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: a bad CHECK name", what);
+        c[k].len = imdb_rd_u32(r);
+        if (r->err) return IMDB_OK;
+        if (!c[k].len || c[k].len > IMDB_MAX_CHECK_TEXT - total)
+            return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: CHECK texts past %u bytes", what, IMDB_MAX_CHECK_TEXT);
+        const uint8_t *s = imdb_rd_bytes(r, c[k].len);
+        if (!s) return IMDB_OK;
+        memcpy(tp, s, c[k].len);
+        tp[c[k].len] = 0;
+        c[k].text = tp;
+        tp += c[k].len + 1;
+        total += c[k].len;
+    }
+    if (!imdb_checks_ok(c, *n)) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: a bad CHECK list", what);
+    return IMDB_OK;
+}
+
 int imdb_alter_put(imdb_buf *b, const imdb_op *o)
 {
+    if (o->akind == IMDB_ALTER_ADD_CHECK) { /* F2b-1: one check, valid */
+        if (o->nchk != 1 || !o->chk || !imdb_checks_ok(o->chk, 1)) {
+            b->err = IMDB_ERR_INVALID;
+            return IMDB_ERR_INVALID;
+        }
+        imdb_buf_put_u8(b, o->akind);
+        size_t nl = strlen(o->chk[0].name);
+        imdb_buf_put_u8(b, (uint8_t)nl);
+        imdb_buf_put(b, o->chk[0].name, nl);
+        imdb_buf_put_u32(b, o->chk[0].len);
+        imdb_buf_put(b, o->chk[0].text, o->chk[0].len);
+        return IMDB_OK;
+    }
+    if (o->akind == IMDB_ALTER_DROP_CHECK) { /* F2b-1: its name */
+        size_t nl = o->aname ? strnlen(o->aname, IMDB_MAX_IDENT + 1) : 0;
+        if (!nl || nl > IMDB_MAX_IDENT || !imdb_ident_valid(o->aname, nl)) {
+            b->err = IMDB_ERR_INVALID;
+            return IMDB_ERR_INVALID;
+        }
+        imdb_buf_put_u8(b, o->akind);
+        imdb_buf_put_u8(b, (uint8_t)nl);
+        imdb_buf_put(b, o->aname, nl);
+        return IMDB_OK;
+    }
     size_t nl = o->aname ? strnlen(o->aname, IMDB_MAX_IDENT + 1) : 0;
     bool named = o->akind == IMDB_ALTER_RENAME_COLUMN || o->akind == IMDB_ALTER_RENAME_TABLE;
     imdb_err e2 = {0};
@@ -235,6 +330,31 @@ int imdb_alter_get(imdb_rd *r, imdb_op *o, const char *what, imdb_err *e)
     if (r->err) return IMDB_OK;
     if (o->akind < IMDB_ALTER_ADD_COLUMN || o->akind > IMDB_ALTER_LAST)
         return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: unknown ALTER TABLE kind %u", what, o->akind);
+    if (o->akind == IMDB_ALTER_ADD_CHECK) { /* F2b-1: one check (a list of one's rules), one allocation */
+        imdb_check *c = imdb_alloc(sizeof *c + IMDB_MAX_CHECK_TEXT + 1, e);
+        if (!c) return e->code;
+        o->chk = c;
+        o->nchk = 1;
+        imdb_err e2 = {0};
+        if (imdb_rd_ident(r, c->name, &e2)) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: a bad CHECK name", what);
+        c->len = imdb_rd_u32(r);
+        if (r->err) return IMDB_OK;
+        if (!c->len || c->len > IMDB_MAX_CHECK_TEXT) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: a bad CHECK text", what);
+        const uint8_t *s = imdb_rd_bytes(r, c->len);
+        if (!s) return IMDB_OK;
+        char *tp = (char *)(c + 1);
+        memcpy(tp, s, c->len);
+        tp[c->len] = 0;
+        c->text = tp;
+        if (!imdb_checks_ok(c, 1)) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: a bad CHECK text", what);
+        return IMDB_OK;
+    }
+    if (o->akind == IMDB_ALTER_DROP_CHECK) { /* F2b-1: a name */
+        if (!(o->aname = imdb_alloc(IMDB_MAX_IDENT + 1, e))) return e->code;
+        imdb_err e2 = {0};
+        if (imdb_rd_ident(r, o->aname, &e2)) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: a bad CHECK name", what);
+        return IMDB_OK;
+    }
     if (o->akind == IMDB_ALTER_ADD_COLUMN) {
         imdb_err e2 = {0};
         if (imdb_rd_ident(r, o->acol.name, &e2)) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad column name", what);
@@ -308,6 +428,7 @@ void imdb_commit_free(imdb_commit_rec *c)
             imdb_free(c->ops[i].iname);
             imdb_free(c->ops[i].aname);
             imdb_free(c->ops[i].defs); /* F2a */
+            imdb_free(c->ops[i].chk); /* F2b-1 */
             imdb_free(c->ops[i].sdef); /* F2a-2 */
             imdb_viewdef_free(c->ops[i].vdef);
         }
@@ -479,6 +600,17 @@ void imdb_commit_encode_header(const imdb_commit_rec *c, imdb_buf *b)
             imdb_buf_put_u32(b, o->table);
             imdb_coldefs_put(b, c->ops[i - 2].schema, o->defs, o->ndefs);
             break;
+        case IMDB_OP_TABLE_CHECKS: { /* F2b-1: right after its CREATE_TABLE, SET_RETENTION and any COLUMN_DEFAULTS */
+            uint32_t at = i >= 1 && c->ops[i - 1].code == IMDB_OP_COLUMN_DEFAULTS ? i - 1 : i;
+            if (at < 2 || c->ops[at - 2].code != IMDB_OP_CREATE_TABLE || c->ops[at - 2].table != o->table ||
+                c->ops[at - 1].code != IMDB_OP_SET_RETENTION || (at != i && c->ops[i - 1].table != o->table) || !o->nchk) {
+                b->err = IMDB_ERR_INVALID;
+                break;
+            }
+            imdb_buf_put_u32(b, o->table);
+            imdb_checks_put(b, o->chk, o->nchk);
+            break;
+        }
         case IMDB_OP_SET_RETENTION:
             if (!imdb_retention_ok(o->retention_us)) {
                 b->err = IMDB_ERR_INVALID;
@@ -844,6 +976,16 @@ int imdb_commit_decode_header(const uint8_t *h, size_t hlen, imdb_commit_rec *c,
                 c->ops[i - 1].code != IMDB_OP_SET_RETENTION)
                 return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: COLUMN_DEFAULTS not right after its table's CREATE_TABLE");
             if (imdb_coldefs_get(&r, c->ops[i - 2].schema, false, &o->defs, &o->ndefs, "commit", e)) return e->code;
+            break;
+        }
+        case IMDB_OP_TABLE_CHECKS: { /* F2b-1: right after its CREATE_TABLE, SET_RETENTION and any COLUMN_DEFAULTS */
+            o->table = imdb_rd_u32(&r);
+            if (r.err) break;
+            uint32_t at = i >= 1 && c->ops[i - 1].code == IMDB_OP_COLUMN_DEFAULTS ? i - 1 : i;
+            if (at < 2 || c->ops[at - 2].code != IMDB_OP_CREATE_TABLE || c->ops[at - 2].table != o->table ||
+                c->ops[at - 1].code != IMDB_OP_SET_RETENTION || (at != i && c->ops[i - 1].table != o->table))
+                return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: TABLE_CHECKS not right after its table's CREATE_TABLE");
+            if (imdb_checks_get(&r, false, &o->chk, &o->nchk, "commit", e)) return e->code;
             break;
         }
         case IMDB_OP_SET_RETENTION:

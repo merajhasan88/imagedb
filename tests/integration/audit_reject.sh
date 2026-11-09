@@ -460,6 +460,29 @@ must_fail "the manifest's state differs from the log's" "$AUD" verify "$PFU"
 echo "   FS a signed mark one increment back, FT a signed DROP SEQUENCE of an IDENTITY's: the replay and the auditor refuse
    each; FU a manifest's sequence one value on (aligned, in bounds): VERIFY and the auditor refuse it"
 
+echo "== FV, FW, FX: CHECK constraints broken (F2b-1): a signed row failing one, a signed ADD CHECK a live row fails, a manifest's text"
+PFV=$WORK/fv; "$BIN" init "$PFV" >/dev/null
+"$BIN" sql "$PFV" --nosync -c "CREATE TABLE z (id INT64 PRIMARY KEY, a INT64 CHECK (a > 0), s TEXT);" \
+  -c "INSERT INTO z VALUES (1, 2, 'x'), (2, 5, NULL);" >/dev/null
+"$BIN" verify "$PFV" >/dev/null && "$AUD" verify "$PFV" >/dev/null || fail "the honest directory must verify"
+cp -r "$PFV" "$WORK/fw"
+"$FORGE" index-lie "$PFV" check-row
+must_fail "violates check constraint z_a_check" "$BIN" verify "$PFV"   # the open's replay refuses it
+must_fail "violates CHECK z_a_check" "$AUD" verify "$PFV"
+PFW=$WORK/fw
+"$FORGE" index-lie "$PFW" check-add
+must_fail "check constraint forged of table z is violated by some row" "$BIN" verify "$PFW"
+must_fail "ADD CHECK forged of table z, which a live row violates" "$AUD" verify "$PFW"
+PFX=$WORK/fx; "$BIN" init "$PFX" >/dev/null
+"$BIN" sql "$PFX" --nosync -c "CREATE TABLE z (id INT64 PRIMARY KEY, a INT64 CHECK (a > 0));" \
+  -c "INSERT INTO z VALUES (1, 2);" -c "CHECKPOINT;" >/dev/null
+"$BIN" verify "$PFX" >/dev/null && "$AUD" verify "$PFX" >/dev/null || fail "the honest directory must verify"
+"$FORGE" manifest-lie "$PFX" check-text
+must_fail "differ" "$BIN" verify "$PFX"   # the snapshot open took the manifest's CHECK
+must_fail "differs from the log" "$AUD" verify "$PFX"
+echo "   FV a signed INSERT of a row a CHECK refuses, FW a signed ADD CHECK a live row fails: the replay and the auditor
+   refuse each; FX a manifest's version 1 CHECK of another text: VERIFY and the auditor refuse it"
+
 echo "== Z: a commit naming the other digest algorithm, re-signed by the writer (both ways round); META naming an unknown one"
 for a in 1 2; do # explicit algorithms: under IMDB_DIGEST_ALG=2 make_db's would all be alg 2
   PZ=$WORK/z$a

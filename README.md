@@ -658,6 +658,18 @@ never updated. Values a rolled-back transaction took are gaps; a committed value
 never comes again, through a crash or a restart. Not yet: CYCLE, CACHE past 1,
 ALTER SEQUENCE, OWNED BY, an IDENTITY added by ALTER TABLE.
 
+CHECK constraints: a column's or a table's `[CONSTRAINT name] CHECK (condition)` in
+CREATE TABLE, `ALTER TABLE t ADD [CONSTRAINT name] CHECK (condition)` (every row
+there must pass) and `ALTER TABLE t DROP CONSTRAINT name`. A row passes when the
+condition is TRUE or NULL; FALSE refuses the write (`new row for table t violates
+check constraint t_a_check`), named as PostgreSQL names them when no name is
+given. A condition reads the row's columns with literals, arithmetic, comparisons,
+BETWEEN, IN, IS NULL, LIKE, AND, OR, NOT, CASE, COALESCE, NULLIF, LENGTH, ABS,
+LOWER, UPPER and `||`; every replica and the auditor recompute it, so a clock, a
+sequence, a zone, a FLOAT64 value, a TIMESTAMPTZ literal, a subquery and CAST are
+refused. A column a CHECK names is not renamed or dropped until the CHECK is
+dropped. Not yet: NOT VALID, the other functions, FOREIGN KEY.
+
 Primary keys: every table has one, of one column (`id INT64 PRIMARY KEY`) or of
 up to eight (`PRIMARY KEY (region, day)`, a table constraint anywhere among the
 columns), each NOT NULL and of any type but FLOAT64. Rows come in the key's

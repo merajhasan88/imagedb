@@ -137,6 +137,10 @@ enum {
                                      increment's direction, from the last SEQ_SET or the start), within the bounds */
     IMDB_OP_SEQ_SET = 27,         /* F2a-2: setval: u32 sequence, i64 value, u8 called (0 or 1); in a commit of
                                      SEQ_SETs and SEQ_ADVANCEs alone */
+    IMDB_OP_TABLE_CHECKS = 28,    /* F2b-1: a CREATE's CHECK constraints, right after its CREATE_TABLE, SET_RETENTION and
+                                     COLUMN_DEFAULTS (when it has one), in their commit: u32 table, then imdb_checks_put's
+                                     list (1 to IMDB_MAX_CHECKS, by name). Catalog state, as a DEFAULT: no schema hash
+                                     covers it; replay and VERIFY bind each text against the CREATE's schema */
 };
 
 /* op 22's kinds (F1) */
@@ -152,8 +156,28 @@ enum {
     IMDB_ALTER_DROP_DEFAULT = 8,
     IMDB_ALTER_SET_TYPE = 9,     /* widening: every stored value stays valid as the new type */
     IMDB_ALTER_SET_DEFAULT_CLOCK = 10, /* F2a: a u16 position and a clock kind (IMDB_DEFK_* past VALUE) its type suits */
-    IMDB_ALTER_LAST = IMDB_ALTER_SET_DEFAULT_CLOCK,
+    IMDB_ALTER_ADD_CHECK = 11,   /* F2b-1: a CHECK constraint (imdb_check: its name, none of the table's live ones', and
+                                    its text); every live row at the commit passes it (replay and the auditor) */
+    IMDB_ALTER_DROP_CHECK = 12,  /* F2b-1: DROP CONSTRAINT: a live CHECK's name */
+    IMDB_ALTER_LAST = IMDB_ALTER_DROP_CHECK,
 };
+
+/* F2b-1: a CHECK constraint: its name (an identifier, folded) and its text as written (strict UTF-8 without NUL, 1 to
+ * IMDB_MAX_CHECK_TEXT bytes: a condition over its table's columns, bound by the engine's and the auditor's own binder,
+ * design.md §5, CHECK constraints). A list (op 28, a manifest's version 1): u16 n (1 to IMDB_MAX_CHECKS; a manifest's
+ * 0 too), each u8 name length, the name, u32 text length and the text, by name strictly increasing (so each once), the
+ * texts IMDB_MAX_CHECK_TEXT bytes together at most. Op 22's kind 11 is one of them, kind 12 its name alone */
+typedef struct imdb_check {
+    char name[IMDB_MAX_IDENT + 1];
+    uint32_t len;
+    const char *text; /* len bytes and a NUL (the text holds none) */
+} imdb_check;
+bool imdb_check_text_ok(const char *s, uint32_t len);
+/* put: IMDB_ERR_INVALID (the buffer's sticky error) unless the list is valid; get: strict, *out one allocation (the
+ * array, then each text), the caller's to free whatever it returns */
+void imdb_checks_put(imdb_buf *b, const imdb_check *c, uint16_t n);
+int imdb_checks_get(imdb_rd *r, bool none_ok, imdb_check **out, uint16_t *n, const char *what, imdb_err *e);
+bool imdb_checks_ok(const imdb_check *c, uint16_t n);
 
 /* F2a: a column default's kind: a constant, or the clock read when a row is written (PostgreSQL's: the transaction's
  * start, design.md §5, Clock values); a clock kind suits a column type by imdb_defk_fits */
@@ -297,6 +321,9 @@ typedef struct imdb_op {
     /* COLUMN_DEFAULTS (F2a): its CREATE's defaults (allocated), in column order */
     imdb_coldef *defs;
     uint16_t ndefs;
+    /* F2b-1: TABLE_CHECKS' list, ALTER's ADD CHECK's one (one allocation, imdb_checks_get's); DROP CHECK: aname */
+    imdb_check *chk;
+    uint16_t nchk;
     /* F2a-2: CREATE_SEQUENCE's definition (allocated); DROP_SEQUENCE, SEQ_ADVANCE and SEQ_SET: seq, sval (the mark or
      * the value) and scalled */
     imdb_seqdef *sdef;

@@ -129,6 +129,13 @@ typedef struct imdb_segcache {
 /* F1 (design.md §5, Schema versions): a table's column positions, every one ever used. A column keeps its position
  * for its life, and a dropped one keeps it after, so a row of any version maps onto any later version position by
  * position; a position a row's version lacks (added after it) reads its missing value */
+/* F2b-1: a live CHECK constraint: its name, and its text where a version keeps it (imdb_schema_hist) */
+typedef struct imdb_chkref {
+    char name[IMDB_MAX_IDENT + 1];
+    const char *text;
+    uint32_t len;
+} imdb_chkref;
+
 typedef struct imdb_tcol {
     imdb_value missing;      /* its ADD's DEFAULT, or NULL (a CREATE's columns: NULL, never read) */
     uint8_t *missing_text;   /* a TEXT DEFAULT's own bytes (missing.s points here) */
@@ -161,6 +168,10 @@ typedef struct imdb_sver {
     uint8_t *atext;              /* its TEXT bytes, the version's own (adef.s and a write default point here) */
     uint8_t aclock;              /* F2a: SET DEFAULT's clock kind (IMDB_ALTER_SET_DEFAULT_CLOCK), or an ADD's write default's
                                     (its missing value then the clock's at the ALTER); 0: none */
+    char cname[IMDB_MAX_IDENT + 1]; /* F2b-1: ADD CHECK's and DROP CHECK's name */
+    char *ctext;                 /* F2b-1: ADD CHECK's text, the version's own (len bytes and a NUL), as live while the
+                                    history lives: a live check's text is one of these or version 1's */
+    uint32_t clen;
 } imdb_sver;
 
 /* F1: a table's schema history: its positions and versions (a table embeds one; so does VERIFY's model, which parses
@@ -172,6 +183,15 @@ typedef struct imdb_schema_hist {
     uint32_t nvers, capvers;
     uint8_t *staged;               /* F1 stage 4: a SET DEFAULT's TEXT bytes between its prepare and its install (a
                                       rollback leaves them for the next prepare or the free) */
+    /* F2b-1: CHECK constraints: version 1's (op 23's CREATE, a manifest's version 1: one allocation, by name), and the
+     * live ones by name (version 1's or an ADD CHECK version's text, never moved or freed while the history lives);
+     * cstaged: an ADD CHECK's text between its prepare and its install (a rollback leaves it, as staged) */
+    imdb_check *chk0;
+    uint16_t nchk0;
+    uint16_t nchk;
+    imdb_chkref chk[IMDB_MAX_CHECKS];
+    uint32_t chkbytes;            /* the live texts' bytes together: IMDB_MAX_CHECK_TEXT at most */
+    char *cstaged;
 } imdb_schema_hist;
 
 typedef struct imdb_table {
@@ -202,6 +222,7 @@ typedef struct imdb_table {
     imdb_index idx[IMDB_MAX_INDEXES];
     uint32_t nidx;
     imdb_schema_hist hist;    /* F1: its schema history; hist.vers[hist.nvers - 1].s is s */
+    struct imdb_chkc *chkc;   /* F2b-1: its live CHECKs compiled (sql_exec.c), for the history length it names; NULL: none yet */
     uint64_t idx_upto;        /* versions below are in the indexes' structures; the rest are the */
                               /* active transaction's own (versions are only appended) */
 } imdb_table;
@@ -666,6 +687,30 @@ int imdb_view_rebind(imdb_db *db, const imdb_viewdef *def, imdb_err *e);
  * ident as an identifier token (unquoted, folded to lowercase) */
 int imdb_view_names_col(const imdb_db *db, uint32_t table, const char *col, const char **name, imdb_err *e);
 int imdb_sql_names_ident(const char *text, size_t len, const char *ident, bool *out, imdb_err *e);
+
+/* ---- F2b-1: CHECK constraints (design.md §5, CHECK constraints): bound and evaluated by the SQL layer (sql_exec.c) */
+struct imdb_chkc; /* a table's live CHECKs compiled (imdb_table.chkc) */
+void imdb_check_free(struct imdb_chkc *c);
+/* text alone against schema s: a CHECK of the subset, IMDB_ERR_INVALID with the reason otherwise; *cols (when not
+ * NULL) the columns it reads, a bit each */
+int imdb_check_bind(const imdb_schema *s, const char *text, uint32_t len, uint64_t *cols, imdb_err *e);
+/* a row (s's values, t's current schema) against t's live CHECKs by name: IMDB_ERR_CONSTRAINT at the first FALSE; an
+ * evaluation's own error (an overflow, a zero divisor) as it is */
+int imdb_check_row(imdb_db *db, imdb_table *t, const imdb_value *vals, imdb_err *e);
+/* every live row of t against one CHECK (an ADD's): IMDB_ERR_CONSTRAINT at a FALSE */
+int imdb_check_rows(imdb_db *db, imdb_table *t, const char *name, const char *text, uint32_t len, imdb_err *e);
+/* the tests': text bound alone against s (its error), then evaluated on nrows rows of s's values (rows[r * ncols + c]):
+ * out[r] 1 (TRUE or NULL), 0 (FALSE) or the evaluation's negative error code */
+int imdb_check_eval_text(const imdb_schema *s, const char *text, uint32_t len, const imdb_value *rows, uint32_t nrows,
+                         int *out, imdb_err *e);
+/* a CREATE's CHECKs (op 28, a valid list by name), pushed after its CREATE (and its defaults) and installed at once */
+int imdb_create_table_checks(imdb_db *db, uint32_t table, const imdb_check *c, uint16_t n, imdb_err *e);
+/* version 1's CHECKs into a history (op 28, a manifest's version 1): copied, made the live ones */
+int imdb_hist_create_checks(imdb_schema_hist *h, const imdb_check *c, uint16_t n, imdb_err *e);
+/* the live CHECK of that name's index in h->chk, or -1 */
+int imdb_hist_check(const imdb_schema_hist *h, const char *name);
+/* the first live CHECK whose text holds ident as an identifier (a RENAME's or DROP COLUMN's rule), or NULL */
+int imdb_checks_name_col(const imdb_schema_hist *h, const char *ident, const char **which, imdb_err *e);
 
 /* ---- transactions --------------------------------------------------------- */
 int imdb_begin(imdb_db *db, imdb_err *e);

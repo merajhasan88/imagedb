@@ -249,6 +249,12 @@ typedef struct sql_stmt {
     bool seq_write;                             /* F2a-2: it calls nextval or setval: a write, its commit the marks */
     uint8_t overriding;                         /* F2a-2: INSERT ... OVERRIDING SYSTEM VALUE (1), USER VALUE (2) */
     bool default_values;                        /* F2a-2: INSERT ... DEFAULT VALUES */
+    uint8_t nchecks;                            /* F2b-1: CREATE TABLE's CHECKs in order (ALTER TABLE ... ADD CHECK: one): each its
+                                                   name ("" for one to choose) and its text's span as written */
+    struct {
+        char name[IMDB_MAX_IDENT + 1];
+        uint32_t off, len;
+    } checks[IMDB_MAX_CHECKS];
     bool has_alter_def;
     char set_name[IMDB_MAX_IDENT + 1];          /* SET */
     char set_value[IMDB_MAX_IDENT + 1];

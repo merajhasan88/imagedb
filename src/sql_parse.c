@@ -1257,6 +1257,52 @@ static int default_value(parser *p, sql_lit *l, uint8_t *clock)
 
 /* ALTER TABLE t, read: SET RETENTION ...; F1: ADD [COLUMN] c type [NULL | NOT NULL] [DEFAULT literal] (either order),
  * RENAME [COLUMN] a TO b, RENAME TO n */
+/* F2b-1: CHECK (condition), CHECK already read: the condition's text kept as written, from its first token to the end
+ * of its last (balanced parentheses; the engine binds it on its own, as replay and the auditor do: design.md §5, CHECK
+ * constraints); name: CONSTRAINT's, or "" for the engine to choose */
+static int parse_check(parser *p, sql_stmt *st, const char *name)
+{
+    if (st->nchecks >= IMDB_MAX_CHECKS)
+        return imdb_fail(p->e, IMDB_ERR_LIMIT, "a table has at most %u CHECK constraints", IMDB_MAX_CHECKS);
+    if (expect(p, TK_LP, "(")) return p->e->code;
+    uint32_t t0 = p->i;
+    int depth = 0;
+    for (;; p->i++) {
+        uint8_t k = p->t[p->i].kind;
+        if (k == TK_EOF || k == TK_SEMI) return fail_at(p, "the CHECK's closing )");
+        if (k == TK_PARAM) return imdb_fail(p->e, IMDB_ERR_INVALID, "a CHECK takes no parameter ($n)");
+        if (k == TK_LP) depth++;
+        if (k == TK_RP && !depth--) break;
+    }
+    if (p->i == t0) return imdb_fail(p->e, IMDB_ERR_SYNTAX, "CHECK () holds no condition");
+    const sql_tok *a = &p->t[t0], *z = &p->t[p->i - 1];
+    uint32_t off = a->off - (a->kind == TK_STR), len = z->off + z->len + (z->kind == TK_STR) - off;
+    if (len > IMDB_MAX_CHECK_TEXT) return imdb_fail(p->e, IMDB_ERR_LIMIT, "a CHECK's text of more than %u bytes", IMDB_MAX_CHECK_TEXT);
+    p->i++; /* its ) */
+    if (tok_is_kw(p, p->i, "no") || (tok_is_kw(p, p->i, "not") && tok_is_kw(p, p->i + 1, "valid")))
+        return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "a CHECK holds for every row: NOT VALID and NO INHERIT are not in imagedb");
+    snprintf(st->checks[st->nchecks].name, sizeof st->checks[st->nchecks].name, "%s", name);
+    st->checks[st->nchecks].off = off;
+    st->checks[st->nchecks].len = len;
+    st->nchecks++;
+    return IMDB_OK;
+}
+
+/* F2b-1: [CONSTRAINT name] CHECK at p's token, read: 1 (a CHECK added), 0 (neither word: nothing read), or the error */
+static int maybe_check(parser *p, sql_stmt *st)
+{
+    char name[IMDB_MAX_IDENT + 1] = "";
+    if (tok_is_kw(p, p->i, "constraint")) {
+        p->i++;
+        if (ident(p, name)) return p->e->code;
+        if (!tok_is_kw(p, p->i, "check")) return fail_at(p, "CHECK (a CONSTRAINT names a CHECK: PRIMARY KEY takes no name)");
+    } else if (!tok_is_kw(p, p->i, "check") || p->t[p->i + 1].kind != TK_LP) {
+        return 0;
+    }
+    p->i++;
+    return parse_check(p, st, name) ? p->e->code : 1;
+}
+
 static int parse_alter(parser *p, sql_stmt *st)
 {
     if (kw(p, "set")) {
@@ -1267,6 +1313,12 @@ static int parse_alter(parser *p, sql_stmt *st)
     }
     st->kind = ST_ALTER_TABLE;
     if (kw(p, "add")) {
+        int ck = maybe_check(p, st); /* F2b-1: ADD [CONSTRAINT name] CHECK (condition) */
+        if (ck < 0) return ck;
+        if (ck) {
+            st->alter_kind = IMDB_ALTER_ADD_CHECK;
+            return IMDB_OK;
+        }
         kw(p, "column");
         st->alter_kind = IMDB_ALTER_ADD_COLUMN;
         imdb_column *c = &st->schema.cols[0];
@@ -1295,6 +1347,14 @@ static int parse_alter(parser *p, sql_stmt *st)
         return IMDB_OK;
     }
     if (kw(p, "drop")) { /* F1 stage 4: DROP [COLUMN] c (RESTRICT, the default and only one) */
+        if (tok_is_kw(p, p->i, "constraint") && p->t[p->i + 1].kind == TK_IDENT) { /* F2b-1: DROP CONSTRAINT name */
+            p->i++;
+            st->alter_kind = IMDB_ALTER_DROP_CHECK;
+            if (ident(p, st->alter_old)) return p->e->code;
+            if (kw(p, "cascade")) return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "DROP CONSTRAINT ... CASCADE: nothing depends on a CHECK");
+            kw(p, "restrict");
+            return IMDB_OK;
+        }
         kw(p, "column");
         st->alter_kind = IMDB_ALTER_DROP_COLUMN;
         if (ident(p, st->alter_old)) return p->e->code;
@@ -1360,6 +1420,9 @@ static int parse_create(parser *p, sql_stmt *st)
     int nkname = -1;
     bool said_null[IMDB_MAX_COLS] = {false};
     do {
+        int cki = maybe_check(p, st); /* F2b-1: a table's [CONSTRAINT name] CHECK (condition), anywhere among the columns */
+        if (cki < 0) return cki;
+        if (cki) continue;
         if (kw(p, "primary")) { /* the table's constraint, anywhere among the columns (PRIMARY is reserved) */
             if (expect_kw(p, "key") || expect(p, TK_LP, "(")) return p->e->code;
             if (pk >= 0 || nkname >= 0) return imdb_fail(p->e, IMDB_ERR_INVALID, "a table has one PRIMARY KEY");
@@ -1408,6 +1471,8 @@ static int parse_create(parser *p, sql_stmt *st)
                 uint8_t ck = 0;
                 if (default_value(p, &st->cdef[s->ncols], &ck)) return p->e->code;
                 st->cdef_kind[s->ncols] = ck ? ck : IMDB_DEFK_VALUE;
+            } else if ((cki = maybe_check(p, st)) != 0) { /* F2b-1: a column's [CONSTRAINT name] CHECK (condition) */
+                if (cki < 0) return cki;
             } else if (kw(p, "subject")) {
                 if (s->subject >= 0) return imdb_fail(p->e, IMDB_ERR_INVALID, "only one SUBJECT column is supported");
                 c->flags |= IMDB_COL_SUBJECT;

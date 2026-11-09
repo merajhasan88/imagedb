@@ -284,6 +284,8 @@ static bool ident_ok(const uint8_t *s, size_t n)
 #define MAX_TABLES 1024u
 #define MAX_VIEWS 1024u
 #define MAX_SEQUENCES 4096u /* F2a-2: per database, dropped ones counted (limits.h) */
+#define MAX_CHECKS 32u      /* F2b-1: a table's live CHECKs (limits.h) */
+#define MAX_CHECK_TEXT 8192u /* F2b-1: one CHECK's text, and a table's live ones' together */
 #define MAX_VIEW_TEXT 65536u
 #define MAX_VIEW_DEPS 256u
 
@@ -811,6 +813,14 @@ typedef struct acdef {
     uint32_t seq; /* F2a-2: kinds 6-8 (IDENTITY ALWAYS, BY DEFAULT, nextval): the sequence */
 } acdef;
 
+/* F2b-1: a CHECK constraint: its name and its text as written (op 28's list, ALTER kind 11's one, a manifest's
+ * version 1), the text its own allocation */
+typedef struct achk {
+    char name[64];
+    uint32_t len;
+    char *text;
+} achk;
+
 typedef struct op {
     uint8_t code;
     uint32_t table;
@@ -840,6 +850,8 @@ typedef struct op {
     acdef *cd;      /* F2a: COLUMN_DEFAULTS (23): its CREATE's DEFAULTs */
     uint16_t ncd;
     aseq *sd;       /* F2a-2: CREATE_SEQUENCE (24): its definition; 25-27 seq, sval, scalled */
+    struct achk *ck; /* F2b-1: TABLE_CHECKS (28): its list; ALTER kind 11: its one (kind 12: aname) */
+    uint16_t nck;
     uint32_t seqid;
     int64_t sval;
     uint8_t scalled;
@@ -867,6 +879,8 @@ static void commit_free(commit *c)
         aviewdef_free(c->ops[i].vd);
         free(c->ops[i].cd);
         free(c->ops[i].sd); /* F2a-2 */
+        for (uint16_t k = 0; c->ops[i].ck && k < c->ops[i].nck; k++) free(c->ops[i].ck[k].text); /* F2b-1 */
+        free(c->ops[i].ck);
     }
     free(c->ops);
     memset(c, 0, sizeof *c);
@@ -983,10 +997,63 @@ static int coldefs_body(rd *hr, const schema *s, bool none_ok, acdef **out, uint
     return 0;
 }
 
+/* F2b-1: one CHECK: u8 name length, the name (an identifier), u32 text length and the text (1 to MAX_CHECK_TEXT bytes
+ * of UTF-8 without NUL) */
+static int check_one(rd *hr, achk *c, const char *what)
+{
+    uint8_t nl = rd_u8(hr);
+    const uint8_t *nm = rd_bytes(hr, nl);
+    if (!hr->bad && (!nm || !ident_ok(nm, nl))) return fail("%s: bad CHECK name", what);
+    if (nm) memcpy(c->name, nm, nl);
+    c->len = rd_u32(hr);
+    if (hr->bad) return 0;
+    if (!c->len || c->len > MAX_CHECK_TEXT) return fail("%s: a CHECK's text of %u bytes", what, c->len);
+    const uint8_t *tx = rd_bytes(hr, c->len);
+    if (!tx) return 0;
+    if (!utf8_ok(tx, c->len) || memchr(tx, 0, c->len)) return fail("%s: a CHECK's text is not UTF-8 without NUL", what);
+    c->text = xcalloc(c->len + 1, 1);
+    memcpy(c->text, tx, c->len);
+    return 0;
+}
+
+/* F2b-1: op 28's list (a manifest's version 1: none_ok): u16 n (1 to MAX_CHECKS), each a CHECK, by name strictly
+ * increasing, the texts MAX_CHECK_TEXT bytes together at most */
+static int checks_body(rd *hr, bool none_ok, achk **out, uint16_t *n, const char *what)
+{
+    *out = NULL;
+    *n = rd_u16(hr);
+    if (hr->bad) return 0;
+    if ((!*n && !none_ok) || *n > MAX_CHECKS) return fail("%s: a bad count of CHECKs", what);
+    if (!*n) return 0;
+    achk *c = xcalloc(*n, sizeof *c);
+    *out = c;
+    uint32_t total = 0;
+    for (uint16_t k = 0; k < *n; k++) {
+        if (check_one(hr, &c[k], what)) return -1;
+        if (hr->bad) return 0;
+        if (k && strcmp(c[k - 1].name, c[k].name) >= 0) return fail("%s: CHECKs not by name, each once", what);
+        total += c[k].len;
+    }
+    if (total > MAX_CHECK_TEXT) return fail("%s: CHECK texts of more than %u bytes together", what, MAX_CHECK_TEXT);
+    return 0;
+}
+
 static int alter_body(rd *hr, op *o, const char *what)
 {
     o->akind = rd_u8(hr);
-    if (!hr->bad && (o->akind < 1 || o->akind > 10)) return fail("%s: ALTER TABLE of an unknown kind", what);
+    if (!hr->bad && (o->akind < 1 || o->akind > 12)) return fail("%s: ALTER TABLE of an unknown kind", what);
+    if (!hr->bad && o->akind == 11) { /* F2b-1: ADD CHECK: a CHECK (checks_body's rules, one) */
+        o->ck = xcalloc(1, sizeof *o->ck);
+        o->nck = 1;
+        return check_one(hr, o->ck, what);
+    }
+    if (!hr->bad && o->akind == 12) { /* F2b-1: DROP CHECK: its name */
+        uint8_t nl = rd_u8(hr);
+        const uint8_t *nm = rd_bytes(hr, nl);
+        if (!hr->bad && (!nm || !ident_ok(nm, nl))) return fail("%s: bad CHECK name", what);
+        if (nm) memcpy(o->aname, nm, nl);
+        return 0;
+    }
     if (!hr->bad && o->akind == 1) {
         uint8_t cl = rd_u8(hr);
         const uint8_t *cn = rd_bytes(hr, cl);
@@ -1256,6 +1323,15 @@ static int decode_body(const uint8_t *b, size_t n, const meta *m, keys *ks, comm
                 return fail("header: COLUMN_DEFAULTS not right after its table's CREATE_TABLE");
             if (!hr.bad && coldefs_body(&hr, c->ops[i - 2].sch, false, &o->cd, &o->ncd, "header")) return -1;
             break;
+        case 28: { /* TABLE_CHECKS (F2b-1): u32 table, right after its CREATE_TABLE, SET_RETENTION and any COLUMN_DEFAULTS */
+            o->table = rd_u32(&hr);
+            uint32_t at = i >= 1 && c->ops[i - 1].code == 23 ? i - 1 : i;
+            if (!hr.bad && (at < 2 || c->ops[at - 2].code != 1 || c->ops[at - 2].table != o->table || c->ops[at - 1].code != 16 ||
+                            (at != i && c->ops[i - 1].table != o->table)))
+                return fail("header: TABLE_CHECKS not right after its table's CREATE_TABLE");
+            if (!hr.bad && checks_body(&hr, false, &o->ck, &o->nck, "header")) return -1;
+            break;
+        }
         case 22: /* ALTER_TABLE (F1): u32 table, its body (alter_body), alone */
             o->table = rd_u32(&hr);
             if (!hr.bad && nops != 1) return fail("header: ALTER TABLE must be the only op");
@@ -1363,6 +1439,10 @@ typedef struct table {
     uint8_t wkind[MAX_COLS];   /* F2a-2: by position: a write default of a sequence (6-8), and which (DROP SEQUENCE's rule) */
     uint32_t wseqid[MAX_COLS];
     uint32_t cseq[MAX_COLS];   /* F2a-2: the CREATE's DEFAULT's sequence (kinds 6-8) */
+    achk *ck0;                 /* F2b-1: version 1's CHECKs (op 28, a manifest's), by name */
+    uint16_t nck0, nlck;
+    achk lck[MAX_CHECKS];      /* the live ones by name: each text version 1's or an ADD CHECK version's (not owned) */
+    struct ab_check *cc[MAX_CHECKS]; /* the live ones bound against the schema now (NULL: not yet, or since an ALTER) */
 } table;
 
 typedef struct aver { /* F1: rows begun at or after since are encoded under s (its raw bytes its own) */
@@ -1377,6 +1457,9 @@ typedef struct aver { /* F1: rows begun at or after since are encoded under s (i
     uint8_t *def;
     uint32_t def_len;
     uint8_t aclock;         /* F2a: kind 10's clock kind, or an ADD's (its write default a clock), else 0 */
+    char cname[64];         /* F2b-1: ADD and DROP CHECK's name, ADD CHECK's text (the version's own) */
+    char *ctext;
+    uint32_t clen;
     uint8_t hash[32];       /* SHA-256("IMDBSVR1", raw, each column's position as a u16): a segment names it */
 } aver;
 
@@ -1759,6 +1842,9 @@ static int alter_next(const aver *cur, const op *o, aver *nv, uint64_t seq, cons
     nv->s.raw = NULL;
     nv->def = NULL;
     nv->def_len = 0;
+    nv->ctext = NULL; /* F2b-1: the ALTER's own */
+    nv->clen = 0;
+    nv->cname[0] = 0;
     nv->akind = o->akind;
     nv->apos = o->akind == 1 ? (uint16_t)cur->npos : o->apos;
     nv->aclock = o->akind == 1 || o->akind == 10 ? o->aclock : 0; /* F2a */
@@ -1766,7 +1852,7 @@ static int alter_next(const aver *cur, const op *o, aver *nv, uint64_t seq, cons
     const schema *cs = &cur->s;
     unsigned long long sq = (unsigned long long)seq;
     int c = -1;
-    if (o->akind != 1 && o->akind != 3) {
+    if (o->akind != 1 && o->akind != 3 && o->akind != 11 && o->akind != 12) { /* F2b-1: a CHECK names no position */
         if (o->apos >= cur->npos || cur->at[o->apos] < 0) return fail("commit %llu: ALTER TABLE of no column", sq);
         c = cur->at[o->apos];
     }
@@ -1820,6 +1906,15 @@ static int alter_next(const aver *cur, const op *o, aver *nv, uint64_t seq, cons
         nv->def = xcalloc(o->def_len ? o->def_len : 1, 1);
         memcpy(nv->def, o->def, o->def_len);
         nv->def_len = o->def_len;
+        break;
+    case 11: /* F2b-1: ADD CHECK: catalog state (its rules apply_op's, on the table's live CHECKs and rows) */
+        snprintf(nv->cname, sizeof nv->cname, "%s", o->ck->name);
+        nv->ctext = xcalloc(o->ck->len + 1, 1);
+        memcpy(nv->ctext, o->ck->text, o->ck->len);
+        nv->clen = o->ck->len;
+        break;
+    case 12: /* F2b-1: DROP CHECK */
+        snprintf(nv->cname, sizeof nv->cname, "%s", o->aname);
         break;
     case 10: /* F2a: SET DEFAULT of a clock its column's type takes */
         if (!defk_fits(o->aclock, cc->type)) return fail("commit %llu: a clock DEFAULT its column's type does not take", sq);
@@ -2117,6 +2212,105 @@ static int apply_seq_op(state *S, const op *o, uint64_t seq)
     return 0;
 }
 
+/* ---- F2b-1: CHECK constraints: version 1's and the ALTERs', the live ones by name, each bound against the table's
+ * schema (abind.c's strict typer) when a row first needs it after the table changed, evaluated by abind.c ---- */
+
+static void ck_cols(const schema *s, ab_col *out)
+{
+    for (int c = 0; c < s->ncols; c++) {
+        memset(&out[c], 0, sizeof out[c]);
+        snprintf(out[c].name, sizeof out[c].name, "%s", s->c[c].name);
+        out[c].type = s->c[c].type;
+        out[c].scale = s->c[c].type == T_DECIMAL ? s->c[c].scale : 0;
+    }
+}
+
+static int ck_bind_text(const schema *s, const char *text, uint32_t len, struct ab_check **out, uint64_t seq, const char *name)
+{
+    ab_col cols[MAX_COLS];
+    char err[256];
+    ck_cols(s, cols);
+    if (ab_check_bind(text, len, cols, (uint16_t)s->ncols, out, err, sizeof err))
+        return fail("commit %llu: CHECK %s of table %s does not bind: %s", (unsigned long long)seq, name, s->name, err);
+    return 0;
+}
+
+static void ck_unbind(table *t)
+{
+    for (uint16_t i = 0; i < MAX_CHECKS; i++) {
+        ab_check_free(t->cc[i]);
+        t->cc[i] = NULL;
+    }
+}
+
+static int live_find(const table *t, const char *name)
+{
+    for (uint16_t i = 0; i < t->nlck; i++)
+        if (!strcmp(t->lck[i].name, name)) return i;
+    return -1;
+}
+
+static void live_add(table *t, const char *name, char *text, uint32_t len)
+{
+    uint16_t at = 0;
+    while (at < t->nlck && strcmp(t->lck[at].name, name) < 0) at++;
+    memmove(&t->lck[at + 1], &t->lck[at], (t->nlck - at) * sizeof *t->lck);
+    memset(&t->lck[at], 0, sizeof t->lck[at]);
+    snprintf(t->lck[at].name, sizeof t->lck[at].name, "%s", name);
+    t->lck[at].text = text;
+    t->lck[at].len = len;
+    t->nlck++;
+}
+
+static void live_rebuild(table *t)
+{
+    ck_unbind(t);
+    t->nlck = 0;
+    for (uint16_t i = 0; i < t->nck0; i++) live_add(t, t->ck0[i].name, t->ck0[i].text, t->ck0[i].len);
+    for (uint32_t k = 1; k < t->nvers; k++) {
+        const aver *v = &t->vers[k];
+        int at = v->akind == 12 ? live_find(t, v->cname) : -1;
+        if (v->akind == 11 && t->nlck < MAX_CHECKS) live_add(t, v->cname, v->ctext, v->clen);
+        if (at >= 0) {
+            memmove(&t->lck[at], &t->lck[at + 1], (t->nlck - (uint16_t)at - 1) * sizeof *t->lck);
+            t->nlck--;
+        }
+    }
+}
+
+/* a row (vals: t's current schema) against t's live CHECKs by name: FALSE or a failed evaluation refuses it */
+static int ck_row(table *t, const val *vals, uint64_t seq)
+{
+    if (!t->nlck) return 0;
+    ab_val av[MAX_COLS];
+    for (int c = 0; c < t->s.ncols; c++) av[c] = (ab_val){.i = vals[c].i, .s = vals[c].s, .len = vals[c].len, .null = vals[c].null};
+    for (uint16_t i = 0; i < t->nlck; i++) {
+        if (!t->cc[i] && ck_bind_text(&t->s, t->lck[i].text, t->lck[i].len, &t->cc[i], seq, t->lck[i].name)) return -1;
+        char err[256];
+        int v = ab_check_eval(t->cc[i], av, err, sizeof err);
+        if (v < 0) return fail("commit %llu: a row of table %s: CHECK %s fails: %s", (unsigned long long)seq, t->s.name, t->lck[i].name, err);
+        if (!v) return fail("commit %llu: a row of table %s violates CHECK %s", (unsigned long long)seq, t->s.name, t->lck[i].name);
+    }
+    return 0;
+}
+
+static achk *checks_dup(const achk *c, uint16_t n)
+{
+    achk *d = xcalloc(n ? n : 1, sizeof *d);
+    for (uint16_t i = 0; i < n; i++) {
+        d[i] = c[i];
+        d[i].text = xcalloc(c[i].len + 1, 1);
+        memcpy(d[i].text, c[i].text, c[i].len);
+    }
+    return d;
+}
+
+static void checks_free(achk *c, uint16_t n)
+{
+    for (uint16_t i = 0; c && i < n; i++) free(c[i].text);
+    free(c);
+}
+
 static int apply_op(state *S, const op *o, uint64_t seq)
 {
     if (o->code == 13) return 0; /* WRITER_KEY: keys, not data (decode_body follows it) */
@@ -2179,6 +2373,21 @@ static int apply_op(state *S, const op *o, uint64_t seq)
         }
         return 0;
     }
+    if (o->code == 28) { /* TABLE_CHECKS (F2b-1): its CREATE's, in its commit (the header's rule); each binds against its schema */
+        if (o->table >= S->nt || S->t[o->table].created_at != seq)
+            return fail("commit %llu: TABLE_CHECKS of a table not created there", (unsigned long long)seq);
+        table *t = &S->t[o->table];
+        for (uint16_t k = 0; k < o->nck; k++) {
+            struct ab_check *c = NULL;
+            if (ck_bind_text(&t->s, o->ck[k].text, o->ck[k].len, &c, seq, o->ck[k].name)) return -1;
+            ab_check_free(c);
+        }
+        checks_free(t->ck0, t->nck0);
+        t->ck0 = checks_dup(o->ck, o->nck);
+        t->nck0 = o->nck;
+        live_rebuild(t);
+        return 0;
+    }
     if (o->code == 22) { /* ALTER_TABLE (F1): live; its kind's rules on the current version; the next version */
         if (o->table >= S->nt) return fail("commit %llu: ALTER TABLE of an unknown table", (unsigned long long)seq);
         table *t = &S->t[o->table];
@@ -2202,6 +2411,44 @@ static int apply_op(state *S, const op *o, uint64_t seq)
             for (int j = 0; !rc && j < t->idx[k].ncols; j++)
                 if (t->idx[k].cols[j] == cc)
                     rc = fail("commit %llu: DROP COLUMN of a column index %s names", (unsigned long long)seq, t->idx[k].name);
+        if (!rc && (o->akind == 2 || o->akind == 4)) { /* F2b-1: a CHECK holds its column's name as written: RESTRICT */
+            for (uint16_t q = 0; !rc && q < t->nlck; q++) {
+                char err[128];
+                int has = ab_names(t->lck[q].text, t->lck[q].len, t->s.c[cc].name, err, sizeof err);
+                if (has)
+                    rc = fail("commit %llu: a rename or drop of column %s of table %s, which CHECK %s names", (unsigned long long)seq,
+                              t->s.c[cc].name, t->s.name, t->lck[q].name);
+            }
+        }
+        if (!rc && o->akind == 11) { /* F2b-1: ADD CHECK: a free name, within the limits, binding, every live row passing */
+            uint32_t bytes = 0;
+            for (uint16_t q = 0; q < t->nlck; q++) bytes += t->lck[q].len;
+            struct ab_check *ac = NULL;
+            if (live_find(t, o->ck->name) >= 0) rc = fail("commit %llu: ADD CHECK of a name table %s has", (unsigned long long)seq, t->s.name);
+            else if (t->nlck >= MAX_CHECKS || o->ck->len > MAX_CHECK_TEXT - bytes)
+                rc = fail("commit %llu: ADD CHECK past table %s's limits", (unsigned long long)seq, t->s.name);
+            else rc = ck_bind_text(&t->s, o->ck->text, o->ck->len, &ac, seq, o->ck->name);
+            for (uint64_t vid = av_skip(t, 0); !rc && vid < t->n; vid = av_skip(t, vid + 1)) {
+                ver *v = av(t, vid);
+                if (!v || v->end != LIVE || !v->row) continue; /* an erased row's payload is gone */
+                val vals[MAX_COLS];
+                ab_val abv[MAX_COLS];
+                char err[256];
+                if (decode_held(t, v, vals)) {
+                    rc = fail("commit %llu: a live row of table %s does not decode", (unsigned long long)seq, t->s.name);
+                    break;
+                }
+                for (int q = 0; q < t->s.ncols; q++)
+                    abv[q] = (ab_val){.i = vals[q].i, .s = vals[q].s, .len = vals[q].len, .null = vals[q].null};
+                int hv = ab_check_eval(ac, abv, err, sizeof err);
+                if (hv <= 0)
+                    rc = fail("commit %llu: ADD CHECK %s of table %s, which a live row %s", (unsigned long long)seq, o->ck->name,
+                              t->s.name, hv < 0 ? "fails to evaluate" : "violates");
+            }
+            ab_check_free(ac);
+        }
+        if (!rc && o->akind == 12 && live_find(t, o->aname) < 0)
+            rc = fail("commit %llu: DROP CHECK %s, which table %s does not have", (unsigned long long)seq, o->aname, t->s.name);
         if (!rc && (o->akind == 2 || o->akind == 3)) {
             if (view_naming(S, 1, o->table)) /* a rename: RESTRICT, as DROP is */
                 rc = fail("commit %llu: a rename of table %s, which a live view names", (unsigned long long)seq, t->s.name);
@@ -2225,6 +2472,7 @@ static int apply_op(state *S, const op *o, uint64_t seq)
         if (rc) {
             free(nv.s.raw);
             free(nv.def);
+            free(nv.ctext); /* F2b-1 */
             return rc;
         }
         for (uint32_t k = 0; k <= t->nidx; k++) { /* the indexes and the primary key, carried by position (F1 stage 4) */
@@ -2239,6 +2487,7 @@ static int apply_op(state *S, const op *o, uint64_t seq)
         t->s = nv.s;
         t->s.raw = xcalloc(nv.s.rawlen, 1);
         memcpy(t->s.raw, nv.s.raw, nv.s.rawlen);
+        live_rebuild(t); /* F2b-1: the live CHECKs, each bound again against the new schema when a row needs it */
         return 0;
     }
     if (o->code == 19) { /* DROP_TABLE: live, not kept FOREVER (its op 16 first); every live version ends, one by one */
@@ -2393,6 +2642,7 @@ static int apply_op(state *S, const op *o, uint64_t seq)
             row_commit(o->table, o->salt, o->row, o->row_len, chk);
             if (memcmp(chk, cm, 32) != 0) return fail("commit %llu: payload does not match its commitment", (unsigned long long)seq);
             if (decode_row(&t->s, o->row, o->row_len, vals)) return -1;
+            if (ck_row(t, vals, seq)) return -1; /* F2b-1: its table's CHECKs, as the writer evaluated them */
             S->payload_rows++;
         }
         ver *v = av_need(t, t->n); /* zeroed, live, held */
@@ -3269,6 +3519,8 @@ typedef struct mtable {
     uint8_t wkind[MAX_COLS];   /* F2a-2: by position: a write default of a sequence (6-8), and which (DROP SEQUENCE's rule) */
     uint32_t wseqid[MAX_COLS];
     uint32_t cseq[MAX_COLS];   /* F2a-2: the CREATE's DEFAULT's sequence (kinds 6-8) */
+    achk *ck0;                 /* F2b-1 (manifest 11): version 1's CHECKs */
+    uint16_t nck0;
 } mtable;
 
 typedef struct mview { /* P2 S7: a manifest's view: a live one's definition, a dropped one's tombstone (def NULL) */
@@ -3296,6 +3548,8 @@ static void manifest_free(manifest *m)
         free(m->t[i].seg);
         free(m->t[i].dv);
         free(m->t[i].nrows);
+        for (uint32_t k = 0; k < m->t[i].nvers; k++) free(m->t[i].vers[k].ctext); /* F2b-1 */
+        checks_free(m->t[i].ck0, m->t[i].nck0);
         for (uint32_t k = 0; k < m->t[i].nvers; k++) free(m->t[i].vers[k].s.raw), free(m->t[i].vers[k].def); /* F1 */
         free(m->t[i].vers);
         for (int k = 0; k < MAX_COLS; k++) free(m->t[i].missing_text[k]);
@@ -3382,7 +3636,7 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
     rd r = {b, len, 0, false};
     const uint8_t *mg = rd_bytes(&r, 8);
     uint32_t mver = mg && memcmp(mg, "IMDBMAN1", 8) == 0 ? rd_u32(&r) : 0;
-    if (mver != 10) return fail("manifest: bad header (version 10 only: the sequences, F2a-2)");
+    if (mver != 11) return fail("manifest: bad header (version 11 only: CHECK constraints, F2b-1)");
     uint32_t nsec = rd_u32(&r); /* every section, in order: 1 tables, 2 views, 3 sequences (F2a-2), 4-11 reserved and empty */
     const uint8_t *id = rd_bytes(&r, 16);
     m->seq = rd_u64(&r);
@@ -3490,6 +3744,8 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
             if (crc) return -1;
             if (r.bad) return fail("manifest: truncated");
         }
+        if (checks_body(&r, true, &t->ck0, &t->nck0, "manifest")) return -1; /* F2b-1 (manifest 11): version 1's CHECKs */
+        if (r.bad) return fail("manifest: truncated");
         uint64_t last = t->created_at;
         for (uint32_t k = 0; k < na; k++) {
             uint64_t at = rd_u64(&r);
@@ -3504,11 +3760,14 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
             if (alter_state(&o, t->vers[t->nvers - 1].npos, t->missing, t->missing_text, t->has_wdef)) {
                 free(nv.s.raw);
                 free(nv.def);
+                free(nv.ctext);
+                checks_free(o.ck, o.nck);
                 return -1;
             }
             nv.since = at;
             t->vers[t->nvers++] = nv;
             last = at;
+            checks_free(o.ck, o.nck); /* F2b-1: an ADD CHECK's, the version holds its own copy */
         }
         const schema *ls = &t->vers[t->nvers - 1].s;
         if (ls->rawlen != t->s.rawlen || memcmp(ls->raw, t->s.raw, t->s.rawlen) != 0)
@@ -4162,6 +4421,10 @@ static int floor_seed(int dirfd, state *S, flr *f)
                 t->vers[k].def = xcalloc(mt->vers[k].def_len ? mt->vers[k].def_len : 1, 1);
                 memcpy(t->vers[k].def, mt->vers[k].def, mt->vers[k].def_len);
             }
+            if (mt->vers[k].ctext) { /* F2b-1: an ADD CHECK's text, the version's own */
+                t->vers[k].ctext = xcalloc(mt->vers[k].clen + 1, 1);
+                memcpy(t->vers[k].ctext, mt->vers[k].ctext, mt->vers[k].clen);
+            }
         }
         for (int c = 0; c < MAX_COLS; c++) {
             t->missing[c] = mt->missing[c];
@@ -4181,6 +4444,9 @@ static int floor_seed(int dirfd, state *S, flr *f)
             memcpy(t->missing_text[c], mt->missing_text[c], tl);
             t->missing[c].s = t->missing_text[c] + (mt->missing[c].s - mt->missing_text[c]);
         }
+        t->ck0 = mt->nck0 ? checks_dup(mt->ck0, mt->nck0) : NULL; /* F2b-1: F's CHECKs, version 1's and the live ones */
+        t->nck0 = mt->nck0;
+        live_rebuild(t);
     }
     for (uint32_t i = 0; i < f->m.nv; i++) /* P2 S7: F's views, a live one's definition the replay's rules read */
         view_push(S, f->m.v[i].name, f->m.v[i].created_at, f->m.v[i].dropped_at, f->m.v[i].def);
@@ -4252,9 +4518,15 @@ static bool same_history(const mtable *mt, const table *t)
         if (a->since != b->since || a->s.rawlen != b->s.rawlen || memcmp(a->s.raw, b->s.raw, a->s.rawlen) != 0 ||
             memcmp(a->hash, b->hash, 32) != 0 || a->akind != b->akind || a->apos != b->apos || a->def_len != b->def_len ||
             a->aclock != b->aclock || /* F2a */
-            (a->def_len && memcmp(a->def, b->def, a->def_len) != 0))
+            (a->def_len && memcmp(a->def, b->def, a->def_len) != 0) ||
+            strcmp(a->cname, b->cname) || a->clen != b->clen || (a->clen && memcmp(a->ctext, b->ctext, a->clen))) /* F2b-1 */
             return false;
     }
+    if (mt->nck0 != t->nck0) return false; /* F2b-1: version 1's CHECKs, which no version holds */
+    for (uint16_t q = 0; q < mt->nck0; q++)
+        if (strcmp(mt->ck0[q].name, t->ck0[q].name) || mt->ck0[q].len != t->ck0[q].len ||
+            memcmp(mt->ck0[q].text, t->ck0[q].text, mt->ck0[q].len))
+            return false;
     for (int p = 0; p < mt->vers[0].npos; p++) /* F2a: the CREATE's DEFAULTs, which no version's hash covers */
         if (mt->ckind[p] != t->ckind[p] || mt->cdef_len[p] != t->cdef_len[p] || mt->cseq[p] != t->cseq[p] || /* F2a-2 */
             (mt->cdef_len[p] && memcmp(mt->cdef[p], t->cdef[p], mt->cdef_len[p]) != 0))
@@ -4405,6 +4677,9 @@ static int cmd_verify(const char *dir, const char *anchor)
         for (uint32_t k = 0; k < S.t[i].nidx; k++) uk_free(S.t[i].idx[k].uk);
         uk_free(S.t[i].pkx.uk);
         free(S.t[i].vc);
+        for (uint32_t k = 0; k < S.t[i].nvers; k++) free(S.t[i].vers[k].ctext); /* F2b-1 */
+        checks_free(S.t[i].ck0, S.t[i].nck0);
+        ck_unbind(&S.t[i]);
         for (uint32_t k = 0; k < S.t[i].nvers; k++) free(S.t[i].vers[k].s.raw), free(S.t[i].vers[k].def); /* F1: its versions' bytes */
         free(S.t[i].vers);
         for (int k = 0; k < MAX_COLS; k++) free(S.t[i].missing_text[k]);

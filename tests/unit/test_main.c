@@ -128,6 +128,7 @@ int main(int argc, char **argv)
         {"vc", vc_tests, &vc_ntests},       /* F3c: VARCHAR(n) */
         {"def", def_tests, &def_ntests},    /* F2a: clock values and column DEFAULTs */
         {"seq", seq_tests, &seq_ntests},    /* F2a-2: sequences, IDENTITY and SERIAL */
+        {"check", check_tests, &check_ntests}, /* F2b-1: CHECK constraints */
         {"tz", tz_tests, &tz_ntests}, /* P2: time zones */
         {"tzsql", tzsql_tests, &tzsql_ntests}, /* P2: time zones through the engine */
     };

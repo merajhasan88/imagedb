@@ -720,7 +720,8 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
         bool on_table = o->code == IMDB_OP_INSERT || o->code == IMDB_OP_DELETE || o->code == IMDB_OP_UPDATE ||
                         o->code == IMDB_OP_COMPACT || o->code == IMDB_OP_CREATE_INDEX || o->code == IMDB_OP_DROP_INDEX ||
                         o->code == IMDB_OP_SET_RETENTION || o->code == IMDB_OP_EXPIRE || o->code == IMDB_OP_DROP_TABLE ||
-                        o->code == IMDB_OP_ALTER_TABLE || o->code == IMDB_OP_COLUMN_DEFAULTS;
+                        o->code == IMDB_OP_ALTER_TABLE || o->code == IMDB_OP_COLUMN_DEFAULTS ||
+                        o->code == IMDB_OP_TABLE_CHECKS; /* F2b-1 */
         vtab *t = on_table && o->table < x->nt ? &x->t[o->table] : NULL;
         if (on_table && !t) return imdb_fail(e, IMDB_ERR_VERIFY, "verify: unknown table");
         if (t && t->dropped_at && /* replay's and the auditor's rule: a dropped table's history may still expire */
@@ -752,6 +753,18 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
         case IMDB_OP_COLUMN_DEFAULTS: /* F2a: its CREATE's defaults into the model's first version (the codec checked them) */
             if (!(rc = imdb_hist_create_defaults(&t->hist, o->defs, o->ndefs, e)))
                 rc = v_seq_own(x, o->table, o->defs, o->ndefs, seq, e); /* F2a-2 */
+            break;
+        case IMDB_OP_TABLE_CHECKS: /* F2b-1: each text a CHECK of the CREATE's schema (the codec checked the list); the
+                                    * rows' verdicts are replay's and the auditor's: this model keeps no payloads */
+            for (uint16_t q = 0; q < o->nchk; q++) {
+                imdb_err e2 = {0};
+                int brc = imdb_check_bind(&t->s, o->chk[q].text, o->chk[q].len, NULL, &e2);
+                if (brc == IMDB_ERR_NOMEM) return imdb_fail(e, brc, "%s", e2.msg);
+                if (brc)
+                    return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: table %s's CHECK %s: %s", (unsigned long long)seq,
+                                     t->s.name, o->chk[q].name, e2.msg);
+            }
+            rc = imdb_hist_create_checks(&t->hist, o->chk, o->nchk, e);
             break;
         case IMDB_OP_CREATE_SEQUENCE: /* F2a-2: replay's rules on the model */
         case IMDB_OP_DROP_SEQUENCE:
@@ -870,6 +883,21 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
             if (o->akind == IMDB_ALTER_RENAME_TABLE && v_name_live(x, o->aname))
                 return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: RENAME TO a live table's or view's name",
                                  (unsigned long long)seq);
+            if (o->akind == IMDB_ALTER_RENAME_COLUMN || o->akind == IMDB_ALTER_DROP_COLUMN) { /* F2b-1: a CHECK's name */
+                const char *cn = NULL;
+                if (imdb_checks_name_col(&t->hist, t->s.cols[cur->at[o->apos]].name, &cn, e)) return e->code;
+                if (cn)
+                    return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: a rename or drop of a column check %s names",
+                                     (unsigned long long)seq, cn);
+            }
+            if (o->akind == IMDB_ALTER_ADD_CHECK) { /* F2b-1: its text binds (its rows: replay's and the auditor's) */
+                imdb_err e3 = {0};
+                int brc = imdb_check_bind(&t->s, o->chk[0].text, o->chk[0].len, NULL, &e3);
+                if (brc == IMDB_ERR_NOMEM) return imdb_fail(e, brc, "%s", e3.msg);
+                if (brc)
+                    return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: ADD CHECK %s: %s", (unsigned long long)seq,
+                                     o->chk[0].name, e3.msg);
+            }
             /* SET NOT NULL's rule on the live rows needs their payloads, which this model does not keep: replay and
              * the auditor check it (as they do a row's key) */
             imdb_op oc = *o; /* the engine's prepare re-points a TEXT DEFAULT at its own copy */
@@ -1479,7 +1507,14 @@ static bool same_hist(const imdb_schema_hist *m, const imdb_schema_hist *x, uint
             return false;
         if (a->akind == IMDB_ALTER_SET_DEFAULT && !val_eq(&a->adef, &b->adef)) return false; /* no hash covers it */
         if (a->aclock != b->aclock) return false; /* F2a: a clock DEFAULT, nor this */
+        if (strcmp(a->cname, b->cname) || a->clen != b->clen || (a->clen && memcmp(a->ctext, b->ctext, a->clen)))
+            return false; /* F2b-1: an ADD or DROP CHECK, nor this */
     }
+    if (m->nchk0 != x->nchk0) return false; /* F2b-1: version 1's CHECKs, which no version holds */
+    for (uint16_t k = 0; k < m->nchk0; k++)
+        if (strcmp(m->chk0[k].name, x->chk0[k].name) || m->chk0[k].len != x->chk0[k].len ||
+            memcmp(m->chk0[k].text, x->chk0[k].text, m->chk0[k].len))
+            return false;
     uint16_t np = 0; /* the positions the first n versions have: those added at or before version n */
     while (np < x->ntcol && x->tcol[np].added <= n) np++;
     if (m->ntcol != np) return false;
@@ -1776,6 +1811,12 @@ static int verify_engine(imdb_db *db, const vctx *x, imdb_verify_report *rep, im
             return imdb_fail(e, IMDB_ERR_VERIFY, "verify: table %s differs from the log", et->s.name);
         if (!same_indexes(vt->idx, vt->nidx, et->idx, et->nidx))
             return imdb_fail(e, IMDB_ERR_VERIFY, "verify: the engine's indexes of table %s differ from the log's", et->s.name);
+        bool cks = vt->hist.nchk == et->hist.nchk; /* F2b-1: its live CHECKs, by name, each text as logged */
+        for (uint16_t q = 0; cks && q < vt->hist.nchk; q++)
+            cks = !strcmp(vt->hist.chk[q].name, et->hist.chk[q].name) && vt->hist.chk[q].len == et->hist.chk[q].len &&
+                  !memcmp(vt->hist.chk[q].text, et->hist.chk[q].text, vt->hist.chk[q].len);
+        if (!cks)
+            return imdb_fail(e, IMDB_ERR_VERIFY, "verify: the engine's CHECKs of table %s differ from the log's", et->s.name);
         /* from scratch, independent of the delta arithmetic */
         imdb_lthash re;
         if (imdb_recompute_digest(db, et, db->seq, &re, e)) return e->code;

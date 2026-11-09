@@ -944,8 +944,9 @@ static void manifest_lie(const char *dir, const char *kind)
         imdb_buf_put(&nb, man, mn);
         uint16_t c = m.t[m.nt - 1].s.ncols; /* the last index's column, little endian, before the three u64, F1's u32 and
                                              * F2a's u16 (manifest 9: version 1's DEFAULTs, none) */
-        nb.p[nb.len - 192] = (uint8_t)c; /* then the views section (12 + a count of 0) and the nine empty ones (16 each) */
-        nb.p[nb.len - 191] = (uint8_t)(c >> 8);
+        nb.p[nb.len - 194] = (uint8_t)c; /* then F2b-1's u16 (manifest 11: version 1's CHECKs, none), the views section
+                                          * (12 + a count of 0) and the nine empty ones (16 each) */
+        nb.p[nb.len - 193] = (uint8_t)(c >> 8);
     } else if (strcmp(kind, "section") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION && mn > 144 + 144) {
         imdb_buf_put(&nb, man, mn); /* the format design's slice 1: the nine reserved sections end it, 16 bytes each */
         nb.p[nb.len - 116] = 1;     /* the enums section's u32 count: a later format's (F2a-2: the sequences section, 3, is read now) */
@@ -991,6 +992,16 @@ static void manifest_lie(const char *dir, const char *kind)
         if (!at) exit(1);
         int64_t inc = (int64_t)imdb_get_le64(nb.p + at + 1);
         imdb_le64(nb.p + at + 33, imdb_get_le64(nb.p + at + 33) + (uint64_t)inc);
+    } else if (strcmp(kind, "check-text") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION) {
+        /* F2b-1: version 1's CHECK z_a_check (manifest 11: u8 9, the name, u32 5, "a > 0") made "a > 1": a CHECK the rows still
+         * pass, another than the log's */
+        imdb_buf_put(&nb, man, mn);
+        static const uint8_t pat[] = {9, 'z', '_', 'a', '_', 'c', 'h', 'e', 'c', 'k', 5, 0, 0, 0, 'a', ' ', '>', ' ', '0'};
+        size_t at = 0;
+        for (size_t i = 0; i + sizeof pat <= mn && !at; i++)
+            if (memcmp(nb.p + i, pat, sizeof pat) == 0) at = i + sizeof pat - 1;
+        if (!at) exit(1);
+        nb.p[at] = '1';
     } else if (strcmp(kind, "create-default") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION) {
         /* F2a: version 1's DEFAULTs (manifest 9) of a table with no ALTER whose column 2 is an INT64 DEFAULT 77: u32 0
          * (no ALTER), u16 1, u16 column 2, u8 kind 1, then the u64 value, made 78: the history still ends at the schema */
@@ -1005,7 +1016,8 @@ static void manifest_lie(const char *dir, const char *kind)
         fputs("imdb-forge: manifest-lie DIR boundary (none yet) | column (an index in the last table) | section (a reserved"
               " one not empty) | nsections (ten) | order (a reserved one out of order) | later (the last one a later"
               " format's, longer) | keylist (table 0's key list another column) | default (an added column n's DEFAULT"
-              " another in the history) | create-default (a CREATE's DEFAULT 77 of column 2 another) | seq-state (fu_seq's last on)\n", stderr);
+              " another in the history) | create-default (a CREATE's DEFAULT 77 of column 2 another) | seq-state (fu_seq's last on)"
+              " | check-text (z_a_check's 'a > 0' another)\n", stderr);
         exit(1);
     }
     if (nb.err) exit(1);
@@ -1292,6 +1304,54 @@ static void index_lie(const char *dir, const char *kind)
         op.apos = t->hist.vers[t->hist.nvers - 1].pos[c];
         op.aclock = IMDB_DEFK_CURRENT_DATE;
         op.iname = NULL;
+    } else if (strcmp(kind, "check-add") == 0) { /* F2b-1: ADD CHECK forged (a > 100) to table 0, which a live row fails */
+        static imdb_check fc = {.name = "forged", .len = 7, .text = "a > 100"};
+        op.code = IMDB_OP_ALTER_TABLE;
+        op.table = db->t[0]->s.id;
+        op.akind = IMDB_ALTER_ADD_CHECK;
+        op.chk = &fc;
+        op.nchk = 1;
+        op.iname = NULL;
+    } else if (strcmp(kind, "check-row") == 0) { /* F2b-1: an INSERT into the last table of a live row's values under a new INT64
+                                                * key, its column a -1 (the test's CHECK (a > 0) refuses it), its digest right */
+        imdb_table *t = db->t[db->nt - 1];
+        uint64_t src = IMDB_NONE;
+        int64_t maxpk = 0;
+        for (uint64_t vid = imdb_v_next(t, 0); vid < t->nver; vid = imdb_v_next(t, vid + 1)) {
+            imdb_value k;
+            if (imdb_vh(t, vid)->end != IMDB_LIVE || imdb_version_key(t, vid, t->s.key[0], &k) != IMDB_OK) continue;
+            if (src == IMDB_NONE) src = vid;
+            if (k.i > maxpk) maxpk = k.i;
+        }
+        imdb_value vals[IMDB_MAX_COLS];
+        imdb_err e = {0};
+        int ac = imdb_schema_col(&t->s, "a");
+        if (src == IMDB_NONE || ac < 0 || t->s.npk != 1 || imdb_version_values(db, t, src, vals, &e)) {
+            fputs("imdb-forge: index-lie check-row needs a live row and an INT64 column a in the last table\n", stderr);
+            exit(1);
+        }
+        vals[t->s.key[0]].i = maxpk + 1;
+        vals[ac].null = false;
+        vals[ac].i = -1;
+        static imdb_buf row;
+        imdb_buf_init(&row);
+        if (imdb_row_encode(&t->s, vals, &row, &e) || imdb_buf_check(&row, &e)) die("row", &e);
+        memset(op.salt, 0x5c, sizeof op.salt);
+        op.code = IMDB_OP_INSERT;
+        op.table = t->s.id;
+        op.vid = t->nver;
+        op.pkind = IMDB_PAYLOAD_ROW;
+        op.row = row.p;
+        op.row_len = (uint32_t)row.len;
+        op.iname = NULL;
+        imdb_row_commit(t->s.id, op.salt, row.p, row.len, op.commit);
+        imdb_lthash g = db->global;
+        imdb_lthash_add_commit(db->meta.digest_alg, &g, op.commit);
+        uint8_t dg[32];
+        imdb_lthash_digest(db->meta.digest_alg, &g, dg);
+        append_commit_digest(dir, db, &op, 1, &sg, NULL, dg);
+        imdb_close(db);
+        return;
     } else if (strcmp(kind, "pk-dup") == 0) { /* F4: an INSERT repeating a live row's whole key (the last table), its digest right */
         imdb_table *t = db->t[db->nt - 1];
         uint64_t src = IMDB_NONE;
@@ -1325,7 +1385,8 @@ static void index_lie(const char *dir, const char *kind)
     } else {
         fputs("imdb-forge: index-lie DIR column | duplicate (needs an index) | drop-absent | unique-dup (needs a unique index) | "
               "pk-dup (a live row in the last table) | alter-view (ADD COLUMN k to table 0) | alter-not-null | "
-              "alter-drop-indexed | date-range (a DATE column and an INT64 key in the last table) | varchar-long (a VARCHAR(n <= 200)) | alter-varchar-default | create-default-clock | alter-clock-type (a TEXT column in table 0) | seq-back | seq-drop-owned\n", stderr);
+              "alter-drop-indexed | date-range (a DATE column and an INT64 key in the last table) | varchar-long (a VARCHAR(n <= 200)) | alter-varchar-default | create-default-clock | alter-clock-type (a TEXT column in table 0) | seq-back | seq-drop-owned | "
+              "check-add (ADD CHECK forged: a > 100, to table 0) | check-row (a -1 in the last table's column a)\n", stderr);
         exit(1);
     }
     append_commit(dir, db, &op, 1, &sg, NULL);

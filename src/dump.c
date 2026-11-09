@@ -131,7 +131,7 @@ static int column_text(dumper *d, const imdb_table *t, uint16_t i, imdb_err *e)
  * a key of several columns (F4) as the table's constraint after them, PRIMARY KEY (a, b), in key order; F1: every
  * live column in the CREATE (a dropped one is in no row the dump writes), each with its write default (F2a: CREATE
  * TABLE's DEFAULT, a literal or a clock; the restore's rows are all written whole, so the value an older row read for
- * an added column is never needed) */
+ * an added column is never needed); F2b-1: then each live CHECK, CONSTRAINT name CHECK (its text as written) */
 static int create_text(dumper *d, const imdb_table *t, imdb_err *e)
 {
     char ret[64];
@@ -144,6 +144,11 @@ static int create_text(dumper *d, const imdb_table *t, imdb_err *e)
     if (t->s.npk > 1) {
         imdb_buf_put_str(&d->b, ", PRIMARY KEY (");
         for (int k = 0; k < t->s.npk; k++) imdb_buf_printf(&d->b, "%s%s", k ? ", " : "", t->s.cols[t->s.key[k]].name);
+        imdb_buf_put_str(&d->b, ")");
+    }
+    for (uint16_t k = 0; k < t->hist.nchk; k++) { /* F2b-1: each live CHECK by name, its text as written */
+        imdb_buf_printf(&d->b, ", CONSTRAINT %s CHECK (", t->hist.chk[k].name);
+        imdb_buf_put(&d->b, t->hist.chk[k].text, t->hist.chk[k].len);
         imdb_buf_put_str(&d->b, ")");
     }
     imdb_buf_printf(&d->b, ") RETENTION %s;\n", ret);

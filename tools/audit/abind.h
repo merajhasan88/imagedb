@@ -43,4 +43,21 @@ int ab_bind(const char *text, size_t len, ab_lookup_fn lookup, void *arg, ab_res
  * not lex (the reason in err): an ADD COLUMN's rule on the views that read its table */
 int ab_names(const char *text, size_t len, const char *ident, char *err, size_t errn);
 
+/* F2b-1: a CHECK constraint's text bound against its table's columns (cols: their names, types and scales, by index)
+ * by this binder's strict typer of the engine's subset (design.md §5, CHECK constraints): 0 and *out, or -1 and the
+ * reason (a text the engine refuses) */
+typedef struct ab_check ab_check;
+int ab_check_bind(const char *text, size_t len, const ab_col *cols, uint16_t ncols, ab_check **out, char *err, size_t errn);
+void ab_check_free(ab_check *c);
+/* a row's values by the table's columns, as the auditor decodes them (a DECIMAL scaled by its column's scale; a
+ * TEXT's bytes) */
+typedef struct ab_val {
+    int64_t i;
+    const uint8_t *s;
+    uint32_t len;
+    bool null;
+} ab_val;
+/* 1: the row passes (TRUE or NULL), 0: it fails (FALSE), -1: its evaluation fails (an overflow, a zero divisor ...) */
+int ab_check_eval(const ab_check *c, const ab_val *row, char *err, size_t errn);
+
 #endif

@@ -48,6 +48,12 @@ static int apply_insert(imdb_db *db, imdb_table *t, const imdb_op *op, uint64_t 
             return imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: duplicate live primary key in table %s",
                              (unsigned long long)seq, t->s.name);
         if (imdb_index_unique_replay(t, vals, seq, e)) return e->code; /* an UPDATE's old version ended already */
+        if (t->hist.nchk) { /* F2b-1: the row passes its table's CHECKs, as the writer's did */
+            imdb_err e3 = {0};
+            int crc = imdb_check_row(db, t, vals, &e3);
+            if (crc == IMDB_ERR_NOMEM) return imdb_fail(e, crc, "%s", e3.msg);
+            if (crc) return imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: %s", (unsigned long long)seq, e3.msg);
+        }
     }
     if (imdb_ver_push(t, e)) return e->code;
     imdb_version *v = imdb_vh(t, vid);
@@ -228,7 +234,8 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
         if (!t && (o->code == IMDB_OP_INSERT || o->code == IMDB_OP_DELETE || o->code == IMDB_OP_UPDATE ||
                    o->code == IMDB_OP_COMPACT || o->code == IMDB_OP_CREATE_INDEX || o->code == IMDB_OP_DROP_INDEX ||
                    o->code == IMDB_OP_SET_RETENTION || o->code == IMDB_OP_EXPIRE || o->code == IMDB_OP_DROP_TABLE ||
-                   o->code == IMDB_OP_ALTER_TABLE || o->code == IMDB_OP_COLUMN_DEFAULTS)) {
+                   o->code == IMDB_OP_ALTER_TABLE || o->code == IMDB_OP_COLUMN_DEFAULTS ||
+                   o->code == IMDB_OP_TABLE_CHECKS)) {
             rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: unknown table %u", (unsigned long long)seq, o->table);
             break;
         }
@@ -251,6 +258,18 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
             if (!(rc = imdb_hist_create_defaults(&t->hist, o->defs, o->ndefs, e)))
                 rc = imdb_seq_own(db, o->table, o->defs, o->ndefs, seq, e); /* F2a-2: an IDENTITY's sequence is its column's */
             break;
+        case IMDB_OP_TABLE_CHECKS: { /* F2b-1: each text binds against the CREATE's schema (the codec checked the list) */
+            for (uint16_t k = 0; k < o->nchk && !rc; k++) {
+                imdb_err e2 = {0};
+                int brc = imdb_check_bind(&t->s, o->chk[k].text, o->chk[k].len, NULL, &e2);
+                if (brc == IMDB_ERR_NOMEM) rc = imdb_fail(e, brc, "%s", e2.msg);
+                else if (brc)
+                    rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: table %u's CHECK %s: %s", (unsigned long long)seq,
+                                   o->table, o->chk[k].name, e2.msg);
+            }
+            if (!rc) rc = imdb_hist_create_checks(&t->hist, o->chk, o->nchk, e);
+            break;
+        }
         case IMDB_OP_DROP_TABLE: /* live, and its history not kept FOREVER (its commit's op 16 applied first) */
             if (t->dropped_at)
                 rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: DROP of table %u, dropped already", (unsigned long long)seq,

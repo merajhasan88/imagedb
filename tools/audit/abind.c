@@ -2178,3 +2178,1022 @@ int ab_names(const char *text, size_t len, const char *ident, char *err, size_t 
     free(b.t);
     return has;
 }
+
+/* ---- F2b-1: CHECK constraints (design.md §5, CHECK constraints) --------------------------------------------------
+ * A CHECK's text, as op 28 or op 22's kind 11 logs it, bound against its table's columns and evaluated on a row, by
+ * this file's own parser, a strict typer of the engine's subset and an evaluator of it: the row's columns, literals,
+ * + - * / % and unary minus, the comparisons, BETWEEN, IN (a list), IS [NOT] NULL, [NOT] LIKE, AND, OR, NOT, CASE,
+ * COALESCE, NULLIF, LENGTH, ABS, LOWER, UPPER and ||; no FLOAT64 value, no TIMESTAMPTZ literal. STRICT HERE, unlike the
+ * views' binder: a CHECK's verdict decides whether a row may exist, so every rule the engine's binder applies to the
+ * subset is applied (a text it refuses is refused), and every value is computed by design.md §5's rules exactly
+ * (INT64 checked, DECIMAL to 38 digits, division by its rule, three-valued logic, left to right as the engine's
+ * evaluator stops). */
+
+typedef struct cv { /* a value a CHECK computes: INT64, DECIMAL (scaled), BOOL and the temporal types in i; TEXT p, n */
+    uint8_t t, s;
+    bool null;
+    __int128 i;
+    const uint8_t *p;
+    uint32_t n;
+} cv;
+
+typedef struct cnode { /* a node bound: its type and scale, a column's index, a literal's value */
+    uint8_t t, s;
+    int16_t col;
+    cv k;
+} cnode;
+
+struct ab_check {
+    char *text; /* its own copy: the tokens point into it */
+    aq *q;
+    uint16_t root;
+    cnode *nd;
+    uint8_t *sbuf; /* its string literals' bytes */
+    size_t sused;
+};
+
+typedef struct ck {
+    ab *b;
+    ab_check *c;
+    const ab_col *cols;
+    uint16_t ncols;
+} ck;
+
+enum { CK_DATE_MIN = -719162, CK_DATE_MAX = 2932896 }; /* 0001-01-01 and 9999-12-31, days from 1970-01-01 */
+#define CK_DAY_US 86400000000LL
+
+#define CN(x, k) (&(x)->c->q->ex[(k)])
+#define CK_MAX_TEXT 8192 /* a CHECK's text (the engine's IMDB_MAX_CHECK_TEXT) */
+
+/* a list's elements in order (the parser's balanced EX_LIST tree: its height log2 of its length) */
+typedef struct cli {
+    const aq *q;
+    uint16_t st[40];
+    int n;
+} cli;
+static void cli_start(cli *it, const aq *q, uint16_t k)
+{
+    it->q = q;
+    it->n = 0;
+    if (k) it->st[it->n++] = k;
+}
+static uint16_t cli_next(cli *it)
+{
+    while (it->n > 0) {
+        uint16_t k = it->st[--it->n];
+        const xn *x = QX(it->q, k);
+        if (x->op != X_LIST) return k;
+        if (x->r && it->n < 40) it->st[it->n++] = x->r;
+        if (x->l && it->n < 40) it->st[it->n++] = x->l;
+    }
+    return 0;
+}
+
+static bool cnum(uint8_t t) { return t == T_INT64 || t == T_DECIMAL || t == T_FLOAT64; }
+static bool ctemporal(uint8_t t) { return t == T_TIMESTAMP || t == T_TIMESTAMPTZ || t == T_DATE || t == T_TIME; }
+static bool ccomparable(uint8_t a, uint8_t b) { return a == b || (cnum(a) && cnum(b)); }
+
+static unsigned __int128 cp10(int n)
+{
+    unsigned __int128 r = 1;
+    while (n-- > 0) r *= 10;
+    return r;
+}
+static unsigned __int128 cmag(__int128 v) { return v < 0 ? (unsigned __int128)0 - (unsigned __int128)v : (unsigned __int128)v; }
+
+/* ---- the engine's literal grammars (design.md §5): DATE 'YYYY-MM-DD', TIME 'HH:MM:SS[.f]', TIMESTAMP 'YYYY-MM-DD[
+ * HH:MM:SS[.f][Z]]' (a T for the space), at most 32 bytes */
+static bool cdig(const char *s, size_t n, size_t off, size_t cnt, int64_t *v)
+{
+    if (off > n || cnt > n - off) return false;
+    int64_t x = 0;
+    for (size_t i = 0; i < cnt; i++) {
+        if (s[off + i] < '0' || s[off + i] > '9') return false;
+        x = x * 10 + (s[off + i] - '0');
+    }
+    *v = x;
+    return true;
+}
+static bool cleap(int64_t y) { return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0; }
+static int cdim(int64_t y, int m)
+{
+    static const int d[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    return m == 2 && cleap(y) ? 29 : d[m - 1];
+}
+static int64_t cdays(int64_t y, int m, int d) /* days from 1970-01-01, the proleptic Gregorian calendar */
+{
+    y -= m <= 2;
+    int64_t era = (y >= 0 ? y : y - 399) / 400, yoe = y - era * 400;
+    int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1, doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+static int pdate(const char *s, size_t n, int64_t *out)
+{
+    int64_t Y, M, D;
+    if (n != 10 || !cdig(s, n, 0, 4, &Y) || s[4] != '-' || !cdig(s, n, 5, 2, &M) || s[7] != '-' || !cdig(s, n, 8, 2, &D))
+        return -1;
+    if (Y < 1 || M < 1 || M > 12 || D < 1 || D > cdim(Y, (int)M)) return -1;
+    *out = cdays(Y, (int)M, (int)D);
+    return 0;
+}
+static int ptime(const char *s, size_t n, int64_t *out)
+{
+    int64_t h, mi, se, fr = 0;
+    if (n < 8 || n > 15 || !cdig(s, n, 0, 2, &h) || s[2] != ':' || !cdig(s, n, 3, 2, &mi) || s[5] != ':' || !cdig(s, n, 6, 2, &se))
+        return -1;
+    if (n > 8) {
+        size_t fd = n - 9;
+        if (s[8] != '.' || fd < 1 || !cdig(s, n, 9, fd, &fr)) return -1;
+        for (size_t k = fd; k < 6; k++) fr *= 10;
+    }
+    if (h > 23 || mi > 59 || se > 59) return -1;
+    *out = (h * 3600 + mi * 60 + se) * 1000000 + fr;
+    return 0;
+}
+static int pts(const char *s, size_t n, int64_t *out)
+{
+    int64_t Y, M, D, h = 0, mi = 0, se = 0, us = 0;
+    if (n > 32 || !cdig(s, n, 0, 4, &Y) || n < 10 || s[4] != '-' || !cdig(s, n, 5, 2, &M) || s[7] != '-' || !cdig(s, n, 8, 2, &D))
+        return -1;
+    size_t i = 10;
+    if (i < n && (s[i] == ' ' || s[i] == 'T') && i + 1 < n && s[i + 1] >= '0' && s[i + 1] <= '9') {
+        if (!cdig(s, n, i + 1, 2, &h) || i + 3 >= n || s[i + 3] != ':' || !cdig(s, n, i + 4, 2, &mi) || i + 6 >= n ||
+            s[i + 6] != ':' || !cdig(s, n, i + 7, 2, &se))
+            return -1;
+        i += 9;
+        if (i < n && s[i] == '.') {
+            size_t f0 = ++i;
+            while (i < n && s[i] >= '0' && s[i] <= '9') i++;
+            size_t fd = i - f0;
+            if (fd < 1 || fd > 6) return -1;
+            cdig(s, n, f0, fd, &us);
+            for (size_t k = fd; k < 6; k++) us *= 10;
+        }
+    } else if (i < n && s[i] == 'T') {
+        return -1;
+    }
+    if (i < n && i > 10 && s[i] == 'Z') i++;
+    if (i != n) return -1;
+    if (Y < 1 || M < 1 || M > 12 || D < 1 || D > cdim(Y, (int)M) || h > 23 || mi > 59 || se > 59) return -1;
+    *out = ((cdays(Y, (int)M, (int)D) * 86400 + h * 3600 + mi * 60 + se) * 1000000) + us;
+    return 0;
+}
+
+/* a string literal at k read as temporal type t (a comparison's, IN's, CASE's or COALESCE's: the engine reads it as
+ * the other side's type, never compares it as text) */
+static int ck_tslit(ck *x, uint16_t k, uint8_t t)
+{
+    const xn *n = CN(x, k);
+    if (n->op != X_LIT || n->lit != L_STR) return 0;
+    if (t == T_TIMESTAMPTZ) return fail(x->b, "a CHECK reads no TIMESTAMPTZ literal: it would be read in a session's zone");
+    int64_t v = 0;
+    const char *s = x->c->text + n->off;
+    if (t == T_DATE ? pdate(s, n->len, &v) : t == T_TIME ? ptime(s, n->len, &v) : pts(s, n->len, &v))
+        return fail(x->b, "a %s literal that does not parse", tname(t));
+    cnode *d = &x->c->nd[k];
+    d->t = t;
+    d->s = 0;
+    memset(&d->k, 0, sizeof d->k);
+    d->k.t = t;
+    d->k.i = v;
+    return 0;
+}
+
+static int ck_lit(ck *x, uint16_t k, bool null_ok)
+{
+    const xn *n = CN(x, k);
+    cnode *d = &x->c->nd[k];
+    const char *s = x->c->text + n->off;
+    memset(&d->k, 0, sizeof d->k);
+    switch (n->lit) {
+    case L_INT: {
+        unsigned __int128 m = 0;
+        for (uint32_t i = 0; i < n->len; i++) {
+            m = m * 10 + (unsigned)(s[i] - '0');
+            if (m > (unsigned __int128)INT64_MAX + 1) return fail(x->b, "integer literal out of INT64 range");
+        }
+        if (!n->neg && m > (unsigned __int128)INT64_MAX) return fail(x->b, "integer literal out of INT64 range");
+        d->k.i = n->neg ? -(__int128)m : (__int128)m;
+        d->t = d->k.t = T_INT64;
+        return 0;
+    }
+    case L_DEC: {
+        unsigned __int128 m = 0;
+        unsigned scale = 0, digits = 0;
+        bool point = false, any = false;
+        for (uint32_t i = 0; i < n->len; i++) {
+            if (s[i] == '.' && !point) {
+                point = true;
+                continue;
+            }
+            if (s[i] < '0' || s[i] > '9') return fail(x->b, "invalid DECIMAL literal");
+            any = true;
+            if (point) scale++;
+            if (m || s[i] != '0') digits++;
+            if (digits > MAX_SCALE || scale > MAX_SCALE) return fail(x->b, "a DECIMAL literal of more than %u digits", MAX_SCALE);
+            m = m * 10 + (unsigned)(s[i] - '0');
+        }
+        if (!any) return fail(x->b, "invalid DECIMAL literal");
+        d->k.i = n->neg ? -(__int128)m : (__int128)m;
+        d->t = d->k.t = T_DECIMAL;
+        d->s = d->k.s = (uint8_t)scale;
+        return 0;
+    }
+    case L_STR: { /* '' is one quote */
+        uint8_t *p = x->c->sbuf + x->c->sused;
+        uint32_t j = 0;
+        for (uint32_t i = 0; i < n->len; i++) {
+            p[j++] = (uint8_t)s[i];
+            if (s[i] == '\'') i++;
+        }
+        x->c->sused += j;
+        d->k.p = p;
+        d->k.n = j;
+        d->t = d->k.t = T_TEXT;
+        return 0;
+    }
+    case L_BOOL:
+        d->k.i = n->len == 4 && !strncasecmp(s, "true", 4);
+        d->t = d->k.t = T_BOOL;
+        return 0;
+    case L_TS:
+    case L_DATE:
+    case L_TIME: {
+        int64_t v = 0;
+        uint8_t t = n->lit == L_TS ? T_TIMESTAMP : n->lit == L_DATE ? T_DATE : T_TIME;
+        if (t == T_DATE ? pdate(s, n->len, &v) : t == T_TIME ? ptime(s, n->len, &v) : pts(s, n->len, &v))
+            return fail(x->b, "a %s literal that does not parse", tname(t));
+        d->k.i = v;
+        d->t = d->k.t = t;
+        return 0;
+    }
+    case L_NULL:
+        if (!null_ok) return fail(x->b, "NULL cannot be an operand: the result would always be unknown (use IS NULL)");
+        d->t = 0;
+        d->k.null = true;
+        return 0;
+    default:
+        return fail(x->b, "a CHECK's literal is an integer, a DECIMAL, a string, TRUE, FALSE, NULL, a DATE, a TIME or a "
+                          "TIMESTAMP");
+    }
+}
+
+/* arithmetic's result type (design.md §5): DATE +- INT64 days, DATE - DATE, DATE + TIME; INT64 with INT64; with a
+ * DECIMAL a DECIMAL (+ - % the larger scale, * their sum, / the larger plus six), within 38 */
+static int ck_arith(ck *x, uint8_t op, const cnode *l, const cnode *r, cnode *d)
+{
+    d->s = 0;
+    if (l->t == T_DATE || r->t == T_DATE || l->t == T_TIME || r->t == T_TIME) {
+        if (op == X_ADD && ((l->t == T_DATE && r->t == T_INT64) || (l->t == T_INT64 && r->t == T_DATE))) d->t = T_DATE;
+        else if (op == X_SUB && l->t == T_DATE && r->t == T_INT64) d->t = T_DATE;
+        else if (op == X_SUB && l->t == T_DATE && r->t == T_DATE) d->t = T_INT64;
+        else if (op == X_ADD && ((l->t == T_DATE && r->t == T_TIME) || (l->t == T_TIME && r->t == T_DATE))) d->t = T_TIMESTAMP;
+        else return fail(x->b, "date arithmetic: a DATE + or - an INT64 of days, DATE - DATE, DATE + TIME");
+        return 0;
+    }
+    if (!cnum(l->t) || !cnum(r->t) || l->t == T_FLOAT64 || r->t == T_FLOAT64)
+        return fail(x->b, "arithmetic takes INT64 and DECIMAL values in a CHECK");
+    if (l->t == T_INT64 && r->t == T_INT64) {
+        d->t = T_INT64;
+        return 0;
+    }
+    int s1 = l->t == T_DECIMAL ? l->s : 0, s2 = r->t == T_DECIMAL ? r->s : 0, big = s1 > s2 ? s1 : s2;
+    int s = op == X_MUL ? s1 + s2 : op == X_DIV ? big + 6 : big;
+    if (s > MAX_SCALE) return fail(x->b, "a DECIMAL result of more than %u decimal places", MAX_SCALE);
+    d->t = T_DECIMAL;
+    d->s = (uint8_t)s;
+    return 0;
+}
+
+static int ck_unify(ck *x, uint8_t *t, uint8_t *s, uint8_t t2, uint8_t s2)
+{
+    if (!t2) return 0;
+    if (!*t) {
+        *t = t2;
+        *s = s2;
+        return 0;
+    }
+    if (*t == t2) {
+        if (t2 == T_DECIMAL && s2 > *s) *s = s2;
+        return 0;
+    }
+    if ((*t == T_INT64 && t2 == T_DECIMAL) || (*t == T_DECIMAL && t2 == T_INT64)) {
+        uint8_t a = *t == T_DECIMAL ? *s : 0, b2 = t2 == T_DECIMAL ? s2 : 0;
+        *t = T_DECIMAL;
+        *s = a > b2 ? a : b2;
+        return 0;
+    }
+    return fail(x->b, "%s and %s: values are not converted", tname(*t), tname(t2));
+}
+
+/* CASE's results and COALESCE's arguments: a string literal beside a temporal value is of the last one's type, then
+ * one type (INT64 and DECIMAL a DECIMAL at the larger scale); an untyped NULL takes it */
+static int ck_unify_all(ck *x, const uint16_t *v, unsigned n, cnode *d)
+{
+    uint8_t ts = 0;
+    for (unsigned i = 0; i < n; i++)
+        if (ctemporal(x->c->nd[v[i]].t)) ts = x->c->nd[v[i]].t;
+    for (unsigned i = 0; ts && i < n; i++)
+        if (ck_tslit(x, v[i], ts)) return -1;
+    d->t = d->s = 0;
+    for (unsigned i = 0; i < n; i++)
+        if (ck_unify(x, &d->t, &d->s, x->c->nd[v[i]].t, x->c->nd[v[i]].s)) return -1;
+    if (!d->t) return fail(x->b, "NULL alone has no type");
+    for (unsigned i = 0; i < n; i++)
+        if (!x->c->nd[v[i]].t) {
+            x->c->nd[v[i]].t = d->t;
+            x->c->nd[v[i]].s = d->s;
+        }
+    return 0;
+}
+
+static int ck_bind(ck *x, uint16_t k, bool null_ok);
+
+static int ck_items(ck *x, uint16_t k, uint16_t *el, unsigned *n, unsigned cap)
+{
+    return list_items(x->b, x->c->q, k, el, n, cap);
+}
+
+static int ck_fn(ck *x, uint16_t k)
+{
+    const xn *n = CN(x, k);
+    cnode *d = &x->c->nd[k];
+    uint16_t el[MAX_ARGS];
+    unsigned na = 0;
+    if (ck_items(x, n->l, el, &na, MAX_ARGS)) return -1;
+    switch (n->fn) {
+    case F_COALESCE:
+        if (na < 1) return fail(x->b, "COALESCE takes 1 to 255 arguments");
+        for (unsigned i = 0; i < na; i++)
+            if (ck_bind(x, el[i], true)) return -1;
+        return ck_unify_all(x, el, na, d);
+    case F_NULLIF: {
+        if (na != 2) return fail(x->b, "NULLIF takes 2 arguments");
+        if (ck_bind(x, el[0], false) || ck_bind(x, el[1], true)) return -1;
+        cnode *a = &x->c->nd[el[0]], *b2 = &x->c->nd[el[1]];
+        if (ctemporal(a->t) && ck_tslit(x, el[1], a->t)) return -1;
+        if (b2->t && !ccomparable(a->t, b2->t)) return fail(x->b, "NULLIF of %s and %s", tname(a->t), tname(b2->t));
+        d->t = a->t;
+        d->s = a->s;
+        if (!b2->t) {
+            b2->t = d->t;
+            b2->s = d->s;
+        }
+        return 0;
+    }
+    case F_ABS:
+    case F_LENGTH:
+    case F_LOWER:
+    case F_UPPER:
+        if (na != 1) return fail(x->b, "a function of one argument called with %u", na);
+        if (ck_bind(x, el[0], false)) return -1;
+        if (n->fn == F_ABS) {
+            if (x->c->nd[el[0]].t != T_INT64 && x->c->nd[el[0]].t != T_DECIMAL) return fail(x->b, "ABS takes a number");
+            d->t = x->c->nd[el[0]].t;
+            d->s = x->c->nd[el[0]].t == T_DECIMAL ? x->c->nd[el[0]].s : 0;
+            return 0;
+        }
+        if (x->c->nd[el[0]].t != T_TEXT) return fail(x->b, "LENGTH, LOWER and UPPER take a TEXT value");
+        d->t = n->fn == F_LENGTH ? T_INT64 : T_TEXT;
+        d->s = 0;
+        return 0;
+    case F_CONCAT:
+        if (na != 2) return fail(x->b, "|| takes two values");
+        if (ck_bind(x, el[0], false) || ck_bind(x, el[1], false)) return -1;
+        if (x->c->nd[el[0]].t != T_TEXT || x->c->nd[el[1]].t != T_TEXT) return fail(x->b, "|| takes TEXT values");
+        d->t = T_TEXT;
+        d->s = 0;
+        return 0;
+    default:
+        return fail(x->b, "a CHECK calls ABS, LENGTH, LOWER, UPPER, COALESCE, NULLIF and || alone");
+    }
+}
+
+static int ck_case(ck *x, uint16_t k)
+{
+    const xn *n = CN(x, k);
+    cnode *d = &x->c->nd[k];
+    uint16_t w[MAX_ARGS + 1], v[MAX_ARGS + 1];
+    unsigned nw = 0, nv = 0;
+    if (n->l && ck_bind(x, n->l, false)) return -1;
+    if (ck_items(x, n->r, w, &nw, MAX_ARGS)) return -1;
+    for (unsigned i = 0; i < nw; i++) {
+        const xn *wx = CN(x, w[i]);
+        if (ck_bind(x, wx->l, false)) return -1;
+        if (!n->l && x->c->nd[wx->l].t != T_BOOL) return fail(x->b, "CASE WHEN takes a condition");
+        if (n->l) {
+            if (ctemporal(x->c->nd[n->l].t) && ck_tslit(x, wx->l, x->c->nd[n->l].t)) return -1;
+            if (!ccomparable(x->c->nd[n->l].t, x->c->nd[wx->l].t))
+                return fail(x->b, "a CASE of %s compared with %s", tname(x->c->nd[n->l].t), tname(x->c->nd[wx->l].t));
+        }
+        if (ck_bind(x, wx->r, true)) return -1;
+        v[nv++] = wx->r;
+    }
+    if (n->x3) {
+        if (ck_bind(x, n->x3, true)) return -1;
+        v[nv++] = n->x3;
+    }
+    return ck_unify_all(x, v, nv, d);
+}
+
+static int ck_cmp(ck *x, uint16_t k)
+{
+    const xn *n = CN(x, k);
+    cnode *d = &x->c->nd[k];
+    d->t = T_BOOL;
+    d->s = 0;
+    if (ck_bind(x, n->l, false)) return -1;
+    if (n->cmp == C_ISNULL || n->cmp == C_NOTNULL) return 0;
+    if (n->cmp == C_IN || n->cmp == C_NOTIN) {
+        if (CN(x, n->r)->op == X_SUBQ) return fail(x->b, "a CHECK is a condition on its row: no subquery");
+        cli it;
+        cli_start(&it, x->c->q, n->r);
+        for (uint16_t el = cli_next(&it); el; el = cli_next(&it)) {
+            if (ck_bind(x, el, true)) return -1;
+            cnode *a = &x->c->nd[n->l], *e2 = &x->c->nd[el];
+            if (ctemporal(a->t) && ck_tslit(x, el, a->t)) return -1;
+            if (e2->t && !ccomparable(a->t, e2->t)) return fail(x->b, "IN compares %s with %s", tname(a->t), tname(e2->t));
+            if (!e2->t) {
+                e2->t = a->t;
+                e2->s = a->s;
+            }
+        }
+        return 0;
+    }
+    if (n->cmp == C_LIKE || n->cmp == C_NOTLIKE) {
+        if (ck_bind(x, n->r, false) || (n->x3 && ck_bind(x, n->x3, false))) return -1;
+        if (x->c->nd[n->l].t != T_TEXT || x->c->nd[n->r].t != T_TEXT || (n->x3 && x->c->nd[n->x3].t != T_TEXT))
+            return fail(x->b, "LIKE takes TEXT values");
+        return 0;
+    }
+    uint16_t ops[2] = {n->r, n->x3};
+    for (int i = 0; i < (n->cmp == C_BETWEEN ? 2 : 1); i++) {
+        if (ck_bind(x, ops[i], false)) return -1;
+        if (ctemporal(x->c->nd[n->l].t) && ck_tslit(x, ops[i], x->c->nd[n->l].t)) return -1;
+        if (ctemporal(x->c->nd[ops[i]].t) && ck_tslit(x, n->l, x->c->nd[ops[i]].t)) return -1;
+        uint8_t ta = x->c->nd[n->l].t, tb = x->c->nd[ops[i]].t;
+        if (!ccomparable(ta, tb)) return fail(x->b, "a comparison of %s with %s", tname(ta), tname(tb));
+        if (ta == T_BOOL && n->cmp != C_EQ && n->cmp != C_NE) return fail(x->b, "BOOL values support only = and !=");
+    }
+    return 0;
+}
+
+static int ck_bind(ck *x, uint16_t k, bool null_ok)
+{
+    const xn *n = CN(x, k);
+    cnode *d = &x->c->nd[k];
+    d->col = -1;
+    switch (n->op) {
+    case X_LIT: return ck_lit(x, k, null_ok);
+    case X_COL: {
+        if (n->qlen) return fail(x->b, "a CHECK names its table's columns bare");
+        char nm[64];
+        fold(x->c->text + n->off, n->len, nm);
+        for (uint16_t c = 0; c < x->ncols; c++)
+            if (!strcmp(x->cols[c].name, nm)) {
+                d->col = (int16_t)c;
+                d->t = x->cols[c].type;
+                d->s = x->cols[c].type == T_DECIMAL ? x->cols[c].scale : 0;
+                if (d->t == T_FLOAT64) return fail(x->b, "a CHECK computes no FLOAT64 value");
+                return 0;
+            }
+        return fail(x->b, "no column %s in its table", nm);
+    }
+    case X_NEG:
+        if (ck_bind(x, n->l, false)) return -1;
+        if (x->c->nd[n->l].t != T_INT64 && x->c->nd[n->l].t != T_DECIMAL) return fail(x->b, "arithmetic takes numbers");
+        d->t = x->c->nd[n->l].t;
+        d->s = x->c->nd[n->l].s;
+        return 0;
+    case X_ADD:
+    case X_SUB:
+    case X_MUL:
+    case X_DIV:
+    case X_MOD:
+        if (ck_bind(x, n->l, false) || ck_bind(x, n->r, false)) return -1;
+        return ck_arith(x, n->op, &x->c->nd[n->l], &x->c->nd[n->r], d);
+    case X_AND:
+    case X_OR:
+    case X_NOT:
+        d->t = T_BOOL;
+        d->s = 0;
+        for (int i = 0; i < (n->op == X_NOT ? 1 : 2); i++) {
+            uint16_t o = i ? n->r : n->l;
+            if (ck_bind(x, o, false)) return -1;
+            if (x->c->nd[o].t != T_BOOL) return fail(x->b, "AND, OR and NOT take conditions");
+        }
+        return 0;
+    case X_CMP: return ck_cmp(x, k);
+    case X_FN: return ck_fn(x, k);
+    case X_CASE: return ck_case(x, k);
+    default: return fail(x->b, "a CHECK is a condition on its row: no subquery, aggregate, window function or CAST");
+    }
+}
+
+void ab_check_free(ab_check *c)
+{
+    if (!c) return;
+    aq_free(c->q);
+    free(c->nd);
+    free(c->sbuf);
+    free(c->text);
+    free(c);
+}
+
+int ab_check_bind(const char *text, size_t len, const ab_col *cols, uint16_t ncols, ab_check **out, char *err, size_t errn)
+{
+    *out = NULL;
+    ab b;
+    memset(&b, 0, sizeof b);
+    b.err = err;
+    b.errn = errn;
+    if (errn) err[0] = 0;
+    if (!len || len > CK_MAX_TEXT || !utf8_ok(text, len) || memchr(text, 0, len)) return fail(&b, "a CHECK's text of %zu bytes", len);
+    ab_check *c = calloc(1, sizeof *c);
+    if (!c) return oom(&b);
+    int rc = 0;
+    if (!(c->text = malloc(len + 1)) || !(c->sbuf = malloc(len + 1))) rc = oom(&b);
+    if (!rc) {
+        memcpy(c->text, text, len);
+        c->text[len] = 0;
+        b.s = c->text;
+        b.n = len;
+        rc = lex(&b);
+    }
+    if (!rc && !(c->q = aq_new(&b))) rc = -1;
+    if (!rc) {
+        b.q = c->q;
+        rc = bexpr(&b, &c->root, 0);
+    }
+    if (!rc && b.t[b.i].k != K_EOF) rc = fail(&b, "a CHECK is one condition (offset %u)", b.t[b.i].off);
+    if (!rc && c->q->nsub) rc = fail(&b, "a CHECK is a condition on its row: no subquery");
+    if (!rc && !(c->nd = calloc((size_t)c->q->nex + 1, sizeof *c->nd))) rc = oom(&b);
+    if (!rc) {
+        ck x = {&b, c, cols, ncols};
+        rc = ck_bind(&x, c->root, false);
+        if (!rc && c->nd[c->root].t != T_BOOL) rc = fail(&b, "a CHECK is a condition: its value a BOOL");
+    }
+    free(b.t);
+    if (rc) {
+        ab_check_free(c);
+        return -1;
+    }
+    *out = c;
+    return 0;
+}
+
+/* ---- evaluation: the engine's evaluator's rules (sql_expr.c's, from design.md §5) ---- */
+
+typedef struct cx {
+    const ab_check *c;
+    const ab_val *row;
+    char *err;
+    size_t errn;
+    uint8_t *tbuf[64]; /* computed TEXT, freed with the evaluation */
+    unsigned ntbuf;
+} cx;
+
+static int cfail(cx *e, const char *m)
+{
+    if (e->errn) snprintf(e->err, e->errn, "%s", m);
+    return -1;
+}
+
+static int ctext(cx *e, size_t n, cv *out)
+{
+    if (n > MAX_TEXT) return cfail(e, "a computed TEXT of more than 65535 bytes");
+    if (e->ntbuf >= sizeof e->tbuf / sizeof *e->tbuf) return cfail(e, "too many computed TEXT values");
+    uint8_t *p = malloc(n ? n : 1);
+    if (!p) return cfail(e, "out of memory");
+    e->tbuf[e->ntbuf++] = p;
+    out->p = p;
+    out->n = (uint32_t)n;
+    return 0;
+}
+
+static int ccmp(const cv *a, const cv *b) /* two comparable non-NULL values: -1, 0, 1, exactly */
+{
+    if (a->t == T_TEXT) {
+        uint32_t n = a->n < b->n ? a->n : b->n;
+        int c = n ? memcmp(a->p, b->p, n) : 0;
+        if (c) return c < 0 ? -1 : 1;
+        return a->n < b->n ? -1 : a->n > b->n;
+    }
+    if (a->t == T_DECIMAL || b->t == T_DECIMAL) {
+        __int128 x = a->i, y = b->i, r;
+        int sx = a->t == T_DECIMAL ? a->s : 0, sy = b->t == T_DECIMAL ? b->s : 0;
+        if (sx < sy) {
+            if (__builtin_mul_overflow(x, (__int128)cp10(sy - sx), &r)) return x < 0 ? -1 : 1;
+            x = r;
+        } else if (sy < sx) {
+            if (__builtin_mul_overflow(y, (__int128)cp10(sx - sy), &r)) return y < 0 ? 1 : -1;
+            y = r;
+        }
+        return x < y ? -1 : x > y;
+    }
+    return a->i < b->i ? -1 : a->i > b->i;
+}
+
+static void ctruth(cv *out, int t) /* 1, 0, -1 unknown */
+{
+    memset(out, 0, sizeof *out);
+    out->t = T_BOOL;
+    out->null = t < 0;
+    out->i = t > 0;
+}
+static int ctv(const cv *v) { return v->null ? -1 : v->i != 0; }
+
+static int ccmp3(uint8_t op, const cv *a, const cv *b)
+{
+    if (a->null || b->null) return -1;
+    int c = ccmp(a, b);
+    switch (op) {
+    case C_EQ: return c == 0;
+    case C_NE: return c != 0;
+    case C_LT: return c < 0;
+    case C_LE: return c <= 0;
+    case C_GT: return c > 0;
+    default: return c >= 0;
+    }
+}
+
+static bool crescale(__int128 v, int s, int t, __int128 *out)
+{
+    __int128 r;
+    if (__builtin_mul_overflow(v, (__int128)cp10(t - s), &r) || cmag(r) >= cp10(MAX_SCALE)) return false;
+    *out = r;
+    return true;
+}
+
+static int cwiden(cx *e, cv *v, uint8_t rt, uint8_t rs)
+{
+    if (v->null || (v->t == rt && (rt != T_DECIMAL || v->s == rs))) {
+        v->t = rt;
+        v->s = rs;
+        return 0;
+    }
+    if (rt == T_DECIMAL && (v->t == T_INT64 || v->t == T_DECIMAL)) {
+        int s = v->t == T_DECIMAL ? v->s : 0;
+        if (s > rs || !crescale(v->i, s, rs, &v->i)) return cfail(e, "a DECIMAL result of more than 38 digits");
+        v->t = T_DECIMAL;
+        v->s = rs;
+        return 0;
+    }
+    return cfail(e, "a value of another type than its CASE's or COALESCE's");
+}
+
+static int cdiv(cx *e, __int128 a, __int128 b, int k, __int128 *out) /* |a| * 10^k / |b| half away from zero, signed */
+{
+    if (!b) return cfail(e, "division by zero");
+    unsigned __int128 ua = cmag(a), ub = cmag(b), q, r, lim = cp10(MAX_SCALE), u128max = ~(unsigned __int128)0;
+    if (k <= MAX_SCALE && ua <= u128max / cp10(k)) {
+        unsigned __int128 n = ua * cp10(k);
+        q = n / ub;
+        r = n % ub;
+    } else {
+        if (ub > u128max / 10) return cfail(e, "a DECIMAL division by a value of more than 37 digits");
+        q = ua / ub;
+        r = ua % ub;
+        for (int i = 0; i < k; i++) {
+            if (q > (lim - 1) / 10) return cfail(e, "a DECIMAL result of more than 38 digits");
+            r *= 10;
+            q = q * 10 + r / ub;
+            r %= ub;
+        }
+    }
+    if (r >= ub - r) q++;
+    if (q >= lim) return cfail(e, "a DECIMAL result of more than 38 digits");
+    *out = (a < 0) != (b < 0) ? -(__int128)q : (__int128)q;
+    return 0;
+}
+
+static int carith(cx *e, uint8_t op, const cv *a, const cv *b, uint8_t rt, uint8_t rs, cv *out)
+{
+    memset(out, 0, sizeof *out);
+    out->t = rt;
+    out->s = rs;
+    if (a->null || b->null) {
+        out->null = true;
+        return 0;
+    }
+    __int128 x = a->i, y = b->i, r = 0;
+    if (rt == T_DATE) {
+        r = op == X_ADD ? x + y : x - y;
+        if (r < CK_DATE_MIN || r > CK_DATE_MAX) return cfail(e, "a DATE result out of range");
+        out->i = r;
+        return 0;
+    }
+    if (rt == T_TIMESTAMP) { /* a DATE + a TIME */
+        out->i = a->t == T_DATE ? x * CK_DAY_US + y : y * CK_DAY_US + x;
+        return 0;
+    }
+    if (rt == T_INT64) { /* a DATE - a DATE too: both within their range */
+        switch (op) {
+        case X_ADD: r = x + y; break;
+        case X_SUB: r = x - y; break;
+        case X_MUL:
+            if (__builtin_mul_overflow(x, y, &r)) return cfail(e, "INT64 overflow");
+            break;
+        case X_DIV:
+            if (!y) return cfail(e, "division by zero");
+            r = x / y;
+            break;
+        default:
+            if (!y) return cfail(e, "division by zero");
+            r = x % y;
+            break;
+        }
+        if (r < INT64_MIN || r > INT64_MAX) return cfail(e, "INT64 overflow");
+        out->i = r;
+        return 0;
+    }
+    int sa = a->t == T_DECIMAL ? a->s : 0, sb = b->t == T_DECIMAL ? b->s : 0;
+    switch (op) {
+    case X_MUL:
+        if (__builtin_mul_overflow(x, y, &r) || cmag(r) >= cp10(MAX_SCALE)) return cfail(e, "a DECIMAL result of more than 38 digits");
+        break;
+    case X_DIV:
+        if (cdiv(e, x, y, rs - sa + sb, &r)) return -1;
+        break;
+    default:
+        if (!crescale(x, sa, rs, &x) || !crescale(y, sb, rs, &y)) return cfail(e, "a DECIMAL result of more than 38 digits");
+        if (op == X_MOD) {
+            if (!y) return cfail(e, "division by zero");
+            r = x % y;
+        } else {
+            if (op == X_ADD ? __builtin_add_overflow(x, y, &r) : __builtin_sub_overflow(x, y, &r))
+                return cfail(e, "a DECIMAL result of more than 38 digits");
+            if (cmag(r) >= cp10(MAX_SCALE)) return cfail(e, "a DECIMAL result of more than 38 digits");
+        }
+        break;
+    }
+    out->i = r;
+    return 0;
+}
+
+static uint32_t cu8(const uint8_t *s, uint32_t n, uint32_t i, uint32_t *cpt) /* the next character after i */
+{
+    uint8_t c = s[i];
+    uint32_t k = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4, v = k == 1 ? c : k == 2 ? c & 0x1Fu : k == 3 ? c & 0x0Fu : c & 0x07u;
+    if (k > n - i) k = n - i;
+    for (uint32_t j = 1; j < k; j++) v = v << 6 | (s[i + j] & 0x3Fu);
+    *cpt = v;
+    return i + k;
+}
+
+static int cpat(const uint8_t *p, uint32_t m, uint32_t j, uint32_t esc, uint32_t *cpt, int *wild, uint32_t *next)
+{
+    uint32_t c, k = cu8(p, m, j, &c);
+    *wild = 0;
+    if (esc && c == esc) {
+        if (k >= m) return -1;
+        *next = cu8(p, m, k, cpt);
+        return 0;
+    }
+    if (c == '%' || c == '_') *wild = (int)c;
+    *cpt = c;
+    *next = k;
+    return 0;
+}
+
+static int clike(cx *e, const uint8_t *s, uint32_t n, const uint8_t *p, uint32_t m, uint32_t esc, bool *match)
+{
+    uint32_t i = 0, j = 0, star_j = UINT32_MAX, star_i = 0, cpt, tc, next;
+    int wild;
+    for (uint32_t k = 0; k < m;) {
+        if (cpat(p, m, k, esc, &cpt, &wild, &next)) return cfail(e, "a LIKE pattern ends in its escape character");
+        k = next;
+    }
+    while (i < n) {
+        if (j < m) {
+            cpat(p, m, j, esc, &cpt, &wild, &next);
+            if (wild == '%') {
+                star_j = next;
+                star_i = i;
+                j = next;
+                continue;
+            }
+            uint32_t ni = cu8(s, n, i, &tc);
+            if (wild == '_' || cpt == tc) {
+                i = ni;
+                j = next;
+                continue;
+            }
+        }
+        if (star_j == UINT32_MAX) {
+            *match = false;
+            return 0;
+        }
+        star_i = cu8(s, n, star_i, &tc);
+        i = star_i;
+        j = star_j;
+    }
+    while (j < m) {
+        cpat(p, m, j, esc, &cpt, &wild, &next);
+        if (wild != '%') break;
+        j = next;
+    }
+    *match = j >= m;
+    return 0;
+}
+
+static int ceval(cx *e, uint16_t k, cv *out)
+{
+    const aq *q = e->c->q;
+    const xn *x = QX(q, k);
+    const cnode *d = &e->c->nd[k];
+    cv l, r, h;
+    switch (x->op) {
+    case X_LIT:
+        *out = d->k;
+        out->t = d->t;
+        if (out->null) out->s = d->s;
+        return 0;
+    case X_COL: {
+        const ab_val *v = &e->row[d->col];
+        memset(out, 0, sizeof *out);
+        out->t = d->t;
+        out->s = d->s;
+        out->null = v->null;
+        if (!v->null) {
+            if (d->t == T_TEXT) out->p = v->s, out->n = v->len;
+            else out->i = v->i;
+        }
+        return 0;
+    }
+    case X_NEG:
+        if (ceval(e, x->l, &l)) return -1;
+        *out = l;
+        if (l.null) return 0;
+        out->i = -l.i;
+        if (l.t == T_INT64 && (out->i > INT64_MAX || out->i < INT64_MIN)) return cfail(e, "INT64 overflow");
+        return 0;
+    case X_NOT:
+        if (ceval(e, x->l, &l)) return -1;
+        ctruth(out, ctv(&l) < 0 ? -1 : !ctv(&l));
+        return 0;
+    case X_AND:
+    case X_OR: {
+        if (ceval(e, x->l, &l)) return -1;
+        int a = ctv(&l), stop = x->op == X_AND ? 0 : 1;
+        if (a == stop) {
+            ctruth(out, stop);
+            return 0;
+        }
+        if (ceval(e, x->r, &r)) return -1;
+        int c = ctv(&r);
+        ctruth(out, c == stop ? stop : a < 0 || c < 0 ? -1 : !stop);
+        return 0;
+    }
+    case X_CMP: {
+        if (ceval(e, x->l, &l)) return -1;
+        if (x->cmp == C_ISNULL || x->cmp == C_NOTNULL) {
+            ctruth(out, l.null == (x->cmp == C_ISNULL));
+            return 0;
+        }
+        if (x->cmp == C_IN || x->cmp == C_NOTIN) {
+            int t = l.null ? -1 : 0;
+            cli it;
+            cli_start(&it, q, l.null ? 0 : x->r);
+            for (uint16_t el = cli_next(&it); el; el = cli_next(&it)) {
+                if (ceval(e, el, &r)) return -1;
+                if (r.null) t = -1;
+                else if (ccmp(&l, &r) == 0) {
+                    t = 1;
+                    break;
+                }
+            }
+            ctruth(out, x->cmp == C_IN ? t : t < 0 ? -1 : !t);
+            return 0;
+        }
+        if (ceval(e, x->r, &r)) return -1;
+        if (x->cmp == C_LIKE || x->cmp == C_NOTLIKE) {
+            uint32_t esc = 0;
+            if (x->x3) {
+                if (ceval(e, x->x3, &h)) return -1;
+                if (h.null) l.null = true;
+                else if (h.n && cu8(h.p, h.n, 0, &esc) != h.n) return cfail(e, "a LIKE's ESCAPE is one character");
+            }
+            if (l.null || r.null) {
+                ctruth(out, -1);
+                return 0;
+            }
+            bool m;
+            if (clike(e, l.p, l.n, r.p, r.n, esc, &m)) return -1;
+            ctruth(out, (x->cmp == C_LIKE) == m);
+            return 0;
+        }
+        if (x->cmp != C_BETWEEN) {
+            ctruth(out, ccmp3(x->cmp, &l, &r));
+            return 0;
+        }
+        if (ceval(e, x->x3, &h)) return -1;
+        int lo = ccmp3(C_GE, &l, &r), hi = ccmp3(C_LE, &l, &h);
+        ctruth(out, lo == 0 || hi == 0 ? 0 : lo < 0 || hi < 0 ? -1 : 1);
+        return 0;
+    }
+    case X_FN: {
+        uint16_t el[MAX_ARGS];
+        unsigned na = 0;
+        cli it;
+        cli_start(&it, q, x->l);
+        for (uint16_t a1 = cli_next(&it); a1 && na < MAX_ARGS; a1 = cli_next(&it)) el[na++] = a1;
+        if (x->fn == F_COALESCE) {
+            for (unsigned i = 0; i < na; i++) {
+                if (ceval(e, el[i], out)) return -1;
+                if (!out->null) return cwiden(e, out, d->t, d->s);
+            }
+            memset(out, 0, sizeof *out);
+            out->null = true;
+            out->t = d->t;
+            out->s = d->s;
+            return 0;
+        }
+        cv a[2];
+        for (unsigned i = 0; i < na && i < 2; i++)
+            if (ceval(e, el[i], &a[i])) return -1;
+        if (x->fn == F_NULLIF) {
+            *out = a[0];
+            if (!a[0].null && !a[1].null && ccmp(&a[0], &a[1]) == 0) out->null = true;
+            out->t = d->t;
+            out->s = d->s;
+            return 0;
+        }
+        memset(out, 0, sizeof *out);
+        out->t = d->t;
+        out->s = d->s;
+        for (unsigned i = 0; i < na; i++)
+            if (a[i].null) {
+                out->null = true;
+                return 0;
+            }
+        switch (x->fn) {
+        case F_ABS:
+            out->i = a[0].i < 0 ? -a[0].i : a[0].i;
+            if (a[0].t == T_INT64 && out->i > INT64_MAX) return cfail(e, "INT64 overflow");
+            return 0;
+        case F_LENGTH: {
+            uint32_t c = 0;
+            for (uint32_t i = 0; i < a[0].n; i++) c += (a[0].p[i] & 0xC0) != 0x80;
+            out->i = c;
+            return 0;
+        }
+        case F_LOWER:
+        case F_UPPER: {
+            if (ctext(e, a[0].n, out)) return -1;
+            uint8_t *p = (uint8_t *)(uintptr_t)out->p;
+            for (uint32_t i = 0; i < a[0].n; i++) {
+                uint8_t c = a[0].p[i];
+                p[i] = x->fn == F_LOWER && c >= 'A' && c <= 'Z' ? (uint8_t)(c + 32)
+                     : x->fn == F_UPPER && c >= 'a' && c <= 'z' ? (uint8_t)(c - 32) : c;
+            }
+            return 0;
+        }
+        default: { /* || */
+            if (ctext(e, (size_t)a[0].n + a[1].n, out)) return -1;
+            uint8_t *p = (uint8_t *)(uintptr_t)out->p;
+            if (a[0].n) memcpy(p, a[0].p, a[0].n);
+            if (a[1].n) memcpy(p + a[0].n, a[1].p, a[1].n);
+            return 0;
+        }
+        }
+    }
+    case X_CASE: {
+        cli it;
+        if (x->l && ceval(e, x->l, &l)) return -1;
+        cli_start(&it, q, x->r);
+        for (uint16_t w = cli_next(&it); w; w = cli_next(&it)) {
+            const xn *wx = QX(q, w);
+            if (ceval(e, wx->l, &r)) return -1;
+            bool hit = x->l ? !l.null && !r.null && ccmp(&l, &r) == 0 : !r.null && r.i != 0;
+            if (hit) {
+                if (ceval(e, wx->r, out)) return -1;
+                return cwiden(e, out, d->t, d->s);
+            }
+        }
+        if (x->x3) {
+            if (ceval(e, x->x3, out)) return -1;
+            return cwiden(e, out, d->t, d->s);
+        }
+        memset(out, 0, sizeof *out);
+        out->null = true;
+        out->t = d->t;
+        out->s = d->s;
+        return 0;
+    }
+    default:
+        if (ceval(e, x->l, &l) || ceval(e, x->r, &r)) return -1;
+        return carith(e, x->op, &l, &r, d->t, d->s, out);
+    }
+}
+
+int ab_check_eval(const ab_check *c, const ab_val *row, char *err, size_t errn)
+{
+    cx e = {c, row, err, errn, {0}, 0};
+    if (errn) err[0] = 0;
+    cv v;
+    int rc = ceval(&e, c->root, &v);
+    for (unsigned i = 0; i < e.ntbuf; i++) free(e.tbuf[i]);
+    if (rc) return -1;
+    return v.null || v.i != 0;
+}

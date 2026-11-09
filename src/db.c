@@ -391,6 +391,89 @@ int imdb_hist_create_defaults(imdb_schema_hist *h, const imdb_coldef *defs, uint
     return IMDB_OK;
 }
 
+/* ---- F2b-1: a history's CHECKs: version 1's, then each ADD and DROP CHECK version's, the live ones by name ---- */
+
+int imdb_hist_check(const imdb_schema_hist *h, const char *name)
+{
+    for (uint16_t i = 0; i < h->nchk; i++)
+        if (!strcmp(h->chk[i].name, name)) return i;
+    return -1;
+}
+
+static void chk_live_add(imdb_schema_hist *h, const char *name, const char *text, uint32_t len)
+{
+    uint16_t at = 0;
+    while (at < h->nchk && strcmp(h->chk[at].name, name) < 0) at++;
+    memmove(&h->chk[at + 1], &h->chk[at], (h->nchk - at) * sizeof *h->chk);
+    snprintf(h->chk[at].name, sizeof h->chk[at].name, "%s", name);
+    h->chk[at].text = text;
+    h->chk[at].len = len;
+    h->nchk++;
+    h->chkbytes += len;
+}
+
+static void chk_live_drop(imdb_schema_hist *h, const char *name)
+{
+    int at = imdb_hist_check(h, name);
+    if (at < 0) return; /* the rules (imdb_sver_next) keep this from happening */
+    h->chkbytes -= h->chk[at].len;
+    memmove(&h->chk[at], &h->chk[at + 1], (h->nchk - (uint16_t)at - 1) * sizeof *h->chk);
+    h->nchk--;
+}
+
+/* the live set again from version 1's and the versions' (a copy's own texts) */
+static void chk_live_rebuild(imdb_schema_hist *h)
+{
+    h->nchk = 0;
+    h->chkbytes = 0;
+    for (uint16_t i = 0; i < h->nchk0; i++) chk_live_add(h, h->chk0[i].name, h->chk0[i].text, h->chk0[i].len);
+    for (uint32_t k = 1; k < h->nvers; k++) {
+        const imdb_sver *v = &h->vers[k];
+        if (v->akind == IMDB_ALTER_ADD_CHECK) chk_live_add(h, v->cname, v->ctext, v->clen);
+        else if (v->akind == IMDB_ALTER_DROP_CHECK) chk_live_drop(h, v->cname);
+    }
+}
+
+/* one allocation: the array, then each text and its NUL */
+static imdb_check *checks_dup(const imdb_check *c, uint16_t n, imdb_err *e)
+{
+    size_t total = (size_t)n * sizeof *c;
+    for (uint16_t i = 0; i < n; i++) total += (size_t)c[i].len + 1;
+    imdb_check *d = imdb_alloc(total ? total : 1, e);
+    if (!d) return NULL;
+    char *tp = (char *)(d + n);
+    for (uint16_t i = 0; i < n; i++) {
+        d[i] = c[i];
+        d[i].text = tp;
+        memcpy(tp, c[i].text, c[i].len);
+        tp[c[i].len] = 0;
+        tp += c[i].len + 1;
+    }
+    return d;
+}
+
+int imdb_hist_create_checks(imdb_schema_hist *h, const imdb_check *c, uint16_t n, imdb_err *e)
+{
+    imdb_check *d = checks_dup(c, n, e);
+    if (!d) return e->code;
+    imdb_free(h->chk0);
+    h->chk0 = d;
+    h->nchk0 = n;
+    chk_live_rebuild(h);
+    return IMDB_OK;
+}
+
+int imdb_checks_name_col(const imdb_schema_hist *h, const char *ident, const char **which, imdb_err *e)
+{
+    *which = NULL;
+    for (uint16_t i = 0; i < h->nchk && !*which; i++) {
+        bool has = false;
+        if (imdb_sql_names_ident(h->chk[i].text, h->chk[i].len, ident, &has, e)) return e->code;
+        if (has) *which = h->chk[i].name;
+    }
+    return IMDB_OK;
+}
+
 const imdb_sver *imdb_hist_at(const imdb_schema_hist *h, uint64_t at)
 {
     uint32_t lo = 0, hi = h->nvers; /* the first version past at */
@@ -467,6 +550,8 @@ void imdb_table_free(imdb_table *t)
     }
     ver_free(t);
     imdb_hist_free(&t->hist);
+    imdb_check_free(t->chkc); /* F2b-1 */
+    t->chkc = NULL;
     imdb_free(t);
 }
 
@@ -1948,6 +2033,9 @@ static void tx_op_free(imdb_op *o)
     imdb_free(o->iname);
     imdb_free(o->aname); /* F1: op 22's new name */
     imdb_free(o->defs);  /* F2a: COLUMN_DEFAULTS' */
+    imdb_free(o->chk);   /* F2b-1: TABLE_CHECKS' or ADD CHECK's */
+    o->chk = NULL;
+    o->nchk = 0;
     imdb_free(o->sdef);  /* F2a-2: CREATE_SEQUENCE's */
     o->sdef = NULL;
     o->defs = NULL;
@@ -2133,6 +2221,29 @@ int imdb_create_table_defs(imdb_db *db, imdb_schema *s, uint64_t retention_us, c
     return imdb_seq_own(db, s->id, own, ndefs, 0, e); /* F2a-2: an IDENTITY's sequence, made in this transaction */
 }
 
+/* F2b-1: op 28 after the CREATE (and its op 23), its list the op's own block, installed into version 1 at once (the
+ * CREATE's undo takes the table and them) */
+int imdb_create_table_checks(imdb_db *db, uint32_t table, const imdb_check *c, uint16_t n, imdb_err *e)
+{
+    if (!n) return IMDB_OK;
+    if (!imdb_checks_ok(c, n)) return imdb_fail(e, IMDB_ERR_INVALID, "a CREATE's CHECKs: names unique, texts within %u bytes",
+                                                 IMDB_MAX_CHECK_TEXT);
+    if (!db->ntx || db->tx[db->ntx - 1].table != table ||
+        (db->tx[db->ntx - 1].code != IMDB_OP_SET_RETENTION && db->tx[db->ntx - 1].code != IMDB_OP_COLUMN_DEFAULTS))
+        return imdb_fail(e, IMDB_ERR_STATE, "a CREATE's CHECKs follow it at once");
+    imdb_check *own = checks_dup(c, n, e);
+    imdb_op *op = own ? tx_push(db, e) : NULL;
+    if (!op) {
+        imdb_free(own);
+        return e->code;
+    }
+    op->code = IMDB_OP_TABLE_CHECKS;
+    op->table = table;
+    op->chk = own;
+    op->nchk = n;
+    return imdb_hist_create_checks(&db->t[table]->hist, own, n, e);
+}
+
 int imdb_set_retention(imdb_db *db, imdb_table *t, uint64_t retention_us, imdb_err *e)
 {
     if (!db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "no transaction");
@@ -2176,9 +2287,13 @@ int imdb_sver_next(const imdb_schema_hist *h, const imdb_sver *cur, const imdb_o
     out->atext = NULL;
     memset(&out->adef, 0, sizeof out->adef);
     out->aclock = 0; /* F2a: the ALTER's own, set by the prepare */
+    out->ctext = NULL; /* F2b-1: the ALTER's own, set by the prepare and the install */
+    out->clen = 0;
+    out->cname[0] = 0;
     imdb_schema *s = &out->s;
     int c = -1; /* the column the position names: every kind but ADD and RENAME TO names one, live */
-    if (o->akind != IMDB_ALTER_ADD_COLUMN && o->akind != IMDB_ALTER_RENAME_TABLE) {
+    if (o->akind != IMDB_ALTER_ADD_COLUMN && o->akind != IMDB_ALTER_RENAME_TABLE && o->akind != IMDB_ALTER_ADD_CHECK &&
+        o->akind != IMDB_ALTER_DROP_CHECK) { /* F2b-1: a CHECK names no position */
         if (o->apos >= cur->npos || cur->at[o->apos] < 0) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no such column");
         c = cur->at[o->apos];
     }
@@ -2259,6 +2374,21 @@ int imdb_sver_next(const imdb_schema_hist *h, const imdb_sver *cur, const imdb_o
         if (!imdb_defk_fits(o->aclock, col->type))
             return imdb_fail(e, IMDB_ERR_INVALID, "column %s: that clock value is not of its type", col->name);
         return IMDB_OK;
+    case IMDB_ALTER_ADD_CHECK: /* F2b-1: catalog state (no schema hash covers it): a name no live CHECK holds, within the
+                                * limits; its text binds against the table and every live row passes it (imdb_alter_check) */
+        if (!o->chk || o->nchk != 1 || !imdb_checks_ok(o->chk, 1))
+            return imdb_fail(e, IMDB_ERR_INVALID, "ADD CHECK: a name and a text of 1 to %u bytes", IMDB_MAX_CHECK_TEXT);
+        if (h && imdb_hist_check(h, o->chk[0].name) >= 0)
+            return imdb_fail(e, IMDB_ERR_CONSTRAINT, "constraint %s for table %s already exists", o->chk[0].name, cur->s.name);
+        if (h && h->nchk >= IMDB_MAX_CHECKS)
+            return imdb_fail(e, IMDB_ERR_LIMIT, "a table has at most %u CHECK constraints", IMDB_MAX_CHECKS);
+        if (h && o->chk[0].len > IMDB_MAX_CHECK_TEXT - h->chkbytes)
+            return imdb_fail(e, IMDB_ERR_LIMIT, "a table's CHECKs of more than %u bytes together", IMDB_MAX_CHECK_TEXT);
+        return IMDB_OK;
+    case IMDB_ALTER_DROP_CHECK:
+        if (!o->aname || (h && imdb_hist_check(h, o->aname) < 0))
+            return imdb_fail(e, IMDB_ERR_NOTFOUND, "constraint %s of table %s does not exist", o->aname ? o->aname : "?", cur->s.name);
+        return IMDB_OK;
     case IMDB_ALTER_SET_TYPE:
         if (!alter_widens(col, &o->acol))
             return imdb_fail(e, IMDB_ERR_INVALID, "column %s: only a widening keeps every stored value (a wider DECIMAL of its "
@@ -2300,9 +2430,21 @@ int imdb_alter_check(imdb_db *db, imdb_table *t, const imdb_op *o, imdb_err *e)
     imdb_sver nx;
     if (imdb_sver_next(&t->hist, cur, o, &nx, e)) return e->code; /* the schema's and the history's rules */
     const char *name = o->akind == IMDB_ALTER_ADD_COLUMN ? o->acol.name
-                       : o->akind == IMDB_ALTER_RENAME_TABLE ? NULL
-                                                             : t->s.cols[cur->at[o->apos]].name;
+                       : o->akind == IMDB_ALTER_RENAME_TABLE || o->akind == IMDB_ALTER_ADD_CHECK || o->akind == IMDB_ALTER_DROP_CHECK
+                           ? NULL
+                           : t->s.cols[cur->at[o->apos]].name;
+    if (o->akind == IMDB_ALTER_RENAME_COLUMN || o->akind == IMDB_ALTER_DROP_COLUMN) { /* F2b-1: a CHECK holds its
+                                                                                        * column's name as written */
+        const char *cn = NULL;
+        if (imdb_checks_name_col(&t->hist, name, &cn, e)) return e->code;
+        if (cn)
+            return imdb_fail(e, IMDB_ERR_INVALID, "check constraint %s names column %s: drop it first, then %s the column",
+                             cn, name, o->akind == IMDB_ALTER_DROP_COLUMN ? "drop" : "rename");
+    }
     switch (o->akind) {
+    case IMDB_ALTER_ADD_CHECK: /* F2b-1: its text binds against the table, and every live row passes it */
+        if (imdb_check_bind(&t->s, o->chk[0].text, o->chk[0].len, NULL, e)) return e->code;
+        return imdb_check_rows(db, t, o->chk[0].name, o->chk[0].text, o->chk[0].len, e);
     case IMDB_ALTER_ADD_COLUMN:
     case IMDB_ALTER_DROP_COLUMN: { /* a view that reads the table and holds the name: an ADD's column could capture it,
                                       a DROP's would leave its re-bind nothing (imdb_view_names_col) */
@@ -2370,6 +2512,11 @@ int imdb_hist_prepare(imdb_schema_hist *h, imdb_op *o, imdb_err *e)
         if (o->adef.len) memcpy(h->staged, o->adef.s, o->adef.len);
         o->adef.s = h->staged;
     }
+    if (o->akind == IMDB_ALTER_ADD_CHECK) { /* F2b-1: its text, the version's own at the install */
+        imdb_free(h->cstaged);
+        if (!(h->cstaged = imdb_alloc((size_t)o->chk[0].len + 1, e))) return e->code;
+        memcpy(h->cstaged, o->chk[0].text, o->chk[0].len);
+    }
     /* the next version, whole but its since, in the room just made: the install adopts it */
     imdb_sver *nv = &h->vers[h->nvers];
     *nv = nx;
@@ -2377,6 +2524,12 @@ int imdb_hist_prepare(imdb_schema_hist *h, imdb_op *o, imdb_err *e)
     nv->apos = o->akind == IMDB_ALTER_ADD_COLUMN ? cur->npos : o->apos;
     if (o->akind == IMDB_ALTER_SET_DEFAULT) nv->adef = o->adef;
     if (o->akind == IMDB_ALTER_SET_DEFAULT_CLOCK || o->akind == IMDB_ALTER_ADD_COLUMN) nv->aclock = o->aclock; /* F2a */
+    if (o->akind == IMDB_ALTER_ADD_CHECK) { /* F2b-1 */
+        snprintf(nv->cname, sizeof nv->cname, "%s", o->chk[0].name);
+        nv->clen = o->chk[0].len;
+    } else if (o->akind == IMDB_ALTER_DROP_CHECK) {
+        snprintf(nv->cname, sizeof nv->cname, "%s", o->aname);
+    }
     return imdb_sver_hash(&nv->s, nv->pos, nv->hash, e);
 }
 
@@ -2423,6 +2576,14 @@ void imdb_hist_install(imdb_schema_hist *h, const imdb_op *o, uint64_t seq)
         tc->wclock = o->aclock;
         tc->wseq = 0;
         break;
+    case IMDB_ALTER_ADD_CHECK: /* F2b-1: its text the version's own now, a live CHECK by name */
+        nv->ctext = h->cstaged;
+        h->cstaged = NULL;
+        chk_live_add(h, nv->cname, nv->ctext, nv->clen);
+        break;
+    case IMDB_ALTER_DROP_CHECK:
+        chk_live_drop(h, nv->cname);
+        break;
     case IMDB_ALTER_DROP_DEFAULT:
         tc->wdef = (imdb_value){.type = tc->missing.type, .scale = tc->missing.scale, .null = true};
         tc->wclock = 0;
@@ -2467,8 +2628,27 @@ int imdb_alter_table(imdb_db *db, imdb_table *t, const imdb_op *proto, imdb_err 
         }
         snprintf(op->aname, IMDB_MAX_IDENT + 1, "%s", proto->aname);
     }
+    if (proto->nchk == 1) { /* F2b-1: ADD CHECK's own copy */
+        imdb_check *c = imdb_alloc(sizeof *c + proto->chk[0].len + 1, e);
+        if (!c) {
+            imdb_free(op->aname);
+            op->aname = NULL;
+            db->ntx--;
+            return e->code;
+        }
+        *c = proto->chk[0];
+        char *tp = (char *)(c + 1);
+        memcpy(tp, proto->chk[0].text, proto->chk[0].len);
+        tp[proto->chk[0].len] = 0;
+        c->text = tp;
+        op->chk = c;
+        op->nchk = 1;
+    }
     if (imdb_alter_prepare(t, op, e)) {
         imdb_free(op->aname);
+        imdb_free(op->chk);
+        op->chk = NULL;
+        op->nchk = 0;
         op->aname = NULL;
         db->ntx--;
         return e->code;
@@ -2515,6 +2695,8 @@ void imdb_table_drop_install(imdb_db *db, imdb_table *t, uint64_t seq)
     t->live = 0;
     t->dropped_at = seq;
     db->ended_pass += ended; /* the memory window's trigger, as DELETE's ends */
+    imdb_check_free(t->chkc); /* F2b-1: a dropped table is written no more */
+    t->chkc = NULL;
     imdb_txn_doom_dropped(db, t->s.id, seq);
 }
 
@@ -3828,10 +4010,20 @@ static int altered_since(imdb_db *db, const imdb_table *t, imdb_err *e)
                      "transaction", t->s.name);
 }
 
+/* F2b-1: a row about to be written against its table's live CHECKs (none: nothing decoded) */
+static int row_checks(imdb_db *db, imdb_table *t, const uint8_t *row, size_t len, imdb_err *e)
+{
+    if (!t->hist.nchk) return IMDB_OK;
+    imdb_value vals[IMDB_MAX_COLS];
+    if (imdb_row_decode(&t->s, row, len, vals, e)) return e->code;
+    return imdb_check_row(db, t, vals, e);
+}
+
 static int insert_row_body(imdb_db *db, imdb_table *t, const uint8_t *row, size_t len, const uint8_t *salt, imdb_err *e)
 {
     if (!db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "no transaction");
     if (altered_since(db, t, e)) return e->code;
+    if (row_checks(db, t, row, len, e)) return e->code; /* F2b-1 */
     int rc = IMDB_OK;
     imdb_pkey key;
     if ((rc = imdb_pkey_of_row(&t->s, row, len, &key, e))) return rc;
@@ -3970,6 +4162,7 @@ static int update_row_body(imdb_db *db, imdb_table *t, uint64_t vid, const uint8
             return imdb_fail(e, IMDB_ERR_CONSTRAINT, "UPDATE cannot change the primary key (use DELETE + INSERT)");
     }
     int rc = IMDB_OK;
+    if ((rc = row_checks(db, t, row, len, e))) return rc; /* F2b-1 */
     if ((rc = tx_bytes_check(db, len, e))) return rc;
     imdb_savepoint sp = imdb_savepoint_take(db);
     imdb_op *op = tx_push(db, e);
@@ -6215,7 +6408,16 @@ void imdb_alter_install(imdb_table *t, const imdb_op *o, uint64_t seq)
 void imdb_hist_free(imdb_schema_hist *h)
 {
     for (uint16_t p = 0; p < IMDB_MAX_COLS; p++) imdb_free(h->tcol[p].missing_text); /* a rolled-back ADD's staged slot too */
-    for (uint32_t k = 0; h->vers && k < h->nvers; k++) imdb_free(h->vers[k].atext);
+    for (uint32_t k = 0; h->vers && k < h->nvers; k++) {
+        imdb_free(h->vers[k].atext);
+        imdb_free(h->vers[k].ctext); /* F2b-1 */
+    }
+    imdb_free(h->chk0); /* F2b-1: version 1's CHECKs, an ADD CHECK's staged text */
+    h->chk0 = NULL;
+    h->nchk0 = h->nchk = 0;
+    h->chkbytes = 0;
+    imdb_free(h->cstaged);
+    h->cstaged = NULL;
     imdb_free(h->staged); /* a rolled-back SET DEFAULT's */
     h->staged = NULL;
     imdb_free(h->vers);
@@ -6237,7 +6439,10 @@ int imdb_hist_copy(imdb_schema_hist *dst, const imdb_schema_hist *src, imdb_err 
     if (!v) return e->code;
     uint8_t *txt[IMDB_MAX_COLS] = {0};
     memcpy(v, src->vers, (size_t)src->nvers * sizeof *v);
-    for (uint32_t k = 0; k < src->nvers; k++) v[k].atext = NULL;
+    for (uint32_t k = 0; k < src->nvers; k++) {
+        v[k].atext = NULL;
+        v[k].ctext = NULL;
+    }
     int rc = IMDB_OK;
     for (uint16_t p = 0; p < src->ntcol && !rc; p++)
         if (src->tcol[p].missing_text &&
@@ -6248,9 +6453,20 @@ int imdb_hist_copy(imdb_schema_hist *dst, const imdb_schema_hist *src, imdb_err 
             if (!(v[k].atext = bytes_dup(src->vers[k].atext, src->vers[k].adef.len, e))) rc = e->code;
             else v[k].adef.s = v[k].atext;
         }
+    for (uint32_t k = 0; k < src->nvers && !rc; k++) /* F2b-1: each ADD CHECK's text, the version's own */
+        if (src->vers[k].ctext) {
+            if (!(v[k].ctext = imdb_alloc((size_t)src->vers[k].clen + 1, e))) rc = e->code;
+            else memcpy(v[k].ctext, src->vers[k].ctext, src->vers[k].clen);
+        }
+    imdb_check *c0 = NULL;
+    if (!rc && src->nchk0 && !(c0 = checks_dup(src->chk0, src->nchk0, e))) rc = e->code;
     if (rc) {
         for (uint16_t p = 0; p < IMDB_MAX_COLS; p++) imdb_free(txt[p]);
-        for (uint32_t k = 0; k < src->nvers; k++) imdb_free(v[k].atext);
+        for (uint32_t k = 0; k < src->nvers; k++) {
+            imdb_free(v[k].atext);
+            imdb_free(v[k].ctext);
+        }
+        imdb_free(c0);
         imdb_free(v);
         return rc;
     }
@@ -6259,6 +6475,9 @@ int imdb_hist_copy(imdb_schema_hist *dst, const imdb_schema_hist *src, imdb_err 
     dst->nvers = src->nvers;
     dst->capvers = src->capvers ? src->capvers : 1;
     dst->ntcol = src->ntcol;
+    dst->chk0 = c0; /* F2b-1: version 1's, then the live set from the versions' own texts */
+    dst->nchk0 = src->nchk0;
+    chk_live_rebuild(dst);
     for (uint16_t p = 0; p < IMDB_MAX_COLS; p++) {
         imdb_tcol *tc = &dst->tcol[p];
         *tc = p < src->ntcol ? src->tcol[p] : (imdb_tcol){.wver = -1};

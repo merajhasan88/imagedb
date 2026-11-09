@@ -1204,6 +1204,13 @@ static int run_alter(const char *run)
         {"INSERT INTO dz (id) VALUES (1)", NULL},
         {"ALTER TABLE dz ALTER COLUMN t SET DEFAULT LOCALTIME", NULL},
         {"INSERT INTO dz (id) VALUES (2)", NULL},
+        /* F2b-1: a CREATE's CHECKs (op 28), an ADD CHECK over the rows (kind 11) and a DROP CONSTRAINT (kind 12), the next
+         * CHECKPOINT's manifest version 1's and its history */
+        {"CREATE TABLE ck (id INT64 PRIMARY KEY, a INT64 CHECK (a > 0), s TEXT, CONSTRAINT s_ok CHECK (s IS NULL OR s <> ''))", NULL},
+        {"INSERT INTO ck VALUES (1, 1, 'x'), (2, 2, NULL)", NULL},
+        {"ALTER TABLE ck ADD CONSTRAINT a_small CHECK (a < 100)", NULL},
+        {"ALTER TABLE ck DROP CONSTRAINT s_ok", NULL},
+        {"INSERT INTO ck VALUES (3, 3, '')", NULL},
         {"CHECKPOINT", NULL},
         {"SELECT COUNT(*) FROM txns WHERE c = 'r'", "SELECT COUNT(*) FROM txns WHERE id = 21"},
         {"SELECT note, c, n FROM txns WHERE user_id = 42 ORDER BY id", "SELECT note, 'q', 5 FROM txns WHERE user_id = 42 ORDER BY id"},
@@ -1212,6 +1219,8 @@ static int run_alter(const char *run)
         {"SELECT COUNT(*) FROM dz WHERE t IS NOT NULL", "SELECT COUNT(*) FROM dz WHERE id = 2"},
         {"INSERT INTO dz (id) VALUES (3)", NULL},
         {"SELECT COUNT(*) FROM dz WHERE s = 'd' AND t IS NOT NULL", "SELECT COUNT(*) FROM dz WHERE id >= 2"},
+        {"SELECT COUNT(*) FROM ck WHERE a < 100 AND a > 0", "SELECT COUNT(*) FROM ck"},
+        {"INSERT INTO ck VALUES (4, 4, NULL)", NULL},
     };
     int v = 0;
     size_t done = 0;

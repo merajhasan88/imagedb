@@ -63,6 +63,9 @@
 #define IMDB_MAX_WINDOWS        8u           /* window functions in one SELECT (P2 S6) */
 #define IMDB_MAX_VIEWS          1024u        /* views per database, dropped ones counted: their ids are never reused (P2 S7) */
 #define IMDB_MAX_SEQUENCES      4096u        /* sequences per database, dropped ones counted: ids never reused (F2a-2) */
+#define IMDB_MAX_CHECKS         32u          /* F2b-1: a table's live CHECK constraints */
+#define IMDB_MAX_CHECK_TEXT     8192u        /* F2b-1: bytes in a CHECK's text, and in a table's live ones' together (so their
+                                                compiled statement stays within IMDB_MAX_EXPR_NODES) */
 #define IMDB_MAX_VIEW_TEXT      65536u       /* bytes in one view's query text, as logged (P2 S7) */
 #define IMDB_MAX_VIEW_DEPS      256u         /* tables and views one view's query names, each once (P2 S7) */
 #define IMDB_MAX_VIEW_DEPTH     4u           /* views expanded inside views, deepest (P2 S7) */

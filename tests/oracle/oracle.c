@@ -385,6 +385,8 @@ static bool g_ckey; /* P2 F4, --ckey: u's key is (tid, id), every dialect's; ids
 static bool g_alter; /* P2 F1, --alter: t's last five columns added after its first rows and zz dropped (alter_add) */
 static bool g_defaults; /* F2a, --defaults: t's g, x and s with constant DEFAULTs in every dialect (ddl_defaults), which
                          * INSERT ... SELECT's column lists leaving them out write; the generator draw for draw */
+static bool g_checks; /* F2b-1, --checks: t with two CHECKs in every dialect (ddl_checks): writes some rows fail, refused whole by
+                       * every engine, the states compared after each; the generator draw for draw */
 /* A seed names the same statements only within one stage: each P2 stage (S1 to S4) adds forms to the default
  * generator's draws, so seed N's statements differ from the stage before's (a mismatch is reproduced on its own
  * build); --no-fns and --no-expr reproduce the generators before P2 S1 and before 1a. */
@@ -1956,6 +1958,9 @@ static void gen_dml(stmt *q, bool may_fail)
                 }
                 q->uswhere = chance(30);
             }
+            if (g_checks) q->ups = 0; /* F2b-1: PostgreSQL and SQLite check the proposed row before its conflict, MySQL's and
+                                       * MariaDB's INSERT IGNORE skips a row a CHECK refuses and SQL Server's MERGE checks only
+                                       * what it writes: an INSERT of the drawn rows instead (an existing key fails it alike) */
         }
     } else if (r < 75) {
         q->kind = Q_UPDATE;
@@ -3360,6 +3365,18 @@ static const char *ddl_defaults(int d, const char *s)
     return b[d];
 }
 
+/* --checks (F2b-1): t's CREATE TABLE given two table CHECKs before its closing parenthesis, the same text in every dialect:
+ * integers alone, so every engine computes them alike (a NULL passes, % C's remainder) */
+static const char *ddl_checks(int d, const char *s)
+{
+    static char b[ND][1100];
+    if (!g_checks) return s;
+    size_t n = strlen(s);
+    if (n + 80 >= sizeof b[d] || s[n - 1] != ')') return s;
+    snprintf(b[d], sizeof b[d], "%.*s, CHECK (g <> 13), CHECK (a IS NULL OR a %% 7 <> 3))", (int)(n - 1), s);
+    return b[d];
+}
+
 static const char *ddl(int d, int tab)
 {
     static const char *const T[ND] = {
@@ -3395,7 +3412,7 @@ static const char *ddl(int d, int tab)
         "utf8mb4_nopad_bin)",
         "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, tid BIGINT, v INT, s VARCHAR(255) COLLATE "
         "Latin1_General_100_BIN2_UTF8)"};
-    return tab ? (g_ckey ? UCK[d] : U[d]) : g_alter ? ddl_alter(d, T[d]) : ddl_defaults(d, tz_ddl(d, T[d]));
+    return tab ? (g_ckey ? UCK[d] : U[d]) : g_alter ? ddl_alter(d, T[d]) : ddl_checks(d, ddl_defaults(d, tz_ddl(d, T[d])));
 }
 
 /* ---- canonical cells: every engine's answer to one text per value ------------------------------------------------ */
@@ -4758,7 +4775,9 @@ static int run_seed(unsigned seed, int steps)
             memset(&q, 0, sizeof q);
             q.kind = Q_BEGIN;
             q.gcol = -1;
-            if (run_stmt(seed, step, &q, false)) return -1;
+            /* --checks: its statements on their own (a CHECK may refuse any write, and PostgreSQL aborts a transaction at
+             * its first error), the draws alike */
+            if (!g_checks && run_stmt(seed, step, &q, false)) return -1;
             int k = (int)rr(1, 3);
             for (int i = 0; i < k; i++) {
                 gen_dml(&q, false); /* none that fails: PostgreSQL aborts a transaction at its first error */
@@ -4772,7 +4791,7 @@ static int run_seed(unsigned seed, int steps)
             memset(&q, 0, sizeof q);
             q.kind = chance(50) ? Q_COMMIT : Q_ROLLBACK;
             q.gcol = -1;
-            if (run_stmt(seed, step, &q, false) || check_state(seed, step)) return -1;
+            if ((!g_checks && run_stmt(seed, step, &q, false)) || check_state(seed, step)) return -1;
         }
     }
     return 0;
@@ -4798,6 +4817,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--ckey")) g_ckey = true; /* P2 F4 */
         else if (!strcmp(argv[i], "--alter")) g_alter = true; /* P2 F1 */
         else if (!strcmp(argv[i], "--defaults")) g_defaults = true; /* F2a */
+        else if (!strcmp(argv[i], "--checks")) g_checks = true; /* F2b-1 */
         else if (!strcmp(argv[i], "--tz")) g_tz = true; /* P2: time zones */
         else if (!strcmp(argv[i], "--date")) g_dt = 1; /* F3b */
         else if (!strcmp(argv[i], "--time")) g_dt = 2;
@@ -4806,7 +4826,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--ping")) ping = true; /* connect to every engine named, then stop (run.sh waits on it) */
         else if (!strcmp(argv[i], "-v")) g_verbose = true;
         else {
-            fprintf(stderr, "usage: oracle [--engines LIST] [--seeds A-B] [--steps N] [--dir DIR] [--keep-going] [--no-expr] [--no-fns] [--no-views] [--ckey] [--alter] [--defaults] [--ping] [-v]\n");
+            fprintf(stderr, "usage: oracle [--engines LIST] [--seeds A-B] [--steps N] [--dir DIR] [--keep-going] [--no-expr] [--no-fns] [--no-views] [--ckey] [--alter] [--defaults] [--checks] [--ping] [-v]\n");
             return 2;
         }
     }

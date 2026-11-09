@@ -4582,6 +4582,372 @@ int imdb_sql_names_ident(const char *text, size_t len, const char *ident, bool *
     return IMDB_OK;
 }
 
+/* ---- F2b-1: CHECK constraints (design.md §5, CHECK constraints) ---------------------------------------------------
+ * A CHECK's text, as written, is bound on its own against its table's columns by the same binder a statement's trees
+ * take, within a subset every verifier recomputes exactly: the row's columns, literals, arithmetic, comparisons, IN,
+ * BETWEEN, IS NULL, LIKE, AND, OR, NOT, CASE, COALESCE, NULLIF, LENGTH, ABS, LOWER, UPPER and ||; no clock, sequence or
+ * zone (a value of its moment), no FLOAT64 value (binary64 arithmetic and the exact cross-kind comparison would have
+ * to be reproduced bit for bit by the auditor: deferred.md D19), no TIMESTAMPTZ literal (read in a session's zone), no
+ * subquery, aggregate, window, CAST or parameter. A table's live CHECKs are compiled together, by name, into one
+ * statement "SELECT (\n t1 \n) AND TRUE, ..." (the AND keeps a bare column a tree; its left operand is the text's
+ * tree, which is evaluated), when a write first needs them after its history changed. */
+
+struct imdb_chkc {
+    uint32_t ver; /* the history length it was compiled at */
+    uint16_t n;
+    char *sql;
+    sql_stmt st;
+    imdb_xnode *xn;
+    uint8_t *lits; /* its string literals' bytes (the binder's are the statement's, freed with it) */
+};
+
+void imdb_check_free(struct imdb_chkc *c)
+{
+    if (!c) return;
+    imdb_free(c->lits);
+    imdb_sql_stmt_free(&c->st);
+    imdb_free(c->xn);
+    imdb_free(c->sql);
+    imdb_free(c);
+}
+
+/* the text alone lexes, its parentheses balance (never below its start) and it holds no ';', parameter or ',' outside
+ * them: so in the wrapper it is one operand, its own tree */
+static int chk_lex(const char *text, uint32_t len, imdb_err *e)
+{
+    sql_tok *tk = NULL;
+    uint32_t nt = 0;
+    if (imdb_sql_lex(text, len, &tk, &nt, e)) return e->code;
+    int depth = 0, rc = IMDB_OK;
+    for (uint32_t i = 0; i < nt && !rc; i++) {
+        uint8_t k = tk[i].kind;
+        if (k == TK_LP) depth++;
+        else if (k == TK_RP && --depth < 0) rc = imdb_fail(e, IMDB_ERR_INVALID, "a CHECK's parentheses do not balance");
+        else if (k == TK_SEMI || k == TK_PARAM || (k == TK_COMMA && !depth))
+            rc = imdb_fail(e, IMDB_ERR_INVALID, "a CHECK is one condition: no ';', ',' or parameter outside its parentheses");
+    }
+    if (!rc && depth) rc = imdb_fail(e, IMDB_ERR_INVALID, "a CHECK's parentheses do not balance");
+    if (!rc && !nt) rc = imdb_fail(e, IMDB_ERR_INVALID, "a CHECK holds no condition");
+    imdb_free(tk);
+    return rc;
+}
+
+/* the subset's shapes, before binding */
+static int chk_shape(const sql_stmt *st, uint16_t k, imdb_err *e)
+{
+    if (!k) return IMDB_OK;
+    const sql_expr *x = &st->ex[k];
+    switch (x->op) {
+    case EX_LIT:
+        if (x->lit.kind == LIT_INT || x->lit.kind == LIT_DEC || x->lit.kind == LIT_STR || x->lit.kind == LIT_BOOL ||
+            x->lit.kind == LIT_NULL || x->lit.kind == LIT_TS || x->lit.kind == LIT_DATE || x->lit.kind == LIT_TIME)
+            return IMDB_OK;
+        return imdb_fail(e, IMDB_ERR_INVALID, "a CHECK's literal is an integer, a DECIMAL, a string, TRUE, FALSE, NULL, a DATE, "
+                                              "a TIME or a TIMESTAMP (FLOAT64 and TIMESTAMPTZ values are a later step)");
+    case EX_COL:
+        if (x->qual[0]) return imdb_fail(e, IMDB_ERR_INVALID, "a CHECK names its table's columns bare (%s, not %s.%s)", x->col, x->qual, x->col);
+        return IMDB_OK;
+    case EX_FN:
+        if (x->fn != FN_ABS && x->fn != FN_LENGTH && x->fn != FN_COALESCE && x->fn != FN_NULLIF && x->fn != FN_LOWER &&
+            x->fn != FN_UPPER && x->fn != FN_CONCAT)
+            return imdb_fail(e, IMDB_ERR_INVALID, "a CHECK calls ABS, LENGTH, LOWER, UPPER, COALESCE, NULLIF and || alone (a "
+                                                  "clock, a sequence or a zone would make its verdict one of its moment)");
+        break;
+    case EX_NEG: case EX_ADD: case EX_SUB: case EX_MUL: case EX_DIV: case EX_MOD:
+    case EX_CMP: case EX_AND: case EX_OR: case EX_NOT: case EX_LIST: case EX_CASE: case EX_WHEN:
+        break;
+    default:
+        return imdb_fail(e, IMDB_ERR_INVALID, "a CHECK is a condition on its row: no subquery, aggregate, window function or CAST");
+    }
+    if (chk_shape(st, x->l, e) || chk_shape(st, x->r, e) || chk_shape(st, x->x3, e)) return e->code; /* height-bounded */
+    return IMDB_OK;
+}
+
+/* the subset's types, once bound; the columns it reads into *cols */
+static int chk_types(const sql_stmt *st, const imdb_xnode *xn, uint16_t k, uint64_t *cols, imdb_err *e)
+{
+    if (!k) return IMDB_OK;
+    const sql_expr *x = &st->ex[k];
+    if (x->op != EX_LIST && x->op != EX_WHEN) {
+        if (xn[k].type == IMDB_T_FLOAT64)
+            return imdb_fail(e, IMDB_ERR_INVALID, "a CHECK computes no FLOAT64 value: a later step (deferred.md D19)");
+        if (x->op == EX_LIT && x->lit.kind != LIT_NULL && xn[k].type == IMDB_T_TIMESTAMPTZ) /* a NULL is no instant */
+            return imdb_fail(e, IMDB_ERR_INVALID, "a CHECK reads no TIMESTAMPTZ literal: it would be read in a session's zone");
+    }
+    if (x->op == EX_COL && xn[k].col >= 0 && xn[k].col < 64) *cols |= 1ull << xn[k].col;
+    if (chk_types(st, xn, x->l, cols, e) || chk_types(st, xn, x->r, cols, e) || chk_types(st, xn, x->x3, cols, e)) return e->code;
+    return IMDB_OK;
+}
+
+/* texts (n of them) against schema s: one statement, each item's left operand bound as a CHECK; cols[i] its columns */
+static int chk_compile(const imdb_schema *s, const char *const *text, const uint32_t *len, uint16_t n,
+                       struct imdb_chkc **out, uint64_t *cols, imdb_err *e)
+{
+    *out = NULL;
+    size_t total = 8;
+    for (uint16_t i = 0; i < n; i++) {
+        if (!imdb_check_text_ok(text[i], len[i])) return imdb_fail(e, IMDB_ERR_INVALID, "a CHECK's text is 1 to %u bytes of UTF-8", IMDB_MAX_CHECK_TEXT);
+        if (chk_lex(text[i], len[i], e)) return e->code;
+        total += (size_t)len[i] + 16;
+    }
+    struct imdb_chkc *c = imdb_alloc(sizeof *c, e);
+    if (!c) return e->code;
+    imdb_table *pt = NULL;
+    int rc = IMDB_OK;
+    if (!(c->sql = imdb_alloc(total, e))) rc = e->code;
+    size_t o = 0;
+    if (!rc) {
+        memcpy(c->sql, "SELECT ", 7);
+        o = 7;
+        for (uint16_t i = 0; i < n; i++) {
+            if (i) c->sql[o++] = ',';
+            memcpy(c->sql + o, "(\n", 2);
+            o += 2;
+            memcpy(c->sql + o, text[i], len[i]);
+            o += len[i];
+            memcpy(c->sql + o, "\n) AND TRUE", 11);
+            o += 11;
+        }
+        c->sql[o] = 0;
+        rc = imdb_sql_parse(c->sql, o, &c->st, e);
+    }
+    const sql_stmt *st = &c->st;
+    if (!rc && st->nsub)
+        rc = imdb_fail(e, IMDB_ERR_INVALID, "a CHECK is a condition on its row: no subquery, aggregate, window function or CAST");
+    if (!rc && (st->kind != ST_SELECT || st->nitems != n || !st->no_from || st->nsub || st->narm || st->star || st->distinct ||
+                st->has_group || st->norder || st->has_limit || st->has_offset))
+        rc = imdb_fail(e, IMDB_ERR_INVALID, "a CHECK is one condition");
+    for (uint16_t i = 0; !rc && i < n; i++) {
+        uint16_t a = st->items[i].expr;
+        if (!a || st->ex[a].op != EX_AND || st->ex[st->ex[a].r].op != EX_LIT || st->ex[st->ex[a].r].lit.kind != LIT_BOOL)
+            rc = imdb_fail(e, IMDB_ERR_INVALID, "a CHECK is one condition");
+        else
+            rc = chk_shape(st, st->ex[a].l, e);
+    }
+    if (!rc && !(c->xn = imdb_alloc_array((size_t)st->nex + 1, sizeof *c->xn, e))) rc = e->code;
+    if (!rc && !(pt = imdb_alloc(sizeof *pt, e))) rc = e->code;
+    if (!rc) {
+        pt->s = *s;
+        xctx x;
+        memset(&x, 0, sizeof x);
+        x.sql = c->sql; /* no db: the subset reads nothing of one (no zone, sequence or subquery) */
+        x.st = st;
+        x.xn = c->xn;
+        x.probe = true; /* binds alone: no zone loaded, nothing run */
+        xscope sc = {.st = st, .s = &pt->s, .t = pt, .cols = true, .group_col = -1, .no_corr = true};
+        for (uint16_t i = 0; !rc && i < n; i++) {
+            uint16_t k = st->ex[st->items[i].expr].l;
+            uint64_t cm = 0;
+            if (xbind(&x, &sc, k, e)) rc = e->code;
+            else if (c->xn[k].type != IMDB_T_BOOL)
+                rc = imdb_fail(e, IMDB_ERR_INVALID, "a CHECK is a condition: its value a BOOL, not %s", imdb_type_name(c->xn[k].type));
+            else if (!(rc = chk_types(st, c->xn, k, &cm, e)) && cols)
+                cols[i] = cm;
+        }
+        size_t lt = 0; /* the string literals' bytes, the compiled checks' own: the binder's go with xfree */
+        for (uint16_t k = 1; !rc && k <= st->nex; k++)
+            if (st->ex[k].op == EX_LIT && c->xn[k].k.type == IMDB_T_TEXT && !c->xn[k].k.null) lt += c->xn[k].k.len;
+        if (!rc && !(c->lits = imdb_alloc(lt ? lt : 1, e))) rc = e->code;
+        for (uint16_t k = 1, o2 = 0; !rc && k <= st->nex; k++)
+            if (st->ex[k].op == EX_LIT && c->xn[k].k.type == IMDB_T_TEXT && !c->xn[k].k.null) {
+                if (c->xn[k].k.len) memcpy(c->lits + o2, c->xn[k].k.s, c->xn[k].k.len);
+                c->xn[k].k.s = c->lits + o2;
+                o2 = (uint16_t)(o2 + c->xn[k].k.len);
+            }
+        xfree(&x);
+    }
+    imdb_free(pt);
+    if (rc) {
+        imdb_check_free(c);
+        return rc;
+    }
+    c->n = n;
+    *out = c;
+    return IMDB_OK;
+}
+
+int imdb_check_bind(const imdb_schema *s, const char *text, uint32_t len, uint64_t *cols, imdb_err *e)
+{
+    struct imdb_chkc *c;
+    uint64_t cm[1] = {0};
+    imdb_heap_exempt_begin(); /* the catalog's, never a statement's memory */
+    int rc = chk_compile(s, &text, &len, 1, &c, cm, e);
+    imdb_heap_exempt_end();
+    if (!rc && cols) *cols = cm[0];
+    imdb_check_free(c);
+    return rc;
+}
+
+/* t's live CHECKs compiled for its history as it is (a write's: the first after the history changed compiles them) */
+static int chk_ready(imdb_db *db, imdb_table *t, imdb_err *e)
+{
+    const imdb_schema_hist *h = &t->hist;
+    if (t->chkc && t->chkc->ver == h->nvers) return IMDB_OK;
+    imdb_check_free(t->chkc);
+    t->chkc = NULL;
+    const char *tx[IMDB_MAX_CHECKS];
+    uint32_t tl[IMDB_MAX_CHECKS];
+    for (uint16_t i = 0; i < h->nchk; i++) tx[i] = h->chk[i].text, tl[i] = h->chk[i].len;
+    struct imdb_chkc *c;
+    imdb_heap_exempt_begin(); /* the table's, kept past the statement */
+    int rc = chk_compile(&t->s, tx, tl, h->nchk, &c, NULL, e);
+    imdb_heap_exempt_end();
+    if (rc) return rc;
+    c->ver = h->nvers;
+    t->chkc = c;
+    return IMDB_OK;
+}
+
+/* item i of c on a row: 1 TRUE or NULL (it holds), 0 FALSE, or an evaluation's error */
+static int chk_eval(const struct imdb_chkc *c, uint16_t i, const imdb_value *vals, imdb_xarena *ar, int *holds, imdb_err *e)
+{
+    imdb_xenv env;
+    memset(&env, 0, sizeof env);
+    env.arena = ar;
+    imdb_xval v;
+    if (imdb_x_eval(&c->st, c->xn, c->st.ex[c->st.items[i].expr].l, vals, NULL, &env, &v, e)) return e->code;
+    *holds = v.null || v.i != 0;
+    return IMDB_OK;
+}
+
+int imdb_check_row(imdb_db *db, imdb_table *t, const imdb_value *vals, imdb_err *e)
+{
+    if (!t->hist.nchk) return IMDB_OK;
+    if (chk_ready(db, t, e)) return e->code;
+    imdb_xarena ar = {0};
+    int rc = IMDB_OK;
+    for (uint16_t i = 0; i < t->chkc->n && !rc; i++) { /* by name, PostgreSQL's order: the first that fails is named */
+        int holds = 1;
+        if (!(rc = chk_eval(t->chkc, i, vals, &ar, &holds, e)) && !holds)
+            rc = imdb_fail(e, IMDB_ERR_CONSTRAINT, "new row for table %s violates check constraint %s", t->s.name,
+                           t->hist.chk[i].name);
+    }
+    imdb_xarena_free(&ar);
+    return rc;
+}
+
+/* the tests' one CHECK on one row (db.h): the engine's verdict, against the auditor's */
+int imdb_check_eval_text(const imdb_schema *s, const char *text, uint32_t len, const imdb_value *rows, uint32_t nrows,
+                         int *out, imdb_err *e)
+{
+    struct imdb_chkc *c;
+    int rc = chk_compile(s, &text, &len, 1, &c, NULL, e);
+    if (rc) return rc;
+    imdb_xarena ar = {0};
+    for (uint32_t r = 0; r < nrows; r++) {
+        int holds = 0;
+        imdb_err e2 = {0};
+        int er = chk_eval(c, 0, rows + (size_t)r * s->ncols, &ar, &holds, &e2);
+        out[r] = er ? er : holds;
+        imdb_xarena_free(&ar);
+    }
+    imdb_check_free(c);
+    return IMDB_OK;
+}
+
+int imdb_check_rows(imdb_db *db, imdb_table *t, const char *name, const char *text, uint32_t len, imdb_err *e)
+{
+    struct imdb_chkc *c;
+    imdb_heap_exempt_begin();
+    int rc = chk_compile(&t->s, &text, &len, 1, &c, NULL, e);
+    imdb_heap_exempt_end();
+    if (rc) return rc;
+    imdb_xarena ar = {0};
+    imdb_value vals[IMDB_MAX_COLS];
+    for (uint64_t vid = imdb_v_next(t, 0); vid < t->nver && !rc; vid = imdb_v_next(t, vid + 1)) {
+        const imdb_version *v = imdb_vh(t, vid);
+        if (v->end != IMDB_LIVE || (v->flags & (IMDB_V_STUB | IMDB_V_PURGED))) continue; /* an erased row's payload is gone */
+        int holds = 1;
+        imdb_xmark m = imdb_xarena_mark(&ar);
+        if ((rc = imdb_version_values_v(t, v, vals, e)) || (rc = chk_eval(c, 0, vals, &ar, &holds, e))) break;
+        imdb_xarena_reset(&ar, m);
+        if (!holds) rc = imdb_fail(e, IMDB_ERR_CONSTRAINT, "check constraint %s of table %s is violated by some row", name, t->s.name);
+    }
+    imdb_xarena_free(&ar);
+    imdb_check_free(c);
+    return rc;
+}
+
+/* PostgreSQL's name for a CHECK it names (ChooseConstraintName): table_column_check for one that reads one column,
+ * table_check otherwise, check1, check2 ... past a name taken, the table's and column's names shortened (the longer
+ * first) so it fits IMDB_MAX_IDENT */
+static void chk_name(const char *t, const char *c, unsigned pass, char out[IMDB_MAX_IDENT + 1])
+{
+    char label[16];
+    snprintf(label, sizeof label, pass ? "check%u" : "check", pass);
+    size_t l1 = strlen(t), l2 = c ? strlen(c) : 0, over = strlen(label) + 1 + (c ? 1 : 0), avail = IMDB_MAX_IDENT - over;
+    while (l1 + l2 > avail) {
+        if (l1 > l2) l1--;
+        else l2--;
+    }
+    snprintf(out, IMDB_MAX_IDENT + 1, "%.*s%s%.*s_%s", (int)l1, t, c ? "_" : "", (int)l2, c ? c : "", label);
+}
+
+/* name i of n names chosen or given: given ones must be free, chosen ones avoid every name taken so far (taken[]) */
+static int chk_take(const char *table, const imdb_schema *s, const char *given, uint64_t cols, char taken[][IMDB_MAX_IDENT + 1],
+                    uint16_t ntaken, char out[IMDB_MAX_IDENT + 1], imdb_err *e)
+{
+    if (given[0]) {
+        for (uint16_t k = 0; k < ntaken; k++)
+            if (!strcmp(taken[k], given)) return imdb_fail(e, IMDB_ERR_CONSTRAINT, "constraint %s for table %s already exists", given, table);
+        snprintf(out, IMDB_MAX_IDENT + 1, "%s", given);
+        return IMDB_OK;
+    }
+    const char *col = NULL;
+    if (cols && !(cols & (cols - 1))) col = s->cols[__builtin_ctzll(cols)].name;
+    for (unsigned pass = 0;; pass++) {
+        chk_name(table, col, pass, out);
+        bool used = false;
+        for (uint16_t k = 0; k < ntaken && !used; k++) used = !strcmp(taken[k], out);
+        if (!used) return IMDB_OK;
+    }
+}
+
+static int chk_cmp_name(const void *a, const void *b) { return strcmp(((const imdb_check *)a)->name, ((const imdb_check *)b)->name); }
+
+/* F2b-1: a CREATE's CHECKs, each bound against its schema and named: op 28's list, by name, its texts in x's text */
+static int create_checks(xctx *x, const sql_stmt *st, imdb_check *out, imdb_err *e)
+{
+    char taken[IMDB_MAX_CHECKS][IMDB_MAX_IDENT + 1];
+    uint32_t total = 0;
+    for (uint16_t i = 0; i < st->nchecks; i++) {
+        const char *tx = x->sql + st->checks[i].off;
+        uint32_t tl = st->checks[i].len;
+        uint64_t cols = 0;
+        if (imdb_check_bind(&st->schema, tx, tl, &cols, e)) return e->code;
+        if (chk_take(st->schema.name, &st->schema, st->checks[i].name, cols, taken, i, taken[i], e)) return e->code;
+        total += tl;
+        out[i] = (imdb_check){.len = tl, .text = tx};
+        snprintf(out[i].name, sizeof out[i].name, "%s", taken[i]);
+    }
+    if (total > IMDB_MAX_CHECK_TEXT)
+        return imdb_fail(e, IMDB_ERR_LIMIT, "a table's CHECKs of more than %u bytes together", IMDB_MAX_CHECK_TEXT);
+    qsort(out, st->nchecks, sizeof *out, chk_cmp_name);
+    return IMDB_OK;
+}
+
+/* F2b-1: ALTER TABLE ... ADD CHECK's one, bound against the table and named among its live ones */
+static int alter_check_op(xctx *x, const sql_stmt *st, imdb_table *t, imdb_op *o, imdb_err *e)
+{
+    char taken[IMDB_MAX_CHECKS + 1][IMDB_MAX_IDENT + 1];
+    const imdb_schema_hist *h = &t->hist;
+    const char *tx = x->sql + st->checks[0].off;
+    uint32_t tl = st->checks[0].len;
+    uint64_t cols = 0;
+    for (uint16_t k = 0; k < h->nchk; k++) snprintf(taken[k], sizeof taken[k], "%s", h->chk[k].name);
+    if (imdb_check_bind(&t->s, tx, tl, &cols, e)) return e->code;
+    imdb_check *c = imdb_alloc(sizeof *c + tl + 1, e);
+    if (!c) return e->code;
+    o->chk = c;
+    o->nchk = 1;
+    char *tp = (char *)(c + 1);
+    memcpy(tp, tx, tl);
+    tp[tl] = 0;
+    c->text = tp;
+    c->len = tl;
+    return chk_take(t->s.name, &t->s, st->checks[0].name, cols, taken, h->nchk, c->name, e);
+}
+
 int imdb_view_names_col(const imdb_db *db, uint32_t table, const char *col, const char **name, imdb_err *e)
 {
     *name = NULL;
@@ -7414,6 +7780,9 @@ static int write_row(xctx *x, const sql_stmt *st, imdb_table *t, imdb_value *val
     uint64_t vid = IMDB_NONE;
     imdb_value kv[IMDB_MAX_KEY_COLS];
     for (int c = 0; c < t->s.npk; c++) kv[c] = vals[t->s.key[c]];
+    /* F2b-1: the proposed row passes the table's CHECKs before its conflict is looked for, whichever way it resolves
+     * (PostgreSQL's ExecConstraints before the speculative insertion; SQLite's alike) */
+    if (st->upsert && imdb_check_row(x->db, t, vals, e)) return e->code;
     if (st->upsert && imdb_lookup_pk_at(x->db, t, kv, u->snap, u->pend, &vid, e)) return e->code;
     uint8_t salt[16];
     int rc;
@@ -9304,9 +9673,12 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
                 cd[ncd++] = (imdb_coldef){.col = c, .kind = IMDB_DEFK_VALUE, .v = v};
             }
         }
+        imdb_check ck[IMDB_MAX_CHECKS]; /* F2b-1: each bound against the schema and named before anything is pushed */
+        if (!rc && st->nchecks) rc = create_checks(&x, st, ck, e);
         if (!rc)
             rc = imdb_create_table_defs(db, &st->schema, st->has_retention ? st->retention_us : IMDB_RETAIN_DEFAULT_US, cd,
                                         ncd, e);
+        if (!rc && st->nchecks) rc = imdb_create_table_checks(db, st->schema.id, ck, st->nchecks, e);
         if (!rc) snprintf(r->status, sizeof r->status, "CREATE TABLE %s", st->schema.name);
         break;
     }
@@ -9352,6 +9724,10 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
             else if (!(o.acol.flags & IMDB_COL_NULLABLE) && o.adef.null)
                 rc = imdb_fail(e, IMDB_ERR_INVALID, "column %s is NOT NULL: give it a DEFAULT, which the rows there read",
                                o.acol.name);
+        } else if (o.akind == IMDB_ALTER_ADD_CHECK) { /* F2b-1: bound against the table, named among its live CHECKs */
+            rc = alter_check_op(&x, st, t, &o, e);
+        } else if (o.akind == IMDB_ALTER_DROP_CHECK) {
+            o.aname = st->alter_old;
         } else if (o.akind == IMDB_ALTER_RENAME_TABLE) {
             o.aname = st->alter_new;
         } else { /* a column by name, logged by its position (F1 stage 4: a position names a column for its life) */
@@ -9388,6 +9764,7 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
             }
         }
         if (!rc) rc = imdb_alter_table(db, t, &o, e);
+        imdb_free(o.chk); /* F2b-1: ADD CHECK's (the transaction's op holds its own copy) */
         if (!rc) snprintf(r->status, sizeof r->status, "ALTER TABLE %s", st->table);
         break;
     }

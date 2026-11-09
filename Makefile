@@ -281,6 +281,7 @@ whole: $(WHOLE) $(PROBE) $(DEVSTALL)
 
 # all ten: the five above, then PostgreSQL in a container, MySQL, MariaDB, SQL Server, DuckDB (docker)
 whole-ext: $(WHOLE_EXT) $(PROBE) $(DEVSTALL)
+	sh bench/whole.sh $(WHOLE_EXT)
 
 # The SQL oracle (tests/oracle, P0): imagedb against SQLite in process and, through tests/oracle/run.sh, PostgreSQL,
 # MySQL, MariaDB and SQL Server in private containers, every answer compared. Test-only: it links their clients (the
@@ -290,7 +291,6 @@ $(ORACLE): tests/oracle/oracle.c $(LIB) $(HDR)
 	$(CC) $(CFLAGS) -Wno-missing-prototypes -I /usr/include/postgresql -isystem /usr/include/mysql \
 	  tests/oracle/oracle.c $(LIB) -o $@ $(LDFLAGS) -lsqlite3 -lpq -lmysqlclient -lodbc
 oracle: $(ORACLE)
-	sh bench/whole.sh $(WHOLE_EXT)
 
 # CREATE INDEX measured (docs/bench-2026-10-23.md, the addendum): build/index_sum DIR, a new DIR
 ISUM = $(BUILD)/index_sum
