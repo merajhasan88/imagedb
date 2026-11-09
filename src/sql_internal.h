@@ -17,7 +17,7 @@ typedef struct sql_tok {
 
 /* LIT_EXPR: not a literal but an expression's tree (ex), where a value may be one: an UPDATE's SET, an INSERT's
  * VALUES (a WHERE condition that is not today's col op literal is a tree too: sql_cmp lx) */
-enum { LIT_INT = 1, LIT_DEC, LIT_STR, LIT_BOOL, LIT_TS, LIT_PARAM, LIT_FLOAT, LIT_NULL, LIT_EXPR, LIT_TSTZ }; /* LIT_TSTZ: P2 */
+enum { LIT_INT = 1, LIT_DEC, LIT_STR, LIT_BOOL, LIT_TS, LIT_PARAM, LIT_FLOAT, LIT_NULL, LIT_EXPR, LIT_TSTZ, LIT_DATE, LIT_TIME }; /* LIT_TSTZ: P2; LIT_DATE, LIT_TIME: F3b */
 
 typedef struct sql_lit {
     uint8_t kind;
@@ -49,6 +49,7 @@ typedef struct sql_expr {
     uint16_t x3;             /* EX_CMP BETWEEN: its upper bound; LIKE: its ESCAPE, else 0; EX_CASE: its ELSE */
     uint8_t fn, nargs;       /* EX_FN (P2 S1): FN_*, and its arguments' count */
     uint8_t ctype, cscale, cprec; /* EX_CAST (P2 S1): the target type, scale and precision (a DECIMAL's) */
+    uint16_t cvlen;          /* EX_CAST to VARCHAR(n) (F3c): n, else 0 */
     bool dist;               /* EX_AGG (P2 S2): agg(DISTINCT x); its FILTER (WHERE c) is x3 */
     uint8_t sub, subk;       /* EX_SUBQ (P2 S4): the statement's sub[sub]; subk 0 a value, 1 EXISTS, 2 IN's values */
                              /* EX_WIN (P2 S6): fn a WF_*, agg its aggregate (WF_AGG), l r x3 its arguments, sub its

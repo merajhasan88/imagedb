@@ -69,7 +69,8 @@ static const imdb_value *dump_default(const imdb_table *t, uint16_t c)
  * never the session's zone) quoted with '' */
 static int literal_text(dumper *d, const imdb_value *v, imdb_err *e)
 {
-    if (v->type != IMDB_T_TEXT && v->type != IMDB_T_TIMESTAMP && v->type != IMDB_T_TIMESTAMPTZ) {
+    if (v->type != IMDB_T_TEXT && v->type != IMDB_T_TIMESTAMP && v->type != IMDB_T_TIMESTAMPTZ && v->type != IMDB_T_DATE &&
+        v->type != IMDB_T_TIME) { /* F3b: a DATE and a TIME quoted, as their literals are strings */
         imdb_format_value(v, &d->b);
         return IMDB_OK;
     }
@@ -88,6 +89,7 @@ static void column_text(dumper *d, const imdb_table *t, const imdb_column *c)
 {
     imdb_buf_printf(&d->b, "%s ", c->name);
     if (c->type == IMDB_T_DECIMAL) imdb_buf_printf(&d->b, "DECIMAL(%u,%u)", c->precision, c->scale);
+    else if (c->type == IMDB_T_TEXT && c->vlen) imdb_buf_printf(&d->b, "VARCHAR(%u)", c->vlen); /* F3c */
     else imdb_buf_put_str(&d->b, c->type == IMDB_T_INT64 ? imdb_int_name(c->precision) : imdb_type_name(c->type)); /* F3a */
     if ((c->flags & IMDB_COL_PK) && t->s.npk == 1) imdb_buf_put_str(&d->b, " PRIMARY KEY");
     if (c->flags & IMDB_COL_SUBJECT) imdb_buf_put_str(&d->b, " SUBJECT");

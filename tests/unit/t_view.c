@@ -501,7 +501,7 @@ static void t_view_codec(void)
         {4, 0},   /* a name of length 0 */
         {5, 'V'}, /* the name not folded */
         {6, 0},   /* no column (u16 2 -> 0) */
-        {10, 9},  /* a column of an unknown type */
+        {10, 10}, /* a column of an unknown type (F3b: 9 is TIME, the last) */
         {11, 1},  /* an INT64 with a scale */
         {15, 19}, /* a DECIMAL past 18 places */
         {13, 'a'}, /* two columns named a */

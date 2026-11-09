@@ -13,7 +13,8 @@
 # COLUMN, a SET DEFAULT and a row after them, so the next CHECKPOINT cuts a segment of each side of the drop), (P2) a
 # TIMESTAMPTZ (tag 7: rows of a gap's and an overlap's literals, offsets, a NULL, one updated from the log) with a view of
 # date_trunc and AT TIME ZONE in its text, and (F3a) SMALLINT, INTEGER and BIGINT columns at their ranges' ends, one
-# widened by SET TYPE after the first CHECKPOINT. The live
+# widened by SET TYPE after the first CHECKPOINT, and (F3b) DATE and TIME at their ends, an index on the TIME, a view of
+# DATE arithmetic, one row updated from the log. The live
 # tables are RETENTION FOREVER and the dropped one is kept a century, the longest but FOREVER: a fixture is frozen
 # data, so its history
 # never expires under the tests that open it (the 24-hour default is tested by the unit tests). Every
@@ -71,6 +72,10 @@ sql "INSERT INTO stamp VALUES (1, '2026-03-29 01:30:00 Europe/London', '2026-03-
 sql "CREATE VIEW stamp_day AS SELECT id, date_trunc('day', at, 'Asia/Kathmandu') AS d, at AT TIME ZONE 'America/St_Johns' AS sj FROM stamp" # zones in a view's text
 sql "CREATE TABLE widths (id INTEGER PRIMARY KEY, s SMALLINT, i INTEGER, b BIGINT) RETENTION FOREVER" # F3a: the widths
 sql "INSERT INTO widths VALUES (1, 32767, 2147483647, 9223372036854775807), (2, -32768, -2147483648, NULL), (3, NULL, 0, 1)"
+sql "CREATE TABLE days (d DATE PRIMARY KEY, t TIME NOT NULL, e DATE, note VARCHAR(8)) RETENTION FOREVER" # F3b: DATE and TIME at their ends; F3c: a VARCHAR
+sql "INSERT INTO days VALUES ('0001-01-01', '00:00:00', NULL, 'first'), ('9999-12-31', '23:59:59.999999', '1970-01-01', 'é日😀last'), ('1969-12-31', '12:00:00.5', '2026-11-09', NULL)"
+sql "CREATE INDEX days_t ON days (t)"
+sql "CREATE VIEW days_v AS SELECT d, d - e AS gap, d + t AS at, CAST(d AS TIMESTAMP) AS mid FROM days WHERE e IS NOT NULL" # DATE arithmetic in a view's text
 sql "CHECKPOINT"
 ship
 sql "ALTER TABLE pair ADD w TEXT DEFAULT 'w0'"          # F1: op 22; pair's rows so far are in a segment of version 1
@@ -82,6 +87,9 @@ sql "ALTER TABLE pair ALTER COLUMN n SET DEFAULT 8"      # the write default par
 sql "INSERT INTO pair (b, a, val) VALUES ('q', 4, 44)"   # n 8: the next CHECKPOINT cuts a segment of each version
 sql "ALTER TABLE widths ALTER COLUMN s TYPE INTEGER"    # F3a: a widening, SET TYPE (op 22 kind 9); the first rows in a segment
 sql "INSERT INTO widths VALUES (4, 40000, -1, -9223372036854775808)"  # of the SMALLINT version
+sql "UPDATE days SET e = d + 1, t = '06:30:00' WHERE d = '1969-12-31'" # F3b: a DATE row from the log
+sql "ALTER TABLE days ALTER COLUMN note TYPE VARCHAR(12)" # F3c: a lengthening in the log and the manifest's history
+sql "UPDATE days SET note = 'twelve chars' WHERE d = '1969-12-31'"
 sql "UPDATE stamp SET at = TIMESTAMPTZ '2030-01-01 12:00:00+05:45' WHERE id = 3" # P2: an instant from the log
 sql "UPDATE acct SET balance = 1.00 WHERE id <= 10"
 sql "DELETE FROM ev WHERE id BETWEEN 1 AND 5"

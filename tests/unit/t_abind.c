@@ -178,6 +178,18 @@ static const char *const g_body[] = {
     "SELECT id FROM t ORDER BY id DESC LIMIT 3 OFFSET 1",
     "SELECT id FROM t WITH (NOLOCK) WHERE g = 1",
     "SELECT id, s FROM t WHERE s LIKE 'a!%%' ESCAPE '!' -- a comment\n  AND g BETWEEN -1 AND 9",
+    /* F3b: DATE and TIME: literals, arithmetic, CASTs each way, aggregates, a string literal typed by its neighbour */
+    "SELECT DATE '2026-11-09' AS a, TIME '01:02:03.5' AS b",
+    "SELECT id, d, tm, d + 1 AS n, 1 + d AS n2, d - 1 AS p, d - d AS z, d + tm AS at, tm + d AS at2 FROM dt",
+    "SELECT CAST(ts AS DATE) AS a, CAST(ts AS TIME) AS b, CAST(d AS TIMESTAMP) AS c, CAST(d AS TEXT) AS e2, "
+    "CAST('2026-01-01' AS DATE) AS f, CAST('01:00:00' AS TIME) AS g2 FROM dt",
+    "SELECT MIN(d) AS a, MAX(tm) AS b, COUNT(DISTINCT d) AS c FROM dt",
+    "SELECT id FROM dt WHERE d BETWEEN '2026-01-01' AND '2026-12-31' AND tm > '12:00:00'",
+    "SELECT COALESCE(d, '2000-01-01') AS c, CASE WHEN id > 0 THEN tm ELSE '00:00:00' END AS t2 FROM dt",
+    "SELECT d FROM dt UNION SELECT DATE '2026-01-01'",
+    "SELECT d, LAG(d) OVER (ORDER BY id) AS pd, MAX(tm) OVER (PARTITION BY d) AS mt FROM dt",
+    /* F3c: a CAST to VARCHAR(n) types a TEXT (the length the run's rule) */
+    "SELECT CAST(s AS VARCHAR(10)) AS a, CAST(g AS CHARACTER VARYING(3)) AS b, CAST(s AS VARCHAR) AS c FROM t",
 };
 #define NBODY (sizeof g_body / sizeof *g_body)
 
@@ -191,6 +203,8 @@ static imdb_db *setup(void)
     imdb_session_init(&g_s, db);
     if (run("CREATE TABLE t (id INT64 PRIMARY KEY, g INT64, d DECIMAL(12,2), f FLOAT64, s TEXT, k BOOL, ts TIMESTAMP, e DECIMAL(18,4))") ||
         run("CREATE TABLE u (id INT64 PRIMARY KEY, tid INT64, v INT64, s TEXT, d DECIMAL(10,3))") ||
+        run("CREATE TABLE dt (id INT64 PRIMARY KEY, d DATE, tm TIME, ts TIMESTAMP)") || /* F3b */
+        run("INSERT INTO dt VALUES (1, '2026-11-09', '12:30:00', '2026-11-09 12:30:00')") ||
         run("INSERT INTO t VALUES (1, 1, 1.25, 0.5, 'ab', TRUE, TIMESTAMP '2026-01-01 00:00:00', 2.5)") ||
         run("INSERT INTO u VALUES (1, 1, 7, 'x', 1.125)")) {
         imdb_session_close(&g_s);
@@ -288,6 +302,16 @@ static void t_abind_refusals(void)
         {"SELECT id FROM t; SELECT 1", "end of the query"},
         {"SELECT ROUND(f, 2) AS x FROM t", "ROUND"},
         {"SELECT 1 AS a WHERE 1 = 1", "one row"},
+        {"SELECT tm - tm AS x FROM dt", "date arithmetic"}, /* F3b */
+        {"SELECT d * 2 AS x FROM dt", "date arithmetic"},
+        {"SELECT d + 1.5 AS x FROM dt", "date arithmetic"},
+        {"SELECT CAST(tm AS DATE) AS x FROM dt", "CAST"},
+        {"SELECT CAST(d AS TIME) AS x FROM dt", "CAST"},
+        {"SELECT CAST(d AS INT64) AS x FROM dt", "CAST"},
+        {"SELECT date_trunc('day', d) AS x FROM dt", "date_trunc"},
+        {"SELECT CASE WHEN id > 0 THEN d ELSE ts END AS x FROM dt", "not converted"},
+        {"SELECT CAST(s AS VARCHAR(0)) AS x FROM t", "VARCHAR(n) needs"}, /* F3c */
+        {"SELECT CAST(s AS VARCHAR(65536)) AS x FROM t", "VARCHAR(n) needs"},
     };
     char e[256], m[600];
     ab_result *r = calloc(1, sizeof *r);

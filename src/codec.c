@@ -82,6 +82,8 @@ const char *imdb_type_name(uint8_t t)
     case IMDB_T_TIMESTAMP: return "TIMESTAMP";
     case IMDB_T_FLOAT64: return "FLOAT64";
     case IMDB_T_TIMESTAMPTZ: return "TIMESTAMPTZ";
+    case IMDB_T_DATE: return "DATE";
+    case IMDB_T_TIME: return "TIME";
     }
     return "?";
 }
@@ -96,6 +98,20 @@ bool imdb_int_fits(uint8_t width, int64_t v)
 }
 
 const char *imdb_int_name(uint8_t width) { return width == 16 ? "SMALLINT" : width == 32 ? "INTEGER" : "INT64"; }
+
+uint32_t imdb_text_max(const imdb_column *c) { return c->type == IMDB_T_TEXT ? c->vlen : 0; }
+
+void imdb_text_set_max(imdb_column *c, uint32_t n)
+{
+    c->vlen = (uint16_t)n;
+}
+
+uint32_t imdb_utf8_chars(const uint8_t *s, uint32_t n)
+{
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < n; i++) k += (s[i] & 0xC0) != 0x80; /* every byte but a continuation begins one */
+    return k;
+}
 
 /* ---- FLOAT64 ------------------------------------------------------------- */
 
@@ -223,8 +239,8 @@ void imdb_schema_encode(const imdb_schema *s, imdb_buf *b)
         imdb_buf_put_u8(b, (uint8_t)cl);
         imdb_buf_put(b, c->name, cl);
         imdb_buf_put_u8(b, c->type);
-        imdb_buf_put_u8(b, c->precision);
-        imdb_buf_put_u8(b, c->scale);
+        imdb_buf_put_u8(b, c->type == IMDB_T_TEXT ? (uint8_t)(c->vlen & 0xff) : c->precision); /* F3c: a VARCHAR's length */
+        imdb_buf_put_u8(b, c->type == IMDB_T_TEXT ? (uint8_t)(c->vlen >> 8) : c->scale);
         imdb_buf_put_u8(b, c->flags);
     }
     /* the key, in key order (the format design's slice 1; F4: up to IMDB_MAX_KEY_COLS columns; each keeps its flag) */
@@ -260,6 +276,10 @@ int imdb_schema_decode(imdb_rd *r, imdb_schema *s, imdb_err *e)
         c->precision = imdb_rd_u8(r);
         c->scale = imdb_rd_u8(r);
         c->flags = imdb_rd_u8(r);
+        if (c->type == IMDB_T_TEXT) { /* F3c: the two bytes a VARCHAR's length; a TEXT's precision and scale 0 */
+            c->vlen = (uint16_t)(c->precision | c->scale << 8);
+            c->precision = c->scale = 0;
+        }
         if (c->flags & IMDB_COL_SUBJECT) s->subject = (int16_t)i;
     }
     s->npk = imdb_rd_u8(r); /* the key list, in key order: the schema check wants it and the flags to agree */
@@ -315,6 +335,12 @@ int imdb_value_check(const imdb_column *c, const imdb_value *v, imdb_err *e)
         if (v->i < TS_MIN || v->i > TS_MAX)
             return imdb_fail(e, IMDB_ERR_LIMIT, "column %s: timestamp out of range", c->name);
         return IMDB_OK;
+    case IMDB_T_DATE: /* F3b: TIMESTAMP's years, so a cast between them never fails */
+        if (v->i < IMDB_DATE_MIN || v->i > IMDB_DATE_MAX) return imdb_fail(e, IMDB_ERR_LIMIT, "column %s: date out of range", c->name);
+        return IMDB_OK;
+    case IMDB_T_TIME:
+        if (v->i < 0 || v->i > IMDB_TIME_MAX) return imdb_fail(e, IMDB_ERR_LIMIT, "column %s: time out of range", c->name);
+        return IMDB_OK;
     case IMDB_T_FLOAT64:
         if (!imdb_f64_key_valid(v->i)) return imdb_fail(e, IMDB_ERR_INVALID, "column %s: not a finite FLOAT64", c->name);
         return IMDB_OK;
@@ -323,6 +349,8 @@ int imdb_value_check(const imdb_column *c, const imdb_value *v, imdb_err *e)
         size_t bad;
         if (v->len && !imdb_utf8_valid(v->s, v->len, &bad))
             return imdb_fail(e, IMDB_ERR_INVALID, "column %s: invalid UTF-8 at byte %zu", c->name, bad);
+        if (imdb_text_max(c) && imdb_utf8_chars(v->s, v->len) > imdb_text_max(c)) /* F3c: characters, not bytes */
+            return imdb_fail(e, IMDB_ERR_LIMIT, "column %s: a value longer than VARCHAR(%u)", c->name, imdb_text_max(c));
         return IMDB_OK;
     }
     }
@@ -739,6 +767,37 @@ int imdb_parse_timestamp(const char *s, size_t n, int64_t *out, imdb_err *e)
     return dt_value(&f, out, e);
 }
 
+/* F3b: a DATE's text is exactly 'YYYY-MM-DD'; a TIME's 'HH:MM:SS', then '.' and 1 to 6 digits (24:00:00, which
+ * PostgreSQL takes, is refused: the standard's and SQL Server's range ends at 23:59:59.999999) */
+#define DATE_SHAPE "a DATE must look like 'YYYY-MM-DD'"
+#define TIME_SHAPE "a TIME must look like 'HH:MM:SS[.ffffff]'"
+
+int imdb_parse_date(const char *s, size_t n, int64_t *out, imdb_err *e)
+{
+    int64_t Y, M, D;
+    if (n != 10 || !digits(s, n, 0, 4, &Y) || s[4] != '-' || !digits(s, n, 5, 2, &M) || s[7] != '-' || !digits(s, n, 8, 2, &D))
+        return imdb_fail(e, IMDB_ERR_INVALID, DATE_SHAPE);
+    if (Y < 1 || M < 1 || M > 12 || D < 1 || D > days_in_month(Y, (int)M)) return imdb_fail(e, IMDB_ERR_INVALID, "date field out of range");
+    *out = days_from_civil(Y, (int)M, (int)D);
+    return IMDB_OK;
+}
+
+int imdb_parse_time(const char *s, size_t n, int64_t *out, imdb_err *e)
+{
+    int64_t h, mi, se, fr = 0;
+    if (n < 8 || n > 15 || !digits(s, n, 0, 2, &h) || s[2] != ':' || !digits(s, n, 3, 2, &mi) || s[5] != ':' ||
+        !digits(s, n, 6, 2, &se))
+        return imdb_fail(e, IMDB_ERR_INVALID, TIME_SHAPE);
+    if (n > 8) {
+        size_t fd = n - 9;
+        if (s[8] != '.' || fd < 1 || !digits(s, n, 9, fd, &fr)) return imdb_fail(e, IMDB_ERR_INVALID, TIME_SHAPE);
+        for (size_t k = fd; k < 6; k++) fr *= 10;
+    }
+    if (h > 23 || mi > 59 || se > 59) return imdb_fail(e, IMDB_ERR_INVALID, "time field out of range");
+    *out = (h * 3600 + mi * 60 + se) * 1000000 + fr;
+    return IMDB_OK;
+}
+
 int imdb_parse_timestamptz(const char *s, size_t n, imdb_tzlit *o, imdb_err *e)
 {
     memset(o, 0, sizeof *o);
@@ -843,6 +902,38 @@ void imdb_format_timestamp(int64_t t, imdb_buf *out)
     imdb_buf_put(out, p, (size_t)(e - p));
 }
 
+/* F3b: 'YYYY-MM-DD', the date part of a TIMESTAMP's text */
+void imdb_format_date(int64_t days, imdb_buf *out)
+{
+    int64_t y;
+    int m, d;
+    civil_from_days(days, &y, &m, &d);
+    char b[16], *e = b + sizeof b, *p = e;
+    p -= pad_digits(d, 2, p);
+    *--p = '-';
+    p -= pad_digits(m, 2, p);
+    *--p = '-';
+    p -= pad_digits(y, 4, p);
+    imdb_buf_put(out, p, (size_t)(e - p));
+}
+
+/* F3b: 'HH:MM:SS', and '.ffffff' when microseconds remain (a TIMESTAMP's time part, its rule) */
+void imdb_format_time(int64_t us, imdb_buf *out)
+{
+    int64_t secs = us / 1000000, f = us % 1000000;
+    char b[24], *e = b + sizeof b, *p = e;
+    if (f) {
+        p -= pad_digits(f, 6, p);
+        *--p = '.';
+    }
+    p -= pad_digits(secs % 60, 2, p);
+    *--p = ':';
+    p -= pad_digits(secs / 60 % 60, 2, p);
+    *--p = ':';
+    p -= pad_digits(secs / 3600, 2, p);
+    imdb_buf_put(out, p, (size_t)(e - p));
+}
+
 void imdb_format_timestamptz(int64_t utc_us, int32_t off, imdb_buf *out)
 {
     imdb_format_timestamp(utc_us + (int64_t)off * 1000000, out);
@@ -905,6 +996,8 @@ void imdb_format_value(const imdb_value *v, imdb_buf *out)
     case IMDB_T_DECIMAL: imdb_format_decimal(v->i, v->scale, out); break;
     case IMDB_T_BOOL: imdb_buf_put_str(out, v->i ? "true" : "false"); break;
     case IMDB_T_TIMESTAMP: imdb_format_timestamp(v->i, out); break;
+    case IMDB_T_DATE: imdb_format_date(v->i, out); break;
+    case IMDB_T_TIME: imdb_format_time(v->i, out); break;
     case IMDB_T_TIMESTAMPTZ: imdb_format_timestamptz(v->i, 0, out); break; /* no zone here: UTC (the renderer has its cell's offset) */
     case IMDB_T_FLOAT64: imdb_format_float64(v->i, out); break;
     case IMDB_T_TEXT: imdb_buf_put(out, v->s, v->len); break;

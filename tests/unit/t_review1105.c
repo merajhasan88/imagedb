@@ -134,7 +134,8 @@ static void t_null_param(void)
     CHECK(db);
     if (!db) return;
     expect(&s, "PREPARE p AS SELECT $1", true);
-    const uint8_t types[] = {IMDB_T_INT64, IMDB_T_DECIMAL, IMDB_T_TEXT, IMDB_T_FLOAT64, IMDB_T_BOOL, IMDB_T_TIMESTAMP};
+    const uint8_t types[] = {IMDB_T_INT64, IMDB_T_DECIMAL, IMDB_T_TEXT,      IMDB_T_FLOAT64, IMDB_T_BOOL,
+                             IMDB_T_TIMESTAMP, IMDB_T_TIMESTAMPTZ, IMDB_T_DATE, IMDB_T_TIME}; /* P2, F3b too */
     for (size_t i = 0; i < sizeof types / sizeof *types; i++) {
         imdb_value v = {.type = types[i], .scale = types[i] == IMDB_T_DECIMAL ? 2 : 0, .null = true};
         imdb_result r;

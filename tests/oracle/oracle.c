@@ -89,6 +89,10 @@ static void sb_reset(sb *b)
  * DATETIMEOFFSET; SQLite's integers as ever), its values within MySQL's TIMESTAMP range, its literals written with
  * +00:00 (MariaDB's without), imagedb's and PostgreSQL's sessions in the seed's zone (g_tzname), every answer an instant */
 static bool g_tz;
+/* F3b, --date and --time: t.ts a DATE (whole days) or a TIME (a day's microseconds) in every dialect, by the same draws
+ * (a day's or a time of day's part of the TIMESTAMP's draw); SQLite's integers (microseconds), as ever */
+static int g_dt; /* 1 --date, 2 --time */
+#define DAY_US 86400000000LL
 static const char *g_tzname = "UTC";
 enum { CT_INT, CT_DEC, CT_FLT, CT_TXT, CT_BOOL, CT_TS };
 enum { D_IMDB, D_SQLITE, D_PG, D_MY, D_MA, D_MS, ND };
@@ -182,6 +186,8 @@ static void gen_val(int tab, int c, val *v, int null_pct)
     case CT_BOOL: v->i = rr(0, 1); break;
     case CT_TS: /* 1970 to 2099, in microseconds; --tz: within MySQL's TIMESTAMP (from 1970-01-01 00:00:01 to 2037), by the same draw */
         v->i = g_tz ? 1000000 + rr(0, 4102444799999999ll) % 2145916800000000ll : rr(0, 4102444799999999ll);
+        if (g_dt == 1) v->i -= v->i % DAY_US; /* F3b: the draw's day (a draw is never negative) */
+        if (g_dt == 2) v->i %= DAY_US;        /* its time of day */
         break;
     }
 }
@@ -2053,6 +2059,21 @@ static void put_ts(sb *b, int64_t us)
               s / 60 % 60, s % 60, f);
 }
 
+/* F3b: a DATE's literal (the day of the microseconds at its midnight) and a TIME's (a day's microseconds) */
+static void put_day(sb *b, int64_t us)
+{
+    int64_t y;
+    unsigned mo, d;
+    civil(us / 86400000000ll, &y, &mo, &d);
+    sb_printf(b, "%04" PRId64 "-%02u-%02u", y, mo, d);
+}
+
+static void put_tod(sb *b, int64_t us)
+{
+    int64_t s = us / 1000000, f = us % 1000000;
+    sb_printf(b, "%02" PRId64 ":%02" PRId64 ":%02" PRId64 ".%06" PRId64, s / 3600, s / 60 % 60, s % 60, f);
+}
+
 static void put_dec(sb *b, __int128 x)
 {
     bool neg = x < 0;
@@ -2121,8 +2142,14 @@ static void put_lit(sb *b, int d, int t, const val *v)
     case CT_TS:
         if (d == D_SQLITE) sb_printf(b, "%" PRId64, v->i);
         else {
+            /* F3b, --time: MySQL 8.4.13 answers a TIME column IN a list of strings that holds a NULL as NULL on every
+             * row, the equal one too (ts IN ('13:14:41.210913', NULL); right with TIME '...'; reproduced alone,
+             * .work/mysql-defects/probe-timein.sql; MySQL bugs 111409 and 117245): its TIME literals typed */
+            if (g_dt == 2 && d == D_MY) sb_str(b, "TIME ");
             sb_str(b, "'");
-            put_ts(b, v->i);
+            if (g_dt == 2) put_tod(b, v->i); /* F3b: 'HH:MM:SS.ffffff' */
+            else if (g_dt == 1) put_day(b, v->i); /* 'YYYY-MM-DD' */
+            else put_ts(b, v->i);
             if (g_tz && d != D_MA) sb_str(b, "+00:00"); /* --tz: an instant's literal (MariaDB's: its +00:00 session) */
             sb_str(b, "'");
         }
@@ -2950,6 +2977,8 @@ static void put_ups_my(sb *b, int d, const stmt *q)
 static void print_merge(sb *b, const stmt *q)
 {
     static const char *const MT[] = {"BIGINT", "DECIMAL(12,2)", "FLOAT(53)", "VARCHAR(255)", "BIT", "DATETIME2(6)"};
+    static const char *const MD[] = {"BIGINT", "DECIMAL(12,2)", "FLOAT(53)", "VARCHAR(255)", "BIT", "DATE"};    /* F3b */
+    static const char *const MTM[] = {"BIGINT", "DECIMAL(12,2)", "FLOAT(53)", "VARCHAR(255)", "BIT", "TIME(6)"};
     static const char *const MTZ[] = {"BIGINT", "DECIMAL(12,2)", "FLOAT(53)", "VARCHAR(255)", "BIT", "DATETIMEOFFSET(6)"};
     sb_str(b, "MERGE INTO t AS tgt USING (VALUES ");
     for (int r = 0; r < q->nrow; r++) {
@@ -2957,7 +2986,7 @@ static void print_merge(sb *b, const stmt *q)
         for (int c = 0; c < ncols(0); c++) {
             sb_str(b, c ? ", CAST(" : "CAST(");
             put_lit(b, D_MS, cols(0)[c].t, &q->row[r][c]);
-            sb_printf(b, " AS %s)", (g_tz ? MTZ : MT)[cols(0)[c].t]);
+            sb_printf(b, " AS %s)", (g_tz ? MTZ : g_dt == 1 ? MD : g_dt == 2 ? MTM : MT)[cols(0)[c].t]);
         }
         sb_str(b, ")");
     }
@@ -3288,13 +3317,17 @@ static const char *ddl_alter(int d, const char *whole)
 static const char *const TZ_TY[ND] = {"TIMESTAMPTZ", "INTEGER", "TIMESTAMPTZ(6)", "TIMESTAMP(6) NULL", "TIMESTAMP(6) NULL",
                                       "DATETIMEOFFSET(6)"};
 
+/* F3b: ts's type in each dialect under --date and --time (SQLite's integers as ever) */
+static const char *const DT_DATE[ND] = {"DATE", "INTEGER", "DATE", "DATE", "DATE", "DATE"};
+static const char *const DT_TIME[ND] = {"TIME", "INTEGER", "TIME(6)", "TIME(6)", "TIME(6)", "TIME(6)"};
+
 /* --tz: a CREATE TABLE t with ts's type an instant's (the text up to ts kept; --alter's has no ts: ALTER adds it) */
 static const char *tz_ddl(int d, const char *s)
 {
     static char b[ND][800];
     const char *p = strstr(s, " ts ");
-    if (!g_tz || !p) return s;
-    snprintf(b[d], sizeof b[d], "%.*s ts %s)", (int)(p - s), s, TZ_TY[d]);
+    if ((!g_tz && !g_dt) || !p) return s; /* F3b: --date and --time type it too */
+    snprintf(b[d], sizeof b[d], "%.*s ts %s)", (int)(p - s), s, g_dt == 1 ? DT_DATE[d] : g_dt == 2 ? DT_TIME[d] : TZ_TY[d]);
     return b[d];
 }
 
@@ -3314,9 +3347,9 @@ static const char *ddl(int d, int tab)
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, g SMALLINT, a BIGINT, x BIGINT, d DECIMAL(12,2), f FLOAT(53), "
         "s VARCHAR(255) COLLATE Latin1_General_100_BIN2_UTF8, k BIT, ts DATETIME2(6))"};
     static const char *const UCK[ND] = { /* --ckey (P2 F4) */
-        "CREATE TABLE u (id INT64 NOT NULL, tid INT64 NOT NULL, v INTEGER, s TEXT, PRIMARY KEY (tid, id))",
+        "CREATE TABLE u (id INT64 NOT NULL, tid INT64 NOT NULL, v INTEGER, s VARCHAR(255), PRIMARY KEY (tid, id))", /* F3c: u.s a VARCHAR */
         "CREATE TABLE u (id INTEGER NOT NULL, tid INTEGER NOT NULL, v INTEGER, s TEXT, PRIMARY KEY (tid, id))",
-        "CREATE TABLE u (id BIGINT NOT NULL, tid BIGINT NOT NULL, v INTEGER, s TEXT COLLATE \"C\", PRIMARY KEY (tid, id))",
+        "CREATE TABLE u (id BIGINT NOT NULL, tid BIGINT NOT NULL, v INTEGER, s VARCHAR(255) COLLATE \"C\", PRIMARY KEY (tid, id))",
         "CREATE TABLE u (id BIGINT NOT NULL, tid BIGINT NOT NULL, v INT, s VARCHAR(255) CHARACTER SET utf8mb4 COLLATE "
         "utf8mb4_0900_bin, PRIMARY KEY (tid, id))",
         "CREATE TABLE u (id BIGINT NOT NULL, tid BIGINT NOT NULL, v INT, s VARCHAR(255) CHARACTER SET utf8mb4 COLLATE "
@@ -3324,9 +3357,9 @@ static const char *ddl(int d, int tab)
         "CREATE TABLE u (id BIGINT NOT NULL, tid BIGINT NOT NULL, v INT, s VARCHAR(255) COLLATE "
         "Latin1_General_100_BIN2_UTF8, PRIMARY KEY (tid, id))"};
     static const char *const U[ND] = {
-        "CREATE TABLE u (id INT64 PRIMARY KEY, tid INT64, v INTEGER, s TEXT)",
+        "CREATE TABLE u (id INT64 PRIMARY KEY, tid INT64, v INTEGER, s VARCHAR(255))", /* F3c */
         "CREATE TABLE u (id INTEGER PRIMARY KEY, tid INTEGER, v INTEGER, s TEXT)",
-        "CREATE TABLE u (id BIGINT PRIMARY KEY, tid BIGINT, v INTEGER, s TEXT COLLATE \"C\")",
+        "CREATE TABLE u (id BIGINT PRIMARY KEY, tid BIGINT, v INTEGER, s VARCHAR(255) COLLATE \"C\")",
         "CREATE TABLE u (id BIGINT PRIMARY KEY, tid BIGINT, v INT, s VARCHAR(255) CHARACTER SET utf8mb4 COLLATE "
         "utf8mb4_0900_bin)",
         "CREATE TABLE u (id BIGINT PRIMARY KEY, tid BIGINT, v INT, s VARCHAR(255) CHARACTER SET utf8mb4 COLLATE "
@@ -3389,6 +3422,24 @@ static int canon_bool_text(sb *b, const char *s)
 
 /* "YYYY-MM-DD[ HH:MM:SS[.f...]]" to microseconds; P2 (--tz): then an offset, Z, +HH, +HH:MM or +HH:MM:SS (SQL Server's
  * after a space), taken off, so every engine's text of one instant is one number */
+/* F3b, --time: a TIME's text, 'HH:MM:SS' and a fraction of 1 to 6 digits, as the day's microseconds */
+static int canon_tod_text(sb *b, const char *s)
+{
+    int64_t h = 0, mi = 0, se = 0, us = 0;
+    int n = 0;
+    if (sscanf(s, "%2" SCNd64 ":%2" SCNd64 ":%2" SCNd64 "%n", &h, &mi, &se, &n) != 3 || n != 8) return -1;
+    s += n;
+    if (*s == '.') {
+        int k = 0;
+        for (s++; *s >= '0' && *s <= '9'; s++, k++)
+            if (k < 6) us = us * 10 + (*s - '0');
+        for (; k < 6; k++) us *= 10;
+    }
+    if (*s) return -1;
+    sb_printf(b, "%" PRId64, (h * 3600 + mi * 60 + se) * 1000000 + us);
+    return 0;
+}
+
 static int canon_ts_text(sb *b, const char *s)
 {
     int64_t y = 0, mo = 0, d = 0, h = 0, mi = 0, se = 0, us = 0, off = 0;
@@ -3447,7 +3498,7 @@ static int canon_text(sb *b, int ty, const char *s, size_t len)
     }
     case CT_TXT: sb_put(b, s, len); return 0;
     case CT_BOOL: return canon_bool_text(b, s);
-    case CT_TS: return canon_ts_text(b, s);
+    case CT_TS: return g_dt == 2 ? canon_tod_text(b, s) : canon_ts_text(b, s); /* F3b: a TIME's text alone */
     }
     return -1;
 }
@@ -3622,7 +3673,9 @@ static void exec_imdb_p(eng *e, const char *sql, bool rows, const int *ty, int n
                 case CT_FLT: canon_flt(&row, imdb_f64_value(cl->v.i)); break;
                 case CT_TXT: sb_put(&row, (const char *)cl->v.s, cl->v.len); break;
                 case CT_BOOL:
-                case CT_TS: sb_printf(&row, "%" PRId64, cl->v.i); break;
+                case CT_TS: /* F3b: a DATE's days as its midnight's microseconds, as the others' texts read */
+                    sb_printf(&row, "%" PRId64, (int64_t)(cl->v.type == IMDB_T_DATE ? cl->v.i * DAY_US : cl->v.i));
+                    break;
                 }
             sb_str(&row, "\x1f");
         }
@@ -4191,14 +4244,16 @@ static imdb_value par_value(int i)
     static const uint8_t IT[] = {IMDB_T_INT64, IMDB_T_DECIMAL, IMDB_T_FLOAT64, IMDB_T_TEXT, IMDB_T_BOOL, IMDB_T_TIMESTAMP};
     const val *v = &g_par[i].v;
     int t = g_par[i].t;
-    imdb_value x = {.type = g_tz && t == CT_TS ? IMDB_T_TIMESTAMPTZ : IT[t], .scale = t == CT_DEC ? 2 : 0}; /* --tz: an instant */
+    imdb_value x = {.type = t != CT_TS ? IT[t] : g_tz ? IMDB_T_TIMESTAMPTZ : g_dt == 1 ? IMDB_T_DATE : g_dt == 2 ? IMDB_T_TIME
+                                                                   : IMDB_T_TIMESTAMP,
+                    .scale = t == CT_DEC ? 2 : 0}; /* --tz: an instant; F3b: a DATE's days, a TIME's microseconds */
     if (v->null) {
         x.null = true;
         return x;
     }
     if (t == CT_FLT) x.i = imdb_f64_key(v->f);
     else if (t == CT_TXT) x.s = (const uint8_t *)v->s, x.len = (uint32_t)strlen(v->s);
-    else x.i = v->i; /* INT64, DECIMAL scaled by 100, BOOL, TIMESTAMP's microseconds */
+    else x.i = t == CT_TS && g_dt == 1 ? v->i / DAY_US : v->i; /* INT64, DECIMAL scaled by 100, BOOL, TIMESTAMP's microseconds */
     return x;
 }
 
@@ -4210,6 +4265,8 @@ static void exec_prepared(eng *e, sb *text, bool rows, const int *ty, int nty, r
 {
     static const char *const TN[] = {"INT64", "DECIMAL(18,2)", "FLOAT64", "TEXT", "BOOL", "TIMESTAMP"};
     static const char *const TNZ[] = {"INT64", "DECIMAL(18,2)", "FLOAT64", "TEXT", "BOOL", "TIMESTAMPTZ"}; /* --tz */
+    static const char *const TND[] = {"INT64", "DECIMAL(18,2)", "FLOAT64", "TEXT", "BOOL", "DATE"}; /* F3b */
+    static const char *const TNT[] = {"INT64", "DECIMAL(18,2)", "FLOAT64", "TEXT", "BOOL", "TIME"};
     long k = g_prep_runs++;
     bool api = k % 2 == 1, decl = !(api && k % 4 == 3);
     g_prep_last_api = api;
@@ -4217,7 +4274,8 @@ static void exec_prepared(eng *e, sb *text, bool rows, const int *ty, int nty, r
     for (int i = 0; i < g_npar; i++) g_prep_last_null |= g_par[i].v.null;
     sb p = {0}, x = {0};
     sb_str(&p, "PREPARE oq");
-    for (int i = 0; decl && i < g_npar; i++) sb_printf(&p, "%s%s", i ? ", " : " (", (g_tz ? TNZ : TN)[g_par[i].t]);
+    for (int i = 0; decl && i < g_npar; i++)
+        sb_printf(&p, "%s%s", i ? ", " : " (", (g_tz ? TNZ : g_dt == 1 ? TND : g_dt == 2 ? TNT : TN)[g_par[i].t]);
     sb_str(&p, g_npar && decl ? ") AS " : " AS "); /* the statement whole: sb_printf takes pieces of 512 bytes (P2 S13: a
                                                     * write runs past) */
     sb_str(&p, text->p);
@@ -4588,7 +4646,8 @@ static void alter_add(void)
         for (int k = 0; k < 5; k++) {
             sb b = {0};
             sb_printf(&b, "ALTER TABLE t ADD %s%s %s", d == D_MS ? "" : "COLUMN ", TC[4 + k].name,
-                      g_tz && k == 4 ? TZ_TY[d] : ALT_TY[k][d]); /* --tz: ts an instant's type */
+                      k == 4 && g_tz ? TZ_TY[d] : k == 4 && g_dt ? (g_dt == 1 ? DT_DATE : DT_TIME)[d] : ALT_TY[k][d]); /* --tz,
+                      * F3b: ts its mode's type */
             if (d == D_MS) sb_str(&b, " NULL");
             if (!dv[k].null) {
                 sb_str(&b, " DEFAULT ");
@@ -4710,6 +4769,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--ckey")) g_ckey = true; /* P2 F4 */
         else if (!strcmp(argv[i], "--alter")) g_alter = true; /* P2 F1 */
         else if (!strcmp(argv[i], "--tz")) g_tz = true; /* P2: time zones */
+        else if (!strcmp(argv[i], "--date")) g_dt = 1; /* F3b */
+        else if (!strcmp(argv[i], "--time")) g_dt = 2;
         else if (!strcmp(argv[i], "--no-view-audit")) g_view_audit = false; /* P2 S7b */
         else if (!strcmp(argv[i], "--audit") && i + 1 < argc) snprintf(g_audit_bin, sizeof g_audit_bin, "%s", argv[++i]);
         else if (!strcmp(argv[i], "--ping")) ping = true; /* connect to every engine named, then stop (run.sh waits on it) */
@@ -4718,6 +4779,10 @@ int main(int argc, char **argv)
             fprintf(stderr, "usage: oracle [--engines LIST] [--seeds A-B] [--steps N] [--dir DIR] [--keep-going] [--no-expr] [--no-fns] [--no-views] [--ckey] [--alter] [--ping] [-v]\n");
             return 2;
         }
+    }
+    if (g_tz && g_dt) {
+        fprintf(stderr, "oracle: --tz and --date or --time each type t.ts: one of them\n");
+        return 2;
     }
     char list[256];
     snprintf(list, sizeof list, "%s", engines);

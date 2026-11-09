@@ -391,6 +391,16 @@ static int bind_lit(xctx *x, const sql_lit *l, const imdb_column *c, bool compar
                 return imdb_fail(e, IMDB_ERR_INVALID, "column %s expects TIMESTAMP '...'", c->name);
             if (imdb_parse_timestamp(txt, tl, &out->i, e)) return e->code;
             break;
+        case IMDB_T_DATE: /* F3b */
+            if (l->kind != LIT_DATE && l->kind != LIT_STR)
+                return imdb_fail(e, IMDB_ERR_INVALID, "column %s expects DATE '...'", c->name);
+            if (imdb_parse_date(txt, tl, &out->i, e)) return e->code;
+            break;
+        case IMDB_T_TIME:
+            if (l->kind != LIT_TIME && l->kind != LIT_STR)
+                return imdb_fail(e, IMDB_ERR_INVALID, "column %s expects TIME '...'", c->name);
+            if (imdb_parse_time(txt, tl, &out->i, e)) return e->code;
+            break;
         case IMDB_T_TIMESTAMPTZ: /* P2: its offset, its zone, or the session's zone */
             if (l->kind != LIT_TSTZ && l->kind != LIT_STR)
                 return imdb_fail(e, IMDB_ERR_INVALID, "column %s expects TIMESTAMPTZ '...'", c->name);
@@ -418,6 +428,11 @@ static int bind_lit(xctx *x, const sql_lit *l, const imdb_column *c, bool compar
     }
     if (compare && (c->type == IMDB_T_DECIMAL || (c->type == IMDB_T_INT64 && c->precision)))
         return IMDB_OK; /* ranges may exceed the column precision (F3a: a SMALLINT compared with 100000 is false, never an error) */
+    if (compare && c->type == IMDB_T_TEXT && c->vlen) { /* F3c: a longer string compares (false), its UTF-8 still checked */
+        imdb_column any = *c;
+        any.vlen = 0;
+        return imdb_value_check(&any, out, e);
+    }
     return imdb_value_check(c, out, e);
 }
 
@@ -529,6 +544,16 @@ static int bind_xlit(xctx *x, const sql_lit *l, imdb_xval *v, imdb_err *e)
         v->type = IMDB_T_TIMESTAMP;
         v->i = i;
         return IMDB_OK;
+    case LIT_DATE: /* F3b */
+        if (imdb_parse_date(txt, tl, &i, e)) return e->code;
+        v->type = IMDB_T_DATE;
+        v->i = i;
+        return IMDB_OK;
+    case LIT_TIME:
+        if (imdb_parse_time(txt, tl, &i, e)) return e->code;
+        v->type = IMDB_T_TIME;
+        v->i = i;
+        return IMDB_OK;
     case LIT_TSTZ: /* P2 */
         if (imdb_x_tstz_text(txt, tl, &x->env, &i, e)) return e->code;
         v->type = IMDB_T_TIMESTAMPTZ;
@@ -559,8 +584,11 @@ static int ts_lit(xctx *x, const sql_stmt *st, uint16_t k, uint8_t t, imdb_err *
     const sql_expr *n = &st->ex[k];
     if (n->op != EX_LIT || n->lit.kind != LIT_STR) return IMDB_OK;
     int64_t us;
-    if (t == IMDB_T_TIMESTAMPTZ ? imdb_x_tstz_text(x->sql + n->lit.off, n->lit.len, &x->env, &us, e)
-                                : imdb_parse_timestamp(x->sql + n->lit.off, n->lit.len, &us, e))
+    const char *s = x->sql + n->lit.off; /* F3b: a DATE's and a TIME's by their own literal rules */
+    if (t == IMDB_T_TIMESTAMPTZ ? imdb_x_tstz_text(s, n->lit.len, &x->env, &us, e)
+        : t == IMDB_T_DATE      ? imdb_parse_date(s, n->lit.len, &us, e)
+        : t == IMDB_T_TIME      ? imdb_parse_time(s, n->lit.len, &us, e)
+                                : imdb_parse_timestamp(s, n->lit.len, &us, e))
         return e->code;
     imdb_xnode *b = &x->xn[k];
     memset(&b->k, 0, sizeof b->k);
@@ -569,7 +597,19 @@ static int ts_lit(xctx *x, const sql_stmt *st, uint16_t k, uint8_t t, imdb_err *
     return IMDB_OK;
 }
 
-static bool is_ts(uint8_t t) { return t == IMDB_T_TIMESTAMP || t == IMDB_T_TIMESTAMPTZ; }
+/* a type a string literal beside it takes (F3b: DATE and TIME too); a value of one compares only with its own type */
+static bool is_ts(uint8_t t)
+{
+    return t == IMDB_T_TIMESTAMP || t == IMDB_T_TIMESTAMPTZ || t == IMDB_T_DATE || t == IMDB_T_TIME;
+}
+
+/* CAST between the temporal types: TIMESTAMP and TIMESTAMPTZ each way (the session's zone), and (F3b) a TIMESTAMP's or
+ * a TIMESTAMPTZ's date and time of day, a DATE's midnight as either; never a TIME to a date or a DATE to a time */
+static bool dt_cast_ok(uint8_t from, uint8_t to)
+{
+    bool fts = from == IMDB_T_TIMESTAMP || from == IMDB_T_TIMESTAMPTZ, tts = to == IMDB_T_TIMESTAMP || to == IMDB_T_TIMESTAMPTZ;
+    return (fts && (tts || to == IMDB_T_DATE || to == IMDB_T_TIME)) || (from == IMDB_T_DATE && tts);
+}
 
 static int xbind(xctx *x, xscope *sc, uint16_t k, imdb_err *e);
 static int xbind_node(xctx *x, xscope *sc, uint16_t k, imdb_err *e);
@@ -629,7 +669,7 @@ static int xbind_s1(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
         bool num = a->type == IMDB_T_INT64 || a->type == IMDB_T_DECIMAL || a->type == IMDB_T_FLOAT64;
         bool to_num = n->ctype == IMDB_T_INT64 || n->ctype == IMDB_T_DECIMAL || n->ctype == IMDB_T_FLOAT64;
         if (a->type && a->type != IMDB_T_TEXT && n->ctype != IMDB_T_TEXT && a->type != n->ctype && !(num && to_num) &&
-            !(is_ts(a->type) && is_ts(n->ctype))) /* P2: TIMESTAMP and TIMESTAMPTZ each way, by the session's zone */
+            !dt_cast_ok(a->type, n->ctype)) /* P2: TIMESTAMP and TIMESTAMPTZ each way, by the session's zone; F3b: DATE, TIME */
             return imdb_fail(e, IMDB_ERR_INVALID, "CAST of %s to %s is not defined", imdb_type_name(a->type),
                              imdb_type_name(n->ctype));
         x_type_null(x, n->l, n->ctype, n->cscale);
@@ -1134,7 +1174,7 @@ static bool x_same(const xctx *x, const xscope *sc, uint16_t a, uint16_t b)
     if (!a || !b) return false;
     const sql_expr *p = &sc->st->ex[a], *q = &sc->st->ex[b];
     if (p->op != q->op || p->agg != q->agg || p->cmp != q->cmp || p->fn != q->fn || p->nargs != q->nargs || p->sub != q->sub ||
-        p->ctype != q->ctype || p->cscale != q->cscale || p->cprec != q->cprec || p->dist != q->dist)
+        p->ctype != q->ctype || p->cscale != q->cscale || p->cprec != q->cprec || p->cvlen != q->cvlen || p->dist != q->dist)
         return false;
     if (p->op == EX_LIT)
         return p->lit.kind == q->lit.kind && p->lit.neg == q->lit.neg && p->lit.bval == q->lit.bval &&
@@ -2692,7 +2732,7 @@ typedef struct fg_cache_ent {
 static bool fg_int_type(uint8_t ty)
 {
     return ty == IMDB_T_INT64 || ty == IMDB_T_DECIMAL || ty == IMDB_T_TIMESTAMP || ty == IMDB_T_BOOL || ty == IMDB_T_FLOAT64 ||
-           ty == IMDB_T_TIMESTAMPTZ;
+           ty == IMDB_T_TIMESTAMPTZ || ty == IMDB_T_DATE || ty == IMDB_T_TIME; /* F3b: each a value in i */
 }
 
 static bool fast_group_ok(sink *k, const imdb_table *t)
@@ -6470,7 +6510,8 @@ static bool ex_alike(const xctx *x, const sql_stmt *st, uint16_t a, uint16_t b)
     if (!a || !b) return false;
     const sql_expr *p = &st->ex[a], *q = &st->ex[b];
     if (p->op != q->op || p->agg != q->agg || p->cmp != q->cmp || p->fn != q->fn || p->nargs != q->nargs || p->sub != q->sub ||
-        p->subk != q->subk || p->ctype != q->ctype || p->cscale != q->cscale || p->cprec != q->cprec || p->dist != q->dist ||
+        p->subk != q->subk || p->ctype != q->ctype || p->cscale != q->cscale || p->cprec != q->cprec || p->cvlen != q->cvlen ||
+        p->dist != q->dist ||
         p->op == EX_WIN)
         return false;
     if (p->op == EX_LIT)
@@ -7461,6 +7502,12 @@ static int copy_value(const imdb_column *col, const char *s, uint32_t n, bool qu
     case IMDB_T_TIMESTAMPTZ: /* P2: an offset, a zone, or the session's zone, as a literal's */
         if (imdb_x_tstz_text(s, n, env, &x, e)) return e->code;
         break;
+    case IMDB_T_DATE: /* F3b */
+        if (imdb_parse_date(s, n, &x, e)) return e->code;
+        break;
+    case IMDB_T_TIME:
+        if (imdb_parse_time(s, n, &x, e)) return e->code;
+        break;
     case IMDB_T_BOOL: /* what COPY TO writes, and nothing else */
         if (n == 4 && memcmp(s, "true", 4) == 0) x = 1;
         else if (!(n == 5 && memcmp(s, "false", 5) == 0)) return imdb_fail(e, IMDB_ERR_INVALID, "a BOOL is true or false");
@@ -8132,8 +8179,11 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
             for (int c = 0; c < t->s.ncols; c++) {
                 const imdb_column *cd = &t->s.cols[c];
                 imdb_buf_printf(&cols, "%s%s %s", c ? ", " : "", cd->name,
-                                cd->type == IMDB_T_INT64 ? imdb_int_name(cd->precision) : imdb_type_name(cd->type)); /* F3a */
+                                cd->type == IMDB_T_INT64                 ? imdb_int_name(cd->precision)
+                                : cd->type == IMDB_T_TEXT && cd->vlen ? "VARCHAR" /* F3c */
+                                                                        : imdb_type_name(cd->type)); /* F3a */
                 if (cd->type == IMDB_T_DECIMAL) imdb_buf_printf(&cols, "(%u,%u)", cd->precision, cd->scale);
+                if (cd->type == IMDB_T_TEXT && cd->vlen) imdb_buf_printf(&cols, "(%u)", cd->vlen); /* F3c: VARCHAR(n) */
                 if ((cd->flags & IMDB_COL_PK) && t->s.npk == 1) imdb_buf_put_str(&cols, " PK");
                 for (int k = 0; t->s.npk > 1 && k < t->s.npk; k++) /* F4: its place in the key */
                     if (t->s.key[k] == c) imdb_buf_printf(&cols, " PK(%d)", k + 1);
@@ -9026,6 +9076,7 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
                 o.acol.type = col->type;
                 o.acol.precision = col->precision;
                 o.acol.scale = col->scale;
+                o.acol.vlen = col->vlen; /* F3c: a VARCHAR's length (its DEFAULT within it) */
                 if (bind_lit(&x, &st->alter_def, col, false, &o.adef, e)) rc = e->code;
                 else if (o.adef.null || imdb_value_check(col, &o.adef, &e2))
                     rc = imdb_fail(e, IMDB_ERR_INVALID, "column %s: its DEFAULT: %s", col->name,
@@ -9036,6 +9087,7 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
                 o.acol.type = nt->type;
                 o.acol.precision = nt->precision;
                 o.acol.scale = nt->scale;
+                o.acol.vlen = nt->vlen; /* F3c: SET TYPE VARCHAR(m) */
                 if (nt->type == IMDB_T_DECIMAL && (nt->precision < 1 || nt->precision > 18 || nt->scale > nt->precision))
                     rc = imdb_fail(e, IMDB_ERR_INVALID, "column %s: DECIMAL(p,s) needs 1<=p<=18, 0<=s<=p", col->name);
             }
@@ -9679,6 +9731,8 @@ static size_t cell_width_fast(const imdb_cell *c, imdb_buf *tmp)
         if (v->type == IMDB_T_BOOL) return v->i ? 4 : 5;
         if (v->type == IMDB_T_TIMESTAMP && v->i >= -62135596800000000LL && v->i <= 253402300799999999LL)
             return v->i % 1000000 ? 26 : 19; /* years 0001-9999: codec.c's TS_MIN, TS_MAX */
+        if (v->type == IMDB_T_DATE) return 10; /* F3b: 'YYYY-MM-DD' (in range: imdb_value_check's) */
+        if (v->type == IMDB_T_TIME) return v->i % 1000000 ? 15 : 8;
         if (v->type == IMDB_T_TIMESTAMPTZ) { /* P2: the wall clock's width (in range), then +HH, +HH:MM or +HH:MM:SS */
             int64_t l = v->i + (int64_t)c->tz_off * 1000000;
             uint32_t a = c->tz_off < 0 ? (uint32_t)0 - (uint32_t)c->tz_off : (uint32_t)c->tz_off;
@@ -9767,7 +9821,7 @@ void imdb_result_render(const imdb_result *r, bool csv, imdb_buf *out)
             cell_text(cell, &tmp, true);
             size_t dw = disp_width(tmp.p, tmp.len);
             bool right = !cell->null && cell->v.type != IMDB_T_TEXT && cell->v.type != IMDB_T_TIMESTAMP &&
-                         cell->v.type != IMDB_T_TIMESTAMPTZ;
+                         cell->v.type != IMDB_T_TIMESTAMPTZ && cell->v.type != IMDB_T_DATE && cell->v.type != IMDB_T_TIME;
             imdb_buf_put_str(out, c ? " | " : " ");
             if (right)
                 for (size_t k = dw; k < w[c]; k++) imdb_buf_put_u8(out, ' ');

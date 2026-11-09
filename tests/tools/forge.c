@@ -858,6 +858,12 @@ static imdb_db *open_ro(const char *dir)
  * promotion's descriptor extension); the database is only read through the engine */
 /* digest: the state digest the commit records, or NULL for the current one (ops that change no
  * row); the ops' payloads go into the frame */
+/* F3c: bytes of the encoded commit header changed before it is hashed and signed (one lie the encoder would refuse to
+ * write: an ADD's VARCHAR length shorter than its DEFAULT): the first match of g_find, its byte g_at made g_to */
+static const uint8_t *g_find;
+static size_t g_find_len, g_at;
+static uint8_t g_to;
+
 static void append_commit_digest(const char *dir, imdb_db *db, imdb_op *ops, uint32_t nops, const imdb_signer *key,
                                  const uint8_t *ext, const uint8_t *digest)
 {
@@ -877,6 +883,12 @@ static void append_commit_digest(const char *dir, imdb_db *db, imdb_op *ops, uin
     imdb_buf_init(&pl);
     imdb_commit_encode_header(&c, &h);
     imdb_commit_encode_payload(&c, &pl);
+    for (size_t i = 0; g_find && h.len >= g_find_len && i <= h.len - g_find_len; i++)
+        if (!memcmp(h.p + i, g_find, g_find_len)) {
+            h.p[i + g_at] = g_to;
+            g_find = NULL;
+        }
+    if (g_find) exit(1); /* the lie's bytes were not found: nothing written */
     if (h.err || pl.err) exit(1);
     imdb_commit_hash(h.p, h.len, c.hash);
     uint8_t m[IMDB_SIGMSG_LEN];
@@ -1020,6 +1032,20 @@ static void index_lie(const char *dir, const char *kind)
     } else if (strcmp(kind, "duplicate") == 0 && db->t[0]->nidx) {
         op.code = IMDB_OP_CREATE_INDEX;
         snprintf(nm, sizeof nm, "%s", db->t[0]->idx[0].d.name);
+    } else if (strcmp(kind, "alter-varchar-default") == 0) { /* F3c: ADD COLUMN k VARCHAR(2) DEFAULT 'abc' to table 0: a default
+                                                               * past its length, every old row's missing value if taken */
+        op.code = IMDB_OP_ALTER_TABLE;
+        op.akind = IMDB_ALTER_ADD_COLUMN;
+        snprintf(op.acol.name, sizeof op.acol.name, "k");
+        op.acol.type = IMDB_T_TEXT;
+        op.acol.vlen = 3; /* encoded as VARCHAR(3), which the DEFAULT fits; the header's length byte then made 2 */
+        static const uint8_t pat[] = {1, 'k', IMDB_T_TEXT, 3, 0};
+        g_find = pat;
+        g_find_len = sizeof pat;
+        g_at = 3;
+        g_to = 2;
+        op.acol.flags = IMDB_COL_NULLABLE;
+        op.adef = (imdb_value){.type = IMDB_T_TEXT, .s = (const uint8_t *)"abc", .len = 3};
     } else if (strcmp(kind, "alter-view") == 0) { /* F1: ADD COLUMN k (INT64, NULL) to table 0, a name a view reading it holds */
         op.code = IMDB_OP_ALTER_TABLE;
         op.akind = IMDB_ALTER_ADD_COLUMN;
@@ -1087,6 +1113,93 @@ static void index_lie(const char *dir, const char *kind)
         append_commit_digest(dir, db, &op, 1, &sg, NULL, dg);
         imdb_close(db);
         return;
+    } else if (strcmp(kind, "varchar-long") == 0) { /* F3c: an INSERT into the last table whose first VARCHAR(n) holds
+                                                       * n + 1 characters (encoded as a TEXT's: the bytes are the
+                                                       * same), the key a new INT64, its commitment and digest right */
+        imdb_table *t = db->t[db->nt - 1];
+        int vc = -1;
+        for (int c = 0; c < t->s.ncols && vc < 0; c++) if (t->s.cols[c].type == IMDB_T_TEXT && t->s.cols[c].vlen) vc = c;
+        if (vc < 0 || t->s.cols[vc].vlen > 200 || t->s.npk != 1 || t->s.cols[t->s.key[0]].type != IMDB_T_INT64) {
+            fputs("imdb-forge: index-lie varchar-long needs a VARCHAR(n <= 200) and an INT64 key in the last table\n", stderr);
+            exit(1);
+        }
+        imdb_value vals[IMDB_MAX_COLS];
+        memset(vals, 0, sizeof vals);
+        for (int c = 0; c < t->s.ncols; c++) {
+            vals[c].type = t->s.cols[c].type;
+            vals[c].scale = t->s.cols[c].scale;
+            vals[c].null = c != vc && c != t->s.key[0];
+        }
+        static uint8_t lng[256];
+        memset(lng, 'x', sizeof lng);
+        vals[vc].s = lng;
+        vals[vc].len = (uint32_t)t->s.cols[vc].vlen + 1;
+        vals[t->s.key[0]].i = 987654322;
+        imdb_schema loose = t->s;
+        loose.cols[vc].vlen = 0; /* the encoder's check passed: a TEXT's bytes */
+        imdb_err e = {0};
+        static imdb_buf row;
+        imdb_buf_init(&row);
+        if (imdb_row_encode(&loose, vals, &row, &e) || imdb_buf_check(&row, &e)) die("row", &e);
+        memset(op.salt, 0x5d, sizeof op.salt);
+        op.code = IMDB_OP_INSERT;
+        op.table = t->s.id;
+        op.vid = t->nver;
+        op.pkind = IMDB_PAYLOAD_ROW;
+        op.row = row.p;
+        op.row_len = (uint32_t)row.len;
+        op.iname = NULL;
+        imdb_row_commit(t->s.id, op.salt, row.p, row.len, op.commit);
+        imdb_lthash g = db->global;
+        imdb_lthash_add_commit(db->meta.digest_alg, &g, op.commit);
+        uint8_t dg[32];
+        imdb_lthash_digest(db->meta.digest_alg, &g, dg);
+        append_commit_digest(dir, db, &op, 1, &sg, NULL, dg);
+        imdb_close(db);
+        return;
+    } else if (strcmp(kind, "date-range") == 0) { /* F3b: an INSERT into the last table whose first DATE column holds
+                                                     * 9999-12-31 + 1 (its bytes written past the encoder's check), the
+                                                     * key a new INT64, its commitment and digest right */
+        imdb_table *t = db->t[db->nt - 1];
+        int dc = -1;
+        for (int c = 0; c < t->s.ncols && dc < 0; c++) if (t->s.cols[c].type == IMDB_T_DATE) dc = c;
+        if (dc < 0 || t->s.npk != 1 || t->s.cols[t->s.key[0]].type != IMDB_T_INT64) {
+            fputs("imdb-forge: index-lie date-range needs a DATE column and an INT64 key in the last table\n", stderr);
+            exit(1);
+        }
+        imdb_value vals[IMDB_MAX_COLS];
+        memset(vals, 0, sizeof vals);
+        for (int c = 0; c < t->s.ncols; c++) {
+            vals[c].type = t->s.cols[c].type;
+            vals[c].scale = t->s.cols[c].scale;
+            vals[c].null = c != dc && c != t->s.key[0];
+        }
+        vals[t->s.key[0]].i = 987654321; /* a key no honest row of the test holds */
+        imdb_err e = {0};
+        static imdb_buf row;
+        imdb_buf_init(&row);
+        if (imdb_row_encode(&t->s, vals, &row, &e) || imdb_buf_check(&row, &e)) die("row", &e);
+        size_t off = 0, nn = 0;
+        for (int c = 0; c < t->s.ncols; c++) nn += (t->s.cols[c].flags & IMDB_COL_NULLABLE) != 0;
+        off = (nn + 7) / 8;
+        for (int c = 0; c < dc; c++) if (!vals[c].null) off += t->s.cols[c].type == IMDB_T_BOOL ? 1 : 8; /* no TEXT before */
+        imdb_le64(row.p + off, (uint64_t)(IMDB_DATE_MAX + 1));
+        memset(op.salt, 0x5c, sizeof op.salt);
+        op.code = IMDB_OP_INSERT;
+        op.table = t->s.id;
+        op.vid = t->nver;
+        op.pkind = IMDB_PAYLOAD_ROW;
+        op.row = row.p;
+        op.row_len = (uint32_t)row.len;
+        op.iname = NULL;
+        imdb_row_commit(t->s.id, op.salt, row.p, row.len, op.commit);
+        imdb_lthash g = db->global;
+        imdb_lthash_add_commit(db->meta.digest_alg, &g, op.commit);
+        uint8_t dg[32];
+        imdb_lthash_digest(db->meta.digest_alg, &g, dg);
+        append_commit_digest(dir, db, &op, 1, &sg, NULL, dg);
+        imdb_close(db);
+        return;
     } else if (strcmp(kind, "pk-dup") == 0) { /* F4: an INSERT repeating a live row's whole key (the last table), its digest right */
         imdb_table *t = db->t[db->nt - 1];
         uint64_t src = IMDB_NONE;
@@ -1120,7 +1233,7 @@ static void index_lie(const char *dir, const char *kind)
     } else {
         fputs("imdb-forge: index-lie DIR column | duplicate (needs an index) | drop-absent | unique-dup (needs a unique index) | "
               "pk-dup (a live row in the last table) | alter-view (ADD COLUMN k to table 0) | alter-not-null | "
-              "alter-drop-indexed\n", stderr);
+              "alter-drop-indexed | date-range (a DATE column and an INT64 key in the last table) | varchar-long (a VARCHAR(n <= 200)) | alter-varchar-default\n", stderr);
         exit(1);
     }
     append_commit(dir, db, &op, 1, &sg, NULL);

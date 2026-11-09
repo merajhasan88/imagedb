@@ -1777,7 +1777,8 @@ static int lake_lookup_pk(const imdb_table *t, const imdb_value *kv, uint64_t sn
             imdb_segzone zt; /* F1: by the version that built the segment (a key column is in every version) */
             const imdb_segzone *z = imdb_seg_zone(t, g, (uint32_t)t->s.key[c], &zt);
             uint8_t ty = t->s.cols[t->s.key[c]].type; /* the columns whose zone map bounds values (lake.c's is_int_col) */
-            out = (ty == IMDB_T_INT64 || ty == IMDB_T_DECIMAL || ty == IMDB_T_TIMESTAMP || ty == IMDB_T_FLOAT64 ||
+            out = (ty == IMDB_T_INT64 || ty == IMDB_T_DECIMAL || ty == IMDB_T_TIMESTAMP || ty == IMDB_T_FLOAT64 || ty == IMDB_T_DATE ||
+                   ty == IMDB_T_TIME ||
                    ty == IMDB_T_TIMESTAMPTZ) &&
                   (!z->has || kv[c].i < z->min || kv[c].i > z->max);
         }
@@ -2074,6 +2075,8 @@ static unsigned int_rank(uint8_t width) { return width == 16 ? 1 : width == 32 ?
 static bool alter_widens(const imdb_column *from, const imdb_column *to)
 {
     if (from->type == IMDB_T_INT64 && to->type == IMDB_T_INT64) return int_rank(to->precision) > int_rank(from->precision);
+    if (from->type == IMDB_T_TEXT && to->type == IMDB_T_TEXT) /* F3c: a VARCHAR longer, or a TEXT (unbounded) */
+        return from->vlen && (!to->vlen || to->vlen > from->vlen);
     return from->type == IMDB_T_DECIMAL && to->type == IMDB_T_DECIMAL && to->scale == from->scale &&
            to->precision > from->precision && to->precision <= 18;
 }
@@ -2145,6 +2148,7 @@ int imdb_sver_next(const imdb_schema_hist *h, const imdb_sver *cur, const imdb_o
     case IMDB_ALTER_SET_DEFAULT: {
         imdb_err e2 = {0};
         if (o->acol.type != col->type || o->acol.precision != col->precision || o->acol.scale != col->scale ||
+            o->acol.vlen != col->vlen || /* F3c */
             o->adef.null || imdb_value_check(col, &o->adef, &e2))
             return imdb_fail(e, IMDB_ERR_INVALID, "column %s: its DEFAULT is not a value of its type", col->name);
         return IMDB_OK; /* catalog state: the schema and its positions stay, so the version's hash does */
@@ -2155,8 +2159,10 @@ int imdb_sver_next(const imdb_schema_hist *h, const imdb_sver *cur, const imdb_o
     case IMDB_ALTER_SET_TYPE:
         if (!alter_widens(col, &o->acol))
             return imdb_fail(e, IMDB_ERR_INVALID, "column %s: only a widening keeps every stored value (a wider DECIMAL of its "
-                             "scale, a wider integer; another type: rewrite the table, CREATE TABLE ... AS SELECT)", col->name);
+                             "scale, a wider integer, a longer VARCHAR or TEXT; another type: rewrite the table, CREATE TABLE "
+                             "... AS SELECT)", col->name);
         col->precision = o->acol.precision;
+        col->vlen = o->acol.vlen; /* F3c: a VARCHAR lengthened, or unbounded */
         return IMDB_OK;
     default:
         return imdb_fail(e, IMDB_ERR_INVALID, "unknown ALTER TABLE kind %u", o->akind);

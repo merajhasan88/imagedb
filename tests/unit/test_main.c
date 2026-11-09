@@ -124,6 +124,8 @@ int main(int argc, char **argv)
         {"ckey", ckey_tests, &ckey_ntests}, /* P2 F4 */
         {"alter", alter_tests, &alter_ntests}, /* P2 F1 */
         {"intw", intw_tests, &intw_ntests}, /* F3a: SMALLINT and INTEGER */
+        {"dt", dt_tests, &dt_ntests},       /* F3b: DATE and TIME */
+        {"vc", vc_tests, &vc_ntests},       /* F3c: VARCHAR(n) */
         {"tz", tz_tests, &tz_ntests}, /* P2: time zones */
         {"tzsql", tzsql_tests, &tzsql_ntests}, /* P2: time zones through the engine */
     };

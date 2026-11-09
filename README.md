@@ -594,13 +594,19 @@ round to short ones writing the same row, so retry with backoff). SERIALIZABLE
 is refused; snapshot write skew is possible.
 
 Types: INT64 (BIGINT, INT8), INTEGER (INT, INT4: 32 bits), SMALLINT (INT2: 16 bits),
-DECIMAL, TEXT, BOOL, TIMESTAMP, TIMESTAMPTZ, finite FLOAT64 (exact SUM, rounded
+DECIMAL, TEXT, VARCHAR(n), BOOL, TIMESTAMP, TIMESTAMPTZ, DATE, TIME, finite FLOAT64 (exact SUM, rounded
 once) and nullable non-key columns. SMALLINT and INTEGER are INT64 values checked
 against their range at every write (INSERT, UPDATE, COPY, a DEFAULT) and in
 `CAST(x AS SMALLINT)`; arithmetic over them is INT64's (a SMALLINT sum past 32767
 is a value until it is written back). INT and INTEGER were INT64 before; they are
 32 bits now. `ALTER TABLE ... ALTER COLUMN c TYPE INTEGER` widens a SMALLINT (and
-either to BIGINT) as metadata. Comparisons with NULL, including NULL parameters,
+either to BIGINT) as metadata. DATE (0001-01-01 to 9999-12-31) and TIME (00:00:00 to
+23:59:59.999999) take `DATE '2026-11-09'`, `TIME '12:30:00.5'` and plain strings beside them;
+`d + 7`, `d - 1` and `d2 - d1` (days) and `d + t` (a TIMESTAMP) compute, CAST converts each
+way with TEXT, TIMESTAMP and TIMESTAMPTZ (the session's zone), and a DATE compares only
+with a DATE (CAST a TIMESTAMP first). VARCHAR(n) (CHARACTER VARYING(n)) is a TEXT whose
+values are refused past n characters at every write and in CAST(x AS VARCHAR(n)), never
+cut; SET TYPE lengthens it or makes it TEXT. Comparisons with NULL, including NULL parameters,
 are refused: use IS NULL / IS NOT NULL.
 
 Time zones: TIMESTAMPTZ (`TIMESTAMP WITH TIME ZONE`) holds an instant (UTC

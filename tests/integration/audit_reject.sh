@@ -392,6 +392,30 @@ PFL=$WORK/fl; "$BIN" init "$PFL" >/dev/null
 "$FORGE" index-lie "$PFL" alter-drop-indexed
 must_fail "index ta names column a" "$BIN" verify "$PFL"
 must_fail "DROP COLUMN of a column index ta names" "$AUD" verify "$PFL"
+
+echo "== FM: a signed INSERT whose DATE is 9999-12-31 + 1 (F3b): the replay and the auditor refuse the value"
+PFM=$WORK/fm; "$BIN" init "$PFM" >/dev/null
+"$BIN" sql "$PFM" --nosync -c "CREATE TABLE d (id INT64 PRIMARY KEY, dd DATE);" -c "INSERT INTO d VALUES (1, '9999-12-31');" >/dev/null
+"$BIN" verify "$PFM" >/dev/null && "$AUD" verify "$PFM" >/dev/null || fail "the honest directory must verify"
+"$FORGE" index-lie "$PFM" date-range
+must_fail "date out of range" "$BIN" verify "$PFM"
+must_fail "DATE out of range in column dd" "$AUD" verify "$PFM"
+
+echo "== FN: a signed INSERT whose VARCHAR(4) holds 5 characters (F3c): the replay and the auditor refuse the value"
+PFN=$WORK/fn; "$BIN" init "$PFN" >/dev/null
+"$BIN" sql "$PFN" --nosync -c "CREATE TABLE v (id INT64 PRIMARY KEY, a VARCHAR(4));" -c "INSERT INTO v VALUES (1, 'abcd');" >/dev/null
+"$BIN" verify "$PFN" >/dev/null && "$AUD" verify "$PFN" >/dev/null || fail "the honest directory must verify"
+"$FORGE" index-lie "$PFN" varchar-long
+must_fail "a value longer than VARCHAR(4)" "$BIN" verify "$PFN"
+must_fail "a value longer than VARCHAR(4) in column a" "$AUD" verify "$PFN"
+
+echo "== FO: a signed ADD COLUMN k VARCHAR(2) DEFAULT 'abc' (F3c): the replay and the auditor refuse the DEFAULT"
+PFO=$WORK/fo; "$BIN" init "$PFO" >/dev/null
+"$BIN" sql "$PFO" --nosync -c "CREATE TABLE v (id INT64 PRIMARY KEY, a INT64);" -c "INSERT INTO v VALUES (1, 1);" >/dev/null
+"$BIN" verify "$PFO" >/dev/null && "$AUD" verify "$PFO" >/dev/null || fail "the honest directory must verify"
+"$FORGE" index-lie "$PFO" alter-varchar-default
+must_fail "bad DEFAULT" "$BIN" verify "$PFO"
+must_fail "a value longer than VARCHAR(2) in column k" "$AUD" verify "$PFO"
 echo "   the engine's replay and the auditor refuse each: SET NOT NULL by the live rows' payloads, DROP by the indexes"
 
 echo "== Z: a commit naming the other digest algorithm, re-signed by the writer (both ways round); META naming an unknown one"

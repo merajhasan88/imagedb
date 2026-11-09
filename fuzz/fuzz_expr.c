@@ -13,8 +13,8 @@ static const __int128 P38 = (__int128)10000000000000000000ull * 1000000000000000
 /* the value at p (16 bytes) of type t (an INT64 within 2^103, a SUM's bound; a DECIMAL under 10^38, scale <= 38) */
 static void value(uint8_t t, uint8_t s, const uint8_t *p, imdb_xval *v)
 {
-    static const uint8_t T[] = {IMDB_T_INT64, IMDB_T_DECIMAL, IMDB_T_FLOAT64, IMDB_T_TEXT};
-    memset(v, 0, sizeof *v);
+    static const uint8_t T[] = {IMDB_T_INT64, IMDB_T_DECIMAL, IMDB_T_FLOAT64, IMDB_T_TEXT, IMDB_T_DATE, IMDB_T_TIME}; /* F3b */
+    v->type = T[t % 6];
     v->type = T[t % 4];
     v->null = (t & 0x80) != 0;
     __int128 x;
@@ -26,6 +26,10 @@ static void value(uint8_t t, uint8_t s, const uint8_t *p, imdb_xval *v)
     } else if (v->type == IMDB_T_DECIMAL) {
         v->scale = (uint8_t)(s % (IMDB_X_MAX_SCALE + 1));
         v->i = x % P38;
+    } else if (v->type == IMDB_T_DATE) { /* F3b: a day in DATE's range */
+        v->i = IMDB_DATE_MIN + (x < 0 ? -(x + 1) : x) % (IMDB_DATE_MAX - IMDB_DATE_MIN + 1);
+    } else if (v->type == IMDB_T_TIME) {
+        v->i = (x < 0 ? -(x + 1) : x) % (IMDB_TIME_MAX + 1);
     } else if (v->type == IMDB_T_FLOAT64) {
         double d;
         memcpy(&d, p, sizeof d);
@@ -43,6 +47,9 @@ static void bounds(const imdb_xval *r, uint8_t rt, uint8_t rs)
     if (rt == IMDB_T_INT64 && (r->i < INT64_MIN || r->i > INT64_MAX)) abort();
     if (rt == IMDB_T_DECIMAL && (r->i >= P38 || r->i <= -P38)) abort();
     if (rt == IMDB_T_FLOAT64 && !isfinite(r->f)) abort();
+    if (rt == IMDB_T_DATE && (r->i < IMDB_DATE_MIN || r->i > IMDB_DATE_MAX)) abort(); /* F3b */
+    if (rt == IMDB_T_TIME && (r->i < 0 || r->i > IMDB_TIME_MAX)) abort();
+    if (rt == IMDB_T_TIMESTAMP && (r->i < -62135596800000000LL || r->i > 253402300799999999LL)) abort();
 }
 
 /* ---- P2 S1: the functions, CAST and LIKE ------------------------------------------------------------------------- */
@@ -141,7 +148,8 @@ static void s1(const uint8_t *data, size_t size, const imdb_xval *a, const imdb_
         }
     }
     static const uint8_t CT[] = {IMDB_T_INT64, IMDB_T_DECIMAL, IMDB_T_FLOAT64,   IMDB_T_TEXT,
-                                 IMDB_T_BOOL,  IMDB_T_TIMESTAMP, IMDB_T_TIMESTAMPTZ}; /* the last: P2, the session's zone UTC */
+                                 IMDB_T_BOOL,  IMDB_T_TIMESTAMP, IMDB_T_TIMESTAMPTZ, IMDB_T_DATE, IMDB_T_TIME}; /* P2's: the
+                                 * session's zone UTC; F3b's: each within its range (bounds) */
     for (int i = 0; i < 4; i++)
         for (size_t c = 0; c < sizeof CT; c++) {
             imdb_column col;
@@ -162,7 +170,7 @@ static void s1(const uint8_t *data, size_t size, const imdb_xval *a, const imdb_
                     if (out.scale != col.scale || out.i >= lim || out.i <= -lim) abort();
                 }
                 if (!out.null && col.type != IMDB_T_DECIMAL && col.type != IMDB_T_TEXT && col.type != IMDB_T_BOOL &&
-                    col.type != IMDB_T_TIMESTAMP && col.type != IMDB_T_TIMESTAMPTZ)
+                    col.type != IMDB_T_TIMESTAMPTZ)
                     bounds(&out, col.type, 0);
                 if (!out.null && col.type == IMDB_T_BOOL && out.i != 0 && out.i != 1) abort();
                 if (!out.null && col.type == IMDB_T_INT64 && !imdb_int_fits(col.precision, (int64_t)out.i)) abort(); /* F3a */

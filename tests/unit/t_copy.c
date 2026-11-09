@@ -145,7 +145,9 @@ static void done(imdb_db *db)
         }                                                                                                          \
     } while (0)
 
-#define SCHEMA "(id INT64 PRIMARY KEY, s TEXT NULL, d DECIMAL(18,3) NULL, f FLOAT64 NULL, b BOOL NULL, ts TIMESTAMP NULL)"
+#define SCHEMA                                                                                                     \
+    "(id INT64 PRIMARY KEY, s TEXT NULL, d DECIMAL(18,3) NULL, f FLOAT64 NULL, b BOOL NULL, ts TIMESTAMP NULL, "    \
+    "dd DATE NULL, tm TIME NULL, vs VARCHAR(10) NULL)" /* F3b: a DATE and a TIME; F3c: a VARCHAR(10) */
 
 /* every type at its edges, NULLs and the empty string, quotes, delimiters, a newline and a CR inside quotes, UTF-8 of
  * every length; LF ends (eol 1) or CR LF (eol 2) */
@@ -154,15 +156,17 @@ static size_t edge_data(char *out, size_t cap, int eol, bool header)
     const char *nl = eol == 2 ? "\r\n" : "\n";
     size_t n = 0;
 #define PUT(...) (n += (size_t)snprintf(out + n, cap - n, __VA_ARGS__))
-    if (header) PUT("id,s,d,f,b,ts%s", nl);
-    PUT("-9223372036854775808,plain,-999999999999999.999,-1.7976931348623157e+308,true,0001-01-01 00:00:00%s", nl);
-    PUT("9223372036854775807,\"\",999999999999999.999,1.7976931348623157e+308,false,9999-12-31 23:59:59.999999%s", nl);
-    PUT("0,,,,,%s", nl);
-    PUT("1,\"a, comma; and \"\"quotes\"\"\",0.001,0.1,true,2026-11-05 13:45:00.500000%s", nl);
-    PUT("2,\"line one\nline two\r\nline three\",-0.001,1e-300,false,1970-01-01 00:00:00%s", nl);
-    PUT("3,\xc3\xa9\xe6\x97\xa5\xf0\x9f\x98\x80 \x7f end,12.345,-2.5,,%s", nl);
-    PUT("4,\"\\.\",1.000,1,true,2000-02-29 12:00:00%s", nl);
-    PUT("5, spaces kept ,0.000,0,false,2026-01-01 00:00:00.000001%s", nl);
+    if (header) PUT("id,s,d,f,b,ts,dd,tm,vs%s", nl);
+    PUT("-9223372036854775808,plain,-999999999999999.999,-1.7976931348623157e+308,true,0001-01-01 00:00:00,0001-01-01,"
+        "00:00:00,\xc3\xa9\xc3\xa9\xe6\x97\xa5\xe6\x97\xa5\xf0\x9f\x98\x80\xf0\x9f\x98\x80" "abcd%s", nl); /* ten characters */
+    PUT("9223372036854775807,\"\",999999999999999.999,1.7976931348623157e+308,false,9999-12-31 23:59:59.999999,"
+        "9999-12-31,23:59:59.999999,\"\"%s", nl);
+    PUT("0,,,,,,,,%s", nl);
+    PUT("1,\"a, comma; and \"\"quotes\"\"\",0.001,0.1,true,2026-11-05 13:45:00.500000,2026-11-05,13:45:00.500000,\"a,b\"%s", nl);
+    PUT("2,\"line one\nline two\r\nline three\",-0.001,1e-300,false,1970-01-01 00:00:00,1969-12-31,00:00:00.000001,x%s", nl);
+    PUT("3,\xc3\xa9\xe6\x97\xa5\xf0\x9f\x98\x80 \x7f end,12.345,-2.5,,,,,%s", nl);
+    PUT("4,\"\\.\",1.000,1,true,2000-02-29 12:00:00,2000-02-29,12:00:00,\"\\.\"%s", nl);
+    PUT("5, spaces kept ,0.000,0,false,2026-01-01 00:00:00.000001,2026-01-01,23:00:00, ten kept %s", nl); /* ten characters, its spaces kept */
 #undef PUT
     return n;
 }

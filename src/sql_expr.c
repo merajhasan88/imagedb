@@ -39,6 +39,20 @@ static int div0(imdb_err *e) { return imdb_fail(e, IMDB_ERR_INVALID, "division b
 
 int imdb_x_type(uint8_t op, uint8_t ta, uint8_t sa, uint8_t tb, uint8_t sb, uint8_t *rt, uint8_t *rs, imdb_err *e)
 {
+    /* F3b: a DATE plus or minus days (an INT64), a DATE minus a DATE (the days between), a DATE plus a TIME (a TIMESTAMP),
+     * as PostgreSQL computes them; the rest waits for INTERVAL */
+    if (ta == IMDB_T_DATE || tb == IMDB_T_DATE || ta == IMDB_T_TIME || tb == IMDB_T_TIME) {
+        *rs = 0;
+        if (op == EX_ADD && ((ta == IMDB_T_DATE && tb == IMDB_T_INT64) || (ta == IMDB_T_INT64 && tb == IMDB_T_DATE))) *rt = IMDB_T_DATE;
+        else if (op == EX_SUB && ta == IMDB_T_DATE && tb == IMDB_T_INT64) *rt = IMDB_T_DATE;
+        else if (op == EX_SUB && ta == IMDB_T_DATE && tb == IMDB_T_DATE) *rt = IMDB_T_INT64;
+        else if (op == EX_ADD && ((ta == IMDB_T_DATE && tb == IMDB_T_TIME) || (ta == IMDB_T_TIME && tb == IMDB_T_DATE)))
+            *rt = IMDB_T_TIMESTAMP;
+        else
+            return imdb_fail(e, IMDB_ERR_INVALID, "date arithmetic: a DATE + or - an INT64 of days, DATE - DATE, DATE + TIME "
+                                                  "(INTERVAL is not in imagedb yet)");
+        return IMDB_OK;
+    }
     if (!is_num(ta) || !is_num(tb))
         return imdb_fail(e, IMDB_ERR_INVALID, "arithmetic takes INT64, DECIMAL and FLOAT64 values");
     *rs = 0;
@@ -181,6 +195,16 @@ int imdb_x_arith(uint8_t op, const imdb_xval *a, const imdb_xval *b, uint8_t rt,
         return IMDB_OK;
     }
     __int128 x = a->i, y = b->i, r = 0;
+    if (rt == IMDB_T_DATE) { /* F3b: days added or taken away; a day past 0001-01-01 or 9999-12-31 an error */
+        r = op == EX_ADD ? x + y : x - y; /* both within int64: no overflow in __int128 */
+        if (r < IMDB_DATE_MIN || r > IMDB_DATE_MAX) return imdb_fail(e, IMDB_ERR_LIMIT, "a DATE result out of range");
+        out->i = r;
+        return IMDB_OK;
+    }
+    if (rt == IMDB_T_TIMESTAMP) { /* F3b: a DATE + a TIME: within TIMESTAMP's range by DATE's */
+        out->i = a->type == IMDB_T_DATE ? x * IMDB_DAY_US + y : y * IMDB_DAY_US + x;
+        return IMDB_OK;
+    }
     if (rt == IMDB_T_INT64) { /* operands within 2^103 (a SUM's bound): only * can leave __int128 */
         switch (op) {
         case EX_ADD: r = x + y; break;
@@ -662,7 +686,9 @@ int imdb_x_fn_type(uint8_t fn, uint8_t nargs, const uint8_t *ta, const uint8_t *
             return imdb_fail(e, IMDB_ERR_INVALID, "date_trunc's unit is a string constant ('day', 'hour', ...)");
         if (imdb_x_trunc_unit(kv[0]->s, kv[0]->len, &u, e)) return e->code;
         if (ta[1] != IMDB_T_TIMESTAMP && ta[1] != IMDB_T_TIMESTAMPTZ)
-            return imdb_fail(e, IMDB_ERR_INVALID, "date_trunc takes a TIMESTAMP or a TIMESTAMPTZ");
+            return imdb_fail(e, IMDB_ERR_INVALID, ta[1] == IMDB_T_DATE ? "date_trunc of a DATE: CAST it to TIMESTAMP first (PostgreSQL "
+                                                                         "would make it a TIMESTAMPTZ in the session's zone)"
+                                                                       : "date_trunc takes a TIMESTAMP or a TIMESTAMPTZ");
         if (nargs == 3 && (ta[1] != IMDB_T_TIMESTAMPTZ || ta[2] != IMDB_T_TEXT))
             return imdb_fail(e, IMDB_ERR_INVALID, "date_trunc's third argument is a TIMESTAMPTZ's zone: date_trunc(unit, x, zone)");
         *rt = ta[1];
@@ -936,6 +962,14 @@ int imdb_x_cast(const imdb_xval *v, const imdb_column *c, imdb_xenv *env, imdb_x
             if (imdb_parse_timestamp(s, v->len, &i, &pe)) return cast_bad(c, e);
             out->i = i;
             return IMDB_OK;
+        case IMDB_T_DATE: /* F3b: the literal's rules */
+            if (imdb_parse_date(s, v->len, &i, &pe)) return cast_bad(c, e);
+            out->i = i;
+            return IMDB_OK;
+        case IMDB_T_TIME:
+            if (imdb_parse_time(s, v->len, &i, &pe)) return cast_bad(c, e);
+            out->i = i;
+            return IMDB_OK;
         case IMDB_T_TIMESTAMPTZ: /* P2: the literal's rules: its offset, its zone, or the session's zone */
             if (imdb_x_tstz_text(s, v->len, env, &i, e)) return e->code;
             out->i = i;
@@ -977,6 +1011,10 @@ int imdb_x_cast(const imdb_xval *v, const imdb_column *c, imdb_xenv *env, imdb_x
         out->i = v->i;
         return IMDB_OK;
     case IMDB_T_TIMESTAMP:
+        if (v->type == IMDB_T_DATE) { /* F3b: its midnight */
+            out->i = v->i * IMDB_DAY_US;
+            return IMDB_OK;
+        }
         if (v->type == IMDB_T_TIMESTAMPTZ) { /* P2: its wall clock in the session's zone (PostgreSQL's cast) */
             out->i = v->i + (__int128)imdb_x_tz_off(env, env ? env->zone : NULL, (int64_t)v->i) * 1000000;
             return ts_range((int64_t)out->i, e);
@@ -985,6 +1023,10 @@ int imdb_x_cast(const imdb_xval *v, const imdb_column *c, imdb_xenv *env, imdb_x
         out->i = v->i;
         return IMDB_OK;
     case IMDB_T_TIMESTAMPTZ:
+        if (v->type == IMDB_T_DATE) { /* F3b: its midnight in the session's zone (PostgreSQL's cast) */
+            out->i = imdb_tz_utc_of_local(env && env->zone ? env->zone : &imdb_tz_utc_zone, (int64_t)v->i * IMDB_DAY_US);
+            return ts_range((int64_t)out->i, e);
+        }
         if (v->type == IMDB_T_TIMESTAMP) { /* P2: the session zone's wall clock read as an instant (its rule) */
             out->i = imdb_tz_utc_of_local(env && env->zone ? env->zone : &imdb_tz_utc_zone, (int64_t)v->i);
             return ts_range((int64_t)out->i, e);
@@ -992,7 +1034,33 @@ int imdb_x_cast(const imdb_xval *v, const imdb_column *c, imdb_xenv *env, imdb_x
         if (v->type != c->type) break;
         out->i = v->i;
         return IMDB_OK;
-    case IMDB_T_TEXT: return cast_to_text(v, env, out, e);
+    case IMDB_T_DATE: /* F3b: a TIMESTAMP's day; a TIMESTAMPTZ's in the session's zone (PostgreSQL's cast) */
+        if (v->type == IMDB_T_TIMESTAMP || v->type == IMDB_T_TIMESTAMPTZ) {
+            int64_t l = (int64_t)v->i;
+            if (v->type == IMDB_T_TIMESTAMPTZ) l += (int64_t)imdb_x_tz_off(env, env ? env->zone : NULL, l) * 1000000;
+            out->i = l / IMDB_DAY_US - (l % IMDB_DAY_US < 0); /* the floor: a day before 1970 too */
+            return out->i < IMDB_DATE_MIN || out->i > IMDB_DATE_MAX ? imdb_fail(e, IMDB_ERR_LIMIT, "a DATE out of range") : IMDB_OK;
+        }
+        if (v->type != c->type) break;
+        out->i = v->i;
+        return IMDB_OK;
+    case IMDB_T_TIME: /* F3b: a TIMESTAMP's time of day; a TIMESTAMPTZ's in the session's zone */
+        if (v->type == IMDB_T_TIMESTAMP || v->type == IMDB_T_TIMESTAMPTZ) {
+            int64_t l = (int64_t)v->i;
+            if (v->type == IMDB_T_TIMESTAMPTZ) l += (int64_t)imdb_x_tz_off(env, env ? env->zone : NULL, l) * 1000000;
+            int64_t r = l % IMDB_DAY_US;
+            out->i = r < 0 ? r + IMDB_DAY_US : r;
+            return IMDB_OK;
+        }
+        if (v->type != c->type) break;
+        out->i = v->i;
+        return IMDB_OK;
+    case IMDB_T_TEXT: { /* F3c: CAST(x AS VARCHAR(n)) refuses a longer value (PostgreSQL's cuts it: never guessed here) */
+        int rc = cast_to_text(v, env, out, e);
+        if (!rc && c->vlen && !out->null && imdb_utf8_chars(out->s, out->len) > c->vlen)
+            return imdb_fail(e, IMDB_ERR_LIMIT, "CAST: the value is longer than VARCHAR(%u)", c->vlen);
+        return rc;
+    }
     default: break;
     }
     return imdb_fail(e, IMDB_ERR_INVALID, "CAST of %s to %s is not defined", imdb_type_name(v->type), imdb_type_name(c->type));
@@ -1246,6 +1314,7 @@ int imdb_x_eval(const sql_stmt *st, const imdb_xnode *xn, uint16_t k, const imdb
         c.type = x->ctype;
         c.scale = x->cscale;
         c.precision = x->cprec;
+        c.vlen = x->cvlen; /* F3c: CAST(x AS VARCHAR(n)) refuses a longer value */
         return imdb_x_cast(&l, &c, env, out, e);
     }
     default:

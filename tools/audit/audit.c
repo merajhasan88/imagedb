@@ -57,8 +57,12 @@
 #define RETAIN_MIN_US 1000000ull                      /* SET_RETENTION (16): a second ... */
 #define RETAIN_MAX_US (36525ull * 24 * 3600 * 1000000) /* ... to a century, or all ones (FOREVER) */
 
-enum { T_INT64 = 1, T_DECIMAL = 2, T_TEXT = 3, T_BOOL = 4, T_TIMESTAMP = 5, T_FLOAT64 = 6, T_TIMESTAMPTZ = 7 };
-#define T_LAST T_TIMESTAMPTZ /* P2: an instant (UTC microseconds), its zone only how a session shows it */
+enum { T_INT64 = 1, T_DECIMAL = 2, T_TEXT = 3, T_BOOL = 4, T_TIMESTAMP = 5, T_FLOAT64 = 6, T_TIMESTAMPTZ = 7, T_DATE = 8, T_TIME = 9 };
+#define T_LAST T_TIME /* P2: TIMESTAMPTZ an instant (UTC microseconds), its zone only how a session shows it; F3b: DATE (days since
+                      * 1970-01-01, 0001-01-01 to 9999-12-31) and TIME (microseconds since midnight, below a day) */
+#define DATE_MIN (-719162LL)
+#define DATE_MAX 2932896LL
+#define TIME_MAX 86399999999LL
 enum { F_PK = 1, F_SUBJECT = 2, F_NULLABLE = 4 };
 #define TS_MIN (-62135596800000000LL)
 #define TS_MAX (253402300799999999LL)
@@ -366,6 +370,7 @@ bad:
 typedef struct col {
     char name[64];
     uint8_t type, prec, scale, flags;
+    uint16_t vlen; /* F3c: a TEXT's VARCHAR length (the schema's precision and scale bytes), 0 unbounded */
 } col;
 
 typedef struct schema {
@@ -416,6 +421,10 @@ static int decode_schema(rd *r, schema *s)
         c->prec = rd_u8(r);
         c->scale = rd_u8(r);
         c->flags = rd_u8(r);
+        if (c->type == T_TEXT) { /* F3c: the two bytes a VARCHAR's length */
+            c->vlen = (uint16_t)(c->prec | c->scale << 8);
+            c->prec = c->scale = 0;
+        }
         if (r->bad) return fail("schema: truncated");
         if (c->type < T_INT64 || c->type > T_LAST || (c->flags & ~(F_PK | F_SUBJECT | F_NULLABLE)) ||
             ((c->flags & F_NULLABLE) && (c->flags & (F_PK | F_SUBJECT))))
@@ -490,10 +499,17 @@ static int check_value(const col *c, const val *v)
         return fail("value out of DECIMAL range in column %s", c->name);
     if ((c->type == T_TIMESTAMP || c->type == T_TIMESTAMPTZ) && (v->i < TS_MIN || v->i > TS_MAX))
         return fail("TIMESTAMP out of range in column %s", c->name);
+    if (c->type == T_DATE && (v->i < DATE_MIN || v->i > DATE_MAX)) return fail("DATE out of range in column %s", c->name); /* F3b */
+    if (c->type == T_TIME && (v->i < 0 || v->i > TIME_MAX)) return fail("TIME out of range in column %s", c->name);
     if (c->type == T_BOOL && v->i != 0 && v->i != 1) return fail("bad BOOL in column %s", c->name);
     if (c->type == T_FLOAT64 && !float_key_ok(v->i)) return fail("not a finite FLOAT64 in column %s", c->name);
     if (c->type == T_TEXT && (v->len > MAX_TEXT || (v->len && !utf8_ok(v->s, v->len))))
         return fail("invalid TEXT in column %s", c->name);
+    if (c->type == T_TEXT && c->vlen) { /* F3c: VARCHAR(n) counts characters */
+        uint32_t k = 0;
+        for (uint32_t i = 0; i < v->len; i++) k += (v->s[i] & 0xC0) != 0x80;
+        if (k > c->vlen) return fail("a value longer than VARCHAR(%u) in column %s", c->vlen, c->name);
+    }
     return 0;
 }
 
@@ -844,6 +860,10 @@ static int alter_body(rd *hr, op *o, const char *what)
         o->acol.prec = rd_u8(hr);
         o->acol.scale = rd_u8(hr);
         o->acol.flags = rd_u8(hr);
+        if (o->acol.type == T_TEXT) { /* F3c: as the schema's encoding */
+            o->acol.vlen = (uint16_t)(o->acol.prec | o->acol.scale << 8);
+            o->acol.prec = o->acol.scale = 0;
+        }
         const col *ac = &o->acol;
         if (!hr->bad && (ac->type < T_INT64 || ac->type > T_LAST || (ac->flags & ~F_NULLABLE) ||
                          (ac->type == T_DECIMAL ? (ac->prec < 1 || ac->prec > 18 || ac->scale > ac->prec)
@@ -877,6 +897,10 @@ static int alter_body(rd *hr, op *o, const char *what)
         o->acol.type = rd_u8(hr);
         o->acol.prec = rd_u8(hr);
         o->acol.scale = rd_u8(hr);
+        if (o->acol.type == T_TEXT) { /* F3c: as the schema's encoding */
+            o->acol.vlen = (uint16_t)(o->acol.prec | o->acol.scale << 8);
+            o->acol.prec = o->acol.scale = 0;
+        }
         const col *ac = &o->acol;
         if (!hr->bad && (ac->type < T_INT64 || ac->type > T_LAST ||
                          (ac->type == T_DECIMAL ? (ac->prec < 1 || ac->prec > 18 || ac->scale > ac->prec)
@@ -1480,8 +1504,8 @@ static void schema_reencode(schema *s)
         memcpy(b + o, s->c[c].name, cl);
         o += cl;
         b[o++] = s->c[c].type;
-        b[o++] = s->c[c].prec;
-        b[o++] = s->c[c].scale;
+        b[o++] = s->c[c].type == T_TEXT ? (uint8_t)(s->c[c].vlen & 0xff) : s->c[c].prec; /* F3c: as the engine writes it */
+        b[o++] = s->c[c].type == T_TEXT ? (uint8_t)(s->c[c].vlen >> 8) : s->c[c].scale;
         b[o++] = s->c[c].flags;
     }
     b[o++] = (uint8_t)s->npk;
@@ -1613,7 +1637,7 @@ static int alter_next(const aver *cur, const op *o, aver *nv, uint64_t seq, cons
         cc->flags = (uint8_t)(o->akind == 5 ? cc->flags & ~F_NULLABLE : cc->flags | F_NULLABLE);
         break;
     case 7: /* SET DEFAULT: of the column's type (alter_body decoded its value as one) */
-        if (o->acol.type != cc->type || o->acol.prec != cc->prec || o->acol.scale != cc->scale)
+        if (o->acol.type != cc->type || o->acol.prec != cc->prec || o->acol.scale != cc->scale || o->acol.vlen != cc->vlen) /* F3c */
             return fail("commit %llu: SET DEFAULT of another type than its column's", sq);
         nv->def = xcalloc(o->def_len ? o->def_len : 1, 1);
         memcpy(nv->def, o->def, o->def_len);
@@ -1624,11 +1648,13 @@ static int alter_next(const aver *cur, const op *o, aver *nv, uint64_t seq, cons
         break;
     case 9: { /* SET TYPE, a widening: a wider DECIMAL of its scale, a wider integer (F3a), every stored value valid */
         unsigned rf = cc->prec == 16 ? 1 : cc->prec == 32 ? 2 : 3, rt = o->acol.prec == 16 ? 1 : o->acol.prec == 32 ? 2 : 3;
-        bool wide = cc->type == T_INT64 && o->acol.type == T_INT64 ? rt > rf
+        bool wide = cc->type == T_TEXT && o->acol.type == T_TEXT ? cc->vlen && (!o->acol.vlen || o->acol.vlen > cc->vlen) /* F3c */
+                    : cc->type == T_INT64 && o->acol.type == T_INT64 ? rt > rf
                     : cc->type == T_DECIMAL && o->acol.type == T_DECIMAL && o->acol.scale == cc->scale &&
                           o->acol.prec > cc->prec && o->acol.prec <= 18;
         if (!wide) return fail("commit %llu: SET TYPE that is not a widening", sq);
         cc->prec = o->acol.prec;
+        cc->vlen = o->acol.vlen;
         break;
     }
     default:
@@ -2623,7 +2649,7 @@ static void seg_free(seg *g)
 
 static bool is_int(uint8_t t)
 {
-    return t == T_INT64 || t == T_DECIMAL || t == T_TIMESTAMP || t == T_FLOAT64 || t == T_TIMESTAMPTZ;
+    return t == T_INT64 || t == T_DECIMAL || t == T_TIMESTAMP || t == T_FLOAT64 || t == T_TIMESTAMPTZ || t == T_DATE || t == T_TIME;
 }
 
 static bool has_value(const seg *g, int c, uint32_t i)

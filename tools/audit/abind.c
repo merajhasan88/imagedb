@@ -30,7 +30,7 @@
 
 #include "abind.h"
 
-enum { T_INT64 = 1, T_DECIMAL = 2, T_TEXT = 3, T_BOOL = 4, T_TIMESTAMP = 5, T_FLOAT64 = 6, T_TIMESTAMPTZ = 7 };
+enum { T_INT64 = 1, T_DECIMAL = 2, T_TEXT = 3, T_BOOL = 4, T_TIMESTAMP = 5, T_FLOAT64 = 6, T_TIMESTAMPTZ = 7, T_DATE = 8, T_TIME = 9 };
 enum { DEP_TABLE = 1, DEP_VIEW = 2 };
 
 #define MAX_IDENT 63
@@ -67,7 +67,7 @@ typedef struct tk {
 
 /* ---- the tree ---------------------------------------------------------------------------------------------------- */
 
-enum { L_INT = 1, L_DEC, L_FLT, L_STR, L_PARAM, L_BOOL, L_TS, L_NULL, L_TSTZ }; /* L_TSTZ: P2 */
+enum { L_INT = 1, L_DEC, L_FLT, L_STR, L_PARAM, L_BOOL, L_TS, L_NULL, L_TSTZ, L_DATE, L_TIME }; /* L_TSTZ: P2; L_DATE, L_TIME: F3b */
 enum { X_LIT = 1, X_COL, X_NEG, X_ADD, X_SUB, X_MUL, X_DIV, X_MOD, X_CMP, X_AND, X_OR, X_NOT, X_FN, X_CASE, X_WHEN, X_CAST,
        X_AGG, X_WIN, X_SUBQ, X_LIST };
 enum { C_EQ = 1, C_NE, C_LT, C_LE, C_GT, C_GE, C_BETWEEN, C_ISNULL, C_NOTNULL, C_IN, C_NOTIN, C_LIKE, C_NOTLIKE };
@@ -579,8 +579,26 @@ static int col_type(ab *b, uint8_t *type, uint8_t *scale) /* a CAST's type, as a
         kw(b, "smallint") || kw(b, "int2"))
         *type = T_INT64; /* F3a: every width an INT64 value (a CAST's range is the run's, not the type's) */
     else if (kw(b, "text")) *type = T_TEXT;
+    else if (kw(b, "varchar") || (kwat(b, b->i, "character") && kwat(b, b->i + 1, "varying") && (b->i += 2))) {
+        *type = T_TEXT; /* F3c: VARCHAR(n), a TEXT to a view's types (its length the run's rule, as a width is) */
+        if (tok(b, K_LP)) {
+            const tk *t = &b->t[b->i];
+            if (t->k != K_INT || t->len > 5 || atoi(b->s + t->off) < 1 || atoi(b->s + t->off) > 65535)
+                return fail(b, "VARCHAR(n) needs 1 <= n <= 65535");
+            b->i++;
+            if (expect(b, K_RP, ")")) return -1;
+        }
+    }
     else if (kw(b, "bool") || kw(b, "boolean")) *type = T_BOOL;
     else if (kw(b, "timestamptz")) *type = T_TIMESTAMPTZ; /* P2 */
+    else if (kw(b, "date")) *type = T_DATE; /* F3b */
+    else if (kw(b, "time")) {
+        *type = T_TIME;
+        if ((kwat(b, b->i, "with") || kwat(b, b->i, "without")) && kwat(b, b->i + 1, "time") && kwat(b, b->i + 2, "zone")) {
+            if (kwat(b, b->i, "with")) return fail(b, "TIME WITH TIME ZONE is not supported");
+            b->i += 3;
+        }
+    }
     else if (kw(b, "timestamp")) {
         *type = T_TIMESTAMP;
         if ((kwat(b, b->i, "with") || kwat(b, b->i, "without")) && kwat(b, b->i + 1, "time") && kwat(b, b->i + 2, "zone")) {
@@ -620,7 +638,7 @@ static int col_type(ab *b, uint8_t *type, uint8_t *scale) /* a CAST's type, as a
 static int cast_expr(ab *b, uint16_t *out, unsigned d) /* CAST eaten */
 {
     uint16_t a;
-    uint8_t t, s;
+    uint8_t t = 0, s = 0; /* set by col_type on its every success */
     if (expect(b, K_LP, "(") || bexpr(b, &a, d + 1) || expect_kw(b, "as") || col_type(b, &t, &s) ||
         expect(b, K_RP, ")") || nnew(b, X_CAST, a, 0, out))
         return -1;
@@ -715,6 +733,7 @@ static int window_call(ab *b, uint8_t wf, uint16_t *out, unsigned d)
  * ZONE then a string (the engine's rule) */
 static bool ts_literal_at(const ab *b, uint32_t i)
 {
+    if (kwat(b, i, "date") || kwat(b, i, "time")) return kind_at(b, i + 1) == K_STR; /* F3b */
     if (kwat(b, i, "timestamptz")) return kind_at(b, i + 1) == K_STR;
     if (!kwat(b, i, "timestamp")) return false;
     if (kind_at(b, i + 1) == K_STR) return true;
@@ -737,7 +756,11 @@ static int literal(ab *b, uint16_t *out)
     else if (t->k == K_STR) lit = L_STR;
     else if (t->k == K_PARAM) lit = L_PARAM;
     else if (kwat(b, b->i, "true") || kwat(b, b->i, "false")) lit = L_BOOL;
-    else if (ts_literal_at(b, b->i)) { /* P2: TIMESTAMPTZ and TIMESTAMP WITH TIME ZONE its TIMESTAMPTZ */
+    else if ((kwat(b, b->i, "date") || kwat(b, b->i, "time")) && kind_at(b, b->i + 1) == K_STR) { /* F3b */
+        lit = kwat(b, b->i, "date") ? L_DATE : L_TIME;
+        b->i++;
+        t = &b->t[b->i];
+    } else if (ts_literal_at(b, b->i)) { /* P2: TIMESTAMPTZ and TIMESTAMP WITH TIME ZONE its TIMESTAMPTZ */
         bool tz = kwat(b, b->i, "timestamptz") || kwat(b, b->i + 1, "with");
         b->i += kwat(b, b->i, "timestamptz") || kind_at(b, b->i + 1) == K_STR ? 1 : 4;
         lit = tz ? L_TSTZ : L_TS;
@@ -1367,8 +1390,8 @@ static bool num(uint8_t t) { return t == T_INT64 || t == T_DECIMAL || t == T_FLO
 
 static const char *tname(uint8_t t)
 {
-    static const char *const N[] = {"NULL", "INT64", "DECIMAL", "TEXT", "BOOL", "TIMESTAMP", "FLOAT64", "TIMESTAMPTZ"};
-    return t <= T_TIMESTAMPTZ ? N[t] : "?";
+    static const char *const N[] = {"NULL", "INT64", "DECIMAL", "TEXT", "BOOL", "TIMESTAMP", "FLOAT64", "TIMESTAMPTZ", "DATE", "TIME"};
+    return t <= T_TIME ? N[t] : "?";
 }
 
 static int dep_note(ab *b, uint8_t kind, uint32_t id)
@@ -1595,6 +1618,15 @@ static int type_of(ab *b, const scope *sc, uint16_t k, bool null_ok, ty *out);
  * larger plus six, within 38); anything with FLOAT64 FLOAT64 (% refused) */
 static int arith(ab *b, uint8_t op, ty l, ty r, ty *out)
 {
+    /* F3b: a DATE plus or minus days, DATE minus DATE (days), DATE plus TIME (a TIMESTAMP); the rest refused */
+    if (l.t == T_DATE || r.t == T_DATE || l.t == T_TIME || r.t == T_TIME) {
+        if (op == X_ADD && ((l.t == T_DATE && r.t == T_INT64) || (l.t == T_INT64 && r.t == T_DATE))) *out = (ty){T_DATE, 0};
+        else if (op == X_SUB && l.t == T_DATE && r.t == T_INT64) *out = (ty){T_DATE, 0};
+        else if (op == X_SUB && l.t == T_DATE && r.t == T_DATE) *out = (ty){T_INT64, 0};
+        else if (op == X_ADD && ((l.t == T_DATE && r.t == T_TIME) || (l.t == T_TIME && r.t == T_DATE))) *out = (ty){T_TIMESTAMP, 0};
+        else return fail(b, "date arithmetic: DATE + or - INT64, DATE - DATE, DATE + TIME");
+        return 0;
+    }
     if (!num(l.t) || !num(r.t)) return fail(b, "arithmetic takes INT64, DECIMAL and FLOAT64 values");
     if (l.t == T_FLOAT64 || r.t == T_FLOAT64) {
         if (op == X_MOD) return fail(b, "%% is not defined on FLOAT64");
@@ -1641,7 +1673,7 @@ static int unify_all(ab *b, const scope *sc, const uint16_t *v, unsigned n, cons
     uint8_t ts = 0; /* a TIMESTAMP or (P2) a TIMESTAMPTZ among them: a string literal is of its type */
     for (unsigned i = 0; i < n; i++) {
         if (type_of(b, sc, v[i], true, &t[i])) return -1;
-        if (t[i].t == T_TIMESTAMP || t[i].t == T_TIMESTAMPTZ) ts = t[i].t;
+        if (t[i].t == T_TIMESTAMP || t[i].t == T_TIMESTAMPTZ || t[i].t == T_DATE || t[i].t == T_TIME) ts = t[i].t; /* F3b */
     }
     *out = (ty){0, 0};
     for (unsigned i = 0; i < n; i++) {
@@ -1770,7 +1802,8 @@ static int cast_type(ab *b, const scope *sc, const xn *x, ty *out)
     ty a;
     if (type_of(b, sc, x->l, true, &a)) return -1;
     bool to_num = num(x->ctype);
-    bool ts2 = (a.t == T_TIMESTAMP || a.t == T_TIMESTAMPTZ) && (x->ctype == T_TIMESTAMP || x->ctype == T_TIMESTAMPTZ); /* P2 */
+    bool fts = a.t == T_TIMESTAMP || a.t == T_TIMESTAMPTZ, tts = x->ctype == T_TIMESTAMP || x->ctype == T_TIMESTAMPTZ;
+    bool ts2 = (fts && (tts || x->ctype == T_DATE || x->ctype == T_TIME)) || (a.t == T_DATE && tts); /* P2; F3b: the engine's dt_cast_ok */
     if (a.t && a.t != T_TEXT && x->ctype != T_TEXT && a.t != x->ctype && !(num(a.t) && to_num) && !ts2)
         return fail(b, "CAST of %s to %s is not defined", tname(a.t), tname(x->ctype));
     *out = (ty){x->ctype, x->ctype == T_DECIMAL ? x->cscale : 0};
@@ -1877,6 +1910,8 @@ static int type_of(ab *b, const scope *sc, uint16_t k, bool null_ok, ty *out)
         case L_BOOL: *out = (ty){T_BOOL, 0}; return 0;
         case L_TS: *out = (ty){T_TIMESTAMP, 0}; return 0;
         case L_TSTZ: *out = (ty){T_TIMESTAMPTZ, 0}; return 0; /* P2 */
+        case L_DATE: *out = (ty){T_DATE, 0}; return 0; /* F3b */
+        case L_TIME: *out = (ty){T_TIME, 0}; return 0;
         case L_NULL:
             if (!null_ok) return fail(b, "NULL cannot be an operand");
             *out = (ty){0, 0};

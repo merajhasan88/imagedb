@@ -116,8 +116,8 @@ int imdb_alter_put(imdb_buf *b, const imdb_op *o)
         imdb_buf_put_u8(b, (uint8_t)cl);
         imdb_buf_put(b, o->acol.name, cl);
         imdb_buf_put_u8(b, o->acol.type);
-        imdb_buf_put_u8(b, o->acol.precision);
-        imdb_buf_put_u8(b, o->acol.scale);
+        imdb_buf_put_u8(b, o->acol.type == IMDB_T_TEXT ? (uint8_t)(o->acol.vlen & 0xff) : o->acol.precision); /* F3c */
+        imdb_buf_put_u8(b, o->acol.type == IMDB_T_TEXT ? (uint8_t)(o->acol.vlen >> 8) : o->acol.scale);
         imdb_buf_put_u8(b, o->acol.flags);
         put_default(b, &o->acol, &o->adef);
         return IMDB_OK;
@@ -128,8 +128,8 @@ int imdb_alter_put(imdb_buf *b, const imdb_op *o)
     case IMDB_ALTER_SET_TYPE:
         imdb_buf_put_u16(b, o->apos);
         imdb_buf_put_u8(b, o->acol.type);
-        imdb_buf_put_u8(b, o->acol.precision);
-        imdb_buf_put_u8(b, o->acol.scale);
+        imdb_buf_put_u8(b, o->acol.type == IMDB_T_TEXT ? (uint8_t)(o->acol.vlen & 0xff) : o->acol.precision); /* F3c */
+        imdb_buf_put_u8(b, o->acol.type == IMDB_T_TEXT ? (uint8_t)(o->acol.vlen >> 8) : o->acol.scale);
         if (o->akind == IMDB_ALTER_SET_DEFAULT) put_value(b, &o->acol, &o->adef);
         return IMDB_OK;
     default:
@@ -153,6 +153,10 @@ int imdb_alter_get(imdb_rd *r, imdb_op *o, const char *what, imdb_err *e)
         o->acol.type = imdb_rd_u8(r);
         o->acol.precision = imdb_rd_u8(r);
         o->acol.scale = imdb_rd_u8(r);
+        if (o->acol.type == IMDB_T_TEXT) { /* F3c: the two bytes a VARCHAR's length, as the schema's encoding writes it */
+            o->acol.vlen = (uint16_t)(o->acol.precision | o->acol.scale << 8);
+            o->acol.precision = o->acol.scale = 0;
+        }
         o->acol.flags = imdb_rd_u8(r);
         if (!r->err && !alter_col_ok(&o->acol)) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad added column", what);
         if (!r->err && get_default(r, &o->acol, &o->adef, what, e)) return e->code;
@@ -166,6 +170,10 @@ int imdb_alter_get(imdb_rd *r, imdb_op *o, const char *what, imdb_err *e)
         o->acol.type = imdb_rd_u8(r);
         o->acol.precision = imdb_rd_u8(r);
         o->acol.scale = imdb_rd_u8(r);
+        if (o->acol.type == IMDB_T_TEXT) { /* F3c: the two bytes a VARCHAR's length, as the schema's encoding writes it */
+            o->acol.vlen = (uint16_t)(o->acol.precision | o->acol.scale << 8);
+            o->acol.precision = o->acol.scale = 0;
+        }
         if (!r->err && !alter_bare_ok(&o->acol)) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad column type", what);
         if (!r->err && o->akind == IMDB_ALTER_SET_DEFAULT) return get_value(r, &o->acol, &o->adef, what, e);
         return IMDB_OK;

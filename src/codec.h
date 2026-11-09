@@ -26,8 +26,10 @@ typedef enum imdb_type {
     IMDB_T_TIMESTAMP = 5, /* microseconds since 1970-01-01 00:00:00 UTC */
     IMDB_T_FLOAT64 = 6,   /* finite IEEE-754 binary64, held as its order-preserving key (imdb_f64_key) */
     IMDB_T_TIMESTAMPTZ = 7, /* P2: an instant, microseconds since 1970-01-01 00:00:00 UTC, shown in the session's zone */
+    IMDB_T_DATE = 8,        /* F3b: days since 1970-01-01, 0001-01-01 to 9999-12-31 (TIMESTAMP's years) */
+    IMDB_T_TIME = 9,        /* F3b: microseconds since midnight, 00:00:00 to 23:59:59.999999 */
 } imdb_type;
-#define IMDB_T_LAST IMDB_T_TIMESTAMPTZ /* the highest tag a schema may hold */
+#define IMDB_T_LAST IMDB_T_TIME /* the highest tag a schema may hold */
 
 #define IMDB_COL_PK       0x01
 #define IMDB_COL_SUBJECT  0x02
@@ -39,6 +41,8 @@ typedef struct imdb_column {
     uint8_t precision; /* DECIMAL only: 1..18 */
     uint8_t scale;     /* DECIMAL only: 0..precision */
     uint8_t flags;
+    uint16_t vlen;     /* F3c: a TEXT's VARCHAR length in characters, 0 unbounded; written in the precision and scale
+                        * bytes (little-endian) of the schema's encoding, its precision and scale in memory 0 */
 } imdb_column;
 
 typedef struct imdb_schema {
@@ -88,6 +92,10 @@ bool imdb_type_is_int(uint8_t t); /* every type but TEXT: compared as int64 */
 bool imdb_int_width_ok(uint8_t width);
 bool imdb_int_fits(uint8_t width, int64_t v);
 const char *imdb_int_name(uint8_t width);
+/* F3c: a TEXT column's VARCHAR length in characters (vlen; 0: TEXT unbounded) */
+uint32_t imdb_text_max(const imdb_column *c);
+void imdb_text_set_max(imdb_column *c, uint32_t n);
+uint32_t imdb_utf8_chars(const uint8_t *s, uint32_t n); /* code points of valid UTF-8 */
 
 /* ---- FLOAT64 -------------------------------------------------------- */
 /* The order-preserving key of a finite double (-0.0 is taken as +0.0): key order is
@@ -126,6 +134,14 @@ int imdb_parse_int64(const char *s, size_t n, int64_t *out, imdb_err *e);
 int imdb_parse_float64(const char *s, size_t n, int64_t *key, imdb_err *e);
 /* 'YYYY-MM-DD[ HH:MM:SS[.ffffff]]' UTC only. */
 int imdb_parse_timestamp(const char *s, size_t n, int64_t *out, imdb_err *e);
+/* F3b: 'YYYY-MM-DD' (days since 1970-01-01) and 'HH:MM:SS[.f]' (1 to 6 fraction digits; microseconds since
+ * midnight; 24:00:00 refused) */
+int imdb_parse_date(const char *s, size_t n, int64_t *out, imdb_err *e);
+int imdb_parse_time(const char *s, size_t n, int64_t *out, imdb_err *e);
+#define IMDB_DATE_MIN (-719162LL)  /* 0001-01-01 */
+#define IMDB_DATE_MAX 2932896LL    /* 9999-12-31 */
+#define IMDB_TIME_MAX 86399999999LL /* 23:59:59.999999 */
+#define IMDB_DAY_US 86400000000LL
 /* P2: a TIMESTAMPTZ literal: a TIMESTAMP's text (its wall-clock time in local), then nothing (the session's zone
  * decides), an offset (Z, +HH, +HHMM, +HH:MM or +HH:MM:SS, at most 15:59:59 as PostgreSQL's, a space before it
  * allowed) or a space and a zone's name (zoff, zlen: where in s; the caller looks it up) */
@@ -145,6 +161,8 @@ void imdb_format_i128(__int128 v, int scale, imdb_buf *out);
 int64_t imdb_days_from_civil(int64_t y, int m, int d);
 void imdb_civil_from_days(int64_t z, int64_t *y, int *m, int *d);
 void imdb_format_timestamp(int64_t us, imdb_buf *out);
+void imdb_format_date(int64_t days, imdb_buf *out); /* F3b: 'YYYY-MM-DD' */
+void imdb_format_time(int64_t us, imdb_buf *out);   /* F3b: 'HH:MM:SS', and '.ffffff' when microseconds remain */
 /* P2: a TIMESTAMPTZ in a zone whose offset at it is off (seconds east): its local time as a TIMESTAMP's, then the
  * offset as PostgreSQL writes it: +HH, +HH:MM, or +HH:MM:SS (a local mean time's) */
 void imdb_format_timestamptz(int64_t utc_us, int32_t off, imdb_buf *out);

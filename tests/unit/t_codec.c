@@ -562,8 +562,8 @@ static void schema_null(imdb_schema *s)
     s->subject = -1;
     s->ncols = 12;
     static const uint8_t ty[12] = {IMDB_T_INT64, IMDB_T_INT64, IMDB_T_TEXT, IMDB_T_FLOAT64, IMDB_T_BOOL,
-                                   IMDB_T_DECIMAL, IMDB_T_TIMESTAMP, IMDB_T_INT64, IMDB_T_TEXT, IMDB_T_FLOAT64,
-                                   IMDB_T_INT64, IMDB_T_FLOAT64};
+                                   IMDB_T_DECIMAL, IMDB_T_TIMESTAMP, IMDB_T_DATE, IMDB_T_TEXT, IMDB_T_FLOAT64,
+                                   IMDB_T_TIME, IMDB_T_FLOAT64}; /* F3b: a DATE and a TIME among them */
     for (int i = 0; i < 12; i++) {
         snprintf(s->cols[i].name, sizeof s->cols[i].name, "c%d", i);
         s->cols[i].type = ty[i];

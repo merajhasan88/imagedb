@@ -226,6 +226,7 @@ static bool tok_is_kw(const parser *p, uint32_t at, const char *kw)
  * ZONE then a string (each token checked before the next is read: the end token stops the chain) */
 static bool ts_literal_at(const parser *p, uint32_t i)
 {
+    if (tok_is_kw(p, i, "date") || tok_is_kw(p, i, "time")) return p->t[i + 1].kind == TK_STR; /* F3b: DATE '...', TIME '...' */
     if (tok_is_kw(p, i, "timestamptz")) return p->t[i + 1].kind == TK_STR;
     if (!tok_is_kw(p, i, "timestamp")) return false;
     if (p->t[i + 1].kind == TK_STR) return true;
@@ -340,6 +341,14 @@ static int literal(parser *p, sql_lit *l)
     if (kw(p, "true") || kw(p, "false")) {
         l->kind = LIT_BOOL;
         l->bval = tok_is_kw(p, p->i - 1, "true");
+        return IMDB_OK;
+    }
+    /* F3b: DATE '...' and TIME '...' (a column named date or time is an identifier: no string follows it) */
+    if ((tok_is_kw(p, p->i, "date") || tok_is_kw(p, p->i, "time")) && p->t[p->i + 1].kind == TK_STR) {
+        l->kind = tok_is_kw(p, p->i, "date") ? LIT_DATE : LIT_TIME;
+        l->off = p->t[p->i + 1].off;
+        l->len = p->t[p->i + 1].len;
+        p->i += 2;
         return IMDB_OK;
     }
     /* TIMESTAMP '...', TIMESTAMP WITHOUT TIME ZONE '...'; P2: TIMESTAMPTZ '...', TIMESTAMP WITH TIME ZONE '...' */
@@ -557,6 +566,7 @@ static int cast_expr(parser *p, uint16_t *out, unsigned depth)
     x->ctype = c.type;
     x->cscale = c.scale;
     x->cprec = c.precision;
+    x->cvlen = c.vlen; /* F3c */
     return IMDB_OK;
 }
 
@@ -1042,8 +1052,29 @@ static int col_type(parser *p, imdb_column *c)
     else if (kw(p, "integer") || kw(p, "int") || kw(p, "int4")) c->type = IMDB_T_INT64, c->precision = 32; /* F3a */
     else if (kw(p, "smallint") || kw(p, "int2")) c->type = IMDB_T_INT64, c->precision = 16;
     else if (kw(p, "text")) c->type = IMDB_T_TEXT;
+    else if (tok_is_kw(p, p->i, "varchar") || (tok_is_kw(p, p->i, "character") && tok_is_kw(p, p->i + 1, "varying"))) {
+        p->i += tok_is_kw(p, p->i, "varchar") ? 1 : 2; /* F3c: VARCHAR(n), CHARACTER VARYING(n); without (n) a TEXT */
+        c->type = IMDB_T_TEXT;
+        if (tok(p, TK_LP)) {
+            uint64_t n;
+            if (uint_lit(p, &n) || expect(p, TK_RP, ")")) return p->e->code;
+            if (n < 1 || n > IMDB_MAX_TEXT) return imdb_fail(p->e, IMDB_ERR_INVALID, "VARCHAR(n) needs 1 <= n <= %u", IMDB_MAX_TEXT);
+            imdb_text_set_max(c, (uint32_t)n);
+        }
+    }
     else if (kw(p, "bool") || kw(p, "boolean")) c->type = IMDB_T_BOOL;
     else if (kw(p, "timestamptz")) c->type = IMDB_T_TIMESTAMPTZ; /* P2 */
+    else if (kw(p, "date")) c->type = IMDB_T_DATE; /* F3b */
+    else if (tok_is_kw(p, p->i, "time")) { /* F3b: TIME [WITHOUT TIME ZONE]; WITH TIME ZONE is refused (no zone in a time of day) */
+        p->i++;
+        c->type = IMDB_T_TIME;
+        if ((tok_is_kw(p, p->i, "with") || tok_is_kw(p, p->i, "without")) && tok_is_kw(p, p->i + 1, "time") &&
+            tok_is_kw(p, p->i + 2, "zone")) {
+            if (tok_is_kw(p, p->i, "with"))
+                return imdb_fail(p->e, IMDB_ERR_INVALID, "TIME WITH TIME ZONE is not supported (a time of day has no zone: TIMESTAMPTZ)");
+            p->i += 3;
+        }
+    }
     else if (kw(p, "timestamp")) {
         c->type = IMDB_T_TIMESTAMP;
         if ((tok_is_kw(p, p->i, "with") || tok_is_kw(p, p->i, "without")) && tok_is_kw(p, p->i + 1, "time") &&

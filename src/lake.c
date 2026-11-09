@@ -25,7 +25,8 @@ static size_t align8(size_t x) { return (x + 7) & ~(size_t)7; }
 
 static bool is_int_col(uint8_t type)
 {
-    return type == IMDB_T_INT64 || type == IMDB_T_DECIMAL || type == IMDB_T_TIMESTAMP || type == IMDB_T_FLOAT64 ||
+    return type == IMDB_T_INT64 || type == IMDB_T_DECIMAL || type == IMDB_T_TIMESTAMP || type == IMDB_T_FLOAT64 || type == IMDB_T_DATE ||
+           type == IMDB_T_TIME ||
            type == IMDB_T_TIMESTAMPTZ;
 }
 
@@ -85,7 +86,7 @@ static bool schema_same(const imdb_schema *a, const imdb_schema *b)
     for (uint16_t c = 0; c < a->ncols; c++) {
         const imdb_column *x = &a->cols[c], *y = &b->cols[c];
         if (strcmp(x->name, y->name) != 0 || x->type != y->type || x->precision != y->precision || x->scale != y->scale ||
-            x->flags != y->flags)
+            x->flags != y->flags || x->vlen != y->vlen) /* F3c */
             return false;
     }
     for (uint8_t k = 0; k < a->npk; k++)
@@ -359,6 +360,8 @@ int imdb_segment_parse(const imdb_schema *s, const uint8_t vhash[32], uint8_t *b
                 } else if ((col->type == IMDB_T_DECIMAL && (v > lim || v < -lim)) ||
                            (col->type == IMDB_T_INT64 && !imdb_int_fits(col->precision, v)) || /* F3a */
                            ((col->type == IMDB_T_TIMESTAMP || col->type == IMDB_T_TIMESTAMPTZ) && (v < TS_MIN || v > TS_MAX)) ||
+                           (col->type == IMDB_T_DATE && (v < IMDB_DATE_MIN || v > IMDB_DATE_MAX)) || /* F3b */
+                           (col->type == IMDB_T_TIME && (v < 0 || v > IMDB_TIME_MAX)) ||
                            (col->type == IMDB_T_FLOAT64 && !imdb_f64_key_valid(v))) {
                     rc = imdb_fail(e, IMDB_ERR_CORRUPT, "segment: value out of range in column %s", col->name);
                 }
@@ -381,6 +384,8 @@ int imdb_segment_parse(const imdb_schema *s, const uint8_t vhash[32], uint8_t *b
                     rc = imdb_fail(e, IMDB_ERR_CORRUPT, "segment: a row without a value in column %s keeps text", col->name);
                 else if (z > a && !imdb_utf8_valid(sc->data + a, z - a, &bad))
                     rc = imdb_fail(e, IMDB_ERR_CORRUPT, "segment: invalid UTF-8 in column %s", col->name);
+                else if (col->vlen && z > a && imdb_utf8_chars(sc->data + a, z - a) > col->vlen) /* F3c */
+                    rc = imdb_fail(e, IMDB_ERR_CORRUPT, "segment: a value longer than VARCHAR(%u) in column %s", col->vlen, col->name);
             }
         }
         if (vb) k++;
@@ -1780,6 +1785,7 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
                 o.acol.type = c->type;
                 o.acol.precision = c->precision;
                 o.acol.scale = c->scale;
+                o.acol.vlen = c->vlen; /* F3c: a VARCHAR's length */
                 o.adef = v->adef;
             } /* DROP COLUMN, SET and DROP NOT NULL, DROP DEFAULT: the position alone */
             imdb_buf_put_u64(mb, v->since);
