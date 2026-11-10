@@ -18,7 +18,8 @@ typedef struct sql_tok {
 /* LIT_EXPR: not a literal but an expression's tree (ex), where a value may be one: an UPDATE's SET, an INSERT's
  * VALUES (a WHERE condition that is not today's col op literal is a tree too: sql_cmp lx) */
 enum { LIT_INT = 1, LIT_DEC, LIT_STR, LIT_BOOL, LIT_TS, LIT_PARAM, LIT_FLOAT, LIT_NULL, LIT_EXPR, LIT_TSTZ, LIT_DATE, LIT_TIME,
-       LIT_DEFAULT }; /* LIT_TSTZ: P2; LIT_DATE, LIT_TIME: F3b; LIT_DEFAULT: F2a-2, INSERT ... VALUES (DEFAULT) */
+       LIT_DEFAULT, LIT_UUID, LIT_BYTEA }; /* LIT_TSTZ: P2; LIT_DATE, LIT_TIME: F3b; LIT_DEFAULT: F2a-2, INSERT ... VALUES
+                                         * (DEFAULT); LIT_UUID, LIT_BYTEA: F3d, UUID '...' and BYTEA '...' */
 
 typedef struct sql_lit {
     uint8_t kind;
@@ -69,7 +70,9 @@ enum { FN_ABS = 1, FN_SIGN, FN_ROUND, FN_CEIL, FN_FLOOR, FN_MOD, FN_LENGTH, FN_S
        FN_POSITION, FN_COALESCE, FN_NULLIF, FN_LOWER, FN_UPPER, FN_REPLACE, FN_CONCAT,
        FN_DATE_TRUNC, FN_TIMEZONE, /* P2: date_trunc(unit, x [, zone]); x AT TIME ZONE z as timezone(z, x) */
        FN_NOW, FN_LOCALTIMESTAMP, FN_CURRENT_DATE, FN_LOCALTIME, /* F2a: the clock (the transaction's start) */
-       FN_NEXTVAL, FN_CURRVAL, FN_SETVAL, FN_LASTVAL }; /* F2a-2: sequences (a statement calling nextval or setval writes) */
+       FN_NEXTVAL, FN_CURRVAL, FN_SETVAL, FN_LASTVAL, /* F2a-2: sequences (a statement calling nextval or setval writes) */
+       FN_GEN_RANDOM_UUID, /* F3d: a version-4 UUID drawn at each call (a statement calling it runs one plan) */
+       FN_OCTET_LENGTH }; /* F3d: a TEXT's or a BYTEA's bytes */
 
 /* col op a (BETWEEN: a AND b), today's form, whose literals bind to the column (an index may serve it); or with lx a
  * residual: a boolean tree (1c), tested on every row that passed the bound conjuncts, kept when TRUE */
@@ -254,6 +257,7 @@ typedef struct sql_stmt {
     sql_seqopt idopt[IMDB_MAX_COLS];            /* F2a-2: an IDENTITY column's sequence options */
     sql_seqopt seqopt;                          /* F2a-2: CREATE SEQUENCE's (its name in table) */
     bool seq_write;                             /* F2a-2: it calls nextval or setval: a write, its commit the marks */
+    bool rand_call;                             /* F3d: it calls gen_random_uuid: one plan runs (two would draw twice) */
     uint8_t overriding;                         /* F2a-2: INSERT ... OVERRIDING SYSTEM VALUE (1), USER VALUE (2) */
     bool default_values;                        /* F2a-2: INSERT ... DEFAULT VALUES */
     uint8_t nchecks;                            /* F2b-1: CREATE TABLE's CHECKs in order (ALTER TABLE ... ADD CHECK: one): each its

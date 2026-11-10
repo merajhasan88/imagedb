@@ -34,7 +34,8 @@ int imdb_hmap_init(imdb_hmap *m, uint8_t ktype, imdb_err *e)
 {
     m->cap = 16;
     m->count = m->key_bytes = 0;
-    m->ktype = ktype == IMDB_T_TEXT || ktype == IMDB_HKEY_BYTES ? ktype : IMDB_T_INT64;
+    /* F3d: UUID and BYTEA keys are byte strings too (hashed and compared as TEXT's; never an INT64's i) */
+    m->ktype = ktype == IMDB_HKEY_BYTES ? ktype : imdb_type_bytes(ktype) ? IMDB_T_TEXT : IMDB_T_INT64;
     m->slots = imdb_alloc_array(m->cap, sizeof *m->slots, e);
     return m->slots ? IMDB_OK : e->code;
 }

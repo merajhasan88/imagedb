@@ -220,7 +220,10 @@ enum {
     IMDB_DEFK_NEXTVAL = 8,           /* DEFAULT nextval('s'): a sequence of its own life */
     IMDB_DEFK_GENERATED = 9,         /* F2c: GENERATED ALWAYS AS (expr) STORED: its text as written (op 28's texts' rules), the
                                         column's value on every row computed from the row: no key, SUBJECT or FLOAT64 column */
-    IMDB_DEFK_LAST = IMDB_DEFK_GENERATED,
+    IMDB_DEFK_RANDOM_UUID = 10,      /* F3d: DEFAULT gen_random_uuid(): a UUID column's, drawn at each write and logged in the row (a
+                                        verifier never draws); a CREATE's or a SET DEFAULT's, never an ADD's (one value for every older
+                                        row: PostgreSQL draws one a row) */
+    IMDB_DEFK_LAST = IMDB_DEFK_RANDOM_UUID,
 };
 bool imdb_defk_fits(uint8_t kind, uint8_t type);
 

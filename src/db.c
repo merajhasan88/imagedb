@@ -383,7 +383,7 @@ int imdb_hist_create_defaults(imdb_schema_hist *h, const imdb_coldef *defs, uint
         }
         if (d->kind == IMDB_DEFK_VALUE) {
             tc->cdef = d->v;
-            if (d->v.type == IMDB_T_TEXT) { /* its own bytes, as an ADD's DEFAULT keeps them */
+            if (imdb_type_bytes(d->v.type)) { /* its own bytes, as an ADD's DEFAULT keeps them */
                 imdb_free(tc->missing_text);
                 if (!(tc->missing_text = imdb_alloc(d->v.len ? d->v.len : 1, e))) return e->code;
                 if (d->v.len) memcpy(tc->missing_text, d->v.s, d->v.len);
@@ -2302,7 +2302,7 @@ int imdb_create_table_defs(imdb_db *db, imdb_schema *s, uint64_t retention_us, c
     if (imdb_create_table_ex(db, s, retention_us, e) || !ndefs) return e->code;
     size_t text = 0;
     for (uint16_t k = 0; k < ndefs; k++) {
-        if (defs[k].kind == IMDB_DEFK_VALUE && defs[k].v.type == IMDB_T_TEXT) text += defs[k].v.len;
+        if (defs[k].kind == IMDB_DEFK_VALUE && imdb_type_bytes(defs[k].v.type)) text += defs[k].v.len;
         if (defs[k].kind == IMDB_DEFK_GENERATED) text += defs[k].tlen; /* F2c: its text, the op's own too */
     }
     imdb_coldef *own = imdb_alloc((size_t)ndefs * sizeof *own + text + 1, e);
@@ -2314,7 +2314,7 @@ int imdb_create_table_defs(imdb_db *db, imdb_schema *s, uint64_t retention_us, c
     uint8_t *tb = (uint8_t *)(own + ndefs);
     for (uint16_t k = 0; k < ndefs; k++) {
         own[k] = defs[k];
-        if (own[k].kind == IMDB_DEFK_VALUE && own[k].v.type == IMDB_T_TEXT) {
+        if (own[k].kind == IMDB_DEFK_VALUE && imdb_type_bytes(own[k].v.type)) {
             if (own[k].v.len) memcpy(tb, own[k].v.s, own[k].v.len);
             own[k].v.s = tb;
             tb += own[k].v.len;
@@ -2666,7 +2666,7 @@ int imdb_hist_prepare(imdb_schema_hist *h, imdb_op *o, imdb_err *e)
     const imdb_sver *cur = &h->vers[h->nvers - 1];
     imdb_sver nx;
     if (imdb_sver_next(h, cur, o, &nx, e)) return e->code; /* its callers checked it: never here but for a broken rule */
-    bool text = o->acol.type == IMDB_T_TEXT && !o->adef.null;
+    bool text = imdb_type_bytes(o->acol.type) && !o->adef.null;
     if (o->akind == IMDB_ALTER_ADD_COLUMN && text) {
         imdb_tcol *tc = &h->tcol[cur->npos];
         imdb_free(tc->missing_text);
@@ -2719,7 +2719,7 @@ void imdb_hist_install(imdb_schema_hist *h, const imdb_op *o, uint64_t seq)
         tc->missing = o->adef;
         tc->missing.type = o->acol.type;
         tc->missing.scale = o->acol.scale;
-        if (o->acol.type == IMDB_T_TEXT && !o->adef.null) tc->missing.s = tc->missing_text;
+        if (imdb_type_bytes(o->acol.type) && !o->adef.null) tc->missing.s = tc->missing_text;
         tc->wdef = tc->missing; /* the ADD's DEFAULT is the column's for later writes too, as in every engine */
         tc->cdef = (imdb_value){.type = o->acol.type, .scale = o->acol.scale, .null = true}; /* F2a: a CREATE's alone */
         tc->cclock = 0;
@@ -2732,7 +2732,7 @@ void imdb_hist_install(imdb_schema_hist *h, const imdb_op *o, uint64_t seq)
         tc->dropped = made;
         break;
     case IMDB_ALTER_SET_DEFAULT:
-        if (nv->adef.type == IMDB_T_TEXT) {
+        if (imdb_type_bytes(nv->adef.type)) {
             nv->atext = h->staged; /* the version's own now */
             h->staged = NULL;
             nv->adef.s = nv->atext;
@@ -3123,7 +3123,7 @@ static const imdb_table *seq_named_by(const imdb_db *db, uint32_t id, uint16_t *
         const imdb_sver *v = &t->hist.vers[t->hist.nvers - 1];
         for (uint16_t c = 0; c < v->s.ncols; c++) {
             const imdb_tcol *tc = &t->hist.tcol[v->pos[c]];
-            if (tc->wclock >= IMDB_DEFK_IDENTITY_ALWAYS && tc->wseq == id) {
+            if (tc->wclock >= IMDB_DEFK_IDENTITY_ALWAYS && tc->wclock <= IMDB_DEFK_NEXTVAL && tc->wseq == id) { /* F3d: kind 10 owns none */
                 *pos = c;
                 return t;
             }
@@ -3425,12 +3425,12 @@ static bool ukey_vals_version(imdb_table *t, uint64_t vid, const imdb_index *ix,
 static int ukey(const imdb_index *ix, const imdb_value *v, imdb_buf *b, imdb_value *out, imdb_err *e)
 {
     if (ix->d.ncols == 1) {
-        *out = v[0].type == IMDB_T_TEXT ? v[0] : (imdb_value){.type = IMDB_T_INT64, .i = v[0].i};
+        *out = imdb_type_bytes(v[0].type) ? v[0] : (imdb_value){.type = IMDB_T_INT64, .i = v[0].i};
         return IMDB_OK;
     }
     b->len = 0;
     for (uint8_t c = 0; c < ix->d.ncols; c++) {
-        if (v[c].type == IMDB_T_TEXT) {
+        if (imdb_type_bytes(v[c].type)) {
             imdb_buf_put_u32(b, v[c].len);
             imdb_buf_put(b, v[c].s, v[c].len);
         } else {
@@ -3477,7 +3477,7 @@ static int unique_reserve(imdb_table *t, imdb_uidx *u, uint64_t vid, imdb_err *e
 static int unique_build_into(imdb_table *t, const imdb_index *ix, imdb_uidx *u, imdb_err *e)
 {
     unique_free(u);
-    uint8_t kt = ix->d.ncols == 1 && t->s.cols[ix->d.cols[0]].type != IMDB_T_TEXT ? IMDB_T_INT64 : IMDB_T_TEXT;
+    uint8_t kt = ix->d.ncols == 1 && !imdb_type_bytes(t->s.cols[ix->d.cols[0]].type) ? IMDB_T_INT64 : IMDB_T_TEXT;
     if (imdb_hmap_init(&u->map, kt, e)) return e->code;
     imdb_buf b;
     imdb_buf_init(&b);
@@ -3616,7 +3616,7 @@ uint64_t imdb_index_unique_bytes(const imdb_index *ix)
 bool imdb_index_key_of(const imdb_value *v, uint64_t *key)
 {
     if (v->null) return false;
-    if (v->type == IMDB_T_TEXT) { /* the prefix keeps the order: no TEXT holds a NUL */
+    if (imdb_type_bytes(v->type)) { /* the prefix keeps the order (F3d: a BYTEA's NULs too: a shorter value pads with 0) */
         uint64_t k = 0;
         for (uint32_t i = 0; i < 8; i++) k = k << 8 | (i < v->len ? v->s[i] : 0);
         *key = k;
@@ -6718,7 +6718,7 @@ int imdb_hist_copy(imdb_schema_hist *dst, const imdb_schema_hist *src, imdb_err 
         tc->gtext = gt[p]; /* F2c */
         if (txt[p]) tc->missing.s = txt[p];
         if (txt[p] && tc->added == 1) tc->cdef.s = txt[p]; /* F2a: a CREATE's TEXT DEFAULT, its bytes there */
-        if (tc->wdef.type == IMDB_T_TEXT && !tc->wdef.null) /* the copy's own bytes: an ADD's or a SET DEFAULT's */
+        if (imdb_type_bytes(tc->wdef.type) && !tc->wdef.null) /* the copy's own bytes: an ADD's or a SET DEFAULT's */
             tc->wdef.s = tc->wver >= 0 ? v[tc->wver].atext : txt[p];
     }
     return IMDB_OK;

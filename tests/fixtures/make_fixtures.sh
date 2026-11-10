@@ -1,7 +1,7 @@
 #!/bin/sh
-# Makes the format's fixtures (2026-11-09, sixth pair: META 5, log version 3, manifest version 13 and segment format 3 (F1 stage 4:
-# a segment names its schema version by its hash with positions), ops 16, 19, 20, 21, 22's kinds and 23 to 29; alg1-20261109f.tar.gz
-# and alg2-20261109f.tar.gz beside this script): a primary and its replica under digest algorithm ALG, by
+# Makes the format's fixtures (2026-11-09, seventh pair: META 5, log version 3, manifest version 14 and segment format 3 (F1 stage 4:
+# a segment names its schema version by its hash with positions), ops 16, 19, 20, 21, 22's kinds and 23 to 29; alg1-20261109g.tar.gz
+# and alg2-20261109g.tar.gz beside this script): a primary and its replica under digest algorithm ALG, by
 # make_alg2.sh's steps, which reach every reader of the format: a log of several segments (each manifest
 # publish ends one), CHECKPOINTs (manifests, segments, the lanes), a two-column index and a unique one,
 # an UPDATE and a DELETE, ERASE SUBJECT (redacted log payloads, rewritten segments), commits after it, and
@@ -38,7 +38,7 @@
 # before FOREIGN KEYs) stay as
 # directories this format refuses.
 #   sh tests/fixtures/make_fixtures.sh BIN AUDIT ALG OUTDIR   (OUTDIR must not exist)
-#   tar -czf tests/fixtures/algALG-20261109f.tar.gz -C OUTDIR primary replica
+#   tar -czf tests/fixtures/algALG-20261109g.tar.gz -C OUTDIR primary replica
 set -eu
 BIN=$1
 AUD=$2
@@ -105,6 +105,11 @@ sql "CREATE TABLE fkn (id INT64 PRIMARY KEY, cid INT64, CONSTRAINT fkn_c FOREIGN
 sql "INSERT INTO fkp VALUES (1, 'a'), (2, 'b'), (3, 'c')"
 sql "INSERT INTO fkc VALUES (10, 1, 2), (11, 1, 3), (12, 2, NULL)"
 sql "INSERT INTO fkn VALUES (20, 10), (21, 12), (22, NULL)"
+sql "CREATE TABLE ub (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), k UUID, b BYTEA, n INT64) RETENTION FOREVER" # F3d
+sql "INSERT INTO ub (k, b, n) VALUES ('00000000-0000-0000-0000-000000000000', '\\x', 1), ('FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF', '\\x00ff', 2), (NULL, NULL, 3)"
+sql "CREATE INDEX ub_k ON ub (k)"
+sql "CREATE INDEX ub_b ON ub (b)"
+sql "CREATE VIEW ubv AS SELECT k, b, n FROM ub WHERE b > '\\x00'"   # F3d: a view reading both
 sql "CHECKPOINT"
 ship
 sql "ALTER TABLE pair ADD w TEXT DEFAULT 'w0'"          # F1: op 22; pair's rows so far are in a segment of version 1
@@ -138,6 +143,9 @@ sql "INSERT INTO gened (id, a, s) VALUES (4, 1, 'q')"
 sql "ALTER TABLE fkc ADD CONSTRAINT fkc_q FOREIGN KEY (q) REFERENCES fkp" # F2b-2: op 22 kind 13 over the rows
 sql "DELETE FROM fkp WHERE id = 1"                   # fkc 10 and 11 cascade, fkn 20's cid NULL: from the log
 sql "ALTER TABLE fkc DROP CONSTRAINT fkc_q"           # kind 14
+sql "INSERT INTO ub (k, b, n) VALUES (gen_random_uuid(), '\\x0102', 4)" # F3d: from the log
+sql "UPDATE ub SET b = '\\x6869' WHERE n = 1"
+sql "ALTER TABLE ub ALTER COLUMN k SET DEFAULT gen_random_uuid()" # op 22 kind 10, kind 10
 sql "UPDATE stamp SET at = TIMESTAMPTZ '2030-01-01 12:00:00+05:45' WHERE id = 3" # P2: an instant from the log
 sql "UPDATE acct SET balance = 1.00 WHERE id <= 10"
 sql "DELETE FROM ev WHERE id BETWEEN 1 AND 5"

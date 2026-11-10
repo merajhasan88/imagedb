@@ -4669,6 +4669,230 @@ static int check_gen(unsigned seed, int step)
     return 0;
 }
 
+
+/* ---- F3d, --bytes: UUID and BYTEA against the others, a battery per seed (docs/f3d-design.md section 6) ---------------
+ * Its own table x (id, u, b) in every dialect: imagedb UUID and BYTEA, PostgreSQL uuid and bytea, SQLite TEXT and BLOB,
+ * MySQL and MariaDB CHAR(36) ascii_bin and VARBINARY(64), SQL Server CHAR(36) Latin1_General_BIN2 and VARBINARY(64) (no
+ * native type where it orders otherwise: MariaDB's UUID by its time fields, SQL Server's UNIQUEIDENTIFIER by byte groups).
+ * Values from pools drawn per seed: UUIDs as lowercase text (its order its bytes'), BYTEAs without a 0x00 byte (SQL
+ * Server may pad the shorter VARBINARY with zeros when it compares: then it orders as byteacmp whatever it does). Every
+ * answer is text each engine spells alike: a BYTEA as \x and lowercase hex, a UUID's canonical text; an ORDER BY over
+ * values never NULL (the dialects order NULL differently), a grouped answer compared as a multiset. */
+static bool g_bytes;
+static unsigned long g_bytes_compared;
+
+static const char *const BU[] = {"00000000-0000-0000-0000-000000000001", "0fffffff-ffff-ffff-ffff-ffffffffffff",
+                                 "7fffffff-ffff-ffff-ffff-ffffffffffff", "80000000-0000-0000-0000-000000000000",
+                                 "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", "ffffffff-ffff-ffff-ffff-fffffffffffe"};
+static const char *const BB[] = {"", "01", "0101", "010101", "0102", "02", "fe", "fe01", "ff", "6869", "686901"};
+
+/* a BYTEA literal of hex digits h in dialect d */
+static void bx_lit(sb *s, int d, const char *h)
+{
+    if (d == D_IMDB || d == D_PG) sb_printf(s, "'\\x%s'", h);
+    else if (d == D_MS) sb_printf(s, "0x%s", h);
+    else sb_printf(s, "X'%s'", h);
+}
+
+/* the dialect's text of BYTEA expression e: \x and lowercase hex, NULL a NULL */
+static void bx_text(sb *s, int d, const char *e)
+{
+    if (d == D_IMDB) sb_printf(s, "CAST(%s AS TEXT)", e);
+    else if (d == D_PG) sb_printf(s, "'\\x' || encode(%s, 'hex')", e);
+    else if (d == D_SQLITE) sb_printf(s, "CASE WHEN %s IS NULL THEN NULL ELSE '\\x' || lower(hex(%s)) END", e, e);
+    else if (d == D_MS) sb_printf(s, "'\\x' + LOWER(CONVERT(VARCHAR(MAX), %s, 2))", e);
+    else sb_printf(s, "CONCAT('\\\\x', LOWER(HEX(%s)))", e);
+}
+
+/* a UUID expression's canonical text */
+static void ux_text(sb *s, int d, const char *e)
+{
+    if (d == D_IMDB || d == D_PG) sb_printf(s, "CAST(%s AS TEXT)", e);
+    else sb_printf(s, "%s", e);
+}
+
+static int rows_cmp(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+
+static int g_ms_pad = -1; /* design 8.3: SQL Server's 0x01 = 0x0100, recorded (1 it pads the shorter with zeros) */
+
+/* the battery's own statements: a dialect refusing one is a mismatch to report, never the run's end (must exits) */
+static int bx_exec(unsigned seed, int d, const char *sql)
+{
+    res r;
+    memset(&r, 0, sizeof r);
+    exec_eng(&g_eng[d], sql, false, NULL, 0, &r);
+    int rc = r.err ? -1 : 0;
+    if (rc) {
+        g_mismatches++;
+        fprintf(stderr, "MISMATCH seed %u (--bytes, the table x), %s refused: %s\n  %s\n", seed, DNAME[d], r.msg, sql);
+    }
+    res_clear(&r);
+    return rc;
+}
+
+static int bytes_battery(unsigned seed)
+{
+    char hex[3][16];
+    const char *bl[3];
+    for (int i = 0; i < 3; i++) {
+        snprintf(hex[i], sizeof hex[i], "%s", BB[rnd() % (sizeof BB / sizeof *BB)]);
+        bl[i] = hex[i];
+    }
+    const char *ul[2] = {BU[rnd() % 6], BU[rnd() % 6]};
+    int nrow = (int)rr(12, 30);
+    int ru[32], rb[32];
+    for (int i = 0; i < nrow; i++) {
+        ru[i] = chance(12) ? -1 : (int)(rnd() % 6);
+        rb[i] = chance(12) ? -1 : (int)(rnd() % (sizeof BB / sizeof *BB));
+    }
+    static const char *const DDL[ND] = {
+        "CREATE TABLE x (id INT64 PRIMARY KEY, u UUID, b BYTEA)",
+        "CREATE TABLE x (id INTEGER PRIMARY KEY, u TEXT, b BLOB)",
+        "CREATE TABLE x (id BIGINT PRIMARY KEY, u uuid, b bytea)",
+        "CREATE TABLE x (id BIGINT PRIMARY KEY, u CHAR(36) CHARACTER SET ascii COLLATE ascii_bin, b VARBINARY(64))",
+        "CREATE TABLE x (id BIGINT PRIMARY KEY, u CHAR(36) CHARACTER SET ascii COLLATE ascii_bin, b VARBINARY(64))",
+        "CREATE TABLE x (id BIGINT NOT NULL PRIMARY KEY, u CHAR(36) COLLATE Latin1_General_BIN2, b VARBINARY(64))"};
+    for (int d = 0; d < ND; d++) {
+        eng *e = &g_eng[d];
+        if (!e->on) continue;
+        if ((d != D_IMDB && bx_exec(seed, d, "DROP TABLE IF EXISTS x")) || bx_exec(seed, d, DDL[d])) return -1;
+        sb ins = {0};
+        sb_str(&ins, "INSERT INTO x VALUES ");
+        for (int i = 0; i < nrow; i++) {
+            sb_printf(&ins, "%s(%d, ", i ? ", " : "", i + 1);
+            if (ru[i] < 0) sb_str(&ins, "NULL");
+            else sb_printf(&ins, "'%s'", BU[ru[i]]);
+            sb_str(&ins, ", ");
+            if (rb[i] < 0) sb_str(&ins, "NULL");
+            else bx_lit(&ins, d, BB[rb[i]]);
+            sb_str(&ins, ")");
+        }
+        int irc = bx_exec(seed, d, ins.p);
+        free(ins.p);
+        if (irc) return -1;
+        (void)e;
+    }
+    enum { NQ = 9 };
+    for (int qn = 0; qn < NQ; qn++) {
+        static res out[ND];
+        int ty[8];
+        int nty = 0;
+        bool multiset = false;
+        char sql[ND][1600];
+        for (int d = 0; d < ND; d++) {
+            if (!g_eng[d].on) continue;
+            sb s = {0};
+            nty = 0;
+            switch (qn) {
+            case 0: /* every row, ordered by its non-NULL values */
+                sb_str(&s, "SELECT id, ");
+                ux_text(&s, d, "u");
+                sb_str(&s, ", ");
+                bx_text(&s, d, "b");
+                sb_str(&s, " FROM x WHERE u IS NOT NULL AND b IS NOT NULL ORDER BY u, b, id");
+                ty[0] = TY(CT_INT, 0), ty[1] = ty[2] = TY(CT_TXT, 0), nty = 3;
+                break;
+            case 1: /* BYTEA's order: descending */
+                sb_str(&s, "SELECT id FROM x WHERE b IS NOT NULL ORDER BY b DESC, id");
+                ty[0] = TY(CT_INT, 0), nty = 1;
+                break;
+            case 2: /* a range between two literals */
+                sb_str(&s, "SELECT id FROM x WHERE b > ");
+                bx_lit(&s, d, bl[0]);
+                sb_str(&s, " AND b <= ");
+                bx_lit(&s, d, bl[1]);
+                sb_str(&s, " ORDER BY id");
+                ty[0] = TY(CT_INT, 0), nty = 1;
+                break;
+            case 3: /* IN on each */
+                sb_printf(&s, "SELECT id FROM x WHERE u IN ('%s', '%s') OR b IN (", ul[0], ul[1]);
+                bx_lit(&s, d, bl[2]);
+                sb_str(&s, ", ");
+                bx_lit(&s, d, bl[0]);
+                sb_str(&s, ") ORDER BY id");
+                ty[0] = TY(CT_INT, 0), nty = 1;
+                break;
+            case 4: /* grouped by the BYTEA: a multiset */
+                bx_text(&s, d, "b");
+                sb_str(&s, ", COUNT(*), MIN(id) FROM x GROUP BY b");
+                {
+                    sb t = {0};
+                    sb_str(&t, "SELECT ");
+                    sb_put(&t, s.p, s.n);
+                    free(s.p);
+                    s = t;
+                }
+                ty[0] = TY(CT_TXT, 0), ty[1] = ty[2] = TY(CT_INT, 0), nty = 3;
+                multiset = true;
+                break;
+            case 5: /* grouped by the UUID: a multiset */
+                sb_str(&s, "SELECT ");
+                ux_text(&s, d, "u");
+                sb_str(&s, ", COUNT(*), MAX(id) FROM x GROUP BY u");
+                ty[0] = TY(CT_TXT, 0), ty[1] = ty[2] = TY(CT_INT, 0), nty = 3;
+                multiset = true;
+                break;
+            case 6: /* joins on each */
+                sb_str(&s, "SELECT a.id, c.id FROM x AS a JOIN x AS c ON a.b = c.b AND a.id < c.id UNION ALL SELECT a.id, -c.id FROM x AS a "
+                           "JOIN x AS c ON a.u = c.u AND a.id < c.id");
+                ty[0] = ty[1] = TY(CT_INT, 0), nty = 2;
+                multiset = true;
+                break;
+            case 7: { /* the extremes, the distinct counts, a BYTEA's length */
+                sb_str(&s, "SELECT ");
+                /* PostgreSQL 14: no min(bytea) or max(bytea) either; its ORDER BY is byteacmp, the order imagedb's are */
+                bx_text(&s, d, d == D_PG ? "(SELECT b FROM x WHERE b IS NOT NULL ORDER BY b LIMIT 1)" : "MIN(b)");
+                sb_str(&s, ", ");
+                bx_text(&s, d, d == D_PG ? "(SELECT b FROM x WHERE b IS NOT NULL ORDER BY b DESC LIMIT 1)" : "MAX(b)");
+                sb_str(&s, ", ");
+                if (d == D_PG) sb_str(&s, "MIN(CAST(u AS TEXT)), MAX(CAST(u AS TEXT))"); /* PostgreSQL 14: no min(uuid) */
+                else {
+                    ux_text(&s, d, "MIN(u)");
+                    sb_str(&s, ", ");
+                    ux_text(&s, d, "MAX(u)");
+                }
+                sb_printf(&s, ", COUNT(DISTINCT b), COUNT(DISTINCT u), SUM(%s(b)) FROM x", d == D_MS ? "DATALENGTH" : "LENGTH");
+                ty[0] = ty[1] = ty[2] = ty[3] = TY(CT_TXT, 0), ty[4] = ty[5] = ty[6] = TY(CT_INT, 0), nty = 7;
+                break;
+            }
+            case 8: /* the UUID's order past a literal */
+                sb_printf(&s, "SELECT id FROM x WHERE u > '%s' ORDER BY id", ul[0]);
+                ty[0] = TY(CT_INT, 0), nty = 1;
+                break;
+            }
+            snprintf(sql[d], sizeof sql[d], "%s", s.p ? s.p : "");
+            free(s.p);
+            exec_eng(&g_eng[d], sql[d], true, ty, nty, &out[d]);
+            if (multiset && !out[d].err && out[d].n > 1) qsort(out[d].rows, out[d].n, sizeof *out[d].rows, rows_cmp);
+        }
+        const res *base = &out[D_IMDB];
+        for (int d = 1; d < ND; d++) {
+            if (!g_eng[d].on) continue;
+            g_bytes_compared++;
+            const res *o = &out[d];
+            const char *why = base->err != o->err ? "one refused it" : base->err ? NULL : base->n != o->n ? "another number of rows" : NULL;
+            size_t at = 0;
+            for (at = 0; !why && !base->err && at < base->n; at++)
+                if (strcmp(base->rows[at], o->rows[at])) why = "another row";
+            if (!why) continue;
+            g_mismatches++;
+            fprintf(stderr, "MISMATCH seed %u (--bytes, query %d), imagedb against %s: %s\n  imagedb: %s\n  %s: %s\n", seed, qn,
+                    DNAME[d], why, sql[D_IMDB], DNAME[d], sql[d]);
+            fprintf(stderr, "  imagedb: %s (%zu rows)\n", base->err ? base->msg : "ok", base->n);
+            if (!base->err) show_rows(base, at ? at - 1 : 0);
+            fprintf(stderr, "  %s: %s (%zu rows)\n", DNAME[d], o->err ? o->msg : "ok", o->n);
+            if (!o->err) show_rows(o, at ? at - 1 : 0);
+            return -1;
+        }
+    }
+    if (g_eng[D_MS].on && g_ms_pad < 0) { /* design 8.3: recorded, not compared */
+        static res pr;
+        int ty1 = TY(CT_INT, 0);
+        exec_eng(&g_eng[D_MS], "SELECT CASE WHEN 0x01 = 0x0100 THEN 1 ELSE 0 END", true, &ty1, 1, &pr);
+        g_ms_pad = !pr.err && pr.n == 1 ? atoi(pr.rows[0]) : 9;
+    }
+    return 0;
+}
 static int check_state(unsigned seed, int step)
 {
     for (int tab = 0; tab < 2; tab++) {
@@ -4877,7 +5101,7 @@ static int run_seed(unsigned seed, int steps)
             if ((!g_checks && !g_fk && run_stmt(seed, step, &q, false)) || check_state(seed, step)) return -1;
         }
     }
-    return 0;
+    return g_bytes ? bytes_battery(seed) : 0; /* F3d: after the steps: its draws change none of theirs */
 }
 
 int main(int argc, char **argv)
@@ -4903,6 +5127,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--checks")) g_checks = true; /* F2b-1 */
         else if (!strcmp(argv[i], "--generated")) g_gen = true; /* F2c */
         else if (!strcmp(argv[i], "--fk")) g_fk = true; /* F2b-2 */
+        else if (!strcmp(argv[i], "--bytes")) g_bytes = true; /* F3d */
         else if (!strcmp(argv[i], "--tz")) g_tz = true; /* P2: time zones */
         else if (!strcmp(argv[i], "--date")) g_dt = 1; /* F3b */
         else if (!strcmp(argv[i], "--time")) g_dt = 2;
@@ -4999,6 +5224,9 @@ int main(int argc, char **argv)
     if (g_gen) printf("oracle: %lu comparisons of F2c's generated column u.w (each engine's by its own expression), after every change\n", g_gen_compared);
     if (g_fk) printf("oracle: F2b-2's u.tid REFERENCES t (id): seeds with ON DELETE NO ACTION %lu, CASCADE %lu, SET NULL %lu\n",
                      g_fk_seeds[0], g_fk_seeds[1], g_fk_seeds[2]);
+    if (g_bytes) printf("oracle: %lu comparisons of F3d's UUID and BYTEA battery (a table x a seed, nine queries)\n", g_bytes_compared);
+    if (g_bytes && g_ms_pad >= 0) printf("oracle: SQL Server's 0x01 = 0x0100 is %s (the battery's BYTEAs hold no 0x00 byte either way)\n",
+                                     g_ms_pad == 1 ? "true: it pads the shorter VARBINARY with zeros" : g_ms_pad == 0 ? "false: no padding" : "unread");
     printf("oracle: %ld comparisons of P2 S4b's correlated subqueries\n", g_corr_compared);
     printf("oracle: %ld comparisons of P2 S7's SELECTs over the views vt and vu (t's and u's rows through a predicate)\n",
            g_view_compared);

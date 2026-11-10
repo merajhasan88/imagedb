@@ -195,6 +195,7 @@ typedef struct parser {
     uint8_t parens;          /* P2 S5: parenthesized queries around this point (parse_operand: bounded) */
     bool win_ok;             /* P2 S6: parsing a SELECT item's expression, where a window function may stand */
     bool seqcall;            /* F2a-2: nextval or setval called anywhere in the statement: it writes */
+    bool randcall;           /* F3d: gen_random_uuid called anywhere in it */
 } parser;
 
 static int parse_nested(parser *p, sql_stmt *outer, const char *name); /* P2 S4 */
@@ -228,6 +229,7 @@ static bool tok_is_kw(const parser *p, uint32_t at, const char *kw)
 static bool ts_literal_at(const parser *p, uint32_t i)
 {
     if (tok_is_kw(p, i, "date") || tok_is_kw(p, i, "time")) return p->t[i + 1].kind == TK_STR; /* F3b: DATE '...', TIME '...' */
+    if (tok_is_kw(p, i, "uuid") || tok_is_kw(p, i, "bytea")) return p->t[i + 1].kind == TK_STR; /* F3d */
     if (tok_is_kw(p, i, "timestamptz")) return p->t[i + 1].kind == TK_STR;
     if (!tok_is_kw(p, i, "timestamp")) return false;
     if (p->t[i + 1].kind == TK_STR) return true;
@@ -342,6 +344,14 @@ static int literal(parser *p, sql_lit *l)
     if (kw(p, "true") || kw(p, "false")) {
         l->kind = LIT_BOOL;
         l->bval = tok_is_kw(p, p->i - 1, "true");
+        return IMDB_OK;
+    }
+    /* F3d: UUID '...' and BYTEA '...', as DATE's */
+    if ((tok_is_kw(p, p->i, "uuid") || tok_is_kw(p, p->i, "bytea")) && p->t[p->i + 1].kind == TK_STR) {
+        l->kind = tok_is_kw(p, p->i, "uuid") ? LIT_UUID : LIT_BYTEA;
+        l->off = p->t[p->i + 1].off;
+        l->len = p->t[p->i + 1].len;
+        p->i += 2;
         return IMDB_OK;
     }
     /* F3b: DATE '...' and TIME '...' (a column named date or time is an identifier: no string follows it) */
@@ -563,7 +573,8 @@ static uint8_t fn_named(const parser *p, uint32_t at)
              {"lower", FN_LOWER},       {"upper", FN_UPPER},       {"replace", FN_REPLACE},
              {"date_trunc", FN_DATE_TRUNC}, {"timezone", FN_TIMEZONE}, /* P2 */
              {"now", FN_NOW},                                    /* F2a */
-             {"nextval", FN_NEXTVAL}, {"currval", FN_CURRVAL}, {"setval", FN_SETVAL}, {"lastval", FN_LASTVAL}}; /* F2a-2 */
+             {"nextval", FN_NEXTVAL}, {"currval", FN_CURRVAL}, {"setval", FN_SETVAL}, {"lastval", FN_LASTVAL}, /* F2a-2 */
+             {"gen_random_uuid", FN_GEN_RANDOM_UUID}, {"octet_length", FN_OCTET_LENGTH}}; /* F3d */
     for (size_t i = 0; i < sizeof k / sizeof *k; i++)
         if (tok_is_kw(p, at, k[i].name)) return k[i].fn;
     return 0;
@@ -574,6 +585,7 @@ static int fn_call(parser *p, uint8_t fn, uint16_t *out, unsigned depth)
 {
     p->i += 2; /* the name and its ( */
     if (fn == FN_NEXTVAL || fn == FN_SETVAL) p->seqcall = true; /* F2a-2: the statement writes */
+    if (fn == FN_GEN_RANDOM_UUID) p->randcall = true; /* F3d */
     uint16_t args;
     uint32_t n;
     if (fn == FN_POSITION) {
@@ -1148,6 +1160,8 @@ static int col_type(parser *p, imdb_column *c)
     else if (kw(p, "bool") || kw(p, "boolean")) c->type = IMDB_T_BOOL;
     else if (kw(p, "timestamptz")) c->type = IMDB_T_TIMESTAMPTZ; /* P2 */
     else if (kw(p, "date")) c->type = IMDB_T_DATE; /* F3b */
+    else if (kw(p, "uuid")) c->type = IMDB_T_UUID; /* F3d */
+    else if (kw(p, "bytea")) c->type = IMDB_T_BYTEA;
     else if (tok_is_kw(p, p->i, "time")) { /* F3b: TIME [WITHOUT TIME ZONE]; WITH TIME ZONE is refused (no zone in a time of day) */
         p->i++;
         c->type = IMDB_T_TIME;
@@ -1232,6 +1246,12 @@ static int default_value(parser *p, sql_lit *l, uint8_t *clock)
         p->i++;
         if (expect(p, TK_LP, "(") || expect(p, TK_RP, ")")) return p->e->code;
         *clock = IMDB_DEFK_CURRENT_TIMESTAMP;
+        return IMDB_OK;
+    }
+    if (tok_is_kw(p, p->i, "gen_random_uuid") && p->t[p->i + 1].kind == TK_LP) { /* F3d: drawn at each write */
+        p->i++;
+        if (expect(p, TK_LP, "(") || expect(p, TK_RP, ")")) return p->e->code;
+        *clock = IMDB_DEFK_RANDOM_UUID;
         return IMDB_OK;
     }
     if (tok_is_kw(p, p->i, "nextval") && p->t[p->i + 1].kind == TK_LP) { /* F2a-2: DEFAULT nextval('s'), the name a string */
@@ -2514,7 +2534,7 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
     sql_tok *t;
     uint32_t nt;
     if (imdb_sql_lex(s, n, &t, &nt, e)) return e->code;
-    parser p = {s, t, nt, 0, e, st, 0, 0, 0, false, false};
+    parser p = {s, t, nt, 0, e, st, 0, 0, 0, false, false, false};
     int rc = IMDB_OK;
     if (nt == 0 || (nt == 1 && t[0].kind == TK_SEMI)) {
         st->kind = ST_EMPTY;
@@ -2735,6 +2755,7 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
         if (p.t[p.i].kind != TK_EOF) rc = fail_at(&p, "end of statement");
     }
     if (!rc) st->seq_write = p.seqcall; /* F2a-2: nextval or setval anywhere in it, a nested SELECT's too */
+    if (!rc) st->rand_call = p.randcall; /* F3d */
     if (!rc && explain && p.seqcall) /* F2a-2: EXPLAIN runs nothing, and would hand out no value */
         rc = imdb_fail(e, IMDB_ERR_UNSUPPORTED, "EXPLAIN of a statement calling nextval or setval");
     if (!rc && explain) { /* P1 Q1: its own kind, so no test of the inner kind (a write's autocommit, FOR UPDATE's locks) */

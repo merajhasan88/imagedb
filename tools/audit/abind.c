@@ -30,7 +30,8 @@
 
 #include "abind.h"
 
-enum { T_INT64 = 1, T_DECIMAL = 2, T_TEXT = 3, T_BOOL = 4, T_TIMESTAMP = 5, T_FLOAT64 = 6, T_TIMESTAMPTZ = 7, T_DATE = 8, T_TIME = 9 };
+enum { T_INT64 = 1, T_DECIMAL = 2, T_TEXT = 3, T_BOOL = 4, T_TIMESTAMP = 5, T_FLOAT64 = 6, T_TIMESTAMPTZ = 7, T_DATE = 8, T_TIME = 9,
+       T_UUID = 10, T_BYTEA = 11 }; /* F3d */
 enum { DEP_TABLE = 1, DEP_VIEW = 2 };
 
 #define MAX_IDENT 63
@@ -67,13 +68,16 @@ typedef struct tk {
 
 /* ---- the tree ---------------------------------------------------------------------------------------------------- */
 
-enum { L_INT = 1, L_DEC, L_FLT, L_STR, L_PARAM, L_BOOL, L_TS, L_NULL, L_TSTZ, L_DATE, L_TIME }; /* L_TSTZ: P2; L_DATE, L_TIME: F3b */
+enum { L_INT = 1, L_DEC, L_FLT, L_STR, L_PARAM, L_BOOL, L_TS, L_NULL, L_TSTZ, L_DATE, L_TIME, L_UUID, L_BYTEA }; /* L_TSTZ: P2; L_DATE,
+                                                                                                   * L_TIME: F3b; L_UUID,
+                                                                                                   * L_BYTEA: F3d */
 enum { X_LIT = 1, X_COL, X_NEG, X_ADD, X_SUB, X_MUL, X_DIV, X_MOD, X_CMP, X_AND, X_OR, X_NOT, X_FN, X_CASE, X_WHEN, X_CAST,
        X_AGG, X_WIN, X_SUBQ, X_LIST };
 enum { C_EQ = 1, C_NE, C_LT, C_LE, C_GT, C_GE, C_BETWEEN, C_ISNULL, C_NOTNULL, C_IN, C_NOTIN, C_LIKE, C_NOTLIKE };
 enum { F_ABS = 1, F_SIGN, F_ROUND, F_CEIL, F_FLOOR, F_MOD, F_LENGTH, F_SUBSTR, F_TRIM, F_LTRIM, F_RTRIM, F_POSITION,
        F_COALESCE, F_NULLIF, F_LOWER, F_UPPER, F_REPLACE, F_CONCAT, F_DATE_TRUNC, F_TIMEZONE, /* the last two: P2 */
-       F_NOW, F_LOCALTIMESTAMP, F_CURRENT_DATE, F_LOCALTIME }; /* F2a: the clock */
+       F_NOW, F_LOCALTIMESTAMP, F_CURRENT_DATE, F_LOCALTIME, /* F2a: the clock */
+       F_OCTET_LENGTH }; /* F3d: a TEXT's or a BYTEA's bytes (a view calls no gen_random_uuid: the engine refuses it) */
 enum { A_COUNT = 1, A_COUNT_STAR, A_SUM, A_MIN, A_MAX, A_AVG }; /* the engine's names: count, count, sum, min, max, avg */
 enum { W_ROW_NUMBER = 1, W_RANK, W_DENSE_RANK, W_NTILE, W_LAG, W_LEAD, W_FIRST, W_LAST, W_AGG };
 enum { S_VALUE = 0, S_EXISTS = 1, S_IN = 2 };
@@ -515,7 +519,8 @@ static uint8_t fn_named(const ab *b, uint32_t at)
              {"trim", F_TRIM},        {"ltrim", F_LTRIM},       {"rtrim", F_RTRIM},     {"position", F_POSITION},
              {"coalesce", F_COALESCE}, {"nullif", F_NULLIF},    {"lower", F_LOWER},     {"upper", F_UPPER},
              {"replace", F_REPLACE},  {"date_trunc", F_DATE_TRUNC}, {"timezone", F_TIMEZONE}, /* P2 */
-             {"now", F_NOW}};                                                                /* F2a */
+             {"now", F_NOW},                                                                 /* F2a */
+             {"octet_length", F_OCTET_LENGTH}};                                              /* F3d */
     for (size_t i = 0; i < sizeof F / sizeof *F; i++)
         if (kwat(b, at, F[i].name)) return F[i].fn;
     return 0;
@@ -600,6 +605,8 @@ static int col_type(ab *b, uint8_t *type, uint8_t *scale) /* a CAST's type, as a
     else if (kw(b, "bool") || kw(b, "boolean")) *type = T_BOOL;
     else if (kw(b, "timestamptz")) *type = T_TIMESTAMPTZ; /* P2 */
     else if (kw(b, "date")) *type = T_DATE; /* F3b */
+    else if (kw(b, "uuid")) *type = T_UUID; /* F3d */
+    else if (kw(b, "bytea")) *type = T_BYTEA;
     else if (kw(b, "time")) {
         *type = T_TIME;
         if ((kwat(b, b->i, "with") || kwat(b, b->i, "without")) && kwat(b, b->i + 1, "time") && kwat(b, b->i + 2, "zone")) {
@@ -769,6 +776,10 @@ static int literal(ab *b, uint16_t *out)
     else if (kwat(b, b->i, "true") || kwat(b, b->i, "false")) lit = L_BOOL;
     else if ((kwat(b, b->i, "date") || kwat(b, b->i, "time")) && kind_at(b, b->i + 1) == K_STR) { /* F3b */
         lit = kwat(b, b->i, "date") ? L_DATE : L_TIME;
+        b->i++;
+        t = &b->t[b->i];
+    } else if ((kwat(b, b->i, "uuid") || kwat(b, b->i, "bytea")) && kind_at(b, b->i + 1) == K_STR) { /* F3d */
+        lit = kwat(b, b->i, "uuid") ? L_UUID : L_BYTEA;
         b->i++;
         t = &b->t[b->i];
     } else if (ts_literal_at(b, b->i)) { /* P2: TIMESTAMPTZ and TIMESTAMP WITH TIME ZONE its TIMESTAMPTZ */
@@ -1413,8 +1424,9 @@ static bool num(uint8_t t) { return t == T_INT64 || t == T_DECIMAL || t == T_FLO
 
 static const char *tname(uint8_t t)
 {
-    static const char *const N[] = {"NULL", "INT64", "DECIMAL", "TEXT", "BOOL", "TIMESTAMP", "FLOAT64", "TIMESTAMPTZ", "DATE", "TIME"};
-    return t <= T_TIME ? N[t] : "?";
+    static const char *const N[] = {"NULL", "INT64", "DECIMAL", "TEXT", "BOOL", "TIMESTAMP", "FLOAT64", "TIMESTAMPTZ", "DATE", "TIME",
+                                    "UUID", "BYTEA"};
+    return t <= T_BYTEA ? N[t] : "?";
 }
 
 static int dep_note(ab *b, uint8_t kind, uint32_t id)
@@ -1696,7 +1708,9 @@ static int unify_all(ab *b, const scope *sc, const uint16_t *v, unsigned n, cons
     uint8_t ts = 0; /* a TIMESTAMP or (P2) a TIMESTAMPTZ among them: a string literal is of its type */
     for (unsigned i = 0; i < n; i++) {
         if (type_of(b, sc, v[i], true, &t[i])) return -1;
-        if (t[i].t == T_TIMESTAMP || t[i].t == T_TIMESTAMPTZ || t[i].t == T_DATE || t[i].t == T_TIME) ts = t[i].t; /* F3b */
+        if (t[i].t == T_TIMESTAMP || t[i].t == T_TIMESTAMPTZ || t[i].t == T_DATE || t[i].t == T_TIME || t[i].t == T_UUID ||
+            t[i].t == T_BYTEA)
+            ts = t[i].t; /* F3b; F3d: a string literal beside a UUID or a BYTEA is one, as the engine's is_ts */
     }
     *out = (ty){0, 0};
     for (unsigned i = 0; i < n; i++) {
@@ -1721,6 +1735,9 @@ static int fn_type(ab *b, const scope *sc, const xn *x, ty *out)
     ty a[MAX_ARGS + 1];
     for (unsigned i = 0; i < n; i++)
         if (type_of(b, sc, v[i], x->fn == F_NULLIF && i == 1, &a[i])) return -1;
+    if (x->fn == F_CONCAT && n == 2) /* F3d: a string literal beside a BYTEA is one, as the engine binds it */
+        for (unsigned i = 0; i < 2; i++)
+            if (a[1 - i].t == T_BYTEA && str_lit(q, v[i])) a[i] = (ty){T_BYTEA, 0};
     *out = (ty){0, 0};
     switch (x->fn) {
     case F_NOW: /* F2a: the clock's types; their values are a run's, never a bind's */
@@ -1761,12 +1778,25 @@ static int fn_type(ab *b, const scope *sc, const xn *x, ty *out)
     case F_LTRIM:
     case F_RTRIM:
         if (fn_args(b, n, 1, 1)) return -1;
+        if (x->fn == F_LENGTH && a[0].t == T_BYTEA) { /* F3d: its bytes */
+            *out = (ty){T_INT64, 0};
+            return 0;
+        }
         if (a[0].t != T_TEXT) return fail(b, "that function takes a TEXT value");
         *out = (ty){x->fn == F_LENGTH ? T_INT64 : T_TEXT, 0};
+        return 0;
+    case F_OCTET_LENGTH: /* F3d */
+        if (fn_args(b, n, 1, 1)) return -1;
+        if (a[0].t != T_TEXT && a[0].t != T_BYTEA) return fail(b, "OCTET_LENGTH takes a TEXT or a BYTEA");
+        *out = (ty){T_INT64, 0};
         return 0;
     case F_REPLACE:
     case F_CONCAT:
         if (fn_args(b, n, x->fn == F_REPLACE ? 3 : 2, x->fn == F_REPLACE ? 3 : 2)) return -1;
+        if (x->fn == F_CONCAT && a[0].t == T_BYTEA && a[1].t == T_BYTEA) { /* F3d */
+            *out = (ty){T_BYTEA, 0};
+            return 0;
+        }
         for (unsigned i = 0; i < n; i++)
             if (a[i].t != T_TEXT) return fail(b, "that function takes TEXT values");
         *out = (ty){T_TEXT, 0};
@@ -1942,6 +1972,8 @@ static int type_of(ab *b, const scope *sc, uint16_t k, bool null_ok, ty *out)
         case L_TSTZ: *out = (ty){T_TIMESTAMPTZ, 0}; return 0; /* P2 */
         case L_DATE: *out = (ty){T_DATE, 0}; return 0; /* F3b */
         case L_TIME: *out = (ty){T_TIME, 0}; return 0;
+        case L_UUID: *out = (ty){T_UUID, 0}; return 0; /* F3d */
+        case L_BYTEA: *out = (ty){T_BYTEA, 0}; return 0;
         case L_NULL:
             if (!null_ok) return fail(b, "NULL cannot be an operand");
             *out = (ty){0, 0};
@@ -2657,6 +2689,7 @@ static int ck_bind(ck *x, uint16_t k, bool null_ok)
                 d->t = x->cols[c].type;
                 d->s = x->cols[c].type == T_DECIMAL ? x->cols[c].scale : 0;
                 if (d->t == T_FLOAT64) return fail(x->b, "a CHECK computes no FLOAT64 value");
+                if (d->t == T_UUID || d->t == T_BYTEA) return fail(x->b, "a CHECK reads no UUID or BYTEA value yet"); /* F3d */
                 return 0;
             }
         return fail(x->b, "no column %s in its table", nm);

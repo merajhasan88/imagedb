@@ -61,8 +61,8 @@ static int retention_text(const imdb_table *t, char *out, size_t n, imdb_err *e)
  * never the session's zone) quoted with '' */
 static int literal_text(dumper *d, const imdb_value *v, imdb_err *e)
 {
-    if (v->type != IMDB_T_TEXT && v->type != IMDB_T_TIMESTAMP && v->type != IMDB_T_TIMESTAMPTZ && v->type != IMDB_T_DATE &&
-        v->type != IMDB_T_TIME) { /* F3b: a DATE and a TIME quoted, as their literals are strings */
+    if (!imdb_type_bytes(v->type) && v->type != IMDB_T_TIMESTAMP && v->type != IMDB_T_TIMESTAMPTZ && v->type != IMDB_T_DATE &&
+        v->type != IMDB_T_TIME) { /* F3b: a DATE and a TIME quoted, as their literals are strings; F3d: a UUID and a BYTEA */
         imdb_format_value(v, &d->b);
         return IMDB_OK;
     }
@@ -99,7 +99,13 @@ static int default_text(dumper *d, const imdb_table *t, uint16_t c, imdb_err *e)
         imdb_buf_put_str(&d->b, ") STORED");
         return IMDB_OK;
     }
-    const imdb_sequence *s = tc->wclock >= IMDB_DEFK_IDENTITY_ALWAYS && tc->wseq < d->s.db->nseqs ? &d->s.db->seqs[tc->wseq] : NULL;
+    const imdb_sequence *s = tc->wclock >= IMDB_DEFK_IDENTITY_ALWAYS && tc->wclock <= IMDB_DEFK_NEXTVAL && tc->wseq < d->s.db->nseqs
+                                 ? &d->s.db->seqs[tc->wseq]
+                                 : NULL; /* F3d: kind 10 is no sequence's */
+    if (tc->wclock == IMDB_DEFK_RANDOM_UUID) { /* F3d */
+        imdb_buf_put_str(&d->b, " DEFAULT gen_random_uuid()");
+        return IMDB_OK;
+    }
     if (s && tc->wclock != IMDB_DEFK_NEXTVAL) { /* F2a-2: an IDENTITY, its sequence's options written out */
         imdb_buf_printf(&d->b, " GENERATED %s AS IDENTITY (", tc->wclock == IMDB_DEFK_IDENTITY_ALWAYS ? "ALWAYS" : "BY DEFAULT");
         seq_opts_text(d, s);

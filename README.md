@@ -594,8 +594,8 @@ round to short ones writing the same row, so retry with backoff). SERIALIZABLE
 is refused; snapshot write skew is possible.
 
 Types: INT64 (BIGINT, INT8), INTEGER (INT, INT4: 32 bits), SMALLINT (INT2: 16 bits),
-DECIMAL, TEXT, VARCHAR(n), BOOL, TIMESTAMP, TIMESTAMPTZ, DATE, TIME, finite FLOAT64 (exact SUM, rounded
-once) and nullable non-key columns. SMALLINT and INTEGER are INT64 values checked
+DECIMAL, TEXT, VARCHAR(n), BOOL, TIMESTAMP, TIMESTAMPTZ, DATE, TIME, UUID, BYTEA, finite FLOAT64 (exact
+SUM, rounded once) and nullable non-key columns. SMALLINT and INTEGER are INT64 values checked
 against their range at every write (INSERT, UPDATE, COPY, a DEFAULT) and in
 `CAST(x AS SMALLINT)`; arithmetic over them is INT64's (a SMALLINT sum past 32767
 is a value until it is written back). INT and INTEGER were INT64 before; they are
@@ -606,8 +606,17 @@ either to BIGINT) as metadata. DATE (0001-01-01 to 9999-12-31) and TIME (00:00:0
 way with TEXT, TIMESTAMP and TIMESTAMPTZ (the session's zone), and a DATE compares only
 with a DATE (CAST a TIMESTAMP first). VARCHAR(n) (CHARACTER VARYING(n)) is a TEXT whose
 values are refused past n characters at every write and in CAST(x AS VARCHAR(n)), never
-cut; SET TYPE lengthens it or makes it TEXT. Comparisons with NULL, including NULL parameters,
-are refused: use IS NULL / IS NOT NULL.
+cut; SET TYPE lengthens it or makes it TEXT. UUID holds 16 bytes, written `'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'`
+(either case; the 32 digits without hyphens too) and ordered by its bytes; BYTEA holds
+any bytes, written in PostgreSQL's hex form `'\x00ff'` (`'\x'` empty) and ordered by
+its bytes, a shorter prefix first. Strings beside either are read as one, `UUID '...'` and
+`BYTEA '...'` type a literal, CAST converts each way with TEXT; LENGTH and OCTET_LENGTH
+of a BYTEA count bytes and `||` joins two. `gen_random_uuid()` draws a version-4 UUID,
+and `id UUID PRIMARY KEY DEFAULT gen_random_uuid()` draws one for every row written
+(not as an ADD COLUMN's DEFAULT: add the column, fill it, then SET DEFAULT). Not yet:
+UUID or BYTEA in a CHECK or a generated column, ENCODE, DECODE, a UUID SUBJECT.
+Comparisons with NULL, including NULL parameters, are refused: use IS NULL / IS NOT
+NULL.
 
 Time zones: TIMESTAMPTZ (`TIMESTAMP WITH TIME ZONE`) holds an instant (UTC
 microseconds) and shows it in the session's zone, `SET TIME ZONE

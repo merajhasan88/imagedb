@@ -550,6 +550,21 @@ echo "   GD a signed DELETE of a referenced parent beside an ERASE that names an
    refuse it; GE the same commit with the ERASE naming that parent (made as the writer makes one, its payload redacted)
    replays, publishes, and VERIFY and the auditor accept it"
 
+echo "== HA, HB: UUID and BYTEA (F3d) broken, each signed: a 15-byte UUID, gen_random_uuid() on a TIMESTAMPTZ"
+PHA=$WORK/ha; "$BIN" init "$PHA" >/dev/null
+"$BIN" sql "$PHA" --nosync -c "CREATE TABLE hu (id INT64 PRIMARY KEY, u UUID NOT NULL);" \
+  -c "INSERT INTO hu VALUES (1, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');" >/dev/null
+"$BIN" verify "$PHA" >/dev/null && "$AUD" verify "$PHA" >/dev/null || fail "the honest directory must verify"
+"$FORGE" index-lie "$PHA" uuid-short
+must_fail "truncated UUID" "$BIN" verify "$PHA"
+must_fail "row: truncated" "$AUD" verify "$PHA"
+PHB=$WORK/hb; make_db "$PHB"
+"$FORGE" index-lie "$PHB" create-default-uuid
+must_fail "a bad column default" "$BIN" verify "$PHB"
+must_fail "a clock DEFAULT its column's type does not take" "$AUD" verify "$PHB"
+echo "   HA a signed INSERT whose UUID is 15 bytes (the row codec takes 16), HB a signed CREATE whose op 23 gives a
+   TIMESTAMPTZ column gen_random_uuid() (kind 10, a UUID's alone): the replay and the auditor refuse each"
+
 echo "== Z: a commit naming the other digest algorithm, re-signed by the writer (both ways round); META naming an unknown one"
 for a in 1 2; do # explicit algorithms: under IMDB_DIGEST_ALG=2 make_db's would all be alg 2
   PZ=$WORK/z$a

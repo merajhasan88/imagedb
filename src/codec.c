@@ -84,11 +84,15 @@ const char *imdb_type_name(uint8_t t)
     case IMDB_T_TIMESTAMPTZ: return "TIMESTAMPTZ";
     case IMDB_T_DATE: return "DATE";
     case IMDB_T_TIME: return "TIME";
+    case IMDB_T_UUID: return "UUID";
+    case IMDB_T_BYTEA: return "BYTEA";
     }
     return "?";
 }
 
-bool imdb_type_is_int(uint8_t t) { return t != IMDB_T_TEXT; }
+bool imdb_type_bytes(uint8_t t) { return t == IMDB_T_TEXT || t == IMDB_T_UUID || t == IMDB_T_BYTEA; }
+
+bool imdb_type_is_int(uint8_t t) { return !imdb_type_bytes(t); }
 
 bool imdb_int_width_ok(uint8_t width) { return width == 0 || width == 16 || width == 32; }
 
@@ -353,6 +357,13 @@ int imdb_value_check(const imdb_column *c, const imdb_value *v, imdb_err *e)
             return imdb_fail(e, IMDB_ERR_LIMIT, "column %s: a value longer than VARCHAR(%u)", c->name, imdb_text_max(c));
         return IMDB_OK;
     }
+    case IMDB_T_UUID: /* F3d: 16 bytes always */
+        if (v->len != IMDB_UUID_LEN || !v->s) return imdb_fail(e, IMDB_ERR_INVALID, "column %s: a UUID is 16 bytes", c->name);
+        return IMDB_OK;
+    case IMDB_T_BYTEA: /* F3d: any bytes, TEXT's bound */
+        if (v->len > IMDB_MAX_TEXT) return imdb_fail(e, IMDB_ERR_LIMIT, "column %s: BYTEA longer than %u bytes", c->name, IMDB_MAX_TEXT);
+        if (v->len && !v->s) return imdb_fail(e, IMDB_ERR_INVALID, "column %s: a BYTEA without its bytes", c->name);
+        return IMDB_OK;
     }
     return imdb_fail(e, IMDB_ERR_INVALID, "column %s: unknown type", c->name);
 }
@@ -366,7 +377,7 @@ static uint32_t nullable_count(const imdb_schema *s)
 
 static size_t value_width(uint8_t type, const imdb_value *v)
 {
-    return type == IMDB_T_TEXT ? 4 + (size_t)v->len : type == IMDB_T_BOOL ? 1 : 8;
+    return type == IMDB_T_TEXT || type == IMDB_T_BYTEA ? 4 + (size_t)v->len : type == IMDB_T_UUID ? IMDB_UUID_LEN : type == IMDB_T_BOOL ? 1 : 8;
 }
 
 int imdb_row_encode(const imdb_schema *s, const imdb_value *vals, imdb_buf *out, imdb_err *e)
@@ -391,9 +402,11 @@ int imdb_row_encode(const imdb_schema *s, const imdb_value *vals, imdb_buf *out,
         if (v->null) continue;
         switch (s->cols[i].type) {
         case IMDB_T_TEXT:
+        case IMDB_T_BYTEA:
             imdb_buf_put_u32(out, v->len);
             imdb_buf_put(out, v->s, v->len);
             break;
+        case IMDB_T_UUID: imdb_buf_put(out, v->s, IMDB_UUID_LEN); break; /* F3d: no length: 16 always */
         case IMDB_T_BOOL: imdb_buf_put_u8(out, (uint8_t)v->i); break;
         default: imdb_buf_put_u64(out, (uint64_t)v->i); break;
         }
@@ -433,10 +446,16 @@ int imdb_row_decode(const imdb_schema *s, const uint8_t *row, size_t len, imdb_v
         }
         switch (c->type) {
         case IMDB_T_TEXT:
+        case IMDB_T_BYTEA:
             v->len = imdb_rd_u32(&r);
-            if (v->len > IMDB_MAX_TEXT) return imdb_fail(e, IMDB_ERR_CORRUPT, "row: TEXT length out of range");
+            if (v->len > IMDB_MAX_TEXT) return imdb_fail(e, IMDB_ERR_CORRUPT, "row: %s length out of range", imdb_type_name(c->type));
             v->s = imdb_rd_bytes(&r, v->len);
-            if (!v->s) return imdb_fail(e, IMDB_ERR_CORRUPT, "row: truncated TEXT");
+            if (!v->s) return imdb_fail(e, IMDB_ERR_CORRUPT, "row: truncated %s", imdb_type_name(c->type));
+            break;
+        case IMDB_T_UUID:
+            v->len = IMDB_UUID_LEN;
+            v->s = imdb_rd_bytes(&r, IMDB_UUID_LEN);
+            if (!v->s) return imdb_fail(e, IMDB_ERR_CORRUPT, "row: truncated UUID");
             break;
         case IMDB_T_BOOL: v->i = imdb_rd_u8(&r); break;
         default: v->i = (int64_t)imdb_rd_u64(&r); break;
@@ -466,11 +485,11 @@ void imdb_row_get(const imdb_schema *s, const uint8_t *row, size_t len, int col,
         }
         if (i < col) {
             if (isnull) continue;
-            if (t == IMDB_T_TEXT) {
+            if (t == IMDB_T_TEXT || t == IMDB_T_BYTEA) {
                 uint32_t n = imdb_rd_u32(&r);
                 (void)imdb_rd_bytes(&r, n);
             } else {
-                (void)imdb_rd_bytes(&r, t == IMDB_T_BOOL ? 1 : 8);
+                (void)imdb_rd_bytes(&r, t == IMDB_T_BOOL ? 1 : t == IMDB_T_UUID ? IMDB_UUID_LEN : 8);
             }
             continue;
         }
@@ -478,10 +497,13 @@ void imdb_row_get(const imdb_schema *s, const uint8_t *row, size_t len, int col,
         v->scale = c->scale;
         if (isnull) {
             v->null = true;
-        } else if (t == IMDB_T_TEXT) {
+        } else if (t == IMDB_T_TEXT || t == IMDB_T_BYTEA) {
             v->len = imdb_rd_u32(&r);
             v->s = imdb_rd_bytes(&r, v->len);
             if (!v->s) v->len = 0;
+        } else if (t == IMDB_T_UUID) {
+            v->s = imdb_rd_bytes(&r, IMDB_UUID_LEN);
+            v->len = v->s ? IMDB_UUID_LEN : 0;
         } else if (t == IMDB_T_BOOL) {
             v->i = imdb_rd_u8(&r);
         } else {
@@ -493,7 +515,7 @@ void imdb_row_get(const imdb_schema *s, const uint8_t *row, size_t len, int col,
 int imdb_value_cmp(const imdb_value *a, const imdb_value *b)
 {
     if (a->null || b->null) return a->null == b->null ? 0 : a->null ? 1 : -1; /* NULLS LAST */
-    if (a->type == IMDB_T_TEXT) {
+    if (imdb_type_bytes(a->type)) { /* F3d: TEXT, UUID and BYTEA alike: memcmp, then the shorter first */
         uint32_t n = a->len < b->len ? a->len : b->len;
         int c = n ? memcmp(a->s, b->s, n) : 0;
         if (c) return c < 0 ? -1 : 1;
@@ -542,7 +564,7 @@ uint64_t imdb_siphash24(const uint8_t *in, size_t n, uint64_t k0, uint64_t k1)
 uint64_t imdb_value_hash(const imdb_value *v, uint64_t seed)
 {
     if (v->null) return imdb_siphash24((const uint8_t *)"", 0, seed, 0x6a09e667f3bcc909ull);
-    if (v->type == IMDB_T_TEXT) return imdb_siphash24(v->s, v->len, seed, 0x9e3779b97f4a7c15ull);
+    if (imdb_type_bytes(v->type)) return imdb_siphash24(v->s, v->len, seed, 0x9e3779b97f4a7c15ull);
     uint8_t t[8];
     imdb_le64(t, (uint64_t)v->i);
     return imdb_siphash24(t, 8, seed, 0x9e3779b97f4a7c15ull);
@@ -934,6 +956,78 @@ void imdb_format_time(int64_t us, imdb_buf *out)
     imdb_buf_put(out, p, (size_t)(e - p));
 }
 
+
+/* ---- F3d: UUID and BYTEA text forms ---- */
+
+static int hexval(char c)
+{
+    return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+}
+
+int imdb_parse_uuid(const char *s, size_t n, uint8_t out[IMDB_UUID_LEN], imdb_err *e)
+{
+    bool hyph = n == 36; /* 8-4-4-4-12, or 32 digits alone: one family (braces and other hyphens refused) */
+    if (n != 36 && n != 32) return imdb_fail(e, IMDB_ERR_INVALID, "a UUID is 32 hex digits, hyphenated 8-4-4-4-12 or not");
+    size_t at = 0;
+    for (int k = 0; k < IMDB_UUID_LEN; k++) {
+        if (hyph && (k == 4 || k == 6 || k == 8 || k == 10)) {
+            if (s[at] != '-') return imdb_fail(e, IMDB_ERR_INVALID, "a UUID is 32 hex digits, hyphenated 8-4-4-4-12 or not");
+            at++;
+        }
+        int h = hexval(s[at]), l = hexval(s[at + 1]);
+        if (h < 0 || l < 0) return imdb_fail(e, IMDB_ERR_INVALID, "a UUID is 32 hex digits, hyphenated 8-4-4-4-12 or not");
+        out[k] = (uint8_t)(h << 4 | l);
+        at += 2;
+    }
+    return IMDB_OK;
+}
+
+int imdb_parse_bytea(const char *s, size_t n, uint8_t *out, size_t cap, size_t *outlen, imdb_err *e)
+{
+    if (n < 2 || s[0] != '\\' || s[1] != 'x')
+        return imdb_fail(e, IMDB_ERR_INVALID, "a BYTEA is written \\x and two hex digits a byte (the escape form is refused)");
+    if ((n - 2) % 2) return imdb_fail(e, IMDB_ERR_INVALID, "a BYTEA's hex form has an odd number of digits");
+    size_t m = (n - 2) / 2;
+    if (m > IMDB_MAX_TEXT) return imdb_fail(e, IMDB_ERR_LIMIT, "BYTEA longer than %u bytes", IMDB_MAX_TEXT);
+    if (m > cap) return imdb_fail(e, IMDB_ERR_LIMIT, "BYTEA longer than its buffer");
+    for (size_t k = 0; k < m; k++) {
+        int h = hexval(s[2 + 2 * k]), l = hexval(s[3 + 2 * k]);
+        if (h < 0 || l < 0) return imdb_fail(e, IMDB_ERR_INVALID, "a BYTEA's hex form holds a character that is no hex digit");
+        out[k] = (uint8_t)(h << 4 | l);
+    }
+    *outlen = m;
+    return IMDB_OK;
+}
+
+void imdb_format_uuid(const uint8_t *b, imdb_buf *out)
+{
+    static const char hx[] = "0123456789abcdef";
+    char t[36];
+    size_t o = 0;
+    for (int k = 0; k < IMDB_UUID_LEN; k++) {
+        if (k == 4 || k == 6 || k == 8 || k == 10) t[o++] = '-';
+        t[o++] = hx[b[k] >> 4];
+        t[o++] = hx[b[k] & 15];
+    }
+    imdb_buf_put(out, t, sizeof t);
+}
+
+void imdb_format_bytea(const uint8_t *b, size_t n, imdb_buf *out)
+{
+    static const char hx[] = "0123456789abcdef";
+    imdb_buf_put_str(out, "\\x");
+    char t[128];
+    size_t o = 0;
+    for (size_t k = 0; k < n; k++) {
+        t[o++] = hx[b[k] >> 4];
+        t[o++] = hx[b[k] & 15];
+        if (o == sizeof t) {
+            imdb_buf_put(out, t, o);
+            o = 0;
+        }
+    }
+    if (o) imdb_buf_put(out, t, o);
+}
 void imdb_format_timestamptz(int64_t utc_us, int32_t off, imdb_buf *out)
 {
     imdb_format_timestamp(utc_us + (int64_t)off * 1000000, out);
@@ -1001,6 +1095,8 @@ void imdb_format_value(const imdb_value *v, imdb_buf *out)
     case IMDB_T_TIMESTAMPTZ: imdb_format_timestamptz(v->i, 0, out); break; /* no zone here: UTC (the renderer has its cell's offset) */
     case IMDB_T_FLOAT64: imdb_format_float64(v->i, out); break;
     case IMDB_T_TEXT: imdb_buf_put(out, v->s, v->len); break;
+    case IMDB_T_UUID: imdb_format_uuid(v->s, out); break;
+    case IMDB_T_BYTEA: imdb_format_bytea(v->s, v->len, out); break;
     }
 }
 
@@ -1061,7 +1157,9 @@ size_t imdb_key_len(const imdb_schema *s, const imdb_value *kv)
         const imdb_value *v = &kv[k];
         if (v->type == IMDB_T_BOOL) {
             n += 1;
-        } else if (v->type == IMDB_T_TEXT) {
+        } else if (v->type == IMDB_T_UUID) { /* F3d: its 16 bytes, fixed: memcmp order */
+            n += IMDB_UUID_LEN;
+        } else if (v->type == IMDB_T_TEXT || v->type == IMDB_T_BYTEA) {
             n += 2; /* the terminator */
             for (uint32_t i = 0; i < v->len; i++) n += v->s[i] == 0 ? 2 : 1;
         } else {
@@ -1078,7 +1176,10 @@ void imdb_key_write(const imdb_schema *s, const imdb_value *kv, uint8_t *out)
         const imdb_value *v = &kv[k];
         if (v->type == IMDB_T_BOOL) {
             out[o++] = (uint8_t)(v->i != 0);
-        } else if (v->type == IMDB_T_TEXT) { /* 0x00 written 0x00 0xFF, then 0x00 0x00: a prefix sorts first */
+        } else if (v->type == IMDB_T_UUID) {
+            memcpy(out + o, v->s, IMDB_UUID_LEN);
+            o += IMDB_UUID_LEN;
+        } else if (v->type == IMDB_T_TEXT || v->type == IMDB_T_BYTEA) { /* 0x00 written 0x00 0xFF, then 0x00 0x00: a prefix sorts first */
             for (uint32_t i = 0; i < v->len; i++) {
                 out[o++] = (uint8_t)v->s[i];
                 if (v->s[i] == 0) out[o++] = 0xFF;
@@ -1090,4 +1191,14 @@ void imdb_key_write(const imdb_schema *s, const imdb_value *kv, uint8_t *out)
             o += 8;
         }
     }
+}
+
+/* F3d: gen_random_uuid's value: 122 random bits from the engine's source (imdb_random), version 4 in the high nibble of
+ * byte 6 and RFC 9562's variant (10) in the top bits of byte 8 */
+int imdb_uuid_v4(uint8_t out[IMDB_UUID_LEN], imdb_err *e)
+{
+    if (imdb_random(out, IMDB_UUID_LEN, e)) return e->code;
+    out[6] = (uint8_t)((out[6] & 0x0F) | 0x40);
+    out[8] = (uint8_t)((out[8] & 0x3F) | 0x80);
+    return IMDB_OK;
 }

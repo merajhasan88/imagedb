@@ -24,6 +24,7 @@ bool imdb_defk_fits(uint8_t kind, uint8_t type) /* F2a: a clock kind and the typ
     case IMDB_DEFK_IDENTITY:
     case IMDB_DEFK_NEXTVAL: return type == IMDB_T_INT64;
     case IMDB_DEFK_GENERATED: return type != IMDB_T_FLOAT64; /* F2c: a double's rounding is no verifier's to recompute */
+    case IMDB_DEFK_RANDOM_UUID: return type == IMDB_T_UUID; /* F3d */
     default: return false;
     }
 }
@@ -55,9 +56,11 @@ static bool alter_bare_ok(const imdb_column *c)
 /* a value of column c, not NULL, in the row encoding */
 static void put_value(imdb_buf *b, const imdb_column *c, const imdb_value *v)
 {
-    if (c->type == IMDB_T_TEXT) {
+    if (c->type == IMDB_T_TEXT || c->type == IMDB_T_BYTEA) {
         imdb_buf_put_u32(b, v->len);
         imdb_buf_put(b, v->s, v->len);
+    } else if (c->type == IMDB_T_UUID) { /* F3d: the row codec's 16 bytes */
+        imdb_buf_put(b, v->s, IMDB_UUID_LEN);
     } else if (c->type == IMDB_T_BOOL) {
         imdb_buf_put_u8(b, (uint8_t)v->i);
     } else {
@@ -121,10 +124,13 @@ static int get_value(imdb_rd *r, const imdb_column *c, imdb_value *v, const char
     memset(v, 0, sizeof *v);
     v->type = c->type;
     v->scale = c->scale;
-    if (c->type == IMDB_T_TEXT) {
+    if (c->type == IMDB_T_TEXT || c->type == IMDB_T_BYTEA) {
         v->len = imdb_rd_u32(r);
         if (r->err || v->len > IMDB_MAX_TEXT) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad DEFAULT", what);
         v->s = imdb_rd_bytes(r, v->len);
+    } else if (c->type == IMDB_T_UUID) {
+        v->s = imdb_rd_bytes(r, IMDB_UUID_LEN);
+        v->len = v->s ? IMDB_UUID_LEN : 0;
     } else if (c->type == IMDB_T_BOOL) {
         v->i = imdb_rd_u8(r);
     } else {
@@ -150,7 +156,8 @@ static int get_default(imdb_rd *r, const imdb_column *c, imdb_value *v, uint8_t 
     }
     if (has == 2) {
         *clock = imdb_rd_u8(r);
-        if (!r->err && !imdb_defk_fits(*clock, c->type)) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad clock default", what);
+        if (!r->err && (*clock == IMDB_DEFK_RANDOM_UUID || !imdb_defk_fits(*clock, c->type))) /* F3d: never an ADD's */
+            return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad clock default", what);
     }
     return get_value(r, c, v, what, e);
 }
@@ -382,11 +389,11 @@ int imdb_alter_put(imdb_buf *b, const imdb_op *o)
         (o->akind == IMDB_ALTER_ADD_COLUMN &&
          (!alter_col_ok(&o->acol) || (!(o->acol.flags & IMDB_COL_NULLABLE) && o->adef.null) ||
           (!o->adef.null && imdb_value_check(&o->acol, &o->adef, &e2)) ||
-          (o->aclock && (!imdb_defk_fits(o->aclock, o->acol.type) || o->adef.null)))) || /* F2a */
+          (o->aclock && (o->aclock == IMDB_DEFK_RANDOM_UUID || !imdb_defk_fits(o->aclock, o->acol.type) || o->adef.null)))) || /* F2a; F3d */
         (o->akind == IMDB_ALTER_SET_DEFAULT &&
          (!alter_bare_ok(&o->acol) || o->adef.null || imdb_value_check(&o->acol, &o->adef, &e2))) ||
         (o->akind == IMDB_ALTER_SET_TYPE && !alter_bare_ok(&o->acol)) ||
-        (o->akind == IMDB_ALTER_SET_DEFAULT_CLOCK && (o->aclock <= IMDB_DEFK_VALUE || o->aclock > IMDB_DEFK_CLOCK_LAST)) ||
+        (o->akind == IMDB_ALTER_SET_DEFAULT_CLOCK && (o->aclock <= IMDB_DEFK_VALUE || (o->aclock > IMDB_DEFK_CLOCK_LAST && o->aclock != IMDB_DEFK_RANDOM_UUID))) ||
         (o->akind < IMDB_ALTER_ADD_COLUMN || o->akind > IMDB_ALTER_LAST)) {
         b->err = IMDB_ERR_INVALID;
         return IMDB_ERR_INVALID;
@@ -489,8 +496,8 @@ int imdb_alter_get(imdb_rd *r, imdb_op *o, const char *what, imdb_err *e)
     if (o->akind != IMDB_ALTER_RENAME_TABLE) o->apos = imdb_rd_u16(r);
     if (o->akind == IMDB_ALTER_SET_DEFAULT_CLOCK) { /* F2a: a clock kind; the type it suits is the history's check */
         o->aclock = imdb_rd_u8(r);
-        if (!r->err && (o->aclock <= IMDB_DEFK_VALUE || o->aclock > IMDB_DEFK_CLOCK_LAST))
-            return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad clock default", what);
+        if (!r->err && (o->aclock <= IMDB_DEFK_VALUE || (o->aclock > IMDB_DEFK_CLOCK_LAST && o->aclock != IMDB_DEFK_RANDOM_UUID)))
+            return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad clock default", what); /* F3d: gen_random_uuid() too */
         return IMDB_OK;
     }
     if (o->akind == IMDB_ALTER_SET_DEFAULT || o->akind == IMDB_ALTER_SET_TYPE) {

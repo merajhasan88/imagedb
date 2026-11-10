@@ -1309,9 +1309,37 @@ static void index_lie(const char *dir, const char *kind)
         append_commit(dir, db, &op, 1, &sg, NULL);
         imdb_close(db);
         return;
-    } else if (strcmp(kind, "create-default-clock") == 0) {
+    } else if (strcmp(kind, "uuid-short") == 0) {
+        /* F3d: an INSERT into the last table, (id INT64 PRIMARY KEY, u UUID NOT NULL), of a row whose UUID is 15 bytes:
+         * no NULL bitmap, the id's 8 bytes, then 15 (the row codec wants 16); its commitment and digest right */
+        imdb_table *t = db->t[db->nt - 1];
+        if (t->s.ncols != 2 || t->s.cols[1].type != IMDB_T_UUID || (t->s.cols[1].flags & IMDB_COL_NULLABLE)) {
+            fputs("imdb-forge: index-lie uuid-short needs a last table (id INT64 PRIMARY KEY, u UUID NOT NULL)\n", stderr);
+            exit(1);
+        }
+        static uint8_t row[8 + 15];
+        imdb_le64(row, 999);
+        memset(row + 8, 0xab, 15);
+        memset(op.salt, 0x5f, sizeof op.salt);
+        op.code = IMDB_OP_INSERT;
+        op.table = t->s.id;
+        op.vid = t->nver;
+        op.pkind = IMDB_PAYLOAD_ROW;
+        op.row = row;
+        op.row_len = sizeof row;
+        op.iname = NULL;
+        imdb_row_commit(t->s.id, op.salt, row, sizeof row, op.commit);
+        imdb_lthash g = db->global;
+        imdb_lthash_add_commit(db->meta.digest_alg, &g, op.commit);
+        uint8_t dg[32];
+        imdb_lthash_digest(db->meta.digest_alg, &g, dg);
+        append_commit_digest(dir, db, &op, 1, &sg, NULL, dg);
+        imdb_close(db);
+        return;
+    } else if (strcmp(kind, "create-default-clock") == 0 || strcmp(kind, "create-default-uuid") == 0) {
         /* F2a: CREATE TABLE dz (id INT64 PRIMARY KEY, at TIMESTAMPTZ) with its retention and op 23 giving at
-         * CURRENT_TIMESTAMP, which the encoder takes; the kind byte then made LOCALTIME (5), a TIME's clock */
+         * CURRENT_TIMESTAMP, which the encoder takes; the kind byte then made LOCALTIME (5), a TIME's clock; F3d
+         * (create-default-uuid): made 10, gen_random_uuid, a UUID column's alone */
         static imdb_schema s;
         memset(&s, 0, sizeof s);
         snprintf(s.name, sizeof s.name, "dz");
@@ -1341,7 +1369,7 @@ static void index_lie(const char *dir, const char *kind)
         g_find = pat;
         g_find_len = sizeof pat;
         g_at = 9;
-        g_to = IMDB_DEFK_LOCALTIME;
+        g_to = strcmp(kind, "create-default-uuid") == 0 ? IMDB_DEFK_RANDOM_UUID : IMDB_DEFK_LOCALTIME;
         append_commit(dir, db, ops, 3, &sg, NULL);
         imdb_close(db);
         return;
@@ -1651,7 +1679,8 @@ static void index_lie(const char *dir, const char *kind)
               "check-add (ADD CHECK forged: a > 100, to table 0) | check-row (a -1 in the last table's column a) | "
               "gen-row | gen-update (column w one past its expression in the last table) | "
               "fk-orphan (a child of no parent in the last table) | fk-delete (table 0's first live row) | "
-              "fk-erase-other | fk-erase-named (that DELETE beside an ERASE of an ended version, or of the row itself)\n", stderr);
+              "fk-erase-other | fk-erase-named (that DELETE beside an ERASE of an ended version, or of the row itself) | uuid-short (a\n"
+              "UUID of 15 bytes in the last table) | create-default-uuid (gen_random_uuid on a TIMESTAMPTZ)\n", stderr);
         exit(1);
     }
     append_commit(dir, db, &op, 1, &sg, NULL);

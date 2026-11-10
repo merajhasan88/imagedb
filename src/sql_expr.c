@@ -86,7 +86,7 @@ void imdb_x_from_value(const imdb_value *v, imdb_xval *out)
     out->null = v->null;
     if (v->null) return;
     if (v->type == IMDB_T_FLOAT64) out->f = imdb_f64_value(v->i);
-    else if (v->type == IMDB_T_TEXT) out->s = v->s, out->len = v->len;
+    else if (imdb_type_bytes(v->type)) out->s = v->s, out->len = v->len; /* F3d: UUID and BYTEA too */
     else out->i = v->i;
 }
 
@@ -297,7 +297,7 @@ static int cmp_dec(__int128 x, int sx, __int128 y, int sy)
 
 int imdb_x_cmp(const imdb_xval *a, const imdb_xval *b)
 {
-    if (a->type == IMDB_T_TEXT) {
+    if (imdb_type_bytes(a->type)) { /* F3d: memcmp, then the shorter first, for each byte string */
         uint32_t n = a->len < b->len ? a->len : b->len;
         int c = n ? memcmp(a->s, b->s, n) : 0;
         if (c) return c < 0 ? -1 : 1;
@@ -360,7 +360,7 @@ int imdb_x_assign(const imdb_column *c, const imdb_xval *v, imdb_value *out, imd
     default:
         if (v->type != c->type)
             return imdb_fail(e, IMDB_ERR_INVALID, "column %s expects a %s", c->name, imdb_type_name(c->type));
-        if (c->type == IMDB_T_TEXT) out->s = v->s, out->len = v->len;
+        if (imdb_type_bytes(c->type)) out->s = v->s, out->len = v->len;
         else out->i = (int64_t)v->i;
         break;
     }
@@ -542,6 +542,9 @@ static int cast_to_text(const imdb_xval *v, imdb_xenv *env, imdb_xval *out, imdb
         imdb_format_i128(v->i, v->type == IMDB_T_DECIMAL ? v->scale : 0, &b);
     } else if (v->type == IMDB_T_TIMESTAMPTZ) { /* P2: in the session's zone, its offset written */
         imdb_format_timestamptz((int64_t)v->i, imdb_x_tz_off(env, env ? env->zone : NULL, (int64_t)v->i), &b);
+    } else if (v->type == IMDB_T_UUID || v->type == IMDB_T_BYTEA) { /* F3d: the text forms */
+        imdb_value iv = {.type = v->type, .s = v->s, .len = v->len};
+        imdb_format_value(&iv, &b);
     } else {
         imdb_value iv = {.type = v->type};
         iv.i = v->type == IMDB_T_FLOAT64 ? imdb_f64_key(v->f) : (int64_t)v->i;
@@ -607,7 +610,8 @@ static const char *fn_name(uint8_t fn)
                                     "SUBSTR", "TRIM",  "LTRIM", "RTRIM", "POSITION", "COALESCE", "NULLIF",
                                     "LOWER",  "UPPER", "REPLACE", "||",     "DATE_TRUNC", "TIMEZONE", "NOW",
                                     "LOCALTIMESTAMP", "CURRENT_DATE", "LOCALTIME", /* F2a */
-                                    "NEXTVAL", "CURRVAL", "SETVAL", "LASTVAL"}; /* F2a-2 */
+                                    "NEXTVAL", "CURRVAL", "SETVAL", "LASTVAL", /* F2a-2 */
+                                    "GEN_RANDOM_UUID", "OCTET_LENGTH"}; /* F3d */
     return fn < sizeof n / sizeof *n ? n[fn] : "?";
 }
 
@@ -647,6 +651,15 @@ int imdb_x_fn_type(uint8_t fn, uint8_t nargs, const uint8_t *ta, const uint8_t *
         if (fn_args(fn, nargs, 0, 0, e)) return e->code;
         *rt = IMDB_T_INT64;
         return IMDB_OK;
+    case FN_GEN_RANDOM_UUID: /* F3d */
+        if (fn_args(fn, nargs, 0, 0, e)) return e->code;
+        *rt = IMDB_T_UUID;
+        return IMDB_OK;
+    case FN_OCTET_LENGTH: /* F3d: bytes, of a TEXT or a BYTEA */
+        if (fn_args(fn, nargs, 1, 1, e)) return e->code;
+        if (ta[0] != IMDB_T_TEXT && ta[0] != IMDB_T_BYTEA) return imdb_fail(e, IMDB_ERR_INVALID, "OCTET_LENGTH takes a TEXT or a BYTEA");
+        *rt = IMDB_T_INT64;
+        return IMDB_OK;
     case FN_ABS:
     case FN_SIGN:
     case FN_CEIL:
@@ -683,12 +696,20 @@ int imdb_x_fn_type(uint8_t fn, uint8_t nargs, const uint8_t *ta, const uint8_t *
     case FN_LTRIM:
     case FN_RTRIM:
         if (fn_args(fn, nargs, 1, 1, e)) return e->code;
+        if (fn == FN_LENGTH && ta[0] == IMDB_T_BYTEA) { /* F3d: a BYTEA's bytes, PostgreSQL's */
+            *rt = IMDB_T_INT64;
+            return IMDB_OK;
+        }
         if (ta[0] != IMDB_T_TEXT) return imdb_fail(e, IMDB_ERR_INVALID, "%s takes a TEXT value", fn_name(fn));
         *rt = fn == FN_LENGTH ? IMDB_T_INT64 : IMDB_T_TEXT;
         return IMDB_OK;
     case FN_REPLACE:
     case FN_CONCAT: /* || : TEXT alone, as values are not converted (CAST(x AS TEXT) first) */
         if (fn_args(fn, nargs, fn == FN_REPLACE ? 3 : 2, fn == FN_REPLACE ? 3 : 2, e)) return e->code;
+        if (fn == FN_CONCAT && ta[0] == IMDB_T_BYTEA && ta[1] == IMDB_T_BYTEA) { /* F3d: BYTEA || BYTEA */
+            *rt = IMDB_T_BYTEA;
+            return IMDB_OK;
+        }
         for (unsigned i = 0; i < nargs; i++)
             if (ta[i] != IMDB_T_TEXT) return imdb_fail(e, IMDB_ERR_INVALID, "%s takes TEXT values", fn_name(fn));
         *rt = IMDB_T_TEXT;
@@ -822,6 +843,11 @@ static int fn_eval(uint8_t fn, const imdb_xval *a, uint8_t nargs, uint8_t rt, ui
     case FN_LASTVAL:
         if (!env || !env->seqfn) return imdb_fail(e, IMDB_ERR_STATE, "%s outside a statement's run", fn_name(fn));
         return env->seqfn(env->ctx, fn, a, nargs, out, e);
+    case FN_GEN_RANDOM_UUID: { /* F3d: 16 bytes from the engine's random source, RFC 9562's version 4 */
+        uint8_t *p = x_text(env, IMDB_UUID_LEN, out, e);
+        if (!p || imdb_uuid_v4(p, e)) return e->code;
+        return IMDB_OK;
+    }
     case FN_NOW: /* F2a: the transaction's start (an autocommit statement's), PostgreSQL's now(); never read in a probe */
     case FN_LOCALTIMESTAMP:
     case FN_CURRENT_DATE:
@@ -866,7 +892,8 @@ static int fn_eval(uint8_t fn, const imdb_xval *a, uint8_t nargs, uint8_t rt, ui
     case FN_UPPER:
     case FN_REPLACE:
     case FN_CONCAT: return fn_text(fn, a, env, out, e);
-    case FN_LENGTH: out->i = u8_chars(a[0].s, a[0].len); return IMDB_OK;
+    case FN_LENGTH: out->i = a[0].type == IMDB_T_BYTEA ? a[0].len : u8_chars(a[0].s, a[0].len); return IMDB_OK; /* F3d: bytes */
+    case FN_OCTET_LENGTH: out->i = a[0].len; return IMDB_OK;
     case FN_SUBSTR: { /* characters [start, start + length), clipped to the text (PostgreSQL's: a start below 1 is
                        * outside it, so it shortens what is left) */
         __int128 st = a[1].i, en = nargs == 3 ? a[1].i + a[2].i : (__int128)UINT32_MAX + 1;
@@ -1031,6 +1058,22 @@ int imdb_x_cast(const imdb_xval *v, const imdb_column *c, imdb_xenv *env, imdb_x
             if (imdb_x_tstz_text(s, v->len, env, &i, e)) return e->code;
             out->i = i;
             return IMDB_OK;
+        case IMDB_T_UUID: { /* F3d: the text forms (a malformed one is its parse's error, as a DATE's) */
+            uint8_t u[IMDB_UUID_LEN];
+            if (imdb_parse_uuid(s, v->len, u, e)) return e->code;
+            uint8_t *p = x_text(env, IMDB_UUID_LEN, out, e);
+            if (!p) return e->code;
+            memcpy(p, u, IMDB_UUID_LEN);
+            return IMDB_OK;
+        }
+        case IMDB_T_BYTEA: {
+            size_t m = v->len >= 2 ? (v->len - 2) / 2 : 0, got = 0;
+            uint8_t *p = x_text(env, m, out, e);
+            if (!p && m) return e->code;
+            if (imdb_parse_bytea(s, v->len, p, m, &got, e)) return e->code;
+            out->len = (uint32_t)got;
+            return IMDB_OK;
+        }
         default: break;
         }
     }
@@ -1111,6 +1154,12 @@ int imdb_x_cast(const imdb_xval *v, const imdb_column *c, imdb_xenv *env, imdb_x
         }
         if (v->type != c->type) break;
         out->i = v->i;
+        return IMDB_OK;
+    case IMDB_T_UUID: /* F3d: from itself (or TEXT, above) alone */
+    case IMDB_T_BYTEA:
+        if (v->type != c->type) break;
+        out->s = v->s;
+        out->len = v->len;
         return IMDB_OK;
     case IMDB_T_TEXT: { /* F3c: CAST(x AS VARCHAR(n)) refuses a longer value (PostgreSQL's cuts it: never guessed here) */
         int rc = cast_to_text(v, env, out, e);

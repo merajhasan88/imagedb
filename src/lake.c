@@ -342,7 +342,7 @@ int imdb_segment_parse(const imdb_schema *s, const uint8_t vhash[32], uint8_t *b
          * when NULLABLE, has its bit set: every other row holds zero data */
         const uint8_t *vb = NULL;
         if (nullable(col)) {
-            uint32_t vk = k + (col->type == IMDB_T_TEXT ? 2 : 1);
+            uint32_t vk = k + (imdb_type_bytes(col->type) ? 2 : 1); /* F3d: a byte string's offsets and data */
             vb = sec[vk];
             if ((n & 7) && (vb[n >> 3] >> (n & 7)) != 0) rc = imdb_fail(e, IMDB_ERR_CORRUPT, "segment: VALID padding");
             for (uint32_t i = 0; i < n && !rc; i++)
@@ -382,7 +382,11 @@ int imdb_segment_parse(const imdb_schema *s, const uint8_t vhash[32], uint8_t *b
                 if (z < a || z > dlen || z - a > IMDB_MAX_TEXT) rc = imdb_fail(e, IMDB_ERR_CORRUPT, "segment: bad TEXT length");
                 else if ((!seg_keeps(gi->flags[i], s, c) || (vb && !valid_bit(vb, i))) && z != a)
                     rc = imdb_fail(e, IMDB_ERR_CORRUPT, "segment: a row without a value in column %s keeps text", col->name);
-                else if (z > a && !imdb_utf8_valid(sc->data + a, z - a, &bad))
+                else if (col->type == IMDB_T_UUID && z > a && z - a != IMDB_UUID_LEN) /* F3d: 16 bytes, or no value */
+                    rc = imdb_fail(e, IMDB_ERR_CORRUPT, "segment: a UUID of %u bytes in column %s", z - a, col->name);
+                else if (col->type == IMDB_T_UUID && z == a && seg_keeps(gi->flags[i], s, c) && !(vb && !valid_bit(vb, i)))
+                    rc = imdb_fail(e, IMDB_ERR_CORRUPT, "segment: a UUID of no bytes in column %s", col->name);
+                else if (col->type == IMDB_T_TEXT && z > a && !imdb_utf8_valid(sc->data + a, z - a, &bad))
                     rc = imdb_fail(e, IMDB_ERR_CORRUPT, "segment: invalid UTF-8 in column %s", col->name);
                 else if (col->vlen && z > a && imdb_utf8_chars(sc->data + a, z - a) > col->vlen) /* F3c */
                     rc = imdb_fail(e, IMDB_ERR_CORRUPT, "segment: a value longer than VARCHAR(%u) in column %s", col->vlen, col->name);
@@ -398,7 +402,7 @@ int imdb_segment_parse(const imdb_schema *s, const uint8_t vhash[32], uint8_t *b
         bool has = false, has_null = false;
         int64_t mn = 0, mx = 0;
         for (uint32_t i = 0; sc->valid && i < n; i++) has_null |= !gi->flags[i] && !valid_bit(sc->valid, i);
-        if (s->cols[c].type != IMDB_T_TEXT)
+        if (!imdb_type_bytes(s->cols[c].type)) /* F3d: a byte string's zone map is TEXT's: none */
             for (uint32_t i = 0; i < n; i++) {
                 if (gi->flags[i] || (sc->valid && !valid_bit(sc->valid, i))) continue;
                 int64_t v = sc->i64 ? sc->i64[i] : sc->u8[i];
@@ -474,7 +478,7 @@ static void seg_get(const imdb_schema *s, const imdb_segimg *gi, uint32_t row, u
 static bool value_same(const imdb_value *a, const imdb_value *b)
 {
     if (a->null || b->null) return a->null == b->null;
-    if (a->type == IMDB_T_TEXT) return a->len == b->len && (!a->len || memcmp(a->s, b->s, a->len) == 0);
+    if (imdb_type_bytes(a->type)) return a->len == b->len && (!a->len || memcmp(a->s, b->s, a->len) == 0);
     return a->i == b->i;
 }
 
@@ -752,7 +756,7 @@ static int seg_build(const imdb_table *t, uint32_t gver, const seg_src *src, uin
     }
     uint64_t text_len[IMDB_MAX_COLS] = {0};
     for (uint32_t c = 0; c < s->ncols; c++) {
-        if (s->cols[c].type != IMDB_T_TEXT) continue;
+        if (!imdb_type_bytes(s->cols[c].type)) continue;
         for (uint32_t i = 0; i < n; i++) {
             if (!seg_keeps(fl[i], s, c)) continue;
             imdb_value v;
@@ -810,8 +814,8 @@ static int seg_build(const imdb_table *t, uint32_t gver, const seg_src *src, uin
     for (uint32_t c = 0; c < s->ncols; c++) {
         bool has = false, has_null = false;
         int64_t mn = 0, mx = 0;
-        uint8_t *vb = nullable(&s->cols[c]) ? b + off[k + (s->cols[c].type == IMDB_T_TEXT ? 2 : 1)] : NULL;
-        if (s->cols[c].type == IMDB_T_TEXT) {
+        uint8_t *vb = nullable(&s->cols[c]) ? b + off[k + (imdb_type_bytes(s->cols[c].type) ? 2 : 1)] : NULL;
+        if (imdb_type_bytes(s->cols[c].type)) { /* F3d: TEXT, UUID and BYTEA: offsets and data */
             uint8_t *o = b + off[k], *data = b + off[k + 1];
             uint32_t at = 0;
             for (uint32_t i = 0; i < n; i++) {
@@ -1072,6 +1076,9 @@ static int old_manifest(uint32_t ver, imdb_err *e)
     if (ver == 5)
         return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 5: this lake was written by an imagedb before views' "
                          "format (manifest 6, P2 S7), which this version does not read");
+    if (ver == 13) /* F3d: no UUID or BYTEA column, no gen_random_uuid DEFAULT */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 13: this lake was written by an imagedb before UUID and "
+                         "BYTEA (manifest 14, 2026-11-09), which this version does not read");
     if (ver == 12) /* F2b-2: version 1's FOREIGN KEYs were not in its history */
         return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 12: this lake was written by an imagedb before FOREIGN "
                          "KEYs (manifest 13, 2026-11-09), which this version does not read");
@@ -1111,7 +1118,7 @@ static bool manifest_owners_listed(const imdb_manifest *m)
         const imdb_schema_hist *h = &m->t[i].hist;
         for (uint16_t p = 0; h->nvers && p < h->vers[0].s.ncols; p++) {
             const imdb_tcol *tc = &h->tcol[p];
-            if (tc->cclock < IMDB_DEFK_IDENTITY_ALWAYS) continue;
+            if (tc->cclock < IMDB_DEFK_IDENTITY_ALWAYS || tc->cclock > IMDB_DEFK_NEXTVAL) continue; /* F3d: kind 10 owns no sequence */
             if (tc->cseq >= m->nsq) return false;
             const imdb_sequence *s = &m->sq[tc->cseq];
             if (tc->cclock != IMDB_DEFK_NEXTVAL && (s->owner != i || s->owner_pos != p)) return false;

@@ -28,8 +28,11 @@ typedef enum imdb_type {
     IMDB_T_TIMESTAMPTZ = 7, /* P2: an instant, microseconds since 1970-01-01 00:00:00 UTC, shown in the session's zone */
     IMDB_T_DATE = 8,        /* F3b: days since 1970-01-01, 0001-01-01 to 9999-12-31 (TIMESTAMP's years) */
     IMDB_T_TIME = 9,        /* F3b: microseconds since midnight, 00:00:00 to 23:59:59.999999 */
+    IMDB_T_UUID = 10,       /* F3d: 16 bytes in s (len 16 always), ordered as memcmp orders them */
+    IMDB_T_BYTEA = 11,      /* F3d: 0 to IMDB_MAX_TEXT bytes in s, any byte; memcmp, then the shorter first */
 } imdb_type;
-#define IMDB_T_LAST IMDB_T_TIME /* the highest tag a schema may hold */
+#define IMDB_T_LAST IMDB_T_BYTEA /* the highest tag a schema may hold */
+#define IMDB_UUID_LEN 16
 
 #define IMDB_COL_PK       0x01
 #define IMDB_COL_SUBJECT  0x02
@@ -86,7 +89,10 @@ void imdb_key_write(const imdb_schema *s, const imdb_value *kv, uint8_t *out);
 int imdb_rd_ident(imdb_rd *r, char out[IMDB_MAX_IDENT + 1], imdb_err *e);
 int imdb_schema_col(const imdb_schema *s, const char *name); /* -1 if absent */
 const char *imdb_type_name(uint8_t t);
-bool imdb_type_is_int(uint8_t t); /* every type but TEXT: compared as int64 */
+bool imdb_type_is_int(uint8_t t); /* every type but the byte strings: its value in i, compared as int64 */
+/* F3d: TEXT, UUID and BYTEA: a byte string in s and len (compared by memcmp, the shorter first; hashed, keyed and kept in
+ * a segment as bytes). TEXT alone has the UTF-8 rules, LIKE, the case functions and VARCHAR's length */
+bool imdb_type_bytes(uint8_t t);
 /* F3a: an INT64 column's width, its precision (16 SMALLINT, 32 INTEGER, 0 INT64 or BIGINT, the one spelling of each): valid,
  * whether a value fits it, and its type's name */
 bool imdb_int_width_ok(uint8_t width);
@@ -138,6 +144,11 @@ int imdb_parse_timestamp(const char *s, size_t n, int64_t *out, imdb_err *e);
  * midnight; 24:00:00 refused) */
 int imdb_parse_date(const char *s, size_t n, int64_t *out, imdb_err *e);
 int imdb_parse_time(const char *s, size_t n, int64_t *out, imdb_err *e);
+/* F3d: a UUID's text, 32 hex digits in either case, with hyphens after the 8th, 12th, 16th and 20th or none */
+int imdb_parse_uuid(const char *s, size_t n, uint8_t out[IMDB_UUID_LEN], imdb_err *e);
+/* F3d: a BYTEA's text, PostgreSQL's hex form: \x then two hex digits a byte, either case (the escape form refused);
+ * *outlen bytes into out (cap at least (n - 2) / 2) */
+int imdb_parse_bytea(const char *s, size_t n, uint8_t *out, size_t cap, size_t *outlen, imdb_err *e);
 #define IMDB_DATE_MIN (-719162LL)  /* 0001-01-01 */
 #define IMDB_DATE_MAX 2932896LL    /* 9999-12-31 */
 #define IMDB_TIME_MAX 86399999999LL /* 23:59:59.999999 */
@@ -163,6 +174,9 @@ void imdb_civil_from_days(int64_t z, int64_t *y, int *m, int *d);
 void imdb_format_timestamp(int64_t us, imdb_buf *out);
 void imdb_format_date(int64_t days, imdb_buf *out); /* F3b: 'YYYY-MM-DD' */
 void imdb_format_time(int64_t us, imdb_buf *out);   /* F3b: 'HH:MM:SS', and '.ffffff' when microseconds remain */
+void imdb_format_uuid(const uint8_t *b, imdb_buf *out);              /* F3d: lowercase 8-4-4-4-12 */
+int imdb_uuid_v4(uint8_t out[IMDB_UUID_LEN], imdb_err *e); /* F3d: gen_random_uuid's: random bytes, version 4, RFC 9562's variant */
+void imdb_format_bytea(const uint8_t *b, size_t n, imdb_buf *out);  /* F3d: \x and lowercase hex; empty is \x */
 /* P2: a TIMESTAMPTZ in a zone whose offset at it is off (seconds east): its local time as a TIMESTAMP's, then the
  * offset as PostgreSQL writes it: +HH, +HH:MM, or +HH:MM:SS (a local mean time's) */
 void imdb_format_timestamptz(int64_t utc_us, int32_t off, imdb_buf *out);

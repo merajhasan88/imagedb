@@ -26,7 +26,7 @@ typedef struct imdb_hmap {
     size_t cap;      /* power of two */
     size_t count;
     size_t key_bytes; /* owned TEXT key copies (the memory budget counts them, R4) */
-    uint8_t ktype;   /* IMDB_T_INT64, IMDB_T_TEXT or IMDB_HKEY_BYTES */
+    uint8_t ktype;   /* IMDB_T_INT64, IMDB_T_TEXT (TEXT, UUID and BYTEA keys: F3d) or IMDB_HKEY_BYTES */
 } imdb_hmap;
 
 /* a map keyed by byte strings: a composite primary key's encoding (F4, codec.h imdb_key_write), read from a key's s

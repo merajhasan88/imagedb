@@ -57,8 +57,11 @@
 #define RETAIN_MIN_US 1000000ull                      /* SET_RETENTION (16): a second ... */
 #define RETAIN_MAX_US (36525ull * 24 * 3600 * 1000000) /* ... to a century, or all ones (FOREVER) */
 
-enum { T_INT64 = 1, T_DECIMAL = 2, T_TEXT = 3, T_BOOL = 4, T_TIMESTAMP = 5, T_FLOAT64 = 6, T_TIMESTAMPTZ = 7, T_DATE = 8, T_TIME = 9 };
-#define T_LAST T_TIME /* P2: TIMESTAMPTZ an instant (UTC microseconds), its zone only how a session shows it; F3b: DATE (days since
+enum { T_INT64 = 1, T_DECIMAL = 2, T_TEXT = 3, T_BOOL = 4, T_TIMESTAMP = 5, T_FLOAT64 = 6, T_TIMESTAMPTZ = 7, T_DATE = 8, T_TIME = 9,
+       T_UUID = 10, T_BYTEA = 11 }; /* F3d: UUID 16 bytes, BYTEA any bytes: byte strings as TEXT is (bytes_t) */
+#define UUID_LEN 16
+static bool bytes_t(uint8_t t) { return t == T_TEXT || t == T_UUID || t == T_BYTEA; }
+#define T_LAST T_BYTEA /* P2: TIMESTAMPTZ an instant (UTC microseconds), its zone only how a session shows it; F3b: DATE (days since
                       * 1970-01-01, 0001-01-01 to 9999-12-31) and TIME (microseconds since midnight, below a day) */
 #define DATE_MIN (-719162LL)
 #define DATE_MAX 2932896LL
@@ -508,6 +511,8 @@ static int check_value(const col *c, const val *v)
     if (c->type == T_FLOAT64 && !float_key_ok(v->i)) return fail("not a finite FLOAT64 in column %s", c->name);
     if (c->type == T_TEXT && (v->len > MAX_TEXT || (v->len && !utf8_ok(v->s, v->len))))
         return fail("invalid TEXT in column %s", c->name);
+    if (c->type == T_UUID && (v->len != UUID_LEN || !v->s)) return fail("a UUID not of 16 bytes in column %s", c->name); /* F3d */
+    if (c->type == T_BYTEA && v->len > MAX_TEXT) return fail("BYTEA too long in column %s", c->name);
     if (c->type == T_TEXT && c->vlen) { /* F3c: VARCHAR(n) counts characters */
         uint32_t k = 0;
         for (uint32_t i = 0; i < v->len; i++) k += (v->s[i] & 0xC0) != 0x80;
@@ -532,10 +537,13 @@ static int decode_row(const schema *s, const uint8_t *row, size_t n, val *out)
             if (v->null) continue;
         }
         uint8_t t = s->c[i].type;
-        if (t == T_TEXT) {
+        if (t == T_TEXT || t == T_BYTEA) {
             v->len = rd_u32(&r);
-            if (v->len > MAX_TEXT) return fail("row: TEXT too long");
+            if (v->len > MAX_TEXT) return fail("row: TEXT or BYTEA too long");
             v->s = rd_bytes(&r, v->len);
+        } else if (t == T_UUID) { /* F3d: 16 bytes, no length */
+            v->s = rd_bytes(&r, UUID_LEN);
+            v->len = v->s ? UUID_LEN : 0;
         } else if (t == T_BOOL) {
             v->i = rd_u8(&r);
         } else {
@@ -554,7 +562,7 @@ static size_t encode_row(const schema *s, const val *v, uint8_t **buf, size_t *c
     int nn = count_nullable(s);
     size_t need = (size_t)(nn + 7) / 8;
     for (int i = 0; i < s->ncols; i++)
-        if (!v[i].null) need += s->c[i].type == T_TEXT ? 4 + v[i].len : s->c[i].type == T_BOOL ? 1 : 8;
+        if (!v[i].null) need += s->c[i].type == T_TEXT || s->c[i].type == T_BYTEA ? 4 + v[i].len : s->c[i].type == T_UUID ? UUID_LEN : s->c[i].type == T_BOOL ? 1 : 8;
     if (need > *cap) {
         *buf = xrealloc(*buf, need, 1);
         *cap = need;
@@ -569,10 +577,13 @@ static size_t encode_row(const schema *s, const val *v, uint8_t **buf, size_t *c
     p += (nn + 7) / 8;
     for (int i = 0; i < s->ncols; i++) {
         if (v[i].null) continue;
-        if (s->c[i].type == T_TEXT) {
+        if (s->c[i].type == T_TEXT || s->c[i].type == T_BYTEA) {
             put32(p, v[i].len);
             if (v[i].len) memcpy(p + 4, v[i].s, v[i].len);
             p += 4 + v[i].len;
+        } else if (s->c[i].type == T_UUID) {
+            memcpy(p, v[i].s, UUID_LEN);
+            p += UUID_LEN;
         } else if (s->c[i].type == T_BOOL) {
             *p++ = (uint8_t)v[i].i;
         } else {
@@ -912,6 +923,7 @@ static bool defk_fits(uint8_t k, uint8_t ty)
 {
     if (k == 9) return ty != T_FLOAT64; /* F2c: a generated column's expression: no FLOAT64 (a double's rounding) */
     if (k >= 6 && k <= 8) return ty == T_INT64; /* F2a-2: a sequence's values */
+    if (k == 10) return ty == T_UUID; /* F3d: gen_random_uuid(), drawn at each write (the row holds it) */
     return k == 2 ? ty == T_TIMESTAMPTZ || ty == T_TIMESTAMP : k == 3 ? ty == T_TIMESTAMP : k == 4 ? ty == T_DATE : k == 5 && ty == T_TIME;
 }
 
@@ -919,7 +931,7 @@ static bool defk_fits(uint8_t k, uint8_t ty)
 static int one_value(rd *hr, const col *ac, const uint8_t **def, uint32_t *len, const char *what)
 {
     size_t at = hr->o;
-    uint32_t dl = ac->type == T_TEXT ? 4 + rd_u32(hr) : ac->type == T_BOOL ? 1 : 8;
+    uint32_t dl = ac->type == T_TEXT || ac->type == T_BYTEA ? 4 + rd_u32(hr) : ac->type == T_UUID ? UUID_LEN : ac->type == T_BOOL ? 1 : 8; /* F3d */
     hr->o = at;
     *def = rd_bytes(hr, dl);
     *len = dl;
@@ -998,7 +1010,7 @@ static int coldefs_body(rd *hr, const schema *s, bool none_ok, acdef **out, uint
         d[k].col = rd_u16(hr);
         d[k].kind = rd_u8(hr);
         if (hr->bad) return 0;
-        if (d[k].col >= s->ncols || (k && d[k].col <= d[k - 1].col) || d[k].kind < 1 || d[k].kind > 9 ||
+        if (d[k].col >= s->ncols || (k && d[k].col <= d[k - 1].col) || d[k].kind < 1 || d[k].kind > 10 ||
             ((d[k].kind == 6 || d[k].kind == 7) && (s->c[d[k].col].flags & F_NULLABLE))) /* F2a-2: an IDENTITY NOT NULL */
             return fail("%s: a bad column DEFAULT", what);
         if (d[k].kind == 1 ? one_value(hr, &s->c[d[k].col], &d[k].def, &d[k].def_len, what) != 0
@@ -1016,7 +1028,7 @@ static int coldefs_body(rd *hr, const schema *s, bool none_ok, acdef **out, uint
             gbytes += tl;
             continue;
         }
-        if (d[k].kind >= 6) { /* F2a-2: its sequence */
+        if (d[k].kind >= 6 && d[k].kind <= 8) { /* F2a-2: its sequence (F3d: kind 10 has none) */
             d[k].seq = rd_u32(hr);
             if (!hr->bad && d[k].seq >= MAX_SEQUENCES) return fail("%s: a column DEFAULT's sequence out of range", what);
         }
@@ -1161,7 +1173,7 @@ static int alter_body(rd *hr, op *o, const char *what)
         o->has_def = has;
         if (has) { /* the row encoding of one value: a one-column NOT NULL row, which decode_row checks */
             size_t at = hr->o;
-            uint32_t dl = ac->type == T_TEXT ? 4 + rd_u32(hr) : ac->type == T_BOOL ? 1 : 8;
+            uint32_t dl = ac->type == T_TEXT || ac->type == T_BYTEA ? 4 + rd_u32(hr) : ac->type == T_UUID ? UUID_LEN : ac->type == T_BOOL ? 1 : 8; /* F3d */
             hr->o = at;
             o->def = rd_bytes(hr, dl);
             o->def_len = dl;
@@ -1180,7 +1192,7 @@ static int alter_body(rd *hr, op *o, const char *what)
     if (o->akind != 3) o->apos = rd_u16(hr); /* F1 stage 4: every kind but RENAME TO names a position */
     if (o->akind == 10) { /* F2a: SET DEFAULT of a clock: its kind (alter_next checks the column's type) */
         o->aclock = rd_u8(hr);
-        if (!hr->bad && (o->aclock < 2 || o->aclock > 5)) return fail("%s: bad clock DEFAULT", what);
+        if (!hr->bad && (o->aclock < 2 || (o->aclock > 5 && o->aclock != 10))) return fail("%s: bad clock DEFAULT", what); /* F3d: 10 */
         return 0;
     }
     if (o->akind == 7 || o->akind == 9) { /* SET DEFAULT, SET TYPE: a column's type alone, then SET DEFAULT's value */
@@ -1201,7 +1213,7 @@ static int alter_body(rd *hr, op *o, const char *what)
         if (o->akind == 9 || hr->bad) return 0;
         o->has_def = true; /* never NULL: no marker, the row encoding of one NOT NULL value */
         size_t at = hr->o;
-        uint32_t dl = ac->type == T_TEXT ? 4 + rd_u32(hr) : ac->type == T_BOOL ? 1 : 8;
+        uint32_t dl = ac->type == T_TEXT || ac->type == T_BYTEA ? 4 + rd_u32(hr) : ac->type == T_UUID ? UUID_LEN : ac->type == T_BOOL ? 1 : 8; /* F3d */
         hr->o = at;
         o->def = rd_bytes(hr, dl);
         o->def_len = dl;
@@ -1795,7 +1807,7 @@ static bool uk_key(const schema *s, const val *vals, const aidx *x, uint8_t **ou
             free(b);
             return false;
         }
-        bool text = s->c[x->cols[c]].type == T_TEXT;
+        bool text = bytes_t(s->c[x->cols[c]].type); /* F3d: a UUID's and a BYTEA's bytes as TEXT's */
         size_t add = text ? 4 + (size_t)v->len : 8;
         b = xrealloc(b, n + add, 1);
         uint64_t w = text ? v->len : (uint64_t)v->i;
@@ -2084,7 +2096,7 @@ static int alter_state(const op *o, int npos_before, val *missing, uint8_t **mis
 static bool val_same(const val *a, const val *b, uint8_t ty)
 {
     if (a->null || b->null) return a->null == b->null;
-    if (ty == T_TEXT) return a->len == b->len && (!a->len || memcmp(a->s, b->s, a->len) == 0);
+    if (bytes_t(ty)) return a->len == b->len && (!a->len || memcmp(a->s, b->s, a->len) == 0);
     return a->i == b->i;
 }
 
@@ -3825,7 +3837,7 @@ static bool ukey_of(const schema *s, const seg *g, uint32_t i, const aidx *x, uk
         }
         val v;
         seg_value(s, g, i, cn, &v);
-        bool text = s->c[cn].type == T_TEXT;
+        bool text = bytes_t(s->c[cn].type);
         size_t add = text ? 4 + (size_t)v.len : 8;
         b = xrealloc(b, n + add, 1);
         uint64_t w = text ? v.len : (uint64_t)v.i;
@@ -3927,7 +3939,7 @@ static int parse_segment(const struct aver *vers, uint32_t nvers, const val *mis
     k = 5;
     for (int c = 0; c < s->ncols && !rc; c++) {
         g->colp[c] = sec[k++];
-        if (s->c[c].type == T_TEXT) {
+        if (bytes_t(s->c[c].type)) { /* F3d: offsets and data for each byte string */
             g->tdata[c] = sec[k];
             uint64_t dl = slen[k++];
             if (le32(g->colp[c]) != 0 || le32(g->colp[c] + 4u * n) != dl) rc = fail("segment: bad TEXT offsets");
@@ -4000,7 +4012,7 @@ static int parse_segment(const struct aver *vers, uint32_t nvers, const val *mis
         bool has = false, has_null = false;
         int64_t mn = 0, mx = 0;
         for (uint32_t i = 0; i < n; i++) has_null |= !g->row[i].flags && !has_value(g, c, i);
-        if (s->c[c].type != T_TEXT)
+        if (!bytes_t(s->c[c].type))
             for (uint32_t i = 0; i < n; i++) {
                 if (g->row[i].flags || !has_value(g, c, i)) continue;
                 val v;
@@ -4205,7 +4217,7 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
     rd r = {b, len, 0, false};
     const uint8_t *mg = rd_bytes(&r, 8);
     uint32_t mver = mg && memcmp(mg, "IMDBMAN1", 8) == 0 ? rd_u32(&r) : 0;
-    if (mver != 13) return fail("manifest: bad header (version 13 only: FOREIGN KEYs, F2b-2)");
+    if (mver != 14) return fail("manifest: bad header (version 14 only: UUID and BYTEA, F3d)");
     uint32_t nsec = rd_u32(&r); /* every section, in order: 1 tables, 2 views, 3 sequences (F2a-2), 4-11 reserved and empty */
     const uint8_t *id = rd_bytes(&r, 16);
     m->seq = rd_u64(&r);
@@ -5886,7 +5898,7 @@ static void q_take(qctx *q, const schema *s, const val *vals, const uint8_t cm[3
     for (int k = 0; k < q->nf; k++) {
         const val *v = &vals[q->f[k].col], *w = &q->f[k].v;
         if (v->null) return;
-        if (s->c[q->f[k].col].type == T_TEXT ? (v->len != w->len || (v->len && memcmp(v->s, w->s, v->len) != 0)) : v->i != w->i)
+        if (bytes_t(s->c[q->f[k].col].type) ? (v->len != w->len || (v->len && memcmp(v->s, w->s, v->len) != 0)) : v->i != w->i)
             return;
     }
     q->count++;

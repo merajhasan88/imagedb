@@ -149,7 +149,7 @@ static bool v_seq_named(const vctx *x, uint32_t id)
         const imdb_sver *v = &t->hist.vers[t->hist.nvers - 1];
         for (uint16_t c = 0; c < v->s.ncols; c++) {
             const imdb_tcol *tc = &t->hist.tcol[v->pos[c]];
-            if (tc->wclock >= IMDB_DEFK_IDENTITY_ALWAYS && tc->wseq == id) return true;
+            if (tc->wclock >= IMDB_DEFK_IDENTITY_ALWAYS && tc->wclock <= IMDB_DEFK_NEXTVAL && tc->wseq == id) return true; /* F3d */
         }
     }
     return false;
@@ -1536,7 +1536,7 @@ static bool val_eq(const imdb_value *a, const imdb_value *b)
 {
     if (a->null != b->null || a->type != b->type || a->scale != b->scale) return false;
     if (a->null) return true;
-    return a->type == IMDB_T_TEXT ? a->len == b->len && (!a->len || memcmp(a->s, b->s, a->len) == 0) : a->i == b->i;
+    return imdb_type_bytes(a->type) ? a->len == b->len && (!a->len || memcmp(a->s, b->s, a->len) == 0) : a->i == b->i;
 }
 
 static bool same_hist(const imdb_schema_hist *m, const imdb_schema_hist *x, uint32_t n)

@@ -95,7 +95,7 @@ static void res_put(imdb_result *r, imdb_cell *c, const imdb_value *v)
         return;
     }
     c->v = *v;
-    if (v->type == IMDB_T_TEXT) {
+    if (imdb_type_bytes(v->type)) {
         c->v.i = (int64_t)r->text.len;
         c->v.s = NULL;
         uint64_t cap = r->byte_cap ? r->byte_cap : IMDB_MAX_RESULT_BYTES;
@@ -126,7 +126,7 @@ static int res_finish(imdb_result *r, imdb_err *e)
                          (unsigned long long)r->nrows);
     if (imdb_buf_check(&r->text, e)) return e->code;
     for (uint64_t i = 0; i < r->nrows * r->ncols; i++)
-        if (r->cells[i].v.type == IMDB_T_TEXT && !r->cells[i].null)
+        if (imdb_type_bytes(r->cells[i].v.type) && !r->cells[i].null)
             r->cells[i].v.s = r->text.p ? r->text.p + r->cells[i].v.i : (const uint8_t *)"";
     return IMDB_OK;
 }
@@ -419,7 +419,7 @@ static void xfree(xctx *x)
 /* Copies a TEXT value into context-owned memory (stable across writes). */
 static int xpin(xctx *x, imdb_value *v, imdb_err *e)
 {
-    if (v->type != IMDB_T_TEXT || v->null) return IMDB_OK;
+    if (!imdb_type_bytes(v->type) || v->null) return IMDB_OK;
     if (!v->len) { /* P2 S15: an empty value points nowhere it came from (a releasing statement lets its image go) */
         v->s = (const uint8_t *)"";
         return IMDB_OK;
@@ -441,12 +441,12 @@ static int xpin_row(xctx *x, imdb_value *v, uint16_t n, imdb_err *e)
     imdb_buf *b = &x->row_text;
     size_t total = 0;
     for (uint16_t c = 0; c < n; c++)
-        if (v[c].type == IMDB_T_TEXT && !v[c].null && imdb_add_ovf(total, v[c].len, &total))
+        if (imdb_type_bytes(v[c].type) && !v[c].null && imdb_add_ovf(total, v[c].len, &total))
             return imdb_fail(e, IMDB_ERR_LIMIT, "row TEXT size overflow");
     b->len = 0;
     if (!imdb_buf_reserve(b, total)) return imdb_buf_check(b, e);
     for (uint16_t c = 0; c < n; c++) {
-        if (v[c].type != IMDB_T_TEXT || v[c].null || !v[c].len) continue;
+        if (!imdb_type_bytes(v[c].type) || v[c].null || !v[c].len) continue;
         memcpy(b->p + b->len, v[c].s, v[c].len);
         v[c].s = b->p + b->len;
         b->len += v[c].len;
@@ -522,6 +522,27 @@ static int bind_lit(xctx *x, const sql_lit *l, const imdb_column *c, bool compar
                 return imdb_fail(e, IMDB_ERR_INVALID, "column %s expects a number", c->name);
             if (imdb_parse_float64(txt, tl, &out->i, e)) return e->code;
             break;
+        case IMDB_T_UUID: { /* F3d: a string read by the type's text form, or UUID '...' */
+            if (l->kind != LIT_UUID && l->kind != LIT_STR)
+                return imdb_fail(e, IMDB_ERR_INVALID, "column %s expects UUID '...'", c->name);
+            uint8_t *buf = xalloc(x, IMDB_UUID_LEN, e);
+            if (!buf) return e->code;
+            if (imdb_parse_uuid(txt, tl, buf, e)) return e->code;
+            out->s = buf;
+            out->len = IMDB_UUID_LEN;
+            break;
+        }
+        case IMDB_T_BYTEA: { /* F3d: \x and hex digits */
+            if (l->kind != LIT_BYTEA && l->kind != LIT_STR)
+                return imdb_fail(e, IMDB_ERR_INVALID, "column %s expects BYTEA '\\x...'", c->name);
+            size_t m = tl >= 2 ? (tl - 2) / 2 : 0, got = 0;
+            uint8_t *buf = xalloc(x, m ? m : 1, e);
+            if (!buf) return e->code;
+            if (imdb_parse_bytea(txt, tl, buf, m, &got, e)) return e->code;
+            out->s = buf;
+            out->len = (uint32_t)got;
+            break;
+        }
         case IMDB_T_TEXT: {
             if (l->kind != LIT_STR) return imdb_fail(e, IMDB_ERR_INVALID, "column %s expects a string", c->name);
             uint8_t *buf = xalloc(x, tl, e);
@@ -670,6 +691,23 @@ static int bind_xlit(xctx *x, const sql_lit *l, imdb_xval *v, imdb_err *e)
         v->type = IMDB_T_TIMESTAMPTZ;
         v->i = i;
         return IMDB_OK;
+    case LIT_UUID: { /* F3d */
+        uint8_t *buf = xalloc(x, IMDB_UUID_LEN, e);
+        if (!buf || imdb_parse_uuid(txt, tl, buf, e)) return e->code;
+        v->type = IMDB_T_UUID;
+        v->s = buf;
+        v->len = IMDB_UUID_LEN;
+        return IMDB_OK;
+    }
+    case LIT_BYTEA: {
+        size_t m = tl >= 2 ? (tl - 2) / 2 : 0, got = 0;
+        uint8_t *buf = xalloc(x, m ? m : 1, e);
+        if (!buf || imdb_parse_bytea(txt, tl, buf, m, &got, e)) return e->code;
+        v->type = IMDB_T_BYTEA;
+        v->s = buf;
+        v->len = (uint32_t)got;
+        return IMDB_OK;
+    }
     case LIT_STR: {
         uint8_t *buf = xalloc(x, tl, e);
         if (!buf) return e->code;
@@ -696,6 +734,19 @@ static int ts_lit(xctx *x, const sql_stmt *st, uint16_t k, uint8_t t, imdb_err *
     if (n->op != EX_LIT || n->lit.kind != LIT_STR) return IMDB_OK;
     int64_t us;
     const char *s = x->sql + n->lit.off; /* F3b: a DATE's and a TIME's by their own literal rules */
+    if (t == IMDB_T_UUID || t == IMDB_T_BYTEA) { /* F3d: a UUID's and a BYTEA's text forms, the bytes the statement's */
+        size_t m = t == IMDB_T_UUID ? IMDB_UUID_LEN : n->lit.len >= 2 ? (n->lit.len - 2) / 2 : 0, got = IMDB_UUID_LEN;
+        uint8_t *buf = xalloc(x, m ? m : 1, e);
+        if (!buf) return e->code;
+        if (t == IMDB_T_UUID ? imdb_parse_uuid(s, n->lit.len, buf, e) : imdb_parse_bytea(s, n->lit.len, buf, m, &got, e))
+            return e->code;
+        imdb_xnode *bn = &x->xn[k];
+        memset(&bn->k, 0, sizeof bn->k);
+        bn->k.type = bn->type = t;
+        bn->k.s = buf;
+        bn->k.len = (uint32_t)got;
+        return IMDB_OK;
+    }
     if (t == IMDB_T_TIMESTAMPTZ ? imdb_x_tstz_text(s, n->lit.len, &x->env, &us, e)
         : t == IMDB_T_DATE      ? imdb_parse_date(s, n->lit.len, &us, e)
         : t == IMDB_T_TIME      ? imdb_parse_time(s, n->lit.len, &us, e)
@@ -711,7 +762,8 @@ static int ts_lit(xctx *x, const sql_stmt *st, uint16_t k, uint8_t t, imdb_err *
 /* a type a string literal beside it takes (F3b: DATE and TIME too); a value of one compares only with its own type */
 static bool is_ts(uint8_t t)
 {
-    return t == IMDB_T_TIMESTAMP || t == IMDB_T_TIMESTAMPTZ || t == IMDB_T_DATE || t == IMDB_T_TIME;
+    return t == IMDB_T_TIMESTAMP || t == IMDB_T_TIMESTAMPTZ || t == IMDB_T_DATE || t == IMDB_T_TIME || t == IMDB_T_UUID ||
+           t == IMDB_T_BYTEA; /* F3d: a UUID's and a BYTEA's text forms too */
 }
 
 /* CAST between the temporal types: TIMESTAMP and TIMESTAMPTZ each way (the session's zone), and (F3b) a TIMESTAMP's or
@@ -827,6 +879,9 @@ static int xbind_s1(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
     }
     if (n->fn == FN_COALESCE) return x_unify_all(x, st, v, nv, "COALESCE of", &b->type, &b->scale, e);
     if (n->fn == FN_NULLIF && nv == 2 && is_ts(x->xn[v[0]].type) && ts_lit(x, st, v[1], x->xn[v[0]].type, e)) return e->code;
+    if (n->fn == FN_CONCAT && nv == 2) /* F3d: a string literal beside a BYTEA is one (PostgreSQL's unknown literal) */
+        for (unsigned i = 0; i < 2; i++)
+            if (x->xn[v[1 - i]].type == IMDB_T_BYTEA && ts_lit(x, st, v[i], IMDB_T_BYTEA, e)) return e->code;
     for (unsigned i = 0; i < nv; i++) {
         ta[i] = x->xn[v[i]].type;
         sa[i] = x->xn[v[i]].scale;
@@ -1473,7 +1528,7 @@ static int bind_pred(xctx *x, const sql_cmp *c, int col, bool post, qspec *q, im
         return imdb_fail(e, IMDB_ERR_INVALID, "a comparison with NULL is never true; use IS NULL or IS NOT NULL");
     if (cd->type == IMDB_T_BOOL && c->op != CMP_EQ && c->op != CMP_NE)
         return imdb_fail(e, IMDB_ERR_INVALID, "BOOL column %s supports only = and !=", cd->name);
-    if (cd->type != IMDB_T_TEXT) {
+    if (!imdb_type_bytes(cd->type)) {
         int64_t v = b->a.i;
         b->lo = INT64_MIN;
         b->hi = INT64_MAX;
@@ -1545,7 +1600,7 @@ static bool corr_pred(xctx *x, const sql_stmt *st, uint16_t i, qspec *q)
     b->type = cd->type;
     b->op = op;
     b->a = *v;
-    if (cd->type != IMDB_T_TEXT) {
+    if (!imdb_type_bytes(cd->type)) {
         b->lo = INT64_MIN;
         b->hi = INT64_MAX;
         switch (op) {
@@ -1594,7 +1649,7 @@ static bool pred_ok(const bpred *b, const imdb_value *v)
     if (b->op == CMP_ISNULL) return v->null;
     if (b->op == CMP_NOTNULL) return !v->null;
     if (v->null) return false; /* a comparison with NULL is not true (WHERE is a conjunction) */
-    if (b->type != IMDB_T_TEXT) {
+    if (!imdb_type_bytes(b->type)) {
         bool in = v->i >= b->lo && v->i <= b->hi;
         return b->neg ? !in : in;
     }
@@ -1649,7 +1704,7 @@ typedef struct xacc {
 /* P2 S1: a TEXT extreme copied into its own buffer (grown, never shrunk), so no row or arena outlives it */
 static int xacc_own(imdb_xval *x, uint8_t **buf, uint32_t *cap, imdb_err *e)
 {
-    if (x->type != IMDB_T_TEXT || x->null) return IMDB_OK;
+    if (!imdb_type_bytes(x->type) || x->null) return IMDB_OK;
     if (!*buf || x->len > *cap) { /* an empty extreme too: its pointer is never NULL (memcmp, memcpy) */
         uint32_t nc = x->len > 2 * *cap ? x->len : 2 * *cap;
         uint8_t *nb = imdb_alloc(nc ? nc : 1, e);
@@ -1863,7 +1918,7 @@ static void key_enc(imdb_buf *b, const imdb_xval *v)
 {
     imdb_buf_put_u8(b, v->null ? 0 : 1);
     if (v->null) return;
-    if (v->type == IMDB_T_TEXT) {
+    if (imdb_type_bytes(v->type)) {
         imdb_buf_put_u32(b, v->len);
         if (v->len) imdb_buf_put(b, v->s, v->len);
     } else if (v->type == IMDB_T_FLOAT64) {
@@ -1992,7 +2047,7 @@ static void join_inner_row(sink *k, uint64_t vid, const imdb_value *vals);
  * for a tree's: the row it came from may sit in an image the statement lets go (O3) */
 static int acc_own(imdb_value *v, uint8_t **buf, uint32_t *cap, imdb_err *e)
 {
-    if (v->type != IMDB_T_TEXT || v->null) return IMDB_OK;
+    if (!imdb_type_bytes(v->type) || v->null) return IMDB_OK;
     if (!*buf || v->len > *cap) { /* an empty extreme too: its pointer is never NULL (memcmp) */
         uint32_t nc = v->len > 2 * *cap ? v->len : 2 * *cap;
         uint8_t *nb = imdb_alloc(nc ? nc : 1, e);
@@ -2113,8 +2168,8 @@ static void group_gen(sink *k, const imdb_value *vals)
         for (uint8_t j = 0; j < k->ngk; j++) {
             imdb_xval *d = &k->gkeys[g * k->ngk + j];
             *d = kv[j];
-            if (d->type == IMDB_T_TEXT && !d->null && !d->len) d->s = (const uint8_t *)""; /* never NULL (memcpy) */
-            if (d->type == IMDB_T_TEXT && !d->null && d->len) { /* past the row: the statement's own copy */
+            if (imdb_type_bytes(d->type) && !d->null && !d->len) d->s = (const uint8_t *)""; /* never NULL (memcpy) */
+            if (imdb_type_bytes(d->type) && !d->null && d->len) { /* past the row: the statement's own copy */
                 uint8_t *p = xalloc(x, d->len, k->e);
                 if (!p) goto fail;
                 memcpy(p, d->s, d->len);
@@ -2548,7 +2603,7 @@ static int corr_answer(xctx *x, const sql_expr *n, const xcorr *c, const imdb_re
     if (n->subk == 0 && r->nrows > 1) return imdb_fail(e, IMDB_ERR_INVALID, "a subquery as a value returned more than one row");
     size_t tb = 0;
     for (uint64_t i = 0; i < r->nrows; i++)
-        if (c->ctype == IMDB_T_TEXT && !r->cells[i].null && !r->cells[i].v.null) tb += r->cells[i].v.len;
+        if (imdb_type_bytes(c->ctype) && !r->cells[i].null && !r->cells[i].v.null) tb += r->cells[i].v.len;
     uint8_t *tp = tb ? xalloc(x, tb, e) : NULL;
     if (tb && !tp) return e->code;
     imdb_xset *s = xalloc(x, sizeof *s, e);
@@ -2560,7 +2615,7 @@ static int corr_answer(xctx *x, const sql_expr *n, const xcorr *c, const imdb_re
             s->has_null = true;
             continue;
         }
-        if (v.type == IMDB_T_TEXT && v.len) { /* past the result: the statement's own copy */
+        if (imdb_type_bytes(v.type) && v.len) { /* past the result: the statement's own copy */
             memcpy(tp, v.s, v.len);
             v.s = tp;
             tp += v.len;
@@ -2726,7 +2781,7 @@ static int path_index(xctx *x, const qspec *q, sink *k, imdb_err *e)
  * prefix, so the range is a superset and every predicate is checked again on each row */
 static void word_bounds(const bpred *b, uint64_t *lo, uint64_t *hi)
 {
-    if (b->type != IMDB_T_TEXT) {
+    if (!imdb_type_bytes(b->type)) {
         *lo = (uint64_t)b->lo ^ (1ull << 63);
         *hi = (uint64_t)b->hi ^ (1ull << 63);
         return;
@@ -2783,7 +2838,7 @@ static int ord_only_visit(void *ctx, const uint64_t *key, uint64_t vid)
     if (vid >= t->nver || !visible_q(o->q, imdb_vh(t, vid))) return IMDB_OK;
     const imdb_index *ix = o->q->ord_idx;
     for (uint8_t c = 0; c < ix->d.ncols; c++)
-        if (t->s.cols[ix->d.cols[c]].type != IMDB_T_TEXT) o->vals[ix->d.cols[c]].i = (int64_t)(key[c] ^ (1ull << 63));
+        if (!imdb_type_bytes(t->s.cols[ix->d.cols[c]].type)) o->vals[ix->d.cols[c]].i = (int64_t)(key[c] ^ (1ull << 63));
     if (preds_ok(o->q, o->vals)) sink_row(o->k, vid, o->vals);
     return o->k->err;
 }
@@ -3100,7 +3155,7 @@ static bool in_key(const imdb_table *t, const imdb_index *ix, int col)
 {
     for (uint8_t c = 0; c < ix->d.ncols; c++)
         if (ix->d.cols[c] == col)
-            return t->s.cols[col].type != IMDB_T_TEXT && (c == 0 || !(t->s.cols[col].flags & IMDB_COL_NULLABLE));
+            return !imdb_type_bytes(t->s.cols[col].type) && (c == 0 || !(t->s.cols[col].flags & IMDB_COL_NULLABLE));
     return false;
 }
 
@@ -3130,7 +3185,7 @@ static bool seg_skipped(const qspec *q, const imdb_segment *g)
         imdb_segzone zt;
         const imdb_segzone *zc = imdb_seg_zone(q->t, g, b->col, &zt); /* the descriptor's: no image */
         if (b->op == CMP_ISNULL) skip = !zc->has_null;
-        else if (b->type == IMDB_T_TEXT) continue; /* TEXT has no min/max */
+        else if (imdb_type_bytes(b->type)) continue; /* TEXT has no min/max */
         else if (b->op == CMP_NOTNULL || b->neg) skip = !zc->has;
         else skip = !zc->has || b->hi < zc->min || b->lo > zc->max;
     }
@@ -3528,7 +3583,7 @@ static void cell_x(const imdb_result *r, const imdb_cell *c, imdb_xval *v)
     if (c->null) return;
     if (c->wide) v->i = c->i128;
     else if (c->v.type == IMDB_T_FLOAT64) v->f = imdb_f64_value(c->v.i);
-    else if (c->v.type == IMDB_T_TEXT) v->s = r->text.p + c->v.i, v->len = c->v.len;
+    else if (imdb_type_bytes(c->v.type)) v->s = r->text.p + c->v.i, v->len = c->v.len;
     else v->i = c->v.i;
 }
 
@@ -3542,7 +3597,7 @@ static void row_digest(const imdb_result *r, const imdb_cell *row, uint8_t out[I
         uint8_t tag[3] = {c->null, c->v.type, c->v.scale};
         imdb_sha256_update(&h, tag, sizeof tag);
         if (c->null) continue;
-        if (c->v.type == IMDB_T_TEXT) {
+        if (imdb_type_bytes(c->v.type)) {
             uint32_t n = c->v.len;
             imdb_sha256_update(&h, &n, sizeof n);
             imdb_sha256_update(&h, r->text.p + c->v.i, n);
@@ -3644,10 +3699,10 @@ static int key_resolve(sink *k, imdb_err *e)
     uint64_t nk = k->st->norder;
     for (uint64_t j = 0; j < k->nvids; j++) {
         imdb_value *v = &k->wkv[j].key;
-        if (v->type == IMDB_T_TEXT && !v->null && v->len) v->s = k->kbuf.p + v->i, v->i = 0;
+        if (imdb_type_bytes(v->type) && !v->null && v->len) v->s = k->kbuf.p + v->i, v->i = 0;
         for (uint64_t o = 0; o < nk; o++) {
             imdb_xval *d = &k->wok[j * nk + o];
-            if (d->type == IMDB_T_TEXT && !d->null && d->len) d->s = k->kbuf.p + (uint64_t)d->i, d->i = 0;
+            if (imdb_type_bytes(d->type) && !d->null && d->len) d->s = k->kbuf.p + (uint64_t)d->i, d->i = 0;
         }
     }
     return IMDB_OK;
@@ -3697,7 +3752,7 @@ static int walk_keys(sink *k, uint64_t vid, const imdb_value *vals)
                 k->kbuf.len += n;
             }
             kv->key = (imdb_value){.type = IMDB_T_TEXT, .len = (uint32_t)n, .i = (int64_t)off}; /* key_resolve points it */
-        } else if (kv->key.type == IMDB_T_TEXT && !kv->key.null) {
+        } else if (imdb_type_bytes(kv->key.type) && !kv->key.null) {
             kv->key.i = (int64_t)key_text(k, &kv->key.s, kv->key.len);
         }
     }
@@ -3706,7 +3761,7 @@ static int walk_keys(sink *k, uint64_t vid, const imdb_value *vals)
         int rc = IMDB_OK;
         for (uint8_t o = 0; !rc && o < nk; o++) {
             imdb_xval *d = &k->wok[k->nvids * nk + o];
-            if (!(rc = order_key(x, st, k, o, vals, d, e)) && d->type == IMDB_T_TEXT && !d->null) d->i = key_text(k, &d->s, d->len);
+            if (!(rc = order_key(x, st, k, o, vals, d, e)) && imdb_type_bytes(d->type) && !d->null) d->i = key_text(k, &d->s, d->len);
         }
         imdb_xarena_reset(&x->arena, m);
         if (rc) return rc;
@@ -3916,7 +3971,7 @@ static int plan_select(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb
     if (alloc_xa(x, k, &si, e)) return e->code;
     if (st->has_group) {
         k->mode = SINK_GROUP;
-        uint8_t kt = k->gen || t->s.cols[k->gcol].type == IMDB_T_TEXT ? IMDB_T_TEXT : IMDB_T_INT64;
+        uint8_t kt = k->gen || imdb_type_bytes(t->s.cols[k->gcol].type) ? IMDB_T_TEXT : IMDB_T_INT64;
         if (imdb_hmap_init(&k->gmap, kt, e)) return e->code;
     } else if (any_agg) {
         if (any_plain) return imdb_fail(e, IMDB_ERR_INVALID, "mixing aggregates and columns needs GROUP BY");
@@ -3944,7 +3999,7 @@ static void res_put_x(imdb_result *r, imdb_cell *c, const imdb_xval *v)
         return;
     }
     if (v->type == IMDB_T_FLOAT64) iv.i = imdb_f64_key(v->f);
-    else if (v->type == IMDB_T_TEXT) iv.s = v->s, iv.len = v->len;
+    else if (imdb_type_bytes(v->type)) iv.s = v->s, iv.len = v->len;
     else iv.i = (int64_t)v->i;
     res_put(r, c, &iv);
 }
@@ -4672,6 +4727,8 @@ static int chk_types(const sql_stmt *st, const imdb_xnode *xn, uint16_t k, uint6
     if (x->op != EX_LIST && x->op != EX_WHEN) {
         if (xn[k].type == IMDB_T_FLOAT64)
             return imdb_fail(e, IMDB_ERR_INVALID, "%s computes no FLOAT64 value: a later step (deferred.md D19)", w);
+        if (xn[k].type == IMDB_T_UUID || xn[k].type == IMDB_T_BYTEA) /* F3d: the verifiers' evaluators lack them: a second pass */
+            return imdb_fail(e, IMDB_ERR_INVALID, "%s reads no UUID or BYTEA value yet: a later step (f3d-design.md section 7)", w);
         if (x->op == EX_LIT && x->lit.kind != LIT_NULL && xn[k].type == IMDB_T_TIMESTAMPTZ) /* a NULL is no instant */
             return imdb_fail(e, IMDB_ERR_INVALID, "%s reads no TIMESTAMPTZ literal: it would be read in a session's zone", w);
     }
@@ -4766,10 +4823,10 @@ static int chk_compile_ex(const imdb_schema *s, const char *const *text, const u
         }
         size_t lt = 0; /* the string literals' bytes, the compiled checks' own: the binder's go with xfree */
         for (uint16_t k = 1; !rc && k <= st->nex; k++)
-            if (st->ex[k].op == EX_LIT && c->xn[k].k.type == IMDB_T_TEXT && !c->xn[k].k.null) lt += c->xn[k].k.len;
+            if (st->ex[k].op == EX_LIT && imdb_type_bytes(c->xn[k].k.type) && !c->xn[k].k.null) lt += c->xn[k].k.len;
         if (!rc && !(c->lits = imdb_alloc(lt ? lt : 1, e))) rc = e->code;
         for (uint16_t k = 1, o2 = 0; !rc && k <= st->nex; k++)
-            if (st->ex[k].op == EX_LIT && c->xn[k].k.type == IMDB_T_TEXT && !c->xn[k].k.null) {
+            if (st->ex[k].op == EX_LIT && imdb_type_bytes(c->xn[k].k.type) && !c->xn[k].k.null) {
                 if (c->xn[k].k.len) memcpy(c->lits + o2, c->xn[k].k.s, c->xn[k].k.len);
                 c->xn[k].k.s = c->lits + o2;
                 o2 = (uint16_t)(o2 + c->xn[k].k.len);
@@ -4885,7 +4942,7 @@ int imdb_gen_compute(imdb_db *db, imdb_table *t, imdb_value *vals, struct imdb_x
 static bool gen_same(const imdb_value *a, const imdb_value *b)
 {
     if (a->null || b->null) return a->null == b->null;
-    if (a->type == IMDB_T_TEXT) return a->len == b->len && (!a->len || !memcmp(a->s, b->s, a->len));
+    if (imdb_type_bytes(a->type)) return a->len == b->len && (!a->len || !memcmp(a->s, b->s, a->len));
     return a->i == b->i;
 }
 
@@ -5108,7 +5165,7 @@ int imdb_gen_eval_text(const imdb_schema *s, uint16_t c, uint64_t genmask, const
         memset(&vals[r], 0, sizeof vals[r]);
         if (imdb_x_eval(&cc->st, cc->xn, cc->st.ex[cc->st.items[0].expr].l, rows + (size_t)r * s->ncols, NULL, &env, &v, &e2)) out[r] = 1;
         else out[r] = imdb_x_assign(&s->cols[c], &v, &vals[r], &e2) ? 2 : 0;
-        if (!out[r] && vals[r].type == IMDB_T_TEXT && !vals[r].null && vals[r].len) { /* a literal's bytes are the compiled set's */
+        if (!out[r] && imdb_type_bytes(vals[r].type) && !vals[r].null && vals[r].len) { /* a literal's bytes are the compiled set's */
             uint8_t *p = imdb_xarena_alloc(ar, vals[r].len, e);
             if (!p) {
                 imdb_check_free(cc);
@@ -5396,7 +5453,7 @@ enum { JOIN_CHUNK = 1u << 16 }; /* more than IMDB_MAX_TEXT: a chunk holds any va
 static bool join_key(const imdb_value *v, imdb_value *k)
 {
     if (v->null) return false;
-    *k = v->type == IMDB_T_TEXT ? *v : (imdb_value){.type = IMDB_T_INT64, .i = v->i};
+    *k = imdb_type_bytes(v->type) ? *v : (imdb_value){.type = IMDB_T_INT64, .i = v->i};
     return true;
 }
 
@@ -5526,7 +5583,7 @@ static void join_need(jctx *j)
 /* a kept TEXT value's bytes, copied: what a read path hands a sink need not outlive the row */
 static int join_keep_text(jctx *j, imdb_value *v, imdb_err *e)
 {
-    if (v->type != IMDB_T_TEXT || v->null || !v->len) return IMDB_OK;
+    if (!imdb_type_bytes(v->type) || v->null || !v->len) return IMDB_OK;
     if (!j->nchunks || v->len > JOIN_CHUNK - j->chunk_used) {
         /* charged whole: under a result cap below 64 KiB (a memory budget below 256 KiB), a join
          * that keeps any TEXT is refused */
@@ -5667,7 +5724,7 @@ static void join_build_row(sink *k, uint64_t vid, const imdb_value *vals)
     if (li) {
         l = (uint32_t)*li;
     } else {
-        if (join_charge(j, sizeof(imdb_hslot) + sizeof(imdb_vlist) + (key.type == IMDB_T_TEXT ? key.len : 0), k->e)) {
+        if (join_charge(j, sizeof(imdb_hslot) + sizeof(imdb_vlist) + (imdb_type_bytes(key.type) ? key.len : 0), k->e)) {
             k->err = k->e->code;
             return;
         }
@@ -5784,7 +5841,7 @@ static void join_outer_row(sink *k, uint64_t vid, const imdb_value *vals)
     if (!v->null) {
         bpred *b = &j->probe.p[j->kp];
         b->a = *v; /* the outer row's own bytes: read only while it is the row being probed for */
-        if (b->type != IMDB_T_TEXT) b->lo = b->hi = v->i;
+        if (!imdb_type_bytes(b->type)) b->lo = b->hi = v->i;
         j->ovid = vid;
         j->ovals = vals;
         j->inner->err = 0;
@@ -5876,7 +5933,7 @@ static int join_hash_plan(jctx *j, qspec q[2], int build, const int path[2], imd
     j->build = build;
     join_need(j);
     uint8_t kt = j->nkey != 1 ? (j->nkey ? IMDB_T_TEXT : IMDB_T_INT64) /* P2 S3: encoded pairs; CROSS's one key */
-                              : j->t[build]->s.cols[j->key[build]].type == IMDB_T_TEXT ? IMDB_T_TEXT : IMDB_T_INT64;
+                              : imdb_type_bytes(j->t[build]->s.cols[j->key[build]].type) ? IMDB_T_TEXT : IMDB_T_INT64;
     if (imdb_hmap_init(&j->map, kt, e)) return e->code;
     sink kb, kp;
     memset(&kb, 0, sizeof kb);
@@ -6107,7 +6164,7 @@ static int plan_join_sink(xctx *x, const sql_stmt *st, jctx *j, sink *k, imdb_er
         if (st->star) return imdb_fail(e, IMDB_ERR_INVALID, "SELECT * cannot be grouped");
         k->mode = SINK_GROUP;
         k->gcol = gcol;
-        uint8_t kt = k->gen || j->ct->s.cols[gcol].type == IMDB_T_TEXT ? IMDB_T_TEXT : IMDB_T_INT64;
+        uint8_t kt = k->gen || imdb_type_bytes(j->ct->s.cols[gcol].type) ? IMDB_T_TEXT : IMDB_T_INT64;
         if (imdb_hmap_init(&k->gmap, kt, e)) return e->code;
     } else if (any_agg) {
         if (any_plain) return imdb_fail(e, IMDB_ERR_INVALID, "mixing aggregates and columns needs GROUP BY");
@@ -8118,8 +8175,10 @@ static int write_row(xctx *x, const sql_stmt *st, imdb_table *t, imdb_value *val
 typedef struct seqfill {
     uint16_t n;
     uint16_t col[IMDB_MAX_COLS];
-    uint32_t seq[IMDB_MAX_COLS];
+    uint32_t seq[IMDB_MAX_COLS];                /* a sequence's id, or SEQFILL_UUID (F3d: a UUID drawn) */
+    uint8_t uuid[IMDB_MAX_COLS][IMDB_UUID_LEN]; /* F3d: by column, a drawn UUID's bytes, alive until its row is written */
 } seqfill;
+#define SEQFILL_UUID UINT32_MAX
 
 /* column c's write default a sequence's (its id in *seq); *always: a GENERATED ALWAYS identity */
 static bool col_seq(const imdb_table *t, uint16_t c, uint32_t *seq, bool *always)
@@ -8128,9 +8187,15 @@ static bool col_seq(const imdb_table *t, uint16_t c, uint32_t *seq, bool *always
     if (!t->hist.nvers) return false;
     const imdb_tcol *tc = &t->hist.tcol[t->hist.vers[t->hist.nvers - 1].pos[c]];
     *always = tc->cclock == IMDB_DEFK_IDENTITY_ALWAYS;
-    if (tc->wclock < IMDB_DEFK_IDENTITY_ALWAYS) return false;
+    if (tc->wclock < IMDB_DEFK_IDENTITY_ALWAYS || tc->wclock > IMDB_DEFK_NEXTVAL) return false; /* F3d: kind 10 is no sequence */
     *seq = tc->wseq;
     return true;
+}
+
+/* F3d: column c's write default gen_random_uuid() */
+static bool col_uuid(const imdb_table *t, uint16_t c)
+{
+    return t->hist.nvers && t->hist.tcol[t->hist.vers[t->hist.nvers - 1].pos[c]].wclock == IMDB_DEFK_RANDOM_UUID;
 }
 
 static void seqfill_add(seqfill *f, const imdb_table *t, uint16_t c)
@@ -8140,14 +8205,23 @@ static void seqfill_add(seqfill *f, const imdb_table *t, uint16_t c)
     if (col_seq(t, c, &s, &al)) {
         f->col[f->n] = c;
         f->seq[f->n++] = s;
+    } else if (col_uuid(t, c)) {
+        f->col[f->n] = c;
+        f->seq[f->n++] = SEQFILL_UUID;
     }
 }
 
 static int x_nextval(xctx *x, imdb_sequence *s, int64_t *v, imdb_err *e);
 
-static int seq_fill(xctx *x, const seqfill *f, imdb_value *vals, imdb_err *e)
+static int seq_fill(xctx *x, seqfill *f, imdb_value *vals, imdb_err *e)
 {
     for (uint16_t k = 0; f && k < f->n; k++) {
+        if (f->seq[k] == SEQFILL_UUID) { /* F3d: a UUID drawn for this row, in the filler's own bytes */
+            uint8_t *u = f->uuid[f->col[k]];
+            if (imdb_uuid_v4(u, e)) return e->code;
+            vals[f->col[k]] = (imdb_value){.type = IMDB_T_UUID, .s = u, .len = IMDB_UUID_LEN};
+            continue;
+        }
         int64_t v;
         if (f->seq[k] >= x->db->nseqs) return imdb_fail(e, IMDB_ERR_STATE, "a column's sequence is gone");
         if (x_nextval(x, &x->db->seqs[f->seq[k]], &v, e)) return e->code;
@@ -8160,7 +8234,7 @@ static int seq_fill(xctx *x, const seqfill *f, imdb_value *vals, imdb_err *e)
  * INSERT reading its own table never reads its own rows), each assigned to its column by position as UPDATE's SET
  * assigns (exact, or refused) */
 static int insert_query(xctx *x, const sql_stmt *st, imdb_table *t, const int *map, uint16_t width, imdb_value *vals,
-                        const seqfill *f, ups *u, imdb_result *r, imdb_err *e)
+                        seqfill *f, ups *u, imdb_result *r, imdb_err *e)
 {
     imdb_result q;
     imdb_result_init(&q);
@@ -8209,7 +8283,7 @@ static int col_default(imdb_xenv *env, const imdb_table *t, uint16_t c, imdb_val
     *v = (imdb_value){.type = col->type, .scale = col->scale, .null = true};
     if (!t->hist.nvers) return IMDB_OK;
     const imdb_tcol *tc = &t->hist.tcol[t->hist.vers[t->hist.nvers - 1].pos[c]];
-    if (tc->wclock >= IMDB_DEFK_IDENTITY_ALWAYS) { /* F2a-2: the row's sequence value, given by seq_fill */
+    if (tc->wclock >= IMDB_DEFK_IDENTITY_ALWAYS) { /* F2a-2: the row's sequence value, given by seq_fill (F3d: or a drawn UUID) */
         v->null = false;
         v->i = 0;
         return IMDB_OK;
@@ -8297,6 +8371,9 @@ static int exec_insert(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
                     int64_t sv;
                     if (x_nextval(x, &x->db->seqs[sq], &sv, e)) return e->code;
                     vals[map[i]] = (imdb_value){.type = IMDB_T_INT64, .i = sv};
+                } else if (col_uuid(t, (uint16_t)map[i])) { /* F3d: drawn for this row */
+                    if (imdb_uuid_v4(f.uuid[map[i]], e)) return e->code;
+                    vals[map[i]] = (imdb_value){.type = IMDB_T_UUID, .s = f.uuid[map[i]], .len = IMDB_UUID_LEN};
                 }
                 if (vals[map[i]].null && !(c->flags & IMDB_COL_NULLABLE) && !imdb_col_generated(t, (uint16_t)map[i]))
                     return imdb_fail(e, IMDB_ERR_CONSTRAINT, "row %u: column %s needs a value: it is NOT NULL", row + 1, c->name);
@@ -8404,6 +8481,16 @@ static int copy_value(const imdb_column *col, const char *s, uint32_t n, bool qu
         v->len = n;
         return IMDB_OK;
     }
+    case IMDB_T_UUID: /* F3d: the text forms; the bytes in the statement's arena until the record is written */
+    case IMDB_T_BYTEA: {
+        size_t m = col->type == IMDB_T_UUID ? IMDB_UUID_LEN : n >= 2 ? (n - 2) / 2 : 0, got = IMDB_UUID_LEN;
+        uint8_t *p = env && env->arena ? imdb_xarena_alloc(env->arena, m ? m : 1, e) : NULL;
+        if (!p) return env && env->arena ? e->code : imdb_fail(e, IMDB_ERR_STATE, "COPY: no statement memory");
+        if (col->type == IMDB_T_UUID ? imdb_parse_uuid(s, n, p, e) : imdb_parse_bytea(s, n, p, m, &got, e)) return e->code;
+        v->s = p;
+        v->len = (uint32_t)got;
+        return IMDB_OK;
+    }
     default:
         return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "COPY of a column of this type");
     }
@@ -8466,6 +8553,7 @@ static int exec_copy_from(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err 
             skipped++;
             continue;
         }
+        imdb_xmark fm = imdb_xarena_mark(&x->arena); /* F3d: a UUID's or BYTEA's bytes live until the record is written */
         for (uint16_t i = 0; i < width && !rc; i++) {
             const imdb_column *col = &t->s.cols[map[i]];
             imdb_err e2 = {0};
@@ -8475,7 +8563,7 @@ static int exec_copy_from(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err 
         if (rc) break;
         uint8_t salt[16];
         imdb_err e2 = {0};
-        imdb_xmark gm = imdb_xarena_mark(&x->arena); /* F2c: a computed TEXT lives until the record is written */
+        imdb_xmark gm = fm; /* F2c: a computed TEXT lives until the record is written (F3d: the fields' bytes too) */
         rc = seq_fill(x, &f, vals, &e2) || (t->hist.ngen && imdb_gen_compute(x->db, t, vals, &x->arena, &e2)) ||
                      imdb_salt_next(&x->salts, salt, &e2) || imdb_insert_salt(x->db, t, vals, salt, &e2)
                  ? e2.code
@@ -8931,6 +9019,7 @@ typedef struct fkwork {
 static int fk_set_child(xctx *x, imdb_table *c, uint64_t vid, const imdb_fk *f, bool to_default, imdb_err *e)
 {
     imdb_value vals[IMDB_MAX_COLS];
+    uint8_t ub[IMDB_MAX_KEY_COLS][IMDB_UUID_LEN]; /* F3d: a drawn DEFAULT's bytes, until the row is written */
     imdb_xmark m = imdb_xarena_mark(&x->arena);
     int rc = fetch_row(x, c, vid, vals, e);
     const imdb_sver *cur = &c->hist.vers[c->hist.nvers - 1];
@@ -8945,6 +9034,9 @@ static int fk_set_child(xctx *x, imdb_table *c, uint64_t vid, const imdb_fk *f, 
         if (col_seq(c, (uint16_t)col, &sq, &always))
             rc = imdb_fail(e, IMDB_ERR_UNSUPPORTED, "foreign key %s: ON DELETE SET DEFAULT of column %s, whose default is a "
                            "sequence's: a later step", f->name, c->s.cols[col].name);
+        else if (col_uuid(c, (uint16_t)col)) { /* F3d: drawn, as an INSERT's */
+            if (!(rc = imdb_uuid_v4(ub[i], e))) vals[col] = (imdb_value){.type = IMDB_T_UUID, .s = ub[i], .len = IMDB_UUID_LEN};
+        }
         else
             rc = col_default(&x->env, c, (uint16_t)col, &vals[col], e);
     }
@@ -9943,7 +10035,7 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
     x.env.now_us = ss->txn.open ? ss->txn.begin_us : imdb_now_us(); /* F2a: the transaction's start, or this statement's */
     x.env.has_now = true;
     x.env.seqfn = xenv_seqfn; /* F2a-2 */
-    x.noxc = st->seq_write;
+    x.noxc = st->seq_write || st->rand_call; /* F3d: gen_random_uuid draws at each call: one plan */
     x.env.zone_get = xenv_zone;
     imdb_db *db = ss->db;
     uint64_t seq_before = db->seq;
@@ -10075,7 +10167,7 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
                     cd[ncd++] = (imdb_coldef){.col = c, .kind = k, .text = x.sql + st->cdef[c].off, .tlen = st->cdef[c].len};
                 continue;
             }
-            if (k >= IMDB_DEFK_IDENTITY_ALWAYS) { /* F2a-2: an IDENTITY's own sequence (made first: op 24 before the CREATE), or
+            if (k >= IMDB_DEFK_IDENTITY_ALWAYS && k <= IMDB_DEFK_NEXTVAL) { /* F2a-2: an IDENTITY's own sequence (made first: op 24 before the CREATE), or
                                                      * nextval of a named one */
                 uint32_t sid = 0;
                 if (col->type != IMDB_T_INT64) {
@@ -10152,6 +10244,9 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
             if (o.acol.type == IMDB_T_DECIMAL &&
                 (o.acol.precision < 1 || o.acol.precision > 18 || o.acol.scale > o.acol.precision))
                 rc = imdb_fail(e, IMDB_ERR_INVALID, "column %s: DECIMAL(p,s) needs 1<=p<=18, 0<=s<=p", o.acol.name);
+            else if (st->has_alter_def && st->alter_clock == IMDB_DEFK_RANDOM_UUID) /* F3d: PostgreSQL draws one a row there */
+                rc = imdb_fail(e, IMDB_ERR_UNSUPPORTED, "ADD COLUMN %s ... DEFAULT gen_random_uuid() would give every row there one "
+                               "value: ADD the column, then UPDATE it, then SET DEFAULT gen_random_uuid()", o.acol.name);
             else if (st->has_alter_def && st->alter_clock && !imdb_defk_fits(st->alter_clock, o.acol.type))
                 rc = imdb_fail(e, IMDB_ERR_INVALID, "column %s: its DEFAULT's clock value is not of its type", o.acol.name);
             else if (st->has_alter_def && st->alter_clock) { /* F2a: the rows before it read the clock's value now */
@@ -10242,8 +10337,10 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
         if (!rc) snprintf(r->status, sizeof r->status, "DROP TABLE %s", st->table);
         break;
     }
-    case ST_CREATE_VIEW: /* P2 S7; F2a-2: a view's text calls no nextval or setval (a read of it would write) */
+    case ST_CREATE_VIEW: /* P2 S7; F2a-2: a view's text calls no nextval or setval (a read of it would write); F3d: nor
+                         * gen_random_uuid (a statement reading the view could not know to run one plan) */
         rc = st->seq_write ? imdb_fail(e, IMDB_ERR_UNSUPPORTED, "a view's query calls no nextval or setval")
+           : st->rand_call ? imdb_fail(e, IMDB_ERR_UNSUPPORTED, "a view's query calls no gen_random_uuid")
                            : exec_create_view(&x, st, r, e);
         break;
     case ST_DROP_VIEW: rc = exec_drop_view(&x, st, r, e); break;
@@ -10596,7 +10693,7 @@ static int xval_param(const imdb_xval *v, imdb_value *out, imdb_err *e)
     out->scale = v->scale;
     out->null = v->null;
     if (v->null) return IMDB_OK; /* NULL has no payload to convert. */
-    if (v->type == IMDB_T_TEXT) out->s = v->s, out->len = v->len;
+    if (imdb_type_bytes(v->type)) out->s = v->s, out->len = v->len;
     else if (v->type == IMDB_T_FLOAT64) out->i = imdb_f64_key(v->f);
     else if (v->i < INT64_MIN || v->i > INT64_MAX) return imdb_fail(e, IMDB_ERR_LIMIT, "a value past 18 digits");
     else out->i = (int64_t)v->i;
@@ -10943,7 +11040,7 @@ void imdb_result_render(const imdb_result *r, bool csv, imdb_buf *out)
             const imdb_cell *cell = &r->cells[i * nc + c];
             cell_text(cell, &tmp, true);
             size_t dw = disp_width(tmp.p, tmp.len);
-            bool right = !cell->null && cell->v.type != IMDB_T_TEXT && cell->v.type != IMDB_T_TIMESTAMP &&
+            bool right = !cell->null && !imdb_type_bytes(cell->v.type) && cell->v.type != IMDB_T_TIMESTAMP &&
                          cell->v.type != IMDB_T_TIMESTAMPTZ && cell->v.type != IMDB_T_DATE && cell->v.type != IMDB_T_TIME;
             imdb_buf_put_str(out, c ? " | " : " ");
             if (right)
