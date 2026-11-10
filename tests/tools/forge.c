@@ -195,6 +195,42 @@ static void redact_one(void *ctx, const uint8_t *f, size_t fl)
     imdb_commit_free(&c);
 }
 
+/* F2b-2's fk-erase lies: the payload of one version (an INSERT's vid, an UPDATE's new_vid) redacted, the rest as it was,
+ * as the writer's redaction leaves a segment after an ERASE */
+struct redact_ver {
+    imdb_buf *out;
+    uint32_t table;
+    uint64_t vid;
+    int hits;
+};
+
+static void redact_ver_one(void *ctx, const uint8_t *f, size_t fl)
+{
+    struct redact_ver *x = ctx;
+    imdb_commit_rec c;
+    imdb_err e = {0};
+    if (imdb_frame_decode_body(f + IMDB_FRAME_HDR, fl - IMDB_FRAME_HDR, &c, &e)) die("decode", &e);
+    bool any = false;
+    for (uint32_t i = 0; i < c.nops; i++) {
+        imdb_op *o = &c.ops[i];
+        if (!imdb_op_has_payload(o->code) || o->pkind != IMDB_PAYLOAD_ROW || o->table != x->table) continue;
+        if ((o->code == IMDB_OP_INSERT ? o->vid : o->new_vid) != x->vid) continue;
+        o->pkind = IMDB_PAYLOAD_REDACTED;
+        any = true;
+        x->hits++;
+    }
+    if (any) {
+        imdb_buf pay;
+        imdb_buf_init(&pay);
+        imdb_commit_encode_payload(&c, &pay);
+        imdb_frame_build(f + IMDB_FRAME_HDR + IMDB_BODY_DESC, c.hlen, c.seq, c.hash, c.sig, pay.p, pay.len, x->out);
+        imdb_buf_free(&pay);
+    } else {
+        imdb_buf_put(x->out, f, fl);
+    }
+    imdb_commit_free(&c);
+}
+
 static int obj_rename(int ofd, const char *old, const uint8_t *b, size_t n, const char *ext, char *newname)
 {
     uint8_t h[32];
@@ -944,9 +980,10 @@ static void manifest_lie(const char *dir, const char *kind)
         imdb_buf_put(&nb, man, mn);
         uint16_t c = m.t[m.nt - 1].s.ncols; /* the last index's column, little endian, before the three u64, F1's u32 and
                                              * F2a's u16 (manifest 9: version 1's DEFAULTs, none) */
-        nb.p[nb.len - 194] = (uint8_t)c; /* then F2b-1's u16 (manifest 11: version 1's CHECKs, none), the views section
-                                          * (12 + a count of 0) and the nine empty ones (16 each) */
-        nb.p[nb.len - 193] = (uint8_t)(c >> 8);
+        nb.p[nb.len - 196] = (uint8_t)c; /* then F2b-1's u16 (manifest 11: version 1's CHECKs, none), F2b-2's u16
+                                          * (manifest 13: its FOREIGN KEYs, none), the views section (12 + a count of 0)
+                                          * and the nine empty ones (16 each) */
+        nb.p[nb.len - 195] = (uint8_t)(c >> 8);
     } else if (strcmp(kind, "section") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION && mn > 144 + 144) {
         imdb_buf_put(&nb, man, mn); /* the format design's slice 1: the nine reserved sections end it, 16 bytes each */
         nb.p[nb.len - 116] = 1;     /* the enums section's u32 count: a later format's (F2a-2: the sequences section, 3, is read now) */
@@ -992,6 +1029,16 @@ static void manifest_lie(const char *dir, const char *kind)
         if (!at) exit(1);
         int64_t inc = (int64_t)imdb_get_le64(nb.p + at + 1);
         imdb_le64(nb.p + at + 33, imdb_get_le64(nb.p + at + 33) + (uint64_t)inc);
+    } else if (strcmp(kind, "fk-def") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION) {
+        /* F2b-2: version 1's FOREIGN KEY c_pid_fkey (manifest 13: u8 10, the name, u8 1, u16 1, u32 0, u16 0, then ON
+         * DELETE 2 CASCADE) made 0 NO ACTION: a valid definition, another than the log's */
+        imdb_buf_put(&nb, man, mn);
+        static const uint8_t pat[] = {10, 'c', '_', 'p', 'i', 'd', '_', 'f', 'k', 'e', 'y', 1, 1, 0, 0, 0, 0, 0, 0, 0, IMDB_FK_CASCADE};
+        size_t at = 0;
+        for (size_t i = 0; i + sizeof pat <= mn && !at; i++)
+            if (memcmp(nb.p + i, pat, sizeof pat) == 0) at = i + sizeof pat - 1;
+        if (!at) exit(1);
+        nb.p[at] = IMDB_FK_NO_ACTION;
     } else if (strcmp(kind, "gen-text") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION) {
         /* F2c: version 1's generated column w (manifest 12, op 23's kind 9 among the DEFAULTs: u16 column 2, u8 9, u32 5,
          * "a * 2") made "a * 3": a text that binds, another than the log's */
@@ -1027,7 +1074,7 @@ static void manifest_lie(const char *dir, const char *kind)
               " one not empty) | nsections (ten) | order (a reserved one out of order) | later (the last one a later"
               " format's, longer) | keylist (table 0's key list another column) | default (an added column n's DEFAULT"
               " another in the history) | create-default (a CREATE's DEFAULT 77 of column 2 another) | seq-state (fu_seq's last on)"
-              " | check-text (z_a_check's 'a > 0' another) | gen-text (w's 'a * 2' another)\n", stderr);
+              " | check-text (z_a_check's 'a > 0' another) | gen-text (w's 'a * 2' another) | fk-def (c_pid_fkey's CASCADE another)\n", stderr);
         exit(1);
     }
     if (nb.err) exit(1);
@@ -1362,6 +1409,157 @@ static void index_lie(const char *dir, const char *kind)
         append_commit_digest(dir, db, &op, 1, &sg, NULL, dg);
         imdb_close(db);
         return;
+    } else if (strcmp(kind, "fk-orphan") == 0) {
+        /* F2b-2: an INSERT into the last table of a live row's values under a new INT64 key, its INT64 column pid 999
+         * (no parent holds it), its digest right */
+        imdb_table *t = db->t[db->nt - 1];
+        uint64_t src = IMDB_NONE;
+        int64_t maxpk = 0;
+        for (uint64_t vid = imdb_v_next(t, 0); vid < t->nver; vid = imdb_v_next(t, vid + 1)) {
+            imdb_value k;
+            if (imdb_vh(t, vid)->end != IMDB_LIVE || imdb_version_key(t, vid, t->s.key[0], &k) != IMDB_OK) continue;
+            if (src == IMDB_NONE) src = vid;
+            if (k.i > maxpk) maxpk = k.i;
+        }
+        imdb_value vals[IMDB_MAX_COLS];
+        imdb_err e = {0};
+        int pc = imdb_schema_col(&t->s, "pid");
+        if (src == IMDB_NONE || pc < 0 || t->s.npk != 1 || imdb_version_values(db, t, src, vals, &e)) {
+            fputs("imdb-forge: index-lie fk-orphan needs a live row and an INT64 column pid in the last table\n", stderr);
+            exit(1);
+        }
+        vals[t->s.key[0]].i = maxpk + 1;
+        vals[pc].null = false;
+        vals[pc].i = 999;
+        static imdb_buf row;
+        imdb_buf_init(&row);
+        if (imdb_row_encode(&t->s, vals, &row, &e) || imdb_buf_check(&row, &e)) die("row", &e);
+        memset(op.salt, 0x5e, sizeof op.salt);
+        op.code = IMDB_OP_INSERT;
+        op.table = t->s.id;
+        op.vid = t->nver;
+        op.pkind = IMDB_PAYLOAD_ROW;
+        op.row = row.p;
+        op.row_len = (uint32_t)row.len;
+        op.iname = NULL;
+        imdb_row_commit(t->s.id, op.salt, row.p, row.len, op.commit);
+        imdb_lthash g = db->global;
+        imdb_lthash_add_commit(db->meta.digest_alg, &g, op.commit);
+        uint8_t dg[32];
+        imdb_lthash_digest(db->meta.digest_alg, &g, dg);
+        append_commit_digest(dir, db, &op, 1, &sg, NULL, dg);
+        imdb_close(db);
+        return;
+    } else if (strcmp(kind, "fk-delete") == 0) {
+        /* F2b-2: a DELETE of table 0's first live row (a parent a live child references), its digest right */
+        imdb_table *t = db->t[0];
+        uint64_t src = IMDB_NONE;
+        for (uint64_t vid = imdb_v_next(t, 0); vid < t->nver && src == IMDB_NONE; vid = imdb_v_next(t, vid + 1))
+            if (imdb_vh(t, vid)->end == IMDB_LIVE) src = vid;
+        const uint8_t *oc = NULL;
+        imdb_err e = {0};
+        if (src == IMDB_NONE || imdb_v_commit(t, src, &oc, &e)) {
+            fputs("imdb-forge: index-lie fk-delete needs a live row in table 0\n", stderr);
+            exit(1);
+        }
+        op.code = IMDB_OP_DELETE;
+        op.table = t->s.id;
+        op.vid = src;
+        memcpy(op.commit, oc, 32);
+        op.iname = NULL;
+        imdb_lthash g = db->global;
+        imdb_lthash_sub_commit(db->meta.digest_alg, &g, op.commit);
+        uint8_t dg[32];
+        imdb_lthash_digest(db->meta.digest_alg, &g, dg);
+        append_commit_digest(dir, db, &op, 1, &sg, NULL, dg);
+        imdb_close(db);
+        return;
+    } else if (strcmp(kind, "fk-erase-other") == 0 || strcmp(kind, "fk-erase-named") == 0) {
+        /* F2b-2: one commit of a DELETE of table 0's first live row (a parent a live child references) and an ERASE
+         * that names that row (-named: the ERASE's own delete, which no parent check refuses) or the last table's first
+         * ended version (-other: the delete is not the ERASE's, so the parent check stands). Made as the writer makes
+         * one: the ERASE's manifest planned over the commit's DELETE (imdb_lake_plan_erase reads the pending ops; every
+         * publish flushes the memtable, so the deleted row's end is the commit's while it plans), the digest right, and
+         * the erased version's payload redacted in the log afterwards (each verifier wants an erasure complete) */
+        bool named = kind[9] == 'n';
+        imdb_table *t = db->t[0], *xt = named ? t : db->t[db->nt - 1];
+        uint64_t live = IMDB_NONE, ended = IMDB_NONE;
+        for (uint64_t vid = imdb_v_next(t, 0); vid < t->nver && live == IMDB_NONE; vid = imdb_v_next(t, vid + 1))
+            if (imdb_vh(t, vid)->end == IMDB_LIVE) live = vid;
+        for (uint64_t vid = imdb_v_next(xt, 0); !named && vid < xt->nver && ended == IMDB_NONE; vid = imdb_v_next(xt, vid + 1))
+            if (imdb_vh(xt, vid)->end != IMDB_LIVE && !(imdb_vh(xt, vid)->flags & IMDB_V_STUB)) ended = vid;
+        const uint8_t *cm = NULL;
+        uint8_t lc[32], ec[32];
+        imdb_err e = {0};
+        if (live == IMDB_NONE || (!named && ended == IMDB_NONE) || imdb_v_commit(t, live, &cm, &e)) {
+            fputs("imdb-forge: index-lie fk-erase-* needs a live row in table 0 (and, for -other, an ended version in the "
+                  "last table)\n", stderr);
+            exit(1);
+        }
+        memcpy(lc, cm, 32);
+        if (!named) {
+            if (imdb_v_commit(xt, ended, &cm, &e)) die("commitment", &e);
+            memcpy(ec, cm, 32);
+        }
+        imdb_op ops[2];
+        memset(ops, 0, sizeof ops);
+        ops[0].code = IMDB_OP_DELETE;
+        ops[0].table = t->s.id;
+        ops[0].vid = live;
+        memcpy(ops[0].commit, lc, 32);
+        imdb_erase_ent ent;
+        memset(&ent, 0, sizeof ent);
+        ent.table = xt->s.id;
+        ent.vid = named ? live : ended;
+        memcpy(ent.commit, named ? lc : ec, 32);
+        uint64_t ebegin = imdb_vh(xt, ent.vid)->begin;
+        imdb_op *stx = db->tx;
+        uint32_t sntx = db->ntx;
+        db->tx = ops; /* the plan's digests are the commit's, its DELETE pending, as in the writer's ERASE */
+        db->ntx = 1;
+        imdb_vh(t, live)->end = db->seq + 1; /* and the live count the manifest records, as imdb_delete leaves them */
+        t->live--;
+        imdb_rewrite *rw = NULL;
+        uint32_t nrw = 0;
+        uint8_t man[32];
+        int prc = imdb_lake_plan_erase(db, &ent, 1, &rw, &nrw, man, &e);
+        imdb_vh(t, live)->end = IMDB_LIVE;
+        t->live++;
+        db->tx = stx;
+        db->ntx = sntx;
+        if (prc) die("plan", &e);
+        ops[1].code = IMDB_OP_ERASE;
+        memcpy(ops[1].manifest, man, 32);
+        ops[1].erase = &ent;
+        ops[1].n_erase = 1;
+        ops[1].rewrites = rw;
+        ops[1].n_rewrites = nrw;
+        imdb_lthash g = db->global;
+        imdb_lthash_sub_commit(db->meta.digest_alg, &g, lc);
+        uint8_t dg[32];
+        imdb_lthash_digest(db->meta.digest_alg, &g, dg);
+        append_commit_digest(dir, db, ops, 2, &sg, NULL, dg);
+        imdb_free(rw);
+        uint64_t first = db->segs[0]; /* the segment of the erased version's commit: the last to begin at or before it */
+        for (size_t k = 0; k < db->nsegs; k++)
+            if (db->segs[k] <= ebegin) first = db->segs[k];
+        char seg[700];
+        snprintf(seg, sizeof seg, "%s/log/%020llu.ilg", dir, (unsigned long long)first);
+        size_t sn;
+        uint8_t *sb = seg_read(seg, &sn);
+        imdb_buf out;
+        imdb_buf_init(&out);
+        struct redact_ver x = {&out, ent.table, ent.vid, 0};
+        each_frame(sb, sn, redact_ver_one, &x);
+        if (x.hits != 1 || out.err) {
+            fputs("imdb-forge: index-lie fk-erase-*: the erased version's payload is not in one frame\n", stderr);
+            exit(1);
+        }
+        seg_write(seg, out.p, out.len);
+        free(sb);
+        imdb_buf_free(&out);
+        imdb_close(db);
+        return;
     } else if (strcmp(kind, "gen-row") == 0 || strcmp(kind, "gen-update") == 0) {
         /* F2c: a row of the last table whose generated column w holds one more than its expression gives (the test's
          * w GENERATED ALWAYS AS (a * 2)), its digest right: gen-row an INSERT of a live row's values under a new INT64
@@ -1451,7 +1649,9 @@ static void index_lie(const char *dir, const char *kind)
               "pk-dup (a live row in the last table) | alter-view (ADD COLUMN k to table 0) | alter-not-null | "
               "alter-drop-indexed | date-range (a DATE column and an INT64 key in the last table) | varchar-long (a VARCHAR(n <= 200)) | alter-varchar-default | create-default-clock | alter-clock-type (a TEXT column in table 0) | seq-back | seq-drop-owned | "
               "check-add (ADD CHECK forged: a > 100, to table 0) | check-row (a -1 in the last table's column a) | "
-              "gen-row | gen-update (column w one past its expression in the last table)\n", stderr);
+              "gen-row | gen-update (column w one past its expression in the last table) | "
+              "fk-orphan (a child of no parent in the last table) | fk-delete (table 0's first live row) | "
+              "fk-erase-other | fk-erase-named (that DELETE beside an ERASE of an ended version, or of the row itself)\n", stderr);
         exit(1);
     }
     append_commit(dir, db, &op, 1, &sg, NULL);

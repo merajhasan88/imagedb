@@ -815,6 +815,16 @@ typedef struct acdef {
 
 /* F2b-1: a CHECK constraint: its name and its text as written (op 28's list, ALTER kind 11's one, a manifest's
  * version 1), the text its own allocation */
+/* F2b-2: a FOREIGN KEY (docs/fk-design.md; log.h's imdb_fk by its own decoder): its name, its columns by position, the
+ * parent table's id and its key positions in key order, ON DELETE (0 NO ACTION .. 4 SET DEFAULT), ON UPDATE (0, 1) */
+#define MAX_FKS 16u
+typedef struct afk {
+    char name[64];
+    uint8_t ncols, on_delete, on_update;
+    uint16_t cols[8], pcols[8];
+    uint32_t parent;
+} afk;
+
 typedef struct achk {
     char name[64];
     uint32_t len;
@@ -852,6 +862,8 @@ typedef struct op {
     aseq *sd;       /* F2a-2: CREATE_SEQUENCE (24): its definition; 25-27 seq, sval, scalled */
     struct achk *ck; /* F2b-1: TABLE_CHECKS (28): its list; ALTER kind 11: its one (kind 12: aname) */
     uint16_t nck;
+    afk *fk; /* F2b-2: TABLE_FKS (29): its list; ALTER kind 13: its one (kind 14: aname) */
+    uint16_t nfk;
     uint32_t seqid;
     int64_t sval;
     uint8_t scalled;
@@ -881,6 +893,7 @@ static void commit_free(commit *c)
         free(c->ops[i].sd); /* F2a-2 */
         for (uint16_t k = 0; c->ops[i].ck && k < c->ops[i].nck; k++) free(c->ops[i].ck[k].text); /* F2b-1 */
         free(c->ops[i].ck);
+        free(c->ops[i].fk); /* F2b-2 */
     }
     free(c->ops);
     memset(c, 0, sizeof *c);
@@ -1052,16 +1065,67 @@ static int checks_body(rd *hr, bool none_ok, achk **out, uint16_t *n, const char
     return 0;
 }
 
+
+/* F2b-2: one FOREIGN KEY: u8 name length, the name, u8 ncols (1 to 8), each u16 position (each once), u32 parent, each u16
+ * parent position (each once), u8 ON DELETE (0 to 4), u8 ON UPDATE (0 or 1); positions below MAX_COLS (their meaning
+ * apply_op's) */
+static int fk_one(rd *hr, afk *f, const char *what)
+{
+    memset(f, 0, sizeof *f);
+    uint8_t nl = rd_u8(hr);
+    const uint8_t *nm = rd_bytes(hr, nl);
+    if (!hr->bad && (!nm || !ident_ok(nm, nl))) return fail("%s: a bad FOREIGN KEY name", what);
+    if (nm) memcpy(f->name, nm, nl);
+    f->ncols = rd_u8(hr);
+    if (!hr->bad && (!f->ncols || f->ncols > 8)) return fail("%s: a bad FOREIGN KEY", what);
+    if (hr->bad) return 0;
+    for (uint8_t i = 0; i < f->ncols; i++) f->cols[i] = rd_u16(hr);
+    f->parent = rd_u32(hr);
+    for (uint8_t i = 0; i < f->ncols; i++) f->pcols[i] = rd_u16(hr);
+    f->on_delete = rd_u8(hr);
+    f->on_update = rd_u8(hr);
+    if (hr->bad) return 0;
+    bool ok = f->on_delete <= 4 && f->on_update <= 1;
+    for (uint8_t i = 0; ok && i < f->ncols; i++) {
+        ok = f->cols[i] < MAX_COLS && f->pcols[i] < MAX_COLS;
+        for (uint8_t j = 0; ok && j < i; j++) ok = f->cols[j] != f->cols[i] && f->pcols[j] != f->pcols[i];
+    }
+    return ok ? 0 : fail("%s: a bad FOREIGN KEY", what);
+}
+
+/* F2b-2: a list (op 29, a manifest's version 1): u16 n (1 to MAX_FKS; none_ok: 0 too), each one by name strictly
+ * increasing */
+static int fks_body(rd *hr, bool none_ok, afk **out, uint16_t *n, const char *what)
+{
+    *out = NULL;
+    *n = rd_u16(hr);
+    if (hr->bad) return 0;
+    if ((!*n && !none_ok) || *n > MAX_FKS) return fail("%s: a bad count of FOREIGN KEYs", what);
+    if (!*n) return 0;
+    afk *f = xcalloc(*n, sizeof *f);
+    *out = f;
+    for (uint16_t k = 0; k < *n; k++) {
+        if (fk_one(hr, &f[k], what)) return -1;
+        if (hr->bad) return 0;
+        if (k && strcmp(f[k - 1].name, f[k].name) >= 0) return fail("%s: FOREIGN KEYs not by name, each once", what);
+    }
+    return 0;
+}
 static int alter_body(rd *hr, op *o, const char *what)
 {
     o->akind = rd_u8(hr);
-    if (!hr->bad && (o->akind < 1 || o->akind > 12)) return fail("%s: ALTER TABLE of an unknown kind", what);
+    if (!hr->bad && (o->akind < 1 || o->akind > 14)) return fail("%s: ALTER TABLE of an unknown kind", what);
+    if (!hr->bad && o->akind == 13) { /* F2b-2: ADD FK: one FOREIGN KEY */
+        o->fk = xcalloc(1, sizeof *o->fk);
+        o->nfk = 1;
+        return fk_one(hr, o->fk, what);
+    }
     if (!hr->bad && o->akind == 11) { /* F2b-1: ADD CHECK: a CHECK (checks_body's rules, one) */
         o->ck = xcalloc(1, sizeof *o->ck);
         o->nck = 1;
         return check_one(hr, o->ck, what);
     }
-    if (!hr->bad && o->akind == 12) { /* F2b-1: DROP CHECK: its name */
+    if (!hr->bad && (o->akind == 12 || o->akind == 14)) { /* F2b-1: DROP CHECK; F2b-2: DROP FK: its name */
         uint8_t nl = rd_u8(hr);
         const uint8_t *nm = rd_bytes(hr, nl);
         if (!hr->bad && (!nm || !ident_ok(nm, nl))) return fail("%s: bad CHECK name", what);
@@ -1346,6 +1410,16 @@ static int decode_body(const uint8_t *b, size_t n, const meta *m, keys *ks, comm
             if (!hr.bad && checks_body(&hr, false, &o->ck, &o->nck, "header")) return -1;
             break;
         }
+        case 29: { /* TABLE_FKS (F2b-2): u32 table, right after its CREATE_TABLE, SET_RETENTION and any COLUMN_DEFAULTS and TABLE_CHECKS */
+            o->table = rd_u32(&hr);
+            uint32_t at = i;
+            if (at >= 1 && c->ops[at - 1].code == 28 && c->ops[at - 1].table == o->table) at--;
+            if (at >= 1 && c->ops[at - 1].code == 23 && c->ops[at - 1].table == o->table) at--;
+            if (!hr.bad && (at < 2 || c->ops[at - 2].code != 1 || c->ops[at - 2].table != o->table || c->ops[at - 1].code != 16))
+                return fail("header: TABLE_FKS not right after its table's CREATE_TABLE");
+            if (!hr.bad && fks_body(&hr, false, &o->fk, &o->nfk, "header")) return -1;
+            break;
+        }
         case 22: /* ALTER_TABLE (F1): u32 table, its body (alter_body), alone */
             o->table = rd_u32(&hr);
             if (!hr.bad && nops != 1) return fail("header: ALTER TABLE must be the only op");
@@ -1432,6 +1506,8 @@ typedef struct table {
     ver **vc;            /* versions in chunks of 2^16 (chunk 0 grows from 64): one only where a vid held lands */
     uint32_t nchunk;
     uint64_t cap0, n, live; /* chunk 0's room, the vids handed out, the live rows */
+    uint64_t live_nokey;  /* F2b-2: live versions without a row (a payload an ERASE redacted, read before that ERASE): a
+                           * child's parent key missing then is not refuted (its key is unknown) */
     uint64_t floor_n, n_at_lake; /* the vids at the log floor (FLOOR), and at the lake snapshot commit */
     uint32_t nvers_at_lake; /* F1: its schema versions at the lake snapshot commit */
     lt d, d_at_lake;     /* digest now, and at the lake snapshot commit */
@@ -1459,6 +1535,10 @@ typedef struct table {
     struct ab_check *cc[MAX_CHECKS]; /* the live ones bound against the schema now (NULL: not yet, or since an ALTER) */
     struct ab_check *gc[MAX_COLS]; /* F2c: by column of the schema now: a generated one's expression bound (NULL: not yet,
                                       or since an ALTER); its text is cdef[its position], ckind 9 */
+    afk *fk0;                  /* F2b-2: version 1's FOREIGN KEYs (op 29, a manifest's), by name */
+    uint16_t nfk0, nlfk;
+    afk lfk[MAX_FKS];          /* the live ones by name: version 1's and each ADD FK version's, less the dropped */
+    struct ukmap *fkc[MAX_FKS]; /* by live FK: the live rows' keys, each slot's vid a count (NULL: stale, made again) */
 } table;
 
 typedef struct aver { /* F1: rows begun at or after since are encoded under s (its raw bytes its own) */
@@ -1474,6 +1554,7 @@ typedef struct aver { /* F1: rows begun at or after since are encoded under s (i
     uint32_t def_len;
     uint8_t aclock;         /* F2a: kind 10's clock kind, or an ADD's (its write default a clock), else 0 */
     char cname[64];         /* F2b-1: ADD and DROP CHECK's name, ADD CHECK's text (the version's own) */
+    afk afk;                /* F2b-2: ADD FK's definition (DROP FK's name in cname) */
     char *ctext;
     uint32_t clen;
     uint8_t hash[32];       /* SHA-256("IMDBSVR1", raw, each column's position as a u16): a segment names it */
@@ -1545,6 +1626,9 @@ typedef struct state {
     meta m;
     table *t;
     uint32_t nt;
+    struct fkev *fkev;       /* F2b-2: this commit's child versions written and parent keys ended */
+    uint32_t nfkev, capfkev;
+    const struct op *fk_erase_op; /* F2b-2: this commit's ERASE: the deletes it names end no parent key (erasure runs no action) */
     lt glob;
     uint64_t seq, payload_rows, sigs, last_erase;
     uint8_t head[32];
@@ -1861,6 +1945,7 @@ static int alter_next(const aver *cur, const op *o, aver *nv, uint64_t seq, cons
     nv->ctext = NULL; /* F2b-1: the ALTER's own */
     nv->clen = 0;
     nv->cname[0] = 0;
+    memset(&nv->afk, 0, sizeof nv->afk); /* F2b-2: likewise */
     nv->akind = o->akind;
     nv->apos = o->akind == 1 ? (uint16_t)cur->npos : o->apos;
     nv->aclock = o->akind == 1 || o->akind == 10 ? o->aclock : 0; /* F2a */
@@ -1868,7 +1953,7 @@ static int alter_next(const aver *cur, const op *o, aver *nv, uint64_t seq, cons
     const schema *cs = &cur->s;
     unsigned long long sq = (unsigned long long)seq;
     int c = -1;
-    if (o->akind != 1 && o->akind != 3 && o->akind != 11 && o->akind != 12) { /* F2b-1: a CHECK names no position */
+    if (o->akind != 1 && o->akind != 3 && o->akind != 11 && o->akind != 12 && o->akind != 13 && o->akind != 14) { /* F2b-1, F2b-2: a constraint names no position */
         if (o->apos >= cur->npos || cur->at[o->apos] < 0) return fail("commit %llu: ALTER TABLE of no column", sq);
         c = cur->at[o->apos];
     }
@@ -1930,6 +2015,12 @@ static int alter_next(const aver *cur, const op *o, aver *nv, uint64_t seq, cons
         nv->clen = o->ck->len;
         break;
     case 12: /* F2b-1: DROP CHECK */
+        snprintf(nv->cname, sizeof nv->cname, "%s", o->aname);
+        break;
+    case 13: /* F2b-2: ADD FK: catalog state (its rules apply_op's, on the catalog and the rows) */
+        nv->afk = *o->fk;
+        break;
+    case 14: /* F2b-2: DROP FK */
         snprintf(nv->cname, sizeof nv->cname, "%s", o->aname);
         break;
     case 10: /* F2a: SET DEFAULT of a clock its column's type takes */
@@ -1998,12 +2089,14 @@ static bool val_same(const val *a, const val *b, uint8_t ty)
 }
 
 /* version vid ends: its key leaves the unique indexes */
+static void fkc_row(table *t, const val *vals, int delta);
 static void uk_end(table *t, uint64_t vid)
 {
     ver *v = av(t, vid);
     if (!v || !v->row) return;
     val vals[MAX_COLS];
-    if (!decode_held(t, v, vals))
+    if (!decode_held(t, v, vals)) {
+        fkc_row(t, vals, -1); /* F2b-2: its FK keys uncounted */
         for (uint32_t x = 0; x <= t->nidx; x++) { /* the unique indexes, then (x == nidx) the primary key */
             uint8_t *k;
             size_t n;
@@ -2013,6 +2106,7 @@ static void uk_end(table *t, uint64_t vid)
             if (sl && sl->vid == vid) uk_del(ix->uk, sl);
             free(k);
         }
+    }
     free(v->row);
     v->row = NULL;
 }
@@ -2402,6 +2496,311 @@ static int gen_naming(const table *t, const char *ident, int self, const char **
     }
     return 0;
 }
+
+/* ---- F2b-2: FOREIGN KEYs (docs/fk-design.md sections 2 and 5), the auditor's own: each table's live FKs by name, a
+ * count of its live rows by each FK's key, and referential integrity at each commit's end by the versions it wrote and
+ * ended (the actions cannot be told from a user's own writes: integrity is what is checked) ---- */
+
+typedef struct fkev {
+    uint32_t table;
+    bool parent;        /* a parent key ended (k, n), else a child version written */
+    uint64_t vid, old;  /* the child version written; the one it replaced (UINT64_MAX: an insert) */
+    uint8_t *k[MAX_FKS]; /* the parent's key; or the replaced version's key by each live FK (NULL: a NULL in it) */
+    size_t n[MAX_FKS];
+} fkev;
+
+static int lfk_find(const table *t, const char *name)
+{
+    for (uint16_t i = 0; i < t->nlfk; i++)
+        if (!strcmp(t->lfk[i].name, name)) return i;
+    return -1;
+}
+
+static void fkc_free(table *t)
+{
+    for (uint16_t i = 0; i < MAX_FKS; i++) {
+        uk_free(t->fkc[i]);
+        t->fkc[i] = NULL;
+    }
+}
+
+static void lfk_rebuild(table *t)
+{
+    fkc_free(t);
+    t->nlfk = 0;
+    afk all[MAX_FKS * 2];
+    uint16_t n = 0;
+    for (uint16_t i = 0; i < t->nfk0 && n < MAX_FKS; i++) all[n++] = t->fk0[i];
+    for (uint32_t k = 1; k < t->nvers; k++) {
+        const aver *v = &t->vers[k];
+        if (v->akind == 13 && n < MAX_FKS) all[n++] = v->afk;
+        if (v->akind == 14)
+            for (uint16_t i = 0; i < n; i++)
+                if (!strcmp(all[i].name, v->cname)) {
+                    memmove(&all[i], &all[i + 1], (size_t)(n - i - 1) * sizeof *all);
+                    n--;
+                    break;
+                }
+    }
+    for (uint16_t i = 0; i < n; i++) { /* by name */
+        uint16_t at = 0;
+        while (at < t->nlfk && strcmp(t->lfk[at].name, all[i].name) < 0) at++;
+        memmove(&t->lfk[at + 1], &t->lfk[at], (size_t)(t->nlfk - at) * sizeof *t->lfk);
+        t->lfk[at] = all[i];
+        t->nlfk++;
+    }
+}
+
+/* a row's key in FK f, encoded as uk_key encodes the parent's primary key (its columns in key order): false for a
+ * NULL in it (MATCH SIMPLE: not checked) */
+static bool afk_key(const table *t, const afk *f, const val *vals, uint8_t **out, size_t *len)
+{
+    const aver *cur = &t->vers[t->nvers - 1];
+    aidx x;
+    memset(&x, 0, sizeof x);
+    x.ncols = f->ncols;
+    for (uint8_t i = 0; i < f->ncols; i++) {
+        int c = f->cols[i] < cur->npos ? cur->at[f->cols[i]] : -1;
+        if (c < 0) return false;
+        x.cols[i] = (uint16_t)c;
+    }
+    return uk_key(&t->s, vals, &x, out, len);
+}
+
+static void fkc_row(table *t, const val *vals, int delta)
+{
+    for (uint16_t i = 0; i < t->nlfk; i++) {
+        if (!t->fkc[i]) continue; /* stale: made again at its next use */
+        uint8_t *k;
+        size_t n;
+        if (!afk_key(t, &t->lfk[i], vals, &k, &n)) continue;
+        uint64_t h = uk_hash(k, n);
+        ukslot *sl = uk_find(t->fkc[i], k, n, h);
+        if (delta > 0) {
+            if (sl) {
+                sl->vid++;
+                free(k);
+            } else {
+                uk_put(t->fkc[i], k, n, h, 1);
+            }
+        } else {
+            if (sl && --sl->vid == 0) uk_del(t->fkc[i], sl);
+            free(k);
+        }
+    }
+}
+
+/* table t's counts, made again from its live rows where stale */
+static int fkc_ready(table *t)
+{
+    for (uint16_t i = 0; i < t->nlfk; i++) {
+        if (t->fkc[i]) continue;
+        t->fkc[i] = xcalloc(1, sizeof *t->fkc[i]);
+        for (uint64_t vid = av_skip(t, 0); vid < t->n; vid = av_skip(t, vid + 1)) {
+            ver *v = av(t, vid);
+            if (!v || v->end != LIVE || !v->row) continue; /* an erased row blocks nothing */
+            val vals[MAX_COLS];
+            if (decode_held(t, v, vals)) return fail("a live row of table %s does not decode", t->s.name);
+            uint8_t *k;
+            size_t n;
+            if (!afk_key(t, &t->lfk[i], vals, &k, &n)) continue;
+            uint64_t h = uk_hash(k, n);
+            ukslot *sl = uk_find(t->fkc[i], k, n, h);
+            if (sl) {
+                sl->vid++;
+                free(k);
+            } else {
+                uk_put(t->fkc[i], k, n, h, 1);
+            }
+        }
+    }
+    return 0;
+}
+
+static bool afk_parent_live(const state *S, const afk *f, const uint8_t *k, size_t n)
+{
+    if (f->parent >= S->nt || S->t[f->parent].dropped_at || !S->t[f->parent].pkx.uk) return false;
+    /* or not refuted: a live row of the parent's whose key is unknown (erased by a later ERASE) may hold it */
+    return uk_find(S->t[f->parent].pkx.uk, k, n, uk_hash(k, n)) != NULL || S->t[f->parent].live_nokey;
+}
+
+/* the catalog's rules of FK f of table t (its version now), the parent live (or t itself), its key in its order, the
+ * types and a DECIMAL's scale, SET NULL on a nullable column */
+static int afk_def(const state *S, const table *t, uint32_t tid, const afk *f, uint64_t seq)
+{
+    unsigned long long sq = (unsigned long long)seq;
+    const table *p = f->parent == tid ? t : f->parent < S->nt ? &S->t[f->parent] : NULL;
+    if (!p || p->dropped_at) return fail("commit %llu: foreign key %s references no live table", sq, f->name);
+    const aver *cc = &t->vers[t->nvers - 1], *pc = &p->vers[p->nvers - 1];
+    if (p->s.npk != f->ncols) return fail("commit %llu: foreign key %s of %u columns, its parent's key of %d", sq, f->name, f->ncols, p->s.npk);
+    for (uint8_t i = 0; i < f->ncols; i++) {
+        int c = f->cols[i] < cc->npos ? cc->at[f->cols[i]] : -1;
+        int pk = p->s.key[i];
+        if (c < 0) return fail("commit %llu: foreign key %s names a column table %s does not have", sq, f->name, t->s.name);
+        if (f->pcols[i] != pc->pos[pk]) return fail("commit %llu: foreign key %s references another than its parent's key", sq, f->name);
+        const col *a = &t->s.c[c], *b = &p->s.c[pk];
+        if (a->type != b->type || (a->type == T_DECIMAL && a->scale != b->scale))
+            return fail("commit %llu: foreign key %s: column %s of another type than the key column it references", sq, f->name, a->name);
+        if (f->on_delete == 3 && !(a->flags & F_NULLABLE))
+            return fail("commit %llu: foreign key %s: ON DELETE SET NULL of a NOT NULL column", sq, f->name);
+    }
+    return 0;
+}
+
+/* every live row of t referencing a live parent key of f (an ADD FOREIGN KEY) */
+static int afk_rows(const state *S, table *t, const afk *f, uint64_t seq)
+{
+    for (uint64_t vid = av_skip(t, 0); vid < t->n; vid = av_skip(t, vid + 1)) {
+        ver *v = av(t, vid);
+        if (!v || v->end != LIVE || !v->row) continue;
+        val vals[MAX_COLS];
+        if (decode_held(t, v, vals)) return fail("commit %llu: a live row of table %s does not decode", (unsigned long long)seq, t->s.name);
+        uint8_t *k;
+        size_t n;
+        if (!afk_key(t, f, vals, &k, &n)) continue;
+        bool ok = afk_parent_live(S, f, k, n);
+        free(k);
+        if (!ok)
+            return fail("commit %llu: ADD FOREIGN KEY %s of table %s, which a live row violates", (unsigned long long)seq, f->name,
+                        t->s.name);
+    }
+    return 0;
+}
+
+static bool afk_referenced(const state *S, uint32_t pid)
+{
+    for (uint32_t ci = 0; ci < S->nt; ci++)
+        for (uint16_t i = 0; ci != pid && !S->t[ci].dropped_at && i < S->t[ci].nlfk; i++)
+            if (S->t[ci].lfk[i].parent == pid) return true;
+    return false;
+}
+
+/* a live FK of any live table, this one's own included (a tree), references table pid: its ended keys are watched */
+static bool afk_watched(const state *S, uint32_t pid)
+{
+    for (uint32_t ci = 0; ci < S->nt; ci++)
+        for (uint16_t i = 0; !S->t[ci].dropped_at && i < S->t[ci].nlfk; i++)
+            if (S->t[ci].lfk[i].parent == pid) return true;
+    return false;
+}
+
+static fkev *fkev_push(state *S)
+{
+    if (S->nfkev == S->capfkev) {
+        S->capfkev = S->capfkev ? 2 * S->capfkev : 16;
+        S->fkev = xrealloc(S->fkev, S->capfkev, sizeof *S->fkev);
+    }
+    fkev *v = &S->fkev[S->nfkev++];
+    memset(v, 0, sizeof *v);
+    return v;
+}
+
+static void fkev_clear(state *S)
+{
+    for (uint32_t i = 0; i < S->nfkev; i++)
+        for (uint16_t k = 0; k < MAX_FKS; k++) free(S->fkev[i].k[k]);
+    S->nfkev = 0;
+    S->fk_erase_op = NULL;
+}
+
+/* before version vid of t ends (its row still held): a parent key ended; an op 4's old side's keys for its new one */
+static void fkev_end(state *S, table *t, uint32_t tid, uint64_t vid, bool update, uint64_t new_vid)
+{
+    ver *v = av(t, vid);
+    if (!v || !v->row) return;
+    val vals[MAX_COLS];
+    if (decode_held(t, v, vals)) return;
+    if (afk_watched(S, tid)) {
+        fkev *e = fkev_push(S);
+        e->table = tid;
+        e->parent = true;
+        e->vid = vid; /* an ERASE naming it excuses it */
+        uk_key(&t->s, vals, &t->pkx, &e->k[0], &e->n[0]);
+    }
+    if (update && t->nlfk) {
+        fkev *e = fkev_push(S);
+        e->table = tid;
+        e->vid = new_vid;
+        e->old = vid;
+        for (uint16_t i = 0; i < t->nlfk; i++) afk_key(t, &t->lfk[i], vals, &e->k[i], &e->n[i]);
+    }
+}
+
+static void fkev_insert(state *S, table *t, uint32_t tid, uint64_t vid)
+{
+    if (!t->nlfk) return;
+    fkev *e = fkev_push(S);
+    e->table = tid;
+    e->vid = vid;
+    e->old = UINT64_MAX;
+}
+
+/* the ERASE op's entries (strictly sorted by table, then version: the decoder's rule) name this version: its own delete */
+static bool erase_named(const struct op *er, uint32_t tid, uint64_t vid)
+{
+    if (!er) return false;
+    uint32_t lo = 0, hi = er->n_erase;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        const erase_ent *x = &er->erase[mid];
+        if (x->table < tid || (x->table == tid && x->vid < vid)) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < er->n_erase && er->erase[lo].table == tid && er->erase[lo].vid == vid;
+}
+
+/* at the commit's end: every child version written and live, new or with another key than the version before the
+ * commit, has a live parent; every parent key ended with none of its versions live has no live child */
+static int fk_commit_check(state *S, uint64_t seq)
+{
+    unsigned long long sq = (unsigned long long)seq;
+    int rc = 0;
+    for (uint32_t i = 0; i < S->nfkev && !rc; i++) {
+        const fkev *e = &S->fkev[i];
+        table *t = &S->t[e->table];
+        if (e->parent) {
+            if (erase_named(S->fk_erase_op, e->table, e->vid) || !e->k[0] || (t->pkx.uk && uk_find(t->pkx.uk, e->k[0], e->n[0], uk_hash(e->k[0], e->n[0])))) continue;
+            for (uint32_t ci = 0; ci < S->nt && !rc; ci++) {
+                table *c = &S->t[ci];
+                if (c->dropped_at) continue;
+                if ((rc = fkc_ready(c))) break;
+                for (uint16_t q = 0; q < c->nlfk && !rc; q++) {
+                    ukslot *sl = c->lfk[q].parent == e->table ? uk_find(c->fkc[q], e->k[0], e->n[0], uk_hash(e->k[0], e->n[0])) : NULL;
+                    if (sl && sl->vid)
+                        rc = fail("commit %llu: a key of table %s ended while a live row of table %s references it by foreign "
+                                  "key %s", sq, t->s.name, c->s.name, c->lfk[q].name);
+                }
+            }
+            continue;
+        }
+        ver *v = av(t, e->vid);
+        if (!v || v->end != LIVE || !v->row) continue; /* ended again in the commit, or erased */
+        const fkev *a = e; /* back through the commit's own versions to the one before it */
+        for (bool moved = true; moved && a->old != UINT64_MAX;) {
+            moved = false;
+            for (uint32_t j = 0; j < S->nfkev; j++)
+                if (!S->fkev[j].parent && S->fkev[j].table == e->table && S->fkev[j].vid == a->old) {
+                    a = &S->fkev[j];
+                    moved = true;
+                    break;
+                }
+        }
+        val vals[MAX_COLS];
+        if (decode_held(t, v, vals)) return fail("commit %llu: a row of table %s does not decode", sq, t->s.name);
+        for (uint16_t q = 0; q < t->nlfk && !rc; q++) {
+            uint8_t *k;
+            size_t n;
+            if (!afk_key(t, &t->lfk[q], vals, &k, &n)) continue;
+            bool same = a->old != UINT64_MAX && a->k[q] && a->n[q] == n && !memcmp(a->k[q], k, n);
+            if (!same && !afk_parent_live(S, &t->lfk[q], k, n))
+                rc = fail("commit %llu: a row of table %s violates foreign key %s: its parent key is not live", sq, t->s.name,
+                          t->lfk[q].name);
+            free(k);
+        }
+    }
+    fkev_clear(S);
+    return rc;
+}
 static achk *checks_dup(const achk *c, uint16_t n)
 {
     achk *d = xcalloc(n ? n : 1, sizeof *d);
@@ -2497,6 +2896,22 @@ static int apply_op(state *S, const op *o, uint64_t seq)
         live_rebuild(t);
         return 0;
     }
+    if (o->code == 29) { /* TABLE_FKS (F2b-2): its CREATE's, in its commit (the header's rule); each by the catalog's rules */
+        if (o->table >= S->nt || S->t[o->table].created_at != seq)
+            return fail("commit %llu: TABLE_FKS of a table not created there", (unsigned long long)seq);
+        table *t = &S->t[o->table];
+        for (uint16_t k = 0; k < o->nfk; k++) {
+            if (afk_def(S, t, o->table, &o->fk[k], seq)) return -1;
+            if (live_find(t, o->fk[k].name) >= 0)
+                return fail("commit %llu: a FOREIGN KEY named as a CHECK of table %s", (unsigned long long)seq, t->s.name);
+        }
+        free(t->fk0);
+        t->fk0 = xcalloc(o->nfk, sizeof *t->fk0);
+        memcpy(t->fk0, o->fk, (size_t)o->nfk * sizeof *t->fk0);
+        t->nfk0 = o->nfk;
+        lfk_rebuild(t);
+        return 0;
+    }
     if (o->code == 22) { /* ALTER_TABLE (F1): live; its kind's rules on the current version; the next version */
         if (o->table >= S->nt) return fail("commit %llu: ALTER TABLE of an unknown table", (unsigned long long)seq);
         table *t = &S->t[o->table];
@@ -2567,6 +2982,24 @@ static int apply_op(state *S, const op *o, uint64_t seq)
         }
         if (!rc && o->akind == 12 && live_find(t, o->aname) < 0)
             rc = fail("commit %llu: DROP CHECK %s, which table %s does not have", (unsigned long long)seq, o->aname, t->s.name);
+        if (!rc && o->akind == 13) { /* F2b-2: ADD FK: a free name, within the limit, the catalog's rules, every live row */
+            if (live_find(t, o->fk->name) >= 0 || lfk_find(t, o->fk->name) >= 0)
+                rc = fail("commit %llu: ADD FOREIGN KEY of a name table %s has", (unsigned long long)seq, t->s.name);
+            else if (t->nlfk >= MAX_FKS)
+                rc = fail("commit %llu: ADD FOREIGN KEY past table %s's limit", (unsigned long long)seq, t->s.name);
+            else if (!(rc = afk_def(S, t, o->table, o->fk, seq)))
+                rc = afk_rows(S, t, o->fk, seq);
+        }
+        if (!rc && o->akind == 14 && lfk_find(t, o->aname) < 0)
+            rc = fail("commit %llu: DROP FOREIGN KEY %s, which table %s does not have", (unsigned long long)seq, o->aname, t->s.name);
+        for (uint16_t q = 0; !rc && o->akind == 4 && q < t->nlfk; q++) /* F2b-2: DROP COLUMN of an FK's column: RESTRICT */
+            for (uint8_t c = 0; c < t->lfk[q].ncols; c++)
+                if (t->lfk[q].cols[c] == o->apos) {
+                    rc = fail("commit %llu: DROP COLUMN of a column foreign key %s names", (unsigned long long)seq, t->lfk[q].name);
+                    break;
+                }
+        if (!rc && o->akind == 11 && lfk_find(t, o->ck->name) >= 0) /* one name space */
+            rc = fail("commit %llu: ADD CHECK of a name a FOREIGN KEY of table %s has", (unsigned long long)seq, t->s.name);
         if (!rc && (o->akind == 2 || o->akind == 3)) {
             if (view_naming(S, 1, o->table)) /* a rename: RESTRICT, as DROP is */
                 rc = fail("commit %llu: a rename of table %s, which a live view names", (unsigned long long)seq, t->s.name);
@@ -2607,6 +3040,7 @@ static int apply_op(state *S, const op *o, uint64_t seq)
         memcpy(t->s.raw, nv.s.raw, nv.s.rawlen);
         live_rebuild(t); /* F2b-1: the live CHECKs, each bound again against the new schema when a row needs it */
         gen_unbind(t); /* F2c: likewise the generated columns */
+        lfk_rebuild(t); /* F2b-2: the live FOREIGN KEYs (the counts made again at their next use) */
         return 0;
     }
     if (o->code == 19) { /* DROP_TABLE: live, not kept FOREVER (its op 16 first); every live version ends, one by one */
@@ -2616,6 +3050,8 @@ static int apply_op(state *S, const op *o, uint64_t seq)
             return fail("commit %llu: DROP of table %s, dropped already or kept FOREVER", (unsigned long long)seq, t->s.name);
         const aview *n = view_naming(S, 1, o->table); /* P2 S7: RESTRICT */
         if (n) return fail("commit %llu: DROP of table %s, which view %s names", (unsigned long long)seq, t->s.name, n->name);
+        if (afk_referenced(S, o->table)) /* F2b-2: RESTRICT */
+            return fail("commit %llu: DROP of table %s, which a live foreign key references", (unsigned long long)seq, t->s.name);
         for (uint64_t vid = av_skip(t, 0); vid < t->n; vid = av_skip(t, vid + 1)) {
             ver *v = av(t, vid);
             if (!v || v->end != LIVE) continue;
@@ -2627,6 +3063,7 @@ static int apply_op(state *S, const op *o, uint64_t seq)
         }
         if (t->live) return fail("commit %llu: DROP of table %s leaves live rows", (unsigned long long)seq, t->s.name);
         t->dropped_at = seq;
+        t->live_nokey = 0;
         seq_drop_owned(S, o->table, UINT16_MAX, seq); /* F2a-2: its IDENTITYs' sequences */
         return 0;
     }
@@ -2737,6 +3174,8 @@ static int apply_op(state *S, const op *o, uint64_t seq)
             v->stub = true;
         }
         S->last_erase = seq;
+        for (uint32_t ti = 0; ti < S->nt; ti++) fkc_free(&S->t[ti]); /* F2b-2: an erased row blocks nothing: counted again */
+        S->fk_erase_op = o;
         return 0;
     }
     if (o->table >= S->nt) return fail("commit %llu: unknown table %u", (unsigned long long)seq, o->table);
@@ -2745,7 +3184,9 @@ static int apply_op(state *S, const op *o, uint64_t seq)
         ver *dv = av(t, o->vid);
         if (!dv || dv->end != LIVE || memcmp(dv->commit, o->commit, 32) != 0)
             return fail("commit %llu: delete precondition fails", (unsigned long long)seq);
+        if (!dv->row && t->live_nokey) t->live_nokey--;
         dv->end = seq;
+        fkev_end(S, t, o->table, o->vid, o->code == 4, o->new_vid); /* F2b-2: its keys before its row goes */
         uk_end(t, o->vid);
         t->live--;
         lt_sub(S->m.alg, &t->d, o->commit);
@@ -2771,10 +3212,13 @@ static int apply_op(state *S, const op *o, uint64_t seq)
         v->end = LIVE;
         v->payload = !o->redacted;
         v->redacted = o->redacted;
+        if (o->redacted) t->live_nokey++;
         if (!o->redacted) { /* the unique indexes, then the row kept while it is live */
             for (uint32_t x = 0; x < t->nidx; x++)
                 if (t->idx[x].uk && uk_add(t, &t->idx[x], vals, vid, seq)) return -1;
             if (uk_add(t, &t->pkx, vals, vid, seq)) return -1; /* F4: the primary key's */
+            fkc_row(t, vals, +1); /* F2b-2: its FK keys counted */
+            if (o->code == 2) fkev_insert(S, t, o->table, vid); /* an op 4's new side: fkev_end's event, with the old keys */
             v->row = xcalloc(o->row_len, 1);
             memcpy(v->row, o->row, o->row_len);
             v->row_len = o->row_len;
@@ -3154,6 +3598,8 @@ static int replay(state *S, int dirfd, uint64_t *commits)
             }
             S->time = c.time;
             for (uint32_t i = 0; !rc && i < c.nops; i++) rc = apply_op(S, &c.ops[i], c.seq);
+            if (!rc) rc = fk_commit_check(S, c.seq); /* F2b-2: referential integrity at the commit's end */
+            else fkev_clear(S);
             uint8_t d[32];
             lt_digest(S->m.alg, &S->glob, d);
             if (!rc && memcmp(d, c.digest, 32) != 0)
@@ -3641,6 +4087,8 @@ typedef struct mtable {
     uint32_t cseq[MAX_COLS];   /* F2a-2: the CREATE's DEFAULT's sequence (kinds 6-8) */
     achk *ck0;                 /* F2b-1 (manifest 11): version 1's CHECKs */
     uint16_t nck0;
+    afk *fk0;                  /* F2b-2 (manifest 13): version 1's FOREIGN KEYs */
+    uint16_t nfk0;
 } mtable;
 
 typedef struct mview { /* P2 S7: a manifest's view: a live one's definition, a dropped one's tombstone (def NULL) */
@@ -3670,6 +4118,7 @@ static void manifest_free(manifest *m)
         free(m->t[i].nrows);
         for (uint32_t k = 0; k < m->t[i].nvers; k++) free(m->t[i].vers[k].ctext); /* F2b-1 */
         checks_free(m->t[i].ck0, m->t[i].nck0);
+        free(m->t[i].fk0); /* F2b-2 */
         for (uint32_t k = 0; k < m->t[i].nvers; k++) free(m->t[i].vers[k].s.raw), free(m->t[i].vers[k].def); /* F1 */
         free(m->t[i].vers);
         for (int k = 0; k < MAX_COLS; k++) free(m->t[i].missing_text[k]);
@@ -3756,7 +4205,7 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
     rd r = {b, len, 0, false};
     const uint8_t *mg = rd_bytes(&r, 8);
     uint32_t mver = mg && memcmp(mg, "IMDBMAN1", 8) == 0 ? rd_u32(&r) : 0;
-    if (mver != 12) return fail("manifest: bad header (version 12 only: generated columns, F2c)");
+    if (mver != 13) return fail("manifest: bad header (version 13 only: FOREIGN KEYs, F2b-2)");
     uint32_t nsec = rd_u32(&r); /* every section, in order: 1 tables, 2 views, 3 sequences (F2a-2), 4-11 reserved and empty */
     const uint8_t *id = rd_bytes(&r, 16);
     m->seq = rd_u64(&r);
@@ -3865,6 +4314,7 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
             if (r.bad) return fail("manifest: truncated");
         }
         if (checks_body(&r, true, &t->ck0, &t->nck0, "manifest")) return -1; /* F2b-1 (manifest 11): version 1's CHECKs */
+        if (fks_body(&r, true, &t->fk0, &t->nfk0, "manifest")) return -1; /* F2b-2 (manifest 13): version 1's FOREIGN KEYs */
         if (r.bad) return fail("manifest: truncated");
         uint64_t last = t->created_at;
         for (uint32_t k = 0; k < na; k++) {
@@ -3882,12 +4332,14 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
                 free(nv.def);
                 free(nv.ctext);
                 checks_free(o.ck, o.nck);
+                free(o.fk); /* F2b-2: an ADD FOREIGN KEY's, the version holds its own copy */
                 return -1;
             }
             nv.since = at;
             t->vers[t->nvers++] = nv;
             last = at;
             checks_free(o.ck, o.nck); /* F2b-1: an ADD CHECK's, the version holds its own copy */
+            free(o.fk); /* F2b-2: an ADD FOREIGN KEY's too */
         }
         const schema *ls = &t->vers[t->nvers - 1].s;
         if (ls->rawlen != t->s.rawlen || memcmp(ls->raw, t->s.raw, t->s.rawlen) != 0)
@@ -4503,6 +4955,7 @@ static int seed_row(void *ctx, uint32_t ti, const schema *s, const seg *g, uint3
         }
     }
     if (v->end != LIVE) return 0; /* not in the digest at F */
+    if (!v->row) t->live_nokey++; /* F2b-2: an erased row live at F, its key unknown */
     lt_add(S->m.alg, &t->d, v->commit);
     lt_add(S->m.alg, &S->glob, v->commit);
     t->live++;
@@ -4567,6 +5020,10 @@ static int floor_seed(int dirfd, state *S, flr *f)
         t->ck0 = mt->nck0 ? checks_dup(mt->ck0, mt->nck0) : NULL; /* F2b-1: F's CHECKs, version 1's and the live ones */
         t->nck0 = mt->nck0;
         live_rebuild(t);
+        t->fk0 = mt->nfk0 ? xcalloc(mt->nfk0, sizeof *t->fk0) : NULL; /* F2b-2: F's FOREIGN KEYs */
+        if (mt->nfk0) memcpy(t->fk0, mt->fk0, (size_t)mt->nfk0 * sizeof *t->fk0);
+        t->nfk0 = mt->nfk0;
+        lfk_rebuild(t);
     }
     for (uint32_t i = 0; i < f->m.nv; i++) /* P2 S7: F's views, a live one's definition the replay's rules read */
         view_push(S, f->m.v[i].name, f->m.v[i].created_at, f->m.v[i].dropped_at, f->m.v[i].def);
@@ -4639,9 +5096,11 @@ static bool same_history(const mtable *mt, const table *t)
             memcmp(a->hash, b->hash, 32) != 0 || a->akind != b->akind || a->apos != b->apos || a->def_len != b->def_len ||
             a->aclock != b->aclock || /* F2a */
             (a->def_len && memcmp(a->def, b->def, a->def_len) != 0) ||
-            strcmp(a->cname, b->cname) || a->clen != b->clen || (a->clen && memcmp(a->ctext, b->ctext, a->clen))) /* F2b-1 */
+            strcmp(a->cname, b->cname) || a->clen != b->clen || (a->clen && memcmp(a->ctext, b->ctext, a->clen)) || /* F2b-1 */
+            memcmp(&a->afk, &b->afk, sizeof a->afk)) /* F2b-2 */
             return false;
     }
+    if (mt->nfk0 != t->nfk0 || (mt->nfk0 && memcmp(mt->fk0, t->fk0, (size_t)mt->nfk0 * sizeof *mt->fk0))) return false; /* F2b-2 */
     if (mt->nck0 != t->nck0) return false; /* F2b-1: version 1's CHECKs, which no version holds */
     for (uint16_t q = 0; q < mt->nck0; q++)
         if (strcmp(mt->ck0[q].name, t->ck0[q].name) || mt->ck0[q].len != t->ck0[q].len ||
@@ -4801,12 +5260,16 @@ static int cmd_verify(const char *dir, const char *anchor)
         checks_free(S.t[i].ck0, S.t[i].nck0);
         ck_unbind(&S.t[i]);
         gen_unbind(&S.t[i]); /* F2c */
+        free(S.t[i].fk0); /* F2b-2: version 1's FOREIGN KEYs and the child keys' counts */
+        fkc_free(&S.t[i]);
         for (uint32_t k = 0; k < S.t[i].nvers; k++) free(S.t[i].vers[k].s.raw), free(S.t[i].vers[k].def); /* F1: its versions' bytes */
         free(S.t[i].vers);
         for (int k = 0; k < MAX_COLS; k++) free(S.t[i].missing_text[k]);
         for (int k = 0; k < MAX_COLS; k++) free(S.t[i].cdef[k]); /* F2a */
         free(S.t[i].s.raw);
     }
+    fkev_clear(&S); /* F2b-2: a commit's events, kept when it failed */
+    free(S.fkev);
     keys_free(&S.K);
     free(S.t);
     free(S.sq); /* F2a-2 */

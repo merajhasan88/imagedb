@@ -506,6 +506,50 @@ must_fail "differs from the log" "$AUD" verify "$PFZ"
 echo "   FY a signed INSERT and a signed UPDATE of a row whose generated column holds another value than its expression gives:
    the replay and the auditor refuse each; FZ a manifest's version 1 generation text another: VERIFY and the auditor refuse it"
 
+echo "== GA, GB, GC: FOREIGN KEYs broken (F2b-2): a signed orphan, a signed delete of a referenced parent, a manifest's definition"
+PGA=$WORK/ga; "$BIN" init "$PGA" >/dev/null
+"$BIN" sql "$PGA" --nosync -c "CREATE TABLE p (id INT64 PRIMARY KEY, n TEXT);" \
+  -c "CREATE TABLE c (id INT64 PRIMARY KEY, pid INT64 REFERENCES p ON DELETE CASCADE);" \
+  -c "INSERT INTO p VALUES (1, 'a'), (2, 'b');" -c "INSERT INTO c VALUES (10, 1), (11, 2);" >/dev/null
+"$BIN" verify "$PGA" >/dev/null && "$AUD" verify "$PGA" >/dev/null || fail "the honest directory must verify"
+cp -r "$PGA" "$WORK/gb"
+"$FORGE" index-lie "$PGA" fk-orphan
+must_fail "violates foreign key c_pid_fkey: its parent key is not live" "$BIN" verify "$PGA"   # the open's replay
+must_fail "violates foreign key c_pid_fkey: its parent key is not live" "$AUD" verify "$PGA"
+PGB=$WORK/gb
+"$FORGE" index-lie "$PGB" fk-delete
+must_fail "violates foreign key constraint c_pid_fkey on table c" "$BIN" verify "$PGB"
+must_fail "while a live row of table c references it by foreign key c_pid_fkey" "$AUD" verify "$PGB"
+PGC=$WORK/gc; "$BIN" init "$PGC" >/dev/null
+"$BIN" sql "$PGC" --nosync -c "CREATE TABLE p (id INT64 PRIMARY KEY);" \
+  -c "CREATE TABLE c (id INT64 PRIMARY KEY, pid INT64 REFERENCES p ON DELETE CASCADE);" \
+  -c "INSERT INTO p VALUES (1);" -c "INSERT INTO c VALUES (10, 1);" -c "CHECKPOINT;" >/dev/null
+"$BIN" verify "$PGC" >/dev/null && "$AUD" verify "$PGC" >/dev/null || fail "the honest directory must verify"
+"$FORGE" manifest-lie "$PGC" fk-def
+must_fail "differ" "$BIN" verify "$PGC"   # the snapshot open took the manifest's definition
+must_fail "differs from the log" "$AUD" verify "$PGC"
+echo "   GA a signed INSERT of a child whose parent key is not live, GB a signed DELETE of a parent a live child references:
+   the replay and the auditor refuse each; GC a manifest's version 1 FOREIGN KEY another: VERIFY and the auditor refuse it"
+
+echo "== GD, GE: an ERASE excuses only its own deletes (F2b-2): a referenced parent's DELETE beside an ERASE of another version"
+PGD=$WORK/gd; "$BIN" init "$PGD" >/dev/null
+"$BIN" sql "$PGD" --nosync -c "CREATE TABLE p (id INT64 PRIMARY KEY, n TEXT);" \
+  -c "CREATE TABLE c (id INT64 PRIMARY KEY, pid INT64 REFERENCES p ON DELETE CASCADE);" -c "CREATE TABLE x (id INT64 PRIMARY KEY);" \
+  -c "INSERT INTO p VALUES (1, 'a'), (2, 'b');" -c "INSERT INTO c VALUES (10, 1), (11, 2);" \
+  -c "INSERT INTO x VALUES (1);" -c "DELETE FROM x WHERE id = 1;" >/dev/null
+"$BIN" verify "$PGD" >/dev/null && "$AUD" verify "$PGD" >/dev/null || fail "the honest directory must verify"
+cp -r "$PGD" "$WORK/ge"
+"$FORGE" index-lie "$PGD" fk-erase-other   # one commit: DELETE of p's row 1 (c's row 10 references it), ERASE of x's ended row
+must_fail "violates foreign key constraint c_pid_fkey on table c" "$BIN" verify "$PGD"
+must_fail "while a live row of table c references it by foreign key c_pid_fkey" "$AUD" verify "$PGD"
+PGE=$WORK/ge
+"$FORGE" index-lie "$PGE" fk-erase-named   # the same commit, its ERASE naming the deleted row itself: the control
+"$BIN" sql "$PGE" -c "SELECT COUNT(*) FROM c;" >/dev/null || fail "the control's commit must replay (the open finishes its publish)"
+"$BIN" verify "$PGE" >/dev/null && "$AUD" verify "$PGE" >/dev/null || fail "an ERASE of a referenced parent, its own delete, must verify"
+echo "   GD a signed DELETE of a referenced parent beside an ERASE that names another version: the replay and the auditor
+   refuse it; GE the same commit with the ERASE naming that parent (made as the writer makes one, its payload redacted)
+   replays, publishes, and VERIFY and the auditor accept it"
+
 echo "== Z: a commit naming the other digest algorithm, re-signed by the writer (both ways round); META naming an unknown one"
 for a in 1 2; do # explicit algorithms: under IMDB_DIGEST_ALG=2 make_db's would all be alg 2
   PZ=$WORK/z$a

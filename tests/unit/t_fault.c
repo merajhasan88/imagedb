@@ -1171,7 +1171,7 @@ static int run_view(const char *run)
  * leaves both out, a rename, CHECKPOINTs between (segments of each version, the manifest's schema history); F1 stage 4:
  * a column dropped before the others, a SET DEFAULT, a row taking it, a SET NOT NULL, and a CHECKPOINT whose memtable
  * holds rows from both sides of the drop (a segment of each version); F2a: a table of CREATE DEFAULTs (op 23) and a
- * SET DEFAULT of a clock (kind 10) before that CHECKPOINT; F2b-1: a table of CHECKs; F2c: a table of generated columns; each read against its twin, and every
+ * SET DEFAULT of a clock (kind 10) before that CHECKPOINT; F2b-1: a table of CHECKs; F2c: a table of generated columns; F2b-2: FOREIGN KEYs and a CASCADE; each read against its twin, and every
  * recovered state the acknowledged one (VERIFY and the auditor) */
 static int run_alter(const char *run)
 {
@@ -1217,6 +1217,12 @@ static int run_alter(const char *run)
          "u TEXT GENERATED ALWAYS AS (s || '!') STORED)", NULL},
         {"INSERT INTO gz (id, a, s) VALUES (1, 1, 'x'), (2, NULL, 'y')", NULL},
         {"UPDATE gz SET a = 5 WHERE id = 2", NULL},
+        /* F2b-2: FOREIGN KEYs (op 29), a parent deleted with its CASCADE, the next CHECKPOINT's manifest version 1's */
+        {"CREATE TABLE fp (id INT64 PRIMARY KEY)", NULL},
+        {"CREATE TABLE fc (id INT64 PRIMARY KEY, pid INT64 REFERENCES fp ON DELETE CASCADE)", NULL},
+        {"INSERT INTO fp VALUES (1), (2)", NULL},
+        {"INSERT INTO fc VALUES (10, 1), (11, 2), (12, 1)", NULL},
+        {"DELETE FROM fp WHERE id = 1", NULL},
         {"CHECKPOINT", NULL},
         {"SELECT COUNT(*) FROM txns WHERE c = 'r'", "SELECT COUNT(*) FROM txns WHERE id = 21"},
         {"SELECT note, c, n FROM txns WHERE user_id = 42 ORDER BY id", "SELECT note, 'q', 5 FROM txns WHERE user_id = 42 ORDER BY id"},
@@ -1229,6 +1235,9 @@ static int run_alter(const char *run)
         {"INSERT INTO ck VALUES (4, 4, NULL)", NULL},
         {"SELECT w, u FROM gz ORDER BY id", "SELECT a * 2, s || '!' FROM gz ORDER BY id"},
         {"INSERT INTO gz (id, a, s) VALUES (3, 3, 'z')", NULL},
+        {"SELECT COUNT(*) FROM fc WHERE pid = 2", "SELECT COUNT(*) FROM fc"},
+        {"ALTER TABLE fc ADD CONSTRAINT fc_two FOREIGN KEY (pid) REFERENCES fp", NULL},
+        {"INSERT INTO fc VALUES (13, 2)", NULL},
     };
     int v = 0;
     size_t done = 0;
@@ -1270,9 +1279,10 @@ static int run_alter(const char *run)
     const imdb_table *tt = imdb_table_by_name(db, "txns");
     const imdb_table *dz = imdb_table_by_name(db, "dz");
     const imdb_table *gz = imdb_table_by_name(db, "gz");
+    const imdb_table *fc = imdb_table_by_name(db, "fc");
     if (!v && done == sizeof q / sizeof *q && !db->warning[0] && !db->failed &&
         (!tt || tt->hist.nvers != 7 || !dz || dz->hist.nvers != 2 || dz->hist.tcol[3].wclock != IMDB_DEFK_LOCALTIME ||
-         !gz || gz->hist.ngen != 2))
+         !gz || gz->hist.ngen != 2 || !fc || fc->hist.nfk != 2))
         v = VIOL_ALTER;
     imdb_session_close(&s);
     imdb_close(db);

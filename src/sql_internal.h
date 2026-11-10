@@ -140,6 +140,13 @@ typedef struct sql_seqopt {
     int64_t inc, min, max, start;
 } sql_seqopt;
 
+/* F2b-2: a parsed FOREIGN KEY */
+typedef struct sql_fkdef {
+    char name[IMDB_MAX_IDENT + 1], parent[IMDB_MAX_IDENT + 1];
+    uint8_t ncols, npcols, on_delete, on_update;
+    char cols[IMDB_MAX_KEY_COLS][IMDB_MAX_IDENT + 1], pcols[IMDB_MAX_KEY_COLS][IMDB_MAX_IDENT + 1];
+} sql_fkdef;
+
 typedef struct sql_stmt {
     uint8_t kind;
     char table[IMDB_MAX_IDENT + 1];
@@ -255,6 +262,12 @@ typedef struct sql_stmt {
         char name[IMDB_MAX_IDENT + 1];
         uint32_t off, len;
     } checks[IMDB_MAX_CHECKS];
+    uint8_t nfks;                               /* F2b-2: CREATE TABLE's FOREIGN KEYs in order (ALTER TABLE ... ADD FOREIGN KEY: one):
+                                                   each its name ("" for one to choose), its columns, the parent and its
+                                                   columns (none named: its primary key), the actions (IMDB_FK_*); fks
+                                                   allocated (IMDB_MAX_FKS) at the first one parsed, so a statement without
+                                                   one (every nested SELECT) carries a pointer, not 19 KB */
+    struct sql_fkdef *fks;
     bool has_alter_def;
     char set_name[IMDB_MAX_IDENT + 1];          /* SET */
     char set_value[IMDB_MAX_IDENT + 1];

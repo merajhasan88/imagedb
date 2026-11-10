@@ -243,6 +243,24 @@ int imdb_dump(imdb_db *db, uint32_t batch, imdb_copy_write_fn wr, void *arg, imd
         imdb_buf_put_str(&d->b, "\\.\n");
         if ((rc = put(d, e)) || (rc = index_text(d, t, e))) break;
     }
+    for (uint32_t i = 0; !rc && i < n; i++) { /* F2b-2: each FOREIGN KEY after every table's rows (pg_dump's order): the
+                                               * restore never meets a child before its parent, and checks each whole */
+        static const char *const act[] = {"NO ACTION", "RESTRICT", "CASCADE", "SET NULL", "SET DEFAULT"};
+        const imdb_table *t = ts[i];
+        const imdb_sver *cur = &t->hist.vers[t->hist.nvers - 1];
+        for (uint16_t k = 0; k < t->hist.nfk; k++) {
+            const imdb_fk *f = &t->hist.fk[k];
+            const imdb_table *p = f->parent < db->nt ? db->t[f->parent] : NULL;
+            if (!p) continue;
+            const imdb_sver *pc = &p->hist.vers[p->hist.nvers - 1];
+            imdb_buf_printf(&d->b, "ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY (", t->s.name, f->name);
+            for (uint8_t c = 0; c < f->ncols; c++) imdb_buf_printf(&d->b, "%s%s", c ? ", " : "", t->s.cols[cur->at[f->cols[c]]].name);
+            imdb_buf_printf(&d->b, ") REFERENCES %s (", p->s.name);
+            for (uint8_t c = 0; c < f->ncols; c++) imdb_buf_printf(&d->b, "%s%s", c ? ", " : "", p->s.cols[pc->at[f->pcols[c]]].name);
+            imdb_buf_printf(&d->b, ") ON DELETE %s;\n", act[f->on_delete]);
+            if ((rc = put(d, e))) break;
+        }
+    }
     uint32_t nviews = 0; /* P2 S7: the live views by id, after every table: each names only earlier ones */
     for (uint32_t i = 0; !rc && i < db->nviews; i++) {
         const imdb_view *v = &db->views[i];

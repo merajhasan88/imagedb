@@ -1072,6 +1072,9 @@ static int old_manifest(uint32_t ver, imdb_err *e)
     if (ver == 5)
         return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 5: this lake was written by an imagedb before views' "
                          "format (manifest 6, P2 S7), which this version does not read");
+    if (ver == 12) /* F2b-2: version 1's FOREIGN KEYs were not in its history */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 12: this lake was written by an imagedb before FOREIGN "
+                         "KEYs (manifest 13, 2026-11-09), which this version does not read");
     if (ver == 11) /* F2c: a CREATE's generated columns were not in its history */
         return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 11: this lake was written by an imagedb before generated "
                          "columns (manifest 12, 2026-11-09), which this version does not read");
@@ -1232,6 +1235,19 @@ int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err
             }
             if (!cok) goto bad;
         }
+        { /* F2b-2 (manifest 13): version 1's FOREIGN KEYs, the CREATE's (op 29), after its CHECKs */
+            imdb_fk *fk = NULL;
+            uint16_t nfk = 0;
+            imdb_err ef = {0};
+            bool fok = !imdb_fks_get(&r, true, &fk, &nfk, "manifest", &ef) && !r.err;
+            int frc = fok && nfk ? imdb_hist_create_fks(&t->hist, fk, nfk, e) : IMDB_OK;
+            imdb_free(fk);
+            if (frc) {
+                imdb_manifest_free(m);
+                return frc;
+            }
+            if (!fok) goto bad;
+        }
         uint64_t last = t->created_at;
         for (uint32_t k = 0; k < na; k++) {
             uint64_t at = imdb_rd_u64(&r);
@@ -1246,6 +1262,7 @@ int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err
             if (ok && !prc) imdb_hist_install(&t->hist, &o, at);
             imdb_free(o.aname);
             imdb_free(o.chk); /* F2b-1: an ADD CHECK's */
+            imdb_free(o.fk); /* F2b-2: an ADD FK's */
             if (prc) {
                 imdb_manifest_free(m);
                 return prc;
@@ -1872,6 +1889,7 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
             imdb_coldefs_put(mb, s1, cd, ncd);
         }
         imdb_checks_put(mb, h->nvers ? h->chk0 : NULL, h->nvers ? h->nchk0 : 0); /* F2b-1 (manifest 11): version 1's CHECKs */
+        imdb_fks_put(mb, h->nvers ? h->fk0 : NULL, h->nvers ? h->nfk0 : 0); /* F2b-2 (manifest 13): version 1's FOREIGN KEYs */
         for (uint32_t k = 1; k <= na && !rc; k++) {
             const imdb_sver *v = &h->vers[k];
             if (v->since > seq) {
@@ -1885,6 +1903,7 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
             o.aclock = v->aclock; /* F2a: SET DEFAULT now()'s kind, or an ADD's */
             char nm[IMDB_MAX_IDENT + 1];
             imdb_check ckw; /* F2b-1 */
+            imdb_fk fkw;    /* F2b-2 */
             if (v->akind == IMDB_ALTER_ADD_COLUMN) {
                 o.acol = v->s.cols[v->at[v->apos]];
                 o.adef = h->tcol[v->apos].missing;
@@ -1903,9 +1922,13 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
                 snprintf(ckw.name, sizeof ckw.name, "%s", v->cname);
                 o.chk = &ckw;
                 o.nchk = 1;
-            } else if (v->akind == IMDB_ALTER_DROP_CHECK) {
+            } else if (v->akind == IMDB_ALTER_DROP_CHECK || v->akind == IMDB_ALTER_DROP_FK) { /* F2b-2 too */
                 snprintf(nm, sizeof nm, "%s", v->cname);
                 o.aname = nm;
+            } else if (v->akind == IMDB_ALTER_ADD_FK) { /* F2b-2: its definition */
+                fkw = v->afk;
+                o.fk = &fkw;
+                o.nfk = 1;
             } /* DROP COLUMN, SET and DROP NOT NULL, DROP DEFAULT: the position alone */
             imdb_buf_put_u64(mb, v->since);
             if (imdb_alter_put(mb, &o)) rc = imdb_fail(e, IMDB_ERR_STATE, "lake: table %s's ALTER cannot be written", t->s.name);
@@ -3239,7 +3262,7 @@ static int load_table(imdb_db *db, int ofd, const imdb_manifest_tab *mt, uint32_
     bool cdefs = false; /* F2a: a CREATE's DEFAULTs, which version 1 alone (the table's own first) lacks */
     for (uint16_t p = 0; p < mt->hist.ntcol && !cdefs; p++)
         cdefs = mt->hist.tcol[p].added == 1 && (mt->hist.tcol[p].cclock || !mt->hist.tcol[p].cdef.null || mt->hist.tcol[p].gtext);
-    if ((mt->hist.nvers > 1 || cdefs || mt->hist.nchk0) && /* F2b-1: version 1's CHECKs, likewise */
+    if ((mt->hist.nvers > 1 || cdefs || mt->hist.nchk0 || mt->hist.nfk0) && /* F2b-1: version 1's CHECKs, likewise; F2b-2: FKs */
         imdb_hist_copy(&t->hist, &mt->hist, e))
         return e->code; /* F1: s is its last version */
     if (mt->nseg) {
@@ -3354,6 +3377,7 @@ static int load_table(imdb_db *db, int ofd, const imdb_manifest_tab *mt, uint32_
                 v->seg_row = si;
                 v->flags = IMDB_V_SEG | ((gi->flags[si] & IMDB_SEG_STUB) ? IMDB_V_STUB : 0) |
                            ((gi->flags[si] & IMDB_SEG_PURGED) ? IMDB_V_PURGED : 0);
+                if ((gi->flags[si] & IMDB_SEG_STUB) && v->end == IMDB_LIVE) t->live_stubs++; /* F2b-2: an erased row live here */
             }
             si++;
             j++;

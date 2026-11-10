@@ -721,7 +721,7 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
                         o->code == IMDB_OP_COMPACT || o->code == IMDB_OP_CREATE_INDEX || o->code == IMDB_OP_DROP_INDEX ||
                         o->code == IMDB_OP_SET_RETENTION || o->code == IMDB_OP_EXPIRE || o->code == IMDB_OP_DROP_TABLE ||
                         o->code == IMDB_OP_ALTER_TABLE || o->code == IMDB_OP_COLUMN_DEFAULTS ||
-                        o->code == IMDB_OP_TABLE_CHECKS; /* F2b-1 */
+                        o->code == IMDB_OP_TABLE_CHECKS || o->code == IMDB_OP_TABLE_FKS; /* F2b-1, F2b-2 */
         vtab *t = on_table && o->table < x->nt ? &x->t[o->table] : NULL;
         if (on_table && !t) return imdb_fail(e, IMDB_ERR_VERIFY, "verify: unknown table");
         if (t && t->dropped_at && /* replay's and the auditor's rule: a dropped table's history may still expire */
@@ -778,6 +778,18 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
             }
             rc = imdb_hist_create_checks(&t->hist, o->chk, o->nchk, e);
             break;
+        case IMDB_OP_TABLE_FKS: { /* F2b-2: each by the catalog's rules against the CREATE's version and its parent now */
+            const imdb_sver *ccur = &t->hist.vers[t->hist.nvers - 1];
+            for (uint16_t q = 0; q < o->nfk; q++) {
+                const vtab *p = o->fk[q].parent == o->table ? t : o->fk[q].parent < x->nt ? &x->t[o->fk[q].parent] : NULL;
+                const imdb_sver *pcur = p == t ? ccur : p && p->hist.nvers ? &p->hist.vers[p->hist.nvers - 1] : NULL;
+                imdb_err e2 = {0};
+                if (imdb_fk_def_check(ccur, pcur, p && !p->dropped_at, &o->fk[q], &e2))
+                    return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: %s", (unsigned long long)seq, e2.msg);
+            }
+            rc = imdb_hist_create_fks(&t->hist, o->fk, o->nfk, e);
+            break;
+        }
         case IMDB_OP_CREATE_SEQUENCE: /* F2a-2: replay's rules on the model */
         case IMDB_OP_DROP_SEQUENCE:
         case IMDB_OP_SEQ_ADVANCE:
@@ -906,6 +918,14 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
                     return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: a rename or drop of a column generated column %s names",
                                      (unsigned long long)seq, cn);
             }
+            if (o->akind == IMDB_ALTER_ADD_FK) { /* F2b-2: the catalog's rules against the model (its rows: replay's and the auditor's) */
+                const vtab *p = o->fk->parent == o->table ? t : o->fk->parent < x->nt ? &x->t[o->fk->parent] : NULL;
+                const imdb_sver *ccur = &t->hist.vers[t->hist.nvers - 1];
+                const imdb_sver *pcur = p == t ? ccur : p && p->hist.nvers ? &p->hist.vers[p->hist.nvers - 1] : NULL;
+                imdb_err e3 = {0};
+                if (imdb_fk_def_check(ccur, pcur, p && !p->dropped_at, o->fk, &e3))
+                    return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: %s", (unsigned long long)seq, e3.msg);
+            }
             if (o->akind == IMDB_ALTER_ADD_CHECK) { /* F2b-1: its text binds (its rows: replay's and the auditor's) */
                 imdb_err e3 = {0};
                 int brc = imdb_check_bind(&t->s, o->chk[0].text, o->chk[0].len, NULL, &e3);
@@ -933,6 +953,11 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
             if (v_named(x, IMDB_VIEWDEP_TABLE, o->table)) /* P2 S7: RESTRICT */
                 return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: DROP of table %s, which a live view names",
                                  (unsigned long long)seq, t->s.name);
+            for (uint32_t ci = 0; ci < x->nt; ci++) /* F2b-2: RESTRICT, a live FK of another table referencing it */
+                for (uint16_t q = 0; ci != o->table && !x->t[ci].dropped_at && q < x->t[ci].hist.nfk; q++)
+                    if (x->t[ci].hist.fk[q].parent == o->table)
+                        return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: DROP of table %s, which foreign key %s references",
+                                         (unsigned long long)seq, t->s.name, x->t[ci].hist.fk[q].name);
             for (uint64_t vid = 0; vid < t->n; vid++) {
                 vver *dv = vv(t, vid);
                 if (dv && dv->end == IMDB_LIVE) dv->end = seq;
@@ -1526,6 +1551,7 @@ static bool same_hist(const imdb_schema_hist *m, const imdb_schema_hist *x, uint
         if (strcmp(a->cname, b->cname) || a->clen != b->clen || (a->clen && memcmp(a->ctext, b->ctext, a->clen)))
             return false; /* F2b-1: an ADD or DROP CHECK, nor this */
     }
+    if (m->nfk0 != x->nfk0 || (m->nfk0 && memcmp(m->fk0, x->fk0, (size_t)m->nfk0 * sizeof *m->fk0))) return false; /* F2b-2 */
     if (m->nchk0 != x->nchk0) return false; /* F2b-1: version 1's CHECKs, which no version holds */
     for (uint16_t k = 0; k < m->nchk0; k++)
         if (strcmp(m->chk0[k].name, x->chk0[k].name) || m->chk0[k].len != x->chk0[k].len ||
@@ -1841,6 +1867,8 @@ static int verify_engine(imdb_db *db, const vctx *x, imdb_verify_report *rep, im
                    (!vt->hist.tcol[p].glen || !memcmp(vt->hist.tcol[p].gtext, et->hist.tcol[p].gtext, vt->hist.tcol[p].glen));
         if (!gens)
             return imdb_fail(e, IMDB_ERR_VERIFY, "verify: the engine's generated columns of table %s differ from the log's", et->s.name);
+        if (vt->hist.nfk != et->hist.nfk || (vt->hist.nfk && memcmp(vt->hist.fk, et->hist.fk, (size_t)vt->hist.nfk * sizeof *vt->hist.fk)))
+            return imdb_fail(e, IMDB_ERR_VERIFY, "verify: the engine's FOREIGN KEYs of table %s differ from the log's", et->s.name);
         /* from scratch, independent of the delta arithmetic */
         imdb_lthash re;
         if (imdb_recompute_digest(db, et, db->seq, &re, e)) return e->code;

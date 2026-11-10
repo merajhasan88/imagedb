@@ -171,7 +171,8 @@ typedef struct imdb_sver {
     uint8_t *atext;              /* its TEXT bytes, the version's own (adef.s and a write default point here) */
     uint8_t aclock;              /* F2a: SET DEFAULT's clock kind (IMDB_ALTER_SET_DEFAULT_CLOCK), or an ADD's write default's
                                     (its missing value then the clock's at the ALTER); 0: none */
-    char cname[IMDB_MAX_IDENT + 1]; /* F2b-1: ADD CHECK's and DROP CHECK's name */
+    char cname[IMDB_MAX_IDENT + 1]; /* F2b-1: ADD CHECK's and DROP CHECK's name; F2b-2: DROP FK's */
+    imdb_fk afk;                 /* F2b-2: ADD FK's definition */
     char *ctext;                 /* F2b-1: ADD CHECK's text, the version's own (len bytes and a NUL), as live while the
                                     history lives: a live check's text is one of these or version 1's */
     uint32_t clen;
@@ -196,6 +197,12 @@ typedef struct imdb_schema_hist {
     uint32_t chkbytes;            /* the live texts' bytes together: IMDB_MAX_CHECK_TEXT at most */
     uint16_t ngen;                /* F2c: the columns the CREATE generated, ever (a DROP COLUMN leaves it: 0 means no write
                                      computes or verifies one; the live ones are those whose tcol has a gtext) */
+    /* F2b-2: FOREIGN KEYs (docs/fk-design.md): version 1's (op 29's CREATE, a manifest's version 1: by name, one
+     * allocation) and the live ones by name, copies (each version 1's or an ADD FK version's) */
+    imdb_fk *fk0;
+    uint16_t nfk0;
+    uint16_t nfk;
+    imdb_fk fk[IMDB_MAX_FKS];
     char *cstaged;
 } imdb_schema_hist;
 
@@ -216,6 +223,8 @@ typedef struct imdb_table {
     uint32_t nsubj, capsubj;
     imdb_lthash digest;       /* over live versions                        */
     uint64_t live;
+    uint64_t live_stubs;      /* F2b-2: live versions whose payload an ERASE redacted (a replay before that ERASE, a snapshot
+                               * loaded before it): their keys unknown, a child's missing parent key is not refuted */
     /* lake (segments) */
     struct imdb_segment **seg;
     imdb_segcache *segcache;  /* the database's (stage 3c-1): where its segments' images are loaded and kept */
@@ -229,6 +238,7 @@ typedef struct imdb_table {
     imdb_schema_hist hist;    /* F1: its schema history; hist.vers[hist.nvers - 1].s is s */
     struct imdb_chkc *chkc;   /* F2b-1: its live CHECKs compiled (sql_exec.c), for the history length it names; NULL: none yet */
     struct imdb_chkc *genc;   /* F2c: its live generated columns' expressions compiled, likewise */
+    struct imdb_fkm *fkm;     /* F2b-2: its live FOREIGN KEYs' child maps (fk.c), built when a check first needs them */
     uint64_t idx_upto;        /* versions below are in the indexes' structures; the rest are the */
                               /* active transaction's own (versions are only appended) */
 } imdb_table;
@@ -722,6 +732,11 @@ int imdb_hist_create_checks(imdb_schema_hist *h, const imdb_check *c, uint16_t n
 int imdb_hist_check(const imdb_schema_hist *h, const char *name);
 /* the first live CHECK whose text holds ident as an identifier (a RENAME's or DROP COLUMN's rule), or NULL */
 int imdb_checks_name_col(const imdb_schema_hist *h, const char *ident, const char **which, imdb_err *e);
+/* F2b-2: a history's FOREIGN KEYs: a live one by name (its index, or -1); version 1's installed (op 29, a manifest's); the
+ * first live one holding position pos, or NULL (DROP COLUMN's RESTRICT) */
+int imdb_hist_fk(const imdb_schema_hist *h, const char *name);
+int imdb_hist_create_fks(imdb_schema_hist *h, const imdb_fk *f, uint16_t n, imdb_err *e);
+const char *imdb_fks_name_pos(const imdb_schema_hist *h, uint16_t pos);
 /* F2c: the first live generated column but the one at position self whose expression holds ident, or NULL */
 int imdb_gens_name_col(const imdb_schema_hist *h, const char *ident, uint16_t self, const char **which, imdb_err *e);
 /* F2c: generated columns, computed and verified by the SQL layer (sql_exec.c): the expression at position's column c of
@@ -732,6 +747,26 @@ int imdb_gen_bind(const imdb_schema *s, uint16_t c, uint64_t genmask, const char
 int imdb_gen_compute(imdb_db *db, imdb_table *t, imdb_value *vals, struct imdb_xarena *ar, imdb_err *e);
 /* every generated column of the row holding the value its expression gives: IMDB_ERR_CONSTRAINT otherwise */
 int imdb_gen_verify(imdb_db *db, imdb_table *t, const imdb_value *vals, imdb_err *e);
+/* F2b-2 (fk.c, docs/fk-design.md): FOREIGN KEYs at run time: a table's child maps freed; a version added to them (its
+ * values, the table's current columns) and taken out (an undone insert, an erased row: before its bytes are wiped); the
+ * transaction's writes from op index from on checked against the current state (a statement's at its end, every one
+ * at the commit): CONSTRAINT what it can see, CONFLICT what a commit after its snapshot did */
+void imdb_fk_free(imdb_table *t);
+int imdb_fk_index_add(imdb_db *db, imdb_table *t, uint64_t vid, const imdb_value *vals, imdb_err *e);
+void imdb_fk_index_remove(imdb_db *db, imdb_table *t, uint64_t vid, const imdb_value *vals);
+int imdb_fk_check(imdb_db *db, uint32_t from, imdb_err *e);
+/* the catalog's rules of an FK (docs/fk-design.md section 2): the child's version now ccur, the parent's pcur (NULL: none) */
+int imdb_fk_def_check(const imdb_sver *ccur, const imdb_sver *pcur, bool parent_live, const imdb_fk *f, imdb_err *e);
+/* every live row of t referencing a live key of f's parent (an ADD FOREIGN KEY's scan): CONSTRAINT otherwise */
+int imdb_fk_rows_check(imdb_db *db, imdb_table *t, const imdb_fk *f, imdb_err *e);
+/* a live FK of another live table references table pid (DROP TABLE's RESTRICT); *which its name */
+bool imdb_fk_referenced(const imdb_db *db, uint32_t pid, const char **which);
+/* the live versions of child table c holding key k (the parent's primary key encoding) in its FK fki: *out allocated */
+int imdb_fk_children(imdb_db *db, imdb_table *c, uint16_t fki, const imdb_value *k, uint64_t **out, uint32_t *n, imdb_err *e);
+/* replay's check of a commit just applied (seq): referential integrity at its end, by its versions (CORRUPT) */
+int imdb_fk_verify_commit(imdb_db *db, const imdb_commit_rec *c, uint64_t seq, imdb_err *e);
+/* a CREATE's FOREIGN KEYs (op 29, a valid list by name), pushed after its CREATE (and its defaults and checks) */
+int imdb_create_table_fks(imdb_db *db, uint32_t table, const imdb_fk *f, uint16_t n, imdb_err *e);
 /* column c of t's current schema generated */
 bool imdb_col_generated(const imdb_table *t, uint16_t c);
 

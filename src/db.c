@@ -475,6 +475,65 @@ int imdb_hist_create_checks(imdb_schema_hist *h, const imdb_check *c, uint16_t n
     return IMDB_OK;
 }
 
+
+/* ---- F2b-2: a history's FOREIGN KEYs: version 1's, then each ADD and DROP FK version's, the live ones by name ---- */
+
+int imdb_hist_fk(const imdb_schema_hist *h, const char *name)
+{
+    for (uint16_t i = 0; i < h->nfk; i++)
+        if (!strcmp(h->fk[i].name, name)) return i;
+    return -1;
+}
+
+static void fk_live_add(imdb_schema_hist *h, const imdb_fk *f)
+{
+    if (h->nfk >= IMDB_MAX_FKS) return; /* the rules (imdb_sver_next) keep this from happening */
+    uint16_t at = 0;
+    while (at < h->nfk && strcmp(h->fk[at].name, f->name) < 0) at++;
+    memmove(&h->fk[at + 1], &h->fk[at], (h->nfk - at) * sizeof *h->fk);
+    h->fk[at] = *f;
+    h->nfk++;
+}
+
+static void fk_live_drop(imdb_schema_hist *h, const char *name)
+{
+    int at = imdb_hist_fk(h, name);
+    if (at < 0) return; /* the rules keep this from happening */
+    memmove(&h->fk[at], &h->fk[at + 1], (h->nfk - (uint16_t)at - 1) * sizeof *h->fk);
+    h->nfk--;
+}
+
+static void fk_live_rebuild(imdb_schema_hist *h)
+{
+    h->nfk = 0;
+    for (uint16_t i = 0; i < h->nfk0; i++) fk_live_add(h, &h->fk0[i]);
+    for (uint32_t k = 1; k < h->nvers; k++) {
+        const imdb_sver *v = &h->vers[k];
+        if (v->akind == IMDB_ALTER_ADD_FK) fk_live_add(h, &v->afk);
+        else if (v->akind == IMDB_ALTER_DROP_FK) fk_live_drop(h, v->cname);
+    }
+}
+
+int imdb_hist_create_fks(imdb_schema_hist *h, const imdb_fk *f, uint16_t n, imdb_err *e)
+{
+    imdb_fk *d = imdb_alloc_array(n ? n : 1, sizeof *d, e);
+    if (!d) return e->code;
+    if (n) memcpy(d, f, (size_t)n * sizeof *d);
+    imdb_free(h->fk0);
+    h->fk0 = d;
+    h->nfk0 = n;
+    fk_live_rebuild(h);
+    return IMDB_OK;
+}
+
+/* the first live FK (by name) whose columns hold position pos, or NULL: DROP COLUMN's RESTRICT */
+const char *imdb_fks_name_pos(const imdb_schema_hist *h, uint16_t pos)
+{
+    for (uint16_t i = 0; i < h->nfk; i++)
+        for (uint8_t c = 0; c < h->fk[i].ncols; c++)
+            if (h->fk[i].cols[c] == pos) return h->fk[i].name;
+    return NULL;
+}
 int imdb_checks_name_col(const imdb_schema_hist *h, const char *ident, const char **which, imdb_err *e)
 {
     *which = NULL;
@@ -583,6 +642,7 @@ void imdb_table_free(imdb_table *t)
     t->chkc = NULL;
     imdb_check_free(t->genc); /* F2c */
     t->genc = NULL;
+    imdb_fk_free(t); /* F2b-2 */
     imdb_free(t);
 }
 
@@ -1254,6 +1314,7 @@ static void subj_remove(imdb_table *t, const imdb_value *sv, uint64_t vid)
 void imdb_stub_version(imdb_table *t, uint64_t vid)
 {
     imdb_version *v = imdb_vh(t, vid);
+    imdb_fk_free(t); /* F2b-2: an erased row blocks nothing: the FK maps are built again without it at their next use */
     if (v->flags & IMDB_V_STUB) {
         v->flags &= (uint8_t)~IMDB_V_PENDING_AUTH;
         return;
@@ -1275,6 +1336,7 @@ void imdb_stub_version(imdb_table *t, uint64_t vid)
     if (!(v->flags & IMDB_V_SEG) && v->row_len) imdb_wipe(t->arena.p + v->row_off, v->row_len);
     /* a flushed version's salt is its segment row's, which the ERASE's rewrite drops (the old image wiped as it is freed) */
     if (vid >= t->mem_first) imdb_wipe(imdb_vc(t, vid)->salt, sizeof imdb_vc(t, vid)->salt);
+    if (v->end == IMDB_LIVE && !(v->flags & IMDB_V_STUB)) t->live_stubs++; /* F2b-2 (an ERASE ends its live rows first) */
     v->pk_prev = IMDB_NONE;
     v->flags = (uint8_t)((v->flags | IMDB_V_STUB) & ~IMDB_V_PENDING_AUTH);
 }
@@ -2067,6 +2129,9 @@ static void tx_op_free(imdb_op *o)
     imdb_free(o->chk);   /* F2b-1: TABLE_CHECKS' or ADD CHECK's */
     o->chk = NULL;
     o->nchk = 0;
+    imdb_free(o->fk);    /* F2b-2: TABLE_FKS' or ADD FK's */
+    o->fk = NULL;
+    o->nfk = 0;
     imdb_free(o->sdef);  /* F2a-2: CREATE_SEQUENCE's */
     o->sdef = NULL;
     o->defs = NULL;
@@ -2089,6 +2154,15 @@ static void undo_one(imdb_db *db, const imdb_undo *u)
         imdb_table *t = db->t[u->table];
         if (u->vid + 1 != t->nver) break; /* LIFO invariant */
         imdb_version *v = imdb_vh(t, u->vid);
+        if (t->fkm) { /* F2b-2: out of the FK maps, its bytes still there */
+            imdb_value fv[IMDB_MAX_COLS];
+            imdb_err e2 = {0};
+            if (v->row_len && !(v->flags & (IMDB_V_STUB | IMDB_V_SEG)) &&
+                imdb_row_decode(&t->s, t->arena.p + v->row_off, v->row_len, fv, &e2) == IMDB_OK)
+                imdb_fk_index_remove(db, t, u->vid, fv);
+            else
+                imdb_fk_free(t);
+        }
         if (!(v->flags & IMDB_V_STUB)) unindex_newest(t, u->vid, u);
         imdb_wipe(t->arena.p + u->arena_len, t->arena.len - u->arena_len);
         t->arena.len = u->arena_len;
@@ -2282,6 +2356,28 @@ int imdb_create_table_checks(imdb_db *db, uint32_t table, const imdb_check *c, u
     return imdb_hist_create_checks(&db->t[table]->hist, own, n, e);
 }
 
+int imdb_create_table_fks(imdb_db *db, uint32_t table, const imdb_fk *f, uint16_t n, imdb_err *e)
+{
+    if (!n) return IMDB_OK;
+    if (!imdb_fks_ok(f, n)) return imdb_fail(e, IMDB_ERR_INVALID, "a CREATE's FOREIGN KEYs: names unique, 1 to %u columns", IMDB_MAX_KEY_COLS);
+    uint8_t last = db->ntx ? db->tx[db->ntx - 1].code : 0;
+    if (!db->ntx || db->tx[db->ntx - 1].table != table ||
+        (last != IMDB_OP_SET_RETENTION && last != IMDB_OP_COLUMN_DEFAULTS && last != IMDB_OP_TABLE_CHECKS))
+        return imdb_fail(e, IMDB_ERR_STATE, "a CREATE's FOREIGN KEYs follow it at once");
+    imdb_fk *own = imdb_alloc_array(n, sizeof *own, e);
+    imdb_op *op = own ? tx_push(db, e) : NULL;
+    if (!op) {
+        imdb_free(own);
+        return e->code;
+    }
+    memcpy(own, f, (size_t)n * sizeof *own);
+    op->code = IMDB_OP_TABLE_FKS;
+    op->table = table;
+    op->fk = own;
+    op->nfk = n;
+    return imdb_hist_create_fks(&db->t[table]->hist, own, n, e);
+}
+
 int imdb_set_retention(imdb_db *db, imdb_table *t, uint64_t retention_us, imdb_err *e)
 {
     if (!db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "no transaction");
@@ -2331,7 +2427,8 @@ int imdb_sver_next(const imdb_schema_hist *h, const imdb_sver *cur, const imdb_o
     imdb_schema *s = &out->s;
     int c = -1; /* the column the position names: every kind but ADD and RENAME TO names one, live */
     if (o->akind != IMDB_ALTER_ADD_COLUMN && o->akind != IMDB_ALTER_RENAME_TABLE && o->akind != IMDB_ALTER_ADD_CHECK &&
-        o->akind != IMDB_ALTER_DROP_CHECK) { /* F2b-1: a CHECK names no position */
+        o->akind != IMDB_ALTER_DROP_CHECK && o->akind != IMDB_ALTER_ADD_FK &&
+        o->akind != IMDB_ALTER_DROP_FK) { /* F2b-1, F2b-2: a constraint names no position */
         if (o->apos >= cur->npos || cur->at[o->apos] < 0) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no such column");
         c = cur->at[o->apos];
     }
@@ -2365,6 +2462,9 @@ int imdb_sver_next(const imdb_schema_hist *h, const imdb_sver *cur, const imdb_o
     case IMDB_ALTER_DROP_COLUMN:
         if (col->flags & IMDB_COL_PK)
             return imdb_fail(e, IMDB_ERR_INVALID, "column %s is in the primary key of table %s", col->name, s->name);
+        if (h && imdb_fks_name_pos(h, o->apos)) /* F2b-2: RESTRICT, as a CHECK's */
+            return imdb_fail(e, IMDB_ERR_INVALID, "foreign key %s names column %s: drop it first, then drop the column",
+                             imdb_fks_name_pos(h, o->apos), col->name);
         if (c == s->subject)
             return imdb_fail(e, IMDB_ERR_INVALID, "column %s is the SUBJECT of table %s: erasure finds a subject by it",
                              col->name, s->name);
@@ -2419,7 +2519,7 @@ int imdb_sver_next(const imdb_schema_hist *h, const imdb_sver *cur, const imdb_o
                                 * limits; its text binds against the table and every live row passes it (imdb_alter_check) */
         if (!o->chk || o->nchk != 1 || !imdb_checks_ok(o->chk, 1))
             return imdb_fail(e, IMDB_ERR_INVALID, "ADD CHECK: a name and a text of 1 to %u bytes", IMDB_MAX_CHECK_TEXT);
-        if (h && imdb_hist_check(h, o->chk[0].name) >= 0)
+        if (h && (imdb_hist_check(h, o->chk[0].name) >= 0 || imdb_hist_fk(h, o->chk[0].name) >= 0)) /* F2b-2: one name space */
             return imdb_fail(e, IMDB_ERR_CONSTRAINT, "constraint %s for table %s already exists", o->chk[0].name, cur->s.name);
         if (h && h->nchk >= IMDB_MAX_CHECKS)
             return imdb_fail(e, IMDB_ERR_LIMIT, "a table has at most %u CHECK constraints", IMDB_MAX_CHECKS);
@@ -2428,6 +2528,23 @@ int imdb_sver_next(const imdb_schema_hist *h, const imdb_sver *cur, const imdb_o
         return IMDB_OK;
     case IMDB_ALTER_DROP_CHECK:
         if (!o->aname || (h && imdb_hist_check(h, o->aname) < 0))
+            return imdb_fail(e, IMDB_ERR_NOTFOUND, "constraint %s of table %s does not exist", o->aname ? o->aname : "?", cur->s.name);
+        return IMDB_OK;
+    case IMDB_ALTER_ADD_FK: /* F2b-2: catalog state: a name no live constraint holds, within the limit, its columns live
+                             * (the parent, its key and the types: imdb_alter_check's, with the catalog; every live row
+                             * referencing a live parent key: replay's and the auditor's) */
+        if (!o->fk || o->nfk != 1 || !imdb_fks_ok(o->fk, 1))
+            return imdb_fail(e, IMDB_ERR_INVALID, "ADD FOREIGN KEY: a name, 1 to %u columns, an action", IMDB_MAX_KEY_COLS);
+        if (h && (imdb_hist_check(h, o->fk->name) >= 0 || imdb_hist_fk(h, o->fk->name) >= 0))
+            return imdb_fail(e, IMDB_ERR_CONSTRAINT, "constraint %s for table %s already exists", o->fk->name, cur->s.name);
+        if (h && h->nfk >= IMDB_MAX_FKS)
+            return imdb_fail(e, IMDB_ERR_LIMIT, "a table has at most %u FOREIGN KEY constraints", IMDB_MAX_FKS);
+        for (uint8_t k = 0; k < o->fk->ncols; k++)
+            if (o->fk->cols[k] >= cur->npos || cur->at[o->fk->cols[k]] < 0)
+                return imdb_fail(e, IMDB_ERR_INVALID, "ADD FOREIGN KEY of a column table %s does not have", cur->s.name);
+        return IMDB_OK;
+    case IMDB_ALTER_DROP_FK:
+        if (!o->aname || (h && imdb_hist_fk(h, o->aname) < 0))
             return imdb_fail(e, IMDB_ERR_NOTFOUND, "constraint %s of table %s does not exist", o->aname ? o->aname : "?", cur->s.name);
         return IMDB_OK;
     case IMDB_ALTER_SET_TYPE:
@@ -2471,7 +2588,8 @@ int imdb_alter_check(imdb_db *db, imdb_table *t, const imdb_op *o, imdb_err *e)
     imdb_sver nx;
     if (imdb_sver_next(&t->hist, cur, o, &nx, e)) return e->code; /* the schema's and the history's rules */
     const char *name = o->akind == IMDB_ALTER_ADD_COLUMN ? o->acol.name
-                       : o->akind == IMDB_ALTER_RENAME_TABLE || o->akind == IMDB_ALTER_ADD_CHECK || o->akind == IMDB_ALTER_DROP_CHECK
+                       : o->akind == IMDB_ALTER_RENAME_TABLE || o->akind == IMDB_ALTER_ADD_CHECK || o->akind == IMDB_ALTER_DROP_CHECK ||
+                               o->akind == IMDB_ALTER_ADD_FK || o->akind == IMDB_ALTER_DROP_FK
                            ? NULL
                            : t->s.cols[cur->at[o->apos]].name;
     if (o->akind == IMDB_ALTER_RENAME_COLUMN || o->akind == IMDB_ALTER_DROP_COLUMN) { /* F2b-1: a CHECK holds its
@@ -2490,6 +2608,13 @@ int imdb_alter_check(imdb_db *db, imdb_table *t, const imdb_op *o, imdb_err *e)
     case IMDB_ALTER_ADD_CHECK: /* F2b-1: its text binds against the table, and every live row passes it */
         if (imdb_check_bind(&t->s, o->chk[0].text, o->chk[0].len, NULL, e)) return e->code;
         return imdb_check_rows(db, t, o->chk[0].name, o->chk[0].text, o->chk[0].len, e);
+    case IMDB_ALTER_ADD_FK: { /* F2b-2: the parent live (or the table itself), its key, the types; every live row
+                               * referencing a live parent key */
+        const imdb_table *p = o->fk->parent < db->nt ? db->t[o->fk->parent] : NULL;
+        const imdb_sver *ccur = &t->hist.vers[t->hist.nvers - 1], *pcur = p && p->hist.nvers ? &p->hist.vers[p->hist.nvers - 1] : NULL;
+        if (imdb_fk_def_check(ccur, pcur, p && !p->dropped_at, o->fk, e)) return e->code;
+        return imdb_fk_rows_check(db, t, o->fk, e);
+    }
     case IMDB_ALTER_ADD_COLUMN:
     case IMDB_ALTER_DROP_COLUMN: { /* a view that reads the table and holds the name: an ADD's column could capture it,
                                       a DROP's would leave its re-bind nothing (imdb_view_names_col) */
@@ -2572,8 +2697,10 @@ int imdb_hist_prepare(imdb_schema_hist *h, imdb_op *o, imdb_err *e)
     if (o->akind == IMDB_ALTER_ADD_CHECK) { /* F2b-1 */
         snprintf(nv->cname, sizeof nv->cname, "%s", o->chk[0].name);
         nv->clen = o->chk[0].len;
-    } else if (o->akind == IMDB_ALTER_DROP_CHECK) {
+    } else if (o->akind == IMDB_ALTER_DROP_CHECK || o->akind == IMDB_ALTER_DROP_FK) { /* F2b-2 too */
         snprintf(nv->cname, sizeof nv->cname, "%s", o->aname);
+    } else if (o->akind == IMDB_ALTER_ADD_FK) { /* F2b-2 */
+        nv->afk = o->fk[0];
     }
     return imdb_sver_hash(&nv->s, nv->pos, nv->hash, e);
 }
@@ -2628,6 +2755,12 @@ void imdb_hist_install(imdb_schema_hist *h, const imdb_op *o, uint64_t seq)
         break;
     case IMDB_ALTER_DROP_CHECK:
         chk_live_drop(h, nv->cname);
+        break;
+    case IMDB_ALTER_ADD_FK: /* F2b-2: a live FOREIGN KEY by name */
+        fk_live_add(h, &nv->afk);
+        break;
+    case IMDB_ALTER_DROP_FK:
+        fk_live_drop(h, nv->cname);
         break;
     case IMDB_ALTER_DROP_DEFAULT:
         tc->wdef = (imdb_value){.type = tc->missing.type, .scale = tc->missing.scale, .null = true};
@@ -2689,9 +2822,27 @@ int imdb_alter_table(imdb_db *db, imdb_table *t, const imdb_op *proto, imdb_err 
         op->chk = c;
         op->nchk = 1;
     }
+    if (proto->nfk == 1) { /* F2b-2: ADD FK's own copy */
+        imdb_fk *f = imdb_alloc(sizeof *f, e);
+        if (!f) {
+            imdb_free(op->aname);
+            imdb_free(op->chk);
+            op->aname = NULL;
+            op->chk = NULL;
+            op->nchk = 0;
+            db->ntx--;
+            return e->code;
+        }
+        *f = proto->fk[0];
+        op->fk = f;
+        op->nfk = 1;
+    }
     if (imdb_alter_prepare(t, op, e)) {
         imdb_free(op->aname);
         imdb_free(op->chk);
+        imdb_free(op->fk);
+        op->fk = NULL;
+        op->nfk = 0;
         op->chk = NULL;
         op->nchk = 0;
         op->aname = NULL;
@@ -2708,6 +2859,9 @@ int imdb_drop_table(imdb_db *db, imdb_table *t, uint64_t retention_us, imdb_err 
     if (t->dropped_at) return imdb_fail(e, IMDB_ERR_NOTFOUND, "table %s was dropped already", t->s.name);
     const imdb_view *dv = imdb_view_dependent(db, IMDB_VIEWDEP_TABLE, t->s.id); /* P2 S7: PostgreSQL's RESTRICT */
     if (dv) return imdb_fail(e, IMDB_ERR_INVALID, "view %s names table %s: drop it first", dv->name, t->s.name);
+    const char *fkn = NULL; /* F2b-2: RESTRICT, as a view's */
+    if (imdb_fk_referenced(db, t->s.id, &fkn))
+        return imdb_fail(e, IMDB_ERR_INVALID, "foreign key %s references table %s: drop it first", fkn, t->s.name);
     if (retention_us && !imdb_retention_ok(retention_us))
         return imdb_fail(e, IMDB_ERR_INVALID, "RETENTION is a second to a century, or FOREVER");
     uint64_t r = retention_us ? retention_us : t->retention_us;
@@ -2738,12 +2892,14 @@ void imdb_table_drop_install(imdb_db *db, imdb_table *t, uint64_t seq)
         ended++;
     }
     t->live = 0;
+    t->live_stubs = 0;
     t->dropped_at = seq;
     db->ended_pass += ended; /* the memory window's trigger, as DELETE's ends */
     imdb_check_free(t->chkc); /* F2b-1: a dropped table is written no more */
     t->chkc = NULL;
     imdb_check_free(t->genc); /* F2c */
     t->genc = NULL;
+    imdb_fk_free(t); /* F2b-2 */
     imdb_txn_doom_dropped(db, t->s.id, seq);
 }
 
@@ -3986,6 +4142,11 @@ static int add_version(imdb_db *db, imdb_table *t, const uint8_t *row, size_t le
         goto fail;
     }
     t->live++;
+    if (t->fkm) { /* F2b-2: the FK maps (fk.c) take it, a derived structure: a failure only drops them */
+        imdb_value fv[IMDB_MAX_COLS];
+        imdb_err e2 = {0};
+        if (imdb_row_decode(&t->s, row, len, fv, &e2) || imdb_fk_index_add(db, t, vid, fv, &e2)) imdb_fk_free(t);
+    }
     *vid_out = vid;
     return IMDB_OK;
 fail:
@@ -5198,6 +5359,8 @@ static int commit_body(imdb_db *db, imdb_err *e)
             frc = imdb_fail(e, IMDB_ERR_CONFLICT, "table %s was dropped at commit %llu; roll back and retry the transaction",
                             db->t[db->tx[i].table]->s.name, (unsigned long long)db->t[db->tx[i].table]->dropped_at);
     }
+    if (!frc) frc = imdb_fk_check(db, 0, e); /* F2b-2: every write against the state now (a parked transaction's replay
+                                               * met the commits since; the API's writes have no statement end) */
     /* the commit index doubles now and then: a commit that writes rows is refused here, before
      * anything is logged; deletions and the physical ops (the ways down) never are */
     bool grows = false;
@@ -6470,6 +6633,9 @@ void imdb_hist_free(imdb_schema_hist *h)
     imdb_free(h->chk0); /* F2b-1: version 1's CHECKs, an ADD CHECK's staged text */
     h->chk0 = NULL;
     h->nchk0 = h->nchk = 0;
+    imdb_free(h->fk0); /* F2b-2 */
+    h->fk0 = NULL;
+    h->nfk0 = h->nfk = 0;
     h->chkbytes = 0;
     imdb_free(h->cstaged);
     h->cstaged = NULL;
@@ -6515,6 +6681,9 @@ int imdb_hist_copy(imdb_schema_hist *dst, const imdb_schema_hist *src, imdb_err 
         }
     imdb_check *c0 = NULL;
     if (!rc && src->nchk0 && !(c0 = checks_dup(src->chk0, src->nchk0, e))) rc = e->code;
+    imdb_fk *f0 = NULL; /* F2b-2 */
+    if (!rc && !(f0 = imdb_alloc_array(src->nfk0 ? src->nfk0 : 1, sizeof *f0, e))) rc = e->code;
+    if (f0 && src->nfk0) memcpy(f0, src->fk0, (size_t)src->nfk0 * sizeof *f0);
     char *gt[IMDB_MAX_COLS] = {0}; /* F2c: each generated column's text, the copy's own */
     for (uint16_t p = 0; p < src->ntcol && !rc; p++)
         if (src->tcol[p].gtext && !(gt[p] = (char *)bytes_dup((const uint8_t *)src->tcol[p].gtext, src->tcol[p].glen, e))) rc = e->code;
@@ -6525,6 +6694,7 @@ int imdb_hist_copy(imdb_schema_hist *dst, const imdb_schema_hist *src, imdb_err 
             imdb_free(v[k].ctext);
         }
         imdb_free(c0);
+        imdb_free(f0);
         for (uint16_t p = 0; p < IMDB_MAX_COLS; p++) imdb_free(gt[p]);
         imdb_free(v);
         return rc;
@@ -6535,9 +6705,12 @@ int imdb_hist_copy(imdb_schema_hist *dst, const imdb_schema_hist *src, imdb_err 
     dst->capvers = src->capvers ? src->capvers : 1;
     dst->ntcol = src->ntcol;
     dst->chk0 = c0; /* F2b-1: version 1's, then the live set from the versions' own texts */
+    dst->fk0 = f0; /* F2b-2: likewise */
+    dst->nfk0 = src->nfk0;
     dst->ngen = src->ngen; /* F2c */
     dst->nchk0 = src->nchk0;
     chk_live_rebuild(dst);
+    fk_live_rebuild(dst);
     for (uint16_t p = 0; p < IMDB_MAX_COLS; p++) {
         imdb_tcol *tc = &dst->tcol[p];
         *tc = p < src->ntcol ? src->tcol[p] : (imdb_tcol){.wver = -1};

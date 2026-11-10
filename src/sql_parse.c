@@ -1311,6 +1311,110 @@ static int parse_check(parser *p, sql_stmt *st, const char *name)
     return IMDB_OK;
 }
 
+/* F2b-2: ON DELETE / ON UPDATE's action at p's token (ON and the event read): IMDB_FK_* */
+static int fk_action(parser *p, uint8_t *out)
+{
+    if (kw(p, "cascade")) *out = IMDB_FK_CASCADE;
+    else if (kw(p, "restrict")) *out = IMDB_FK_RESTRICT;
+    else if (kw(p, "no")) {
+        if (expect_kw(p, "action")) return p->e->code;
+        *out = IMDB_FK_NO_ACTION;
+    } else if (kw(p, "set")) {
+        if (kw(p, "null")) *out = IMDB_FK_SET_NULL;
+        else if (kw(p, "default")) *out = IMDB_FK_SET_DEFAULT;
+        else return fail_at(p, "NULL or DEFAULT");
+    } else {
+        return fail_at(p, "CASCADE, RESTRICT, NO ACTION, SET NULL or SET DEFAULT");
+    }
+    return IMDB_OK;
+}
+
+/* F2b-2: REFERENCES parent [(cols)] [ON DELETE action] [ON UPDATE action] [MATCH SIMPLE] [NOT DEFERRABLE], REFERENCES
+ * already read, for the FK st->fks[st->nfks] whose name and columns the caller set; then it counts */
+static int parse_references(parser *p, sql_stmt *st)
+{
+    sql_fkdef *f = &st->fks[st->nfks];
+    if (ident(p, f->parent)) return p->e->code;
+    if (tok(p, TK_LP)) {
+        do {
+            if (f->npcols >= IMDB_MAX_KEY_COLS)
+                return imdb_fail(p->e, IMDB_ERR_LIMIT, "a FOREIGN KEY of more than %u columns", IMDB_MAX_KEY_COLS);
+            if (ident(p, f->pcols[f->npcols++])) return p->e->code;
+        } while (tok(p, TK_COMMA));
+        if (expect(p, TK_RP, ")")) return p->e->code;
+    }
+    bool del = false, upd = false;
+    for (;;) {
+        if (tok_is_kw(p, p->i, "on") && (tok_is_kw(p, p->i + 1, "delete") || tok_is_kw(p, p->i + 1, "update"))) {
+            p->i++;
+            bool d = kw(p, "delete");
+            if (!d) p->i++; /* UPDATE */
+            if (d ? del : upd) return imdb_fail(p->e, IMDB_ERR_SYNTAX, "ON %s given twice", d ? "DELETE" : "UPDATE");
+            if (fk_action(p, d ? &f->on_delete : &f->on_update)) return p->e->code;
+            if (d) del = true;
+            else upd = true;
+        } else if (kw(p, "match")) {
+            if (!kw(p, "simple"))
+                return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "MATCH FULL and MATCH PARTIAL are a later step: MATCH SIMPLE (the "
+                                                            "default) checks a key with no NULL in it");
+        } else if (tok_is_kw(p, p->i, "not") && tok_is_kw(p, p->i + 1, "deferrable")) {
+            p->i += 2;
+        } else if (tok_is_kw(p, p->i, "deferrable") || tok_is_kw(p, p->i, "initially")) {
+            return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "a deferrable FOREIGN KEY is a later step: it is checked at each "
+                                                        "statement's end");
+        } else {
+            break;
+        }
+    }
+    if (f->on_update != IMDB_FK_NO_ACTION && f->on_update != IMDB_FK_RESTRICT)
+        return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "ON UPDATE takes NO ACTION or RESTRICT: a key is never updated in imagedb, "
+                                                    "so no other action could fire");
+    st->nfks++;
+    return IMDB_OK;
+}
+
+/* F2b-2: a table's FOREIGN KEY (cols) REFERENCES ..., FOREIGN read, named name ("" for one to choose) */
+static int parse_fk_table(parser *p, sql_stmt *st, const char *name)
+{
+    if (st->nfks >= IMDB_MAX_FKS) return imdb_fail(p->e, IMDB_ERR_LIMIT, "a table has at most %u FOREIGN KEY constraints", IMDB_MAX_FKS);
+    if (!st->fks && !(st->fks = imdb_alloc_array(IMDB_MAX_FKS, sizeof *st->fks, p->e))) return p->e->code;
+    if (expect_kw(p, "key") || expect(p, TK_LP, "(")) return p->e->code;
+    sql_fkdef *f = &st->fks[st->nfks];
+    memset(f, 0, sizeof *f);
+    snprintf(f->name, sizeof f->name, "%s", name);
+    do {
+        if (f->ncols >= IMDB_MAX_KEY_COLS)
+            return imdb_fail(p->e, IMDB_ERR_LIMIT, "a FOREIGN KEY of more than %u columns", IMDB_MAX_KEY_COLS);
+        if (ident(p, f->cols[f->ncols++])) return p->e->code;
+    } while (tok(p, TK_COMMA));
+    if (expect(p, TK_RP, ")") || expect_kw(p, "references")) return p->e->code;
+    return parse_references(p, st);
+}
+
+/* F2b-2: a column's [CONSTRAINT name] REFERENCES ..., at p's token: 1 (one added), 0 (not one: nothing read), or the
+ * error; col the column's name */
+static int maybe_column_fk(parser *p, sql_stmt *st, const char *col)
+{
+    char name[IMDB_MAX_IDENT + 1] = "";
+    uint32_t at = p->i;
+    if (tok_is_kw(p, p->i, "constraint") && tok_is_kw(p, p->i + 2, "references")) {
+        p->i++;
+        if (ident(p, name)) return p->e->code;
+    }
+    if (!kw(p, "references")) {
+        p->i = at;
+        return 0;
+    }
+    if (st->nfks >= IMDB_MAX_FKS) return imdb_fail(p->e, IMDB_ERR_LIMIT, "a table has at most %u FOREIGN KEY constraints", IMDB_MAX_FKS);
+    if (!st->fks && !(st->fks = imdb_alloc_array(IMDB_MAX_FKS, sizeof *st->fks, p->e))) return p->e->code;
+    sql_fkdef *f = &st->fks[st->nfks];
+    memset(f, 0, sizeof *f);
+    snprintf(f->name, sizeof f->name, "%s", name);
+    snprintf(f->cols[0], sizeof f->cols[0], "%s", col);
+    f->ncols = 1;
+    return parse_references(p, st) ? p->e->code : 1;
+}
+
 /* F2b-1: [CONSTRAINT name] CHECK at p's token, read: 1 (a CHECK added), 0 (neither word: nothing read), or the error */
 static int maybe_check(parser *p, sql_stmt *st)
 {
@@ -1318,7 +1422,11 @@ static int maybe_check(parser *p, sql_stmt *st)
     if (tok_is_kw(p, p->i, "constraint")) {
         p->i++;
         if (ident(p, name)) return p->e->code;
-        if (!tok_is_kw(p, p->i, "check")) return fail_at(p, "CHECK (a CONSTRAINT names a CHECK: PRIMARY KEY takes no name)");
+        if (kw(p, "foreign")) return parse_fk_table(p, st, name) ? p->e->code : 1; /* F2b-2 */
+        if (!tok_is_kw(p, p->i, "check")) return fail_at(p, "CHECK or FOREIGN KEY (a CONSTRAINT names one: PRIMARY KEY takes no name)");
+    } else if (tok_is_kw(p, p->i, "foreign") && tok_is_kw(p, p->i + 1, "key")) { /* F2b-2: a table's FOREIGN KEY */
+        p->i++;
+        return parse_fk_table(p, st, name) ? p->e->code : 1;
     } else if (!tok_is_kw(p, p->i, "check") || p->t[p->i + 1].kind != TK_LP) {
         return 0;
     }
@@ -1336,10 +1444,10 @@ static int parse_alter(parser *p, sql_stmt *st)
     }
     st->kind = ST_ALTER_TABLE;
     if (kw(p, "add")) {
-        int ck = maybe_check(p, st); /* F2b-1: ADD [CONSTRAINT name] CHECK (condition) */
+        int ck = maybe_check(p, st); /* F2b-1: ADD [CONSTRAINT name] CHECK (condition); F2b-2: or FOREIGN KEY */
         if (ck < 0) return ck;
         if (ck) {
-            st->alter_kind = IMDB_ALTER_ADD_CHECK;
+            st->alter_kind = st->nfks ? IMDB_ALTER_ADD_FK : IMDB_ALTER_ADD_CHECK;
             return IMDB_OK;
         }
         kw(p, "column");
@@ -1509,6 +1617,8 @@ static int parse_create(parser *p, sql_stmt *st)
                 uint8_t ck = 0;
                 if (default_value(p, &st->cdef[s->ncols], &ck)) return p->e->code;
                 st->cdef_kind[s->ncols] = ck ? ck : IMDB_DEFK_VALUE;
+            } else if ((cki = maybe_column_fk(p, st, c->name)) != 0) { /* F2b-2: a column's [CONSTRAINT name] REFERENCES */
+                if (cki < 0) return cki;
             } else if ((cki = maybe_check(p, st)) != 0) { /* F2b-1: a column's [CONSTRAINT name] CHECK (condition) */
                 if (cki < 0) return cki;
             } else if (kw(p, "subject")) {
@@ -2327,6 +2437,9 @@ void imdb_sql_stmt_free(sql_stmt *st)
     st->narm = 0;
     imdb_free(st->ptypes); /* P2 S9 */
     st->ptypes = NULL;
+    imdb_free(st->fks); /* F2b-2 */
+    st->fks = NULL;
+    st->nfks = 0;
     imdb_free(st->cte_col); /* P2 S5 */
     st->cte_col = NULL;
     st->cte_ncols = 0;

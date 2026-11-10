@@ -1,7 +1,7 @@
 #!/bin/sh
-# Makes the format's fixtures (2026-11-09, fifth pair: META 5, log version 3, manifest version 12 and segment format 3 (F1 stage 4:
-# a segment names its schema version by its hash with positions), ops 16, 19, 20, 21, 22's kinds and 23 to 28; alg1-20261109e.tar.gz
-# and alg2-20261109e.tar.gz beside this script): a primary and its replica under digest algorithm ALG, by
+# Makes the format's fixtures (2026-11-09, sixth pair: META 5, log version 3, manifest version 13 and segment format 3 (F1 stage 4:
+# a segment names its schema version by its hash with positions), ops 16, 19, 20, 21, 22's kinds and 23 to 29; alg1-20261109f.tar.gz
+# and alg2-20261109f.tar.gz beside this script): a primary and its replica under digest algorithm ALG, by
 # make_alg2.sh's steps, which reach every reader of the format: a log of several segments (each manifest
 # publish ends one), CHECKPOINTs (manifests, segments, the lanes), a two-column index and a unique one,
 # an UPDATE and a DELETE, ERASE SUBJECT (redacted log payloads, rewritten segments), commits after it, and
@@ -21,7 +21,9 @@
 # one and a table's; a NULL passing), an ADD CONSTRAINT CHECK over its rows and a DROP CONSTRAINT after the first CHECKPOINT
 # (op 22 kinds 11 and 12; manifest 11: version 1's CHECKs in the history), and (F2c) a table of generated columns (op 23
 # kind 9: an INT64, a VARCHAR and a DECIMAL rounding both signs; rows leaving them out, a NULL source), a source column
-# updated and the generated column itself renamed after the first CHECKPOINT (manifest 12: version 1's expressions). The live
+# updated and the generated column itself renamed after the first CHECKPOINT (manifest 12: version 1's expressions). And (F2b-2)
+# FOREIGN KEYs (op 29: a CASCADE and a SET NULL over two levels), an ADD FOREIGN KEY after the first CHECKPOINT, a parent
+# deleted with its actions from the log, a DROP CONSTRAINT (manifest 13: version 1's FOREIGN KEYs). The live
 # tables are RETENTION FOREVER and the dropped one is kept a century, the longest but FOREVER: a fixture is frozen
 # data, so its history
 # never expires under the tests that open it (the 24-hour default is tested by the unit tests). Every
@@ -32,10 +34,11 @@
 # version 6 and log version 2; alg1-20261108 and alg2-20261108, manifest version 7 and segment format 2; alg1-20261109
 # and alg2-20261109, manifest version 8: before CREATE TABLE's DEFAULTs; alg1-20261109b and alg2-20261109b, manifest version 9:
 # before sequences; alg1-20261109c and alg2-20261109c, manifest version 10: before CHECK constraints; alg1-20261109d and
-# alg2-20261109d, manifest version 11: before generated columns) stay as
+# alg2-20261109d, manifest version 11: before generated columns; alg1-20261109e and alg2-20261109e, manifest version 12:
+# before FOREIGN KEYs) stay as
 # directories this format refuses.
 #   sh tests/fixtures/make_fixtures.sh BIN AUDIT ALG OUTDIR   (OUTDIR must not exist)
-#   tar -czf tests/fixtures/algALG-20261109e.tar.gz -C OUTDIR primary replica
+#   tar -czf tests/fixtures/algALG-20261109f.tar.gz -C OUTDIR primary replica
 set -eu
 BIN=$1
 AUD=$2
@@ -96,6 +99,12 @@ sql "CREATE TABLE checked (id INT64 PRIMARY KEY, q INTEGER CHECK (q BETWEEN 0 AN
 sql "INSERT INTO checked VALUES (1, 10, 'k1', '2001-01-01'), (2, NULL, NULL, NULL)" # a NULL passes
 sql "CREATE TABLE gened (id INT64 PRIMARY KEY, a INTEGER, s TEXT, w BIGINT GENERATED ALWAYS AS (a * 2 + id) STORED, u VARCHAR(12) GENERATED ALWAYS AS (UPPER(s) || '!') STORED, h DECIMAL(8,2) GENERATED ALWAYS AS (a / 3.0) STORED) RETENTION FOREVER" # F2c: op 23 kind 9
 sql "INSERT INTO gened (id, a, s) VALUES (1, 5, 'ab'), (2, NULL, NULL), (3, -5, 'x')" # 1.67 and -1.67: half away from zero
+sql "CREATE TABLE fkp (id INT64 PRIMARY KEY, n TEXT) RETENTION FOREVER" # F2b-2
+sql "CREATE TABLE fkc (id INT64 PRIMARY KEY, pid INT64 REFERENCES fkp ON DELETE CASCADE, q INT64) RETENTION FOREVER" # op 29
+sql "CREATE TABLE fkn (id INT64 PRIMARY KEY, cid INT64, CONSTRAINT fkn_c FOREIGN KEY (cid) REFERENCES fkc ON DELETE SET NULL) RETENTION FOREVER"
+sql "INSERT INTO fkp VALUES (1, 'a'), (2, 'b'), (3, 'c')"
+sql "INSERT INTO fkc VALUES (10, 1, 2), (11, 1, 3), (12, 2, NULL)"
+sql "INSERT INTO fkn VALUES (20, 10), (21, 12), (22, NULL)"
 sql "CHECKPOINT"
 ship
 sql "ALTER TABLE pair ADD w TEXT DEFAULT 'w0'"          # F1: op 22; pair's rows so far are in a segment of version 1
@@ -126,6 +135,9 @@ sql "INSERT INTO checked VALUES (3, 4, 'free text', NULL)"
 sql "UPDATE gened SET a = 7 WHERE id = 1"              # F2c: computed again from the log
 sql "ALTER TABLE gened RENAME COLUMN u TO shout"      # the generated column itself renamed
 sql "INSERT INTO gened (id, a, s) VALUES (4, 1, 'q')"
+sql "ALTER TABLE fkc ADD CONSTRAINT fkc_q FOREIGN KEY (q) REFERENCES fkp" # F2b-2: op 22 kind 13 over the rows
+sql "DELETE FROM fkp WHERE id = 1"                   # fkc 10 and 11 cascade, fkn 20's cid NULL: from the log
+sql "ALTER TABLE fkc DROP CONSTRAINT fkc_q"           # kind 14
 sql "UPDATE stamp SET at = TIMESTAMPTZ '2030-01-01 12:00:00+05:45' WHERE id = 3" # P2: an instant from the log
 sql "UPDATE acct SET balance = 1.00 WHERE id <= 10"
 sql "DELETE FROM ev WHERE id BETWEEN 1 AND 5"

@@ -73,9 +73,10 @@ enum {
 
 #define IMDB_SEG_HEADER 64u
 #define IMDB_SEG_VERSION 3u /* F1 stage 4: the header names its schema version by imdb_sver_hash (2: by the schema alone) */
-#define IMDB_MANIFEST_VERSION 12u /* F2c: a CREATE's generated columns (op 23 kind 9) among version 1's DEFAULTs (11 before
-                                   them: F2b-1, version 1's CHECKs; 10: F2a-2, the sequences section; 9: F2a, a CREATE's
-                                   DEFAULTs; 8; 7: segment format 2); 2 to 11 refused by name (old_manifest) */
+#define IMDB_MANIFEST_VERSION 13u /* F2b-2: version 1's FOREIGN KEYs (op 29) after its CHECKs (12 before them: F2c, a
+                                   CREATE's generated columns; 11: F2b-1, version 1's CHECKs; 10: F2a-2, the sequences
+                                   section; 9: F2a, a CREATE's DEFAULTs; 8; 7: segment format 2); 2 to 12 refused by name
+                                   (old_manifest) */
 #define IMDB_SEG_STUB 1u   /* erased: vid, begin and commitment only */
 #define IMDB_SEG_PURGED 2u /* purged by COMPACT ... PURGE: vid, begin, commitment and the SUBJECT value */
 

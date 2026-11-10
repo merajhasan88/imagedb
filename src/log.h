@@ -143,6 +143,9 @@ enum {
                                      COLUMN_DEFAULTS (when it has one), in their commit: u32 table, then imdb_checks_put's
                                      list (1 to IMDB_MAX_CHECKS, by name). Catalog state, as a DEFAULT: no schema hash
                                      covers it; replay and VERIFY bind each text against the CREATE's schema */
+    IMDB_OP_TABLE_FKS = 29,       /* F2b-2: a CREATE's FOREIGN KEYs, right after its CREATE_TABLE, SET_RETENTION and any
+                                     COLUMN_DEFAULTS and TABLE_CHECKS, in their commit: u32 table, then imdb_fks_put's list
+                                     (1 to IMDB_MAX_FKS, by name). Catalog state, as a CHECK (docs/fk-design.md) */
 };
 
 /* op 22's kinds (F1) */
@@ -161,7 +164,10 @@ enum {
     IMDB_ALTER_ADD_CHECK = 11,   /* F2b-1: a CHECK constraint (imdb_check: its name, none of the table's live ones', and
                                     its text); every live row at the commit passes it (replay and the auditor) */
     IMDB_ALTER_DROP_CHECK = 12,  /* F2b-1: DROP CONSTRAINT: a live CHECK's name */
-    IMDB_ALTER_LAST = IMDB_ALTER_DROP_CHECK,
+    IMDB_ALTER_ADD_FK = 13,      /* F2b-2: a FOREIGN KEY (imdb_fk: its name, none of the table's live constraints'); every
+                                    live row at the commit references a live parent key (replay and the auditor) */
+    IMDB_ALTER_DROP_FK = 14,     /* F2b-2: DROP CONSTRAINT: a live FOREIGN KEY's name */
+    IMDB_ALTER_LAST = IMDB_ALTER_DROP_FK,
 };
 
 /* F2b-1: a CHECK constraint: its name (an identifier, folded) and its text as written (strict UTF-8 without NUL, 1 to
@@ -180,6 +186,25 @@ bool imdb_check_text_ok(const char *s, uint32_t len);
 void imdb_checks_put(imdb_buf *b, const imdb_check *c, uint16_t n);
 int imdb_checks_get(imdb_rd *r, bool none_ok, imdb_check **out, uint16_t *n, const char *what, imdb_err *e);
 bool imdb_checks_ok(const imdb_check *c, uint16_t n);
+
+/* F2b-2: a FOREIGN KEY (docs/fk-design.md): its name (an identifier, folded; one name space with the table's CHECKs),
+ * its columns by position (1 to IMDB_MAX_KEY_COLS, each once), the parent table's id and the parent's primary key
+ * columns by position in its key order (as many), ON DELETE and ON UPDATE. A list (op 29, a manifest's version 1): u16 n
+ * (1 to IMDB_MAX_FKS; a manifest's 0 too), each u8 name length, the name, u8 ncols, each u16 position, u32 parent,
+ * each u16 parent position, u8 on_delete (IMDB_FK_*), u8 on_update (NO ACTION or RESTRICT: a key is never updated), by
+ * name strictly increasing. Op 22's kind 13 is one of them, kind 14 its name alone. The positions' meaning (live
+ * columns, the parent's key, the types) is the catalog's rule, not the codec's */
+enum { IMDB_FK_NO_ACTION = 0, IMDB_FK_RESTRICT = 1, IMDB_FK_CASCADE = 2, IMDB_FK_SET_NULL = 3, IMDB_FK_SET_DEFAULT = 4 };
+typedef struct imdb_fk {
+    char name[IMDB_MAX_IDENT + 1];
+    uint8_t ncols, on_delete, on_update;
+    uint16_t cols[IMDB_MAX_KEY_COLS];
+    uint32_t parent;
+    uint16_t pcols[IMDB_MAX_KEY_COLS];
+} imdb_fk;
+bool imdb_fks_ok(const imdb_fk *f, uint16_t n);
+void imdb_fks_put(imdb_buf *b, const imdb_fk *f, uint16_t n);
+int imdb_fks_get(imdb_rd *r, bool none_ok, imdb_fk **out, uint16_t *n, const char *what, imdb_err *e);
 
 /* F2a: a column default's kind: a constant, or the clock read when a row is written (PostgreSQL's: the transaction's
  * start, design.md §5, Clock values); a clock kind suits a column type by imdb_defk_fits */
@@ -330,6 +355,9 @@ typedef struct imdb_op {
     /* F2b-1: TABLE_CHECKS' list, ALTER's ADD CHECK's one (one allocation, imdb_checks_get's); DROP CHECK: aname */
     imdb_check *chk;
     uint16_t nchk;
+    /* F2b-2: TABLE_FKS' list, ALTER's ADD FK's one (allocated); DROP FK: aname */
+    imdb_fk *fk;
+    uint16_t nfk;
     /* F2a-2: CREATE_SEQUENCE's definition (allocated); DROP_SEQUENCE, SEQ_ADVANCE and SEQ_SET: seq, sval (the mark or
      * the value) and scalled */
     imdb_seqdef *sdef;

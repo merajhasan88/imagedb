@@ -87,6 +87,7 @@ static int apply_insert(imdb_db *db, imdb_table *t, const imdb_op *op, uint64_t 
     if (op->pkind == IMDB_PAYLOAD_REDACTED) {
         v->flags = IMDB_V_STUB | IMDB_V_PENDING_AUTH;
         db->pending_auth++;
+        t->live_stubs++; /* F2b-2: a live row whose key is unknown */
         return IMDB_OK;
     }
     memcpy(imdb_vc(t, vid)->salt, op->salt, 16);
@@ -95,6 +96,12 @@ static int apply_insert(imdb_db *db, imdb_table *t, const imdb_op *op, uint64_t 
     imdb_buf_put(&t->arena, op->row, op->row_len);
     if (imdb_buf_check(&t->arena, e)) return e->code;
     if (imdb_index_version(t, vid, NULL, e)) return e->code;
+    if (t->fkm) { /* F2b-2: the FK maps take it (a derived structure: a failure only drops them) */
+        imdb_value fv[IMDB_MAX_COLS];
+        imdb_err e2 = {0};
+        bool row = op->pkind == IMDB_PAYLOAD_ROW && imdb_row_decode(&t->s, op->row, op->row_len, fv, &e2) == IMDB_OK;
+        if ((op->pkind == IMDB_PAYLOAD_ROW && !row) || imdb_fk_index_add(db, t, vid, row ? fv : NULL, &e2)) imdb_fk_free(t);
+    }
     (void)pk_link;
     return IMDB_OK;
 }
@@ -163,6 +170,7 @@ static int apply_end(imdb_table *t, uint64_t vid, const uint8_t commit[32], uint
     v->end = seq;
     imdb_seg_set_end(t, v, seq);
     t->live--;
+    if ((v->flags & IMDB_V_STUB) && t->live_stubs) t->live_stubs--;
     return IMDB_OK;
 }
 
@@ -259,7 +267,7 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
                    o->code == IMDB_OP_COMPACT || o->code == IMDB_OP_CREATE_INDEX || o->code == IMDB_OP_DROP_INDEX ||
                    o->code == IMDB_OP_SET_RETENTION || o->code == IMDB_OP_EXPIRE || o->code == IMDB_OP_DROP_TABLE ||
                    o->code == IMDB_OP_ALTER_TABLE || o->code == IMDB_OP_COLUMN_DEFAULTS ||
-                   o->code == IMDB_OP_TABLE_CHECKS)) {
+                   o->code == IMDB_OP_TABLE_CHECKS || o->code == IMDB_OP_TABLE_FKS)) {
             rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: unknown table %u", (unsigned long long)seq, o->table);
             break;
         }
@@ -295,12 +303,27 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
             if (!rc) rc = imdb_hist_create_checks(&t->hist, o->chk, o->nchk, e);
             break;
         }
+        case IMDB_OP_TABLE_FKS: { /* F2b-2: each by the catalog's rules against the CREATE's version and its parent now */
+            const imdb_sver *ccur = &t->hist.vers[t->hist.nvers - 1];
+            for (uint16_t k = 0; k < o->nfk && !rc; k++) {
+                const imdb_table *p = o->fk[k].parent == o->table ? t : o->fk[k].parent < db->nt ? db->t[o->fk[k].parent] : NULL;
+                const imdb_sver *pcur = p == t ? ccur : p && p->hist.nvers ? &p->hist.vers[p->hist.nvers - 1] : NULL;
+                imdb_err e2 = {0};
+                if (imdb_fk_def_check(ccur, pcur, p && !p->dropped_at, &o->fk[k], &e2))
+                    rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: %s", (unsigned long long)seq, e2.msg);
+            }
+            if (!rc) rc = imdb_hist_create_fks(&t->hist, o->fk, o->nfk, e);
+            break;
+        }
         case IMDB_OP_DROP_TABLE: /* live, and its history not kept FOREVER (its commit's op 16 applied first) */
             if (t->dropped_at)
                 rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: DROP of table %u, dropped already", (unsigned long long)seq,
                                o->table);
             else if (t->retention_us == IMDB_RETAIN_FOREVER)
                 rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: DROP of table %u, which is kept FOREVER",
+                               (unsigned long long)seq, o->table);
+            else if (imdb_fk_referenced(db, t->s.id, NULL)) /* F2b-2: RESTRICT */
+                rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: DROP of table %u, which a live foreign key references",
                                (unsigned long long)seq, o->table);
             else if (imdb_view_dependent(db, IMDB_VIEWDEP_TABLE, t->s.id)) /* P2 S7: RESTRICT */
                 rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: DROP of table %u, which a live view names",
@@ -520,6 +543,7 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
             rc = imdb_fail(e, IMDB_ERR_VERIFY, "commit %llu: version store does not reflect op %u", (unsigned long long)seq, i);
     }
     if (rc) goto out;
+    if ((rc = imdb_fk_verify_commit(db, c, seq, e))) goto out; /* F2b-2: referential integrity at the commit's end */
 
     /* 4. install */
     if (imdb_commit_writer_op(c) && (rc = imdb_writer_apply(db, c, e))) goto out; /* later commits verify under its key */

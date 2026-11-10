@@ -385,6 +385,12 @@ static bool g_ckey; /* P2 F4, --ckey: u's key is (tid, id), every dialect's; ids
 static bool g_alter; /* P2 F1, --alter: t's last five columns added after its first rows and zz dropped (alter_add) */
 static bool g_defaults; /* F2a, --defaults: t's g, x and s with constant DEFAULTs in every dialect (ddl_defaults), which
                          * INSERT ... SELECT's column lists leaving them out write; the generator draw for draw */
+static bool g_fk;    /* F2b-2, --fk: u.tid REFERENCES t (id) in every dialect, ON DELETE by seed (g_fk_act: NO ACTION, CASCADE,
+                        * SET NULL where tid is nullable), a table constraint (MySQL ignores a column's REFERENCES); SQLite's
+                        * PRAGMA foreign_keys = ON; u's tids from t's nine times in ten */
+static int g_fk_act;
+static bool g_fill; /* run_seed's first rows: under --fk every tid a live t id (a refused batch of 8 would thin u) */
+static unsigned long g_fk_seeds[3];
 static bool g_gen; /* F2c, --generated: u given w GENERATED ALWAYS AS (v + tid) STORED in every dialect (ddl_gen): every write to u
                      * names its columns, SELECT * of u lists them, and u's state compares w (check_gen) */
 static bool g_checks; /* F2b-1, --checks: t with two CHECKs in every dialect (ddl_checks): writes some rows fail, refused whole by
@@ -1540,7 +1546,9 @@ static void gen_row(int tab, val *row)
     row[0].null = false;
     if (tab == 1 && g_ckey) row[1].null = false; /* F4: tid a key column */
     row[0].i = g_next_id++;
-    if (tab == 1 && !row[1].null && g_ntids && chance(70)) row[1].i = g_tids[rnd() % (uint64_t)g_ntids];
+    bool pick = g_ntids && tab == 1 && !row[1].null && (g_fk ? chance(90) : chance(70));
+    if (g_fk && g_fill && tab == 1 && !row[1].null && g_ntids) pick = true; /* F2b-2: the first rows all valid, draw for draw */
+    if (pick) row[1].i = g_tids[rnd() % (uint64_t)g_ntids];
     if (tab == 0 && g_ntids < (int)(sizeof g_tids / sizeof g_tids[0])) g_tids[g_ntids++] = row[0].i;
     for (int c = tab ? 0 : 1; c < ncols(tab); c++) sample(tab, c, &row[c]); /* t.id: g_tids */
 }
@@ -3405,6 +3413,18 @@ static const char *ddl_gen(int d, const char *s)
     return b[d];
 }
 
+/* --fk (F2b-2): u's FOREIGN KEY as a table constraint before its closing parenthesis, the seed's action */
+static const char *ddl_fk(int d, const char *s)
+{
+    static char b[ND][900];
+    static const char *const A[3] = {"NO ACTION", "CASCADE", "SET NULL"};
+    if (!g_fk) return s;
+    size_t n = strlen(s);
+    if (n + 80 >= sizeof b[d] || s[n - 1] != ')') return s;
+    snprintf(b[d], sizeof b[d], "%.*s, FOREIGN KEY (tid) REFERENCES t (id) ON DELETE %s)", (int)(n - 1), s, A[g_fk_act]);
+    return b[d];
+}
+
 static const char *ddl(int d, int tab)
 {
     static const char *const T[ND] = {
@@ -3440,7 +3460,7 @@ static const char *ddl(int d, int tab)
         "utf8mb4_nopad_bin)",
         "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, tid BIGINT, v INT, s VARCHAR(255) COLLATE "
         "Latin1_General_100_BIN2_UTF8)"};
-    return tab ? ddl_gen(d, g_ckey ? UCK[d] : U[d]) : g_alter ? ddl_alter(d, T[d]) : ddl_checks(d, ddl_defaults(d, tz_ddl(d, T[d])));
+    return tab ? ddl_fk(d, ddl_gen(d, g_ckey ? UCK[d] : U[d])) : g_alter ? ddl_alter(d, T[d]) : ddl_checks(d, ddl_defaults(d, tz_ddl(d, T[d])));
 }
 
 /* ---- canonical cells: every engine's answer to one text per value ------------------------------------------------ */
@@ -4105,6 +4125,7 @@ static void reset_all(unsigned seed)
             if (e->lite) sqlite3_close(e->lite);
             if (sqlite3_open(":memory:", &e->lite) != SQLITE_OK) exit(2);
             must(e, "PRAGMA case_sensitive_like = ON"); /* P2 S1: LIKE as the others compare it (binary collations) */
+            if (g_fk) must(e, "PRAGMA foreign_keys = ON"); /* F2b-2: SQLite enforces FOREIGN KEYs per connection */
         } else {
             /* a seed stopped by a mismatch (--keep-going) may have left a transaction open, or aborted (PostgreSQL) */
             res rb;
@@ -4776,6 +4797,8 @@ static void alter_add(void)
 
 static int run_seed(unsigned seed, int steps)
 {
+    g_fk_act = (int)(seed % (g_ckey ? 2u : 3u)); /* F2b-2: the action by the seed, no draw taken (SET NULL needs a nullable tid) */
+    if (g_fk) g_fk_seeds[g_fk_act]++;
     g_rng = 0x9E3779B97F4A7C15ull ^ ((uint64_t)seed * 0xBF58476D1CE4E5B9ull);
     if (!g_rng) g_rng = 1;
     g_next_id = 1;
@@ -4786,6 +4809,7 @@ static int run_seed(unsigned seed, int steps)
     reset_all(seed);
     stmt q;
     int step = 0;
+    g_fill = true; /* F2b-2 */
     for (int tab = 0; tab < 2; tab++) { /* the first rows: t's, then u's children */
         int n = (int)rr(tab ? 10 : 20, tab ? 60 : 100);
         for (int i = 0; i < n; i += 8) {
@@ -4804,6 +4828,7 @@ static int run_seed(unsigned seed, int steps)
             if (run_stmt(seed, step++, &q, false)) return -1;
         }
     }
+    g_fill = false;
     if (check_state(seed, step)) return -1;
     if (g_views) { /* P2 S7 */
         for (int tab = 0; tab < 2; tab++) g_vk[tab] = (int)rr(2, 5), g_vr[tab] = (int)rr(0, g_vk[tab] - 1);
@@ -4835,7 +4860,7 @@ static int run_seed(unsigned seed, int steps)
             q.gcol = -1;
             /* --checks: its statements on their own (a CHECK may refuse any write, and PostgreSQL aborts a transaction at
              * its first error), the draws alike */
-            if (!g_checks && run_stmt(seed, step, &q, false)) return -1;
+            if (!g_checks && !g_fk && run_stmt(seed, step, &q, false)) return -1; /* F2b-2: --fk alike (any write may meet a key) */
             int k = (int)rr(1, 3);
             for (int i = 0; i < k; i++) {
                 gen_dml(&q, false); /* none that fails: PostgreSQL aborts a transaction at its first error */
@@ -4849,7 +4874,7 @@ static int run_seed(unsigned seed, int steps)
             memset(&q, 0, sizeof q);
             q.kind = chance(50) ? Q_COMMIT : Q_ROLLBACK;
             q.gcol = -1;
-            if ((!g_checks && run_stmt(seed, step, &q, false)) || check_state(seed, step)) return -1;
+            if ((!g_checks && !g_fk && run_stmt(seed, step, &q, false)) || check_state(seed, step)) return -1;
         }
     }
     return 0;
@@ -4877,6 +4902,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--defaults")) g_defaults = true; /* F2a */
         else if (!strcmp(argv[i], "--checks")) g_checks = true; /* F2b-1 */
         else if (!strcmp(argv[i], "--generated")) g_gen = true; /* F2c */
+        else if (!strcmp(argv[i], "--fk")) g_fk = true; /* F2b-2 */
         else if (!strcmp(argv[i], "--tz")) g_tz = true; /* P2: time zones */
         else if (!strcmp(argv[i], "--date")) g_dt = 1; /* F3b */
         else if (!strcmp(argv[i], "--time")) g_dt = 2;
@@ -4971,6 +4997,8 @@ int main(int argc, char **argv)
            "");
     printf("oracle: %ld comparisons of P2 S5's set operations, %ld of its WITH RECURSIVE\n", g_set_compared, g_rec_compared);
     if (g_gen) printf("oracle: %lu comparisons of F2c's generated column u.w (each engine's by its own expression), after every change\n", g_gen_compared);
+    if (g_fk) printf("oracle: F2b-2's u.tid REFERENCES t (id): seeds with ON DELETE NO ACTION %lu, CASCADE %lu, SET NULL %lu\n",
+                     g_fk_seeds[0], g_fk_seeds[1], g_fk_seeds[2]);
     printf("oracle: %ld comparisons of P2 S4b's correlated subqueries\n", g_corr_compared);
     printf("oracle: %ld comparisons of P2 S7's SELECTs over the views vt and vu (t's and u's rows through a predicate)\n",
            g_view_compared);

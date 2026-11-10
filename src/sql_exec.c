@@ -4906,6 +4906,124 @@ int imdb_gen_verify(imdb_db *db, imdb_table *t, const imdb_value *vals, imdb_err
     return rc;
 }
 
+
+/* ---- F2b-2: FOREIGN KEYs (docs/fk-design.md) ---------------------------------------------------------------------- */
+
+/* PostgreSQL's name for an FK it names (ChooseConstraintName): table_col1_col2_fkey, makeObjectName's shortening (the
+ * longer part first) to 63 bytes, a number past a name taken */
+static void fk_name(const char *t, const char *cols, unsigned pass, char out[IMDB_MAX_IDENT + 1])
+{
+    char label[16];
+    snprintf(label, sizeof label, pass ? "fkey%u" : "fkey", pass);
+    size_t l1 = strlen(t), l2 = strlen(cols), over = strlen(label) + 2, avail = IMDB_MAX_IDENT - over;
+    while (l1 + l2 > avail) {
+        if (l1 > l2) l1--;
+        else l2--;
+    }
+    snprintf(out, IMDB_MAX_IDENT + 1, "%.*s_%.*s_%s", (int)l1, t, (int)l2, cols, label);
+}
+
+/* parsed FK k of st resolved against its child (ccur: the child's schema now, by position; child_id its table id) and
+ * the catalog: the child's columns by position, the parent by id (the child itself for a self-reference, self its
+ * version 1 then), the parent's key in its order (named parent columns: the whole key in any order, the child's
+ * columns taken in the key's order then), named (given: free; else PostgreSQL's), the catalog's rules checked */
+static int fk_resolve(xctx *x, const sql_stmt *st, int k, const imdb_sver *ccur, uint32_t child_id,
+                      char taken[][IMDB_MAX_IDENT + 1], uint16_t ntaken, imdb_fk *out, imdb_err *e)
+{
+    const sql_fkdef *pf = &st->fks[k];
+    memset(out, 0, sizeof *out);
+    const char *child = ccur->s.name;
+    bool self = !strcmp(pf->parent, child);
+    imdb_table *p = self ? NULL : imdb_table_by_name(x->db, pf->parent);
+    if (!self && !p) return no_table(x, pf->parent, e);
+    const imdb_sver *pcur = self ? ccur : &p->hist.vers[p->hist.nvers - 1];
+    const imdb_schema *ps = &pcur->s;
+    out->parent = self ? child_id : p->s.id;
+    out->ncols = pf->ncols;
+    out->on_delete = pf->on_delete;
+    out->on_update = pf->on_update;
+    if (pf->npcols && pf->npcols != ps->npk)
+        return imdb_fail(e, IMDB_ERR_INVALID, "a FOREIGN KEY references the whole primary key of table %s (%u columns)", ps->name,
+                         ps->npk);
+    if (pf->ncols != ps->npk)
+        return imdb_fail(e, IMDB_ERR_INVALID, "a FOREIGN KEY of %u columns references table %s, whose primary key has %u",
+                         pf->ncols, ps->name, ps->npk);
+    uint16_t order[IMDB_MAX_KEY_COLS]; /* key column i is the child's column named at order[i] */
+    for (uint8_t i = 0; i < pf->ncols; i++) order[i] = i;
+    if (pf->npcols) {
+        for (uint8_t j = 0; j < pf->npcols; j++) {
+            int pc = imdb_schema_col(ps, pf->pcols[j]);
+            int at = -1;
+            for (int i = 0; pc >= 0 && i < ps->npk; i++)
+                if (ps->key[i] == pc) at = i;
+            if (at < 0)
+                return imdb_fail(e, IMDB_ERR_INVALID, "a FOREIGN KEY references table %s's primary key: %s is not in it", ps->name,
+                                 pf->pcols[j]);
+            for (uint8_t i = 0; i < j; i++)
+                if (!strcmp(pf->pcols[i], pf->pcols[j])) return imdb_fail(e, IMDB_ERR_INVALID, "a FOREIGN KEY names %s twice", pf->pcols[j]);
+            order[at] = j;
+        }
+    }
+    char joined[IMDB_MAX_IDENT * IMDB_MAX_KEY_COLS + IMDB_MAX_KEY_COLS];
+    size_t jl = 0;
+    for (uint8_t i = 0; i < pf->ncols; i++) {
+        int c = imdb_schema_col(&ccur->s, pf->cols[order[i]]);
+        if (c < 0) return imdb_fail(e, IMDB_ERR_INVALID, "a FOREIGN KEY names column %s, which table %s lacks", pf->cols[order[i]], child);
+        out->cols[i] = ccur->pos[c];
+        out->pcols[i] = pcur->pos[ps->key[i]];
+    }
+    for (uint8_t i = 0; i < pf->ncols; i++) /* the name: the columns as written */
+        jl += (size_t)snprintf(joined + jl, sizeof joined - jl, "%s%s", i ? "_" : "", pf->cols[i]);
+    if (pf->name[0]) {
+        for (uint16_t t2 = 0; t2 < ntaken; t2++)
+            if (!strcmp(taken[t2], pf->name))
+                return imdb_fail(e, IMDB_ERR_CONSTRAINT, "constraint %s for table %s already exists", pf->name, child);
+        snprintf(out->name, sizeof out->name, "%s", pf->name);
+    } else {
+        for (unsigned pass = 0;; pass++) {
+            fk_name(child, joined, pass, out->name);
+            bool used = false;
+            for (uint16_t t2 = 0; t2 < ntaken && !used; t2++) used = !strcmp(taken[t2], out->name);
+            if (!used) break;
+        }
+    }
+    return imdb_fk_def_check(ccur, pcur, true, out, e);
+}
+
+static int fk_cmp_name(const void *a, const void *b) { return strcmp(((const imdb_fk *)a)->name, ((const imdb_fk *)b)->name); }
+
+/* a CREATE's FKs resolved (its schema version 1, its id the next), named past its CHECKs' names: op 29's list, by name */
+static int create_fks(xctx *x, const sql_stmt *st, const imdb_check *ck, imdb_fk *out, imdb_err *e)
+{
+    imdb_sver *v1 = imdb_alloc(sizeof *v1, e);
+    if (!v1) return e->code;
+    v1->s = st->schema;
+    v1->npos = st->schema.ncols;
+    for (uint16_t i = 0; i < IMDB_MAX_COLS; i++) v1->at[i] = (int8_t)(i < st->schema.ncols ? i : -1);
+    for (uint16_t i = 0; i < st->schema.ncols; i++) v1->pos[i] = i;
+    char taken[IMDB_MAX_CHECKS + IMDB_MAX_FKS][IMDB_MAX_IDENT + 1];
+    uint16_t nt = 0;
+    for (uint16_t i = 0; i < st->nchecks; i++) snprintf(taken[nt++], sizeof taken[0], "%.*s", (int)IMDB_MAX_IDENT, ck[i].name);
+    int rc = IMDB_OK;
+    for (uint8_t k = 0; k < st->nfks && !rc; k++)
+        if (!(rc = fk_resolve(x, st, k, v1, x->db->nt, taken, nt, &out[k], e))) snprintf(taken[nt++], sizeof taken[0], "%.*s", (int)IMDB_MAX_IDENT, out[k].name);
+    imdb_free(v1);
+    if (!rc) qsort(out, st->nfks, sizeof *out, fk_cmp_name);
+    return rc;
+}
+
+/* ALTER TABLE t ADD FOREIGN KEY: resolved against t now, named past its live constraints' names */
+static int alter_fk_op(xctx *x, const sql_stmt *st, imdb_table *t, imdb_fk *fk, imdb_op *o, imdb_err *e)
+{
+    char taken[IMDB_MAX_CHECKS + IMDB_MAX_FKS][IMDB_MAX_IDENT + 1];
+    uint16_t nt = 0;
+    for (uint16_t i = 0; i < t->hist.nchk; i++) snprintf(taken[nt++], sizeof taken[0], "%.*s", (int)IMDB_MAX_IDENT, t->hist.chk[i].name);
+    for (uint16_t i = 0; i < t->hist.nfk; i++) snprintf(taken[nt++], sizeof taken[0], "%.*s", (int)IMDB_MAX_IDENT, t->hist.fk[i].name);
+    if (fk_resolve(x, st, 0, &t->hist.vers[t->hist.nvers - 1], t->s.id, taken, nt, fk, e)) return e->code;
+    o->fk = fk;
+    o->nfk = 1;
+    return IMDB_OK;
+}
 /* t's live CHECKs compiled for its history as it is (a write's: the first after the history changed compiles them) */
 static int chk_ready(imdb_db *db, imdb_table *t, imdb_err *e)
 {
@@ -8629,6 +8747,7 @@ static int cmp_pkrow(const void *a, const void *b, void *arg)
  * pair (t's row beside u's, a join's scope: an unqualified column of both is ambiguous), and refuses a t row two pairs
  * name (PostgreSQL takes one of them, which one unspecified); DELETE removes it once. The writes, RETURNING's rows
  * with them, go in t's key order whichever plan the join took */
+static int fk_delete(xctx *x, imdb_table *t, uint64_t vid, imdb_err *e); /* F2b-2 */
 static int exec_join_write(xctx *x, const sql_stmt *st, bool upd, imdb_result *r, xplain *xp, imdb_err *e)
 {
     /* upd: an UPDATE's (st->kind is EXPLAIN's under EXPLAIN) */
@@ -8719,7 +8838,7 @@ static int exec_join_write(xctx *x, const sql_stmt *st, bool upd, imdb_result *r
             rc = imdb_salt_next(&x->salts, salt, e) || imdb_update_salt(x->db, t, vid, both, salt, e) ? e->code : IMDB_OK;
             imdb_wipe(salt, sizeof salt);
         } else if (!rc) {
-            rc = imdb_delete(x->db, t, vid, e);
+            rc = fk_delete(x, t, vid, e); /* F2b-2 */
         }
         imdb_xarena_reset(&x->arena, m);
     }
@@ -8798,6 +8917,112 @@ static int exec_update(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, 
     return rc;
 }
 
+
+/* ---- F2b-2: ON DELETE's actions (docs/fk-design.md section 3): a parent row's DELETE, then each FK referencing its
+ * table with CASCADE, SET NULL or SET DEFAULT applied to the live children of its key, a CASCADE's rows in turn (a work
+ * list: a tree's depth never deepens the C stack; a row ended already is passed: a cycle ends). NO ACTION and RESTRICT
+ * are the statement's end's check. A child the transaction cannot see (committed after its snapshot) is CONFLICT ---- */
+
+typedef struct fkwork {
+    uint32_t table;
+    uint64_t vid;
+} fkwork;
+
+static int fk_set_child(xctx *x, imdb_table *c, uint64_t vid, const imdb_fk *f, bool to_default, imdb_err *e)
+{
+    imdb_value vals[IMDB_MAX_COLS];
+    imdb_xmark m = imdb_xarena_mark(&x->arena);
+    int rc = fetch_row(x, c, vid, vals, e);
+    const imdb_sver *cur = &c->hist.vers[c->hist.nvers - 1];
+    for (uint8_t i = 0; !rc && i < f->ncols; i++) {
+        int col = cur->at[f->cols[i]];
+        if (!to_default) {
+            vals[col] = (imdb_value){.type = c->s.cols[col].type, .scale = c->s.cols[col].scale, .null = true};
+            continue;
+        }
+        uint32_t sq;
+        bool always;
+        if (col_seq(c, (uint16_t)col, &sq, &always))
+            rc = imdb_fail(e, IMDB_ERR_UNSUPPORTED, "foreign key %s: ON DELETE SET DEFAULT of column %s, whose default is a "
+                           "sequence's: a later step", f->name, c->s.cols[col].name);
+        else
+            rc = col_default(&x->env, c, (uint16_t)col, &vals[col], e);
+    }
+    if (!rc && c->hist.ngen) rc = imdb_gen_compute(x->db, c, vals, &x->arena, e); /* F2c: a generated column reading it */
+    uint8_t salt[16];
+    if (!rc && !(rc = imdb_salt_next(&x->salts, salt, e))) rc = imdb_update_salt(x->db, c, vid, vals, salt, e);
+    imdb_wipe(salt, sizeof salt);
+    imdb_xarena_reset(&x->arena, m);
+    return rc;
+}
+
+static int fk_delete(xctx *x, imdb_table *t, uint64_t vid, imdb_err *e)
+{
+    imdb_db *db = x->db;
+    bool any = false; /* an action anywhere on t: else a plain DELETE */
+    for (uint32_t ci = 0; ci < db->nt && !any; ci++)
+        for (uint16_t i = 0; db->t[ci] && !db->t[ci]->dropped_at && i < db->t[ci]->hist.nfk && !any; i++)
+            any = db->t[ci]->hist.fk[i].parent == t->s.id && db->t[ci]->hist.fk[i].on_delete >= IMDB_FK_CASCADE;
+    if (!any) return imdb_delete(db, t, vid, e);
+    uint64_t snap = 0, pend = 0;
+    imdb_txn_write_view(db, &snap, &pend);
+    fkwork *w = imdb_alloc_array(16, sizeof *w, e);
+    if (!w) return e->code;
+    uint64_t nw = 0, cap = 16, at = 0;
+    w[nw++] = (fkwork){t->s.id, vid};
+    int rc = IMDB_OK;
+    while (at < nw && !rc) {
+        fkwork cur = w[at++];
+        imdb_table *p = db->t[cur.table];
+        if (!imdb_v_held(p, cur.vid) || imdb_vh(p, cur.vid)->end != IMDB_LIVE) continue; /* ended already: a cycle */
+        if ((rc = xtick(x, 64, e))) break;
+        imdb_pkey k;
+        if ((rc = imdb_version_pkey(p, cur.vid, &k))) {
+            rc = imdb_fail(e, rc, "a row of table %s could not be read for its foreign keys", p->s.name);
+            break;
+        }
+        if ((rc = imdb_delete(db, p, cur.vid, e))) {
+            imdb_pkey_done(&k);
+            break;
+        }
+        for (uint32_t ci = 0; ci < db->nt && !rc; ci++) {
+            imdb_table *c = db->t[ci];
+            if (!c || c->dropped_at) continue;
+            for (uint16_t i = 0; i < c->hist.nfk && !rc; i++) {
+                const imdb_fk *f = &c->hist.fk[i];
+                if (f->parent != p->s.id || f->on_delete < IMDB_FK_CASCADE) continue;
+                uint64_t *kids = NULL;
+                uint32_t nk = 0;
+                if ((rc = imdb_fk_children(db, c, i, &k.v, &kids, &nk, e))) break;
+                for (uint32_t j = 0; j < nk && !rc; j++) {
+                    const imdb_version *cv = imdb_vh(c, kids[j]);
+                    if (!(cv->begin > db->seq || cv->begin <= snap)) {
+                        rc = imdb_fail(e, IMDB_ERR_CONFLICT, "could not serialize access: a row referencing table %s by foreign key "
+                                       "%s was inserted by a commit after this transaction's snapshot; retry the transaction",
+                                       p->s.name, f->name);
+                    } else if (f->on_delete == IMDB_FK_CASCADE) {
+                        if (nw == cap) {
+                            fkwork *nwk = imdb_realloc_array(w, cap, cap * 2, sizeof *w, e);
+                            if (!nwk) {
+                                rc = e->code;
+                                break;
+                            }
+                            w = nwk;
+                            cap *= 2;
+                        }
+                        w[nw++] = (fkwork){c->s.id, kids[j]};
+                    } else {
+                        rc = fk_set_child(x, c, kids[j], f, f->on_delete == IMDB_FK_SET_DEFAULT, e);
+                    }
+                }
+                imdb_free(kids);
+            }
+        }
+        imdb_pkey_done(&k);
+    }
+    imdb_free(w);
+    return rc;
+}
 static int exec_delete(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, imdb_err *e)
 {
     wceil_set(x); /* P2 S8: what it reads */
@@ -8823,7 +9048,7 @@ static int exec_delete(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, 
             imdb_xarena_reset(&x->arena, m);
             if (rc) break;
         }
-        rc = imdb_delete(x->db, t, vids[i], e);
+        rc = fk_delete(x, t, vids[i], e); /* F2b-2: its FOREIGN KEYs' actions too */
     }
     imdb_free(vids);
     if (!rc) snprintf(r->status, sizeof r->status, "DELETE %llu", (unsigned long long)n);
@@ -9887,10 +10112,13 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
         }
         imdb_check ck[IMDB_MAX_CHECKS]; /* F2b-1: each bound against the schema and named before anything is pushed */
         if (!rc && st->nchecks) rc = create_checks(&x, st, ck, e);
+        imdb_fk fk[IMDB_MAX_FKS]; /* F2b-2: each resolved against the catalog and named before anything is pushed */
+        if (!rc && st->nfks) rc = create_fks(&x, st, ck, fk, e);
         if (!rc)
             rc = imdb_create_table_defs(db, &st->schema, st->has_retention ? st->retention_us : IMDB_RETAIN_DEFAULT_US, cd,
                                         ncd, e);
         if (!rc && st->nchecks) rc = imdb_create_table_checks(db, st->schema.id, ck, st->nchecks, e);
+        if (!rc && st->nfks) rc = imdb_create_table_fks(db, st->schema.id, fk, st->nfks, e);
         if (!rc) snprintf(r->status, sizeof r->status, "CREATE TABLE %s", st->schema.name);
         break;
     }
@@ -9908,6 +10136,7 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
         break;
     }
     case ST_ALTER_TABLE: { /* F1: op 22 */
+        imdb_fk afk; /* F2b-2: an ADD FOREIGN KEY's */
         imdb_table *t = imdb_table_by_name(db, st->table);
         if (!t) {
             rc = imdb_fail(e, IMDB_ERR_INVALID, "no table %s", st->table);
@@ -9936,10 +10165,13 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
             else if (!(o.acol.flags & IMDB_COL_NULLABLE) && o.adef.null)
                 rc = imdb_fail(e, IMDB_ERR_INVALID, "column %s is NOT NULL: give it a DEFAULT, which the rows there read",
                                o.acol.name);
+        } else if (o.akind == IMDB_ALTER_ADD_FK) { /* F2b-2: resolved against the catalog, named among its constraints */
+            rc = alter_fk_op(&x, st, t, &afk, &o, e);
         } else if (o.akind == IMDB_ALTER_ADD_CHECK) { /* F2b-1: bound against the table, named among its live CHECKs */
             rc = alter_check_op(&x, st, t, &o, e);
         } else if (o.akind == IMDB_ALTER_DROP_CHECK) {
             o.aname = st->alter_old;
+            if (imdb_hist_fk(&t->hist, st->alter_old) >= 0) o.akind = IMDB_ALTER_DROP_FK; /* F2b-2: one name space */
         } else if (o.akind == IMDB_ALTER_RENAME_TABLE) {
             o.aname = st->alter_new;
         } else { /* a column by name, logged by its position (F1 stage 4: a position names a column for its life) */
@@ -10270,6 +10502,7 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
     if (ceiling) imdb_heap_ceiling_set(0, 0);
     wceil_lift(&x); /* P2 S8: a write that left before lifting its own (an error), before its savepoint is restored */
     if (wr) {
+        if (!rc && db->in_txn) rc = imdb_fk_check(db, sp.ntx, e); /* F2b-2: its writes' FOREIGN KEYs, at the statement's end */
         if (rc) {
             imdb_savepoint_restore(db, sp);
             if (autocommit) imdb_rollback(db);

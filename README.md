@@ -668,7 +668,7 @@ BETWEEN, IN, IS NULL, LIKE, AND, OR, NOT, CASE, COALESCE, NULLIF, LENGTH, ABS,
 LOWER, UPPER and `||`; every replica and the auditor recompute it, so a clock, a
 sequence, a zone, a FLOAT64 value, a TIMESTAMPTZ literal, a subquery and CAST are
 refused. A column a CHECK names is not renamed or dropped until the CHECK is
-dropped. Not yet: NOT VALID, the other functions, FOREIGN KEY.
+dropped. Not yet: NOT VALID, the other functions.
 
 Generated columns: `c type GENERATED ALWAYS AS (expression) STORED` in CREATE TABLE.
 The expression reads the row's other columns by CHECK's rules (the same literals,
@@ -681,6 +681,25 @@ out both ways, and the dump's restore computes it again. Every replica and the
 auditor recompute it for every row. A column an expression names is not renamed
 or dropped until the generated column is dropped. Not yet: VIRTUAL, ADD COLUMN ...
 GENERATED, a FLOAT64 generated column.
+
+FOREIGN KEYs: a column's `REFERENCES parent [(col)]` or a table's `[CONSTRAINT
+name] FOREIGN KEY (cols) REFERENCES parent [(cols)]` in CREATE TABLE, `ALTER TABLE
+t ADD [CONSTRAINT name] FOREIGN KEY ...` (every row there must reference a live
+parent) and `ALTER TABLE t DROP CONSTRAINT name`, named as PostgreSQL names them
+(`t_pid_fkey`). The referenced columns are the parent's whole primary key, each
+paired with a column of its type. A child row whose key has a NULL is not checked
+(MATCH SIMPLE). `ON DELETE NO ACTION` (the default), `RESTRICT`, `CASCADE`, `SET
+NULL` and `SET DEFAULT` act on every DELETE; ON UPDATE takes NO ACTION or RESTRICT
+(no UPDATE changes a key). Each write statement is checked at its end, so one
+statement may insert a child before its parent, and each commit again: a key
+another session's commit removed or added since the transaction began is a
+conflict to retry (`could not serialize access`), what the transaction itself can
+see a violation (`violates foreign key constraint t_pid_fkey`). A parent another
+table references is not dropped, nor a column a FOREIGN KEY names; ERASE SUBJECT
+runs no action. Every replica and the auditor hold every commit to the keys. The
+API's `imdb_delete` runs no action (the commit refuses a parent left referenced).
+Not yet: a reference to a UNIQUE index, ON UPDATE CASCADE, MATCH FULL, DEFERRABLE,
+DROP TABLE ... CASCADE.
 
 Primary keys: every table has one, of one column (`id INT64 PRIMARY KEY`) or of
 up to eight (`PRIMARY KEY (region, day)`, a table constraint anywhere among the
