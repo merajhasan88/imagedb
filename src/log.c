@@ -61,6 +61,10 @@ static void put_value(imdb_buf *b, const imdb_column *c, const imdb_value *v)
         imdb_buf_put(b, v->s, v->len);
     } else if (c->type == IMDB_T_UUID) { /* F3d: the row codec's 16 bytes */
         imdb_buf_put(b, v->s, IMDB_UUID_LEN);
+    } else if (c->type == IMDB_T_INTERVAL) { /* F3f: the row codec's 16 bytes: months, days, microseconds */
+        imdb_buf_put_u32(b, (uint32_t)v->iv.mon);
+        imdb_buf_put_u32(b, (uint32_t)v->iv.day);
+        imdb_buf_put_u64(b, (uint64_t)v->i);
     } else if (c->type == IMDB_T_DECIMAL && imdb_dec_wide(c->precision)) { /* F3e: the row codec's 16 bytes, i then hi */
         imdb_buf_put_u64(b, (uint64_t)v->i);
         imdb_buf_put_u64(b, (uint64_t)v->hi);
@@ -134,6 +138,10 @@ static int get_value(imdb_rd *r, const imdb_column *c, imdb_value *v, const char
     } else if (c->type == IMDB_T_UUID) {
         v->s = imdb_rd_bytes(r, IMDB_UUID_LEN);
         v->len = v->s ? IMDB_UUID_LEN : 0;
+    } else if (c->type == IMDB_T_INTERVAL) { /* F3f */
+        v->iv.mon = (int32_t)imdb_rd_u32(r);
+        v->iv.day = (int32_t)imdb_rd_u32(r);
+        v->i = (int64_t)imdb_rd_u64(r);
     } else if (c->type == IMDB_T_DECIMAL && imdb_dec_wide(c->precision)) { /* F3e */
         v->wide = true;
         v->i = (int64_t)imdb_rd_u64(r);

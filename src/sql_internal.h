@@ -18,8 +18,8 @@ typedef struct sql_tok {
 /* LIT_EXPR: not a literal but an expression's tree (ex), where a value may be one: an UPDATE's SET, an INSERT's
  * VALUES (a WHERE condition that is not today's col op literal is a tree too: sql_cmp lx) */
 enum { LIT_INT = 1, LIT_DEC, LIT_STR, LIT_BOOL, LIT_TS, LIT_PARAM, LIT_FLOAT, LIT_NULL, LIT_EXPR, LIT_TSTZ, LIT_DATE, LIT_TIME,
-       LIT_DEFAULT, LIT_UUID, LIT_BYTEA }; /* LIT_TSTZ: P2; LIT_DATE, LIT_TIME: F3b; LIT_DEFAULT: F2a-2, INSERT ... VALUES
-                                         * (DEFAULT); LIT_UUID, LIT_BYTEA: F3d, UUID '...' and BYTEA '...' */
+       LIT_DEFAULT, LIT_UUID, LIT_BYTEA, LIT_INTERVAL }; /* LIT_TSTZ: P2; LIT_DATE, LIT_TIME: F3b; LIT_DEFAULT: F2a-2, INSERT ... VALUES
+                                         * (DEFAULT); LIT_UUID, LIT_BYTEA: F3d, UUID '...' and BYTEA '...'; LIT_INTERVAL: F3f */
 
 typedef struct sql_lit {
     uint8_t kind;
@@ -313,7 +313,9 @@ typedef struct imdb_xval {
     double f;
     const uint8_t *s;
     uint32_t len;
+    int32_t mon, day;        /* F3f: an INTERVAL's months and days (its microseconds in i), in the tail padding */
 } imdb_xval;
+_Static_assert(sizeof(imdb_xval) == 64, "F3f: an INTERVAL's fields in imdb_xval's tail padding (64 bytes kept)");
 
 /* st->ex[k] bound: its result's type, its column or constant (an array parallel to st->ex) */
 /* P2 S4: IN (SELECT ...)'s values: the non-NULL ones sorted by imdb_x_cmp (exact across numeric kinds), a NULL seen */
@@ -344,6 +346,7 @@ typedef struct imdb_xnode {
 int imdb_x_type(uint8_t op, uint8_t ta, uint8_t sa, uint8_t tb, uint8_t sb, uint8_t *rt, uint8_t *rs, imdb_err *e);
 /* a column's value as an expression value (a FLOAT64 key becomes its double) */
 void imdb_x_from_value(const imdb_value *v, imdb_xval *out);
+void imdb_x_to_iv(const imdb_xval *v, imdb_value *out); /* F3f: an INTERVAL's fields into v (type set by the caller) */
 /* a op b at the bound result type: checked; a NULL operand gives NULL */
 int imdb_x_arith(uint8_t op, const imdb_xval *a, const imdb_xval *b, uint8_t rt, uint8_t rs, imdb_xval *out,
                  imdb_err *e);

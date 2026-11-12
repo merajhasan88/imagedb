@@ -583,6 +583,21 @@ must_fail "schema: bad precision/scale" "$AUD" verify "$PIB"
 echo "   IA a signed INSERT of a DECIMAL(30,2) of 10^28 (16 bytes, one past its precision): the replay and the auditor
    refuse it; IB a manifest whose schema gives w DECIMAL(39,2): VERIFY and the auditor refuse it"
 
+echo "== JA, JB: INTERVAL (F3f) broken, each signed: a 15-byte INTERVAL, a CREATE whose key is an INTERVAL"
+PJA=$WORK/ja; "$BIN" init "$PJA" >/dev/null
+"$BIN" sql "$PJA" --nosync -c "CREATE TABLE ji (id INT64 PRIMARY KEY, iv INTERVAL NOT NULL);" \
+  -c "INSERT INTO ji VALUES (1, '1 mon 2 days 03:04:05');" >/dev/null
+"$BIN" verify "$PJA" >/dev/null && "$AUD" verify "$PJA" >/dev/null || fail "the honest directory must verify"
+"$FORGE" index-lie "$PJA" iv-short
+must_fail "row: truncated" "$BIN" verify "$PJA"
+must_fail "row: truncated" "$AUD" verify "$PJA"
+PJB=$WORK/jb; make_db "$PJB"
+"$FORGE" index-lie "$PJB" create-interval-key
+must_fail "a PRIMARY KEY column cannot be an INTERVAL" "$BIN" verify "$PJB"
+must_fail "schema: bad PRIMARY KEY" "$AUD" verify "$PJB"
+echo "   JA a signed INSERT whose INTERVAL is 15 bytes (the row codec takes 16), JB a signed CREATE whose key is an
+   INTERVAL (deferred.md D26): the replay and the auditor refuse each"
+
 echo "== Z: a commit naming the other digest algorithm, re-signed by the writer (both ways round); META naming an unknown one"
 for a in 1 2; do # explicit algorithms: under IMDB_DIGEST_ALG=2 make_db's would all be alg 2
   PZ=$WORK/z$a

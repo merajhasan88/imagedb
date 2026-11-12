@@ -594,7 +594,7 @@ round to short ones writing the same row, so retry with backoff). SERIALIZABLE
 is refused; snapshot write skew is possible.
 
 Types: INT64 (BIGINT, INT8), INTEGER (INT, INT4: 32 bits), SMALLINT (INT2: 16 bits),
-DECIMAL(p,s) (NUMERIC(p,s): p 1 to 38), TEXT, VARCHAR(n), BOOL, TIMESTAMP, TIMESTAMPTZ, DATE, TIME, UUID, BYTEA,
+DECIMAL(p,s) (NUMERIC(p,s): p 1 to 38), TEXT, VARCHAR(n), BOOL, TIMESTAMP, TIMESTAMPTZ, DATE, TIME, UUID, BYTEA, INTERVAL,
 finite FLOAT64 (exact SUM, rounded once) and nullable non-key columns. A DECIMAL of up to 18 digits is held in 64 bits
 and one of 19 to 38 in 128 (16 bytes a value); both compare, join and group with each other by value. Not yet on a
 DECIMAL past 18 digits: CREATE INDEX on it, a FOREIGN KEY between it and one of 18 or fewer, and SET TYPE across 18
@@ -618,6 +618,15 @@ of a BYTEA count bytes and `||` joins two. `gen_random_uuid()` draws a version-4
 and `id UUID PRIMARY KEY DEFAULT gen_random_uuid()` draws one for every row written
 (not as an ADD COLUMN's DEFAULT: add the column, fill it, then SET DEFAULT). Not yet:
 UUID or BYTEA in a CHECK or a generated column, ENCODE, DECODE, a UUID SUBJECT.
+INTERVAL is PostgreSQL's: months, days and microseconds, written and read as PostgreSQL 14 writes and reads
+it (`INTERVAL '1 year 2 mons -3 days +04:05:06.5'`, `'@ 1 day ago'`, `'1.5 hours'`; strings beside one are
+read as one). It compares and sorts by its span, a month 30 days: `'1 mon' = '30 days'` is true, though
+`ts + '1 mon'` and `ts + '30 days'` differ (the month moves the calendar, its last day clamped). `iv + iv`,
+`iv - iv`, `-iv`, `ts + iv`, `ts - iv`, `d + iv` (a TIMESTAMP) and `ts1 - ts2` (an INTERVAL) compute; MIN, MAX
+(of equal spans the least, `720:00:00` before `30 days` before `1 mon`), SUM and COUNT aggregate; CAST converts
+each way with TEXT; COPY and the dump carry it. Not yet: GROUP BY, DISTINCT, UNION (UNION ALL works), a window's
+PARTITION BY or ORDER BY over one, a key or an index on one, a CHECK or a generated column reading one, `*`, `/`,
+AVG, EXTRACT, ISO 8601 or SQL-standard input, `INTERVAL YEAR TO MONTH`, and TIMESTAMPTZ or TIME with one.
 Comparisons with NULL, including NULL parameters, are refused: use IS NULL / IS NOT
 NULL.
 

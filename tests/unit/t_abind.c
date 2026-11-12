@@ -190,6 +190,19 @@ static const char *const g_body[] = {
     "SELECT d, LAG(d) OVER (ORDER BY id) AS pd, MAX(tm) OVER (PARTITION BY d) AS mt FROM dt",
     /* F3c: a CAST to VARCHAR(n) types a TEXT (the length the run's rule) */
     "SELECT CAST(s AS VARCHAR(10)) AS a, CAST(g AS CHARACTER VARYING(3)) AS b, CAST(s AS VARCHAR) AS c FROM t",
+    /* F3f: INTERVAL: every + and - rule both ways round with TIMESTAMP and DATE, TIMESTAMP - TIMESTAMP and TIMESTAMPTZ -
+     * TIMESTAMPTZ, the negation; a string beside one in a comparison, CASE, COALESCE, NULLIF and IN; MIN, MAX, SUM, LAG,
+     * a moving SUM, CAST both ways; a derived table and UNION ALL carry it */
+    "SELECT iv + iv AS a, iv - INTERVAL '1 day' AS b, -iv AS c, ts + iv AS d, iv + ts AS e2, ts - iv AS f, d + iv AS g2, "
+    "iv + d AS h, d - iv AS i2, ts - ts AS j, tz - tz AS k2 FROM ivt",
+    "SELECT INTERVAL '1 mon 2 days' AS a, CAST('1 day' AS INTERVAL) AS b, CAST(iv AS TEXT) AS c FROM ivt",
+    "SELECT id FROM ivt WHERE iv > '1 day' AND iv IN ('1 mon', INTERVAL '30 days') AND iv BETWEEN '0 days' AND '1 year'",
+    "SELECT CASE WHEN id > 0 THEN iv ELSE '0 days' END AS a, COALESCE(iv, '1 day') AS b, NULLIF(iv, '30 days') AS c FROM ivt",
+    "SELECT MIN(iv) AS a, MAX(iv) AS b, SUM(iv) AS c, COUNT(iv) AS e2, SUM(iv + INTERVAL '1 day') AS f FROM ivt",
+    "SELECT id, LAG(iv) OVER (ORDER BY id) AS a, SUM(iv) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS b, "
+    "MIN(iv) OVER (ORDER BY id) AS c FROM ivt",
+    "SELECT x FROM (SELECT iv AS x FROM ivt UNION ALL SELECT INTERVAL '1 day') AS q",
+    "SELECT a.id FROM ivt AS a JOIN ivt AS b ON a.iv = b.iv",
 };
 #define NBODY (sizeof g_body / sizeof *g_body)
 
@@ -204,6 +217,8 @@ static imdb_db *setup(void)
     if (run("CREATE TABLE t (id INT64 PRIMARY KEY, g INT64, d DECIMAL(12,2), f FLOAT64, s TEXT, k BOOL, ts TIMESTAMP, e DECIMAL(18,4))") ||
         run("CREATE TABLE u (id INT64 PRIMARY KEY, tid INT64, v INT64, s TEXT, d DECIMAL(10,3))") ||
         run("CREATE TABLE dt (id INT64 PRIMARY KEY, d DATE, tm TIME, ts TIMESTAMP)") || /* F3b */
+        run("CREATE TABLE ivt (id INT64 PRIMARY KEY, iv INTERVAL, ts TIMESTAMP, tz TIMESTAMPTZ, d DATE)") || /* F3f */
+        run("INSERT INTO ivt VALUES (1, '1 mon', '2026-01-31 00:00:00', '2026-01-31 00:00:00+00', '2026-01-31')") ||
         run("INSERT INTO dt VALUES (1, '2026-11-09', '12:30:00', '2026-11-09 12:30:00')") ||
         run("INSERT INTO t VALUES (1, 1, 1.25, 0.5, 'ab', TRUE, TIMESTAMP '2026-01-01 00:00:00', 2.5)") ||
         run("INSERT INTO u VALUES (1, 1, 7, 'x', 1.125)")) {
@@ -312,6 +327,13 @@ static void t_abind_refusals(void)
         {"SELECT CASE WHEN id > 0 THEN d ELSE ts END AS x FROM dt", "not converted"},
         {"SELECT CAST(s AS VARCHAR(0)) AS x FROM t", "VARCHAR(n) needs"}, /* F3c */
         {"SELECT CAST(s AS VARCHAR(65536)) AS x FROM t", "VARCHAR(n) needs"},
+        {"SELECT iv * 2 AS x FROM ivt", "interval arithmetic"}, /* F3f */
+        {"SELECT iv + 1 AS x FROM ivt", "interval arithmetic"},
+        {"SELECT iv - ts AS x FROM ivt", "interval arithmetic"},
+        {"SELECT tz + iv AS x FROM ivt", "interval arithmetic"},
+        {"SELECT CAST(iv AS INT64) AS x FROM ivt", "CAST"},
+        {"SELECT CASE WHEN id > 0 THEN iv ELSE ts END AS x FROM ivt", "not converted"},
+        {"SELECT AVG(iv) AS x FROM ivt", "SUM and AVG"},
         /* fuzz_abind's find (2026-11-09): a window function inside a window's keys overflowed them */
         {"SELECT LAG(d, 1) OVER (PARTITION BY s, LAG(d, 6) OVER (PARTITION BY g)) AS x FROM t",
          "a window function inside a window's definition"},

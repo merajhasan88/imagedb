@@ -27,15 +27,12 @@ static size_t align8(size_t x) { return (x + 7) & ~(size_t)7; }
  * 16 bytes (i then hi, little-endian) or none, with no zone map; every other DECIMAL an int64 column as before */
 static bool dec_wide(const imdb_column *c) { return c->type == IMDB_T_DECIMAL && imdb_dec_wide(c->precision); }
 
-static bool is_int_col(const imdb_column *c)
-{
-    uint8_t type = c->type;
-    return type == IMDB_T_INT64 || (type == IMDB_T_DECIMAL && !dec_wide(c)) || type == IMDB_T_TIMESTAMP || type == IMDB_T_FLOAT64 ||
-           type == IMDB_T_DATE || type == IMDB_T_TIME || type == IMDB_T_TIMESTAMPTZ;
-}
+/* F3f: a column's shape from codec.h's two predicates alone (no list kept here): an int64 array with a zone map
+ * (imdb_col_i64), or offsets and data (a byte string; a 16-byte cell of imdb_col_fixed16), or a BOOL's bytes */
+static bool is_int_col(const imdb_column *c) { return imdb_col_i64(c); }
 
-/* the columns laid out as offsets and data: TEXT, UUID, BYTEA (F3d) and a wide DECIMAL (F3e) */
-static bool seg_bytes(const imdb_column *c) { return imdb_type_bytes(c->type) || dec_wide(c); }
+/* the columns laid out as offsets and data: TEXT, UUID, BYTEA (F3d), a wide DECIMAL (F3e) and an INTERVAL (F3f) */
+static bool seg_bytes(const imdb_column *c) { return imdb_type_bytes(c->type) || imdb_col_fixed16(c); }
 
 /* F3e: a wide DECIMAL's 16-byte cell (i then hi, little-endian) as its value, and its range (10^p - 1 either way) */
 static __int128 dec_cell(const uint8_t *p)
@@ -47,6 +44,12 @@ static bool dec_cell_fits(const uint8_t *p, const imdb_column *c)
 {
     __int128 x = dec_cell(p), lim = imdb_pow10_128(c->precision) - 1;
     return x <= lim && x >= -lim;
+}
+
+/* F3f: an INTERVAL's 16-byte cell, its row's encoding: months LE32, days LE32, microseconds LE64 */
+static void iv_cell(const uint8_t *p, imdb_value *v)
+{
+    imdb_iv_set(v, (int32_t)imdb_get_le32(p), (int32_t)imdb_get_le32(p + 4), (int64_t)imdb_get_le64(p + 8));
 }
 
 static bool nullable(const imdb_column *c) { return (c->flags & IMDB_COL_NULLABLE) != 0; }
@@ -405,8 +408,8 @@ int imdb_segment_parse(const imdb_schema *s, const uint8_t vhash[32], uint8_t *b
                     rc = imdb_fail(e, IMDB_ERR_CORRUPT, "segment: a UUID of %u bytes in column %s", z - a, col->name);
                 else if (col->type == IMDB_T_UUID && z == a && seg_keeps(gi->flags[i], s, c) && !(vb && !valid_bit(vb, i)))
                     rc = imdb_fail(e, IMDB_ERR_CORRUPT, "segment: a UUID of no bytes in column %s", col->name);
-                else if (dec_wide(col) && (z > a ? z - a != 16 : seg_keeps(gi->flags[i], s, c) && !(vb && !valid_bit(vb, i))))
-                    rc = imdb_fail(e, IMDB_ERR_CORRUPT, "segment: a DECIMAL of %u bytes in column %s", z - a, col->name);
+                else if (imdb_col_fixed16(col) && (z > a ? z - a != 16 : seg_keeps(gi->flags[i], s, c) && !(vb && !valid_bit(vb, i))))
+                    rc = imdb_fail(e, IMDB_ERR_CORRUPT, "segment: a %s of %u bytes in column %s", imdb_type_name(col->type), z - a, col->name);
                 else if (dec_wide(col) && z > a && !dec_cell_fits(sc->data + a, col))
                     rc = imdb_fail(e, IMDB_ERR_CORRUPT, "segment: value out of range in column %s", col->name);
                 else if (col->type == IMDB_T_TEXT && z > a && !imdb_utf8_valid(sc->data + a, z - a, &bad))
@@ -486,7 +489,11 @@ static void segcol_get(const imdb_column *col, const imdb_segcol *sc, uint32_t r
     }
     if (sc->i64) v->i = sc->i64[row];
     else if (sc->u8) v->i = sc->u8[row];
-    else if (dec_wide(col)) { /* F3e: its 16-byte cell (a row that keeps no value has none: 0, as an int column's zero) */
+    else if (col->type == IMDB_T_INTERVAL) { /* F3f: its 16-byte cell (a row that keeps no value has none: zero) */
+        uint32_t a = sc->off[row], z = sc->off[row + 1];
+        if (z - a == 16) iv_cell(sc->data + a, v);
+        else imdb_iv_set(v, 0, 0, 0);
+    } else if (dec_wide(col)) { /* F3e: its 16-byte cell (a row that keeps no value has none: 0, as an int column's zero) */
         uint32_t a = sc->off[row], z = sc->off[row + 1];
         imdb_dec_set(v, z - a == 16 ? dec_cell(sc->data + a) : 0, true);
     } else {
@@ -789,7 +796,7 @@ static int seg_build(const imdb_table *t, uint32_t gver, const seg_src *src, uin
             if (!seg_keeps(fl[i], s, c)) continue;
             imdb_value v;
             src_get(t, &src[i], &t->hist.vers[rver[i]], bv, c, &v);
-            text_len[c] += dec_wide(&s->cols[c]) ? (v.null ? 0 : 16) : v.len; /* F3e: a wide DECIMAL's cell */
+            text_len[c] += imdb_col_fixed16(&s->cols[c]) ? (v.null ? 0 : 16) : v.len; /* F3e, F3f: a 16-byte cell */
         }
         if (text_len[c] > UINT32_MAX) {
             imdb_free(fl);
@@ -857,6 +864,13 @@ static int seg_build(const imdb_table *t, uint32_t gver, const seg_src *src, uin
                     continue;
                 }
                 if (vb) vb[i >> 3] |= (uint8_t)(1u << (i & 7));
+                if (s->cols[c].type == IMDB_T_INTERVAL) { /* F3f: the row's encoding: months, days, microseconds */
+                    imdb_le32(data + at, (uint32_t)v.iv.mon);
+                    imdb_le32(data + at + 4, (uint32_t)v.iv.day);
+                    imdb_le64(data + at + 8, (uint64_t)v.i);
+                    at += 16;
+                    continue;
+                }
                 if (dec_wide(&s->cols[c])) { /* F3e: i then hi, little-endian (the value's 128 bits, either form) */
                     unsigned __int128 x = (unsigned __int128)imdb_dec_value(&v);
                     imdb_le64(data + at, (uint64_t)x);
@@ -1111,6 +1125,9 @@ static int old_manifest(uint32_t ver, imdb_err *e)
     if (ver == 5)
         return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 5: this lake was written by an imagedb before views' "
                          "format (manifest 6, P2 S7), which this version does not read");
+    if (ver == 15) /* F3f: no INTERVAL column */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 15: this lake was written by an imagedb before INTERVAL "
+                         "(manifest 16, 2026-11-12), which this version does not read");
     if (ver == 14) /* F3e: no DECIMAL past 18 digits */
         return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 14: this lake was written by an imagedb before DECIMALs "
                          "of 38 digits (manifest 15, 2026-11-10), which this version does not read");

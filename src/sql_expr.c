@@ -18,6 +18,9 @@
 
 #define U128_MAX (~(unsigned __int128)0)
 
+#define XTS_MIN (-62135596800000000LL) /* 0001-01-01 00:00:00 */
+#define XTS_MAX (253402300799999999LL) /* 9999-12-31 23:59:59.999999 */
+
 static unsigned __int128 p10(int n) /* n in 0..38: the codec's one table (F3e); past it, as before, by multiplying */
 {
     if (n >= 0 && n <= IMDB_DEC_MAX_DIGITS) return (unsigned __int128)imdb_pow10_128(n);
@@ -40,8 +43,25 @@ static int div0(imdb_err *e) { return imdb_fail(e, IMDB_ERR_INVALID, "division b
 
 int imdb_x_type(uint8_t op, uint8_t ta, uint8_t sa, uint8_t tb, uint8_t sb, uint8_t *rt, uint8_t *rs, imdb_err *e)
 {
+    /* F3f: INTERVAL + or - INTERVAL, a TIMESTAMP or a DATE (its midnight) + or - an INTERVAL (a TIMESTAMP), a TIMESTAMP
+     * minus a TIMESTAMP (an INTERVAL; a TIMESTAMPTZ's too, no zone in it), as PostgreSQL 14 computes them; * and / of an
+     * INTERVAL, a TIMESTAMPTZ's or a TIME's with one wait (deferred.md D26) */
+    if (ta == IMDB_T_INTERVAL || tb == IMDB_T_INTERVAL ||
+        (op == EX_SUB && ta == tb && (ta == IMDB_T_TIMESTAMP || ta == IMDB_T_TIMESTAMPTZ))) {
+        bool da = ta == IMDB_T_TIMESTAMP || ta == IMDB_T_DATE, db = tb == IMDB_T_TIMESTAMP || tb == IMDB_T_DATE;
+        *rs = 0;
+        if (ta == IMDB_T_INTERVAL && tb == IMDB_T_INTERVAL && (op == EX_ADD || op == EX_SUB)) *rt = IMDB_T_INTERVAL;
+        else if ((op == EX_ADD || op == EX_SUB) && da && tb == IMDB_T_INTERVAL) *rt = IMDB_T_TIMESTAMP;
+        else if (op == EX_ADD && ta == IMDB_T_INTERVAL && db) *rt = IMDB_T_TIMESTAMP;
+        else if (op == EX_SUB && ta == tb && ta != IMDB_T_INTERVAL) *rt = IMDB_T_INTERVAL;
+        else
+            return imdb_fail(e, IMDB_ERR_INVALID, "interval arithmetic: INTERVAL + or - INTERVAL, a TIMESTAMP or DATE + or - an "
+                                                  "INTERVAL, TIMESTAMP - TIMESTAMP (* and / of an INTERVAL, and a TIMESTAMPTZ or "
+                                                  "TIME with one, are not in imagedb yet)");
+        return IMDB_OK;
+    }
     /* F3b: a DATE plus or minus days (an INT64), a DATE minus a DATE (the days between), a DATE plus a TIME (a TIMESTAMP),
-     * as PostgreSQL computes them; the rest waits for INTERVAL */
+     * as PostgreSQL computes them (F3f: a DATE and an INTERVAL above) */
     if (ta == IMDB_T_DATE || tb == IMDB_T_DATE || ta == IMDB_T_TIME || tb == IMDB_T_TIME) {
         *rs = 0;
         if (op == EX_ADD && ((ta == IMDB_T_DATE && tb == IMDB_T_INT64) || (ta == IMDB_T_INT64 && tb == IMDB_T_DATE))) *rt = IMDB_T_DATE;
@@ -50,8 +70,8 @@ int imdb_x_type(uint8_t op, uint8_t ta, uint8_t sa, uint8_t tb, uint8_t sb, uint
         else if (op == EX_ADD && ((ta == IMDB_T_DATE && tb == IMDB_T_TIME) || (ta == IMDB_T_TIME && tb == IMDB_T_DATE)))
             *rt = IMDB_T_TIMESTAMP;
         else
-            return imdb_fail(e, IMDB_ERR_INVALID, "date arithmetic: a DATE + or - an INT64 of days, DATE - DATE, DATE + TIME "
-                                                  "(INTERVAL is not in imagedb yet)");
+            return imdb_fail(e, IMDB_ERR_INVALID, "date arithmetic: a DATE + or - an INT64 of days, DATE - DATE, DATE + TIME, "
+                                                  "a DATE + or - an INTERVAL");
         return IMDB_OK;
     }
     if (!is_num(ta) || !is_num(tb))
@@ -89,7 +109,83 @@ void imdb_x_from_value(const imdb_value *v, imdb_xval *out)
     if (v->type == IMDB_T_FLOAT64) out->f = imdb_f64_value(v->i);
     else if (imdb_type_bytes(v->type)) out->s = v->s, out->len = v->len; /* F3d: UUID and BYTEA too */
     else if (v->type == IMDB_T_DECIMAL) out->i = imdb_dec_value(v); /* F3e: either form */
+    else if (v->type == IMDB_T_INTERVAL) out->i = v->i, out->mon = v->iv.mon, out->day = v->iv.day; /* F3f */
     else out->i = v->i;
+}
+
+/* F3f: an INTERVAL's value into a stored one (its microseconds within int64: every operation checks them) */
+void imdb_x_to_iv(const imdb_xval *v, imdb_value *out)
+{
+    imdb_iv_set(out, v->mon, v->day, (int64_t)v->i);
+}
+
+/* ---- F3f: INTERVAL arithmetic, PostgreSQL 14's (timestamp.c: interval_pl, interval_mi, interval_um, timestamp_mi with
+ * interval_justify_hours, timestamp_pl_interval); its answers checked against a postgres:14 container
+ * (docs/f3f-design.md). Each field's result past its int32 or int64 is PostgreSQL's "interval out of range" ---- */
+
+static int iv_range(imdb_err *e) { return imdb_fail(e, IMDB_ERR_LIMIT, "an INTERVAL out of range in an expression"); }
+
+static int iv_out(__int128 mon, __int128 day, __int128 us, imdb_xval *out, imdb_err *e)
+{
+    if (mon < INT32_MIN || mon > INT32_MAX || day < INT32_MIN || day > INT32_MAX || us < INT64_MIN || us > INT64_MAX)
+        return iv_range(e);
+    out->mon = (int32_t)mon;
+    out->day = (int32_t)day;
+    out->i = us;
+    return IMDB_OK;
+}
+
+static int ts_out(imdb_err *e) { return imdb_fail(e, IMDB_ERR_LIMIT, "a timestamp before 0001-01-01 or past 9999-12-31"); }
+
+/* timestamp_pl_interval: the months moved through the year and month, the day clamped to that month's last; then the
+ * days through the calendar; then the time added; sign -1 subtracts each (timestamp_mi_interval). A step past
+ * PostgreSQL's own bounds (4714-11-24 BC to 294276-12-31) is its error; the result is held to TIMESTAMP's range */
+static int ts_plus_iv(__int128 ts, const imdb_xval *iv, int sign, __int128 *out, imdb_err *e)
+{
+    const int64_t lo = imdb_days_from_civil(-4713, 11, 24), hi = imdb_days_from_civil(294277, 1, 1);
+    __int128 mon = (__int128)iv->mon * sign, day = (__int128)iv->day * sign, us = iv->i * sign;
+    int64_t t = (int64_t)ts, days = t / IMDB_DAY_US - (t % IMDB_DAY_US < 0), tod = t - days * IMDB_DAY_US;
+    __int128 dd = days;
+    if (mon) {
+        int64_t y;
+        int m, d;
+        imdb_civil_from_days(days, &y, &m, &d);
+        __int128 at = (__int128)y * 12 + (m - 1) + mon, yy = at / 12 - (at % 12 < 0);
+        if (yy < -4714 || yy > 294277) return ts_out(e);
+        int mm = (int)(at - yy * 12) + 1;
+        static const int dim[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+        bool leap = ((int64_t)yy % 4 == 0 && (int64_t)yy % 100 != 0) || (int64_t)yy % 400 == 0;
+        int last = mm == 2 && leap ? 29 : dim[mm - 1];
+        dd = imdb_days_from_civil((int64_t)yy, mm, d > last ? last : d);
+        if (dd < lo || dd >= hi) return ts_out(e);
+    }
+    if (day) {
+        dd += day;
+        if (dd < lo || dd >= hi) return ts_out(e);
+    }
+    __int128 r = dd * IMDB_DAY_US + tod + us;
+    if (r < XTS_MIN || r > XTS_MAX) return ts_out(e);
+    *out = r;
+    return IMDB_OK;
+}
+
+static int iv_arith(uint8_t op, const imdb_xval *a, const imdb_xval *b, uint8_t rt, imdb_xval *out, imdb_err *e)
+{
+    if (rt == IMDB_T_INTERVAL && a->type == IMDB_T_INTERVAL) { /* field by field */
+        int s = op == EX_ADD ? 1 : -1;
+        return iv_out((__int128)a->mon + s * (__int128)b->mon, (__int128)a->day + s * (__int128)b->day, a->i + s * b->i, out, e);
+    }
+    if (rt == IMDB_T_INTERVAL) { /* a TIMESTAMP minus a TIMESTAMP: the time, then interval_justify_hours (both in range) */
+        __int128 t = a->i - b->i, wd = t / IMDB_DAY_US;
+        t -= wd * IMDB_DAY_US;
+        if (wd > 0 && t < 0) t += IMDB_DAY_US, wd--;
+        else if (wd < 0 && t > 0) t -= IMDB_DAY_US, wd++;
+        return iv_out(0, wd, t, out, e);
+    }
+    /* a TIMESTAMP (or a DATE's midnight) + or - an INTERVAL, either side for + */
+    const imdb_xval *ts = a->type == IMDB_T_INTERVAL ? b : a, *iv = a->type == IMDB_T_INTERVAL ? a : b;
+    __int128 t = ts->type == IMDB_T_DATE ? ts->i * IMDB_DAY_US : ts->i;
+    return ts_plus_iv(t, iv, op == EX_SUB ? -1 : 1, &out->i, e);
 }
 
 /* a DECIMAL (or INT64, scale 0) as the nearest double: one rounding (strtod's, through the literal parser) */
@@ -179,6 +275,7 @@ int imdb_x_arith(uint8_t op, const imdb_xval *a, const imdb_xval *b, uint8_t rt,
         out->null = true;
         return IMDB_OK;
     }
+    if (rt == IMDB_T_INTERVAL || a->type == IMDB_T_INTERVAL || b->type == IMDB_T_INTERVAL) return iv_arith(op, a, b, rt, out, e);
     if (rt == IMDB_T_FLOAT64) {
         double x, y, r = 0;
         if (to_f64(a, &x, e) || to_f64(b, &y, e)) return e->code;
@@ -262,6 +359,7 @@ int imdb_x_neg(const imdb_xval *a, imdb_xval *out, imdb_err *e)
 {
     *out = *a;
     if (a->null) return IMDB_OK;
+    if (a->type == IMDB_T_INTERVAL) return iv_out(-(__int128)a->mon, -(__int128)a->day, -a->i, out, e); /* F3f: interval_um */
     if (a->type == IMDB_T_FLOAT64) out->f = -a->f;
     else out->i = -a->i;
     if (a->type == IMDB_T_INT64 && (out->i > INT64_MAX || out->i < INT64_MIN)) /* -INT64_MIN; -SUM past int64 */
@@ -304,6 +402,10 @@ int imdb_x_cmp(const imdb_xval *a, const imdb_xval *b)
         int c = n ? memcmp(a->s, b->s, n) : 0;
         if (c) return c < 0 ? -1 : 1;
         return a->len < b->len ? -1 : a->len > b->len;
+    }
+    if (a->type == IMDB_T_INTERVAL) { /* F3f: SQL's order, the span (PostgreSQL 14's interval_cmp): equal spans tie */
+        __int128 x = imdb_iv_span(a->mon, a->day, (int64_t)a->i), y = imdb_iv_span(b->mon, b->day, (int64_t)b->i);
+        return x < y ? -1 : x > y;
     }
     if (a->type == IMDB_T_FLOAT64 || b->type == IMDB_T_FLOAT64) {
         if (a->type == IMDB_T_INT64) return cmp_i_f(a->i, b->f);
@@ -364,6 +466,7 @@ int imdb_x_assign(const imdb_column *c, const imdb_xval *v, imdb_value *out, imd
         if (v->type != c->type)
             return imdb_fail(e, IMDB_ERR_INVALID, "column %s expects a %s", c->name, imdb_type_name(c->type));
         if (imdb_type_bytes(c->type)) out->s = v->s, out->len = v->len;
+        else if (c->type == IMDB_T_INTERVAL) imdb_x_to_iv(v, out); /* F3f */
         else out->i = (int64_t)v->i;
         break;
     }
@@ -548,6 +651,8 @@ static int cast_to_text(const imdb_xval *v, imdb_xenv *env, imdb_xval *out, imdb
     } else if (v->type == IMDB_T_UUID || v->type == IMDB_T_BYTEA) { /* F3d: the text forms */
         imdb_value iv = {.type = v->type, .s = v->s, .len = v->len};
         imdb_format_value(&iv, &b);
+    } else if (v->type == IMDB_T_INTERVAL) { /* F3f: PostgreSQL's IntervalStyle postgres */
+        imdb_format_interval(v->mon, v->day, (int64_t)v->i, &b);
     } else {
         imdb_value iv = {.type = v->type};
         iv.i = v->type == IMDB_T_FLOAT64 ? imdb_f64_key(v->f) : (int64_t)v->i;
@@ -1077,6 +1182,12 @@ int imdb_x_cast(const imdb_xval *v, const imdb_column *c, imdb_xenv *env, imdb_x
             out->len = (uint32_t)got;
             return IMDB_OK;
         }
+        case IMDB_T_INTERVAL: { /* F3f: PostgreSQL 14's verbose form (its parse's error, as a DATE's) */
+            int64_t us;
+            if (imdb_parse_interval(s, v->len, &out->mon, &out->day, &us, e)) return e->code;
+            out->i = us;
+            return IMDB_OK;
+        }
         default: break;
         }
     }
@@ -1163,6 +1274,12 @@ int imdb_x_cast(const imdb_xval *v, const imdb_column *c, imdb_xenv *env, imdb_x
         if (v->type != c->type) break;
         out->s = v->s;
         out->len = v->len;
+        return IMDB_OK;
+    case IMDB_T_INTERVAL: /* F3f: from itself (or TEXT, above) alone this slice (TIME's: deferred.md D26) */
+        if (v->type != c->type) break;
+        out->i = v->i;
+        out->mon = v->mon;
+        out->day = v->day;
         return IMDB_OK;
     case IMDB_T_TEXT: { /* F3c: CAST(x AS VARCHAR(n)) refuses a longer value (PostgreSQL's cuts it: never guessed here) */
         int rc = cast_to_text(v, env, out, e);
@@ -1435,8 +1552,6 @@ int imdb_x_eval(const sql_stmt *st, const imdb_xnode *xn, uint16_t k, const imdb
 
 /* ---- P2: time zones (design.md §5, Time zones) ------------------------------------------------------------------- */
 
-#define XTS_MIN (-62135596800000000LL) /* 0001-01-01 00:00:00 */
-#define XTS_MAX (253402300799999999LL) /* 9999-12-31 23:59:59.999999 */
 
 static int ts_range(int64_t v, imdb_err *e)
 {

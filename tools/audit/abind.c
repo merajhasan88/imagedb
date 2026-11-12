@@ -31,7 +31,7 @@
 #include "abind.h"
 
 enum { T_INT64 = 1, T_DECIMAL = 2, T_TEXT = 3, T_BOOL = 4, T_TIMESTAMP = 5, T_FLOAT64 = 6, T_TIMESTAMPTZ = 7, T_DATE = 8, T_TIME = 9,
-       T_UUID = 10, T_BYTEA = 11 }; /* F3d */
+       T_UUID = 10, T_BYTEA = 11, T_INTERVAL = 12 }; /* F3d; F3f */
 enum { DEP_TABLE = 1, DEP_VIEW = 2 };
 
 #define MAX_IDENT 63
@@ -68,9 +68,9 @@ typedef struct tk {
 
 /* ---- the tree ---------------------------------------------------------------------------------------------------- */
 
-enum { L_INT = 1, L_DEC, L_FLT, L_STR, L_PARAM, L_BOOL, L_TS, L_NULL, L_TSTZ, L_DATE, L_TIME, L_UUID, L_BYTEA }; /* L_TSTZ: P2; L_DATE,
+enum { L_INT = 1, L_DEC, L_FLT, L_STR, L_PARAM, L_BOOL, L_TS, L_NULL, L_TSTZ, L_DATE, L_TIME, L_UUID, L_BYTEA, L_INTERVAL }; /* L_TSTZ: P2; L_DATE,
                                                                                                    * L_TIME: F3b; L_UUID,
-                                                                                                   * L_BYTEA: F3d */
+                                                                                                   * L_BYTEA: F3d; L_INTERVAL: F3f */
 enum { X_LIT = 1, X_COL, X_NEG, X_ADD, X_SUB, X_MUL, X_DIV, X_MOD, X_CMP, X_AND, X_OR, X_NOT, X_FN, X_CASE, X_WHEN, X_CAST,
        X_AGG, X_WIN, X_SUBQ, X_LIST };
 enum { C_EQ = 1, C_NE, C_LT, C_LE, C_GT, C_GE, C_BETWEEN, C_ISNULL, C_NOTNULL, C_IN, C_NOTIN, C_LIKE, C_NOTLIKE };
@@ -607,6 +607,10 @@ static int col_type(ab *b, uint8_t *type, uint8_t *scale) /* a CAST's type, as a
     else if (kw(b, "date")) *type = T_DATE; /* F3b */
     else if (kw(b, "uuid")) *type = T_UUID; /* F3d */
     else if (kw(b, "bytea")) *type = T_BYTEA;
+    else if (kw(b, "interval")) { /* F3f: its fields and precision, as the engine refuses them */
+        *type = T_INTERVAL;
+        if (kind_at(b, b->i) == K_LP) return fail(b, "INTERVAL(p) is not supported");
+    }
     else if (kw(b, "time")) {
         *type = T_TIME;
         if ((kwat(b, b->i, "with") || kwat(b, b->i, "without")) && kwat(b, b->i + 1, "time") && kwat(b, b->i + 2, "zone")) {
@@ -752,6 +756,7 @@ static int window_call(ab *b, uint8_t wf, uint16_t *out, unsigned d)
 static bool ts_literal_at(const ab *b, uint32_t i)
 {
     if (kwat(b, i, "date") || kwat(b, i, "time")) return kind_at(b, i + 1) == K_STR; /* F3b */
+    if (kwat(b, i, "interval")) return kind_at(b, i + 1) == K_STR; /* F3f */
     if (kwat(b, i, "timestamptz")) return kind_at(b, i + 1) == K_STR;
     if (!kwat(b, i, "timestamp")) return false;
     if (kind_at(b, i + 1) == K_STR) return true;
@@ -776,6 +781,10 @@ static int literal(ab *b, uint16_t *out)
     else if (kwat(b, b->i, "true") || kwat(b, b->i, "false")) lit = L_BOOL;
     else if ((kwat(b, b->i, "date") || kwat(b, b->i, "time")) && kind_at(b, b->i + 1) == K_STR) { /* F3b */
         lit = kwat(b, b->i, "date") ? L_DATE : L_TIME;
+        b->i++;
+        t = &b->t[b->i];
+    } else if (kwat(b, b->i, "interval") && kind_at(b, b->i + 1) == K_STR) { /* F3f: its text the engine's to check */
+        lit = L_INTERVAL;
         b->i++;
         t = &b->t[b->i];
     } else if ((kwat(b, b->i, "uuid") || kwat(b, b->i, "bytea")) && kind_at(b, b->i + 1) == K_STR) { /* F3d */
@@ -1425,8 +1434,8 @@ static bool num(uint8_t t) { return t == T_INT64 || t == T_DECIMAL || t == T_FLO
 static const char *tname(uint8_t t)
 {
     static const char *const N[] = {"NULL", "INT64", "DECIMAL", "TEXT", "BOOL", "TIMESTAMP", "FLOAT64", "TIMESTAMPTZ", "DATE", "TIME",
-                                    "UUID", "BYTEA"};
-    return t <= T_BYTEA ? N[t] : "?";
+                                    "UUID", "BYTEA", "INTERVAL"};
+    return t <= T_INTERVAL ? N[t] : "?";
 }
 
 static int dep_note(ab *b, uint8_t kind, uint32_t id)
@@ -1653,6 +1662,18 @@ static int type_of(ab *b, const scope *sc, uint16_t k, bool null_ok, ty *out);
  * larger plus six, within 38); anything with FLOAT64 FLOAT64 (% refused) */
 static int arith(ab *b, uint8_t op, ty l, ty r, ty *out)
 {
+    /* F3f: INTERVAL + or - INTERVAL, a TIMESTAMP or a DATE + or - an INTERVAL (a TIMESTAMP), TIMESTAMP - TIMESTAMP and
+     * TIMESTAMPTZ - TIMESTAMPTZ (an INTERVAL), as the engine's imdb_x_type */
+    if (l.t == T_INTERVAL || r.t == T_INTERVAL || (op == X_SUB && l.t == r.t && (l.t == T_TIMESTAMP || l.t == T_TIMESTAMPTZ))) {
+        bool dl = l.t == T_TIMESTAMP || l.t == T_DATE, dr = r.t == T_TIMESTAMP || r.t == T_DATE;
+        if (l.t == T_INTERVAL && r.t == T_INTERVAL && (op == X_ADD || op == X_SUB)) *out = (ty){T_INTERVAL, 0};
+        else if ((op == X_ADD || op == X_SUB) && dl && r.t == T_INTERVAL) *out = (ty){T_TIMESTAMP, 0};
+        else if (op == X_ADD && l.t == T_INTERVAL && dr) *out = (ty){T_TIMESTAMP, 0};
+        else if (op == X_SUB && l.t == r.t && l.t != T_INTERVAL) *out = (ty){T_INTERVAL, 0};
+        else return fail(b, "interval arithmetic: INTERVAL + or - INTERVAL, a TIMESTAMP or DATE + or - an INTERVAL, "
+                            "TIMESTAMP - TIMESTAMP");
+        return 0;
+    }
     /* F3b: a DATE plus or minus days, DATE minus DATE (days), DATE plus TIME (a TIMESTAMP); the rest refused */
     if (l.t == T_DATE || r.t == T_DATE || l.t == T_TIME || r.t == T_TIME) {
         if (op == X_ADD && ((l.t == T_DATE && r.t == T_INT64) || (l.t == T_INT64 && r.t == T_DATE))) *out = (ty){T_DATE, 0};
@@ -1709,7 +1730,7 @@ static int unify_all(ab *b, const scope *sc, const uint16_t *v, unsigned n, cons
     for (unsigned i = 0; i < n; i++) {
         if (type_of(b, sc, v[i], true, &t[i])) return -1;
         if (t[i].t == T_TIMESTAMP || t[i].t == T_TIMESTAMPTZ || t[i].t == T_DATE || t[i].t == T_TIME || t[i].t == T_UUID ||
-            t[i].t == T_BYTEA)
+            t[i].t == T_BYTEA || t[i].t == T_INTERVAL) /* F3f: a string literal beside an INTERVAL is one */
             ts = t[i].t; /* F3b; F3d: a string literal beside a UUID or a BYTEA is one, as the engine's is_ts */
     }
     *out = (ty){0, 0};
@@ -1880,7 +1901,8 @@ static int agg_type(ab *b, const scope *sc, uint8_t agg, uint16_t arg, ty *out)
     }
     ty a;
     if (type_of(b, sc, arg, false, &a)) return -1;
-    if ((agg == A_SUM || agg == A_AVG) && !num(a.t)) return fail(b, "SUM and AVG need an INT64, DECIMAL or FLOAT64 value");
+    if ((agg == A_SUM || agg == A_AVG) && !num(a.t) && !(agg == A_SUM && a.t == T_INTERVAL)) /* F3f: SUM of an INTERVAL */
+        return fail(b, "SUM and AVG need an INT64, DECIMAL or FLOAT64 value");
     *out = a;
     if (agg == A_AVG && a.t != T_FLOAT64) {
         unsigned s = (a.t == T_DECIMAL ? a.s : 0u) + 6u;
@@ -1990,6 +2012,7 @@ static int type_of(ab *b, const scope *sc, uint16_t k, bool null_ok, ty *out)
         case L_TIME: *out = (ty){T_TIME, 0}; return 0;
         case L_UUID: *out = (ty){T_UUID, 0}; return 0; /* F3d */
         case L_BYTEA: *out = (ty){T_BYTEA, 0}; return 0;
+        case L_INTERVAL: *out = (ty){T_INTERVAL, 0}; return 0; /* F3f */
         case L_NULL:
             if (!null_ok) return fail(b, "NULL cannot be an operand");
             *out = (ty){0, 0};
@@ -1999,7 +2022,7 @@ static int type_of(ab *b, const scope *sc, uint16_t k, bool null_ok, ty *out)
     case X_COL: return col_of(b, sc, x, out);
     case X_NEG:
         if (type_of(b, sc, x->l, false, &l)) return -1;
-        if (!num(l.t)) return fail(b, "arithmetic takes INT64, DECIMAL and FLOAT64 values");
+        if (!num(l.t) && l.t != T_INTERVAL) return fail(b, "arithmetic takes INT64, DECIMAL and FLOAT64 values"); /* F3f */
         *out = l;
         return 0;
     case X_ADD:
@@ -2096,7 +2119,7 @@ static int bind_core(ab *b, const aq *q, const scope *up, int mode, ab_col *out,
             ty t = {0, 0};
             if (it->shape == 2) {
                 if (x->agg == A_COUNT || x->agg == A_COUNT_STAR) t = (ty){T_INT64, 0};
-                else if (!(rc = col_of(b, &sc, QX(q, x->l), &t)) && x->agg == A_SUM && !num(t.t))
+                else if (!(rc = col_of(b, &sc, QX(q, x->l), &t)) && x->agg == A_SUM && !num(t.t) && t.t != T_INTERVAL) /* F3f */
                     rc = fail(b, "SUM needs an INT64, DECIMAL or FLOAT64 value");
             } else {
                 rc = type_of(b, &sc, it->ex, true, &t);
@@ -2714,6 +2737,7 @@ static int ck_bind(ck *x, uint16_t k, bool null_ok)
                 d->s = x->cols[c].type == T_DECIMAL ? x->cols[c].scale : 0;
                 if (d->t == T_FLOAT64) return fail(x->b, "a CHECK computes no FLOAT64 value");
                 if (d->t == T_UUID || d->t == T_BYTEA) return fail(x->b, "a CHECK reads no UUID or BYTEA value yet"); /* F3d */
+                if (d->t == T_INTERVAL) return fail(x->b, "a CHECK reads no INTERVAL value yet"); /* F3f */
                 return 0;
             }
         return fail(x->b, "no column %s in its table", nm);

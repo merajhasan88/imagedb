@@ -1,7 +1,7 @@
 #!/bin/sh
-# Makes the format's fixtures (2026-11-10, its first pair: META 5, log version 3, manifest version 15 and segment format 3 (F1 stage 4:
-# a segment names its schema version by its hash with positions), ops 16, 19, 20, 21, 22's kinds and 23 to 29; alg1-20261110a.tar.gz
-# and alg2-20261110a.tar.gz beside this script): a primary and its replica under digest algorithm ALG, by
+# Makes the format's fixtures (2026-11-12, its first pair: META 5, log version 3, manifest version 16 and segment format 3 (F1 stage 4:
+# a segment names its schema version by its hash with positions), ops 16, 19, 20, 21, 22's kinds and 23 to 29; alg1-20261112a.tar.gz
+# and alg2-20261112a.tar.gz beside this script): a primary and its replica under digest algorithm ALG, by
 # make_alg2.sh's steps, which reach every reader of the format: a log of several segments (each manifest
 # publish ends one), CHECKPOINTs (manifests, segments, the lanes), a two-column index and a unique one,
 # an UPDATE and a DELETE, ERASE SUBJECT (redacted log payloads, rewritten segments), commits after it, and
@@ -25,7 +25,9 @@
 # FOREIGN KEYs (op 29: a CASCADE and a SET NULL over two levels), an ADD FOREIGN KEY after the first CHECKPOINT, a parent
 # deleted with its actions from the log, a DROP CONSTRAINT (manifest 13: version 1's FOREIGN KEYs), and (F3d) UUID and BYTEA (manifest
 # 14), and (F3e) a table of DECIMALs to 38 digits at their bounds (a wide key, a wide DEFAULT, a view of wide values and of
-# places past 18; a widening within the wide form and rows from the log: manifest 15). The live
+# places past 18; a widening within the wide form and rows from the log: manifest 15), and (F3f) a table of INTERVALs (each
+# field at its ends, the equal-span trio '1 mon', '30 days', '720:00:00', a DEFAULT, a view of their arithmetic; an ADD
+# with an INTERVAL DEFAULT after the first CHECKPOINT, rows and an update from the log: manifest 16). The live
 # tables are RETENTION FOREVER and the dropped one is kept a century, the longest but FOREVER: a fixture is frozen
 # data, so its history
 # never expires under the tests that open it (the 24-hour default is tested by the unit tests). Every
@@ -38,10 +40,11 @@
 # before sequences; alg1-20261109c and alg2-20261109c, manifest version 10: before CHECK constraints; alg1-20261109d and
 # alg2-20261109d, manifest version 11: before generated columns; alg1-20261109e and alg2-20261109e, manifest version 12:
 # before FOREIGN KEYs; alg1-20261109f and alg2-20261109f, manifest version 13: before UUID and BYTEA; alg1-20261109g and
-# alg2-20261109g, manifest version 14: before DECIMALs of 38 digits) stay as
+# alg2-20261109g, manifest version 14: before DECIMALs of 38 digits; alg1-20261110a and alg2-20261110a, manifest version
+# 15: before INTERVAL) stay as
 # directories this format refuses.
 #   sh tests/fixtures/make_fixtures.sh BIN AUDIT ALG OUTDIR   (OUTDIR must not exist)
-#   tar -czf tests/fixtures/algALG-20261110a.tar.gz -C OUTDIR primary replica
+#   tar -czf tests/fixtures/algALG-20261112a.tar.gz -C OUTDIR primary replica
 set -eu
 BIN=$1
 AUD=$2
@@ -117,6 +120,10 @@ sql "CREATE TABLE wide (id DECIMAL(38,0) PRIMARY KEY, w DECIMAL(30,4) DEFAULT 18
 sql "INSERT INTO wide VALUES (99999999999999999999999999999999999999, 99999999999999999999999999.9999, 9999999999999999.99, 1), (-99999999999999999999999999999999999999, -99999999999999999999999999.9999, -9999999999999999.99, NULL), (18446744073709551616, 0, 0, 18446744073709551617)"
 sql "INSERT INTO wide (id, n) VALUES (1, 1.25)"  # w its DEFAULT, 2^64 + 0.0001
 sql "CREATE VIEW widev AS SELECT id, w * 2 AS w2, CAST(n AS DECIMAL(38,16)) / 3 AS m FROM wide" # F3e: a view of wide values; m 22 places
+sql "CREATE TABLE spans (id INT64 PRIMARY KEY, iv INTERVAL, at TIMESTAMP, d INTERVAL DEFAULT INTERVAL '1 year 2 mons -3 days +04:05:06.5') RETENTION FOREVER" # F3f
+sql "INSERT INTO spans (id, iv, at) VALUES (1, '1 mon', '2024-01-31 10:00:00'), (2, '30 days', '2024-01-31 10:00:00'), (3, '720:00:00', '2024-02-29 00:00:00'), (4, NULL, NULL)"
+sql "INSERT INTO spans VALUES (5, '178956970 years 7 mons 2147483647 days 2562047788:00:54.775807', '0001-01-01 00:00:00', '-178956970 years -8 mons -2147483648 days -2562047788:00:54.775808')" # each field's ends
+sql "CREATE VIEW spansv AS SELECT id, at + iv AS later, iv - INTERVAL '1 day' AS less, -d AS neg FROM spans WHERE id < 5" # F3f: arithmetic
 sql "CHECKPOINT"
 ship
 sql "ALTER TABLE pair ADD w TEXT DEFAULT 'w0'"          # F1: op 22; pair's rows so far are in a segment of version 1
@@ -154,6 +161,9 @@ sql "INSERT INTO ub (k, b, n) VALUES (gen_random_uuid(), '\\x0102', 4)" # F3d: f
 sql "UPDATE ub SET b = '\\x6869' WHERE n = 1"
 sql "ALTER TABLE ub ALTER COLUMN k SET DEFAULT gen_random_uuid()" # op 22 kind 10, kind 10
 sql "ALTER TABLE wide ALTER COLUMN x TYPE DECIMAL(38,0)"  # F3e: a widening within the wide form, after the first CHECKPOINT
+sql "ALTER TABLE spans ADD COLUMN e INTERVAL DEFAULT INTERVAL '-1 mons +1 day -01:00:00'" # F3f: older rows read it (a 16-byte cell)
+sql "UPDATE spans SET iv = iv + INTERVAL '1 day', at = at - INTERVAL '1 mon' WHERE id = 2" # from the log
+sql "INSERT INTO spans (id, iv, at) VALUES (6, '-1 days +02:00:00', '2000-03-31 00:00:00')"
 sql "UPDATE wide SET w = w - 1, x = x * 1000000000000 WHERE id = 1" # from the log
 sql "INSERT INTO wide (id, x) VALUES (2, -12345678901234567890123456789012345678)"
 sql "UPDATE stamp SET at = TIMESTAMPTZ '2030-01-01 12:00:00+05:45' WHERE id = 3" # P2: an instant from the log

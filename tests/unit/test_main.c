@@ -133,6 +133,7 @@ int main(int argc, char **argv)
         {"fk", fk_tests, &fk_ntests},          /* F2b-2: FOREIGN KEYs */
         {"ub", ub_tests, &ub_ntests},          /* F3d: UUID and BYTEA */
         {"dec38", dec38_tests, &dec38_ntests}, /* F3e: NUMERIC to 38 digits */
+        {"iv", iv_tests, &iv_ntests},          /* F3f: INTERVAL */
         {"tz", tz_tests, &tz_ntests}, /* P2: time zones */
         {"tzsql", tzsql_tests, &tzsql_ntests}, /* P2: time zones through the engine */
     };

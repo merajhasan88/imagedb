@@ -62,7 +62,8 @@ static int retention_text(const imdb_table *t, char *out, size_t n, imdb_err *e)
 static int literal_text(dumper *d, const imdb_value *v, imdb_err *e)
 {
     if (!imdb_type_bytes(v->type) && v->type != IMDB_T_TIMESTAMP && v->type != IMDB_T_TIMESTAMPTZ && v->type != IMDB_T_DATE &&
-        v->type != IMDB_T_TIME) { /* F3b: a DATE and a TIME quoted, as their literals are strings; F3d: a UUID and a BYTEA */
+        v->type != IMDB_T_TIME && v->type != IMDB_T_INTERVAL) { /* F3b: a DATE and a TIME quoted, as their literals are
+                                                                * strings; F3d: a UUID and a BYTEA; F3f: an INTERVAL */
         imdb_format_value(v, &d->b);
         return IMDB_OK;
     }

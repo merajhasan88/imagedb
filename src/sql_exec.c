@@ -212,6 +212,11 @@ typedef struct xctx {
     uint16_t oref[2 * IMDB_MAX_COLS];
     struct xcorr *corr;           /* this statement's correlated subqueries, one per nested SELECT (NULL: none) */
     imdb_result *probe_r;         /* the bind-only pass's result: its columns typed, no row (probe_types) */
+    const sql_stmt *ivban_st;     /* F3f: a window statement's copy (exec_window): its first ivban_ndist items its
+                                   * DISTINCT's, the items ivban_win marks its windows' keys; iv_items_ok refuses
+                                   * an INTERVAL among them at the copy's binding */
+    uint16_t ivban_ndist;
+    uint64_t ivban_win;           /* a bit an item (IMDB_MAX_COLS: 64) */
     bool wceil;                   /* P2 S8: a write set the memory ceiling for its reading (wceil_set) */
     bool nested;                  /* P2 S15: a nested SELECT's run (run_nested): never a releasing one, and while one runs
                                    * the statement around it holds row pointers into its own segments */
@@ -461,6 +466,14 @@ static int xpin_row(xctx *x, imdb_value *v, uint16_t n, imdb_err *e)
 
 static int bind_const_tree(xctx *x, const sql_stmt *st, uint16_t k, const imdb_column *c, imdb_value *out, imdb_err *e);
 
+/* F3f: what groups or matches values by equality refuses an INTERVAL this slice: SQL's equality is its span, and
+ * '1 mon' and '30 days' are two values of one span, so a group's or a match's value would be whichever came first
+ * (deferred.md D26) */
+static int iv_unsupported(imdb_err *e, const char *what)
+{
+    return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "%s over an INTERVAL is not in imagedb yet", what);
+}
+
 /* F3e: a DECIMAL value in column c's form (codec.h imdb_dec_wide): a value past 18 digits never cut into a narrow
  * column's form, refused there (an API parameter, a row set's cell); a write's precision is imdb_value_check's */
 static int dec_form(const imdb_column *c, imdb_value *v, imdb_err *e)
@@ -578,6 +591,15 @@ static int bind_lit(xctx *x, const sql_lit *l, const imdb_column *c, bool compar
             }
             out->s = buf;
             out->len = (uint32_t)k;
+            break;
+        }
+        case IMDB_T_INTERVAL: { /* F3f: a string read by PostgreSQL's verbose form, or INTERVAL '...' */
+            if (l->kind != LIT_INTERVAL && l->kind != LIT_STR)
+                return imdb_fail(e, IMDB_ERR_INVALID, "column %s expects INTERVAL '...'", c->name);
+            int32_t mon, day;
+            if (imdb_parse_interval(txt, tl, &mon, &day, &out->i, e)) return e->code;
+            out->iv.mon = mon;
+            out->iv.day = day;
             break;
         }
         }
@@ -740,6 +762,13 @@ static int bind_xlit(xctx *x, const sql_lit *l, imdb_xval *v, imdb_err *e)
         v->len = (uint32_t)got;
         return IMDB_OK;
     }
+    case LIT_INTERVAL: { /* F3f */
+        int64_t us;
+        if (imdb_parse_interval(txt, tl, &v->mon, &v->day, &us, e)) return e->code;
+        v->type = IMDB_T_INTERVAL;
+        v->i = us;
+        return IMDB_OK;
+    }
     case LIT_STR: {
         uint8_t *buf = xalloc(x, tl, e);
         if (!buf) return e->code;
@@ -779,6 +808,14 @@ static int ts_lit(xctx *x, const sql_stmt *st, uint16_t k, uint8_t t, imdb_err *
         bn->k.len = (uint32_t)got;
         return IMDB_OK;
     }
+    if (t == IMDB_T_INTERVAL) { /* F3f: PostgreSQL's verbose form */
+        imdb_xnode *bn = &x->xn[k];
+        memset(&bn->k, 0, sizeof bn->k);
+        if (imdb_parse_interval(s, n->lit.len, &bn->k.mon, &bn->k.day, &us, e)) return e->code;
+        bn->k.type = bn->type = t;
+        bn->k.i = us;
+        return IMDB_OK;
+    }
     if (t == IMDB_T_TIMESTAMPTZ ? imdb_x_tstz_text(s, n->lit.len, &x->env, &us, e)
         : t == IMDB_T_DATE      ? imdb_parse_date(s, n->lit.len, &us, e)
         : t == IMDB_T_TIME      ? imdb_parse_time(s, n->lit.len, &us, e)
@@ -795,7 +832,7 @@ static int ts_lit(xctx *x, const sql_stmt *st, uint16_t k, uint8_t t, imdb_err *
 static bool is_ts(uint8_t t)
 {
     return t == IMDB_T_TIMESTAMP || t == IMDB_T_TIMESTAMPTZ || t == IMDB_T_DATE || t == IMDB_T_TIME || t == IMDB_T_UUID ||
-           t == IMDB_T_BYTEA; /* F3d: a UUID's and a BYTEA's text forms too */
+           t == IMDB_T_BYTEA || t == IMDB_T_INTERVAL; /* F3d: a UUID's and a BYTEA's text forms too; F3f: an INTERVAL's */
 }
 
 /* CAST between the temporal types: TIMESTAMP and TIMESTAMPTZ each way (the session's zone), and (F3b) a TIMESTAMP's or
@@ -1194,8 +1231,8 @@ static int bind_win(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
         if (xbind(x, sc, n->l, e)) return e->code;
         const imdb_xnode *a = &x->xn[n->l];
         bool num = a->type == IMDB_T_INT64 || a->type == IMDB_T_DECIMAL || a->type == IMDB_T_FLOAT64;
-        if ((n->agg == AGG_SUM || n->agg == AGG_AVG) && !num)
-            return imdb_fail(e, IMDB_ERR_INVALID, n->agg == AGG_SUM ? "SUM needs an INT64, DECIMAL or FLOAT64 value"
+        if ((n->agg == AGG_SUM || n->agg == AGG_AVG) && !num && !(n->agg == AGG_SUM && a->type == IMDB_T_INTERVAL)) /* F3f */
+            return imdb_fail(e, IMDB_ERR_INVALID, n->agg == AGG_SUM ? "SUM needs an INT64, DECIMAL, FLOAT64 or INTERVAL value"
                                                                   : "AVG needs an INT64, DECIMAL or FLOAT64 value");
         if (n->agg == AGG_COUNT) return IMDB_OK;
         b->type = a->type;
@@ -1257,8 +1294,9 @@ static int xbind_node(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
             if (rc) return rc;
             const imdb_xnode *a = &x->xn[n->l];
             bool num = a->type == IMDB_T_INT64 || a->type == IMDB_T_DECIMAL || a->type == IMDB_T_FLOAT64;
-            if ((n->agg == AGG_SUM || n->agg == AGG_AVG) && !num)
-                return imdb_fail(e, IMDB_ERR_INVALID, n->agg == AGG_SUM ? "SUM needs an INT64, DECIMAL or FLOAT64 value"
+            if (n->dist && a->type == IMDB_T_INTERVAL) return iv_unsupported(e, "an aggregate's DISTINCT"); /* F3f */
+            if ((n->agg == AGG_SUM || n->agg == AGG_AVG) && !num && !(n->agg == AGG_SUM && a->type == IMDB_T_INTERVAL)) /* F3f */
+                return imdb_fail(e, IMDB_ERR_INVALID, n->agg == AGG_SUM ? "SUM needs an INT64, DECIMAL, FLOAT64 or INTERVAL value"
                                                                       : "AVG needs an INT64, DECIMAL or FLOAT64 value");
             if (n->agg != AGG_COUNT) b->type = a->type, b->scale = a->scale;
             if (n->agg == AGG_AVG && a->type != IMDB_T_FLOAT64) { /* 1e: SUM / COUNT by the division rule: six more places */
@@ -1287,8 +1325,8 @@ static int xbind_node(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
         if (xbind(x, sc, n->l, e)) return e->code;
         b->type = x->xn[n->l].type;
         b->scale = x->xn[n->l].scale;
-        if (b->type != IMDB_T_INT64 && b->type != IMDB_T_DECIMAL && b->type != IMDB_T_FLOAT64)
-            return imdb_fail(e, IMDB_ERR_INVALID, "arithmetic takes INT64, DECIMAL and FLOAT64 values");
+        if (b->type != IMDB_T_INT64 && b->type != IMDB_T_DECIMAL && b->type != IMDB_T_FLOAT64 && b->type != IMDB_T_INTERVAL)
+            return imdb_fail(e, IMDB_ERR_INVALID, "arithmetic takes INT64, DECIMAL and FLOAT64 values (and - an INTERVAL)");
         return IMDB_OK;
     case EX_SUBQ: return bind_subq(x, sc, k, e); /* P2 S4 */
     case EX_WIN: return bind_win(x, sc, k, e); /* P2 S6 */
@@ -1418,7 +1456,7 @@ typedef struct bpred {
     uint8_t type;
     uint8_t op;
     bool neg;
-    bool byval;              /* compared by value (a, b: imdb_value_cmp): TEXT, UUID, BYTEA, a wide DECIMAL (F3e) */
+    bool byval;              /* compared by value (a, b: imdb_value_cmp): TEXT, UUID, BYTEA, a wide DECIMAL (F3e), an INTERVAL (F3f) */
     int64_t lo, hi;          /* else int-like: inclusive range */
     imdb_value a, b;         /* TEXT */
 } bpred;
@@ -1426,7 +1464,7 @@ typedef struct bpred {
 /* F3e: a DECIMAL past 18 digits: its segment column is 16-byte cells, no i64 array (lake.c seg_bytes), so no fast path,
  * no zone map and no int64 range: its predicates compare by value, exactly, as a byte string's do */
 static bool dec_wide_col(const imdb_column *c) { return c->type == IMDB_T_DECIMAL && imdb_dec_wide(c->precision); }
-static bool pred_byval(const imdb_column *c) { return imdb_type_bytes(c->type) || dec_wide_col(c); }
+static bool pred_byval(const imdb_column *c) { return imdb_type_bytes(c->type) || imdb_col_fixed16(c); } /* F3f: INTERVAL by its span */
 
 typedef struct qspec {
     imdb_table *t;
@@ -1716,9 +1754,47 @@ static bool preds_ok(const qspec *q, const imdb_value *vals)
 
 /* ---- sinks: what a read path feeds matching rows into ----------------------------- */
 
+/* F3f: MIN and MAX order INTERVALs by their span, and of equal spans keep the least triple (months, days, then
+ * microseconds), MAX too: one answer whatever the rows' order (PostgreSQL keeps the last it scans) */
+static int iv_triple(int32_t m1, int32_t d1, int64_t u1, int32_t m2, int32_t d2, int64_t u2)
+{
+    if (m1 != m2) return m1 < m2 ? -1 : 1;
+    if (d1 != d2) return d1 < d2 ? -1 : 1;
+    return u1 < u2 ? -1 : u1 > u2;
+}
+
+static int ext_cmp(uint8_t agg, const imdb_value *a, const imdb_value *b)
+{
+    int c = imdb_value_cmp(a, b);
+    if (c || a->type != IMDB_T_INTERVAL) return c;
+    c = iv_triple(a->iv.mon, a->iv.day, a->i, b->iv.mon, b->iv.day, b->i);
+    return agg == AGG_MAX ? -c : c;
+}
+
+/* F3f: an INTERVAL SUM's total, each field's sum exact in any order and only the total held to its field's range (no
+ * order of the rows decides whether it fails; PostgreSQL's interval_pl fails at a partial sum past a field) */
+static int iv_total(__int128 smon, __int128 sday, __int128 sum, int64_t wrap, imdb_xval *out, imdb_err *e)
+{
+    if (wrap || smon < INT32_MIN || smon > INT32_MAX || sday < INT32_MIN || sday > INT32_MAX || sum < INT64_MIN || sum > INT64_MAX)
+        return imdb_fail(e, IMDB_ERR_LIMIT, "an INTERVAL SUM out of range");
+    out->mon = (int32_t)smon;
+    out->day = (int32_t)sday;
+    out->i = sum;
+    return IMDB_OK;
+}
+
+static int x_ext_cmp(uint8_t agg, const imdb_xval *a, const imdb_xval *b)
+{
+    int c = imdb_x_cmp(a, b);
+    if (c || a->type != IMDB_T_INTERVAL) return c;
+    c = iv_triple(a->mon, a->day, (int64_t)a->i, b->mon, b->day, (int64_t)b->i);
+    return agg == AGG_MAX ? -c : c;
+}
+
 typedef struct agg_acc {
     uint64_t count;          /* COUNT(*): rows; otherwise non-null values */
     __int128 sum;            /* wrapping, as xacc's (F3e: a wide DECIMAL's values pass 2^127 in two rows): sum + wrap * 2^128 */
+    __int128 smon, sday;     /* F3f: an INTERVAL SUM's months and days (its microseconds in sum, wrap): the total checked */
     int64_t wrap;
     imdb_fsum fsum;          /* SUM of a FLOAT64 column, exact */
     bool has;
@@ -1733,6 +1809,7 @@ typedef struct agg_acc {
 typedef struct xacc {
     uint64_t count;
     __int128 sum;            /* INT64, DECIMAL at the argument's scale, wrapping: the exact sum is sum + wrap * 2^128 */
+    __int128 smon, sday;     /* F3f: an INTERVAL SUM's months and days (its microseconds in sum, wrap): the total checked */
     int64_t wrap;            /* P2 S12: the times sum wrapped (up 1, down -1); only the total is checked under 10^38,
                               * when it is read (xacc_total), so no order of the rows decides whether a SUM fails */
     imdb_fsum fsum;          /* FLOAT64, exact */
@@ -1782,12 +1859,13 @@ static int xacc_add(xacc *a, uint8_t agg, const imdb_xval *v, imdb_err *e)
         if (imdb_fsum_add(&a->fsum, imdb_f64_key(v->f), e)) return e->code;
     } else if (sum) { /* exact in any order (the wrap counted); 38 digits are the total's rule (xacc_total) */
         if (__builtin_add_overflow(a->sum, v->i, &a->sum)) a->wrap += v->i < 0 ? -1 : 1;
+        if (v->type == IMDB_T_INTERVAL) a->smon += v->mon, a->sday += v->day; /* F3f: field by field */
     } else if (agg == AGG_MIN || agg == AGG_MAX) {
-        if (!a->has || imdb_x_cmp(v, &a->mn) < 0) {
+        if (!a->has || x_ext_cmp(AGG_MIN, v, &a->mn) < 0) {
             a->mn = *v;
             if (xacc_own(&a->mn, &a->mnb, &a->mncap, e)) return e->code;
         }
-        if (!a->has || imdb_x_cmp(v, &a->mx) > 0) {
+        if (!a->has || x_ext_cmp(AGG_MAX, v, &a->mx) > 0) {
             a->mx = *v;
             if (xacc_own(&a->mx, &a->mxb, &a->mxcap, e)) return e->code;
         }
@@ -1812,6 +1890,7 @@ static int xacc_sub(xacc *a, uint8_t agg, const imdb_xval *v, imdb_err *e)
         if (v->f != 0 && imdb_fsum_add(&a->fsum, imdb_f64_key(-v->f), e)) return e->code;
     } else if (sum) {
         if (__builtin_sub_overflow(a->sum, v->i, &a->sum)) a->wrap += v->i < 0 ? 1 : -1;
+        if (v->type == IMDB_T_INTERVAL) a->smon -= v->mon, a->sday -= v->day; /* F3f */
     }
     a->has = a->count > 0;
     return IMDB_OK;
@@ -1859,6 +1938,7 @@ static int xacc_value(xacc *a, uint8_t agg, const imdb_xnode *b, uint8_t ta, uin
         *out = agg == AGG_MIN ? a->mn : a->mx;
         return IMDB_OK;
     }
+    if (b->type == IMDB_T_INTERVAL) return iv_total(a->smon, a->sday, a->sum, a->wrap, out, e); /* F3f */
     if (b->type != IMDB_T_FLOAT64) return xacc_total(a, agg, &out->i, e);
     int64_t key;
     if (imdb_fsum_result(&a->fsum, &key, e)) return e->code;
@@ -1963,6 +2043,10 @@ static void key_enc(imdb_buf *b, const imdb_xval *v)
     if (imdb_type_bytes(v->type)) {
         imdb_buf_put_u32(b, v->len);
         if (v->len) imdb_buf_put(b, v->s, v->len);
+    } else if (v->type == IMDB_T_INTERVAL) { /* F3f: the triple, its identity (a correlated subquery's memo) */
+        imdb_buf_put_u32(b, (uint32_t)v->mon);
+        imdb_buf_put_u32(b, (uint32_t)v->day);
+        imdb_buf_put(b, &v->i, sizeof v->i);
     } else if (v->type == IMDB_T_FLOAT64) {
         imdb_buf_put_u64(b, (uint64_t)imdb_f64_key(v->f));
     } else { /* INT64, DECIMAL at its key's bound scale, BOOL, TIMESTAMP: the value itself */
@@ -2123,14 +2207,15 @@ static int acc_add(agg_acc *a, uint8_t agg, const imdb_value *v, imdb_err *e)
     if (agg == AGG_SUM && v->type == IMDB_T_FLOAT64 && imdb_fsum_add(&a->fsum, v->i, e)) return e->code;
     if (agg == AGG_SUM && v->type != IMDB_T_FLOAT64) { /* F3e: either DECIMAL form; the wraps counted, as xacc_add's */
         __int128 x = v->type == IMDB_T_DECIMAL ? imdb_dec_value(v) : (__int128)v->i, r;
+        if (v->type == IMDB_T_INTERVAL) a->smon += v->iv.mon, a->sday += v->iv.day; /* F3f: field by field */
         if (__builtin_add_overflow(a->sum, x, &r)) a->wrap += x < 0 ? -1 : 1;
         a->sum = r;
     }
-    if (agg == AGG_MIN && (!a->has || imdb_value_cmp(v, &a->mn) < 0)) {
+    if (agg == AGG_MIN && (!a->has || ext_cmp(agg, v, &a->mn) < 0)) {
         a->mn = *v;
         if (acc_own(&a->mn, &a->mnb, &a->mncap, e)) return e->code;
     }
-    if (agg == AGG_MAX && (!a->has || imdb_value_cmp(v, &a->mx) > 0)) {
+    if (agg == AGG_MAX && (!a->has || ext_cmp(agg, v, &a->mx) > 0)) {
         a->mx = *v;
         if (acc_own(&a->mx, &a->mxb, &a->mxcap, e)) return e->code;
     }
@@ -2928,7 +3013,7 @@ static bool fast_aggregate(const sink *k, const imdb_table *t)
     if (k->mode != SINK_AGG || k->nresid || k->trees) return false;
     for (uint16_t i = 0; i < k->st->nitems; i++) {
         uint8_t a = k->st->items[i].agg;
-        if (a == AGG_SUM && k->item_col[i] >= 0 && dec_wide_col(&t->s.cols[k->item_col[i]])) return false;
+        if (a == AGG_SUM && k->item_col[i] >= 0 && imdb_col_fixed16(&t->s.cols[k->item_col[i]])) return false; /* F3e, F3f */
         if (a == AGG_SUM || a == AGG_COUNT || a == AGG_COUNT_STAR) continue;
         return false;
     }
@@ -3037,7 +3122,7 @@ static bool fast_group_ok(sink *k, const imdb_table *t)
         if (it->expr || it->agg == AGG_NONE || it->agg == AGG_COUNT_STAR) continue; /* a key, or over the keys alone */
         if (it->agg != AGG_COUNT && it->agg != AGG_SUM) return false;
         if (k->item_col[i] < 0) return false;
-        if (it->agg == AGG_SUM && dec_wide_col(&t->s.cols[k->item_col[i]])) return false; /* F3e: no i64 array to sum */
+        if (it->agg == AGG_SUM && imdb_col_fixed16(&t->s.cols[k->item_col[i]])) return false; /* F3e, F3f: no i64 array to sum */
     }
     return true;
 }
@@ -3639,6 +3724,7 @@ static void cell_x(const imdb_result *r, const imdb_cell *c, imdb_xval *v)
     if (c->wide) v->i = c->i128;
     else if (c->v.type == IMDB_T_FLOAT64) v->f = imdb_f64_value(c->v.i);
     else if (imdb_type_bytes(c->v.type)) v->s = r->text.p + c->v.i, v->len = c->v.len;
+    else if (c->v.type == IMDB_T_INTERVAL) v->i = c->v.i, v->mon = c->v.iv.mon, v->day = c->v.iv.day; /* F3f */
     else v->i = c->v.i;
 }
 
@@ -3658,6 +3744,10 @@ static void row_digest(const imdb_result *r, const imdb_cell *row, uint8_t out[I
             imdb_sha256_update(&h, r->text.p + c->v.i, n);
         } else {
             __int128 v = c->wide ? c->i128 : (__int128)c->v.i; /* a FLOAT64's key: one per value (-0.0 is 0.0) */
+            if (c->v.type == IMDB_T_INTERVAL) { /* F3f: the triple */
+                int32_t md[2] = {c->v.iv.mon, c->v.iv.day};
+                imdb_sha256_update(&h, md, sizeof md);
+            }
             imdb_sha256_update(&h, &v, sizeof v);
         }
     }
@@ -3671,7 +3761,7 @@ typedef struct window {
     imdb_hmap seen;          /* DISTINCT: the kept rows' digests */
 } window;
 
-static int window_init(window *w, const sql_stmt *st, imdb_err *e)
+static int window_init(window *w, const sql_stmt *st, const imdb_result *r, imdb_err *e)
 {
     memset(w, 0, sizeof *w);
     w->skip = st->has_offset ? st->offset : 0;
@@ -3840,6 +3930,14 @@ static int put_agg(imdb_result *r, imdb_cell *c, agg_acc *a, uint8_t agg, const 
             if (imdb_fsum_result(&a->fsum, &c->v.i, e)) return e->code;
             break;
         }
+        if (col->type == IMDB_T_INTERVAL) { /* F3f: field by field, the total held to each field's range */
+            imdb_xval t = {.type = IMDB_T_INTERVAL};
+            if (iv_total(a->smon, a->sday, a->sum, a->wrap, &t, e)) return e->code;
+            imdb_value iv = {.type = IMDB_T_INTERVAL};
+            imdb_x_to_iv(&t, &iv);
+            res_put(r, c, &iv);
+            break;
+        }
         if (a->wrap || a->sum >= imdb_pow10_128(IMDB_DEC_MAX_DIGITS) || a->sum <= -imdb_pow10_128(IMDB_DEC_MAX_DIGITS))
             return imdb_fail(e, IMDB_ERR_LIMIT, "a SUM of more than 38 digits"); /* F3e: the total's rule, xacc_total's */
         c->wide = true;
@@ -3900,6 +3998,28 @@ static bool distinct_key(const sql_stmt *st, uint16_t k)
 
 /* ORDER BY's keys bound with the SELECT list's scope (a key may hold aggregates where an item may, and its columns
  * count as an item's do); a position within the list (nout items, or the columns under SELECT *) */
+/* F3f: SELECT DISTINCT's items, and a window statement's (its copy's, marked by exec_window: its DISTINCT's items and
+ * its windows' keys), refuse an INTERVAL at their binding, so the bind-only pass (a view's probe, the replay's
+ * re-bind) and EXPLAIN refuse it as the run does: equality there is the span, and a group's triple would be whichever
+ * came first (deferred.md D26). Each item's type as col_types reads it */
+static int iv_items_ok(const xctx *x, const sql_stmt *st, const sink *k, const imdb_schema *s, imdb_err *e)
+{
+    bool ban = x->ivban_st == st;
+    if (!st->distinct && !ban) return IMDB_OK;
+    uint16_t n = st->star ? s->ncols : st->nitems;
+    for (uint16_t i = 0; i < n && i < IMDB_MAX_COLS; i++) {
+        bool win = ban && (x->ivban_win >> i & 1), dist = st->distinct || (ban && i < x->ivban_ndist);
+        if (!win && !dist) continue;
+        uint8_t ty = 0;
+        if (st->star) ty = s->cols[i].type;
+        else if (st->items[i].expr) ty = x->xn[st->items[i].expr].type;
+        else if (st->items[i].agg != AGG_COUNT_STAR && st->items[i].agg != AGG_COUNT && k && k->item_col[i] >= 0)
+            ty = s->cols[k->item_col[i]].type;
+        if (ty == IMDB_T_INTERVAL) return iv_unsupported(e, win ? "a window's PARTITION BY or ORDER BY" : "SELECT DISTINCT");
+    }
+    return IMDB_OK;
+}
+
 static int bind_order(xctx *x, const sql_stmt *st, sink *k, xscope *si, uint16_t nout, bool *any_agg, bool *any_plain,
                       imdb_err *e);
 
@@ -3950,6 +4070,7 @@ static int bind_keys(xctx *x, const sql_stmt *st, sink *k, const xscope *sc, xsc
     for (uint8_t j = 0; j < st->ngroup; j++) {
         uint16_t g = st->group_ex[j];
         if (xbind(x, &sk, g, e)) return e->code;
+        if (x->xn[g].type == IMDB_T_INTERVAL) return iv_unsupported(e, "GROUP BY"); /* F3f */
         if (!ex_reads(st, g))
             return imdb_fail(e, IMDB_ERR_INVALID,
                              "GROUP BY key %u reads no column (a constant makes one group; a number names no item here)", j + 1u);
@@ -3986,6 +4107,7 @@ static int plan_select(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb
     if (st->has_group) {
         k->gcol = -1;
         if (st->group_col[0] && (k->gcol = one_col(st, t, st->group_qual, st->group_col, e)) < 0) return k->gcol;
+        if (k->gcol >= 0 && t->s.cols[k->gcol].type == IMDB_T_INTERVAL) return iv_unsupported(e, "GROUP BY"); /* F3f */
         if (st->star) return imdb_fail(e, IMDB_ERR_INVALID, "SELECT * cannot be grouped");
     }
     xscope sc = {.st = st, .s = &t->s, .t = t, .cols = true, .group_col = -1};
@@ -4018,12 +4140,13 @@ static int plan_select(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb
         } else {
             any_agg = true;
             uint8_t ct = t->s.cols[c].type;
-            if (it->agg == AGG_SUM && ct != IMDB_T_INT64 && ct != IMDB_T_DECIMAL && ct != IMDB_T_FLOAT64)
-                return imdb_fail(e, IMDB_ERR_INVALID, "SUM needs an INT64, DECIMAL or FLOAT64 column");
+            if (it->agg == AGG_SUM && ct != IMDB_T_INT64 && ct != IMDB_T_DECIMAL && ct != IMDB_T_FLOAT64 && ct != IMDB_T_INTERVAL)
+                return imdb_fail(e, IMDB_ERR_INVALID, "SUM needs an INT64, DECIMAL, FLOAT64 or INTERVAL column");
         }
     }
     if (bind_having(x, st, k, &si, &any_agg, &any_plain, e) ||
-        bind_order(x, st, k, &si, st->star ? t->s.ncols : st->nitems, &any_agg, &any_plain, e))
+        bind_order(x, st, k, &si, st->star ? t->s.ncols : st->nitems, &any_agg, &any_plain, e) ||
+        iv_items_ok(x, st, k, &t->s, e)) /* F3f */
         return e->code;
     if (alloc_xa(x, k, &si, e)) return e->code;
     if (st->has_group) {
@@ -4057,6 +4180,7 @@ static void res_put_x(imdb_result *r, imdb_cell *c, const imdb_xval *v)
     }
     if (v->type == IMDB_T_FLOAT64) iv.i = imdb_f64_key(v->f);
     else if (imdb_type_bytes(v->type)) iv.s = v->s, iv.len = v->len;
+    else if (v->type == IMDB_T_INTERVAL) imdb_x_to_iv(v, &iv); /* F3f */
     else iv.i = (int64_t)v->i;
     res_put(r, c, &iv);
 }
@@ -4133,7 +4257,7 @@ static int reorder_rows(const sql_stmt *st, imdb_xval *keys, imdb_result *r, imd
         qsort_r(ord, n, sizeof *ord, cmp_order, &c);
     }
     window w;
-    int rc = window_init(&w, st, e);
+    int rc = window_init(&w, st, r, e);
     imdb_cell *cells = NULL;
     uint64_t nk = 0;
     if (!rc && !(keep = imdb_alloc_array(n ? n : 1, sizeof *keep, e))) rc = e->code;
@@ -4269,7 +4393,7 @@ static int materialize(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb
             qsort_r(ord, n, sizeof *ord, cmp_order, &c);
             rc = xcheck(x, e); /* a sort runs to its end (the result cap bounds it): the check after it */
         }
-        if (!rc) rc = window_init(&w, st, e);
+        if (!rc) rc = window_init(&w, st, r, e);
         for (uint64_t j = 0; !rc && j < n && w.left; j++) {
             if (!w.distinct && w.skip) { /* OFFSET without DISTINCT: skipped unread */
                 w.skip--;
@@ -4369,6 +4493,8 @@ static bool cells_equal(const imdb_cell *a, const imdb_cell *b)
     if (a->null) return true;
     if (a->wide) return a->i128 == b->i128;
     if (a->v.type != b->v.type) return false;
+    if (a->v.type == IMDB_T_INTERVAL) /* F3f: one value is one triple: two plans' answers alike, not merely equal */
+        return a->v.null == b->v.null && (a->v.null || (a->v.i == b->v.i && a->v.iv.mon == b->v.iv.mon && a->v.iv.day == b->v.iv.day));
     return imdb_value_cmp(&a->v, &b->v) == 0;
 }
 
@@ -4786,6 +4912,8 @@ static int chk_types(const sql_stmt *st, const imdb_xnode *xn, uint16_t k, uint6
             return imdb_fail(e, IMDB_ERR_INVALID, "%s computes no FLOAT64 value: a later step (deferred.md D19)", w);
         if (xn[k].type == IMDB_T_UUID || xn[k].type == IMDB_T_BYTEA) /* F3d: the verifiers' evaluators lack them: a second pass */
             return imdb_fail(e, IMDB_ERR_INVALID, "%s reads no UUID or BYTEA value yet: a later step (f3d-design.md section 7)", w);
+        if (xn[k].type == IMDB_T_INTERVAL) /* F3f: the verifiers' evaluators lack it (deferred.md D26) */
+            return imdb_fail(e, IMDB_ERR_INVALID, "%s reads no INTERVAL value yet: a later step (deferred.md D26)", w);
         if (x->op == EX_LIT && x->lit.kind != LIT_NULL && xn[k].type == IMDB_T_TIMESTAMPTZ) /* a NULL is no instant */
             return imdb_fail(e, IMDB_ERR_INVALID, "%s reads no TIMESTAMPTZ literal: it would be read in a session's zone", w);
     }
@@ -6216,18 +6344,21 @@ static int plan_join_sink(xctx *x, const sql_stmt *st, jctx *j, sink *k, imdb_er
         } else {
             any_agg = true;
             uint8_t ct = j->ct->s.cols[cc].type;
-            if (it->agg == AGG_SUM && ct != IMDB_T_INT64 && ct != IMDB_T_DECIMAL && ct != IMDB_T_FLOAT64)
-                return imdb_fail(e, IMDB_ERR_INVALID, "SUM needs an INT64, DECIMAL or FLOAT64 column");
+            if (it->agg == AGG_SUM && ct != IMDB_T_INT64 && ct != IMDB_T_DECIMAL && ct != IMDB_T_FLOAT64 && ct != IMDB_T_INTERVAL)
+                return imdb_fail(e, IMDB_ERR_INVALID, "SUM needs an INT64, DECIMAL, FLOAT64 or INTERVAL column");
         }
     }
     if (bind_having(x, st, k, &si, &any_agg, &any_plain, e) ||
-        bind_order(x, st, k, &si, st->star ? (uint16_t)(j->nc[0] + j->nc[1]) : st->nitems, &any_agg, &any_plain, e))
+        bind_order(x, st, k, &si, st->star ? (uint16_t)(j->nc[0] + j->nc[1]) : st->nitems, &any_agg, &any_plain, e) ||
+        iv_items_ok(x, st, k, &j->ct->s, e)) /* F3f */
         return e->code;
     if (alloc_xa(x, k, &si, e)) return e->code;
     if (st->has_group) {
         if (st->star) return imdb_fail(e, IMDB_ERR_INVALID, "SELECT * cannot be grouped");
         k->mode = SINK_GROUP;
         k->gcol = gcol;
+        if (gcol >= 0 && j->ct->s.cols[gcol].type == IMDB_T_INTERVAL) /* F3f (general keys: bind_keys refused one) */
+            return iv_unsupported(e, "GROUP BY");
         uint8_t kt = k->gen || imdb_type_bytes(j->ct->s.cols[gcol].type) ? IMDB_T_TEXT : IMDB_T_INT64;
         if (imdb_hmap_init(&k->gmap, kt, e)) return e->code;
     } else if (any_agg) {
@@ -6323,7 +6454,7 @@ static int join_materialize(xctx *x, const sql_stmt *st, jctx *j, sink *k, imdb_
         qsort_r(ord, n, sizeof *ord, cmp_order, &c);
         rc = xcheck(x, e); /* a sort runs to its end: the check after it */
     }
-    if (!rc) rc = window_init(&w, st, e);
+    if (!rc) rc = window_init(&w, st, r, e);
     for (uint64_t jx = 0; !rc && jx < n && w.left; jx++) {
         if (!w.distinct && w.skip) {
             w.skip--;
@@ -6622,6 +6753,7 @@ static int join_run(xctx *x, const sql_stmt *st, jctx *j, qspec q[2], const jpla
 static int join_pair_add(jctx *j, int c0, int c1, imdb_err *e)
 {
     const imdb_column *k0 = &j->t[0]->s.cols[c0], *k1 = &j->t[1]->s.cols[c1];
+    if (k0->type == IMDB_T_INTERVAL) return iv_unsupported(e, "USING"); /* F3f */
     if (k0->type != k1->type || (k0->type == IMDB_T_DECIMAL && k0->scale != k1->scale))
         return imdb_fail(e, IMDB_ERR_INVALID, "a join's key compares %s with %s: values are not converted",
                          imdb_type_name(k0->type), imdb_type_name(k1->type));
@@ -6644,8 +6776,19 @@ static int join_eq_pair(jctx *j, const sql_stmt *st, uint16_t k, imdb_err *e)
     if (sa == sb) return 0;
     const imdb_column *x = &j->t[sa]->s.cols[ca], *y = &j->t[sb]->s.cols[cb];
     if (x->type != y->type || (x->type == IMDB_T_DECIMAL && x->scale != y->scale)) return 0; /* compared as a condition */
+    if (x->type == IMDB_T_INTERVAL) return 0; /* F3f: compared as a condition, by its span (a key map compares the triple) */
     int rc = sa == 0 ? join_pair_add(j, ca, cb, e) : join_pair_add(j, cb, ca, e);
     return rc ? rc : 1;
+}
+
+/* F3f: ON a = b over an INTERVAL: a condition on each candidate pair (join_on_split), never the key path */
+static bool on_interval(const sql_stmt *st, imdb_table *const t[2])
+{
+    int s0, c0, s1, c1;
+    imdb_err e2 = {0};
+    if (join_col(st, t, st->on_qual[0], st->on_col[0], &s0, &c0, &e2) || join_col(st, t, st->on_qual[1], st->on_col[1], &s1, &c1, &e2))
+        return false; /* the key path reports it */
+    return t[s0]->s.cols[c0].type == IMDB_T_INTERVAL || t[s1]->s.cols[c1].type == IMDB_T_INTERVAL;
 }
 
 /* P2 S3: ON's conjuncts (its top-level ANDs): each equality of a column of each side a key pair, the rest conditions
@@ -6701,7 +6844,7 @@ static int exec_join(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, im
         j->nulls0[c] = (imdb_value){.type = t[0]->s.cols[c].type, .scale = t[0]->s.cols[c].scale, .null = true};
     /* ON: one equality of a column of each side, of one type (values are tagged: never converted), the path it always
      * had; P2 S3: else its conjuncts (key pairs and conditions), USING's columns, or none (CROSS) */
-    if (st->on_col[0][0]) {
+    if (st->on_col[0][0] && !on_interval(st, t)) {
         int s0 = 0, c0 = 0, s1 = 0, c1 = 0;
         if (join_col(st, t, st->on_qual[0], st->on_col[0], &s0, &c0, e) || join_col(st, t, st->on_qual[1], st->on_col[1], &s1, &c1, e))
             rc = e->code;
@@ -6996,6 +7139,8 @@ static int setop_fold(xctx *x, uint8_t op, const imdb_result *acc, const imdb_re
         ut[c] = acc->ctype[c];
         us[c] = acc->cscale[c];
         if (imdb_x_unify(&ut[c], &us[c], b->ctype[c], b->cscale[c], what, e)) return e->code;
+        if (ut[c] == IMDB_T_INTERVAL && op != (SQL_SET_UNION | SQL_SET_ALL)) /* F3f: the rest match rows by equality */
+            return iv_unsupported(e, "a set operation other than UNION ALL");
     }
     res_cols(out, n);
     out->byte_cap = workspace_of(x->ss);
@@ -7247,6 +7392,8 @@ static int rec_take(xctx *x, const imdb_result *n, imdb_result *all, imdb_result
                     imdb_buf *kb, imdb_err *e)
 {
     imdb_xval v[IMDB_MAX_COLS + 4];
+    for (uint16_t c = 0; !keep_all && c < all->ncols; c++) /* F3f: UNION matches rows by equality (UNION ALL keeps them) */
+        if (all->ctype[c] == IMDB_T_INTERVAL) return iv_unsupported(e, "WITH RECURSIVE's UNION");
     for (uint64_t i = 0; i < n->nrows; i++) {
         if (++x->ticks >= x->next_check && xcheck(x, e)) return e->code;
         if (setop_row(n, i, all->ctype, all->cscale, v, kb, e)) return e->code;
@@ -7546,7 +7693,7 @@ static int slide_to(xctx *x, wslide *w, const imdb_result *R, const uint64_t *sr
         while (w->dt > w->dh) {
             imdb_xval t;
             rval(R, srt[w->dq[w->dt - 1]], vcol, &t);
-            int d = imdb_x_cmp(&t, &a);
+            int d = x_ext_cmp(agg, &t, &a); /* F3f: an INTERVAL's equal spans by the least triple */
             if (agg == AGG_MIN ? d <= 0 : d >= 0) break; /* it stays: no greater (MIN), no less (MAX), or earlier */
             w->dt--;
         }
@@ -7730,11 +7877,25 @@ static int exec_window(xctx *x, const sql_stmt *st, imdb_result *r, struct xplai
             }
     }
     if (rc) return rc;
+    const sql_stmt *iv_st0 = x->ivban_st; /* F3f: the marks restored after, not cleared (a statement around this one) */
+    uint16_t iv_nd0 = x->ivban_ndist;
+    uint64_t iv_w0 = x->ivban_win;
+    x->ivban_st = w; /* F3f: its DISTINCT's items and its windows' keys, refused as INTERVALs at the copy's binding */
+    x->ivban_ndist = st->distinct ? st->nitems : 0;
+    x->ivban_win = 0;
+    for (uint8_t q = 0; q < nwi; q++) {
+        const sql_win *s = &st->win[st->ex[wi[q].node].sub];
+        for (uint8_t kq = 0; kq < s->npart + s->nord; kq++) {
+            uint16_t c = kq < s->npart ? pcol[st->ex[wi[q].node].sub][kq] : ocol[st->ex[wi[q].node].sub][kq - s->npart];
+            if (c < 64) x->ivban_win |= 1ull << c;
+        }
+    }
     if (xp) {
         xp_add(xp, "window", "%u window function%s: computed over the rows below, in each window's order (its partition, its "
                              "ORDER BY, ties in the rows' order), then ORDER BY, DISTINCT, OFFSET and LIMIT",
                nwi, nwi == 1 ? "" : "s");
         int wrc = exec_select(x, w, r, xp, e);
+        x->ivban_st = iv_st0, x->ivban_ndist = iv_nd0, x->ivban_win = iv_w0;
         if (!wrc && x->probe_r) x->probe_r->ncols = st->nitems; /* P2 S11: the copy's hidden items are no columns */
         return wrc;
     }
@@ -7742,6 +7903,7 @@ static int exec_window(xctx *x, const sql_stmt *st, imdb_result *r, struct xplai
     imdb_result_init(&R);
     imdb_result_init(&W);
     rc = exec_select(x, w, &R, NULL, e);
+    x->ivban_st = iv_st0, x->ivban_ndist = iv_nd0, x->ivban_win = iv_w0;
     uint64_t N = R.nrows;
     if (!rc) {
         res_cols(&W, nwi);
@@ -8552,6 +8714,12 @@ static int copy_value(const imdb_column *col, const char *s, uint32_t n, bool qu
         if (col->type == IMDB_T_UUID ? imdb_parse_uuid(s, n, p, e) : imdb_parse_bytea(s, n, p, m, &got, e)) return e->code;
         v->s = p;
         v->len = (uint32_t)got;
+        return IMDB_OK;
+    }
+    case IMDB_T_INTERVAL: { /* F3f: PostgreSQL's verbose form, which COPY TO writes */
+        int32_t mon, day;
+        if (imdb_parse_interval(s, n, &mon, &day, &x, e)) return e->code;
+        imdb_iv_set(v, mon, day, x);
         return IMDB_OK;
     }
     default:
@@ -10759,6 +10927,7 @@ static int xval_param(const imdb_xval *v, imdb_value *out, imdb_err *e)
     if (v->null) return IMDB_OK; /* NULL has no payload to convert. */
     if (imdb_type_bytes(v->type)) out->s = v->s, out->len = v->len;
     else if (v->type == IMDB_T_FLOAT64) out->i = imdb_f64_key(v->f);
+    else if (v->type == IMDB_T_INTERVAL) imdb_x_to_iv(v, out); /* F3f */
     else if (v->type == IMDB_T_DECIMAL) { /* F3e: to 38 digits, the wide form once past an int64 (a column takes its own) */
         if (v->i >= imdb_pow10_128(IMDB_DEC_MAX_DIGITS) || v->i <= -imdb_pow10_128(IMDB_DEC_MAX_DIGITS))
             return imdb_fail(e, IMDB_ERR_LIMIT, "a value past 38 digits");
@@ -11109,7 +11278,8 @@ void imdb_result_render(const imdb_result *r, bool csv, imdb_buf *out)
             cell_text(cell, &tmp, true);
             size_t dw = disp_width(tmp.p, tmp.len);
             bool right = !cell->null && !imdb_type_bytes(cell->v.type) && cell->v.type != IMDB_T_TIMESTAMP &&
-                         cell->v.type != IMDB_T_TIMESTAMPTZ && cell->v.type != IMDB_T_DATE && cell->v.type != IMDB_T_TIME;
+                         cell->v.type != IMDB_T_TIMESTAMPTZ && cell->v.type != IMDB_T_DATE && cell->v.type != IMDB_T_TIME &&
+                         cell->v.type != IMDB_T_INTERVAL; /* F3f: left, as psql sets it */
             imdb_buf_put_str(out, c ? " | " : " ");
             if (right)
                 for (size_t k = dw; k < w[c]; k++) imdb_buf_put_u8(out, ' ');

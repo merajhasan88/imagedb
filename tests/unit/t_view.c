@@ -501,7 +501,7 @@ static void t_view_codec(void)
         {4, 0},   /* a name of length 0 */
         {5, 'V'}, /* the name not folded */
         {6, 0},   /* no column (u16 2 -> 0) */
-        {10, 12}, /* a column of an unknown type (F3d: 11 is BYTEA, the last) */
+        {10, 13}, /* a column of an unknown type (F3f: 12 is INTERVAL, the last) */
         {11, 1},  /* an INT64 with a scale */
         {15, 39}, /* a DECIMAL past 38 places (F3e: 38 are the most) */
         {13, 'a'}, /* two columns named a */

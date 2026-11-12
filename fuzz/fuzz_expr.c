@@ -2,7 +2,8 @@
  * undefined behaviour (this build traps signed overflow: no -fno-strict-overflow), every result within its own bounds
  * (an INT64 inside int64, a DECIMAL under 10^38 at the bound scale, a FLOAT64 finite), comparisons antisymmetric and
  * reflexive, an assignment checked like any value, and a DECIMAL literal's parse total; P2 S1: every function, CAST
- * and LIKE (against a reference matcher) on them and on two texts from the tail. */
+ * and LIKE (against a reference matcher) on them and on two texts from the tail; F3f: INTERVAL's + and - on any triples, its
+ * negation and order, and its text read back (iv_props). */
 #include <math.h>
 
 #include "../src/sql_internal.h"
@@ -15,7 +16,6 @@ static void value(uint8_t t, uint8_t s, const uint8_t *p, imdb_xval *v)
 {
     static const uint8_t T[] = {IMDB_T_INT64, IMDB_T_DECIMAL, IMDB_T_FLOAT64, IMDB_T_TEXT, IMDB_T_DATE, IMDB_T_TIME}; /* F3b */
     v->type = T[t % 6];
-    v->type = T[t % 4];
     v->null = (t & 0x80) != 0;
     __int128 x;
     memcpy(&x, p, sizeof x);
@@ -216,6 +216,67 @@ static void tz_props(const uint8_t *data, size_t size)
     imdb_xarena_free(&arena);
 }
 
+/* F3f: INTERVAL on any triples: + and - of two, of a TIMESTAMP or a DATE in range, TIMESTAMP - TIMESTAMP, the negation,
+ * computed or refused and never undefined behaviour, a TIMESTAMP result in range; the span's order antisymmetric; and
+ * any bytes as an INTERVAL's text: refused, or a triple whose own text reads back as it */
+static void iv_props(const uint8_t *data, size_t size)
+{
+    if (size < 40) return;
+    imdb_xval v[4];
+    memset(v, 0, sizeof v);
+    for (int k = 0; k < 2; k++) {
+        const uint8_t *p = data + 4 + 16 * k;
+        int32_t m, d;
+        int64_t u;
+        memcpy(&m, p, 4);
+        memcpy(&d, p + 4, 4);
+        memcpy(&u, p + 8, 8);
+        v[k].type = IMDB_T_INTERVAL;
+        v[k].mon = m;
+        v[k].day = d;
+        v[k].i = u;
+    }
+    uint64_t t;
+    memcpy(&t, data + 4, sizeof t);
+    v[2].type = IMDB_T_TIMESTAMP;
+    v[2].i = -62135596800000000LL + (__int128)(t % 315537897600000000ull); /* within years 1 to 9999 */
+    v[3].type = IMDB_T_DATE;
+    v[3].i = IMDB_DATE_MIN + (int64_t)(t % (uint64_t)(IMDB_DATE_MAX - IMDB_DATE_MIN + 1));
+    imdb_err e = {0};
+    for (int a = 0; a < 4; a++)
+        for (int b = 0; b < 4; b++)
+            for (uint8_t op = EX_ADD; op <= EX_SUB; op++) {
+                uint8_t rt, rs;
+                imdb_xval r;
+                imdb_err_clear(&e);
+                if (imdb_x_type(op, v[a].type, 0, v[b].type, 0, &rt, &rs, &e)) continue;
+                imdb_err_clear(&e);
+                if (imdb_x_arith(op, &v[a], &v[b], rt, rs, &r, &e) == 0) {
+                    if (r.type != rt) abort();
+                    if (rt == IMDB_T_TIMESTAMP) bounds(&r, rt, rs);
+                    if (rt == IMDB_T_INTERVAL && (r.i < INT64_MIN || r.i > INT64_MAX)) abort();
+                }
+            }
+    imdb_xval r;
+    imdb_err_clear(&e);
+    if (imdb_x_neg(&v[0], &r, &e) == 0 && (r.mon != -(int64_t)v[0].mon || r.day != -(int64_t)v[0].day || r.i != -v[0].i))
+        abort();
+    if (imdb_x_cmp(&v[0], &v[1]) != -imdb_x_cmp(&v[1], &v[0]) || imdb_x_cmp(&v[0], &v[0]) != 0) abort();
+    int32_t m, d, m2, d2;
+    int64_t u, u2;
+    imdb_err_clear(&e);
+    if (imdb_parse_interval((const char *)data + 40, size - 40, &m, &d, &u, &e) == 0) {
+        imdb_buf b;
+        imdb_buf_init(&b);
+        imdb_format_interval(m, d, u, &b);
+        imdb_err_clear(&e);
+        if (imdb_buf_check(&b, &e) || imdb_parse_interval((const char *)b.p, b.len, &m2, &d2, &u2, &e) || m2 != m || d2 != d ||
+            u2 != u)
+            abort();
+        imdb_buf_free(&b);
+    }
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     if (size < 40) return 0;
@@ -251,5 +312,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     imdb_x_parse_decimal((const char *)data + 40, size - 40, &r, &e);
     s1(data, size, &a, &b); /* P2 S1 */
     tz_props(data, size); /* P2: zones */
+    iv_props(data, size); /* F3f */
     return 0;
 }

@@ -1984,9 +1984,8 @@ static int lake_lookup_pk(const imdb_table *t, const imdb_value *kv, uint64_t sn
             imdb_segzone zt; /* F1: by the version that built the segment (a key column is in every version) */
             const imdb_segzone *z = imdb_seg_zone(t, g, (uint32_t)t->s.key[c], &zt);
             const imdb_column *kc = &t->s.cols[t->s.key[c]];
-            uint8_t ty = kc->type; /* the columns whose zone map bounds values (lake.c's is_int_col: F3e, a wide DECIMAL none) */
-            out = (ty == IMDB_T_INT64 || (ty == IMDB_T_DECIMAL && !imdb_dec_wide(kc->precision)) || ty == IMDB_T_TIMESTAMP ||
-                   ty == IMDB_T_FLOAT64 || ty == IMDB_T_DATE || ty == IMDB_T_TIME || ty == IMDB_T_TIMESTAMPTZ) &&
+            /* the columns whose zone map bounds values (codec.h imdb_col_i64: lake.c's is_int_col too) */
+            out = imdb_col_i64(kc) &&
                   (!z->has || kv[c].i < z->min || kv[c].i > z->max); /* kv in the columns' forms (imdb_lookup_pk_at) */
         }
         if (out) continue; /* no image read */
@@ -3337,8 +3336,8 @@ bool imdb_index_def_ok(const imdb_index_def *d, const imdb_schema *s)
     if (!d->name[0] || (d->flags & ~IMDB_INDEX_UNIQUE) || !d->ncols || d->ncols > IMDB_MAX_INDEX_COLS) return false;
     for (uint8_t i = 0; i < d->ncols; i++) {
         if (d->cols[i] >= s->ncols) return false;
-        const imdb_column *c = &s->cols[d->cols[i]]; /* F3e: no index on a DECIMAL past 18 digits yet (deferred.md D25) */
-        if (c->type == IMDB_T_DECIMAL && imdb_dec_wide(c->precision)) return false;
+        const imdb_column *c = &s->cols[d->cols[i]]; /* F3e, F3f: no index on a 16-byte value yet (deferred.md D25, D26) */
+        if (imdb_col_fixed16(c)) return false;
         for (uint8_t j = 0; j < i; j++)
             if (d->cols[i] == d->cols[j]) return false;
     }
@@ -4059,6 +4058,9 @@ int imdb_create_index(imdb_db *db, imdb_table *t, const imdb_index_def *d, imdb_
         if (d->cols[i] < t->s.ncols && t->s.cols[d->cols[i]].type == IMDB_T_DECIMAL && imdb_dec_wide(t->s.cols[d->cols[i]].precision))
             return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "an index on %s, a DECIMAL of more than 18 digits: not yet",
                              t->s.cols[d->cols[i]].name);
+    for (uint8_t i = 0; i < d->ncols && i < IMDB_MAX_INDEX_COLS; i++) /* F3f: an INTERVAL's order is its span (D26) */
+        if (d->cols[i] < t->s.ncols && t->s.cols[d->cols[i]].type == IMDB_T_INTERVAL)
+            return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "an index on %s, an INTERVAL: not yet", t->s.cols[d->cols[i]].name);
     if (!imdb_index_def_ok(d, &t->s))
         return imdb_fail(e, IMDB_ERR_INVALID, "an index takes 1 to %u distinct columns of table %s", IMDB_MAX_INDEX_COLS,
                          t->s.name);

@@ -94,7 +94,7 @@ static bool g_tz;
 static int g_dt; /* 1 --date, 2 --time */
 #define DAY_US 86400000000LL
 static const char *g_tzname = "UTC";
-enum { CT_INT, CT_DEC, CT_FLT, CT_TXT, CT_BOOL, CT_TS };
+enum { CT_INT, CT_DEC, CT_FLT, CT_TXT, CT_BOOL, CT_TS, CT_IV }; /* CT_IV: F3f, an INTERVAL's text as written */
 enum { D_IMDB, D_SQLITE, D_PG, D_MY, D_MA, D_MS, ND };
 static const char *const DNAME[ND] = {"imagedb", "sqlite", "pg", "mysql", "mariadb", "mssql"};
 
@@ -3597,6 +3597,7 @@ static int canon_text(sb *b, int ty, const char *s, size_t len)
     case CT_TXT: sb_put(b, s, len); return 0;
     case CT_BOOL: return canon_bool_text(b, s);
     case CT_TS: return g_dt == 2 ? canon_tod_text(b, s) : canon_ts_text(b, s); /* F3b: a TIME's text alone */
+    case CT_IV: sb_put(b, s, len); return 0; /* F3f: PostgreSQL's text, IntervalStyle postgres, as imagedb writes it */
     }
     return -1;
 }
@@ -3770,6 +3771,14 @@ static void exec_imdb_p(eng *e, const char *sql, bool rows, const int *ty, int n
                     break;
                 case CT_FLT: canon_flt(&row, imdb_f64_value(cl->v.i)); break;
                 case CT_TXT: sb_put(&row, (const char *)cl->v.s, cl->v.len); break;
+                case CT_IV: { /* F3f */
+                    imdb_buf t;
+                    imdb_buf_init(&t);
+                    imdb_format_interval(cl->v.iv.mon, cl->v.iv.day, cl->v.i, &t);
+                    sb_put(&row, (const char *)t.p, t.len);
+                    imdb_buf_free(&t);
+                    break;
+                }
                 case CT_BOOL:
                 case CT_TS: /* F3b: a DATE's days as its midnight's microseconds, as the others' texts read */
                     sb_printf(&row, "%" PRId64, (int64_t)(cl->v.type == IMDB_T_DATE ? cl->v.i * DAY_US : cl->v.i));
@@ -5056,6 +5065,292 @@ static int dec38_battery(unsigned seed)
     }
     return 0;
 }
+/* ---- F3f, --interval: INTERVAL against PostgreSQL 14, a battery per seed ---------------------------------------------
+ * PostgreSQL alone has the type (MySQL, MariaDB, SQL Server and SQLite have none), so the battery's table x2 (id, ts,
+ * ts2, iv, jv) is PostgreSQL's and imagedb's: iv drawn from the equal-span trio ('1 mon', '30 days', '720:00:00'),
+ * months and days with no microseconds, and mixed signs with fractions; jv with every span distinct (MIN and MAX of
+ * equal spans differ by design: imagedb keeps the least triple, PostgreSQL the last it scans). Each answer's interval
+ * text compared as written (both IntervalStyle postgres), timestamps as instants. Then drawn verbose texts parsed by
+ * both, and a timestamp plus one unit (days to years, a month's end clamped) asked of MySQL's and MariaDB's DATE_ADD and
+ * SQL Server's DATEADD as well (SQLite's date() does not clamp a month's end: not asked) */
+static bool g_iv;
+static unsigned long g_iv_compared, g_iv_unit_compared, g_iv_text_compared, g_iv_text_refused;
+
+typedef struct ivv {
+    int32_t mon, day;
+    int64_t us;
+} ivv;
+
+/* a timestamp literal, quoted (a day before 1970 too: the floor) */
+static void put_ts_lit(sb *b, int64_t us)
+{
+    int64_t days = us / 86400000000LL - (us % 86400000000LL < 0), rem = us - days * 86400000000LL, y;
+    unsigned mo, d;
+    civil(days, &y, &mo, &d);
+    int64_t s = rem / 1000000, f = rem % 1000000;
+    sb_printf(b, "'%04" PRId64 "-%02u-%02u %02" PRId64 ":%02" PRId64 ":%02" PRId64 ".%06" PRId64 "'", y, mo, d, s / 3600, s / 60 % 60,
+              s % 60, f);
+}
+
+static void put_iv(sb *b, ivv v)
+{
+    imdb_buf t;
+    imdb_buf_init(&t);
+    imdb_format_interval(v.mon, v.day, v.us, &t);
+    sb_str(b, "INTERVAL '");
+    sb_put(b, (const char *)t.p, t.len);
+    sb_str(b, "'");
+    imdb_buf_free(&t);
+}
+
+static ivv iv_draw(void)
+{
+    ivv v = {0, 0, 0};
+    switch (rnd() % 8) {
+    case 0: v.mon = 1; break;
+    case 1: v.day = 30; break;
+    case 2: v.us = 720LL * 3600000000LL; break;
+    case 3:
+    case 4: v.mon = (int32_t)rr(-30, 30), v.day = (int32_t)rr(-60, 60); break;
+    default:
+        v.mon = (int32_t)rr(-14, 14), v.day = (int32_t)rr(-40, 40);
+        v.us = rr(-5 * 86400000000LL, 5 * 86400000000LL);
+        if (chance(30)) v.us -= v.us % 1000000; /* whole seconds */
+        break;
+    }
+    return v;
+}
+
+static __int128 iv_span(ivv v) { return ((__int128)v.mon * 30 + v.day) * 86400000000LL + v.us; }
+
+/* a verbose text drawn from PostgreSQL's grammar: @, signed numbers (a fraction sometimes) with a unit each, a time, ago */
+static void iv_text(sb *b)
+{
+    static const char *const U[] = {"year", "years", "y", "yr", "yrs", "mon", "mons", "month", "months", "week", "weeks",
+                                    "w", "day", "days", "d", "hour", "hours", "h", "hr", "hrs", "minute", "minutes",
+                                    "min", "mins", "m", "second", "seconds", "s", "sec", "secs", "millisecond", "ms",
+                                    "msec", "msecs", "microsecond", "us", "usec", "usecs", "decade", "decades", "century",
+                                    "millennium", "DAYS", "Mon", "HOURS"};
+    if (chance(10)) sb_str(b, "@ ");
+    int n = (int)rr(1, 4);
+    for (int k = 0; k < n; k++) {
+        if (k) sb_str(b, " ");
+        if (chance(30)) sb_str(b, chance(50) ? "-" : "+");
+        sb_printf(b, "%lld", (long long)rr(0, chance(20) ? 100000 : 40));
+        if (chance(25)) sb_printf(b, ".%0*lld", (int)rr(1, 6), (long long)rr(0, 999999) % 1000000);
+        sb_str(b, chance(15) ? "" : " ");
+        sb_str(b, U[rnd() % (sizeof U / sizeof *U)]);
+    }
+    if (chance(35)) {
+        sb_str(b, " ");
+        if (chance(30)) sb_str(b, chance(50) ? "-" : "+");
+        sb_printf(b, "%lld:%02lld", (long long)rr(0, 99), (long long)rr(0, 59));
+        if (chance(70)) sb_printf(b, ":%02lld", (long long)rr(0, 59));
+        if (chance(30)) sb_printf(b, ".%lld", (long long)rr(0, 999999));
+    }
+    if (chance(15)) sb_str(b, " ago");
+}
+
+static int iv_battery(unsigned seed)
+{
+    int nrow = (int)rr(10, 24);
+    ivv iv[24], jv[24];
+    bool ivn[24], jvn[24];
+    int64_t ts[24], ts2[24];
+    for (int i = 0; i < nrow; i++) {
+        iv[i] = iv_draw();
+        ivn[i] = chance(10);
+        for (int tries = 0;; tries++) { /* jv: every span its own */
+            jv[i] = iv_draw();
+            bool dup = false;
+            for (int k = 0; k < i && !dup; k++) dup = !jvn[k] && iv_span(jv[k]) == iv_span(jv[i]);
+            if (!dup || tries > 50) break;
+        }
+        jvn[i] = chance(10);
+        ts[i] = (rr(-25567, 47482) * 86400LL + rr(0, 86399)) * 1000000LL + (chance(30) ? rr(0, 999999) : 0); /* 1900-2100 */
+        if (chance(25)) { /* a month's last days, so a month's step clamps */
+            int64_t y = rr(1990, 2030);
+            unsigned m = (unsigned)rr(1, 12), last = m == 2 ? (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) ? 29u : 28u)
+                                                             : m == 4 || m == 6 || m == 9 || m == 11 ? 30u : 31u;
+            ts[i] = (days_from_civil(y, m, last - (unsigned)rr(0, 2)) * 86400LL + rr(0, 86399)) * 1000000LL;
+        }
+        ts2[i] = ts[i] + rr(-400 * 86400000000LL, 400 * 86400000000LL);
+    }
+    static const char *const DDL[ND] = {"CREATE TABLE x2 (id INT64 PRIMARY KEY, ts TIMESTAMP, ts2 TIMESTAMP, iv INTERVAL, jv INTERVAL)", "",
+                                        "CREATE TABLE x2 (id BIGINT PRIMARY KEY, ts TIMESTAMP(6), ts2 TIMESTAMP(6), iv INTERVAL, jv INTERVAL)",
+                                        "", "", ""};
+    for (int d = 0; d < ND; d++) {
+        if (!g_eng[d].on || (d != D_IMDB && d != D_PG)) continue;
+        if ((d != D_IMDB && bx_exec(seed, d, "DROP TABLE IF EXISTS x2")) || bx_exec(seed, d, DDL[d])) return -1;
+        sb ins = {0};
+        sb_str(&ins, "INSERT INTO x2 VALUES ");
+        for (int i = 0; i < nrow; i++) {
+            sb_printf(&ins, "%s(%d, ", i ? ", " : "", i + 1);
+            put_ts_lit(&ins, ts[i]);
+            sb_str(&ins, ", ");
+            put_ts_lit(&ins, ts2[i]);
+            sb_str(&ins, ", ");
+            if (ivn[i]) sb_str(&ins, "NULL");
+            else put_iv(&ins, iv[i]);
+            sb_str(&ins, ", ");
+            if (jvn[i]) sb_str(&ins, "NULL");
+            else put_iv(&ins, jv[i]);
+            sb_str(&ins, ")");
+        }
+        int irc = bx_exec(seed, d, ins.p);
+        free(ins.p);
+        if (irc) return -1;
+    }
+    ivv l1 = iv_draw(), l2 = iv_draw();
+    enum { NQ = 14 };
+    for (int qx = 0; qx < NQ + 6 + 9; qx++) { /* then nine more drawn texts (query 10 again) */
+        int qn = qx < NQ + 6 ? qx : 10;
+        static res out[ND];
+        int ty[8];
+        int nty = 0;
+        bool multiset = false, unit = qn >= NQ; /* the last six: a timestamp plus one unit, on four engines */
+        static const char *const UN[6][3] = {{"day", "DAY", "day"},       {"month", "MONTH", "month"}, {"year", "YEAR", "year"},
+                                             {"hour", "HOUR", "hour"},    {"minute", "MINUTE", "minute"},
+                                             {"second", "SECOND", "second"}};
+        int un = unit ? qn - NQ : 0;
+        long long amount = un == 2 ? rr(-3, 3) : un == 1 ? rr(-25, 25) : rr(-90, 90);
+        char sql[ND][2400];
+        sb tx = {0};
+        if (qn == 10) iv_text(&tx);
+        for (int d = 0; d < ND; d++) {
+            if (!g_eng[d].on || d == D_SQLITE || (!unit && d != D_IMDB && d != D_PG)) continue;
+            sb s = {0};
+            switch (qn) {
+            case 0: /* the stored values in the span's order, ties by the key */
+                sb_str(&s, "SELECT id, iv FROM x2 ORDER BY iv, id");
+                ty[0] = TY(CT_INT, 0), ty[1] = TY(CT_IV, 0), nty = 2;
+                break;
+            case 1: /* equal by the span */
+                sb_str(&s, "SELECT id FROM x2 WHERE iv = ");
+                put_iv(&s, l1);
+                sb_str(&s, " ORDER BY id");
+                ty[0] = TY(CT_INT, 0), nty = 1;
+                break;
+            case 2:
+                sb_str(&s, "SELECT id FROM x2 WHERE iv > ");
+                put_iv(&s, l2);
+                sb_str(&s, " OR jv <= ");
+                put_iv(&s, l1);
+                sb_str(&s, " ORDER BY id");
+                ty[0] = TY(CT_INT, 0), nty = 1;
+                break;
+            case 3: /* MIN and MAX of distinct spans, COUNT, SUM field by field */
+                sb_str(&s, "SELECT MIN(jv), MAX(jv), COUNT(iv), SUM(iv), SUM(jv) FROM x2");
+                ty[0] = ty[1] = TY(CT_IV, 0), ty[2] = TY(CT_INT, 0), ty[3] = ty[4] = TY(CT_IV, 0), nty = 5;
+                break;
+            case 4: /* a timestamp and an INTERVAL both ways (the months, the day clamped, the days, the time) */
+                sb_str(&s, "SELECT id, ts + iv, ts - iv, iv + ts2 FROM x2 ORDER BY id");
+                ty[0] = TY(CT_INT, 0), ty[1] = ty[2] = ty[3] = TY(CT_TS, 0), nty = 4;
+                break;
+            case 5: /* field by field, and the negation */
+                sb_str(&s, "SELECT id, iv + jv, iv - jv, -iv FROM x2 ORDER BY id");
+                ty[0] = TY(CT_INT, 0), ty[1] = ty[2] = ty[3] = TY(CT_IV, 0), nty = 4;
+                break;
+            case 6: /* a join by the span */
+                sb_str(&s, "SELECT a.id, b.id FROM x2 AS a JOIN x2 AS b ON a.iv = b.iv AND a.id < b.id");
+                ty[0] = ty[1] = TY(CT_INT, 0), nty = 2;
+                multiset = true;
+                break;
+            case 7:
+                sb_str(&s, "SELECT id FROM x2 WHERE iv IN (");
+                put_iv(&s, l1);
+                sb_str(&s, ", ");
+                put_iv(&s, l2);
+                sb_str(&s, ") ORDER BY id");
+                ty[0] = TY(CT_INT, 0), nty = 1;
+                break;
+            case 8: /* TIMESTAMP - TIMESTAMP: the time, then its whole days */
+                sb_str(&s, "SELECT id, ts - ts2, ts2 - ts FROM x2 ORDER BY id");
+                ty[0] = TY(CT_INT, 0), ty[1] = ty[2] = TY(CT_IV, 0), nty = 3;
+                break;
+            case 9: /* the text forms both ways */
+                sb_str(&s, "SELECT id, CAST(iv AS TEXT), CAST(CAST(jv AS TEXT) AS INTERVAL) FROM x2 ORDER BY id");
+                ty[0] = TY(CT_INT, 0), ty[1] = TY(CT_TXT, 0), ty[2] = TY(CT_IV, 0), nty = 3;
+                break;
+            case 10: /* a drawn verbose text */
+                sb_str(&s, "SELECT CAST('");
+                sb_put(&s, tx.p, tx.n);
+                sb_str(&s, "' AS INTERVAL)");
+                ty[0] = TY(CT_IV, 0), nty = 1;
+                break;
+            case 11: /* descending: NULLs first, ties by the key */
+                sb_str(&s, "SELECT id, jv FROM x2 ORDER BY jv DESC, id");
+                ty[0] = TY(CT_INT, 0), ty[1] = TY(CT_IV, 0), nty = 2;
+                break;
+            case 12: /* a moving frame's sum */
+                sb_str(&s, "SELECT id, SUM(iv) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM x2 ORDER BY id");
+                ty[0] = TY(CT_INT, 0), ty[1] = TY(CT_IV, 0), nty = 2;
+                break;
+            case 13: /* a correlated subquery over the outer row's INTERVAL (the memo keys its triple) */
+                sb_str(&s, "SELECT a.id, (SELECT COUNT(*) FROM x2 AS b WHERE b.ts < a.ts2 + a.iv) FROM x2 AS a ORDER BY a.id");
+                ty[0] = ty[1] = TY(CT_INT, 0), nty = 2;
+                break;
+            default: /* a timestamp plus one unit: imagedb's and PostgreSQL's INTERVAL, the others' functions */
+                if (d == D_IMDB || d == D_PG) sb_printf(&s, "SELECT id, ts + INTERVAL '%lld %s' FROM x2u ORDER BY id", amount, UN[un][0]);
+                else if (d == D_MS) sb_printf(&s, "SELECT id, DATEADD(%s, %lld, ts) FROM x2u ORDER BY id", UN[un][2], amount);
+                else sb_printf(&s, "SELECT id, DATE_ADD(ts, INTERVAL %lld %s) FROM x2u ORDER BY id", amount, UN[un][1]);
+                ty[0] = TY(CT_INT, 0), ty[1] = TY(CT_TS, 0), nty = 2;
+                break;
+            }
+            snprintf(sql[d], sizeof sql[d], "%s", s.p ? s.p : "");
+            free(s.p);
+            exec_eng(&g_eng[d], sql[d], true, ty, nty, &out[d]);
+            if (multiset && !out[d].err && out[d].n > 1) qsort(out[d].rows, out[d].n, sizeof *out[d].rows, rows_cmp);
+        }
+        free(tx.p);
+        const res *base = &out[D_IMDB];
+        for (int d = 1; d < ND; d++) {
+            if (!g_eng[d].on || d == D_SQLITE || (!unit && d != D_PG)) continue;
+            if (unit) g_iv_unit_compared++;
+            else if (qn == 10) {
+                g_iv_text_compared++;
+                g_iv_text_refused += base->err && out[d].err;
+            } else g_iv_compared++;
+            const res *o = &out[d];
+            const char *why = base->err != o->err ? "one refused it" : base->err ? NULL : base->n != o->n ? "another number of rows" : NULL;
+            size_t at = 0;
+            for (at = 0; !why && !base->err && at < base->n; at++)
+                if (strcmp(base->rows[at], o->rows[at])) why = "another row";
+            if (!why) continue;
+            g_mismatches++;
+            fprintf(stderr, "MISMATCH seed %u (--interval, query %d), imagedb against %s: %s\n  imagedb: %s\n  %s: %s\n", seed, qn,
+                    DNAME[d], why, sql[D_IMDB], DNAME[d], sql[d]);
+            fprintf(stderr, "  imagedb: %s (%zu rows)\n", base->err ? base->msg : "ok", base->n);
+            if (!base->err) show_rows(base, at ? at - 1 : 0);
+            fprintf(stderr, "  %s: %s (%zu rows)\n", DNAME[d], o->err ? o->msg : "ok", o->n);
+            if (!o->err) show_rows(o, at ? at - 1 : 0);
+            return -1;
+        }
+        if (qx == NQ - 1) { /* the unit table: its timestamps in every engine but SQLite */
+            static const char *const UDDL[ND] = {"CREATE TABLE x2u (id INT64 PRIMARY KEY, ts TIMESTAMP)", "",
+                                                 "CREATE TABLE x2u (id BIGINT PRIMARY KEY, ts TIMESTAMP(6))",
+                                                 "CREATE TABLE x2u (id BIGINT PRIMARY KEY, ts DATETIME(6))",
+                                                 "CREATE TABLE x2u (id BIGINT PRIMARY KEY, ts DATETIME(6))",
+                                                 "CREATE TABLE x2u (id BIGINT NOT NULL PRIMARY KEY, ts DATETIME2(6))"};
+            for (int d = 0; d < ND; d++) {
+                if (!g_eng[d].on || d == D_SQLITE) continue;
+                if ((d != D_IMDB && bx_exec(seed, d, "DROP TABLE IF EXISTS x2u")) || bx_exec(seed, d, UDDL[d])) return -1;
+                sb ins = {0};
+                sb_str(&ins, "INSERT INTO x2u VALUES ");
+                for (int i = 0; i < nrow; i++) {
+                    sb_printf(&ins, "%s(%d, ", i ? ", " : "", i + 1);
+                    put_ts_lit(&ins, ts[i]);
+                    sb_str(&ins, ")");
+                }
+                int irc = bx_exec(seed, d, ins.p);
+                free(ins.p);
+                if (irc) return -1;
+            }
+        }
+    }
+    return 0;
+}
+
 static int check_state(unsigned seed, int step)
 {
     for (int tab = 0; tab < 2; tab++) {
@@ -5265,7 +5560,8 @@ static int run_seed(unsigned seed, int steps)
         }
     }
     if (g_bytes && bytes_battery(seed)) return -1; /* F3d: after the steps: its draws change none of theirs */
-    return g_dec38 ? dec38_battery(seed) : 0;     /* F3e: after it, likewise */
+    if (g_dec38 && dec38_battery(seed)) return -1; /* F3e: after it, likewise */
+    return g_iv ? iv_battery(seed) : 0;            /* F3f: likewise */
 }
 
 int main(int argc, char **argv)
@@ -5293,6 +5589,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--fk")) g_fk = true; /* F2b-2 */
         else if (!strcmp(argv[i], "--bytes")) g_bytes = true; /* F3d */
         else if (!strcmp(argv[i], "--dec38")) g_dec38 = true; /* F3e */
+        else if (!strcmp(argv[i], "--interval")) g_iv = true; /* F3f */
         else if (!strcmp(argv[i], "--tz")) g_tz = true; /* P2: time zones */
         else if (!strcmp(argv[i], "--date")) g_dt = 1; /* F3b */
         else if (!strcmp(argv[i], "--time")) g_dt = 2;
@@ -5393,6 +5690,11 @@ int main(int argc, char **argv)
     if (g_dec38)
         printf("oracle: %lu comparisons of F3e's DECIMAL(38,10) and DECIMAL(30,0) battery (a table y a seed, nine queries; SQLite not "
                "asked)\n", g_dec38_compared);
+    if (g_iv)
+        printf("oracle: %lu comparisons of F3f's INTERVAL battery against PostgreSQL alone (the others have no INTERVAL; a table x2 "
+               "a seed, fourteen queries), %lu of drawn verbose texts (%lu refused by both), %lu of a timestamp plus one unit "
+               "against PostgreSQL, MySQL, MariaDB and SQL Server (SQLite not asked: its date() does not clamp a month's end)\n",
+               g_iv_compared, g_iv_text_compared, g_iv_text_refused, g_iv_unit_compared);
     if (g_bytes && g_ms_pad >= 0) printf("oracle: SQL Server's 0x01 = 0x0100 is %s (the battery's BYTEAs hold no 0x00 byte either way)\n",
                                      g_ms_pad == 1 ? "true: it pads the shorter VARBINARY with zeros" : g_ms_pad == 0 ? "false: no padding" : "unread");
     printf("oracle: %ld comparisons of P2 S4b's correlated subqueries\n", g_corr_compared);

@@ -86,6 +86,7 @@ const char *imdb_type_name(uint8_t t)
     case IMDB_T_TIME: return "TIME";
     case IMDB_T_UUID: return "UUID";
     case IMDB_T_BYTEA: return "BYTEA";
+    case IMDB_T_INTERVAL: return "INTERVAL";
     }
     return "?";
 }
@@ -203,6 +204,8 @@ int imdb_schema_check(const imdb_schema *s, imdb_err *e)
         if ((c->flags & IMDB_COL_NULLABLE) && (c->flags & (IMDB_COL_PK | IMDB_COL_SUBJECT)))
             return imdb_fail(e, IMDB_ERR_INVALID, "column %s: PRIMARY KEY and SUBJECT columns are NOT NULL", c->name);
         if (c->flags & IMDB_COL_PK) { /* every type held exactly: a measured FLOAT64 is no identity (F4) */
+            if (c->type == IMDB_T_INTERVAL) /* F3f: '1 mon' and '30 days' equal and two (deferred.md D26) */
+                return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "column %s: a PRIMARY KEY column cannot be an INTERVAL yet", c->name);
             if (c->type == IMDB_T_FLOAT64)
                 return imdb_fail(e, IMDB_ERR_INVALID, "column %s: a PRIMARY KEY column cannot be FLOAT64", c->name);
             nflag++;
@@ -380,6 +383,9 @@ int imdb_value_check(const imdb_column *c, const imdb_value *v, imdb_err *e)
     case IMDB_T_UUID: /* F3d: 16 bytes always */
         if (v->len != IMDB_UUID_LEN || !v->s) return imdb_fail(e, IMDB_ERR_INVALID, "column %s: a UUID is 16 bytes", c->name);
         return IMDB_OK;
+    case IMDB_T_INTERVAL: /* F3f: every triple is a value (PostgreSQL 14's range); the form an INTERVAL's alone */
+        if (v->wide) return imdb_fail(e, IMDB_ERR_INVALID, "column %s: not an INTERVAL value", c->name);
+        return IMDB_OK;
     case IMDB_T_BYTEA: /* F3d: any bytes, TEXT's bound */
         if (v->len > IMDB_MAX_TEXT) return imdb_fail(e, IMDB_ERR_LIMIT, "column %s: BYTEA longer than %u bytes", c->name, IMDB_MAX_TEXT);
         if (v->len && !v->s) return imdb_fail(e, IMDB_ERR_INVALID, "column %s: a BYTEA without its bytes", c->name);
@@ -398,7 +404,7 @@ static uint32_t nullable_count(const imdb_schema *s)
 static size_t value_width(uint8_t type, const imdb_value *v)
 {
     return type == IMDB_T_TEXT || type == IMDB_T_BYTEA ? 4 + (size_t)v->len : type == IMDB_T_UUID ? IMDB_UUID_LEN : type == IMDB_T_BOOL ? 1
-         : type == IMDB_T_DECIMAL && v->wide ? 16 : 8; /* F3e: a wide DECIMAL (its form checked to be its column's) */
+         : (type == IMDB_T_DECIMAL && v->wide) || type == IMDB_T_INTERVAL ? 16 : 8; /* F3e: a wide DECIMAL; F3f: an INTERVAL */
 }
 
 int imdb_row_encode(const imdb_schema *s, const imdb_value *vals, imdb_buf *out, imdb_err *e)
@@ -429,6 +435,11 @@ int imdb_row_encode(const imdb_schema *s, const imdb_value *vals, imdb_buf *out,
             break;
         case IMDB_T_UUID: imdb_buf_put(out, v->s, IMDB_UUID_LEN); break; /* F3d: no length: 16 always */
         case IMDB_T_BOOL: imdb_buf_put_u8(out, (uint8_t)v->i); break;
+        case IMDB_T_INTERVAL: /* F3f: months, days, microseconds */
+            imdb_buf_put_u32(out, (uint32_t)v->iv.mon);
+            imdb_buf_put_u32(out, (uint32_t)v->iv.day);
+            imdb_buf_put_u64(out, (uint64_t)v->i);
+            break;
         case IMDB_T_DECIMAL: /* F3e: a wide one i then hi (imdb_value_check made the form the column's) */
             imdb_buf_put_u64(out, (uint64_t)v->i);
             if (v->wide) imdb_buf_put_u64(out, (uint64_t)v->hi);
@@ -483,6 +494,11 @@ int imdb_row_decode(const imdb_schema *s, const uint8_t *row, size_t len, imdb_v
             if (!v->s) return imdb_fail(e, IMDB_ERR_CORRUPT, "row: truncated UUID");
             break;
         case IMDB_T_BOOL: v->i = imdb_rd_u8(&r); break;
+        case IMDB_T_INTERVAL: /* F3f */
+            v->iv.mon = (int32_t)imdb_rd_u32(&r);
+            v->iv.day = (int32_t)imdb_rd_u32(&r);
+            v->i = (int64_t)imdb_rd_u64(&r);
+            break;
         case IMDB_T_DECIMAL: /* F3e: the column's precision decides the form */
             v->i = (int64_t)imdb_rd_u64(&r);
             if ((v->wide = imdb_dec_wide(c->precision))) v->hi = (int64_t)imdb_rd_u64(&r);
@@ -519,7 +535,7 @@ void imdb_row_get(const imdb_schema *s, const uint8_t *row, size_t len, int col,
                 (void)imdb_rd_bytes(&r, n);
             } else {
                 (void)imdb_rd_bytes(&r, t == IMDB_T_BOOL ? 1 : t == IMDB_T_UUID ? IMDB_UUID_LEN
-                                      : t == IMDB_T_DECIMAL && imdb_dec_wide(c->precision) ? 16 : 8);
+                                      : (t == IMDB_T_DECIMAL && imdb_dec_wide(c->precision)) || t == IMDB_T_INTERVAL ? 16 : 8);
             }
             continue;
         }
@@ -536,6 +552,10 @@ void imdb_row_get(const imdb_schema *s, const uint8_t *row, size_t len, int col,
             v->len = v->s ? IMDB_UUID_LEN : 0;
         } else if (t == IMDB_T_BOOL) {
             v->i = imdb_rd_u8(&r);
+        } else if (t == IMDB_T_INTERVAL) { /* F3f */
+            v->iv.mon = (int32_t)imdb_rd_u32(&r);
+            v->iv.day = (int32_t)imdb_rd_u32(&r);
+            v->i = (int64_t)imdb_rd_u64(&r);
         } else if (t == IMDB_T_DECIMAL && imdb_dec_wide(c->precision)) { /* F3e */
             v->wide = true;
             v->i = (int64_t)imdb_rd_u64(&r);
@@ -554,6 +574,10 @@ int imdb_value_cmp(const imdb_value *a, const imdb_value *b)
         int c = n ? memcmp(a->s, b->s, n) : 0;
         if (c) return c < 0 ? -1 : 1;
         return a->len < b->len ? -1 : a->len > b->len;
+    }
+    if (a->type == IMDB_T_INTERVAL) { /* F3f: SQL's order is the span (PostgreSQL 14's interval_cmp): equal spans tie */
+        __int128 x = imdb_iv_span(a->iv.mon, a->iv.day, a->i), y = imdb_iv_span(b->iv.mon, b->iv.day, b->i);
+        return x < y ? -1 : x > y;
     }
     if (a->type == IMDB_T_DECIMAL) { /* F3e: either form, by the 128-bit value */
         __int128 x = imdb_dec_value(a), y = imdb_dec_value(b);
@@ -603,6 +627,13 @@ uint64_t imdb_value_hash(const imdb_value *v, uint64_t seed)
 {
     if (v->null) return imdb_siphash24((const uint8_t *)"", 0, seed, 0x6a09e667f3bcc909ull);
     if (imdb_type_bytes(v->type)) return imdb_siphash24(v->s, v->len, seed, 0x9e3779b97f4a7c15ull);
+    if (v->type == IMDB_T_INTERVAL) { /* F3f: the triple, its identity (no map groups intervals by their span) */
+        uint8_t t[16];
+        imdb_le32(t, (uint32_t)v->iv.mon);
+        imdb_le32(t + 4, (uint32_t)v->iv.day);
+        imdb_le64(t + 8, (uint64_t)v->i);
+        return imdb_siphash24(t, 16, seed, 0x9e3779b97f4a7c15ull);
+    }
     if (v->type == IMDB_T_DECIMAL) { /* F3e: the 128-bit value, a narrow one sign-extended: equal numbers meet */
         uint8_t t[16];
         unsigned __int128 x = (unsigned __int128)imdb_dec_value(v);
@@ -1024,6 +1055,339 @@ void imdb_format_time(int64_t us, imdb_buf *out)
 }
 
 
+/* ---- F3f: INTERVAL text forms, PostgreSQL 14's: its verbose input (datetime.c's ParseDateTime and DecodeInterval for
+ * the fields, DecodeTime for HH:MM[:SS[.f]], AdjustFractSeconds and AdjustFractDays for a fraction, timestamp.c's
+ * tm2interval for the sum) and IntervalStyle postgres (EncodeInterval). Each rule was taken from PostgreSQL 14's own
+ * answers (docs/f3f-design.md); where PostgreSQL 14 adds into an int that can overflow silently, the sums here are
+ * int64 and a result outside the fields' ranges is refused ---- */
+
+enum { IVU_YEAR, IVU_MONTH, IVU_DAY, IVU_WEEK, IVU_HOUR, IVU_MINUTE, IVU_SECOND, IVU_MS, IVU_US, IVU_DECADE, IVU_CENTURY,
+       IVU_MILLENNIUM, IVU_AGO, IVU_SKIP, IVU_NONE };
+#define IVM(u) (1u << (u))
+#define IV_ALL_SECS (IVM(IVU_SECOND) | IVM(IVU_MS) | IVM(IVU_US))
+#define IV_TIME_M (IVM(IVU_HOUR) | IVM(IVU_MINUTE) | IV_ALL_SECS)
+
+/* PostgreSQL 14's deltatktbl, the units an interval takes (a token compared in its first ten letters, as TOKMAXLEN) */
+static const struct {
+    const char *name;
+    uint8_t unit;
+} kIvUnits[] = {
+    {"@", IVU_SKIP}, {"ago", IVU_AGO}, {"c", IVU_CENTURY}, {"cent", IVU_CENTURY}, {"centuries", IVU_CENTURY},
+    {"century", IVU_CENTURY}, {"d", IVU_DAY}, {"day", IVU_DAY}, {"days", IVU_DAY}, {"dec", IVU_DECADE},
+    {"decade", IVU_DECADE}, {"decades", IVU_DECADE}, {"decs", IVU_DECADE}, {"h", IVU_HOUR}, {"hour", IVU_HOUR},
+    {"hours", IVU_HOUR}, {"hr", IVU_HOUR}, {"hrs", IVU_HOUR}, {"m", IVU_MINUTE}, {"microsecon", IVU_US},
+    {"mil", IVU_MILLENNIUM}, {"millennia", IVU_MILLENNIUM}, {"millennium", IVU_MILLENNIUM}, {"millisecon", IVU_MS},
+    {"mils", IVU_MILLENNIUM}, {"min", IVU_MINUTE}, {"mins", IVU_MINUTE}, {"minute", IVU_MINUTE}, {"minutes", IVU_MINUTE},
+    {"mon", IVU_MONTH}, {"mons", IVU_MONTH}, {"month", IVU_MONTH}, {"months", IVU_MONTH}, {"ms", IVU_MS},
+    {"msec", IVU_MS}, {"msecond", IVU_MS}, {"mseconds", IVU_MS}, {"msecs", IVU_MS}, {"s", IVU_SECOND},
+    {"sec", IVU_SECOND}, {"second", IVU_SECOND}, {"seconds", IVU_SECOND}, {"secs", IVU_SECOND}, {"us", IVU_US},
+    {"usec", IVU_US}, {"usecond", IVU_US}, {"useconds", IVU_US}, {"usecs", IVU_US}, {"w", IVU_WEEK}, {"week", IVU_WEEK},
+    {"weeks", IVU_WEEK}, {"y", IVU_YEAR}, {"year", IVU_YEAR}, {"years", IVU_YEAR}, {"yr", IVU_YEAR}, {"yrs", IVU_YEAR},
+};
+
+typedef enum { IVT_NUMBER, IVT_TIME, IVT_STRING } ivtok_kind;
+typedef struct ivtok {
+    ivtok_kind kind;
+    bool neg;          /* a sign before it ('-'), PostgreSQL's DTK_TZ */
+    bool sign;         /* any sign before it */
+    const char *p;     /* its text, after the sign */
+    size_t n;
+} ivtok;
+
+/* strtoint: an int32 from p's digits; *end past them; -1 out of range */
+static int iv_int32(const char *p, size_t n, size_t *end, bool neg, int64_t *out)
+{
+    size_t k = 0;
+    int64_t v = 0;
+    while (k < n && p[k] >= '0' && p[k] <= '9') {
+        v = v * 10 + (p[k] - '0');
+        if (v > (int64_t)INT32_MAX + 1) return -1;
+        k++;
+    }
+    if (neg) v = -v;
+    if (v > INT32_MAX || v < INT32_MIN) return -1;
+    *end = k;
+    *out = v;
+    return 0;
+}
+
+/* a fraction ".ddd" as strtod reads it under the C locale; false when it is no fraction */
+static bool iv_frac(const char *p, size_t n, double *out)
+{
+    char b[96];
+    if (n < 2 || n >= sizeof b || p[0] != '.') return false;
+    for (size_t k = 1; k < n; k++)
+        if (p[k] < '0' || p[k] > '9') return false;
+    memcpy(b, p, n);
+    b[n] = 0;
+    char *end = NULL;
+    errno = 0;
+    *out = strtod_l(b, &end, c_locale());
+    return end == b + n && errno == 0;
+}
+
+static void iv_fract_seconds(double frac, int64_t *sec, int64_t *fsec, int scale)
+{
+    if (frac == 0) return;
+    frac *= scale;
+    int s = (int)frac;
+    *sec += s;
+    frac -= s;
+    *fsec += (int64_t)rint(frac * 1000000);
+}
+
+static void iv_fract_days(double frac, int64_t *mday, int64_t *sec, int64_t *fsec, int scale)
+{
+    if (frac == 0) return;
+    frac *= scale;
+    int d = (int)frac;
+    *mday += d;
+    frac -= d;
+    iv_fract_seconds(frac, sec, fsec, 86400);
+}
+
+/* DecodeTime for an interval: H:M, H:M:S[.f], or M:S.f (one colon and a fraction); minutes 0-59, seconds 0-60 */
+/* the hours of a time token: past int32 (PostgreSQL 14 refuses them), so an INTERVAL's own text, which writes its
+ * microseconds' hours whole (up to 2562047788), reads back (the dump, COPY); 18 digits at most, the total checked */
+static int iv_hours(const char *p, size_t n, size_t *end, int64_t *out)
+{
+    size_t k = 0;
+    int64_t v = 0;
+    while (k < n && p[k] >= '0' && p[k] <= '9') {
+        if (k == 18) return -1;
+        v = v * 10 + (p[k++] - '0');
+    }
+    *end = k;
+    *out = v;
+    return 0;
+}
+
+static int iv_time(const char *p, size_t n, int64_t *hour, int64_t *min, int64_t *sec, int64_t *fsec, imdb_err *e)
+{
+    size_t k, at = 0;
+    int64_t a, b, c = 0, f = 0;
+    if (iv_hours(p, n, &k, &a) || !k) return imdb_fail(e, IMDB_ERR_INVALID, "interval: a field out of range");
+    at = k;
+    if (at >= n || p[at] != ':') return imdb_fail(e, IMDB_ERR_INVALID, "interval: invalid input syntax");
+    at++;
+    if (iv_int32(p + at, n - at, &k, false, &b) || !k) return imdb_fail(e, IMDB_ERR_INVALID, "interval: invalid input syntax");
+    at += k;
+    if (at < n && p[at] == '.') { /* M:S.f */
+        double fr;
+        if (!iv_frac(p + at, n - at, &fr)) return imdb_fail(e, IMDB_ERR_INVALID, "interval: invalid input syntax");
+        f = (int64_t)rint(fr * 1000000);
+        c = b;
+        b = a;
+        a = 0;
+    } else if (at < n && p[at] == ':') {
+        at++;
+        if (iv_int32(p + at, n - at, &k, false, &c) || !k) return imdb_fail(e, IMDB_ERR_INVALID, "interval: invalid input syntax");
+        at += k;
+        if (at < n) {
+            double fr;
+            if (!iv_frac(p + at, n - at, &fr)) return imdb_fail(e, IMDB_ERR_INVALID, "interval: invalid input syntax");
+            f = (int64_t)rint(fr * 1000000);
+        }
+    } else if (at < n) {
+        return imdb_fail(e, IMDB_ERR_INVALID, "interval: invalid input syntax");
+    }
+    if (b < 0 || b > 59 || c < 0 || c > 60 || f < 0 || f > 1000000)
+        return imdb_fail(e, IMDB_ERR_INVALID, "interval: a field out of range");
+    *hour = a;
+    *min = b;
+    *sec = c;
+    *fsec = f;
+    return IMDB_OK;
+}
+
+#define IV_MAX_TOKENS 64
+
+int imdb_parse_interval(const char *s, size_t n, int32_t *mon, int32_t *day, int64_t *us, imdb_err *e)
+{
+    ivtok tk[IV_MAX_TOKENS];
+    int nt = 0;
+    size_t at = 0;
+    /* ParseDateTime: numbers, H:M:S times, words (lowercased when compared), a sign joining what follows it (spaces
+     * after it soaked up), '@' a word; anything else refused */
+    while (at < n) {
+        char c = s[at];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            at++;
+            continue;
+        }
+        if (nt == IV_MAX_TOKENS) return imdb_fail(e, IMDB_ERR_LIMIT, "interval: too many fields");
+        ivtok *t = &tk[nt];
+        memset(t, 0, sizeof *t);
+        if (c == '+' || c == '-') {
+            t->sign = true;
+            t->neg = c == '-';
+            at++;
+            while (at < n && (s[at] == ' ' || s[at] == '\t')) at++;
+            if (at >= n || !((s[at] >= '0' && s[at] <= '9') || s[at] == '.'))
+                return imdb_fail(e, IMDB_ERR_INVALID, "interval: invalid input syntax");
+            c = s[at];
+        }
+        size_t b = at;
+        if ((c >= '0' && c <= '9') || c == '.') {
+            bool colon = false;
+            while (at < n && ((s[at] >= '0' && s[at] <= '9') || s[at] == '.' || s[at] == ':')) colon |= s[at++] == ':';
+            t->kind = colon ? IVT_TIME : IVT_NUMBER;
+        } else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+            while (at < n && ((s[at] >= 'a' && s[at] <= 'z') || (s[at] >= 'A' && s[at] <= 'Z'))) at++;
+            t->kind = IVT_STRING;
+        } else if (c == '@' && !t->sign) {
+            at++;
+            t->kind = IVT_STRING;
+        } else {
+            return imdb_fail(e, IMDB_ERR_INVALID, "interval: invalid input syntax");
+        }
+        t->p = s + b;
+        t->n = at - b;
+        nt++;
+    }
+    /* DecodeInterval: right to left, a word naming the unit of the number before it; a number without one seconds, or
+     * days before a time; each unit once (its mask); 'ago' anywhere negates every field */
+    int64_t year = 0, month = 0, mday = 0, hour = 0, minute = 0, sec = 0, fsec = 0;
+    unsigned fmask = 0;
+    int type = IVU_NONE;
+    bool ago = false;
+    for (int i = nt - 1; i >= 0; i--) {
+        const ivtok *t = &tk[i];
+        unsigned tmask = 0;
+        if (t->kind == IVT_TIME) {
+            int64_t h = 0, m = 0, sc = 0, f = 0;
+            if (iv_time(t->p, t->n, &h, &m, &sc, &f, e)) return e->code;
+            if (t->neg) {
+                h = -h;
+                m = -m;
+                sc = -sc;
+                f = -f;
+            }
+            hour += h;
+            minute += m;
+            sec += sc;
+            fsec += f;
+            tmask = IV_TIME_M;
+            type = IVU_DAY;
+        } else if (t->kind == IVT_NUMBER) {
+            if (type == IVU_NONE) type = IVU_SECOND;
+            size_t k;
+            int64_t val;
+            double fval = 0;
+            if (iv_int32(t->p, t->n, &k, t->neg, &val)) return imdb_fail(e, IMDB_ERR_INVALID, "interval: a field out of range");
+            if (k < t->n) {
+                if (!iv_frac(t->p + k, t->n - k, &fval)) return imdb_fail(e, IMDB_ERR_INVALID, "interval: invalid input syntax");
+                if (t->neg) fval = -fval;
+            } else if (!k) {
+                return imdb_fail(e, IMDB_ERR_INVALID, "interval: invalid input syntax");
+            }
+            switch (type) {
+            case IVU_US: fsec += (int64_t)rint((double)val + fval); break;
+            case IVU_MS:
+                sec += val / 1000;
+                val -= (val / 1000) * 1000;
+                fsec += (int64_t)rint(((double)val + fval) * 1000);
+                break;
+            case IVU_SECOND:
+                sec += val;
+                fsec += (int64_t)rint(fval * 1000000);
+                break;
+            case IVU_MINUTE: minute += val, iv_fract_seconds(fval, &sec, &fsec, 60); break;
+            case IVU_HOUR: hour += val, iv_fract_seconds(fval, &sec, &fsec, 3600); break;
+            case IVU_DAY: mday += val, iv_fract_seconds(fval, &sec, &fsec, 86400); break;
+            case IVU_WEEK: mday += val * 7, iv_fract_days(fval, &mday, &sec, &fsec, 7); break;
+            case IVU_MONTH: month += val, iv_fract_days(fval, &mday, &sec, &fsec, 30); break;
+            /* a fractional year's months as PostgreSQL 14 adds them: tm_mon += fval * 12 [* 10 ...], the double sum made an
+             * int (truncated toward zero; PostgreSQL 15 rounds instead), in its order of operations */
+            case IVU_YEAR: year += val, month = fval != 0 ? (int64_t)((double)month + fval * 12) : month; break;
+            case IVU_DECADE: year += val * 10, month = fval != 0 ? (int64_t)((double)month + fval * 12 * 10) : month; break;
+            case IVU_CENTURY: year += val * 100, month = fval != 0 ? (int64_t)((double)month + fval * 12 * 100) : month; break;
+            case IVU_MILLENNIUM: year += val * 1000, month = fval != 0 ? (int64_t)((double)month + fval * 12 * 1000) : month; break;
+            default: return imdb_fail(e, IMDB_ERR_INVALID, "interval: invalid input syntax");
+            }
+            tmask = type == IVU_SECOND && fval != 0 ? IV_ALL_SECS : IVM(type);
+            if (type == IVU_HOUR) type = IVU_DAY; /* the unit carries to the number before it, an hour's as a day */
+        } else {
+            char w[11];
+            size_t wl = t->n < 10 ? t->n : 10;
+            for (size_t k = 0; k < wl; k++) w[k] = (char)(t->p[k] >= 'A' && t->p[k] <= 'Z' ? t->p[k] + 32 : t->p[k]);
+            w[wl] = 0;
+            int u = -1;
+            for (size_t k = 0; k < sizeof kIvUnits / sizeof *kIvUnits && u < 0; k++)
+                if (!strcmp(kIvUnits[k].name, w)) u = kIvUnits[k].unit;
+            if (u < 0) return imdb_fail(e, IMDB_ERR_INVALID, "interval: invalid input syntax");
+            if (u == IVU_SKIP) continue;
+            if (u == IVU_AGO) {
+                ago = true;
+                type = IVU_NONE;
+                continue;
+            }
+            type = u;
+            continue;
+        }
+        if (tmask & fmask) return imdb_fail(e, IMDB_ERR_INVALID, "interval: invalid input syntax");
+        fmask |= tmask;
+    }
+    if (!fmask) return imdb_fail(e, IMDB_ERR_INVALID, "interval: invalid input syntax");
+    if (fsec) { /* fractional seconds kept fractional */
+        int64_t q = fsec / 1000000;
+        fsec -= q * 1000000;
+        sec += q;
+    }
+    if (ago) {
+        year = -year, month = -month, mday = -mday, hour = -hour, minute = -minute, sec = -sec, fsec = -fsec;
+    }
+    __int128 months = (__int128)year * 12 + month,
+             time = (((__int128)hour * 60 + minute) * 60 + sec) * 1000000 + fsec;
+    if (months > INT32_MAX || months < INT32_MIN || mday > INT32_MAX || mday < INT32_MIN || time > INT64_MAX || time < INT64_MIN)
+        return imdb_fail(e, IMDB_ERR_LIMIT, "interval: out of range");
+    *mon = (int32_t)months;
+    *day = (int32_t)mday;
+    *us = (int64_t)time;
+    return IMDB_OK;
+}
+
+static void iv_part(imdb_buf *out, int64_t v, const char *unit, bool *zero, bool *before)
+{
+    if (!v) return;
+    char b[64];
+    /* a "+" when the field before was negative (AddPostgresIntPart: each field sets is_before for the next alone) */
+    int k = snprintf(b, sizeof b, "%s%s%lld %s%s", *zero ? "" : " ", *before && v > 0 ? "+" : "", (long long)v, unit,
+                     v != 1 ? "s" : "");
+    imdb_buf_put(out, b, (size_t)k);
+    *before = v < 0;
+    *zero = false;
+}
+
+void imdb_format_interval(int32_t mon, int32_t day, int64_t us, imdb_buf *out)
+{
+    bool zero = true, before = false;
+    int64_t years = mon / 12, mons = mon % 12, t = us;
+    int64_t hour = t / 3600000000LL;
+    t -= hour * 3600000000LL;
+    int64_t min = t / 60000000LL;
+    t -= min * 60000000LL;
+    int64_t sec = t / 1000000LL, fsec = t - sec * 1000000LL;
+    iv_part(out, years, "year", &zero, &before);
+    iv_part(out, mons, "mon", &zero, &before);
+    iv_part(out, day, "day", &zero, &before);
+    if (zero || hour || min || sec || fsec) {
+        bool minus = hour < 0 || min < 0 || sec < 0 || fsec < 0;
+        char b[96];
+        int k = snprintf(b, sizeof b, "%s%s%02llu:%02llu:%02llu", zero ? "" : " ", minus ? "-" : before ? "+" : "",
+                         (unsigned long long)(hour < 0 ? -hour : hour), (unsigned long long)(min < 0 ? -min : min),
+                         (unsigned long long)(sec < 0 ? -sec : sec));
+        imdb_buf_put(out, b, (size_t)k);
+        if (fsec) { /* AppendSeconds: six places, the trailing zeros gone */
+            char f[8];
+            snprintf(f, sizeof f, ".%06lld", (long long)(fsec < 0 ? -fsec : fsec));
+            size_t fl = 7;
+            while (fl > 1 && f[fl - 1] == '0') fl--;
+            imdb_buf_put(out, f, fl);
+        }
+    }
+}
+
 /* ---- F3d: UUID and BYTEA text forms ---- */
 
 static int hexval(char c)
@@ -1164,6 +1528,7 @@ void imdb_format_value(const imdb_value *v, imdb_buf *out)
     case IMDB_T_TEXT: imdb_buf_put(out, v->s, v->len); break;
     case IMDB_T_UUID: imdb_format_uuid(v->s, out); break;
     case IMDB_T_BYTEA: imdb_format_bytea(v->s, v->len, out); break;
+    case IMDB_T_INTERVAL: imdb_format_interval(v->iv.mon, v->iv.day, v->i, out); break;
     }
 }
 

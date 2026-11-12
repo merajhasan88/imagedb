@@ -1346,6 +1346,62 @@ static void index_lie(const char *dir, const char *kind)
         append_commit_digest(dir, db, &op, 1, &sg, NULL, dg);
         imdb_close(db);
         return;
+    } else if (strcmp(kind, "iv-short") == 0) {
+        /* F3f: an INSERT into the last table, (id INT64 PRIMARY KEY, iv INTERVAL NOT NULL), of a row whose INTERVAL is 15
+         * bytes: no NULL bitmap, the id's 8 bytes, then 15 (the row codec wants 16); its commitment and digest right */
+        imdb_table *t = db->t[db->nt - 1];
+        if (t->s.ncols != 2 || t->s.cols[1].type != IMDB_T_INTERVAL || (t->s.cols[1].flags & IMDB_COL_NULLABLE)) {
+            fputs("imdb-forge: index-lie iv-short needs a last table (id INT64 PRIMARY KEY, iv INTERVAL NOT NULL)\n", stderr);
+            exit(1);
+        }
+        static uint8_t row[8 + 15];
+        imdb_le64(row, 999);
+        memset(row + 8, 0x01, 15);
+        memset(op.salt, 0x61, sizeof op.salt);
+        op.code = IMDB_OP_INSERT;
+        op.table = t->s.id;
+        op.vid = t->nver;
+        op.pkind = IMDB_PAYLOAD_ROW;
+        op.row = row;
+        op.row_len = sizeof row;
+        op.iname = NULL;
+        imdb_row_commit(t->s.id, op.salt, row, sizeof row, op.commit);
+        imdb_lthash g = db->global;
+        imdb_lthash_add_commit(db->meta.digest_alg, &g, op.commit);
+        uint8_t dg[32];
+        imdb_lthash_digest(db->meta.digest_alg, &g, dg);
+        append_commit_digest(dir, db, &op, 1, &sg, NULL, dg);
+        imdb_close(db);
+        return;
+    } else if (strcmp(kind, "create-interval-key") == 0) {
+        /* F3f: CREATE TABLE jb (jbkey TIMESTAMP PRIMARY KEY, n INT64) with its retention, the key's type byte then made
+         * INTERVAL (12): a key the schema check refuses (deferred.md D26) */
+        static imdb_schema s;
+        memset(&s, 0, sizeof s);
+        snprintf(s.name, sizeof s.name, "jb");
+        s.id = db->nt;
+        s.ncols = 2;
+        s.subject = -1;
+        snprintf(s.cols[0].name, sizeof s.cols[0].name, "jbkey");
+        s.cols[0].type = IMDB_T_TIMESTAMP;
+        s.cols[0].flags = IMDB_COL_PK;
+        snprintf(s.cols[1].name, sizeof s.cols[1].name, "n");
+        s.cols[1].type = IMDB_T_INT64;
+        s.cols[1].flags = IMDB_COL_NULLABLE;
+        s.npk = 1;
+        s.key[0] = 0;
+        imdb_op ops[2];
+        memset(ops, 0, sizeof ops);
+        ops[0] = (imdb_op){.code = IMDB_OP_CREATE_TABLE, .table = s.id, .schema = &s};
+        ops[1] = (imdb_op){.code = IMDB_OP_SET_RETENTION, .table = s.id, .retention_us = IMDB_RETAIN_DEFAULT_US};
+        static const uint8_t pat[] = {5, 'j', 'b', 'k', 'e', 'y', IMDB_T_TIMESTAMP, 0, 0, IMDB_COL_PK};
+        g_find = pat;
+        g_find_len = sizeof pat;
+        g_at = 6;
+        g_to = IMDB_T_INTERVAL;
+        append_commit(dir, db, ops, 2, &sg, NULL);
+        imdb_close(db);
+        return;
     } else if (strcmp(kind, "dec-range") == 0) {
         /* F3e: an INSERT into the last table, (id INT64 PRIMARY KEY, w DECIMAL(30,2) NOT NULL), of a row whose w is 10^28:
          * past its precision by one (the row codec's 16 bytes, i then hi, of its scaled 10^30); commitment and digest
@@ -1722,7 +1778,8 @@ static void index_lie(const char *dir, const char *kind)
               "fk-orphan (a child of no parent in the last table) | fk-delete (table 0's first live row) | "
               "fk-erase-other | fk-erase-named (that DELETE beside an ERASE of an ended version, or of the row itself) | dec-range (a\n"
               "DECIMAL(30,2) of 10^28 in the last table) | uuid-short (a\n"
-              "UUID of 15 bytes in the last table) | create-default-uuid (gen_random_uuid on a TIMESTAMPTZ)\n", stderr);
+              "UUID of 15 bytes in the last table) | create-default-uuid (gen_random_uuid on a TIMESTAMPTZ) | iv-short (an\n"
+              "INTERVAL of 15 bytes in the last table) | create-interval-key (a CREATE whose key is an INTERVAL)\n", stderr);
         exit(1);
     }
     append_commit(dir, db, &op, 1, &sg, NULL);

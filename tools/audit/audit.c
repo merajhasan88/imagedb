@@ -58,10 +58,11 @@
 #define RETAIN_MAX_US (36525ull * 24 * 3600 * 1000000) /* ... to a century, or all ones (FOREVER) */
 
 enum { T_INT64 = 1, T_DECIMAL = 2, T_TEXT = 3, T_BOOL = 4, T_TIMESTAMP = 5, T_FLOAT64 = 6, T_TIMESTAMPTZ = 7, T_DATE = 8, T_TIME = 9,
-       T_UUID = 10, T_BYTEA = 11 }; /* F3d: UUID 16 bytes, BYTEA any bytes: byte strings as TEXT is (bytes_t) */
+       T_UUID = 10, T_BYTEA = 11, T_INTERVAL = 12 }; /* F3d: UUID 16 bytes, BYTEA any bytes: byte strings as TEXT is
+                                                       * (bytes_t); F3f: INTERVAL, months, days, microseconds (16 bytes) */
 #define UUID_LEN 16
 static bool bytes_t(uint8_t t) { return t == T_TEXT || t == T_UUID || t == T_BYTEA; }
-#define T_LAST T_BYTEA /* P2: TIMESTAMPTZ an instant (UTC microseconds), its zone only how a session shows it; F3b: DATE (days since
+#define T_LAST T_INTERVAL /* P2: TIMESTAMPTZ an instant (UTC microseconds), its zone only how a session shows it; F3b: DATE (days since
                       * 1970-01-01, 0001-01-01 to 9999-12-31) and TIME (microseconds since midnight, below a day) */
 #define DATE_MIN (-719162LL)
 #define DATE_MAX 2932896LL
@@ -440,7 +441,7 @@ static int decode_schema(rd *r, schema *s)
                                  : c->type == T_INT64 ? !int_width_ok(c->prec) || c->scale : (c->prec || c->scale))
             return fail("schema: bad precision/scale");
         if (c->flags & F_PK) { /* F4: a key column of any type held exactly: not FLOAT64 */
-            if (c->type == T_FLOAT64) return fail("schema: bad PRIMARY KEY");
+            if (c->type == T_FLOAT64 || c->type == T_INTERVAL) return fail("schema: bad PRIMARY KEY"); /* F3f: not yet (D26) */
             nflag++;
         }
         if (c->flags & F_SUBJECT) {
@@ -474,10 +475,13 @@ typedef struct val {
     bool null;
     bool wide;   /* F3e: a DECIMAL of a column past 18 digits: its value is hi:i (dval) */
     int64_t hi;  /* its high 64 bits; 0 for every other value */
+    int32_t mon, day; /* F3f: an INTERVAL's months and days (i its microseconds); 0 for every other value */
 } val;
 
 /* F3e: a column's DECIMAL form is its precision's (past 18 wide: 16 bytes in a row, i then hi), never a value's */
 static bool dwide(const col *c) { return c->type == T_DECIMAL && c->prec > 18; }
+/* F3f: a value of 16 bytes in a row and a 16-byte cell in a segment: a wide DECIMAL, an INTERVAL */
+static bool fix16(const col *c) { return dwide(c) || c->type == T_INTERVAL; }
 static __int128 dval(const val *v)
 {
     return v->wide ? (__int128)(((unsigned __int128)(uint64_t)v->hi << 64) | (uint64_t)v->i) : (__int128)v->i;
@@ -531,6 +535,8 @@ static int check_value(const col *c, const val *v)
         return fail("invalid TEXT in column %s", c->name);
     if (c->type == T_UUID && (v->len != UUID_LEN || !v->s)) return fail("a UUID not of 16 bytes in column %s", c->name); /* F3d */
     if (c->type == T_BYTEA && v->len > MAX_TEXT) return fail("BYTEA too long in column %s", c->name);
+    if (c->type == T_INTERVAL && v->wide) return fail("not an INTERVAL value in column %s", c->name); /* F3f: every triple */
+    if (c->type != T_INTERVAL && (v->mon || v->day)) return fail("a value with an INTERVAL's fields in column %s", c->name);
     if (c->type == T_TEXT && c->vlen) { /* F3c: VARCHAR(n) counts characters */
         uint32_t k = 0;
         for (uint32_t i = 0; i < v->len; i++) k += (v->s[i] & 0xC0) != 0x80;
@@ -564,6 +570,10 @@ static int decode_row(const schema *s, const uint8_t *row, size_t n, val *out)
             v->len = v->s ? UUID_LEN : 0;
         } else if (t == T_BOOL) {
             v->i = rd_u8(&r);
+        } else if (t == T_INTERVAL) { /* F3f: months, days, microseconds */
+            v->mon = (int32_t)rd_u32(&r);
+            v->day = (int32_t)rd_u32(&r);
+            v->i = (int64_t)rd_u64(&r);
         } else if (dwide(&s->c[i])) { /* F3e: 16 bytes, i then hi */
             v->wide = true;
             v->i = (int64_t)rd_u64(&r);
@@ -585,7 +595,7 @@ static size_t encode_row(const schema *s, const val *v, uint8_t **buf, size_t *c
     size_t need = (size_t)(nn + 7) / 8;
     for (int i = 0; i < s->ncols; i++)
         if (!v[i].null) need += s->c[i].type == T_TEXT || s->c[i].type == T_BYTEA ? 4 + v[i].len : s->c[i].type == T_UUID ? UUID_LEN : s->c[i].type == T_BOOL ? 1
-                              : dwide(&s->c[i]) ? 16 : 8;
+                              : fix16(&s->c[i]) ? 16 : 8; /* F3e, F3f */
     if (need > *cap) {
         *buf = xrealloc(*buf, need, 1);
         *cap = need;
@@ -609,6 +619,11 @@ static size_t encode_row(const schema *s, const val *v, uint8_t **buf, size_t *c
             p += UUID_LEN;
         } else if (s->c[i].type == T_BOOL) {
             *p++ = (uint8_t)v[i].i;
+        } else if (s->c[i].type == T_INTERVAL) { /* F3f */
+            put32(p, (uint32_t)v[i].mon);
+            put32(p + 4, (uint32_t)v[i].day);
+            put64(p + 8, (uint64_t)v[i].i);
+            p += 16;
         } else if (dwide(&s->c[i])) { /* F3e: the 128 bits, i then hi, whatever form v came in */
             unsigned __int128 x = (unsigned __int128)dval(&v[i]);
             put64(p, (uint64_t)x);
@@ -828,7 +843,7 @@ static bool aidx_ok(const aidx *x, int ncols)
 static bool aidx_no_wide(const aidx *x, const schema *s)
 {
     for (int i = 0; i < x->ncols && i < MAX_INDEX_COLS; i++)
-        if (x->cols[i] < s->ncols && dwide(&s->c[x->cols[i]])) return false;
+        if (x->cols[i] < s->ncols && fix16(&s->c[x->cols[i]])) return false; /* F3f: nor on an INTERVAL (D26) */
     return true;
 }
 
@@ -967,7 +982,7 @@ static bool defk_fits(uint8_t k, uint8_t ty)
 static int one_value(rd *hr, const col *ac, const uint8_t **def, uint32_t *len, const char *what)
 {
     size_t at = hr->o;
-    uint32_t dl = ac->type == T_TEXT || ac->type == T_BYTEA ? 4 + rd_u32(hr) : ac->type == T_UUID ? UUID_LEN : ac->type == T_BOOL ? 1 : dwide(ac) ? 16 : 8; /* F3d; F3e */
+    uint32_t dl = ac->type == T_TEXT || ac->type == T_BYTEA ? 4 + rd_u32(hr) : ac->type == T_UUID ? UUID_LEN : ac->type == T_BOOL ? 1 : fix16(ac) ? 16 : 8; /* F3d; F3e; F3f */
     hr->o = at;
     *def = rd_bytes(hr, dl);
     *len = dl;
@@ -1209,7 +1224,7 @@ static int alter_body(rd *hr, op *o, const char *what)
         o->has_def = has;
         if (has) { /* the row encoding of one value: a one-column NOT NULL row, which decode_row checks */
             size_t at = hr->o;
-            uint32_t dl = ac->type == T_TEXT || ac->type == T_BYTEA ? 4 + rd_u32(hr) : ac->type == T_UUID ? UUID_LEN : ac->type == T_BOOL ? 1 : dwide(ac) ? 16 : 8; /* F3d; F3e */
+            uint32_t dl = ac->type == T_TEXT || ac->type == T_BYTEA ? 4 + rd_u32(hr) : ac->type == T_UUID ? UUID_LEN : ac->type == T_BOOL ? 1 : fix16(ac) ? 16 : 8; /* F3d; F3e; F3f */
             hr->o = at;
             o->def = rd_bytes(hr, dl);
             o->def_len = dl;
@@ -1249,7 +1264,7 @@ static int alter_body(rd *hr, op *o, const char *what)
         if (o->akind == 9 || hr->bad) return 0;
         o->has_def = true; /* never NULL: no marker, the row encoding of one NOT NULL value */
         size_t at = hr->o;
-        uint32_t dl = ac->type == T_TEXT || ac->type == T_BYTEA ? 4 + rd_u32(hr) : ac->type == T_UUID ? UUID_LEN : ac->type == T_BOOL ? 1 : dwide(ac) ? 16 : 8; /* F3d; F3e */
+        uint32_t dl = ac->type == T_TEXT || ac->type == T_BYTEA ? 4 + rd_u32(hr) : ac->type == T_UUID ? UUID_LEN : ac->type == T_BOOL ? 1 : fix16(ac) ? 16 : 8; /* F3d; F3e; F3f */
         hr->o = at;
         o->def = rd_bytes(hr, dl);
         o->def_len = dl;
@@ -3800,13 +3815,23 @@ static bool is_int(uint8_t t)
 /* F3e: a column's segment layout by the column, not its type alone: a wide DECIMAL as a UUID is held, offsets and
  * data, each cell 16 bytes (i then hi) or none, with no zone map */
 static bool seg_int(const col *c) { return is_int(c->type) && !dwide(c); }
-static bool seg_text(const col *c) { return bytes_t(c->type) || dwide(c); }
+static bool seg_text(const col *c) { return bytes_t(c->type) || fix16(c); } /* F3e, F3f: 16-byte cells */
 
 /* a wide DECIMAL's cell (a z - a of 16) or nothing stored (0): its value and its stored length */
 static void dcell(const uint8_t *p, uint32_t len, val *v)
 {
     v->len = len; /* what is stored, for the checks that nothing is under a clear VALID bit or an erased row */
     dset(v, len == 16 ? (__int128)(((unsigned __int128)le64(p + 8) << 64) | le64(p)) : 0, true);
+}
+
+/* F3f: an INTERVAL's cell (a z - a of 16: months, days, microseconds, little-endian) or nothing stored (0) */
+static void icell(const uint8_t *p, uint32_t len, val *v)
+{
+    v->len = len; /* what is stored, as dcell's */
+    if (len != 16) return;
+    v->mon = (int32_t)le32(p);
+    v->day = (int32_t)le32(p + 4);
+    v->i = (int64_t)le64(p + 8);
 }
 
 static bool has_value(const seg *g, int c, uint32_t i)
@@ -3826,7 +3851,10 @@ static void seg_raw(const schema *s, const seg *g, uint32_t i, int c, val *v)
     uint8_t t = s->c[c].type;
     if (seg_int(&s->c[c])) v->i = (int64_t)le64(g->colp[c] + 8u * i);
     else if (t == T_BOOL) v->i = g->colp[c][i];
-    else if (dwide(&s->c[c])) { /* F3e */
+    else if (t == T_INTERVAL) { /* F3f */
+        uint32_t a = le32(g->colp[c] + 4u * i), z = le32(g->colp[c] + 4u * (i + 1));
+        icell(g->tdata[c] + a, z - a, v);
+    } else if (dwide(&s->c[c])) { /* F3e */
         uint32_t a = le32(g->colp[c] + 4u * i), z = le32(g->colp[c] + 4u * (i + 1));
         dcell(g->tdata[c] + a, z - a, v);
     } else {
@@ -3856,7 +3884,10 @@ static void seg_own_value(const struct aver *gv, const seg *g, uint32_t i, int c
     uint8_t t = gv->s.c[c].type;
     if (seg_int(&gv->s.c[c])) v->i = (int64_t)le64(g->ocolp[c] + 8u * i);
     else if (t == T_BOOL) v->i = g->ocolp[c][i];
-    else if (dwide(&gv->s.c[c])) { /* F3e */
+    else if (t == T_INTERVAL) { /* F3f */
+        uint32_t a = le32(g->ocolp[c] + 4u * i), z = le32(g->ocolp[c] + 4u * (i + 1));
+        icell(g->otdata[c] + a, z - a, v);
+    } else if (dwide(&gv->s.c[c])) { /* F3e */
         uint32_t a = le32(g->ocolp[c] + 4u * i), z = le32(g->ocolp[c] + 4u * (i + 1));
         dcell(g->otdata[c] + a, z - a, v);
     } else {
@@ -4006,7 +4037,7 @@ static int parse_segment(const struct aver *vers, uint32_t nvers, const val *mis
             for (uint32_t i = 0; i < n && !rc; i++) {
                 uint32_t a = le32(g->colp[c] + 4u * i), z = le32(g->colp[c] + 4u * (i + 1));
                 if (z < a || z > dl || z - a > MAX_TEXT) rc = fail("segment: bad TEXT offsets");
-                else if (dwide(&s->c[c]) && z - a != 0 && z - a != 16) rc = fail("segment: a DECIMAL cell of %u bytes", z - a);
+                else if (fix16(&s->c[c]) && z - a != 0 && z - a != 16) rc = fail("segment: a 16-byte cell of %u bytes", z - a);
             }
         }
         if (s->c[c].flags & F_NULLABLE) {
@@ -4036,8 +4067,8 @@ static int parse_segment(const struct aver *vers, uint32_t nvers, const val *mis
             continue;
         }
         for (int c = 0; c < s->ncols && !rc; c++)
-            if (dwide(&s->c[c]) && !g->cst[c] && !v[c].null && v[c].len != 16) /* F3e: a stored value is its 16 bytes, never none */
-                rc = fail("segment: a DECIMAL of no bytes in column %s", s->c[c].name);
+            if (fix16(&s->c[c]) && !g->cst[c] && !v[c].null && v[c].len != 16) /* F3e, F3f: a stored value is its 16 bytes, never none */
+                rc = fail("segment: a 16-byte value of no bytes in column %s", s->c[c].name);
             else if (!v[c].null) rc = check_value(&s->c[c], &v[c]);
         if (rc) break;
         /* F1: a row of an older version holds, at each column its version lacks, exactly its missing value (no
@@ -4280,7 +4311,7 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
     rd r = {b, len, 0, false};
     const uint8_t *mg = rd_bytes(&r, 8);
     uint32_t mver = mg && memcmp(mg, "IMDBMAN1", 8) == 0 ? rd_u32(&r) : 0;
-    if (mver != 15) return fail("manifest: bad header (version 15 only: DECIMALs to 38 digits, F3e)");
+    if (mver != 16) return fail("manifest: bad header (version 16 only: INTERVAL, F3f)");
     uint32_t nsec = rd_u32(&r); /* every section, in order: 1 tables, 2 views, 3 sequences (F2a-2), 4-11 reserved and empty */
     const uint8_t *id = rd_bytes(&r, 16);
     m->seq = rd_u64(&r);
@@ -5888,6 +5919,7 @@ static int parse_filter(const schema *s, const char *arg, filt *f)
     }
     /* stored as an order-preserving key, not as the digits: an integer here would match the wrong rows */
     if (c->type == T_FLOAT64) return fail("filters on FLOAT64 column %s are not supported", c->name);
+    if (c->type == T_INTERVAL) return fail("filters on INTERVAL column %s are not supported", c->name); /* F3f: three fields */
     bool neg = *v == '-';
     if (*v == '-' || *v == '+') v++;
     __int128 acc = 0;

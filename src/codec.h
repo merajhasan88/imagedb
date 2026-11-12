@@ -31,8 +31,10 @@ typedef enum imdb_type {
     IMDB_T_TIME = 9,        /* F3b: microseconds since midnight, 00:00:00 to 23:59:59.999999 */
     IMDB_T_UUID = 10,       /* F3d: 16 bytes in s (len 16 always), ordered as memcmp orders them */
     IMDB_T_BYTEA = 11,      /* F3d: 0 to IMDB_MAX_TEXT bytes in s, any byte; memcmp, then the shorter first */
+    IMDB_T_INTERVAL = 12,   /* F3f: PostgreSQL 14's months, days and microseconds: i the microseconds, iv.mon and
+                             * iv.day the others; SQL compares the span (imdb_iv_span), identity is the triple */
 } imdb_type;
-#define IMDB_T_LAST IMDB_T_BYTEA /* the highest tag a schema may hold */
+#define IMDB_T_LAST IMDB_T_INTERVAL /* the highest tag a schema may hold */
 #define IMDB_UUID_LEN 16
 
 #define IMDB_COL_PK       0x01
@@ -69,6 +71,9 @@ typedef struct imdb_value {
     union {
         const uint8_t *s; /* TEXT, UUID, BYTEA bytes (not owned): read only after the type says a byte string */
         int64_t hi;       /* F3e: a wide DECIMAL's high 64 bits, in s's place (a DECIMAL never has bytes); 0 in a narrow one */
+        struct {
+            int32_t mon, day; /* F3f: an INTERVAL's months and days, in s's place (an INTERVAL has no bytes) */
+        } iv;
     };
 } imdb_value;
 /* F3e: 24 bytes, as before: every array of held values (join pairs, sorted rows, group keys, cells) costs what it did */
@@ -100,6 +105,48 @@ static inline void imdb_dec_set(imdb_value *v, __int128 x, bool wide)
     v->i = (int64_t)(uint64_t)(unsigned __int128)x;
     v->hi = wide ? (int64_t)(uint64_t)((unsigned __int128)x >> 64) : 0;
 }
+
+/* F3f: the shape a column's values take, decided here alone (the advisor, 2026-11-12: hand-kept type lists drifted, a
+ * missing column's zone among them): imdb_col_fixed16, a value of 16 bytes held whole (a wide DECIMAL's int128, an
+ * INTERVAL's triple: 16 bytes in a row, a 16-byte cell in a segment, no zone map, compared by value); imdb_col_i64, one
+ * int64 a value (i: an int64 array in a segment with a zone map, a predicate's int range); every other column a byte
+ * string (imdb_type_bytes) or a BOOL */
+static inline bool imdb_col_fixed16(const imdb_column *c)
+{
+    return (c->type == IMDB_T_DECIMAL && imdb_dec_wide(c->precision)) || c->type == IMDB_T_INTERVAL;
+}
+static inline bool imdb_col_i64(const imdb_column *c)
+{
+    switch (c->type) {
+    case IMDB_T_INT64:
+    case IMDB_T_TIMESTAMP:
+    case IMDB_T_FLOAT64:
+    case IMDB_T_TIMESTAMPTZ:
+    case IMDB_T_DATE:
+    case IMDB_T_TIME: return true;
+    case IMDB_T_DECIMAL: return !imdb_dec_wide(c->precision);
+    default: return false;
+    }
+}
+
+/* F3f: INTERVAL. Its span, PostgreSQL 14's interval_cmp_value (a month 30 days, a day 86,400 s), is SQL's equality
+ * and order: '1 mon' = '30 days' = '720:00:00'. Its identity is the triple (a commitment, the lake's and VERIFY's value
+ * compares, a change), and `ts + '1 mon'` and `ts + '30 days'` differ */
+#define IMDB_DAY_US 86400000000LL /* a day's microseconds: F3b's DATE arithmetic, F3f's span */
+static inline __int128 imdb_iv_span(int32_t mon, int32_t day, int64_t us)
+{
+    return ((__int128)mon * 30 + day) * (__int128)IMDB_DAY_US + us;
+}
+static inline void imdb_iv_set(imdb_value *v, int32_t mon, int32_t day, int64_t us)
+{
+    v->iv.mon = mon;
+    v->iv.day = day;
+    v->i = us;
+}
+/* PostgreSQL 14's verbose input ([@] {[+-]number unit} [[+-]HH:MM[:SS[.f]]] [ago]; F3f's units), into v's fields */
+int imdb_parse_interval(const char *s, size_t n, int32_t *mon, int32_t *day, int64_t *us, imdb_err *e);
+/* PostgreSQL 14's IntervalStyle postgres (EncodeInterval) */
+void imdb_format_interval(int32_t mon, int32_t day, int64_t us, imdb_buf *out);
 /* 10^n for n in 0..38 as an int128 (0 outside), the one table: the codec's checks, the expressions' rescaling */
 __int128 imdb_pow10_128(int n);
 
@@ -193,7 +240,6 @@ int imdb_parse_bytea(const char *s, size_t n, uint8_t *out, size_t cap, size_t *
 #define IMDB_DATE_MIN (-719162LL)  /* 0001-01-01 */
 #define IMDB_DATE_MAX 2932896LL    /* 9999-12-31 */
 #define IMDB_TIME_MAX 86399999999LL /* 23:59:59.999999 */
-#define IMDB_DAY_US 86400000000LL
 /* P2: a TIMESTAMPTZ literal: a TIMESTAMP's text (its wall-clock time in local), then nothing (the session's zone
  * decides), an offset (Z, +HH, +HHMM, +HH:MM or +HH:MM:SS, at most 15:59:59 as PostgreSQL's, a space before it
  * allowed) or a space and a zone's name (zoff, zlen: where in s; the caller looks it up) */

@@ -92,9 +92,10 @@ static inline void fuzz_schema(int which, imdb_schema *s)
         s->cols[2].flags = IMDB_COL_NULLABLE;
         s->npk = 1;
         s->key[0] = 0;
-    } else { /* fu (F3d): a UUID key, a BYTEA and an INT64: a UUID's 16 bytes or none, a byte string's offsets and data */
+    } else { /* fu (F3d): a UUID key, a BYTEA and an INT64: a UUID's 16 bytes or none, a byte string's offsets and data;
+             * F3f: an INTERVAL, its 16-byte cells */
         strcpy(s->name, "fu");
-        s->ncols = 3;
+        s->ncols = 4;
         strcpy(s->cols[0].name, "id");
         s->cols[0].type = IMDB_T_UUID;
         s->cols[0].flags = IMDB_COL_PK;
@@ -104,6 +105,9 @@ static inline void fuzz_schema(int which, imdb_schema *s)
         strcpy(s->cols[2].name, "n");
         s->cols[2].type = IMDB_T_INT64;
         s->cols[2].flags = IMDB_COL_NULLABLE;
+        strcpy(s->cols[3].name, "iv");
+        s->cols[3].type = IMDB_T_INTERVAL;
+        s->cols[3].flags = IMDB_COL_NULLABLE;
         s->npk = 1;
         s->key[0] = 0;
     }

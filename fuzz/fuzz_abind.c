@@ -10,14 +10,14 @@
 #include "../tools/audit/abind.h"
 
 static const ab_col T[] = {{"id", 1, 0}, {"g", 1, 0}, {"d", 2, 2}, {"f", 6, 0}, {"s", 3, 0}, {"k", 4, 0}, {"ts", 5, 0},
-                           {"e", 2, 4}};
+                           {"e", 2, 4}, {"iv", 12, 0}}; /* F3f: iv an INTERVAL */
 static const ab_col U[] = {{"id", 1, 0}, {"tid", 1, 0}, {"v", 1, 0}, {"s", 3, 0}, {"d", 2, 3}};
 static const ab_col V[] = {{"id", 1, 0}, {"m", 2, 8}};
 
 static bool lookup(void *arg, const char *name, ab_rel *out)
 {
     (void)arg;
-    if (!strcmp(name, "t")) *out = (ab_rel){1, 0, 8, T};
+    if (!strcmp(name, "t")) *out = (ab_rel){1, 0, 9, T};
     else if (!strcmp(name, "u")) *out = (ab_rel){1, 1, 5, U};
     else if (!strcmp(name, "w")) *out = (ab_rel){2, 0, 2, V};
     else return false;

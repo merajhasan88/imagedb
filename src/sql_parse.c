@@ -230,6 +230,7 @@ static bool ts_literal_at(const parser *p, uint32_t i)
 {
     if (tok_is_kw(p, i, "date") || tok_is_kw(p, i, "time")) return p->t[i + 1].kind == TK_STR; /* F3b: DATE '...', TIME '...' */
     if (tok_is_kw(p, i, "uuid") || tok_is_kw(p, i, "bytea")) return p->t[i + 1].kind == TK_STR; /* F3d */
+    if (tok_is_kw(p, i, "interval")) return p->t[i + 1].kind == TK_STR; /* F3f */
     if (tok_is_kw(p, i, "timestamptz")) return p->t[i + 1].kind == TK_STR;
     if (!tok_is_kw(p, i, "timestamp")) return false;
     if (p->t[i + 1].kind == TK_STR) return true;
@@ -306,6 +307,15 @@ static int alias(parser *p, char out[IMDB_MAX_IDENT + 1])
     return ident(p, out);
 }
 
+/* F3f: a word naming an INTERVAL field (the SQL standard's qualifiers, refused this slice) */
+static bool iv_field_word(const parser *p, uint32_t i)
+{
+    static const char *const w[] = {"year", "month", "day", "hour", "minute", "second"};
+    for (size_t k = 0; k < sizeof w / sizeof *w; k++)
+        if (tok_is_kw(p, i, w[k])) return true;
+    return false;
+}
+
 static int literal(parser *p, sql_lit *l)
 {
     memset(l, 0, sizeof *l);
@@ -352,6 +362,18 @@ static int literal(parser *p, sql_lit *l)
         l->off = p->t[p->i + 1].off;
         l->len = p->t[p->i + 1].len;
         p->i += 2;
+        return IMDB_OK;
+    }
+    /* F3f: INTERVAL '...', PostgreSQL's verbose form; a field after it (INTERVAL '1' DAY, the SQL standard's) is refused
+     * by name: read as an alias it would change the value */
+    if (tok_is_kw(p, p->i, "interval") && p->t[p->i + 1].kind == TK_STR) {
+        l->kind = LIT_INTERVAL;
+        l->off = p->t[p->i + 1].off;
+        l->len = p->t[p->i + 1].len;
+        p->i += 2;
+        if (iv_field_word(p, p->i))
+            return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "INTERVAL '...' with a field after it (the SQL standard's form) is "
+                                                         "not in imagedb yet: write the unit in the string, INTERVAL '1 day'");
         return IMDB_OK;
     }
     /* F3b: DATE '...' and TIME '...' (a column named date or time is an identifier: no string follows it) */
@@ -1162,6 +1184,12 @@ static int col_type(parser *p, imdb_column *c)
     else if (kw(p, "date")) c->type = IMDB_T_DATE; /* F3b */
     else if (kw(p, "uuid")) c->type = IMDB_T_UUID; /* F3d */
     else if (kw(p, "bytea")) c->type = IMDB_T_BYTEA;
+    else if (kw(p, "interval")) { /* F3f: its fields and precision (INTERVAL YEAR TO MONTH, INTERVAL(p)): not yet */
+        c->type = IMDB_T_INTERVAL;
+        if (iv_field_word(p, p->i) || p->t[p->i].kind == TK_LP)
+            return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "INTERVAL's fields and precision (INTERVAL YEAR TO MONTH, "
+                                                         "INTERVAL(p)) are not in imagedb yet");
+    }
     else if (tok_is_kw(p, p->i, "time")) { /* F3b: TIME [WITHOUT TIME ZONE]; WITH TIME ZONE is refused (no zone in a time of day) */
         p->i++;
         c->type = IMDB_T_TIME;
