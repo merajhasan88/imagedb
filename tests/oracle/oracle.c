@@ -34,6 +34,8 @@
 
 #include "../../src/codec.h"
 #include "../../src/db.h"
+#include "../../src/role.h"  /* L: --scram reads a role's verifier from the catalog */
+#include "../../src/scram.h"
 #include "../../src/sql.h"
 
 /* ---- a growable string ------------------------------------------------------------------------------------- */
@@ -5082,6 +5084,8 @@ static int dec38_battery(unsigned seed)
 static bool g_iv;
 static unsigned long g_iv_compared, g_iv_unit_compared, g_iv_text_compared, g_iv_text_refused;
 static bool g_en;                  /* F3g: --enum (en_battery) */
+static bool g_scram;               /* L: --scram (scram_battery) */
+static int scram_battery(unsigned seed);
 static int en_battery(unsigned seed);
 
 typedef struct ivv {
@@ -5570,7 +5574,8 @@ static int run_seed(unsigned seed, int steps)
     if (g_bytes && bytes_battery(seed)) return -1; /* F3d: after the steps: its draws change none of theirs */
     if (g_dec38 && dec38_battery(seed)) return -1; /* F3e: after it, likewise */
     if (g_iv && iv_battery(seed)) return -1;      /* F3f: likewise */
-    return g_en ? en_battery(seed) : 0;            /* F3g: likewise */
+    if (g_en && en_battery(seed)) return -1;     /* F3g: likewise */
+    return g_scram ? scram_battery(seed) : 0;      /* L: likewise (PostgreSQL alone) */
 }
 
 
@@ -5733,6 +5738,154 @@ static int en_battery(unsigned seed)
     return 0;
 }
 
+
+/* ---- L, --scram: SCRAM-SHA-256 verifiers against PostgreSQL's, a battery per seed ----------------------------------
+ * Two passwords drawn per seed (printable ASCII, 1 to 40 characters). PostgreSQL makes a verifier of the first (CREATE ROLE
+ * ora_scram ... PASSWORD, password_encryption scram-sha-256): imagedb parses its text (pg_authid.rolpassword), takes it
+ * by CREATE ROLE ... PASSWORD (its catalog then holds those bytes, written back as the same text), and recomputes it from
+ * the password with PostgreSQL's salt and iterations: the same StoredKey and ServerKey. imagedb makes a verifier of the
+ * second (its own salt): PostgreSQL takes its text as it is, and a login as ora_scram on the socket (SCRAM there: run.sh
+ * puts pg_hba's line first) with that password succeeds having used it (PQconnectionUsedPassword) and with a third
+ * fails. The battery talks to PostgreSQL alone; the others have no SCRAM verifier to compare */
+static unsigned long g_scram_checks, g_scram_logins;
+
+static void draw_pw(char *out, int n)
+{
+    for (int i = 0; i < n; i++) out[i] = (char)rr(0x20, 0x7e);
+    out[n] = 0;
+}
+
+static void sql_quote(sb *s, const char *v) /* a string literal, its quotes doubled */
+{
+    sb_str(s, "'");
+    for (const char *p = v; *p; p++) {
+        if (*p == '\'') sb_str(s, "''");
+        else sb_printf(s, "%c", *p);
+    }
+    sb_str(s, "'");
+}
+
+static int scram_fail(unsigned seed, const char *what, const char *detail)
+{
+    g_mismatches++;
+    fprintf(stderr, "MISMATCH seed %u (--scram): %s%s%s\n", seed, what, detail ? ": " : "", detail ? detail : "");
+    return -1;
+}
+
+/* PostgreSQL's verifier of ora_scram, its text */
+static int pg_verifier(unsigned seed, char *out, size_t cap)
+{
+    PGresult *r = PQexec(g_eng[D_PG].pg, "SELECT rolpassword FROM pg_authid WHERE rolname = 'ora_scram'");
+    int rc = PQresultStatus(r) == PGRES_TUPLES_OK && PQntuples(r) == 1 && !PQgetisnull(r, 0, 0) ? 0 : -1;
+    if (!rc) snprintf(out, cap, "%s", PQgetvalue(r, 0, 0));
+    PQclear(r);
+    return rc ? scram_fail(seed, "pg_authid holds no verifier of ora_scram", PQerrorMessage(g_eng[D_PG].pg)) : 0;
+}
+
+static int pg_run(unsigned seed, const char *sql)
+{
+    PGresult *r = PQexec(g_eng[D_PG].pg, sql);
+    int ok = PQresultStatus(r) == PGRES_COMMAND_OK || PQresultStatus(r) == PGRES_TUPLES_OK;
+    PQclear(r);
+    return ok ? 0 : scram_fail(seed, "PostgreSQL refused a statement", PQerrorMessage(g_eng[D_PG].pg));
+}
+
+/* a login as ora_scram with pw on ORACLE_PG's socket: 1 connected having used the password, 0 refused, -1 otherwise */
+static int pg_login(const char *pw)
+{
+    const char *ci = getenv("ORACLE_PG");
+    char *err = NULL;
+    PQconninfoOption *o = ci ? PQconninfoParse(ci, &err) : NULL;
+    if (!o) {
+        PQfreemem(err);
+        return -1;
+    }
+    const char *kw[40], *vv[40];
+    int n = 0;
+    for (PQconninfoOption *x = o; x->keyword && n < 37; x++)
+        if (x->val && strcmp(x->keyword, "user") && strcmp(x->keyword, "password")) kw[n] = x->keyword, vv[n++] = x->val;
+    kw[n] = "user", vv[n++] = "ora_scram";
+    kw[n] = "password", vv[n++] = pw;
+    kw[n] = NULL, vv[n] = NULL;
+    PGconn *c = PQconnectdbParams(kw, vv, 0);
+    int rc = !c ? -1 : PQstatus(c) == CONNECTION_OK ? (PQconnectionUsedPassword(c) ? 1 : -1) : 0;
+    PQfinish(c);
+    PQconninfoFree(o);
+    return rc;
+}
+
+/* imagedb's verifier of role name, from its catalog */
+static int imdb_verifier(unsigned seed, const char *name, imdb_scram *v)
+{
+    imdb_role *r = imdb_role_by_name(g_eng[D_IMDB].idb, name);
+    imdb_err e = {0};
+    if (!r || !r->has_ver || !r->vent.bytes || imdb_scram_decode(r->vent.bytes, r->vent.len, v, &e))
+        return scram_fail(seed, "imagedb's catalog holds no verifier of the role", name);
+    return 0;
+}
+
+static int scram_battery(unsigned seed)
+{
+    if (!g_eng[D_PG].on || !g_eng[D_IMDB].on) return 0;
+    char pw1[41], pw2[41], pw3[42], tpg[512], tim[IMDB_SCRAM_TEXT_MAX + 1], t2[IMDB_SCRAM_TEXT_MAX + 1];
+    draw_pw(pw1, (int)rr(1, 40));
+    draw_pw(pw2, (int)rr(1, 40));
+    snprintf(pw3, sizeof pw3, "%s%c", pw2, (char)rr(0x21, 0x7e)); /* another password: pw2 and one more character */
+    sb q = {0};
+    sb_str(&q, "CREATE ROLE ora_scram LOGIN PASSWORD ");
+    sql_quote(&q, pw1);
+    int rc = pg_run(seed, "SET password_encryption = 'scram-sha-256'") || pg_run(seed, "DROP ROLE IF EXISTS ora_scram") ||
+             pg_run(seed, q.p) || pg_verifier(seed, tpg, sizeof tpg) ? -1 : 0;
+    free(q.p);
+    if (rc) return -1;
+    /* imagedb reads PostgreSQL's text, writes it back the same, and derives the same keys from the password */
+    imdb_scram v, w, c;
+    imdb_err e = {0};
+    if (imdb_scram_parse(tpg, strlen(tpg), &v, &e)) return scram_fail(seed, "imagedb refuses PostgreSQL's verifier", e.msg);
+    if (!imdb_scram_format(&v, t2, sizeof t2) || strcmp(t2, tpg)) return scram_fail(seed, "PostgreSQL's verifier written back another way", t2);
+    if (imdb_scram_make(pw1, strlen(pw1), v.iter, v.salt, v.salt_len, &w, &e) || memcmp(w.stored, v.stored, 32) ||
+        memcmp(w.server, v.server, 32))
+        return scram_fail(seed, "imagedb derives other keys than PostgreSQL's from the same password, salt and iterations", e.msg);
+    g_scram_checks += 3;
+    res out;
+    memset(&out, 0, sizeof out);
+    sb q2 = {0};
+    sb_printf(&q2, "CREATE ROLE sr PASSWORD '%s'", tpg); /* a verifier's text: base64, '$' and ':' alone */
+    exec_eng(&g_eng[D_IMDB], q2.p, false, NULL, 0, &out);
+    free(q2.p);
+    bool bad = out.err;
+    res_clear(&out);
+    if (bad) return scram_fail(seed, "imagedb's CREATE ROLE refuses PostgreSQL's verifier", NULL);
+    if (imdb_verifier(seed, "sr", &c)) return -1;
+    if (memcmp(&c, &v, sizeof c)) return scram_fail(seed, "imagedb's catalog holds another verifier than PostgreSQL's text", tpg);
+    /* imagedb makes one; PostgreSQL takes it as it is, and a SCRAM login with the password succeeds */
+    sb q3 = {0};
+    sb_str(&q3, "CREATE ROLE sm PASSWORD ");
+    sql_quote(&q3, pw2);
+    memset(&out, 0, sizeof out);
+    exec_eng(&g_eng[D_IMDB], q3.p, false, NULL, 0, &out);
+    free(q3.p);
+    bad = out.err;
+    res_clear(&out);
+    if (bad) return scram_fail(seed, "imagedb refuses a printable ASCII password", NULL);
+    if (imdb_verifier(seed, "sm", &c)) return -1;
+    if (!imdb_scram_format(&c, tim, sizeof tim)) return scram_fail(seed, "imagedb's verifier has no text", NULL);
+    sb q4 = {0};
+    sb_printf(&q4, "ALTER ROLE ora_scram PASSWORD '%s'", tim);
+    rc = pg_run(seed, q4.p) || pg_verifier(seed, tpg, sizeof tpg) ? -1 : 0;
+    free(q4.p);
+    if (rc) return -1;
+    if (strcmp(tpg, tim)) return scram_fail(seed, "PostgreSQL holds imagedb's verifier another way", tpg);
+    int l1 = pg_login(pw2), l2 = pg_login(pw3);
+    if (l1 != 1)
+        return scram_fail(seed, l1 == 0 ? "a SCRAM login with imagedb's verifier and its password is refused"
+                                        : "the login did not use the password (no pg_hba line making ora_scram's SCRAM: run.sh's)", NULL);
+    if (l2 != 0) return scram_fail(seed, "a login with another password is not refused", NULL);
+    g_scram_checks += 3;
+    g_scram_logins += 2;
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     setlocale(LC_ALL, "C.UTF-8"); /* the ODBC driver's client code page: UTF-8 */
@@ -5760,6 +5913,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--dec38")) g_dec38 = true; /* F3e */
         else if (!strcmp(argv[i], "--interval")) g_iv = true; /* F3f */
         else if (!strcmp(argv[i], "--enum")) g_en = true; /* F3g */
+        else if (!strcmp(argv[i], "--scram")) g_scram = true; /* L */
         else if (!strcmp(argv[i], "--tz")) g_tz = true; /* P2: time zones */
         else if (!strcmp(argv[i], "--date")) g_dt = 1; /* F3b */
         else if (!strcmp(argv[i], "--time")) g_dt = 2;
@@ -5869,6 +6023,10 @@ int main(int argc, char **argv)
         printf("oracle: %lu comparisons of F3g's ENUM battery against all five engines (a table x3 a seed, seven queries), %lu "
                "of its order against PostgreSQL, MySQL and MariaDB, %lu of its ranges, MIN and MAX against PostgreSQL alone\n",
                g_en_all, g_en_ord, g_en_pg);
+    if (g_scram)
+        printf("oracle: %lu checks of L's SCRAM-SHA-256 verifiers against PostgreSQL's (its text read, written back and its keys "
+               "derived again by imagedb; imagedb's taken by PostgreSQL as it is), %lu SCRAM logins (one with the password, "
+               "one with another refused)\n", g_scram_checks, g_scram_logins);
     if (g_bytes && g_ms_pad >= 0) printf("oracle: SQL Server's 0x01 = 0x0100 is %s (the battery's BYTEAs hold no 0x00 byte either way)\n",
                                      g_ms_pad == 1 ? "true: it pads the shorter VARBINARY with zeros" : g_ms_pad == 0 ? "false: no padding" : "unread");
     printf("oracle: %ld comparisons of P2 S4b's correlated subqueries\n", g_corr_compared);

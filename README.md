@@ -385,7 +385,10 @@ build/imagedb promote /data/p2 --root-key /offline/root.key --old-writer-stopped
   commit made at or before it: the apply stops before the next commit, as at a stream's end (the copy's state
   checked), and the copy is the database as it was there (its head is that commit's hash). A point the backups do
   not hold (before the full backup's snapshot, past the last commit, before the first commit's time) is refused
-  before anything is written.
+  before anything is written. A point where the copy would hold a payload that an ERASE after it redacted (an
+  incremental made after the erasure, holding a row, or a role's name or verifier, made between the full backup and
+  that ERASE) is refused when the apply reaches it, leaving no destination: such a copy could never be served. End
+  at or past the erasure, or restore from backups made before it (their debt: --reerase, --accept-erased).
 - **The copy** is a replica seeded at the snapshot's commit S, holding the database as it was at the backup's last
   commit (the same view token). Its history starts at S: VERIFY and the auditor start there, and `AS OF` an earlier
   commit is refused on it ("commit N is in no log segment"), where the source, which holds its whole log, answers.
@@ -434,6 +437,11 @@ replica applies the same ERASE. It reports cleanup as pending until the log
 rewrite, the lake publication and the GC have all finished. It cannot reach
 backups, exported results, disconnected replicas, freed device blocks or what
 a client holds.
+
+`ERASE ROLE r` does the same for a role's names and verifiers (Roles and grants, under Supported scope): the live role
+r's earlier ones, and every dropped role whose last name was r whole, which then leaves the catalog (its id is never
+given again). A name no role holds is an error (a renamed role goes by its current name); one with nothing left
+commits nothing. A backup made before it owes it, as any ERASE (the catalogue's erasure debt).
 
 ## Monitoring
 
@@ -519,6 +527,7 @@ Command-line options (`imagedb` with no arguments prints the commands):
 | `--identity FILE` | init-replica | a replica from a primary's identity file | |
 | `--after N` | ship | the commits after N | 0 |
 | `--batch N` | dump | each table's `COPY ... FROM STDIN (BATCH N)`: rows a restore commits at once | 10000 |
+| `--role-passwords` | dump | each role's SCRAM-SHA-256 verifier in its `CREATE ROLE` (an offline-guessing target: keep such a dump as a secret); without it the roles come without passwords | off |
 | `--after PREV` | backup | an incremental backup after backup PREV | a full one |
 | `--follow` | ship | keeps shipping new commits | stops at the end |
 | `--acks` | ship | reads the replica's acknowledgements on stdin | off |
@@ -689,6 +698,20 @@ ALWAYS identity refuses a value given unless `OVERRIDING SYSTEM VALUE`, and is
 never updated. Values a rolled-back transaction took are gaps; a committed value
 never comes again, through a crash or a restart. Not yet: CYCLE, CACHE past 1,
 ALTER SEQUENCE, OWNED BY, an IDENTITY added by ALTER TABLE.
+
+Roles and grants (the catalog: no session carries a role yet, so nothing is refused by them): `CREATE ROLE
+r [WITH] [LOGIN | NOLOGIN] [SUPERUSER | NOSUPERUSER] [[ENCRYPTED] PASSWORD 'pw' | PASSWORD NULL]` (`CREATE USER`
+the same, LOGIN by default), `ALTER ROLE r ...` (the same options; `RENAME TO s`), `DROP ROLE [IF EXISTS] r`
+(refused while it holds a privilege or a membership either way), `GRANT SELECT, INSERT, UPDATE, DELETE | ALL ON [TABLE]
+t, v TO r, s`, `REVOKE ... FROM ...`, `GRANT g TO r` and `REVOKE g FROM r` (memberships, no cycle), `SHOW ROLES`, `SHOW
+GRANTS [FOR r]`. A password is stored as PostgreSQL's SCRAM-SHA-256 verifier (4,096 iterations, a 16-byte salt), never
+as itself; a verifier's text (`SCRAM-SHA-256$...`) is taken as it is; an MD5 one, and a password past printable ASCII,
+are refused. Each name and verifier is a payload under a salted commitment, as a row is, so `ERASE ROLE r` removes
+the earlier names and verifiers of the live role r, and everything a dropped role last named r held, from every file
+(the role's grants and its current name and verifier stay while it is live). A view reads with its reader's rights (no
+owner); DROP TABLE and DROP VIEW end their grants; AS OF reads the grants as they are now. A dump writes the roles,
+their memberships and their grants, the verifiers only with `--role-passwords`. Not yet: WITH GRANT OPTION, column
+privileges, PUBLIC, an owner, CREATEDB, CREATEROLE, VALID UNTIL, IN ROLE, ALTER DEFAULT PRIVILEGES, a login.
 
 CHECK constraints: a column's or a table's `[CONSTRAINT name] CHECK (condition)` in
 CREATE TABLE, `ALTER TABLE t ADD [CONSTRAINT name] CHECK (condition)` (every row

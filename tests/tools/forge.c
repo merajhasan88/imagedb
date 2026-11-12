@@ -179,7 +179,7 @@ static void redact_one(void *ctx, const uint8_t *f, size_t fl)
     if (imdb_frame_decode_body(f + IMDB_FRAME_HDR, fl - IMDB_FRAME_HDR, &c, &e)) die("decode", &e);
     bool any = false;
     for (uint32_t i = 0; i < c.nops; i++)
-        if (imdb_op_has_payload(c.ops[i].code)) {
+        if (imdb_op_is_row(c.ops[i].code)) {
             c.ops[i].pkind = IMDB_PAYLOAD_REDACTED;
             any = true;
         }
@@ -213,7 +213,7 @@ static void redact_ver_one(void *ctx, const uint8_t *f, size_t fl)
     bool any = false;
     for (uint32_t i = 0; i < c.nops; i++) {
         imdb_op *o = &c.ops[i];
-        if (!imdb_op_has_payload(o->code) || o->pkind != IMDB_PAYLOAD_ROW || o->table != x->table) continue;
+        if (!imdb_op_is_row(o->code) || o->pkind != IMDB_PAYLOAD_ROW || o->table != x->table) continue;
         if ((o->code == IMDB_OP_INSERT ? o->vid : o->new_vid) != x->vid) continue;
         o->pkind = IMDB_PAYLOAD_REDACTED;
         any = true;
@@ -837,7 +837,7 @@ static bool has_row_payload(const uint8_t *f, size_t fl)
     imdb_err e = {0};
     if (imdb_frame_decode_body(f + IMDB_FRAME_HDR, fl - IMDB_FRAME_HDR, &c, &e)) die("decode", &e);
     bool any = false;
-    for (uint32_t i = 0; i < c.nops; i++) any |= imdb_op_has_payload(c.ops[i].code) && c.ops[i].pkind == IMDB_PAYLOAD_ROW;
+    for (uint32_t i = 0; i < c.nops; i++) any |= imdb_op_is_row(c.ops[i].code) && c.ops[i].pkind == IMDB_PAYLOAD_ROW;
     imdb_commit_free(&c);
     return any;
 }
@@ -861,7 +861,7 @@ static void lie_payload_one(void *ctx, const uint8_t *f, size_t fl)
     if (imdb_frame_decode_body(f + IMDB_FRAME_HDR, fl - IMDB_FRAME_HDR, &c, &e)) die("decode", &e);
     uint8_t *row = NULL;
     for (uint32_t i = 0; i < c.nops && !row; i++)
-        if (imdb_op_has_payload(c.ops[i].code) && c.ops[i].pkind == IMDB_PAYLOAD_ROW && c.ops[i].row_len) {
+        if (imdb_op_is_row(c.ops[i].code) && c.ops[i].pkind == IMDB_PAYLOAD_ROW && c.ops[i].row_len) {
             row = malloc(c.ops[i].row_len);
             memcpy(row, c.ops[i].row, c.ops[i].row_len);
             row[c.ops[i].row_len - 1] ^= 0x01;
@@ -980,19 +980,21 @@ static void manifest_lie(const char *dir, const char *kind)
         imdb_buf_put(&nb, man, mn);
         uint16_t c = m.t[m.nt - 1].s.ncols; /* the last index's column, little endian, before the three u64, F1's u32 and
                                              * F2a's u16 (manifest 9: version 1's DEFAULTs, none) */
-        nb.p[nb.len - 196] = (uint8_t)c; /* then F2b-1's u16 (manifest 11: version 1's CHECKs, none), F2b-2's u16
-                                          * (manifest 13: its FOREIGN KEYs, none), the views section (12 + a count of 0)
-                                          * and the nine empty ones (16 each) */
-        nb.p[nb.len - 195] = (uint8_t)(c >> 8);
+        nb.p[nb.len - 232] = (uint8_t)c; /* then F2b-1's u16 (manifest 11: version 1's CHECKs, none), F2b-2's u16
+                                          * (manifest 13: its FOREIGN KEYs, none), the views section (12 + a count of 0), the
+                                          * sequences and the types (16 each), the roles (52, L: its object's hash, last id and
+                                          * count), the grants and the five reserved ones (16 each) */
+        nb.p[nb.len - 231] = (uint8_t)(c >> 8);
     } else if (strcmp(kind, "section") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION && mn > 144 + 144) {
         imdb_buf_put(&nb, man, mn); /* the format design's slice 1: the seven reserved sections end it, 16 bytes each */
-        nb.p[nb.len - 100] = 1;     /* the roles section's u32 count: a later format's (F2a-2, F3g: sections 3 and 4 are read now) */
+        nb.p[nb.len - 68] = 1;      /* the replica set's section (7): its u32 count a later format's (sections 3 to 6 are read now: F2a-2,
+                                     * F3g, L; with no role, section 5 is 52 bytes and section 6 16) */
     } else if (strcmp(kind, "nsections") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION && mn > 144 + 144) {
         imdb_buf_put(&nb, man, mn);
         nb.p[12] = 10; /* the header's section count: ten, with eleven there */
     } else if (strcmp(kind, "order") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION && mn > 144 + 144) {
         imdb_buf_put(&nb, man, mn);
-        nb.p[nb.len - 144] = 4; /* the sequences section given the enums' kind: out of order */
+        nb.p[nb.len - 180] = 4; /* the sequences section given the enums' kind: out of order (L: no role, 52 + 16 bytes of 5 and 6) */
     } else if (strcmp(kind, "later") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION && mn > 144 + 144) {
         imdb_buf_put(&nb, man, mn - 16); /* the triggers section, last, as a later format would write it: a count and */
         imdb_buf_put_u32(&nb, 11);        /* its entry (4 bytes here), so its length is not 4 */
@@ -1059,6 +1061,16 @@ static void manifest_lie(const char *dir, const char *kind)
             if (memcmp(nb.p + i, pat, sizeof pat) == 0) at = i + sizeof pat - 1;
         if (!at) exit(1);
         nb.p[at] = '1';
+    } else if (strcmp(kind, "grant-bits") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION) {
+        /* L (LJ): staff's SELECT on t in section 6 (u8 1, u32 2, u8 1, u32 0, u32 1) made SELECT and INSERT: its one
+         * encoding, another than the log's */
+        imdb_buf_put(&nb, man, mn);
+        static const uint8_t pat[] = {1, 2, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0};
+        size_t at = 0;
+        for (size_t i = mn - sizeof pat; i > 0 && !at; i--)
+            if (memcmp(nb.p + i, pat, sizeof pat) == 0) at = i + 10;
+        if (!at) exit(1);
+        nb.p[at] = 3;
     } else if (strcmp(kind, "enum-label") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION) {
         /* F3g (KF): a label of the enums section (u8 2, "kc") made "kd": a label the log never made */
         imdb_buf_put(&nb, man, mn);
@@ -1094,7 +1106,7 @@ static void manifest_lie(const char *dir, const char *kind)
               " another in the history) | create-default (a CREATE's DEFAULT 77 of column 2 another) | seq-state (fu_seq's last on)"
               " | check-text (z_a_check's 'a > 0' another) | gen-text (w's 'a * 2' another) | fk-def (c_pid_fkey's CASCADE another)"
               " | dec-precision (a DECIMAL(30,2) w made DECIMAL(39,2))"
-              " | enum-label (an ENUM label kc made kd)\n", stderr);
+              " | enum-label (an ENUM label kc made kd) | grant-bits (staff's SELECT on t made SELECT and INSERT)\n", stderr);
         exit(1);
     }
     if (nb.err) exit(1);
@@ -1444,6 +1456,100 @@ static void index_lie(const char *dir, const char *kind)
         ops[0] = (imdb_op){.code = IMDB_OP_CREATE_TABLE, .table = s.id, .schema = &s};
         ops[1] = (imdb_op){.code = IMDB_OP_SET_RETENTION, .table = s.id, .retention_us = IMDB_RETAIN_DEFAULT_US};
         append_commit(dir, db, ops, 2, &sg, NULL);
+        imdb_close(db);
+        return;
+    } else if (strcmp(kind, "erase-role-live") == 0 || strcmp(kind, "erase-role-commit") == 0 || strcmp(kind, "erase-role-part") == 0) {
+        /* L stage 2 (LM, LN): a signed ERASE of role entries alone, on a directory of l_db's, its manifest planned as the
+         * writer plans one (the entry doomed): -live names alice's current name (a live role's: never erased), -commit
+         * names the dropped gone's current name under another commitment, -part the dropped gone2's name alone (it holds a
+         * verifier too: a part of its entries) */
+        bool live = kind[11] == 'l';
+        bool part = kind[11] == 'p';
+        imdb_role *r = imdb_rcat_by_id(&db->rc, live ? 1 : part ? 4 : 3);
+        if (!r) {
+            fputs("imdb-forge: index-lie erase-role-*: a directory of l_db's (alice 1, gone 3, gone2 4)\n", stderr);
+            exit(1);
+        }
+        imdb_rerase x = {.role = r->id, .seq = r->nent.at, .what = IMDB_RPAY_NAME};
+        memcpy(x.commit, r->nent.commit, 32);
+        imdb_role_doom(&db->rc, &x, 1);
+        imdb_rewrite *rw = NULL;
+        uint32_t nrw = 0;
+        uint8_t man[32];
+        imdb_err e = {0};
+        if (imdb_lake_plan_erase(db, NULL, 0, &rw, &nrw, man, &e)) die("plan", &e);
+        imdb_role_undoom(&db->rc);
+        if (!live && !part) x.commit[0] ^= 1;
+        op.code = IMDB_OP_ERASE;
+        op.iname = NULL;
+        memcpy(op.manifest, man, 32);
+        op.rerase = &x;
+        op.n_rerase = 1;
+        append_commit(dir, db, &op, 1, &sg, NULL);
+        op.rerase = NULL;
+        imdb_free(rw);
+        imdb_close(db);
+        return;
+    } else if (strncmp(kind, "role-", 5) == 0 || strncmp(kind, "grant-", 6) == 0 || strcmp(kind, "drop-role-granted") == 0 ||
+               strcmp(kind, "member-cycle") == 0) {
+        /* L (LA-LL): a signed role op past one of its rules, on a directory of l_db's (audit_reject.sh): roles alice (1, LOGIN,
+         * a password, a member of staff), staff (2, SELECT on t), gone (3, dropped); tables t (0) and old (1, dropped) */
+        static imdb_roleop ro;
+        static imdb_grant_rec g;
+        memset(&ro, 0, sizeof ro);
+        memset(&g, 0, sizeof g);
+        uint32_t next = db->rc.last + 1;
+        const char *name = NULL, *as = NULL;
+        op.iname = NULL;
+        op.ro = &ro;
+        if (strcmp(kind, "role-reserved") == 0) name = "public";                      /* LA */
+        else if (strcmp(kind, "role-taken") == 0) name = "alice";                     /* LB */
+        else if (strcmp(kind, "role-commitment") == 0) name = "zed", as = "zee";      /* LI: the payload not its commitment's */
+        else if (strcmp(kind, "role-redacted") == 0) name = "zed";                    /* LK */
+        if (name) {
+            op.code = IMDB_OP_CREATE_ROLE;
+            ro.rid = next;
+            ro.rfields = IMDB_RF_ATTRS | IMDB_RF_NAME;
+            ro.rname.pkind = strcmp(kind, "role-redacted") ? IMDB_PAYLOAD_ROW : IMDB_PAYLOAD_REDACTED;
+            memset(ro.rname.salt, 7, 16);
+            ro.rname.bytes = (const uint8_t *)name;
+            ro.rname.len = (uint32_t)strlen(name);
+            imdb_role_commit(next, IMDB_RPAY_NAME, ro.rname.salt, (const uint8_t *)(as ? as : name), (uint32_t)strlen(as ? as : name),
+                             ro.rname.commit);
+        } else if (strcmp(kind, "role-rename-taken") == 0) { /* LC: staff renamed alice */
+            op.code = IMDB_OP_ALTER_ROLE;
+            ro.rid = 2;
+            ro.rfields = IMDB_RF_NAME;
+            ro.rname.pkind = IMDB_PAYLOAD_ROW;
+            memset(ro.rname.salt, 7, 16);
+            ro.rname.bytes = (const uint8_t *)"alice";
+            ro.rname.len = 5;
+            imdb_role_commit(2, IMDB_RPAY_NAME, ro.rname.salt, ro.rname.bytes, 5, ro.rname.commit);
+        } else if (strcmp(kind, "role-noop") == 0) { /* LL: alice's attributes set to what they are */
+            op.code = IMDB_OP_ALTER_ROLE;
+            ro.rid = 1;
+            ro.rfields = IMDB_RF_ATTRS;
+            ro.rattrs = IMDB_RA_LOGIN;
+        } else if (strcmp(kind, "drop-role-granted") == 0) { /* LF: staff holds SELECT on t */
+            op.code = IMDB_OP_DROP_ROLE;
+            ro.rid = 2;
+        } else {
+            op.code = IMDB_OP_GRANT;
+            ro.grants = &g;
+            ro.ngrants = 1;
+            g = (imdb_grant_rec){.kind = IMDB_GRANT_PRIV, .okind = IMDB_OBJ_TABLE, .a = 2, .b = 0, .privs = IMDB_PRIV_SELECT}; /* LH */
+            if (strcmp(kind, "grant-dropped-role") == 0) g.a = 3;                                   /* LD */
+            else if (strcmp(kind, "grant-dropped-table") == 0) g.a = 1, g.b = 1;                    /* LE */
+            else if (strcmp(kind, "member-cycle") == 0)                                              /* LG */
+                g = (imdb_grant_rec){.kind = IMDB_GRANT_MEMBER, .a = 2, .b = 1}; /* staff into alice, who is in staff */
+            else if (strcmp(kind, "grant-held") != 0) {
+                fputs("imdb-forge: index-lie role-reserved | role-taken | role-rename-taken | role-commitment | role-redacted |"
+                      " role-noop | drop-role-granted | grant-dropped-role | grant-dropped-table | grant-held | member-cycle\n", stderr);
+                exit(1);
+            }
+        }
+        append_commit(dir, db, &op, 1, &sg, NULL);
+        op.ro = NULL;
         imdb_close(db);
         return;
     } else if (strcmp(kind, "enum-drop-used") == 0 || strcmp(kind, "enum-add-dup") == 0) {
@@ -1887,7 +1993,9 @@ static void index_lie(const char *dir, const char *kind)
               "check-add (ADD CHECK forged: a > 100, to table 0) | check-row (a -1 in the last table's column a) | "
               "gen-row | gen-update (column w one past its expression in the last table) | "
               "fk-orphan (a child of no parent in the last table) | fk-delete (table 0's first live row) | "
-              "fk-erase-other | fk-erase-named (that DELETE beside an ERASE of an ended version, or of the row itself) | dec-range (a\n"
+              "fk-erase-other | fk-erase-named (that DELETE beside an ERASE of an ended version, or of the row itself) | erase-role-live |\n"
+              "erase-role-commit | erase-role-part (L stage 2: an ERASE of alice's current name, of gone's under another\n"
+              "commitment, of gone2's name alone) | dec-range (a\n"
               "DECIMAL(30,2) of 10^28 in the last table) | uuid-short (a\n"
               "UUID of 15 bytes in the last table) | create-default-uuid (gen_random_uuid on a TIMESTAMPTZ) | iv-short (an\n"
               "INTERVAL of 15 bytes in the last table) | create-interval-key (a CREATE whose key is an INTERVAL) |\n"

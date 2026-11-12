@@ -65,4 +65,9 @@ until "$O" --engines pg,mysql,mariadb,mssql --ping >/dev/null 2>&1; do
     sleep 0.5
 done
 echo "run.sh: four servers up after ~$((i / 2)) s; MemAvailable $(awk '/MemAvailable/ { print int($2 / 1024) }' /proc/meminfo) MB"
+# L: --scram's role logs in by SCRAM-SHA-256 on the socket (a first line matching it alone; trust stays for the rest),
+# pg_hba.conf rewritten in place so its owner stays the server's
+{ printf 'local all ora_scram scram-sha-256\n'; cat "$D/pg/data/pg_hba.conf"; } > "$D/pg/hba.new"
+cat "$D/pg/hba.new" > "$D/pg/data/pg_hba.conf"
+docker exec "$C-pg" psql -U postgres -qAtc "SELECT pg_reload_conf()" >/dev/null
 "$O" --engines imagedb,sqlite,pg,mysql,mariadb,mssql --dir "$D/run" "$@"

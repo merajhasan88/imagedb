@@ -1035,6 +1035,7 @@ void imdb_manifest_free(imdb_manifest *m)
     imdb_free(m->sq); /* F2a-2 */
     for (uint32_t i = 0; i < m->nen; i++) imdb_enumdef_free(m->en[i].def); /* F3g */
     imdb_free(m->en);
+    imdb_rcat_free(&m->rc); /* L */
     for (uint32_t i = 0; i < m->nt; i++) {
         imdb_free(m->t[i].seg);
         imdb_hist_free(&m->t[i].hist); /* F1: what no consumer took */
@@ -1123,6 +1124,14 @@ static void man_close(imdb_buf *b, size_t at)
     if (!b->err && at + 8 <= b->len) imdb_le64(b->p + at, (uint64_t)(b->len - at - 8));
 }
 
+/* L: a manifest's table or view live at its commit, for its grants section (tables at their ids, views by id) */
+static bool man_obj_live(const void *arg, uint8_t okind, uint32_t oid)
+{
+    const imdb_manifest *m = arg;
+    if (okind == IMDB_OBJ_TABLE) return oid < m->nt && !m->t[oid].dropped_at;
+    return okind == IMDB_OBJ_VIEW && oid < m->nv && m->v[oid].id == oid && !m->v[oid].dropped_at;
+}
+
 static int old_manifest(uint32_t ver, imdb_err *e)
 {
     if (ver < 5)
@@ -1131,6 +1140,9 @@ static int old_manifest(uint32_t ver, imdb_err *e)
     if (ver == 5)
         return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 5: this lake was written by an imagedb before views' "
                          "format (manifest 6, P2 S7), which this version does not read");
+    if (ver == 17) /* L: no role */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 17: this lake was written by an imagedb before roles "
+                         "(manifest 18, 2026-11-12), which this version does not read");
     if (ver == 16) /* F3g: no ENUM type */
         return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 16: this lake was written by an imagedb before ENUM "
                          "types (manifest 17, 2026-11-12), which this version does not read");
@@ -1472,7 +1484,19 @@ int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err
     if (r.err || r.off != send || !manifest_enums_named(m)) goto bad;
     for (uint32_t i = 0; i < m->nt; i++) /* F3g: each ENUM DEFAULT of a history a label at its version's commit */
         if (!imdb_hist_enum_ok(&m->t[i].hist, m->t[i].created_at, man_enum_count, m)) goto bad;
-    for (uint32_t k = IMDB_MAN_ENUMS + 1; k <= IMDB_MAN_TRIGGERS; k++) { /* reserved: empty until their slices */
+    if (man_section(&r, IMDB_MAN_ROLES, &send)) goto bad; /* L (manifest 18): the roles held, by id */
+    int rrc = imdb_rcat_get_roles(&r, m->seq, &m->rc, m->rhash, e);
+    if (rrc) {
+        imdb_manifest_free(m);
+        return rrc;
+    }
+    if (r.off != send || man_section(&r, IMDB_MAN_GRANTS, &send)) goto bad; /* L: the live grants, the log's order */
+    if ((rrc = imdb_rcat_get_grants(&r, man_obj_live, m, &m->rc, e))) {
+        imdb_manifest_free(m);
+        return rrc;
+    }
+    if (r.off != send) goto bad;
+    for (uint32_t k = IMDB_MAN_GRANTS + 1; k <= IMDB_MAN_TRIGGERS; k++) { /* reserved: empty until their slices */
         if (man_section(&r, k, &send)) goto bad;
         size_t sl = send - r.off; /* a u32 count of 0; any other count is a later format's, whatever its length */
         if (sl >= 4 && imdb_rd_u32(&r) != 0) {
@@ -1507,7 +1531,7 @@ bool imdb_object_name_valid(const char *name)
     for (int i = 0; i < 64; i++)
         if (!((name[i] >= '0' && name[i] <= '9') || (name[i] >= 'a' && name[i] <= 'f'))) return false;
     const char *x = name + 64;
-    return strcmp(x, ".seg") == 0 || strcmp(x, ".dv") == 0 || strcmp(x, ".man") == 0;
+    return strcmp(x, ".seg") == 0 || strcmp(x, ".dv") == 0 || strcmp(x, ".man") == 0 || strcmp(x, ".rol") == 0; /* L */
 }
 
 static void obj_name(const uint8_t h[32], const char *ext, char out[80])
@@ -1674,6 +1698,9 @@ typedef struct imdb_lake_plan {
     uint64_t boundary; /* the manifest's: a RETIRE's new one, else the database's */
     imdb_rewrite *rw;
     uint32_t nrw;
+    imdb_buf robj;      /* L: the roles object section 5 names (empty: none, rhash zero) */
+    uint8_t rhash[32];
+    size_t r56o, r56e;  /* L stage 2: sections 5 and 6 in manifest (the checked builds compare the install's catalog) */
 } imdb_lake_plan;
 
 static void plan_free(imdb_lake_plan *p)
@@ -1690,6 +1717,8 @@ static void plan_free(imdb_lake_plan *p)
     }
     imdb_free(p->tab);
     imdb_buf_free(&p->manifest);
+    if (p->robj.p) imdb_wipe(p->robj.p, p->robj.len); /* L: names and verifiers */
+    imdb_buf_free(&p->robj);
     imdb_free(p->rw);
     imdb_free(p);
 }
@@ -1729,6 +1758,7 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
     p->seq = seq;
     p->boundary = kind == IMDB_OP_RETIRE ? purge_before : db->boundary;
     imdb_buf_init(&p->manifest);
+    imdb_buf_init(&p->robj); /* L */
     p->tab = imdb_alloc_array(db->nt ? db->nt : 1, sizeof *p->tab, e);
     if (!p->tab) {
         imdb_free(p);
@@ -2117,7 +2147,16 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
         for (uint16_t k = 0; k < db->enums[i].def->n; k++) imdb_buf_put_u64(mb, db->enums[i].def->at[k]); /* each label's commit */
     }
     man_close(mb, sec);
-    for (uint32_t k = IMDB_MAN_ENUMS + 1; k <= IMDB_MAN_TRIGGERS; k++) { /* reserved: present and empty */
+    if (!rc) rc = imdb_rcat_object(&db->rc, &p->robj, p->rhash, e); /* L: the current names and verifiers, by hash */
+    p->r56o = mb->len;
+    sec = man_open(mb, IMDB_MAN_ROLES); /* L (manifest 18): the roles held at the snapshot, by id */
+    imdb_rcat_put_roles(mb, &db->rc, p->rhash);
+    man_close(mb, sec);
+    sec = man_open(mb, IMDB_MAN_GRANTS); /* L: the live grants, in the log's order */
+    imdb_rcat_put_grants(mb, &db->rc);
+    man_close(mb, sec);
+    p->r56e = mb->len;
+    for (uint32_t k = IMDB_MAN_GRANTS + 1; k <= IMDB_MAN_TRIGGERS; k++) { /* reserved: present and empty */
         sec = man_open(mb, k);
         imdb_buf_put_u32(mb, 0);
         man_close(mb, sec);
@@ -2288,6 +2327,12 @@ static int plan_install(imdb_db *db, imdb_lake_plan *p, imdb_err *e)
     db->lake_mbytes = p->manifest.p;
     db->lake_mlen = p->manifest.len;
     imdb_buf_init(&p->manifest);
+    if (db->lake_robj) imdb_wipe(db->lake_robj, db->lake_robjlen); /* L: the roles object it names */
+    imdb_free(db->lake_robj);
+    db->lake_robj = p->robj.p;
+    db->lake_robjlen = p->robj.len;
+    imdb_buf_init(&p->robj);
+    memcpy(db->lake_rhash, p->rhash, 32);
     memcpy(db->lake_manifest, p->mhash, 32);
     db->lake_seq = p->seq;
     db->lake_dirty = false;
@@ -2337,7 +2382,7 @@ static bool manifest_refs(const imdb_manifest *m, const uint8_t h[32])
     for (uint32_t ti = 0; ti < m->nt; ti++)
         for (uint32_t k = 0; k < m->t[ti].nseg; k++)
             if (memcmp(h, m->t[ti].seg[k].seg, 32) == 0 || memcmp(h, m->t[ti].seg[k].dv, 32) == 0) return true;
-    return false;
+    return !all_zero(m->rhash, 32) && memcmp(h, m->rhash, 32) == 0; /* L: its roles object */
 }
 
 static bool pinned_refs(const pinset *P, const uint8_t h[32])
@@ -2597,6 +2642,8 @@ static int lake_persist(imdb_db *db, const uint8_t *keep, size_t keeplen, imdb_e
             if (!rc) g->ondisk = true; /* its image may leave memory now: both objects can be read again */
         }
     }
+    if (!rc && !all_zero(db->lake_rhash, 32)) /* L: the roles object before the manifest naming it */
+        rc = obj_put(db, ofd, db->lake_rhash, ".rol", db->lake_robj, db->lake_robjlen, e);
     if (!rc) rc = obj_put(db, ofd, db->lake_manifest, ".man", db->lake_mbytes, db->lake_mlen, e);
     if (!rc) rc = imdb_sync_dir(ofd, e);
     if (!rc) rc = imdb_log_sync(db, e); /* LAKE_HEAD must never name a commit the log could still lose */
@@ -2786,8 +2833,9 @@ int imdb_lake_plan_erase(imdb_db *db, const imdb_erase_ent *ents, uint32_t n, im
         }
     }
     erased_set es = {ents, n};
+    /* L stage 2: an ERASE of role entries alone reads no segment (none is rewritten) */
     imdb_lake_plan *p = NULL;
-    if (!rc) rc = plan_build(db, IMDB_OP_ERASE, 0, 0, &es, post, &global, db->seq + 1, db->head, &p, e);
+    if (!rc) rc = plan_build(db, IMDB_OP_ERASE, 0, 0, n ? &es : NULL, post, &global, db->seq + 1, db->head, &p, e);
     imdb_free(post);
     imdb_free(delta);
     imdb_free(touched);
@@ -2812,6 +2860,29 @@ int imdb_lake_after_erase(imdb_db *db, imdb_err *e)
     imdb_lake_plan *p = db->erase_plan;
     if (!p) return IMDB_OK;
     db->erase_plan = NULL;
+#ifdef IMDB_STORE_CHECKS
+    { /* L stage 2: the one encoder: the catalog after the install is what the plan encoded with its entries doomed */
+        imdb_buf a, o;
+        imdb_buf_init(&a);
+        imdb_buf_init(&o);
+        uint8_t h[32];
+        imdb_err ec = {0};
+        if (imdb_rcat_object(&db->rc, &o, h, &ec) == IMDB_OK) {
+            size_t s = man_open(&a, IMDB_MAN_ROLES);
+            imdb_rcat_put_roles(&a, &db->rc, h);
+            man_close(&a, s);
+            s = man_open(&a, IMDB_MAN_GRANTS);
+            imdb_rcat_put_grants(&a, &db->rc);
+            man_close(&a, s);
+            if (imdb_buf_check(&a, &ec) == IMDB_OK &&
+                (memcmp(h, p->rhash, 32) || o.len != p->robj.len || (o.len && memcmp(o.p, p->robj.p, o.len)) ||
+                 a.len != p->r56e - p->r56o || memcmp(a.p, p->manifest.p + p->r56o, a.len)))
+                abort();
+        }
+        imdb_buf_wipe_free(&o);
+        imdb_buf_free(&a);
+    }
+#endif
     uint8_t *prev = db->lake_mbytes;
     size_t prevlen = db->lake_mlen;
     db->lake_mbytes = NULL;
@@ -2831,7 +2902,7 @@ int imdb_lake_apply_physical(imdb_db *db, const imdb_commit_rec *c, const imdb_o
 {
     erased_set es = {op->erase, op->n_erase};
     imdb_lake_plan *p;
-    int rc = plan_build(db, op->code, op->table, op->purge_before, op->code == IMDB_OP_ERASE ? &es : NULL, post,
+    int rc = plan_build(db, op->code, op->table, op->purge_before, op->code == IMDB_OP_ERASE && op->n_erase ? &es : NULL, post,
                         post_global, c->seq, c->prev, &p, e);
     if (rc) return rc;
     if (memcmp(p->mhash, op->manifest, 32) != 0) {
@@ -2935,6 +3006,9 @@ void imdb_lake_db_free(imdb_db *db)
     db->erase_plan = NULL;
     imdb_free(db->lake_mbytes);
     db->lake_mbytes = NULL;
+    if (db->lake_robj) imdb_wipe(db->lake_robj, db->lake_robjlen); /* L */
+    imdb_free(db->lake_robj);
+    db->lake_robj = NULL;
     imdb_free(db->lake_prev);
     db->lake_prev = NULL;
 }
@@ -3603,8 +3677,8 @@ int imdb_lake_load_snapshot(imdb_db *db, uint64_t *seq, bool *moved, imdb_err *e
         imdb_lake_unpin(pin);
         return e->code;
     }
-    uint8_t *mb = NULL, *cbuf = NULL, *pb = NULL;
-    size_t ml = 0, clen = 0, pl = 0;
+    uint8_t *mb = NULL, *cbuf = NULL, *pb = NULL, *rob = NULL; /* L: rob the roles object */
+    size_t ml = 0, clen = 0, pl = 0, robl = 0;
     imdb_manifest m;
     memset(&m, 0, sizeof m);
     imdb_commit_rec c;
@@ -3613,6 +3687,8 @@ int imdb_lake_load_snapshot(imdb_db *db, uint64_t *seq, bool *moved, imdb_err *e
     memset(&ss, 0, sizeof ss);
     int rc = read_obj(ofd, mh, ".man", &mb, &ml, e);
     if (!rc) rc = imdb_manifest_parse(mb, ml, &m, e);
+    if (!rc && !all_zero(m.rhash, 32)) rc = read_obj(ofd, m.rhash, ".rol", &rob, &robl, e); /* L: the current entries' bytes */
+    if (!rc) rc = imdb_rcat_fill(&m.rc, rob, robl, true, e);
     if (!rc && (m.seq != S || memcmp(m.db_id, db->db_id, 16) != 0))
         rc = imdb_fail(e, IMDB_ERR_STATE, "snapshot: manifest names another commit or database");
     /* the manifest is authenticated by the signed commit that recorded it */
@@ -3657,6 +3733,10 @@ int imdb_lake_load_snapshot(imdb_db *db, uint64_t *seq, bool *moved, imdb_err *e
             for (uint32_t i = 0; i < m.nen; i++) m.en[i].def = NULL; /* the catalog's now */
         }
     }
+    if (!rc) { /* L: the roles and grants at the snapshot (the log's tail replays the rest) */
+        db->rc = m.rc;
+        memset(&m.rc, 0, sizeof m.rc);
+    }
     if (!rc && m.nsq) { /* F2a-2: the sequences, their state at the snapshot (the log's tail replays the rest) */
         if (!(db->seqs = imdb_alloc_array(m.nsq, sizeof *db->seqs, e))) rc = e->code;
         else {
@@ -3700,6 +3780,10 @@ int imdb_lake_load_snapshot(imdb_db *db, uint64_t *seq, bool *moved, imdb_err *e
         memcpy(db->lake_manifest, mh, 32);
         db->lake_mbytes = mb;
         db->lake_mlen = ml;
+        db->lake_robj = rob; /* L */
+        db->lake_robjlen = robl;
+        rob = NULL;
+        memcpy(db->lake_rhash, m.rhash, 32);
         mb = NULL;
         db->lake_prev = pb;
         db->lake_prevlen = pl;
@@ -3720,6 +3804,8 @@ int imdb_lake_load_snapshot(imdb_db *db, uint64_t *seq, bool *moved, imdb_err *e
     if (cbuf) imdb_wipe(cbuf, clen);
     imdb_free(cbuf);
     imdb_free(mb);
+    if (rob) imdb_wipe(rob, robl);
+    imdb_free(rob);
     imdb_free(pb);
     close(ofd);
     imdb_lake_unpin(pin); /* the segments are in memory now: the files are no longer read */

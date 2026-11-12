@@ -2501,6 +2501,10 @@ void imdb_sql_stmt_free(sql_stmt *st)
     st->ptypes = NULL;
     imdb_free(st->ctname); /* F3g */
     st->ctname = NULL;
+    imdb_free(st->gobj); /* L */
+    imdb_free(st->gto);
+    st->gobj = st->gto = NULL;
+    st->ngobj = st->ngto = 0;
     imdb_free(st->fks); /* F2b-2 */
     st->fks = NULL;
     st->nfks = 0;
@@ -2627,6 +2631,177 @@ static int parse_alter_type(parser *p, sql_stmt *st)
     return IMDB_OK;
 }
 
+/* ---- L: roles and grants (docs/roles-design.md) ---------------------------------------------------------------- */
+
+/* role options: [WITH] LOGIN | NOLOGIN | SUPERUSER | NOSUPERUSER | [ENCRYPTED] PASSWORD 'text' | PASSWORD NULL, each
+ * once (a repeat or a conflict refused, as PostgreSQL's "conflicting or redundant options"); the others refused by name.
+ * The password's literal is kept by its offset alone: the executor reads it, makes the verifier and wipes its copy */
+static int role_options(parser *p, sql_stmt *st)
+{
+    static const char *const later[] = {"createdb", "nocreatedb", "createrole", "nocreaterole", "inherit", "noinherit",
+                                        "replication", "noreplication", "bypassrls", "nobypassrls", "connection", "valid",
+                                        "in", "role", "admin", "user", "sysid"};
+    kw(p, "with");
+    uint16_t n = 0;
+    while (p->i < p->n && p->t[p->i].kind != TK_SEMI && p->t[p->i].kind != TK_EOF) {
+        uint32_t bit = 0, val = 0;
+        if (kw(p, "login")) bit = val = IMDB_RA_LOGIN;
+        else if (kw(p, "nologin")) bit = IMDB_RA_LOGIN;
+        else if (kw(p, "superuser")) bit = val = IMDB_RA_SUPERUSER;
+        else if (kw(p, "nosuperuser")) bit = IMDB_RA_SUPERUSER;
+        else if (tok_is_kw(p, p->i, "unencrypted"))
+            return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "UNENCRYPTED PASSWORD: a password is kept as its SCRAM-SHA-256 verifier alone");
+        else if (tok_is_kw(p, p->i, "encrypted") || tok_is_kw(p, p->i, "password")) {
+            kw(p, "encrypted");
+            if (expect_kw(p, "password")) return p->e->code;
+            if (st->rpw) return imdb_fail(p->e, IMDB_ERR_INVALID, "conflicting or redundant options: PASSWORD twice");
+            if (kw(p, "null")) st->rpw = 1;
+            else if (p->t[p->i].kind != TK_STR) return fail_at(p, "a password (a string) or NULL");
+            else {
+                st->rpw = 2;
+                st->rpw_lit = (sql_lit){.kind = LIT_STR, .off = p->t[p->i].off, .len = p->t[p->i].len};
+                p->i++;
+            }
+            n++;
+            continue;
+        } else {
+            for (size_t k = 0; k < sizeof later / sizeof *later; k++)
+                if (tok_is_kw(p, p->i, later[k]))
+                    return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED,
+                                     "role option %s is not in imagedb yet (LOGIN, SUPERUSER and PASSWORD are)", later[k]);
+            return fail_at(p, "a role option (LOGIN, NOLOGIN, SUPERUSER, NOSUPERUSER, PASSWORD)");
+        }
+        if (st->rattr_set & bit) return imdb_fail(p->e, IMDB_ERR_INVALID, "conflicting or redundant options");
+        st->rattr_set |= bit;
+        st->rattr_val |= val;
+        n++;
+    }
+    st->ropts = n;
+    return IMDB_OK;
+}
+
+/* CREATE ROLE name [options] | CREATE USER name [options] (ROLE or USER eaten): USER's LOGIN unless NOLOGIN */
+static int parse_create_role(parser *p, sql_stmt *st, bool user)
+{
+    st->kind = ST_CREATE_ROLE;
+    st->ruser = user;
+    if (ident(p, st->table)) return p->e->code;
+    return role_options(p, st);
+}
+
+/* ALTER ROLE name [options] | ALTER ROLE name RENAME TO new (ROLE or USER eaten) */
+static int parse_alter_role(parser *p, sql_stmt *st)
+{
+    st->kind = ST_ALTER_ROLE;
+    if (tok_is_kw(p, p->i, "all") || tok_is_kw(p, p->i, "current_user") || tok_is_kw(p, p->i, "session_user") ||
+        tok_is_kw(p, p->i, "current_role"))
+        return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "ALTER ROLE names one role in imagedb (ALL and CURRENT_USER are not in it)");
+    if (ident(p, st->table)) return p->e->code;
+    if (kw(p, "rename")) {
+        st->rrename = true;
+        if (expect_kw(p, "to")) return p->e->code;
+        return ident(p, st->rnew);
+    }
+    if (tok_is_kw(p, p->i, "set") || tok_is_kw(p, p->i, "reset"))
+        return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "ALTER ROLE ... SET and RESET (a role's settings) are not in imagedb yet");
+    if (role_options(p, st)) return p->e->code;
+    return st->ropts ? IMDB_OK : fail_at(p, "a role option or RENAME TO");
+}
+
+/* a GRANT's or REVOKE's word: any identifier, folded (SELECT and the other privileges are reserved words) */
+static int grant_word(parser *p, char out[IMDB_MAX_IDENT + 1], const char *what)
+{
+    const sql_tok *t = &p->t[p->i];
+    if (t->kind != TK_IDENT || !imdb_ident_fold(p->s + t->off, t->len, out)) return fail_at(p, what);
+    p->i++;
+    return IMDB_OK;
+}
+
+/* a list of roles (TO or FROM), allocated: 1 to IMDB_MAX_GRANT_NAMES; PUBLIC and the CURRENT_USER forms refused by
+ * name */
+static int grant_roles(parser *p, char (**out)[IMDB_MAX_IDENT + 1], uint16_t *n)
+{
+    if (!(*out = imdb_alloc_array(IMDB_MAX_GRANT_NAMES, sizeof **out, p->e))) return p->e->code;
+    do {
+        if (*n >= IMDB_MAX_GRANT_NAMES)
+            return imdb_fail(p->e, IMDB_ERR_LIMIT, "a GRANT or REVOKE names at most %u roles in a list", IMDB_MAX_GRANT_NAMES);
+        if (tok_is_kw(p, p->i, "public"))
+            return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "PUBLIC is not in imagedb yet: name the roles");
+        if (tok_is_kw(p, p->i, "current_user") || tok_is_kw(p, p->i, "session_user") || tok_is_kw(p, p->i, "current_role"))
+            return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "CURRENT_USER, SESSION_USER and CURRENT_ROLE are not in imagedb yet: name the role");
+        if (ident(p, (*out)[(*n)++])) return p->e->code;
+    } while (tok(p, TK_COMMA));
+    return IMDB_OK;
+}
+
+/* GRANT privileges ON [TABLE] objects TO roles | GRANT roles TO roles; REVOKE ... FROM (GRANT or REVOKE eaten). A list
+ * of words first, read as privileges when ON follows and as roles when TO or FROM does (PostgreSQL's grammar): the
+ * words in gobj, then the objects in their place */
+static int parse_grant(parser *p, sql_stmt *st, bool revoke)
+{
+    static const char *const later[] = {"truncate", "references", "trigger", "usage", "execute", "create", "connect",
+                                        "temporary", "temp", "maintain"};
+    st->kind = revoke ? ST_REVOKE : ST_GRANT;
+    if (revoke && (tok_is_kw(p, p->i, "grant") || tok_is_kw(p, p->i, "admin")) && tok_is_kw(p, p->i + 1, "option"))
+        return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "GRANT OPTION FOR and ADMIN OPTION FOR are not in imagedb yet");
+    if (!(st->gobj = imdb_alloc_array(IMDB_MAX_GRANT_NAMES, sizeof *st->gobj, p->e))) return p->e->code;
+    if (kw(p, "all")) {
+        kw(p, "privileges");
+        st->gall = true;
+        st->gprivs = IMDB_PRIV_ALL;
+    } else
+        do {
+            if (st->ngobj >= IMDB_MAX_GRANT_NAMES)
+                return imdb_fail(p->e, IMDB_ERR_LIMIT, "a GRANT or REVOKE names at most %u roles in a list", IMDB_MAX_GRANT_NAMES);
+            if (grant_word(p, st->gobj[st->ngobj++], "a privilege or a role")) return p->e->code;
+            if (p->t[p->i].kind == TK_LP) return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "column privileges are not in imagedb yet");
+        } while (tok(p, TK_COMMA));
+    if (kw(p, "on")) {
+        static const char *const objs[] = {"sequence", "function", "procedure", "routine", "schema", "database", "domain",
+                                           "type", "language", "large", "foreign", "tablespace", "parameter"};
+        for (size_t j = 0; j < sizeof objs / sizeof *objs; j++)
+            if (tok_is_kw(p, p->i, objs[j]))
+                return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "privileges ON %s are not in imagedb yet (a table's or a view's are)",
+                                 objs[j]);
+        if (tok_is_kw(p, p->i, "all") && tok_is_kw(p, p->i + 1, "tables"))
+            return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "ON ALL TABLES IN SCHEMA is not in imagedb: name the tables");
+        for (uint16_t k = 0; k < st->ngobj; k++) {
+            const char *w = st->gobj[k];
+            uint32_t b = !strcmp(w, "select") ? IMDB_PRIV_SELECT : !strcmp(w, "insert") ? IMDB_PRIV_INSERT
+                         : !strcmp(w, "update") ? IMDB_PRIV_UPDATE : !strcmp(w, "delete") ? IMDB_PRIV_DELETE : 0;
+            for (size_t j = 0; !b && j < sizeof later / sizeof *later; j++)
+                if (!strcmp(w, later[j]))
+                    return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "privilege %s is not in imagedb yet (SELECT, INSERT, UPDATE "
+                                                                 "and DELETE are)", later[j]);
+            if (!b) return imdb_fail(p->e, IMDB_ERR_SYNTAX, "a privilege is SELECT, INSERT, UPDATE, DELETE or ALL");
+            st->gprivs |= b;
+        }
+        kw(p, "table");
+        st->ngobj = 0; /* the objects in the words' place */
+        do {
+            if (st->ngobj >= IMDB_MAX_GRANT_NAMES)
+                return imdb_fail(p->e, IMDB_ERR_LIMIT, "a GRANT or REVOKE names at most %u tables or views", IMDB_MAX_GRANT_NAMES);
+            if (ident(p, st->gobj[st->ngobj++])) return p->e->code;
+        } while (tok(p, TK_COMMA));
+    } else if (st->gall) {
+        return fail_at(p, "ON");
+    } else {
+        for (uint16_t k = 0; k < st->ngobj; k++) /* roles granted: never a reserved word, a role's own name rule */
+            if (!strcmp(st->gobj[k], "select") || !strcmp(st->gobj[k], "insert") || !strcmp(st->gobj[k], "update") ||
+                !strcmp(st->gobj[k], "delete"))
+                return fail_at(p, "ON");
+    }
+    if (expect_kw(p, revoke ? "from" : "to") || grant_roles(p, &st->gto, &st->ngto)) return p->e->code;
+    if (!revoke && tok_is_kw(p, p->i, "with"))
+        return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "WITH GRANT OPTION and WITH ADMIN OPTION are not in imagedb yet");
+    if (tok_is_kw(p, p->i, "granted"))
+        return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "GRANTED BY is not in imagedb yet");
+    if (revoke && kw(p, "cascade"))
+        return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "REVOKE ... CASCADE: no grant option exists to cascade from");
+    if (revoke) kw(p, "restrict");
+    return IMDB_OK;
+}
+
 int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
 {
     memset(st, 0, sizeof *st);
@@ -2646,6 +2821,8 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
             rc = imdb_fail(e, IMDB_ERR_UNSUPPORTED, "CREATE OR REPLACE: drop the view and create it again");
         else if (kw(&p, "view")) rc = parse_create_view(&p, st);
         else if (kw(&p, "type")) rc = parse_create_type(&p, st); /* F3g */
+        else if (kw(&p, "role")) rc = parse_create_role(&p, st, false); /* L */
+        else if (kw(&p, "user")) rc = parse_create_role(&p, st, true);
         else if (kw(&p, "sequence")) { /* F2a-2 */
             st->kind = ST_CREATE_SEQUENCE;
             memset(&st->seqopt, 0, sizeof st->seqopt);
@@ -2658,6 +2835,15 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
         }
     }
     else if (kw(&p, "drop")) {
+        if (kw(&p, "role") || kw(&p, "user")) { /* L: one role a statement (each commits on its own) */
+            st->kind = ST_DROP_ROLE;
+            if (tok_is_kw(&p, p.i, "if") && tok_is_kw(&p, p.i + 1, "exists")) {
+                p.i += 2;
+                st->if_exists = true;
+            }
+            if (!(rc = ident(&p, st->table)) && tok(&p, TK_COMMA))
+                rc = imdb_fail(e, IMDB_ERR_UNSUPPORTED, "DROP ROLE takes one role in imagedb");
+        } else
         if (kw(&p, "type")) { /* F3g: RESTRICT, the default and only one */
             st->kind = ST_DROP_TYPE;
             if (tok_is_kw(&p, p.i, "if") && tok_is_kw(&p, p.i + 1, "exists")) {
@@ -2692,8 +2878,11 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
     }
     else if (kw(&p, "alter")) { /* ALTER TABLE t SET RETENTION ... | ADD ... | RENAME ... (F1) */
         if (kw(&p, "type")) rc = parse_alter_type(&p, st); /* F3g */
+        else if (kw(&p, "role") || kw(&p, "user")) rc = parse_alter_role(&p, st); /* L */
         else if (!(rc = expect_kw(&p, "table")) && !(rc = ident(&p, st->table))) rc = parse_alter(&p, st);
     }
+    else if (kw(&p, "grant")) rc = parse_grant(&p, st, false); /* L */
+    else if (kw(&p, "revoke")) rc = parse_grant(&p, st, true);
     else if (kw(&p, "insert")) rc = parse_insert(&p, st);
     else if (kw(&p, "prepare")) rc = parse_prepare(&p, st); /* P2 S9 */
     else if (kw(&p, "copy")) rc = parse_copy(&p, st); /* P2 S10 */
@@ -2771,8 +2960,11 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
         } else if (kw(&p, "from")) {
             st->kind = ST_ERASE_WHERE;
             if (!(rc = ident(&p, st->table)) && !(rc = expect_kw(&p, "where"))) rc = preds(&p, st);
+        } else if (kw(&p, "role")) { /* L stage 2: a role's earlier names and verifiers, a dropped one's all */
+            st->kind = ST_ERASE_ROLE;
+            rc = ident(&p, st->table);
         } else {
-            rc = fail_at(&p, "SUBJECT or FROM after ERASE");
+            rc = fail_at(&p, "SUBJECT, FROM or ROLE after ERASE");
         }
     } else if (kw(&p, "verify")) st->kind = ST_VERIFY;
     else if (kw(&p, "show")) {
@@ -2784,6 +2976,11 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
         }
         else if (kw(&p, "prepared")) st->kind = ST_SHOW_PREPARED; /* P2 S9 */
         else if (kw(&p, "views")) st->kind = ST_SHOW_VIEWS; /* P2 S7 */
+        else if (kw(&p, "roles")) st->kind = ST_SHOW_ROLES; /* L */
+        else if (kw(&p, "grants")) {
+            st->kind = ST_SHOW_GRANTS;
+            if (kw(&p, "for")) rc = ident(&p, st->table);
+        }
         else if (kw(&p, "indexes")) st->kind = ST_SHOW_INDEXES;
         else if (kw(&p, "retention")) st->kind = ST_SHOW_RETENTION;
         else if (kw(&p, "lake")) st->kind = ST_SHOW_LAKE;
@@ -2884,6 +3081,11 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
 /* P1 M2: a statement's shape for the event log: its tokens joined by one space, every number, string and boolean literal a ?,
  * comments never copied (the lexer skips them: they may hold anything), cut on a token boundary with " ..." to fit cap
  * (NUL included). No row value is ever in it. A text the lexer refuses is "(not lexed)". */
+static bool shape_kw(const char *s, const sql_tok *t, const char *k)
+{
+    return t->kind == TK_IDENT && t->len == strlen(k) && !strncasecmp(s + t->off, k, t->len);
+}
+
 size_t imdb_sql_shape(const char *s, size_t n, char *out, size_t cap)
 {
     if (cap < 5) { /* not even " ..." fits */
@@ -2898,8 +3100,19 @@ size_t imdb_sql_shape(const char *s, size_t n, char *out, size_t cap)
         snprintf(out, cap, "(not lexed)");
         return strlen(out);
     }
+    /* L: a role statement's shape is its leading keywords alone: a role's name is no literal, and the event log is a
+     * file no ERASE ROLE reaches (docs/roles-design.md §11) */
+    uint32_t keep = nt;
+    bool two = nt >= 2 && (shape_kw(s, &t[1], "role") || shape_kw(s, &t[1], "user"));
+    if (nt >= 2 && two && (shape_kw(s, &t[0], "create") || shape_kw(s, &t[0], "alter") || shape_kw(s, &t[0], "drop") ||
+                           (shape_kw(s, &t[0], "erase") && shape_kw(s, &t[1], "role"))))
+        keep = 2;
+    else if (nt >= 2 && shape_kw(s, &t[0], "show") && shape_kw(s, &t[1], "grants")) /* SHOW GRANTS FOR name */
+        keep = 2;
+    else if (nt >= 1 && (shape_kw(s, &t[0], "grant") || shape_kw(s, &t[0], "revoke")))
+        keep = 1;
     size_t len = 0;
-    for (uint32_t i = 0; i < nt && t[i].kind != TK_EOF; i++) {
+    for (uint32_t i = 0; i < keep && t[i].kind != TK_EOF; i++) {
         bool lit = t[i].kind == TK_INT || t[i].kind == TK_DEC || t[i].kind == TK_STR || t[i].kind == TK_FLOAT;
         if (t[i].kind == TK_IDENT && ((t[i].len == 4 && !strncasecmp(s + t[i].off, "true", 4)) ||
                                       (t[i].len == 5 && !strncasecmp(s + t[i].off, "false", 5))))
@@ -2914,6 +3127,10 @@ size_t imdb_sql_shape(const char *s, size_t n, char *out, size_t cap)
         if (len) out[len++] = ' ';
         memcpy(out + len, p, k);
         len += k;
+    }
+    if (keep < nt && t[keep].kind != TK_EOF && len + 4 < cap) { /* L: what a role statement's shape leaves out */
+        memcpy(out + len, " ...", 4);
+        len += 4;
     }
     out[len] = 0;
     imdb_free(t);

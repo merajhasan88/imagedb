@@ -20,8 +20,8 @@
 #include "sha256.h"
 #include "writer.h"
 
-enum { OBJ_SEG = 1, OBJ_DV = 2, OBJ_MAN = 3 };
-static const char *const kExt[] = {"", ".seg", ".dv", ".man"};
+enum { OBJ_SEG = 1, OBJ_DV = 2, OBJ_MAN = 3, OBJ_ROL = 4 }; /* L: the roles object */
+static const char *const kExt[] = {"", ".seg", ".dv", ".man", ".rol"};
 #define CHUNK (64u << 10)
 
 typedef struct sobj {
@@ -48,7 +48,7 @@ static void obj_file(uint8_t kind, const uint8_t h[32], char name[80])
 static int manifest_objects(const imdb_manifest *m, sobj **out, size_t *n, imdb_err *e)
 {
     static const uint8_t zero[32];
-    size_t cap = 1;
+    size_t cap = 2; /* its retained generation's manifest, its roles object (L) */
     for (uint32_t t = 0; t < m->nt; t++) cap += 2 * (size_t)m->t[t].nseg;
     sobj *v = imdb_alloc_array(cap, sizeof *v, e);
     if (!v) return e->code;
@@ -56,6 +56,10 @@ static int manifest_objects(const imdb_manifest *m, sobj **out, size_t *n, imdb_
     if (memcmp(m->prev_manifest, zero, 32) != 0) {
         v[k].kind = OBJ_MAN;
         memcpy(v[k++].h, m->prev_manifest, 32);
+    }
+    if (memcmp(m->rhash, zero, 32) != 0) { /* L: the current names and verifiers */
+        v[k].kind = OBJ_ROL;
+        memcpy(v[k++].h, m->rhash, 32);
     }
     for (uint32_t t = 0; t < m->nt; t++)
         for (uint32_t i = 0; i < m->t[t].nseg; i++) {
@@ -371,7 +375,7 @@ static int object_rec(imdb_stream *s, uint8_t *kind, uint8_t h[32], uint64_t *n,
     *kind = rec[0];
     memcpy(h, rec + 1, 32);
     *n = imdb_get_le64(rec + 33);
-    if (*kind < OBJ_SEG || *kind > OBJ_MAN || *n > IMDB_MAX_OBJECT)
+    if (*kind < OBJ_SEG || *kind > OBJ_ROL || *n > IMDB_MAX_OBJECT)
         return imdb_fail(e, IMDB_ERR_CORRUPT, "seed: a malformed object record");
     return IMDB_OK;
 }

@@ -150,6 +150,15 @@ enum {
     IMDB_OP_DROP_ENUM = 31,       /* F3g: u32 type (live; no column, in any retained table's history, and no live view
                                      naming it): its tombstone keeps its labels; alone */
     IMDB_OP_ENUM_ADD = 32,        /* F3g: u32 type (live), a label (u8 length, bytes) it does not hold, appended; alone */
+    IMDB_OP_CREATE_ROLE = 33,     /* L (N2's records): a role, one body with ALTER_ROLE: u32 id | u32 fields (IMDB_RF_*) |
+                                     attributes u32 (field 1) | the name's commitment[32] (field 2) | the verifier (field
+                                     4: u8 0 none, or 1 and its commitment[32]); CREATE has fields 1 and 2. The name and
+                                     the verifier are payload entries (imdb_rpay), erasable; alone (docs/roles-design.md) */
+    IMDB_OP_ALTER_ROLE = 34,      /* L: the same body, a live role, at least one field; alone */
+    IMDB_OP_DROP_ROLE = 35,       /* L: u32 id (live; no grant or membership names it); alone */
+    IMDB_OP_GRANT = 36,           /* L: u32 n | n records (imdb_grant_rec), strictly increasing, each exactly what it
+                                     adds; alone */
+    IMDB_OP_REVOKE = 37,          /* L: the same, each exactly what it removes; alone */
 };
 
 /* op 22's kinds (F1) */
@@ -333,11 +342,51 @@ enum { IMDB_WRITER_ROTATE = 1, IMDB_WRITER_PROMOTE = 2 };
 
 enum { IMDB_PAYLOAD_ROW = 0, IMDB_PAYLOAD_REDACTED = 1 };
 
+/* L: a role op's fields and a role's attributes (the rest of each u32 reserved: refused) */
+enum { IMDB_RF_ATTRS = 1, IMDB_RF_NAME = 2, IMDB_RF_VERIFIER = 4, IMDB_RF_KNOWN = 7 };
+enum { IMDB_RA_LOGIN = 1, IMDB_RA_SUPERUSER = 2, IMDB_RA_KNOWN = 3 };
+/* L: privileges (the rest reserved: refused); object kinds (3 sequence and 4 type reserved); record kinds */
+enum { IMDB_PRIV_SELECT = 1, IMDB_PRIV_INSERT = 2, IMDB_PRIV_UPDATE = 4, IMDB_PRIV_DELETE = 8, IMDB_PRIV_ALL = 15 };
+enum { IMDB_OBJ_TABLE = 1, IMDB_OBJ_VIEW = 2 };
+enum { IMDB_GRANT_PRIV = 1, IMDB_GRANT_MEMBER = 2 };
+enum { IMDB_RPAY_NAME = 1, IMDB_RPAY_VERIFIER = 2 }; /* an entry's what, in its commitment */
+
+/* L: a role op's payload entry (a name or a verifier), as a row's: its kind, salt and bytes in the payload, its
+ * commitment in the header (imdb_role_commit). bytes point into the record, or into the writer's carrier (imdb_role) */
+typedef struct imdb_rpay {
+    uint8_t pkind; /* IMDB_PAYLOAD_ROW: its bytes are here; IMDB_PAYLOAD_REDACTED: erased */
+    uint8_t salt[16];
+    const uint8_t *bytes;
+    uint32_t len;
+    uint8_t commit[32];
+} imdb_rpay;
+
+/* L: a GRANT's or REVOKE's record. A privilege: grantee a, object (okind, b), privs; a membership: member a, group
+ * b, privs its options. gopt, ncols and grantor are 0 in this format's first slice (WITH GRANT OPTION, column
+ * privileges, grantors later); grantee 0 is PUBLIC, reserved */
+typedef struct imdb_grant_rec {
+    uint8_t kind, okind;
+    uint32_t a, b, privs, gopt, grantor;
+    uint16_t ncols;
+} imdb_grant_rec;
+#define IMDB_GRANT_REC_PRIV 24 /* encoded: u8 kind, u32 a, u8 okind, u32 b, privs, gopt, u16 ncols, u32 grantor */
+#define IMDB_GRANT_REC_MEMBER 17 /* u8 kind, u32 member, group, options, grantor */
+
 typedef struct imdb_erase_ent {
     uint32_t table;
     uint64_t vid;
     uint8_t commit[32];
 } imdb_erase_ent;
+
+/* L stage 2: ERASE ROLE's entry, op 12's third list: a role's name or verifier set at commit seq, by its commitment */
+typedef struct imdb_rerase {
+    uint32_t role;
+    uint64_t seq;
+    uint8_t what; /* IMDB_RPAY_* */
+    uint8_t commit[32];
+} imdb_rerase;
+#define IMDB_RERASE_BYTES 45 /* encoded: u32 role | u64 seq | u8 what | commitment */
+int imdb_rerase_cmp(const imdb_rerase *a, const imdb_rerase *b); /* by (role, seq, what) */
 
 typedef struct imdb_rewrite {
     uint32_t table;
@@ -346,6 +395,18 @@ typedef struct imdb_rewrite {
 } imdb_rewrite;
 
 #define IMDB_INDEX_UNIQUE 1u /* op 14's one flag (and manifest version 3's); the others are zero */
+
+struct imdb_role; /* L: role.h, the carrier of a role op's change */
+
+/* L: ops 33 to 37's fields, behind a pointer (most ops are rows: tx_push zeroes each op whole) */
+typedef struct imdb_roleop {
+    uint32_t rid, rfields, rattrs; /* CREATE_ROLE, ALTER_ROLE: the role, its fields, its attributes; DROP_ROLE: rid */
+    imdb_rpay rname, rver;         /* the name's and the verifier's payload entries */
+    bool rvnone;                   /* ALTER's PASSWORD NULL: a verifier field with no entry */
+    imdb_grant_rec *grants;        /* GRANT and REVOKE: the records (allocated) */
+    uint32_t ngrants;
+    struct imdb_role *rnew;        /* the change, from the writer or the apply: the install takes it */
+} imdb_roleop;
 
 typedef struct imdb_op {
     uint8_t code;
@@ -371,6 +432,8 @@ typedef struct imdb_op {
     uint32_t n_erase;
     imdb_rewrite *rewrites;
     uint32_t n_rewrites;
+    imdb_rerase *rerase;       /* L stage 2: the role entries it erases (allocated), by (role, seq, what) */
+    uint32_t n_rerase;
     /* CREATE_INDEX / DROP_INDEX (table above) */
     uint8_t iflags, incols;
     uint16_t icols[IMDB_MAX_INDEX_COLS];
@@ -405,6 +468,7 @@ typedef struct imdb_op {
     uint32_t eid;
     int64_t sval;
     uint8_t scalled;
+    imdb_roleop *ro;           /* L: ops 33 to 37 (allocated) */
     /* WRITER_KEY */
     uint32_t epoch;
     uint8_t new_pk[IMDB_PUBKEY_LEN];
@@ -430,7 +494,27 @@ typedef struct imdb_commit_rec {
 void imdb_commit_free(imdb_commit_rec *c);
 void imdb_genesis_hash(const uint8_t db_id[16], uint8_t out[32]);
 
-static inline bool imdb_op_has_payload(uint8_t code) { return code == IMDB_OP_INSERT || code == IMDB_OP_UPDATE; }
+/* a row's payload entry (INSERT, UPDATE) */
+static inline bool imdb_op_is_row(uint8_t code) { return code == IMDB_OP_INSERT || code == IMDB_OP_UPDATE; }
+/* L: an op's payload entries, in op order: a row's one, a role op's name and verifier (each one it sets) */
+static inline unsigned imdb_op_npayload(const imdb_op *o)
+{
+    if (imdb_op_is_row(o->code)) return 1;
+    if ((o->code != IMDB_OP_CREATE_ROLE && o->code != IMDB_OP_ALTER_ROLE) || !o->ro) return 0;
+    return ((o->ro->rfields & IMDB_RF_NAME) ? 1u : 0u) + ((o->ro->rfields & IMDB_RF_VERIFIER) && !o->ro->rvnone ? 1u : 0u);
+}
+/* L: a role entry's commitment: SHA-256("IMDBROL1" || u32 role || u8 what || salt16 || u32 len || bytes) */
+void imdb_role_commit(uint32_t role, uint8_t what, const uint8_t salt[16], const uint8_t *bytes, uint32_t len,
+                      uint8_t out[32]);
+/* L: a role name's bytes: an identifier as the parser folds it (lower case), never a reserved role's */
+bool imdb_role_name_ok(const uint8_t *p, size_t len);
+bool imdb_role_name_reserved(const char *name);
+/* L: GRANT's and REVOKE's records (a manifest's section 6 too): their order, 1 to IMDB_MAX_GRANT_RECORDS of them by
+ * their rules and strictly increasing (one encoding of a change), one record's bytes */
+int imdb_grant_cmp(const imdb_grant_rec *x, const imdb_grant_rec *y);
+bool imdb_grants_ok(const imdb_grant_rec *g, uint32_t n);
+void imdb_grant_put(imdb_buf *b, const imdb_grant_rec *g);
+void imdb_grant_get(imdb_rd *r, imdb_grant_rec *g);
 static inline bool imdb_op_publishes_manifest(uint8_t code)
 {
     return code == IMDB_OP_CHECKPOINT || code == IMDB_OP_COMPACT || code == IMDB_OP_ERASE || code == IMDB_OP_RETIRE;

@@ -174,6 +174,16 @@ static int apply_end(imdb_table *t, uint64_t vid, const uint8_t commit[32], uint
     return IMDB_OK;
 }
 
+/* L stage 2: an ERASE's role entry this copy held: its payload is still in the log at its commit (as a row's at its
+ * begin), for the redaction; a pending one's frame came redacted */
+static int replay_role_note(void *arg, const imdb_rerase *x, bool pending, imdb_err *e)
+{
+    imdb_db *db = arg;
+    if (pending) return IMDB_OK;
+    db->needs_redaction = true;
+    return imdb_redact_note(db, x->seq, e);
+}
+
 static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_pre *pre, imdb_err *e)
 {
     if (c->seq != db->seq + 1)
@@ -368,6 +378,17 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
             }
             break;
         }
+        case IMDB_OP_CREATE_ROLE: /* L: the catalog's rules (role.c imdb_role_apply) */
+        case IMDB_OP_ALTER_ROLE:
+        case IMDB_OP_DROP_ROLE:
+        case IMDB_OP_GRANT:
+        case IMDB_OP_REVOKE:
+        {   /* stage 2: a redacted entry is a pending debt, counted with the rows' (every gate reads pending_auth) */
+            uint64_t before = db->rc.npending;
+            rc = imdb_role_apply(&db->rc, imdb_db_obj_live, db, o, seq, e);
+            db->pending_auth += db->rc.npending - before;
+        }
+            break;
         case IMDB_OP_CREATE_ENUM: /* F3g: the catalog's rules (db.c imdb_enum_apply) */
         case IMDB_OP_DROP_ENUM:
         case IMDB_OP_ENUM_ADD:
@@ -457,6 +478,11 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
                     if ((rc = imdb_redact_note(db, f.begin, e))) break;
                 }
                 if (v) imdb_stub_version(et, en->vid); /* the lake's alone: its segment is rewritten below */
+            }
+            if (!rc && o->n_rerase) { /* L stage 2: the role entries (a pending one settled, a held one noted) */
+                uint64_t before = db->rc.npending;
+                rc = imdb_role_erase_apply(&db->rc, o->rerase, o->n_rerase, seq, replay_role_note, db, e);
+                db->pending_auth -= before - db->rc.npending;
             }
             if (!rc) rc = imdb_lake_apply_physical(db, c, o, post, &global, e);
             break;
@@ -563,7 +589,9 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
             code == IMDB_OP_CREATE_INDEX || code == IMDB_OP_DROP_INDEX || code == IMDB_OP_SET_RETENTION ||
             code == IMDB_OP_EXPIRE || code == IMDB_OP_DROP_TABLE || code == IMDB_OP_CREATE_VIEW || code == IMDB_OP_DROP_VIEW ||
             code == IMDB_OP_ALTER_TABLE || code == IMDB_OP_CREATE_SEQUENCE || code == IMDB_OP_DROP_SEQUENCE ||
-            code == IMDB_OP_SEQ_ADVANCE || code == IMDB_OP_SEQ_SET) /* F2a-2: the manifest keeps sequences too */
+            code == IMDB_OP_SEQ_ADVANCE || code == IMDB_OP_SEQ_SET || code == IMDB_OP_CREATE_ENUM || code == IMDB_OP_DROP_ENUM ||
+            code == IMDB_OP_ENUM_ADD || (code >= IMDB_OP_CREATE_ROLE && code <= IMDB_OP_REVOKE)) /* F2a-2: the manifest keeps
+                                                                                             sequences too; F3g: types; L: roles */
             db->lake_dirty = true; /* the manifest records the definitions, the retentions and the horizons */
         if (code == IMDB_OP_ERASE) db->last_erase = seq; /* a pin from before it never keeps the files (lake.h) */
         db->ended_pass += code == IMDB_OP_DELETE || code == IMDB_OP_UPDATE; /* the memory window's trigger */
@@ -572,7 +600,7 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
     memcpy(db->head, c->hash, 32);
     imdb_index_catch_up(db); /* a replica's structures follow each applied commit (an open: at its end) */
     for (uint32_t i = 0; i < c->nops; i++)
-        if (c->ops[i].code == IMDB_OP_ERASE)
+        if (c->ops[i].code == IMDB_OP_ERASE && c->ops[i].n_erase) /* L stage 2: rows (role entries touch no index) */
             for (uint32_t ti = 0; ti < db->nt; ti++) imdb_index_rebuild_table(db, db->t[ti]); /* stubs out */
     db->last_hlen = c->hlen;
     memcpy(db->last_sig, c->sig, IMDB_SIG_LEN);
@@ -651,7 +679,7 @@ static void rpre_frame(void *ctx, size_t i)
     f->payloads_ok = true;
     for (uint32_t k = 0; k < f->c.nops && f->payloads_ok; k++) {
         const imdb_op *o = &f->c.ops[k];
-        if (!imdb_op_has_payload(o->code) || o->pkind != IMDB_PAYLOAD_ROW) continue;
+        if (!imdb_op_is_row(o->code) || o->pkind != IMDB_PAYLOAD_ROW) continue;
         uint8_t chk[32]; /* the decoder enforces schema id == table, so o->table is the commitment's id */
         imdb_row_commit(o->table, o->salt, o->row, o->row_len, chk);
         f->payloads_ok = memcmp(chk, o->code == IMDB_OP_INSERT ? o->commit : o->new_commit, 32) == 0;
@@ -1076,7 +1104,11 @@ int imdb_replay(imdb_db *db, bool ro, imdb_err *e)
 
 int imdb_redact_note(imdb_db *db, uint64_t seq, imdb_err *e)
 {
-    if (db->nsegs && seq < db->segs[0]) return IMDB_OK; /* in no segment here (cut below FLOOR): gone with it */
+    /* in no segment here (cut below FLOOR): gone with it. No segment at all: a copy seeded past a cut taking its first frame
+     * (installed before it is appended), which holds no earlier commit (L stage 2, the advisor 21:3x: an ERASE as a seeded
+     * replica's first frame failed "is in no log segment", rows' and role entries' alike) */
+    db->redact_known = true; /* even when skipped: none of this copy's segments holds it (redact_log_body) */
+    if (!db->nsegs || seq < db->segs[0]) return IMDB_OK;
     if (db->nredact == db->capredact) {
         size_t nc = db->capredact ? db->capredact * 2 : 64;
         uint64_t *n = imdb_realloc_array(db->redact_seqs, db->capredact, nc, sizeof *n, e);
@@ -1122,7 +1154,18 @@ static int redact_segment(imdb_db *db, size_t si, imdb_err *e)
         bool changed = false;
         for (uint32_t i = 0; i < c.nops; i++) {
             imdb_op *o = &c.ops[i];
-            if (!imdb_op_has_payload(o->code) || o->pkind != IMDB_PAYLOAD_ROW) continue;
+            if ((o->code == IMDB_OP_CREATE_ROLE || o->code == IMDB_OP_ALTER_ROLE) && o->ro) { /* L stage 2: its entries */
+                imdb_rpay *pe[2] = {(o->ro->rfields & IMDB_RF_NAME) ? &o->ro->rname : NULL,
+                                    (o->ro->rfields & IMDB_RF_VERIFIER) && !o->ro->rvnone ? &o->ro->rver : NULL};
+                for (int w = 0; w < 2; w++)
+                    if (pe[w] && pe[w]->pkind == IMDB_PAYLOAD_ROW &&
+                        imdb_rcat_entry_erased(&db->rc, o->ro->rid, c.seq, w ? IMDB_RPAY_VERIFIER : IMDB_RPAY_NAME)) {
+                        pe[w]->pkind = IMDB_PAYLOAD_REDACTED;
+                        changed = true;
+                    }
+                continue;
+            }
+            if (!imdb_op_is_row(o->code) || o->pkind != IMDB_PAYLOAD_ROW) continue;
             imdb_table *t = imdb_table_by_id(db, o->table);
             uint64_t vid = o->code == IMDB_OP_INSERT ? o->vid : o->new_vid;
             vfacts f; /* a stub the store holds, or one only the lake does (stage 3b) */
@@ -1226,11 +1269,12 @@ static int redact_log_body(imdb_db *db, imdb_err *e)
             if (si != prev) rc = redact_segment(db, si, e);
             prev = si;
         }
-    } else {
+    } else if (!db->redact_known) { /* no note at all: a state from before the notes existed, every segment checked */
         for (size_t si = 0; si < db->nsegs && !rc; si++) rc = redact_segment(db, si, e);
     }
     if (rc) return rc;
     db->nredact = 0;
+    db->redact_known = false;
     db->needs_redaction = false;
     return imdb_lake_publish_pending(db, e);
 }
@@ -1802,6 +1846,14 @@ static int apply_from(imdb_db *db, const apply_src *src, uint64_t *applied, imdb
             /* point-in-time: the copy ends at the commit before this one, as at a stream's end (its state checked) */
             imdb_commit_free(&c);
             o->stopped = true;
+            /* L stage 2 (rows' too): a copy ending holding a redacted payload whose ERASE comes later can never be served
+             * (no stream follows a point in time): refused as at a stream's end, not left awaiting it */
+            if (db->pending_auth || db->lake_unverified) {
+                rc = imdb_fail(e, IMDB_ERR_STATE, "the copy would end at commit %llu holding a redacted payload that an ERASE "
+                               "after it authorises: end at or past that ERASE, or restore from a backup made before it",
+                               (unsigned long long)db->seq);
+                break;
+            }
             if (*applied && (rc = imdb_check_state(db, e))) db->failed = true;
             if (!rc && o->applied && since) rc = ack_point(db, o, e);
             break;

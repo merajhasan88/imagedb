@@ -162,7 +162,8 @@ bool mem_contains(const uint8_t *h, size_t hn, const char *needle)
     return false;
 }
 
-/* true if any regular file under dir contains needle */
+/* true if any regular file under dir contains needle: each raw, and a log segment's frames untagged too (a needle
+ * across a tagged segment's sector tag is whole only there: L stage 2, the advisor's 2026-11-12) */
 bool tree_contains(const char *dir, const char *needle)
 {
     DIR *d = opendir(dir);
@@ -181,6 +182,13 @@ bool tree_contains(const char *dir, const char *needle)
             size_t n;
             uint8_t *b = slurp(p, &n);
             if (b) found = mem_contains(b, n, needle);
+            uint64_t first = 0;
+            bool tagged = false;
+            if (!found && b && imdb_logseg_parse(de->d_name, &first) && imdb_tseg_is_tagged(b, n)) {
+                free(b);
+                b = seg_frames(p, &n, &first, &tagged);
+                if (b) found = mem_contains(b, n, needle);
+            }
             free(b);
         }
     }

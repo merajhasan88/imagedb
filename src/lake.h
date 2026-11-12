@@ -73,7 +73,8 @@ enum {
 
 #define IMDB_SEG_HEADER 64u
 #define IMDB_SEG_VERSION 3u /* F1 stage 4: the header names its schema version by imdb_sver_hash (2: by the schema alone) */
-#define IMDB_MANIFEST_VERSION 17u /* F3g: ENUM types (the enums section, ENUM columns); 16 before them (F3f: INTERVAL columns,
+#define IMDB_MANIFEST_VERSION 18u /* L: roles and grants (sections 5 and 6 filled); 17 before them (F3g: ENUM types, the
+                                   enums section, ENUM columns); 16 before those (F3f: INTERVAL columns,
                                    16-byte cells and DEFAULTs); 15 before those (F3e: DECIMAL columns to 38
                                    digits, a wide one's 16-byte cells); 14 before those (F3d: UUID and
                                    BYTEA columns and op 23's kind 10 (gen_random_uuid) in version 1's
@@ -287,6 +288,9 @@ typedef struct imdb_manifest {
     imdb_manifest_view *v; /* P2 S7: every view ever created, by id */
     imdb_sequence *sq;     /* F2a-2 (manifest 10): every sequence ever created, by id, its state at the snapshot */
     imdb_enum *en;         /* F3g (manifest 17): every ENUM type ever created, by id (en[id - 1]), a tombstone its labels */
+    imdb_rcat rc;          /* L (manifest 18): the roles held and their grants at the snapshot (role.h); the snapshot
+                            * open takes it whole (and zeroes it) */
+    uint8_t rhash[32];     /* L: section 5's roles object (zero: none), its bytes the current entries' */
     uint32_t nen;
     uint32_t nsq;
     uint32_t nv;

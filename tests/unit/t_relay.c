@@ -30,8 +30,8 @@ static int ex(imdb_db *db, const char *sql)
     return rc;
 }
 
-/* a primary with variety in its stream: inserts, updates, deletes, a CHECKPOINT (a publish), an ERASE (redactions a
- * replica must see authorised) and commits after it; *n: its last commit */
+/* a primary with variety in its stream: inserts, updates, deletes, role ops (L), a CHECKPOINT (a publish), an ERASE and
+ * an ERASE ROLE (redactions a replica must see authorised) and commits after them; *n: its last commit */
 static int make_primary(const char *p, uint64_t *n)
 {
     if (imdb_init(p, false, NULL, E)) return -1;
@@ -41,10 +41,13 @@ static int make_primary(const char *p, uint64_t *n)
     for (int64_t i = 1; !rc && i <= 12; i++) rc = ins1(db, i, i % 3 == 0 ? 42 : i % 4, i * 10, i % 3 == 0 ? "relay-42" : "relay");
     if (!rc) rc = ex(db, "UPDATE txns SET amount = amount + 1 WHERE id <= 4");
     if (!rc) rc = ex(db, "DELETE FROM txns WHERE id = 5");
+    if (!rc) rc = ex(db, "CREATE ROLE relay_r PASSWORD 'relay-pw'"); /* L: role entries in the stream, cut at every byte */
+    if (!rc) rc = ex(db, "ALTER ROLE relay_r PASSWORD 'relay-pw-2'");
     if (!rc) rc = imdb_checkpoint(db, E);
     imdb_value subj = {.type = IMDB_T_INT64, .i = 42};
     imdb_erase_report rep;
     if (!rc) rc = imdb_erase_subject(db, &subj, &rep, E);
+    if (!rc) rc = ex(db, "ERASE ROLE relay_r"); /* L stage 2: its first verifier redacted, the ERASE authorising it */
     for (int64_t i = 20; !rc && i <= 24; i++) rc = ins1(db, i, 1, i, "after-erase");
     *n = db->seq;
     imdb_close(db);

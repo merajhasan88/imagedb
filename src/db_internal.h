@@ -3,6 +3,7 @@
 #define IMDB_DB_INTERNAL_H
 
 #include "db.h"
+#include "role.h"
 
 enum { UNDO_INSERT = 1, UNDO_END = 2, UNDO_CREATE = 3, UNDO_INDEX = 4, UNDO_UNINDEX = 5, UNDO_SEQ_CREATE = 6, UNDO_SEQ_SET = 7 };
 
@@ -135,6 +136,8 @@ int imdb_meta_write(imdb_db *db, bool replica, imdb_err *e);
 int imdb_meta_read_at(int dirfd, imdb_identity *id, bool *replica, imdb_err *e);
 int imdb_meta_write_at(int dirfd, const imdb_identity *id, bool replica, imdb_err *e);
 int imdb_log_sync_segments(int logdirfd, const uint64_t *segs, size_t nsegs, uint64_t from, imdb_err *e);
+/* L: an op of the transaction's, zeroed (role.c's statements push theirs) */
+imdb_op *imdb_tx_push(imdb_db *db, imdb_err *e);
 int imdb_tx_add_writer(imdb_db *db, uint32_t epoch, const uint8_t new_pk[IMDB_PUBKEY_LEN], uint8_t how, imdb_err *e);
 uint64_t imdb_now_us(void);
 void imdb_stub_version(imdb_table *t, uint64_t vid);

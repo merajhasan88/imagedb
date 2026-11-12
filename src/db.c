@@ -2110,6 +2110,8 @@ static imdb_op *tx_push(imdb_db *db, imdb_err *e)
     return op;
 }
 
+imdb_op *imdb_tx_push(imdb_db *db, imdb_err *e) { return tx_push(db, e); }
+
 /* Row bytes the pending commit may still take. The bound keeps every admitted commit
  * inside one frame: an UPDATE, the largest op, adds 85 header and 21 payload bytes. */
 _Static_assert((uint64_t)IMDB_MAX_TXN_BYTES + (uint64_t)IMDB_MAX_OPS_PER_COMMIT * (85 + 21) + (1u << 20) <=
@@ -2129,6 +2131,9 @@ static void tx_op_free(imdb_op *o)
     imdb_free(o->schema);
     imdb_free(o->erase);
     imdb_free(o->rewrites);
+    imdb_free(o->rerase); /* L stage 2: ERASE ROLE's entries */
+    o->rerase = NULL;
+    o->n_rerase = 0;
     imdb_free(o->iname);
     imdb_free(o->aname); /* F1: op 22's new name */
     imdb_free(o->defs);  /* F2a: COLUMN_DEFAULTS' */
@@ -2141,6 +2146,12 @@ static void tx_op_free(imdb_op *o)
     imdb_free(o->sdef);  /* F2a-2: CREATE_SEQUENCE's */
     o->sdef = NULL;
     imdb_enumdef_free(o->edef); /* F3g: CREATE_ENUM's and ENUM_ADD's */
+    if (o->ro) { /* L: a role op's fields, its carrier (its entries wiped) and records */
+        imdb_role_free(o->ro->rnew);
+        imdb_free(o->ro->grants);
+        imdb_free(o->ro);
+        o->ro = NULL;
+    }
     o->edef = NULL;
     o->defs = NULL;
     imdb_viewdef_free(o->vdef);
@@ -2922,6 +2933,7 @@ void imdb_table_drop_install(imdb_db *db, imdb_table *t, uint64_t seq)
     t->live = 0;
     t->live_stubs = 0;
     t->dropped_at = seq;
+    imdb_grants_end_object(&db->rc, IMDB_OBJ_TABLE, t->s.id); /* L: its grants end with it */
     db->ended_pass += ended; /* the memory window's trigger, as DELETE's ends */
     imdb_check_free(t->chkc); /* F2b-1: a dropped table is written no more */
     t->chkc = NULL;
@@ -3008,8 +3020,8 @@ void imdb_view_install(imdb_db *db, imdb_viewdef *def, uint64_t seq)
 
 void imdb_view_drop_install(imdb_db *db, imdb_view *v, uint64_t seq)
 {
-    (void)db;
     v->dropped_at = seq; /* its definition stays until the close: a transaction older than the drop still reads it */
+    imdb_grants_end_object(&db->rc, IMDB_OBJ_VIEW, v->id); /* L: its grants end with it */
 }
 
 static void views_free(imdb_db *db)
@@ -5634,6 +5646,16 @@ static int anchor_fenced(imdb_db *db, imdb_err *e)
     return IMDB_OK;
 }
 
+/* L stage 2: an erased role entry's commit, for the redaction (a note that fails stops the handle: reopen replays) */
+static int erase_role_note(void *arg, const imdb_rerase *x, bool pending, imdb_err *e)
+{
+    imdb_db *db = arg;
+    imdb_err e2 = {0};
+    if (!pending && imdb_redact_note(db, x->seq, &e2)) db->failed = true;
+    (void)e;
+    return IMDB_OK;
+}
+
 static int commit_body(imdb_db *db, imdb_err *e)
 {
     if (!db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "no transaction");
@@ -5757,7 +5779,8 @@ static int commit_body(imdb_db *db, imdb_err *e)
             code == IMDB_OP_EXPIRE || code == IMDB_OP_DROP_TABLE || code == IMDB_OP_CREATE_VIEW || code == IMDB_OP_DROP_VIEW ||
             code == IMDB_OP_ALTER_TABLE || code == IMDB_OP_CREATE_SEQUENCE || code == IMDB_OP_DROP_SEQUENCE ||
             code == IMDB_OP_SEQ_ADVANCE || code == IMDB_OP_SEQ_SET || code == IMDB_OP_CREATE_ENUM || code == IMDB_OP_DROP_ENUM ||
-            code == IMDB_OP_ENUM_ADD) /* F2a-2: the manifest keeps sequences too; F3g: and types */
+            code == IMDB_OP_ENUM_ADD || (code >= IMDB_OP_CREATE_ROLE && code <= IMDB_OP_REVOKE)) /* F2a-2: the manifest keeps
+                                                                                             sequences too; F3g: types; L: roles */
             db->lake_dirty = true; /* the manifest records the definitions, the retentions, the horizons, the drops,
                                     * the views (P2 S7) */
         if (code == IMDB_OP_CREATE_TABLE) db->t[db->tx[i].table]->created_at = c.seq;
@@ -5783,6 +5806,11 @@ static int commit_body(imdb_db *db, imdb_err *e)
             db->tx[i].edef = NULL;
         }
         if (code == IMDB_OP_DROP_ENUM) imdb_enum_drop_install(db, db->tx[i].eid, c.seq);
+        if (code >= IMDB_OP_CREATE_ROLE && code <= IMDB_OP_REVOKE && !imdb_role_install(&db->rc, &db->tx[i], c.seq)) { /* L */
+            db->failed = true;
+            snprintf(db->warning, sizeof db->warning, "commit %llu changed a role with no room reserved; reopen",
+                     (unsigned long long)c.seq);
+        }
         if (code == IMDB_OP_ENUM_ADD) {
             imdb_enum_add_install(db, db->tx[i].eid, db->tx[i].edef, c.seq);
             db->tx[i].edef = NULL;
@@ -5805,7 +5833,7 @@ static int commit_body(imdb_db *db, imdb_err *e)
         if (touched[t]) imdb_lthash_add(&db->t[t]->digest, &delta[t]);
     db->global = global;
     if (imdb_ci_push(db, c.time_us, c.hash, c.digest, e)) db->failed = true;
-    bool erased = false;
+    bool erased = false, erased_rows = false;
     for (uint32_t i = 0; i < db->ntx; i++) {
         imdb_op *o = &db->tx[i];
         if (o->code != IMDB_OP_ERASE) continue;
@@ -5825,7 +5853,13 @@ static int commit_body(imdb_db *db, imdb_err *e)
             if (where != IMDB_VAT_NONE && !stub && imdb_redact_note(db, begin, &e3)) db->failed = true;
             if (where == IMDB_VAT_HELD) imdb_stub_version(et, o->erase[k].vid);
         }
+        /* L stage 2: the role entries erased (wiped; each one's commit noted for the redaction: the writer holds none
+         * pending). Its own list meets every rule; a failure stops the handle (the commit is durable: reopen replays) */
+        imdb_err e4 = {0};
+        if (o->n_rerase && imdb_role_erase_apply(&db->rc, o->rerase, o->n_rerase, c.seq, erase_role_note, db, &e4))
+            db->failed = true;
         imdb_txn_doom_erased(db, o->erase, o->n_erase); /* suspended writes built on erased rows */
+        erased_rows |= o->n_erase != 0;
         erased = true;
         db->last_erase = c.seq;
     }
@@ -5839,7 +5873,7 @@ static int commit_body(imdb_db *db, imdb_err *e)
     db->in_txn = false;
     rc = IMDB_OK;
     imdb_index_catch_up(db); /* the committed versions join the structures */
-    for (uint32_t i = 0; erased && i < db->nt; i++) imdb_index_rebuild_table(db, db->t[i]); /* stubs out, keys wiped */
+    for (uint32_t i = 0; erased_rows && i < db->nt; i++) imdb_index_rebuild_table(db, db->t[i]); /* stubs out, keys wiped */
     if (erased) {
         /* The ERASE is durable at this point, so the caller gets success even if
          * the physical rewrite fails; the rewrite is retried at the next open and
@@ -5890,6 +5924,7 @@ void imdb_reset_state(imdb_db *db)
     for (uint32_t i = 0; i < db->nt; i++) imdb_table_free(db->t[i]);
     views_free(db); /* P2 S7 */
     enums_free(db); /* F3g */
+    imdb_rcat_free(&db->rc); /* L */
     seqs_free(db); /* F2a-2 */
 #ifdef IMDB_STORE_CHECKS
     if (db->segcache.resident) { /* every image charged was credited as it left (lake.c: seg_img_bytes) */
@@ -5917,6 +5952,7 @@ void imdb_reset_state(imdb_db *db)
     db->pending_auth = 0;
     db->needs_redaction = false;
     db->nredact = 0;
+    db->redact_known = false;
     imdb_writers_reset(db); /* a full replay re-derives every epoch from commit 1 */
 }
 
@@ -5939,6 +5975,7 @@ int imdb_close(imdb_db *db)
     for (uint32_t i = 0; i < db->nt; i++) imdb_table_free(db->t[i]);
     views_free(db); /* P2 S7 */
     enums_free(db); /* F3g */
+    imdb_rcat_free(&db->rc); /* L */
     seqs_free(db); /* F2a-2 */
     imdb_free(db->t);
     for (uint32_t i = 0; i < db->ntx; i++) tx_op_free(&db->tx[i]);

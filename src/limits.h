@@ -66,6 +66,14 @@
 #define IMDB_MAX_ENUMS          4096u        /* F3g: ENUM types per database, dropped ones counted: ids never reused (1..4096: a u16) */
 #define IMDB_MAX_ENUM_LABELS    1024u        /* F3g: an ENUM's labels */
 #define IMDB_MAX_ENUM_LABEL     63u          /* F3g: bytes in a label (PostgreSQL's NAMEDATALEN - 1; the empty label taken) */
+#define IMDB_MAX_ROLES          16384u       /* L: roles held: the live ones, and dropped ones with a name or verifier not
+                                                yet erased (ids never reused, to 2^32 - 2) */
+#define IMDB_MAX_ROLE_HISTORY   256u         /* L: a role's earlier names and verifiers kept until an ERASE ROLE */
+#define IMDB_MAX_GRANTS         1048576u     /* L: live privilege and membership records */
+#define IMDB_MAX_GRANT_RECORDS  65536u       /* L: one GRANT's or REVOKE's records (objects times roles) */
+#define IMDB_MAX_GRANT_NAMES    1024u        /* L: names in one of a GRANT's or REVOKE's lists */
+#define IMDB_MAX_ROLE_ERASE     (IMDB_MAX_ROLES * (IMDB_MAX_ROLE_HISTORY + 2u)) /* L stage 2: one ERASE ROLE's entries: every role
+                                                held, each its two current entries and its earlier ones */
 #define IMDB_MAX_CHECKS         32u          /* F2b-1: a table's live CHECK constraints */
 #define IMDB_MAX_FKS            16u          /* F2b-2: a table's live FOREIGN KEY constraints */
 #define IMDB_MAX_CHECK_TEXT     8192u        /* F2b-1: bytes in a CHECK's text, and in a table's live ones' together (so their

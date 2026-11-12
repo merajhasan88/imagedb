@@ -1,7 +1,7 @@
 #!/bin/sh
 # Makes the format's fixtures (2026-11-12, its first pair: META 5, log version 3, manifest version 16 and segment format 3 (F1 stage 4:
-# a segment names its schema version by its hash with positions), ops 16, 19, 20, 21, 22's kinds and 23 to 32; alg1-20261112b.tar.gz
-# and alg2-20261112b.tar.gz beside this script): a primary and its replica under digest algorithm ALG, by
+# a segment names its schema version by its hash with positions), ops 16, 19, 20, 21, 22's kinds and 23 to 37; alg1-20261112c.tar.gz
+# and alg2-20261112c.tar.gz beside this script): a primary and its replica under digest algorithm ALG, by
 # make_alg2.sh's steps, which reach every reader of the format: a log of several segments (each manifest
 # publish ends one), CHECKPOINTs (manifests, segments, the lanes), a two-column index and a unique one,
 # an UPDATE and a DELETE, ERASE SUBJECT (redacted log payloads, rewritten segments), commits after it, and
@@ -30,7 +30,11 @@
 # with an INTERVAL DEFAULT after the first CHECKPOINT, rows and an update from the log: manifest 16), and (F3g) ENUM
 # types (a type holding the empty label, a dropped type's tombstone, a table keyed by one with an index and a DEFAULT,
 # a view with a CAST to the type; after the first CHECKPOINT an ADD VALUE, an ADD COLUMN of the type with a DEFAULT,
-# rows and an update from the log: manifest 17, each label's commit). The live
+# rows and an update from the log: manifest 17, each label's commit), and (L) roles and grants (a role with a verifier, a
+# dropped one, privileges on two tables and a view, a membership, a grant ended by a DROP TABLE; after the first CHECKPOINT
+# a password changed, a rename, a REVOKE and an ALTER of attributes: manifest 18, each name and verifier a payload
+# entry under its commitment, the earlier ones in the history; then (stage 2) ERASE ROLE of a dropped role whole and of
+# a role's earlier verifier, the replica fed the redacted log). The live
 # tables are RETENTION FOREVER and the dropped one is kept a century, the longest but FOREVER: a fixture is frozen
 # data, so its history
 # never expires under the tests that open it (the 24-hour default is tested by the unit tests). Every
@@ -44,10 +48,11 @@
 # alg2-20261109d, manifest version 11: before generated columns; alg1-20261109e and alg2-20261109e, manifest version 12:
 # before FOREIGN KEYs; alg1-20261109f and alg2-20261109f, manifest version 13: before UUID and BYTEA; alg1-20261109g and
 # alg2-20261109g, manifest version 14: before DECIMALs of 38 digits; alg1-20261110a and alg2-20261110a, manifest version
-# 15: before INTERVAL; alg1-20261112a and alg2-20261112a, manifest version 16: before ENUM types) stay as
+# 15: before INTERVAL; alg1-20261112a and alg2-20261112a, manifest version 16: before ENUM types; alg1-20261112b and
+# alg2-20261112b, manifest version 17: before roles) stay as
 # directories this format refuses.
 #   sh tests/fixtures/make_fixtures.sh BIN AUDIT ALG OUTDIR   (OUTDIR must not exist)
-#   tar -czf tests/fixtures/algALG-20261112b.tar.gz -C OUTDIR primary replica
+#   tar -czf tests/fixtures/algALG-20261112c.tar.gz -C OUTDIR primary replica
 set -eu
 BIN=$1
 AUD=$2
@@ -134,6 +139,16 @@ sql "CREATE TABLE moods (m mood PRIMARY KEY, n mood NOT NULL DEFAULT 'ok', w INT
 sql "CREATE INDEX moods_n ON moods (n)"
 sql "INSERT INTO moods VALUES ('sad', 'happy', 1), ('happy', 'sad', 2), ('', '', 3)"
 sql "CREATE VIEW moodsv AS SELECT m, n, CAST('happy' AS mood) AS h FROM moods WHERE n > 'sad'" # a TYPE dependency
+sql "CREATE ROLE reader LOGIN PASSWORD 'fixture-pw'"    # L: op 33, a name and a verifier, payload entries
+sql "CREATE ROLE staff"
+sql "CREATE ROLE gonerole"
+sql "DROP ROLE gonerole"                             # op 35: a dropped role, held in the manifest (its entries not erased)
+sql "GRANT SELECT, INSERT ON acct, moods TO staff"   # op 36: privileges on two tables
+sql "GRANT SELECT ON moodsv TO reader"               # a view's
+sql "GRANT staff TO reader"                          # a membership
+sql "CREATE TABLE gone_t (id INT64 PRIMARY KEY)"
+sql "GRANT SELECT ON gone_t TO staff"
+sql "DROP TABLE gone_t"                              # its grant ends with it (no op)
 sql "CHECKPOINT"
 ship
 sql "ALTER TABLE pair ADD w TEXT DEFAULT 'w0'"          # F1: op 22; pair's rows so far are in a segment of version 1
@@ -174,6 +189,14 @@ sql "ALTER TABLE wide ALTER COLUMN x TYPE DECIMAL(38,0)"  # F3e: a widening with
 sql "ALTER TABLE spans ADD COLUMN e INTERVAL DEFAULT INTERVAL '-1 mons +1 day -01:00:00'" # F3f: older rows read it (a 16-byte cell)
 sql "UPDATE spans SET iv = iv + INTERVAL '1 day', at = at - INTERVAL '1 mon' WHERE id = 2" # from the log
 sql "INSERT INTO spans (id, iv, at) VALUES (6, '-1 days +02:00:00', '2000-03-31 00:00:00')"
+sql "ALTER ROLE reader PASSWORD 'fixture-pw2'"     # L: op 34, the first verifier an earlier entry
+sql "ALTER ROLE staff RENAME TO staffers"           # an earlier name
+sql "REVOKE INSERT ON acct FROM staffers"           # op 37
+sql "ALTER USER reader NOLOGIN"
+sql "CREATE ROLE temp PASSWORD 'fixture-temp'"         # L stage 2: a role dropped, then erased whole
+sql "DROP ROLE temp"
+sql "ERASE ROLE temp"                                 # op 12's role entries alone: temp leaves the catalog, its id spent
+sql "ERASE ROLE reader"                               # reader's first verifier, an earlier entry (staffers keeps its old name)
 sql "ALTER TYPE mood ADD VALUE 'ecstatic'"               # F3g: op 32 after the first CHECKPOINT
 sql "INSERT INTO moods (m, w) VALUES ('ecstatic', 4)"
 sql "ALTER TABLE moods ADD COLUMN p mood DEFAULT 'happy'" # older rows read it

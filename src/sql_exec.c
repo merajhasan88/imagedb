@@ -4992,6 +4992,139 @@ static int exec_show_views(xctx *x, imdb_result *r, imdb_err *e)
 }
 
 
+/* ---- L: roles and grants ----------------------------------------------------------------------------------------- */
+
+static void res_put_bool(imdb_result *r, imdb_cell *c, bool b)
+{
+    imdb_value v = {.type = IMDB_T_BOOL, .i = b};
+    res_put(r, c, &v);
+}
+
+/* SHOW ROLES: each live role, whether it has a verifier (never the verifier) */
+static int exec_show_roles(xctx *x, imdb_result *r, imdb_err *e)
+{
+    imdb_db *db = x->db;
+    res_cols(r, 5);
+    const char *nm[] = {"role", "login", "superuser", "password", "created_at"};
+    for (int i = 0; i < 5; i++) res_name(r, (uint16_t)i, nm[i]);
+    for (uint32_t i = 0; i < db->rc.n; i++) {
+        const imdb_role *ro = db->rc.roles[i];
+        if (ro->dropped_at) continue;
+        imdb_cell *row = res_row(r, e);
+        if (!row) return e->code;
+        res_put_str(r, &row[0], ro->name);
+        res_put_bool(r, &row[1], (ro->attrs & IMDB_RA_LOGIN) != 0);
+        res_put_bool(r, &row[2], (ro->attrs & IMDB_RA_SUPERUSER) != 0);
+        res_put_bool(r, &row[3], ro->has_ver);
+        res_put_int(r, &row[4], (int64_t)ro->created_at);
+    }
+    snprintf(r->status, sizeof r->status, "%llu roles", (unsigned long long)r->nrows);
+    return res_finish(r, e);
+}
+
+/* SHOW GRANTS [FOR role]: each privilege (role, privilege, its object's kind and name) and each membership (role,
+ * MEMBER OF, ROLE, the group), by role id, then as the records are kept */
+static int exec_show_grants(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
+{
+    imdb_db *db = x->db;
+    const imdb_role *only = NULL;
+    if (st->table[0] && !(only = imdb_role_by_name(db, st->table))) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no role %s", st->table);
+    res_cols(r, 4);
+    const char *nm[] = {"role", "privilege", "kind", "object"};
+    for (int i = 0; i < 4; i++) res_name(r, (uint16_t)i, nm[i]);
+    static const char *const pname[] = {"SELECT", "INSERT", "UPDATE", "DELETE"};
+    for (uint32_t i = 0; i < db->rc.n; i++) {
+        const imdb_role *ro = db->rc.roles[i];
+        if (ro->dropped_at || (only && ro != only)) continue;
+        for (uint32_t k = 0; k < ro->nprivs; k++) {
+            const imdb_rpriv *pv = &ro->privs[k];
+            const char *obj = pv->okind == IMDB_OBJ_TABLE ? (imdb_table_by_id(db, pv->oid) ? imdb_table_by_id(db, pv->oid)->s.name : "?")
+                                                           : pv->oid < db->nviews ? db->views[pv->oid].name : "?";
+            for (int b = 0; b < 4; b++) {
+                if (!(pv->privs & (1u << b))) continue;
+                imdb_cell *row = res_row(r, e);
+                if (!row) return e->code;
+                res_put_str(r, &row[0], ro->name);
+                res_put_str(r, &row[1], pname[b]);
+                res_put_str(r, &row[2], pv->okind == IMDB_OBJ_TABLE ? "TABLE" : "VIEW");
+                res_put_str(r, &row[3], obj);
+            }
+        }
+        for (uint32_t k = 0; k < ro->ngroups; k++) {
+            const imdb_role *g = imdb_role_by_id(db, ro->groups[k]);
+            imdb_cell *row = res_row(r, e);
+            if (!row) return e->code;
+            res_put_str(r, &row[0], ro->name);
+            res_put_str(r, &row[1], "MEMBER OF");
+            res_put_str(r, &row[2], "ROLE");
+            res_put_str(r, &row[3], g ? g->name : "?");
+        }
+    }
+    snprintf(r->status, sizeof r->status, "%llu grants", (unsigned long long)r->nrows);
+    return res_finish(r, e);
+}
+
+/* PASSWORD's text as a verifier: PostgreSQL's SCRAM text taken as given, any other text a password hashed at once;
+ * the engine's copy of the text wiped (the statement's own text is its caller's) */
+static int password_verifier(xctx *x, const sql_stmt *st, imdb_scram *v, imdb_err *e)
+{
+    char *b = NULL;
+    size_t n = 0;
+    int rc = lit_text(x, &st->rpw_lit, &b, &n, e);
+    if (rc) return rc;
+    rc = imdb_scram_looks_text(b, n) ? imdb_scram_parse(b, n, v, e)
+                                     : imdb_scram_make(b, n, IMDB_SCRAM_ITER_NEW, NULL, IMDB_SCRAM_SALT_NEW, v, e);
+    imdb_wipe(b, st->rpw_lit.len ? st->rpw_lit.len : 1);
+    return rc;
+}
+
+/* GRANT and REVOKE: the statement's records, every object (or role granted) by every grantee (or member), named live;
+ * ALL on a view is SELECT, any other privilege on one refused by name (a view is read-only) */
+static int exec_grant(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
+{
+    imdb_db *db = x->db;
+    bool revoke = st->kind == ST_REVOKE;
+    uint64_t n = (uint64_t)st->ngobj * st->ngto;
+    if (n > IMDB_MAX_GRANT_RECORDS)
+        return imdb_fail(e, IMDB_ERR_LIMIT, "a %s makes at most %u records (objects times roles)", revoke ? "REVOKE" : "GRANT",
+                         IMDB_MAX_GRANT_RECORDS);
+    imdb_grant_rec *recs = xalloc(x, (size_t)(n ? n : 1) * sizeof *recs, e);
+    uint32_t *to = recs ? xalloc(x, (st->ngto ? st->ngto : 1) * sizeof *to, e) : NULL;
+    if (!to) return e->code;
+    memset(recs, 0, (size_t)(n ? n : 1) * sizeof *recs);
+    for (uint16_t j = 0; j < st->ngto; j++) {
+        const imdb_role *ro = imdb_role_by_name(db, st->gto[j]);
+        if (!ro) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no role %s", st->gto[j]);
+        to[j] = ro->id;
+    }
+    uint32_t k = 0;
+    for (uint16_t i = 0; i < st->ngobj; i++) {
+        uint8_t okind = 0;
+        uint32_t oid = 0, privs = st->gprivs;
+        if (st->gprivs) {
+            const imdb_table *t = imdb_table_by_name(db, st->gobj[i]);
+            const imdb_view *v = t ? NULL : imdb_view_by_name(db, st->gobj[i]);
+            if (!t && !v) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table or view %s", st->gobj[i]);
+            okind = t ? IMDB_OBJ_TABLE : IMDB_OBJ_VIEW;
+            oid = t ? t->s.id : v->id;
+            if (v && st->gall) privs = IMDB_PRIV_SELECT;
+            else if (v && privs != IMDB_PRIV_SELECT)
+                return imdb_fail(e, IMDB_ERR_INVALID, "view %s takes SELECT alone: a view is read-only", st->gobj[i]);
+        } else {
+            const imdb_role *g = imdb_role_by_name(db, st->gobj[i]);
+            if (!g) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no role %s", st->gobj[i]);
+            oid = g->id;
+        }
+        for (uint16_t j = 0; j < st->ngto; j++, k++)
+            recs[k] = (imdb_grant_rec){.kind = st->gprivs ? IMDB_GRANT_PRIV : IMDB_GRANT_MEMBER, .okind = okind, .a = to[j],
+                                       .b = oid, .privs = st->gprivs ? privs : 0};
+    }
+    uint32_t logged = 0;
+    int rc = imdb_grant_revoke(db, revoke, recs, k, &logged, e);
+    if (!rc) snprintf(r->status, sizeof r->status, "%s", revoke ? "REVOKE" : "GRANT");
+    return rc;
+}
+
 int imdb_sql_names_ident(const char *text, size_t len, const char *ident, bool *out, imdb_err *e)
 {
     *out = false;
@@ -9628,6 +9761,19 @@ static void erase_status(imdb_result *r, const imdb_erase_report *er, const imdb
                                    : "payloads removed from log, lake and memory here (SHOW ERASURE: elsewhere)");
 }
 
+static void erase_role_status(imdb_result *r, const imdb_erase_report *er, const imdb_db *db)
+{
+    if (!er->role_entries) {
+        snprintf(r->status, sizeof r->status, "ERASE ROLE: nothing left to erase (no commit)");
+        return;
+    }
+    snprintf(r->status, sizeof r->status,
+             "ERASE ROLE %u names and verifiers (%u dropped roles erased whole) at commit %llu; %s", er->role_entries,
+             er->roles_removed, (unsigned long long)db->seq,
+             er->redaction_pending ? "committed; physical cleanup pending, see warning"
+                                   : "removed from log, lake and memory here (SHOW ERASURE: elsewhere)");
+}
+
 /* ---- admin ------------------------------------------------------------------------- */
 
 /* a retention as SQL writes it: its largest whole unit, or FOREVER */
@@ -10228,7 +10374,8 @@ static bool is_write(uint8_t k)
            k == ST_DROP_INDEX || k == ST_ALTER_RETENTION || k == ST_ALTER_TABLE || k == ST_DROP_TABLE || k == ST_COPY_FROM || /* P2 S10 */
            k == ST_CREATE_VIEW || k == ST_DROP_VIEW || /* P2 S7 */
            k == ST_CREATE_SEQUENCE || k == ST_DROP_SEQUENCE || /* F2a-2 */
-           k == ST_CREATE_TYPE || k == ST_ALTER_TYPE || k == ST_DROP_TYPE; /* F3g */
+           k == ST_CREATE_TYPE || k == ST_ALTER_TYPE || k == ST_DROP_TYPE || /* F3g */
+           k == ST_CREATE_ROLE || k == ST_ALTER_ROLE || k == ST_DROP_ROLE || k == ST_GRANT || k == ST_REVOKE; /* L */
 }
 
 /* A read statement's workspace (P0 R2): what SET statement_memory says, else a quarter of the memory budget, at most
@@ -10246,14 +10393,17 @@ static int stmt_class(int kind)
     case ST_SET_TXN: return IMDB_SC_TXN;
     case ST_CREATE: case ST_CREATE_INDEX: case ST_DROP_INDEX: case ST_DROP_TABLE: case ST_ALTER_RETENTION: case ST_ALTER_TABLE:
     case ST_CREATE_VIEW: case ST_DROP_VIEW: /* P2 S7 */
+    case ST_CREATE_ROLE: case ST_ALTER_ROLE: case ST_DROP_ROLE: case ST_GRANT: case ST_REVOKE: /* L */
         return IMDB_SC_DDL;
-    case ST_CHECKPOINT: case ST_COMPACT: case ST_ERASE_SUBJECT: case ST_ERASE_WHERE: case ST_VERIFY: return IMDB_SC_PHYSICAL;
+    case ST_CHECKPOINT: case ST_COMPACT: case ST_ERASE_SUBJECT: case ST_ERASE_WHERE: case ST_ERASE_ROLE: case ST_VERIFY:
+        return IMDB_SC_PHYSICAL;
     case ST_SHOW_TABLES: case ST_SHOW_DIGEST: case ST_SHOW_HISTORY: case ST_SHOW_LOG: case ST_SHOW_LAKE:
     case ST_SHOW_IDENTITY: case ST_SHOW_REPLICAS: case ST_SHOW_REPLICATION: case ST_SHOW_ERASURE: case ST_SHOW_MEMORY:
     case ST_SHOW_INDEXES: case ST_SHOW_RETENTION: case ST_SHOW_STATS: case ST_SHOW_TRANSACTIONS: case ST_EXPLAIN:
     case ST_SHOW_PREPARED: /* P2 S9 */
     case ST_SHOW_TIMEZONE: /* P2 */
     case ST_SHOW_VIEWS: /* P2 S7 */
+    case ST_SHOW_ROLES: case ST_SHOW_GRANTS: /* L */
         return IMDB_SC_SHOW;
     default: return IMDB_SC_OTHER;
     }
@@ -10528,7 +10678,7 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
     imdb_stats_tick(db, false);
     imdb_savepoint sp = {0, 0};
     bool physical = st->kind == ST_CHECKPOINT || st->kind == ST_COMPACT || st->kind == ST_ERASE_SUBJECT ||
-                    st->kind == ST_ERASE_WHERE || st->kind == ST_VERIFY;
+                    st->kind == ST_ERASE_WHERE || st->kind == ST_ERASE_ROLE || st->kind == ST_VERIFY;
     bool control = st->kind == ST_BEGIN || st->kind == ST_COMMIT || st->kind == ST_ROLLBACK || st->kind == ST_SET ||
                    st->kind == ST_EMPTY || st->kind == ST_SAVEPOINT || st->kind == ST_ROLLBACK_TO ||
                    st->kind == ST_RELEASE || st->kind == ST_SET_TXN || st->kind == ST_PREPARE || st->kind == ST_DEALLOCATE ||
@@ -10541,13 +10691,17 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
                st->kind != ST_DROP_INDEX && st->kind != ST_ALTER_RETENTION && st->kind != ST_ALTER_TABLE && st->kind != ST_DROP_TABLE &&
                st->kind != ST_CREATE_VIEW && st->kind != ST_DROP_VIEW && st->kind != ST_CREATE_SEQUENCE &&
                st->kind != ST_DROP_SEQUENCE && st->kind != ST_CREATE_TYPE && st->kind != ST_ALTER_TYPE &&
-               st->kind != ST_DROP_TYPE; /* each commits on its own (F2a-2: the sequence statements too; F3g: the types') */
+               st->kind != ST_DROP_TYPE && st->kind != ST_CREATE_ROLE && st->kind != ST_ALTER_ROLE &&
+               st->kind != ST_DROP_ROLE && st->kind != ST_GRANT &&
+               st->kind != ST_REVOKE; /* each commits on its own (F2a-2: the sequence statements too; F3g: the types'; L: the roles') */
     x.next_check = TICK_ROWS;
     if (x.checks && ss->stmt_timeout_ms) x.deadline_ns = mono_ns() + (uint64_t)ss->stmt_timeout_ms * 1000000u;
     if (txn && (st->kind == ST_CREATE || st->kind == ST_CREATE_INDEX || st->kind == ST_DROP_INDEX ||
                 st->kind == ST_ALTER_RETENTION || st->kind == ST_ALTER_TABLE || st->kind == ST_DROP_TABLE || st->kind == ST_CREATE_VIEW ||
                 st->kind == ST_DROP_VIEW || st->kind == ST_CREATE_SEQUENCE || st->kind == ST_DROP_SEQUENCE ||
-                st->kind == ST_CREATE_TYPE || st->kind == ST_ALTER_TYPE || st->kind == ST_DROP_TYPE)) {
+                st->kind == ST_CREATE_TYPE || st->kind == ST_ALTER_TYPE || st->kind == ST_DROP_TYPE ||
+                st->kind == ST_CREATE_ROLE || st->kind == ST_ALTER_ROLE || st->kind == ST_DROP_ROLE || st->kind == ST_GRANT ||
+                st->kind == ST_REVOKE)) {
         rc = imdb_fail(e, IMDB_ERR_STATE, "%s commits on its own: run it outside the transaction",
                        st->kind == ST_CREATE         ? "CREATE TABLE"
                        : st->kind == ST_CREATE_INDEX ? "CREATE INDEX"
@@ -10560,11 +10714,16 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
                        : st->kind == ST_CREATE_TYPE ? "CREATE TYPE" /* F3g */
                        : st->kind == ST_ALTER_TYPE ? "ALTER TYPE"
                        : st->kind == ST_DROP_TYPE ? "DROP TYPE"
+                       : st->kind == ST_CREATE_ROLE ? "CREATE ROLE" /* L */
+                       : st->kind == ST_ALTER_ROLE ? "ALTER ROLE"
+                       : st->kind == ST_DROP_ROLE ? "DROP ROLE"
+                       : st->kind == ST_GRANT ? "GRANT"
+                       : st->kind == ST_REVOKE ? "REVOKE"
                                                      : "ALTER TABLE");
         goto done;
     }
     if (txn && physical) {
-        rc = imdb_fail(e, IMDB_ERR_STATE, st->kind == ST_ERASE_SUBJECT || st->kind == ST_ERASE_WHERE
+        rc = imdb_fail(e, IMDB_ERR_STATE, st->kind == ST_ERASE_SUBJECT || st->kind == ST_ERASE_WHERE || st->kind == ST_ERASE_ROLE
                                               ? "ERASE runs outside explicit transactions"
                                               : "CHECKPOINT, COMPACT and VERIFY run outside explicit transactions");
         goto done;
@@ -10591,7 +10750,8 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
                                            st->kind == ST_SHOW_RETENTION || st->kind == ST_SHOW_STATS ||
                                            st->kind == ST_SHOW_TRANSACTIONS || st->kind == ST_EXPLAIN ||
                                            st->kind == ST_COPY_TO || /* P2 S10: its rows are a query's result */
-                                           st->kind == ST_SHOW_VIEWS); /* P2 S7 */
+                                           st->kind == ST_SHOW_VIEWS || /* P2 S7 */
+                                           st->kind == ST_SHOW_ROLES || st->kind == ST_SHOW_GRANTS); /* L */
     if (ceiling) imdb_heap_ceiling_set(imdb_heap_bytes() + workspace_of(ss), workspace_of(ss));
     switch (st->kind) {
     case ST_EMPTY: break;
@@ -10832,6 +10992,41 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
         break;
     case ST_DROP_VIEW: rc = exec_drop_view(&x, st, r, e); break;
     case ST_SHOW_VIEWS: rc = exec_show_views(&x, r, e); break;
+    case ST_SHOW_ROLES: rc = exec_show_roles(&x, r, e); break; /* L */
+    case ST_SHOW_GRANTS: rc = exec_show_grants(&x, st, r, e); break;
+    case ST_GRANT:
+    case ST_REVOKE: rc = exec_grant(&x, st, r, e); break;
+    case ST_CREATE_ROLE: { /* L: op 33, alone; CREATE USER's LOGIN unless NOLOGIN */
+        uint32_t attrs = st->rattr_val | (st->ruser && !(st->rattr_set & IMDB_RA_LOGIN) ? (uint32_t)IMDB_RA_LOGIN : 0u);
+        imdb_scram v;
+        memset(&v, 0, sizeof v);
+        if (st->rpw == 2) rc = password_verifier(&x, st, &v, e);
+        if (!rc) rc = imdb_create_role(db, st->table, attrs, st->rpw == 2 ? &v : NULL, e);
+        imdb_wipe(&v, sizeof v);
+        if (!rc) snprintf(r->status, sizeof r->status, "CREATE ROLE %s", st->table);
+        break;
+    }
+    case ST_ALTER_ROLE: { /* L: op 34, alone: the attributes named over the role's, RENAME TO, PASSWORD (NULL: none) */
+        imdb_role *ro = imdb_role_by_name(db, st->table);
+        imdb_scram v;
+        memset(&v, 0, sizeof v);
+        uint32_t fields = (st->rrename ? (uint32_t)IMDB_RF_NAME : 0u) | (st->rattr_set ? (uint32_t)IMDB_RF_ATTRS : 0u) |
+                          (st->rpw ? (uint32_t)IMDB_RF_VERIFIER : 0u);
+        if (!ro) rc = imdb_fail(e, IMDB_ERR_NOTFOUND, "no role %s", st->table);
+        else if (st->rpw == 2) rc = password_verifier(&x, st, &v, e);
+        if (!rc) rc = imdb_alter_role(db, ro, fields, (ro->attrs & ~st->rattr_set) | st->rattr_val, st->rnew,
+                                      st->rpw == 2 ? &v : NULL, e);
+        imdb_wipe(&v, sizeof v);
+        if (!rc) snprintf(r->status, sizeof r->status, "ALTER ROLE %s", st->table);
+        break;
+    }
+    case ST_DROP_ROLE: { /* L: op 35, alone (RESTRICT); IF EXISTS: none for a name no live role holds */
+        imdb_role *ro = imdb_role_by_name(db, st->table);
+        if (ro) rc = imdb_drop_role(db, ro, e);
+        else if (!st->if_exists) rc = imdb_fail(e, IMDB_ERR_NOTFOUND, "no role %s", st->table);
+        if (!rc) snprintf(r->status, sizeof r->status, "DROP ROLE %s", st->table);
+        break;
+    }
     case ST_DROP_INDEX:
         rc = imdb_drop_index(db, st->index_name, e);
         if (!rc) snprintf(r->status, sizeof r->status, "DROP INDEX %s", st->index_name);
@@ -10976,6 +11171,11 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
         imdb_erase_report er;
         rc = imdb_erase_versions(db, ents, (uint32_t)n, &er, e);
         if (!rc) erase_status(r, &er, db);
+        break;
+    }
+    case ST_ERASE_ROLE: { /* L stage 2: op 12's role entries alone (docs/roles-design.md §11) */
+        imdb_erase_report er;
+        if (!(rc = imdb_erase_role(db, st->table, &er, e))) erase_role_status(r, &er, db);
         break;
     }
     case ST_VERIFY: rc = exec_verify(&x, r, e); break;

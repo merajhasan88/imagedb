@@ -2274,6 +2274,7 @@ static const char *check_promote_ledger(const char *run)
 }
 
 static const char *check_rewind(const char *run); /* the rewind scenario's, with its setup below */
+static const char *check_erase_role(const char *run); /* L stage 2: the erase_role scenario's, with its setup below */
 static const char *check_backup_catalogue(const char *run, bool done); /* with its setup below */
 
 static const char *check_run(const fscen *s, const char *run, const frun *r)
@@ -2374,6 +2375,7 @@ static const char *check_run(const fscen *s, const char *run, const frun *r)
     if (!why && strcmp(s->name, "backup_incr") == 0) why = check_backup_incr(run);
     if (!why && strcmp(s->name, "rewind") == 0) why = check_rewind(run);
     if (!why && strcmp(s->name, "backup_catalogue") == 0) why = check_backup_catalogue(run, closed);
+    if (!why && strcmp(s->name, "erase_role") == 0) why = check_erase_role(run);
     return why;
 }
 
@@ -2870,6 +2872,76 @@ static const char *check_backup_catalogue(const char *run, bool done)
     return ok ? NULL : "once finished, the catalogue does not hold both backups and the erasure once";
 }
 
+
+/* L stage 2: ERASE ROLE at every point. The setup: a role made with a password, published by a CHECKPOINT (the lake's
+ * roles object holds its name), then dropped; a live role renamed (its earlier name an earlier entry). The run erases
+ * the dropped one whole, then the live one's earlier name; each recovered state holds neither name in any file once
+ * its ERASE is in the log (the role no longer held; keeper's earlier entries gone) */
+static int erole_sql(imdb_db *db, const char *q)
+{
+    imdb_session s;
+    imdb_session_init(&s, db);
+    imdb_result r;
+    imdb_err e = {0};
+    int rc = imdb_exec_one(&s, q, strlen(q), NULL, 0, &r, &e);
+    if (!rc) imdb_result_free(&r);
+    imdb_session_close(&s);
+    return rc;
+}
+
+static void setup_erase_role(const char *base)
+{
+    setup_txns(base);
+    imdb_db *db = child_open(dir_in(base, "p"), 1);
+    if (!db) return;
+    static const char *const q[] = {"CREATE ROLE secretrole PASSWORD 'secret-pw'", "CREATE ROLE oldkeeper LOGIN", "CHECKPOINT",
+                                    "DROP ROLE secretrole", "ALTER ROLE oldkeeper RENAME TO keeper"};
+    for (size_t i = 0; i < sizeof q / sizeof *q; i++)
+        if (erole_sql(db, q[i])) break;
+    imdb_close(db);
+}
+
+static const char *erase_role_base_ok(const char *base)
+{
+    imdb_db *db = child_open(dir_in(base, "p"), 1);
+    if (!db) return "the setup's directory does not open";
+    const imdb_role *k = imdb_role_by_name(db, "keeper"), *s = imdb_rcat_by_id(&db->rc, 1);
+    bool ok = k && k->nhist == 1 && s && s->dropped_at;
+    imdb_close(db);
+    return ok ? NULL : "the setup did not make a dropped secretrole and a renamed keeper";
+}
+
+static int run_erase_role(const char *run)
+{
+    imdb_db *db = child_open(dir_in(run, "p"), 1);
+    if (!db) return 0;
+    int v = 0;
+    static const char *const q[] = {"ERASE ROLE secretrole", "ERASE ROLE keeper"};
+    for (size_t i = 0; i < sizeof q / sizeof *q && !v; i++) {
+        if (erole_sql(db, q[i])) {
+            v = after_error(db);
+            break;
+        }
+        ack(db);
+    }
+    imdb_close(db);
+    return v;
+}
+
+static const char *check_erase_role(const char *run)
+{
+    imdb_open_opts o = {.sync = 0, .read_only = true};
+    imdb_db *db = NULL;
+    imdb_err e = {0};
+    if (imdb_open(dir_in(run, "p"), &o, &db, &e)) return "the recovered directory does not open read-only";
+    const imdb_role *k = imdb_role_by_name(db, "keeper");
+    bool gone1 = !imdb_rcat_by_id(&db->rc, 1), gone2 = k && !k->nhist;
+    imdb_close(db);
+    if (gone1 && tree_contains(run, "secretrole")) return "secretrole is erased but a file still holds its name";
+    if (gone2 && tree_contains(run, "oldkeeper")) return "keeper's earlier name is erased but a file still holds it";
+    return NULL;
+}
+
 static const fscen kScen[] = {
     {"commits", setup_txns, run_commits, false, NULL, NULL, false, false, false},
     {"nosync", setup_txns, run_nosync, true, NULL, NULL, false, false, false},
@@ -2907,6 +2979,7 @@ static const fscen kScen[] = {
      false}, /* P2 D1.1 */
     {"alter", setup_txns, run_alter, false, NULL, NULL, false, false, false}, /* P2 F1 */
     {"seq", setup_txns, run_seq, false, NULL, NULL, false, false, false},     /* F2a-2 */
+    {"erase_role", setup_erase_role, run_erase_role, false, NULL, erase_role_base_ok, false, false, false}, /* L stage 2 */
 };
 
 static void t_fault_commits(void) { fault_scenario(&kScen[0]); }
@@ -2944,6 +3017,7 @@ static void t_fault_rewind(void) { fault_scenario(&kScen[31]); }
 static void t_fault_backup_catalogue(void) { fault_scenario(&kScen[32]); }
 static void t_fault_alter(void) { fault_scenario(&kScen[33]); }
 static void t_fault_seq(void) { fault_scenario(&kScen[34]); }
+static void t_fault_erase_role(void) { fault_scenario(&kScen[35]); }
 
 const test_case fault_tests[] = {
     {"fault_commits", t_fault_commits},     {"fault_nosync", t_fault_nosync}, {"fault_checkpoint", t_fault_checkpoint},
@@ -2976,5 +3050,6 @@ const test_case fault_tests[] = {
     {"fault_backup_catalogue", t_fault_backup_catalogue},
     {"fault_alter", t_fault_alter},
     {"fault_seq", t_fault_seq},
+    {"fault_erase_role", t_fault_erase_role}, /* L stage 2 */
 };
 const size_t fault_ntests = sizeof fault_tests / sizeof *fault_tests;

@@ -91,6 +91,8 @@ typedef struct vsnap {
     uint32_t nsq;
     imdb_enum *en;     /* F3g: the ENUM types then (each definition copied) */
     uint32_t nen;
+    uint8_t *rcat;     /* L: the roles and grants then, as manifest 18's sections 5 and 6 encode them */
+    size_t nrcat;
 } vsnap;
 
 typedef struct vstart { /* a log segment's first commit, and its time: what an EXPIRE may name (log.h) */
@@ -139,6 +141,7 @@ typedef struct vctx {
     uint32_t nsq, capsq;
     imdb_enum *en;           /* F3g: the ENUM types the log made, by id (en[id - 1]): replay's rules, its own */
     uint32_t nen, capen;
+    imdb_rcat rc;            /* L: the roles and grants the log made: replay's rules (role.c), on the model's objects */
 } vctx;
 
 /* ---- F2a-2: the sequences, by replay's rules (db.c imdb_seq_apply, imdb_seq_own) on the model -------------------- */
@@ -352,6 +355,55 @@ static bool v_enum_same(const imdb_enum *a, const imdb_enum *b)
 }
 
 /* a copy of n types (each definition its own allocation) into *out */
+/* L: a table or view live in the model (tables at their ids, views by id) */
+static bool v_obj_live(const void *arg, uint8_t okind, uint32_t oid)
+{
+    const vctx *x = arg;
+    if (okind == IMDB_OBJ_TABLE) return oid < x->nt && !x->t[oid].dropped_at;
+    return okind == IMDB_OBJ_VIEW && oid < x->nv && !x->v[oid].dropped_at;
+}
+
+/* L stage 2: an ERASE's role entry the model held: its payload is still in the log, unless a cut took its commit */
+static int v_role_note(void *arg, const imdb_rerase *r, bool pending, imdb_err *e)
+{
+    const vctx *x = arg;
+    if (pending || r->seq <= x->db->log_floor) return IMDB_OK;
+    return imdb_fail(e, IMDB_ERR_VERIFY, "erasure incomplete: an erased name or verifier of role %u (commit %llu) "
+                     "is still in the log", r->role, (unsigned long long)r->seq);
+}
+
+/* L: a catalog's roles and grants as manifest 18's sections 5 and 6 encode them: what the model, the engine and a
+ * manifest are compared by, and its roles object's */
+static int v_rcat_bytes(const imdb_rcat *c, imdb_buf *b, imdb_err *e)
+{
+    imdb_buf obj;
+    uint8_t h[32];
+    imdb_buf_init(b);
+    imdb_buf_init(&obj);
+    int rc = imdb_rcat_object(c, &obj, h, e); /* the roles object too: its bytes are compared with the sections' */
+    if (!rc) {
+        imdb_rcat_put_roles(b, c, h);
+        imdb_rcat_put_grants(b, c);
+        if (obj.len) imdb_buf_put(b, obj.p, obj.len);
+        rc = imdb_buf_check(b, e);
+    }
+    if (obj.p) imdb_wipe(obj.p, obj.len);
+    imdb_buf_free(&obj);
+    return rc;
+}
+
+static bool v_rcat_same(const imdb_rcat *a, const imdb_rcat *b, imdb_err *e, int *rc)
+{
+    imdb_buf x, y;
+    *rc = v_rcat_bytes(a, &x, e);
+    if (!*rc) *rc = v_rcat_bytes(b, &y, e);
+    else imdb_buf_init(&y);
+    bool same = !*rc && x.len == y.len && !memcmp(x.p, y.p, x.len);
+    imdb_buf_free(&x);
+    imdb_buf_free(&y);
+    return same;
+}
+
 static int v_enums_copy(const imdb_enum *src, uint32_t n, imdb_enum **out, imdb_err *e)
 {
     *out = NULL;
@@ -535,7 +587,7 @@ static void stage_frame(void *ctx, size_t i)
     f->decoded = true;
     for (uint32_t k = 0; k < f->c.nops; k++) {
         const imdb_op *o = &f->c.ops[k];
-        if (!imdb_op_has_payload(o->code) || o->pkind != IMDB_PAYLOAD_ROW) continue;
+        if (!imdb_op_is_row(o->code) || o->pkind != IMDB_PAYLOAD_ROW) continue;
         uint8_t chk[32];
         imdb_row_commit(o->table, o->salt, o->row, o->row_len, chk);
         if (memcmp(chk, o->code == IMDB_OP_INSERT ? o->commit : o->new_commit, 32) != 0) {
@@ -638,7 +690,7 @@ static void stage_chunk(void *ctx, size_t i)
     for (uint32_t k = ch->lo; k < ch->hi; k++) {
         const imdb_op *o = &f->c.ops[k];
         if (o->code != IMDB_OP_INSERT && o->code != IMDB_OP_DELETE && o->code != IMDB_OP_UPDATE) continue;
-        if (imdb_op_has_payload(o->code) && o->pkind == IMDB_PAYLOAD_ROW && ch->bad_op == NO_OP) {
+        if (imdb_op_is_row(o->code) && o->pkind == IMDB_PAYLOAD_ROW && ch->bad_op == NO_OP) {
             const imdb_schema *s = batch_schema(b, o->table, ch->frame, k);
             if (s) { /* else the ordered stage reports the unknown table */
                 imdb_value vals[IMDB_MAX_COLS];
@@ -924,6 +976,16 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
             rc = imdb_hist_create_fks(&t->hist, o->fk, o->nfk, e);
             break;
         }
+        case IMDB_OP_CREATE_ROLE: /* L: replay's rules (role.c) on the model's catalog */
+        case IMDB_OP_ALTER_ROLE:
+        case IMDB_OP_DROP_ROLE:
+        case IMDB_OP_GRANT:
+        case IMDB_OP_REVOKE: {
+            imdb_err e2 = {0};
+            if (imdb_role_apply(&x->rc, v_obj_live, x, o, seq, &e2))
+                return imdb_fail(e, e2.code == IMDB_ERR_NOMEM ? e2.code : IMDB_ERR_VERIFY, "verify: %s", e2.msg);
+            break;
+        }
         case IMDB_OP_CREATE_ENUM: /* F3g: replay's rules on the model */
         case IMDB_OP_DROP_ENUM:
         case IMDB_OP_ENUM_ADD:
@@ -987,6 +1049,11 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
                 else
                     v->stub = true;
             }
+            if (!rc && o->n_rerase) { /* L stage 2: the role entries, by replay's rules on the model */
+                imdb_err e2 = {0};
+                if (imdb_role_erase_apply(&x->rc, o->rerase, o->n_rerase, seq, v_role_note, x, &e2))
+                    rc = imdb_fail(e, e2.code == IMDB_ERR_NOMEM ? e2.code : IMDB_ERR_VERIFY, "verify: %s", e2.msg);
+            }
             break;
         case IMDB_OP_COMPACT:
             /* the engine raises a PURGE BEFORE to the table's horizon and never past the last commit */
@@ -1018,6 +1085,7 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
                 return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: DROP VIEW of a view unknown, dropped already or "
                                  "named by a live view", (unsigned long long)seq);
             w->dropped_at = seq;
+            imdb_grants_end_object(&x->rc, IMDB_OBJ_VIEW, o->view); /* L: its grants end with it */
             break;
         }
         case IMDB_OP_ALTER_TABLE: { /* F1: the rules the model decides; the next schema for the rows after it */
@@ -1116,6 +1184,7 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
             t->live = 0;
             t->dropped_at = seq;
             v_seq_drop_owned(x, o->table, UINT16_MAX, seq); /* F2a-2: its IDENTITYs' sequences */
+            imdb_grants_end_object(&x->rc, IMDB_OBJ_TABLE, o->table); /* L: its grants end with it */
             imdb_lthash_sub(&x->global, t->d); /* all it held leaves the state: its lanes, then none */
             imdb_lthash_zero(t->d);
             break;
@@ -1209,6 +1278,16 @@ static int snapshot_at_s(vctx *x, const imdb_commit_rec *c, const uint8_t *publi
     s->nv = x->nv;
     if (v_enums_copy(x->en, x->nen, &s->en, e)) return e->code; /* F3g */
     s->nen = x->nen;
+    imdb_free(s->rcat); /* L: the roles and grants at this publish */
+    s->rcat = NULL;
+    s->nrcat = 0;
+    imdb_buf rb;
+    if (v_rcat_bytes(&x->rc, &rb, e)) {
+        imdb_buf_free(&rb);
+        return e->code;
+    }
+    s->rcat = rb.p;
+    s->nrcat = rb.len;
     if (x->nsq && !(s->sq = imdb_alloc_array(x->nsq, sizeof *s->sq, e))) return e->code; /* F2a-2 */
     if (x->nsq) memcpy(s->sq, x->sq, x->nsq * sizeof *s->sq);
     s->nsq = x->nsq;
@@ -1653,6 +1732,7 @@ static int add_refs(vref **refs, size_t *n, size_t *cap, const uint8_t mh[32], c
 {
     size_t need = 1;
     for (uint32_t ti = 0; ti < m->nt; ti++) need += 2u * m->t[ti].nseg;
+    need++; /* L: its roles object */
     if (*n + need > *cap) {
         size_t nc = *n + need;
         vref *nr = imdb_realloc_array(*refs, *cap, nc, sizeof *nr, e);
@@ -1661,6 +1741,7 @@ static int add_refs(vref **refs, size_t *n, size_t *cap, const uint8_t mh[32], c
         *cap = nc;
     }
     put_ref(&(*refs)[(*n)++], mh, 'm');
+    if (memcmp(m->rhash, (uint8_t[32]){0}, 32) != 0) put_ref(&(*refs)[(*n)++], m->rhash, 'r'); /* L */
     for (uint32_t ti = 0; ti < m->nt; ti++)
         for (uint32_t k = 0; k < m->t[ti].nseg; k++) {
             put_ref(&(*refs)[(*n)++], m->t[ti].seg[k].seg, 's');
@@ -1780,6 +1861,11 @@ static int verify_lake(imdb_db *db, const vctx *x, imdb_verify_report *rep, imdb
     if (!rc && (ml != db->lake_mlen || memcmp(mb, db->lake_mbytes, ml) != 0))
         rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: manifest on disk differs from the engine's");
     if (!rc) rc = imdb_manifest_parse(mb, ml, &m, e);
+    uint8_t *rob = NULL; /* L: the roles object it names, filled into its sections strictly */
+    size_t robl = 0;
+    if (!rc && memcmp(m.rhash, (uint8_t[32]){0}, 32) != 0) rc = imdb_lake_read_object(ofd, m.rhash, ".rol", &rob, &robl, e);
+    if (!rc) rc = imdb_rcat_fill(&m.rc, rob, robl, true, e);
+    imdb_free(rob);
     if (!rc && (m.seq != db->lake_seq || memcmp(m.db_id, db->db_id, 16) != 0 || m.nt != at->nt ||
                 memcmp(m.prev, at->prev, 32) != 0 || m.boundary != at->boundary))
         rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: manifest identity mismatch");
@@ -1827,6 +1913,13 @@ static int verify_lake(imdb_db *db, const vctx *x, imdb_verify_report *rep, imdb
     for (uint32_t i = 0; i < m.nen && !rc; i++)
         if (!v_enum_same(&m.en[i], &at->en[i]))
             rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: ENUM type %s in the manifest differs from the log", at->en[i].def->name);
+    if (!rc) { /* L: the manifest's roles and grants, the log's at its commit */
+        imdb_buf rcb;
+        if (!(rc = v_rcat_bytes(&m.rc, &rcb, e)) && (rcb.len != at->nrcat || memcmp(rcb.p, at->rcat, rcb.len)))
+            rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: the manifest's roles or grants differ from the log at commit %llu",
+                           (unsigned long long)m.seq);
+        imdb_buf_free(&rcb);
+    }
     if (!rc && m.nsq != at->nsq) /* F2a-2: the manifest's sequences, the log's at its commit */
         rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: the manifest's sequences differ from the log at commit %llu",
                        (unsigned long long)m.seq);
@@ -1951,7 +2044,7 @@ static int verify_lake(imdb_db *db, const vctx *x, imdb_verify_report *rep, imdb
                 rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: unexpected file in objects/");
                 break;
             }
-            k[32] = (uint8_t)de->d_name[65]; /* <hash>.man | .seg | .dv */
+            k[32] = (uint8_t)de->d_name[65]; /* <hash>.man | .seg | .dv | .rol (L) */
             if (!bsearch(k, refs, nrefs, sizeof *refs, cmp_ref))
                 rc = imdb_fail(e, IMDB_ERR_VERIFY,
                                "lake: objects/ holds a file no retained manifest references (an interrupted publish: a "
@@ -1984,6 +2077,8 @@ static int verify_engine(imdb_db *db, const vctx *x, imdb_verify_report *rep, im
     for (uint32_t i = 0; i < x->nen; i++)
         if (!v_enum_same(&x->en[i], &db->enums[i]))
             return imdb_fail(e, IMDB_ERR_VERIFY, "verify: ENUM type %s differs from the log", x->en[i].def->name);
+    int rrc = IMDB_OK; /* L: the roles and grants */
+    if (!v_rcat_same(&x->rc, &db->rc, e, &rrc)) return rrc ? rrc : imdb_fail(e, IMDB_ERR_VERIFY, "verify: the roles or grants differ from the log");
     if (x->nsq != db->nseqs) return imdb_fail(e, IMDB_ERR_VERIFY, "verify: sequence count differs"); /* F2a-2 */
     for (uint32_t i = 0; i < x->nsq; i++)
         if (!v_seq_same(&x->sq[i], &db->seqs[i]))
@@ -2141,6 +2236,13 @@ static int verify_seed(imdb_db *db, vctx *x, imdb_err *e)
     if (!rc && fm.nen) { /* F3g: F's ENUM types, tombstones too */
         if (v_enums_copy(fm.en, fm.nen, &x->en, e)) rc = e->code;
         else x->nen = x->capen = fm.nen;
+    }
+    if (!rc) { /* L: F's roles and grants */
+        x->rc = fm.rc;
+        memset(&fm.rc, 0, sizeof fm.rc);
+        /* F's names and verifiers: the bytes of those the current lake's object still holds, each its commitment's (one
+         * superseded since F stays unknown: the log past F supersedes it) */
+        rc = imdb_rcat_fill(&x->rc, db->lake_robj, db->lake_robjlen, false, e);
     }
     if (!rc && fm.nsq) { /* F2a-2: F's sequences, their state at F */
         if (!(x->sq = imdb_alloc_array(fm.nsq, sizeof *x->sq, e))) rc = e->code;
@@ -2338,6 +2440,9 @@ static int verify_body(imdb_db *db, imdb_verify_report *rep, imdb_err *e)
     if (!rc) rc = verify_log(db, &x, &t_read, &t_par, &t_seq, e);
     if (!rc && x.epoch + 1 != db->nwep)
         rc = imdb_fail(e, IMDB_ERR_VERIFY, "verify: the engine holds %u writer epochs, the log %u", db->nwep, x.epoch + 1);
+    if (!rc && x.rc.npending) /* L stage 2: a role's redacted name or verifier, too */
+        rc = imdb_fail(e, IMDB_ERR_VERIFY, "verify: %llu redacted names or verifiers of roles not authorised by any ERASE",
+                       (unsigned long long)x.rc.npending);
     /* a redaction marker must be authorised by an ERASE somewhere in the log */
     for (uint32_t ti = 0; ti < x.nt && !rc; ti++)
         for (uint64_t vid = 0; vid < x.t[ti].n; vid++) {
@@ -2380,6 +2485,8 @@ static int verify_body(imdb_db *db, imdb_verify_report *rep, imdb_err *e)
     imdb_free(x.at_s.sq); /* F2a-2 */
     v_enums_free(x.at_s.en, x.at_s.nen); /* F3g */
     v_enums_free(x.en, x.nen);
+    imdb_rcat_free(&x.rc); /* L */
+    imdb_free(x.at_s.rcat);
     imdb_free(x.sq);
     imdb_free(x.pin);
     imdb_free(x.starts);

@@ -18,6 +18,7 @@
 #include "codec.h"
 #include "hashmap.h"
 #include "log.h"
+#include "role.h"
 #include "lthash.h"
 #include "sign.h"
 #include "stream.h"
@@ -426,6 +427,7 @@ typedef struct imdb_db {
     imdb_tgroup log_tg;       /* tagged: the open group's layout */
     uint64_t *redact_seqs;    /* commits whose payloads await redaction    */
     size_t nredact, capredact;
+    bool redact_known;        /* a note was taken (L stage 2): nredact 0 then means nothing in this log, not a crash's unknown */
     bool lake_pending;        /* objects + LAKE_HEAD of the lake state not yet written */
     bool gc_pending;          /* published, but unreferenced objects could not all be removed */
     bool lake_ahead;          /* open: LAKE_HEAD named a commit the log no longer holds (a --nosync loss) */
@@ -518,6 +520,7 @@ typedef struct imdb_db {
     uint32_t nviews, capviews;
     imdb_enum *enums; /* F3g: enums[id - 1] is type id, a dropped one a tombstone */
     uint32_t nenums, capenums;
+    imdb_rcat rc;           /* L: the roles, their privileges and memberships (role.h) */
     imdb_sequence *seqs; /* F2a-2: seqs[i] is sequence i, a dropped one a tombstone */
     uint32_t nseqs, capseqs;
     uint32_t *txseq;     /* F2a-2: the active transaction's sequences nextval touched, by id (SEQ_ADVANCE at its commit) */
@@ -543,6 +546,9 @@ typedef struct imdb_db {
     uint8_t lake_manifest[32];
     uint8_t *lake_mbytes;     /* that manifest's bytes                     */
     size_t lake_mlen;
+    uint8_t *lake_robj;       /* L: the roles object it names (lake_rhash; none: zero) */
+    size_t lake_robjlen;
+    uint8_t lake_rhash[32];
     uint8_t *lake_prev;       /* previous manifest (GC keeps its objects); */
     size_t lake_prevlen;      /* NULL after an ERASE                       */
     bool lake_dirty;          /* logical changes since the last manifest   */
@@ -988,12 +994,18 @@ typedef struct imdb_erase_report {
     uint32_t tables;
     uint32_t segments_rewritten;
     bool redaction_pending;   /* committed; physical rewrite deferred (see db->warning) */
+    uint32_t role_entries;    /* L stage 2: ERASE ROLE's names and verifiers erased (0: a known role with nothing left) */
+    uint32_t roles_removed;   /* of the roles reached, dropped ones erased whole (the catalog holds them no more) */
 } imdb_erase_report;
 /* ERASE SUBJECT: every version, in every table with a SUBJECT column of the
  * value's type, whose subject equals the value. */
 int imdb_erase_subject(imdb_db *db, const imdb_value *subject, imdb_erase_report *rep, imdb_err *e);
 /* ERASE an explicit set of versions (sorted, unique (table, vid)). */
 int imdb_erase_versions(imdb_db *db, imdb_erase_ent *ents, uint32_t n, imdb_erase_report *rep, imdb_err *e);
+/* L stage 2: ERASE ROLE name (docs/roles-design.md §11): the live role of the name, its earlier names and verifiers;
+ * every dropped role whose last name it was, everything it holds. Outside a transaction; a name no role holds is an
+ * error; nothing to erase commits nothing */
+int imdb_erase_role(imdb_db *db, const char *name, imdb_erase_report *rep, imdb_err *e);
 
 /* ---- replication ---------------------------------------------------------- */
 /* Writes every frame with seq > after_seq to fd. follow: keep polling. */

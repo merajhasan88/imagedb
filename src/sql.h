@@ -165,6 +165,9 @@ bool imdb_copy_in_stmt(const char *sql, size_t len);
  * commit named first, the totals last. imagedb sql -f restores it into an empty database. A failure part way leaves
  * what was written, without the totals */
 int imdb_dump(imdb_db *db, uint32_t batch, imdb_copy_write_fn wr, void *arg, imdb_err *e);
+/* L: IMDB_DUMP_ROLE_PASSWORDS writes each role's SCRAM-SHA-256 verifier (an offline-guessing target: off by default) */
+#define IMDB_DUMP_ROLE_PASSWORDS 1u
+int imdb_dump_ex(imdb_db *db, uint32_t batch, uint32_t flags, imdb_copy_write_fn wr, void *arg, imdb_err *e);
 
 /* Splits a script into statements (respecting string literals and -- comments).
  * Calls cb for each; stops at the first error. */

@@ -301,7 +301,7 @@ echo "== FA-FE: manifest 7 (the format design's slice 1) breaking one of its rul
 PFA=$WORK/fa; make_db "$PFA"
 "$FORGE" manifest-lie "$PFA" section
 must_fail "a later imagedb's format" "$BIN" verify "$PFA"
-must_fail "manifest: section 5 not empty" "$AUD" verify "$PFA"
+must_fail "manifest: section 7 not empty" "$AUD" verify "$PFA"
 PFB=$WORK/fb; make_db "$PFB"
 "$FORGE" manifest-lie "$PFB" keylist
 must_fail "physical divergence" "$BIN" verify "$PFB"   # an unreadable manifest: the open replays and rebuilds it (as X)
@@ -687,5 +687,57 @@ done
 echo "   VA a table dropped under a view, VB a view named as a table, VC a view dropped under another: both refuse;
    VD a view whose dependencies omit what its text reads, VE one whose column it types otherwise: the engine's
    re-bind and the auditor's own binder (P2 S7b) refuse both (design.md §5, Views)"
+
+
+echo "== LA-LP: roles and grants (L) broken, each signed or in the manifest: a reserved name, a live role's name taken by a
+   CREATE and by a RENAME, a payload entry not its commitment's, a redacted entry no ERASE names, an ALTER that changes
+   nothing, a DROP of a role holding a privilege, a GRANT to a dropped role, on a dropped table, of bits held, a
+   membership cycle, a manifest's grant another than the log's; stage 2: an ERASE of a live role's current name, one
+   under another commitment, one naming part of a role's entries, an ERASE ROLE whose role's entries are still in the log"
+l_db() { # $1: alice (LOGIN, a password, a member of staff), staff (SELECT on t), gone (dropped), gone2 (a password,
+  # dropped); tables t and old (dropped)
+  "$BIN" init "$1" >/dev/null
+  "$BIN" sql "$1" --nosync -c "CREATE TABLE t (id INT64 PRIMARY KEY);" -c "CREATE TABLE old (id INT64 PRIMARY KEY);" \
+    -c "CREATE ROLE alice LOGIN PASSWORD 'pw';" -c "CREATE ROLE staff;" -c "CREATE ROLE gone;" -c "DROP ROLE gone;" \
+    -c "CREATE ROLE gone2 PASSWORD 'pw2';" -c "DROP ROLE gone2;" \
+    -c "DROP TABLE old;" -c "GRANT SELECT ON t TO staff;" -c "GRANT staff TO alice;" -c "INSERT INTO t VALUES (1);" >/dev/null
+  "$BIN" verify "$1" >/dev/null && "$AUD" verify "$1" >/dev/null || fail "the honest directory must verify"
+}
+l_case() { # $1 the forge's kind, $2 the engine's reason, $3 the auditor's
+  local d=$WORK/l-$1; l_db "$d"
+  "$FORGE" index-lie "$d" "$1"
+  must_fail "$2" "$BIN" verify "$d"
+  must_fail "$3" "$AUD" verify "$d"
+}
+l_case role-reserved "a role's name is malformed" "a role's name is malformed"                                     # LA
+l_case role-taken "takes a live role's name" "takes a live role's name"                                             # LB
+l_case role-rename-taken "takes a live role's name" "takes a live role's name"                                      # LC
+l_case grant-dropped-role "names a role that is not live" "names a role that is not live"                           # LD
+l_case grant-dropped-table "names a table or view that is not live" "names a table or view that is not live"         # LE
+l_case drop-role-granted "role staff holds privileges" "DROP ROLE of a role holding a privilege or a membership"     # LF
+l_case member-cycle "would close a cycle" "closes a cycle"                                                          # LG
+l_case grant-held "not exactly those it adds" "not exactly those it changes"                                        # LH
+l_case role-commitment "a role's name does not match its commitment" "a role's name is not its commitment's"        # LI
+l_case role-redacted "redacted payloads that no ERASE authorises" "not authorised by any ERASE" # LK: stage 2, a debt never settled
+l_case role-noop "ALTER ROLE of a field that changes nothing" "ALTER ROLE of a field that changes nothing"           # LL
+l_case erase-role-live "an ERASE of a live role's current name or verifier" \
+  "an ERASE of a live role's current name or verifier"                                                        # LM
+l_case erase-role-commit "an ERASE's role entry with another commitment" \
+  "an ERASE's role entry with another commitment"                                                             # LN
+l_case erase-role-part "names part of role 4's entries" "names part of role 4's entries" # LO: gone2's name alone
+PLP=$WORK/lp; l_db "$PLP" # LP: ERASE ROLE committed, its role's entries still in the log (the crash window, as B)
+"$BIN" sql "$PLP" --nosync -c "CHECKPOINT;" >/dev/null
+cp -a "$PLP" "$WORK/lp-pre"
+"$BIN" sql "$PLP" --nosync -c "ERASE ROLE gone;" >/dev/null
+cp "$PLP/log/$(ls "$PLP/log" | tail -1)" "$WORK/lp-pre/log/"
+rm -rf "$PLP"; mv "$WORK/lp-pre" "$PLP"
+must_fail "erasure incomplete" "$AUD" verify "$PLP"
+must_fail "erasure incomplete" "$BIN" verify "$PLP"
+PLJ=$WORK/lj; l_db "$PLJ"
+"$BIN" sql "$PLJ" --nosync -c "CHECKPOINT;" >/dev/null
+"$BIN" verify "$PLJ" >/dev/null && "$AUD" verify "$PLJ" >/dev/null || fail "the honest directory must verify"
+"$FORGE" manifest-lie "$PLJ" grant-bits
+must_fail "roles or grants differ from the log" "$BIN" verify "$PLJ" # LJ: the engine's catalog took the manifest's (a snapshot open)
+must_fail "the manifest's roles or grants differ from the log's at its commit" "$AUD" verify "$PLJ"
 
 echo "ALL REJECTION CHECKS PASSED"

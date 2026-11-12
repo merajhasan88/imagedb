@@ -845,6 +845,13 @@ typedef struct erase_ent {
     uint8_t commit[32];
 } erase_ent;
 
+typedef struct arer { /* L stage 2: op 12's third list, an ERASE ROLE's entry: a role's name or verifier by its commit */
+    uint32_t role;
+    uint64_t seq;
+    uint8_t what; /* 1 name, 2 verifier */
+    uint8_t commit[32];
+} arer;
+
 /* an index definition (CREATE INDEX): its name, flags (1: unique) and columns in key order */
 #define MAX_INDEXES 16
 #define MAX_INDEX_COLS 4
@@ -1034,6 +1041,195 @@ typedef struct achk {
     char *text;
 } achk;
 
+/* ---- L: roles and grants, their records (docs/roles-design.md §10: this auditor's own code) ----------------------- */
+
+#define MAX_ROLES 16384u           /* roles held: live, and dropped ones whose entries are not all erased */
+#define MAX_ROLE_HISTORY 256u      /* a role's earlier entries */
+#define MAX_GRANTS 1048576u        /* live privilege and membership records */
+#define MAX_GRANT_RECORDS 65536u   /* one GRANT's or REVOKE's */
+#define VERIFIER_MAX 133u          /* u32 iterations, u8 salt length, a salt of 64, two keys of 32 */
+
+typedef struct agr { /* a GRANT's or REVOKE's record, or a manifest's grant: the reserved fields read 0 at the decode */
+    uint8_t kind, okind;
+    uint32_t a, b, privs;
+} agr;
+
+typedef struct arop { /* ops 33 to 37 */
+    uint32_t rid, fields, attrs;
+    uint8_t ncommit[32], vcommit[32];
+    bool vhas;               /* field 4 with a verifier */
+    bool npresent, vpresent; /* the payload's entries present, not redacted */
+    const uint8_t *nsalt, *nb, *vsalt, *vb;
+    uint32_t nlen, vlen;
+    agr *g;                  /* 36 and 37 */
+    uint32_t ng;
+} arop;
+
+typedef struct aentry { /* a role's name or verifier: the commit that set it, its commitment, its bytes unless erased */
+    uint64_t at;
+    uint8_t commit[32];
+    bool present;
+    bool erased;  /* L: erased (an ERASE named it, or a redacted copy holds it pending one); present: its bytes known */
+    bool pending; /* L stage 2: its op's entry redacted, the ERASE naming it not yet read (erased too) */
+    uint8_t salt[16];
+    uint32_t len;
+    uint8_t b[VERIFIER_MAX];
+} aentry;
+
+typedef struct ahist { /* an earlier entry: its commit, what, its commitment */
+    uint64_t at;
+    uint8_t what;
+    bool pending; /* L stage 2: as an aentry's */
+    uint8_t commit[32];
+} ahist;
+
+typedef struct apriv {
+    uint8_t okind;
+    uint32_t oid, privs;
+} apriv;
+
+typedef struct arole {
+    uint32_t id;
+    uint64_t created, dropped;
+    uint32_t attrs;
+    aentry name, ver;
+    bool has_ver;
+    ahist *h; /* by (at, what) */
+    uint32_t nh;
+    apriv *p; /* by (okind, oid) */
+    uint32_t np;
+    uint32_t *g; /* the roles it is a member of, ascending */
+    uint32_t ng;
+} arole;
+
+typedef struct aroles {
+    arole *r; /* by id */
+    uint32_t n, cap, last, ngrants;
+    uint64_t npending; /* L stage 2: entries whose op's payload is redacted, pending their ERASE */
+} aroles;
+
+typedef struct abuf { /* the encoder's bytes: a manifest's sections 5 and 6 as this auditor makes them */
+    uint8_t *p;
+    size_t n, cap;
+} abuf;
+
+static void ab_put(abuf *b, const void *d, size_t k)
+{
+    if (b->n + k > b->cap) {
+        b->cap = (b->n + k) * 2 + 64;
+        b->p = xrealloc(b->p, b->cap, 1);
+    }
+    if (k) memcpy(b->p + b->n, d, k);
+    b->n += k;
+}
+static void ab_u8(abuf *b, uint8_t v) { ab_put(b, &v, 1); }
+static void ab_u16(abuf *b, uint16_t v)
+{
+    uint8_t t[2] = {(uint8_t)v, (uint8_t)(v >> 8)};
+    ab_put(b, t, 2);
+}
+static void ab_u32(abuf *b, uint32_t v)
+{
+    uint8_t t[4];
+    put32(t, v);
+    ab_put(b, t, 4);
+}
+static void ab_u64(abuf *b, uint64_t v)
+{
+    uint8_t t[8];
+    put64(t, v);
+    ab_put(b, t, 8);
+}
+
+/* the records' order: (kind, a, object kind (0 for a membership), b) */
+static int agr_cmp(const agr *x, const agr *y)
+{
+    if (x->kind != y->kind) return x->kind < y->kind ? -1 : 1;
+    if (x->a != y->a) return x->a < y->a ? -1 : 1;
+    if (x->okind != y->okind) return x->okind < y->okind ? -1 : 1;
+    if (x->b != y->b) return x->b < y->b ? -1 : 1;
+    return 0;
+}
+
+/* a record from its bytes, by its own rules (24 bytes a privilege's, 17 a membership's) */
+static bool agr_read(rd *r, agr *g)
+{
+    memset(g, 0, sizeof *g);
+    g->kind = rd_u8(r);
+    g->a = rd_u32(r);
+    uint32_t gopt = 0, grantor;
+    uint16_t ncols = 0;
+    if (g->kind == 1) {
+        g->okind = rd_u8(r);
+        g->b = rd_u32(r);
+        g->privs = rd_u32(r);
+        gopt = rd_u32(r);
+        ncols = rd_u16(r);
+    } else {
+        g->b = rd_u32(r);
+        g->privs = rd_u32(r); /* a membership's options */
+    }
+    grantor = rd_u32(r);
+    if (r->bad || !g->a || gopt || ncols || grantor) return false;
+    if (g->kind == 1)
+        return (g->okind == 1 || g->okind == 2) && g->privs && !(g->privs & ~15u) && (g->okind != 2 || g->privs == 1);
+    return g->kind == 2 && g->b && g->b != g->a && !g->privs;
+}
+
+static void agr_write(abuf *b, const agr *g)
+{
+    ab_u8(b, g->kind);
+    ab_u32(b, g->a);
+    if (g->kind == 1) {
+        ab_u8(b, g->okind);
+        ab_u32(b, g->b);
+        ab_u32(b, g->privs);
+        ab_u32(b, 0);
+        ab_u16(b, 0);
+    } else {
+        ab_u32(b, g->b);
+        ab_u32(b, 0);
+    }
+    ab_u32(b, 0);
+}
+
+/* SHA-256("IMDBROL1" | u32 role | u8 what | salt16 | u32 len | bytes) */
+static void role_commit(uint32_t role, uint8_t what, const uint8_t salt[16], const uint8_t *b, uint32_t n, uint8_t out[32])
+{
+    uint8_t h[13], l[4];
+    memcpy(h, "IMDBROL1", 8);
+    put32(h + 8, role);
+    h[12] = what;
+    put32(l, n);
+    a_sha256_ctx c;
+    a_sha256_init(&c);
+    a_sha256_update(&c, h, sizeof h);
+    a_sha256_update(&c, salt, 16);
+    a_sha256_update(&c, l, 4);
+    if (n) a_sha256_update(&c, b, n);
+    a_sha256_final(&c, out);
+}
+
+static bool rname_ok(const uint8_t *s, size_t n)
+{
+    if (!ident_ok(s, n)) return false;
+    char t[64];
+    memcpy(t, s, n);
+    t[n] = 0;
+    return strcmp(t, "public") && strcmp(t, "none") && strcmp(t, "current_user") && strcmp(t, "session_user") &&
+           strcmp(t, "current_role") && strncmp(t, "pg_", 3);
+}
+
+static bool verifier_ok(const uint8_t *b, size_t n)
+{
+    if (n < 5) return false;
+    uint32_t it = le32(b);
+    uint8_t sl = b[4];
+    return it >= 1000 && it <= 1000000 && sl >= 8 && sl <= 64 && n == 5u + sl + 64u;
+}
+
+static void grants_end(aroles *R, uint8_t okind, uint32_t oid); /* a DROP TABLE's or DROP VIEW's (below) */
+
 typedef struct op {
     uint8_t code;
     uint32_t table;
@@ -1043,6 +1239,8 @@ typedef struct op {
     schema *sch;
     erase_ent *erase;
     uint32_t n_erase;
+    arer *rer; /* L stage 2: its role entries, by (role, seq, what) */
+    uint32_t n_rer;
     uint32_t epoch; /* WRITER_KEY: the next epoch, its key, 1 rotation or 2 promotion */
     const uint8_t *new_pk;
     uint8_t how;
@@ -1074,6 +1272,7 @@ typedef struct op {
     uint32_t eid;
     const uint8_t *lab;
     uint8_t lablen;
+    arop *ro;           /* L: ops 33 to 37 */
     /* payload */
     bool redacted;
     const uint8_t *salt, *row;
@@ -1095,6 +1294,7 @@ static void commit_free(commit *c)
         if (c->ops[i].sch) free(c->ops[i].sch->raw);
         free(c->ops[i].sch);
         free(c->ops[i].erase);
+        free(c->ops[i].rer); /* L stage 2 */
         aviewdef_free(c->ops[i].vd);
         free(c->ops[i].cd);
         free(c->ops[i].sd); /* F2a-2 */
@@ -1103,6 +1303,8 @@ static void commit_free(commit *c)
         free(c->ops[i].fk); /* F2b-2 */
         if (c->ops[i].ed) aenum_free(c->ops[i].ed); /* F3g */
         free(c->ops[i].ed);
+        if (c->ops[i].ro) free(c->ops[i].ro->g); /* L */
+        free(c->ops[i].ro);
     }
     free(c->ops);
     memset(c, 0, sizeof *c);
@@ -1535,8 +1737,8 @@ static int decode_body(const uint8_t *b, size_t n, const meta *m, keys *ks, comm
             break;
         case 12: {
             uint32_t k = rd_u32(&hr);
-            if (hr.bad || k == 0 || k > (1u << 24) || k > rd_left(&hr) / 44) return fail("ERASE: bad count");
-            o->erase = xcalloc(k, sizeof *o->erase);
+            if (hr.bad || k > (1u << 24) || k > rd_left(&hr) / 44) return fail("ERASE: bad count"); /* L stage 2: 0 with roles */
+            o->erase = xcalloc(k ? k : 1, sizeof *o->erase);
             o->n_erase = k;
             for (uint32_t j = 0; j < k; j++) {
                 o->erase[j].table = rd_u32(&hr);
@@ -1555,6 +1757,23 @@ static int decode_body(const uint8_t *b, size_t n, const meta *m, keys *ks, comm
                 if (rw && prevrw && (le32(prevrw) > le32(rw) || (le32(prevrw) == le32(rw) && memcmp(prevrw + 4, rw + 4, 32) >= 0)))
                     return fail("ERASE: rewrites not strictly sorted");
                 prevrw = rw;
+            }
+            uint32_t q = rd_u32(&hr); /* L stage 2: the role entries */
+            if (hr.bad || q > 16384u * 258u || q > rd_left(&hr) / 45 || (!k && (!q || m2)) || (k && q))
+                return fail("ERASE: no version and no role entry, both (no writer signs one), or a bad role entry count");
+            o->rer = xcalloc(q ? q : 1, sizeof *o->rer);
+            o->n_rer = q;
+            for (uint32_t j = 0; j < q; j++) {
+                arer *x = &o->rer[j];
+                x->role = rd_u32(&hr);
+                x->seq = rd_u64(&hr);
+                x->what = rd_u8(&hr);
+                const uint8_t *cm = rd_bytes(&hr, 32);
+                if (cm) memcpy(x->commit, cm, 32);
+                const arer *pv = j ? &o->rer[j - 1] : NULL;
+                if (hr.bad || !x->role || !x->seq || x->seq >= c->seq || (x->what != 1 && x->what != 2) ||
+                    (pv && (pv->role > x->role || (pv->role == x->role && (pv->seq > x->seq || (pv->seq == x->seq && pv->what >= x->what))))))
+                    return fail("ERASE: role entries out of range or not strictly sorted");
             }
             o->manifest = rd_bytes(&hr, 32);
             break;
@@ -1603,6 +1822,49 @@ static int decode_body(const uint8_t *b, size_t n, const meta *m, keys *ks, comm
             o->view = rd_u32(&hr);
             if (!hr.bad && (nops != 1 || o->view >= MAX_VIEWS)) return fail("header: a view op must be the only op, in range");
             break;
+        case 33: /* CREATE_ROLE (L): alone, its body (docs/roles-design.md §10) */
+        case 34: { /* ALTER_ROLE: the same body */
+            arop *x = o->ro = xcalloc(1, sizeof *o->ro);
+            x->rid = rd_u32(&hr);
+            x->fields = rd_u32(&hr);
+            if (x->fields & 1) x->attrs = rd_u32(&hr);
+            if (x->fields & 2) {
+                const uint8_t *q = rd_bytes(&hr, 32);
+                if (q) memcpy(x->ncommit, q, 32);
+            }
+            if (x->fields & 4) {
+                uint8_t has = rd_u8(&hr);
+                if (has > 1) return fail("header: a role op's verifier field is bad");
+                x->vhas = has;
+                const uint8_t *q = has ? rd_bytes(&hr, 32) : NULL;
+                if (q) memcpy(x->vcommit, q, 32);
+            }
+            if (!hr.bad && (nops != 1 || !x->rid || x->rid == UINT32_MAX || !x->fields || (x->fields & ~7u) ||
+                            ((x->fields & 1) && (x->attrs & ~3u)) ||
+                            (o->code == 33 && ((x->fields & 3) != 3 || ((x->fields & 4) && !x->vhas)))))
+                return fail("header: a role op must be the only op, its fields its own");
+            break;
+        }
+        case 35: { /* DROP_ROLE: u32 role, alone */
+            arop *x = o->ro = xcalloc(1, sizeof *o->ro);
+            x->rid = rd_u32(&hr);
+            if (!hr.bad && (nops != 1 || !x->rid || x->rid == UINT32_MAX)) return fail("header: DROP ROLE must be the only op, in range");
+            break;
+        }
+        case 36: /* GRANT, REVOKE: u32 n, the records, strictly increasing; alone */
+        case 37: {
+            arop *x = o->ro = xcalloc(1, sizeof *o->ro);
+            uint32_t ngr = rd_u32(&hr);
+            if (hr.bad) break;
+            if (nops != 1 || !ngr || ngr > MAX_GRANT_RECORDS || ngr > rd_left(&hr) / 17)
+                return fail("header: a GRANT or REVOKE must be the only op, of 1 to %u records", MAX_GRANT_RECORDS);
+            x->g = xcalloc(ngr, sizeof *x->g);
+            x->ng = ngr;
+            for (uint32_t k = 0; k < ngr; k++)
+                if (!agr_read(&hr, &x->g[k]) || (k && agr_cmp(&x->g[k - 1], &x->g[k]) >= 0))
+                    return fail("header: a GRANT's or REVOKE's record out of its rules or order");
+            break;
+        }
         case 30: /* CREATE_ENUM (F3g): alone, its definition */
             o->ed = xcalloc(1, sizeof *o->ed);
             if (decode_enumdef(&hr, o->ed, "header")) return -1;
@@ -1703,6 +1965,30 @@ static int decode_body(const uint8_t *b, size_t n, const meta *m, keys *ks, comm
     rd pr = {p, plen, 0, false};
     for (uint32_t i = 0; i < nops; i++) {
         op *o = &c->ops[i];
+        if (o->code == 33 || o->code == 34) { /* L: the name's entry, then the verifier's, each its commitment's */
+            arop *x = o->ro;
+            for (int wh = 1; wh <= 2; wh++) {
+                if (wh == 1 ? !(x->fields & 2) : !((x->fields & 4) && x->vhas)) continue;
+                uint8_t kind = rd_u8(&pr);
+                if (pr.bad || kind > 1) return fail("payload: a role's entry is bad");
+                bool *pres = wh == 1 ? &x->npresent : &x->vpresent;
+                *pres = kind == 0;
+                if (!*pres) continue;
+                const uint8_t *s = rd_bytes(&pr, 16);
+                uint32_t elen = rd_u32(&pr);
+                if (pr.bad || elen > (wh == 1 ? 63u : VERIFIER_MAX)) return fail("payload: a role's entry is bad");
+                const uint8_t *eb = rd_bytes(&pr, elen);
+                if (pr.bad) return fail("payload: truncated");
+                uint8_t eh[32];
+                role_commit(x->rid, (uint8_t)wh, s, eb, elen, eh);
+                if (memcmp(eh, wh == 1 ? x->ncommit : x->vcommit, 32))
+                    return fail("payload: a role's %s is not its commitment's", wh == 1 ? "name" : "verifier");
+                if (wh == 1 ? !rname_ok(eb, elen) : !verifier_ok(eb, elen)) return fail("payload: a role's %s is malformed", wh == 1 ? "name" : "verifier");
+                if (wh == 1) x->nsalt = s, x->nb = eb, x->nlen = elen;
+                else x->vsalt = s, x->vb = eb, x->vlen = elen;
+            }
+            continue;
+        }
         if (o->code != 2 && o->code != 4) continue;
         uint8_t kind = rd_u8(&pr);
         if (pr.bad || kind > 1) return fail("payload: bad entry");
@@ -1906,6 +2192,10 @@ typedef struct state {
     uint32_t nen, capen;
     struct aenum *en_lake;
     uint32_t nen_lake;
+    aroles ro;               /* L: the roles and grants the log made; s5_lake and s6_lake their manifest sections at the
+                              * lake snapshot, as this auditor encodes them */
+    uint8_t *s5_lake, *s6_lake, *o_lake; /* o_lake: the roles object then, as this auditor makes it */
+    size_t n5_lake, n6_lake, no_lake;
     char note[200];
 } state;
 
@@ -2507,6 +2797,7 @@ static int apply_view_op(state *S, const op *o, uint64_t seq)
         const aview *n = view_naming(S, 2, o->view);
         if (n) return fail("commit %llu: DROP of view %s, which view %s names", (unsigned long long)seq, S->v[o->view].name, n->name);
         S->v[o->view].dropped_at = seq;
+        grants_end(&S->ro, 2, o->view); /* L: its grants end with it */
         return 0;
     }
     const aviewdef *d = o->vd; /* CREATE_VIEW: the next id, a free name, every dependency live */
@@ -2567,6 +2858,494 @@ static int apply_enum_op(state *S, const op *o, uint64_t seq)
     snprintf(what, sizeof what, "commit %llu: ADD VALUE", sq);
     return aenum_add(e, o->lab, o->lablen, seq, what);
 }
+
+/* ---- L: roles and grants, the model and the rules (docs/roles-design.md §10) ------------------------------------- */
+
+static arole *arole_at(aroles *R, uint32_t id)
+{
+    uint32_t lo = 0, hi = R->n;
+    while (lo < hi) {
+        uint32_t m = lo + (hi - lo) / 2;
+        if (R->r[m].id < id) lo = m + 1;
+        else hi = m;
+    }
+    return lo < R->n && R->r[lo].id == id ? &R->r[lo] : NULL;
+}
+
+static arole *arole_live(aroles *R, uint32_t id)
+{
+    arole *x = arole_at(R, id);
+    return x && !x->dropped ? x : NULL;
+}
+
+static bool arole_named(const aroles *R, const uint8_t *b, uint32_t n)
+{
+    for (uint32_t i = 0; i < R->n; i++)
+        if (!R->r[i].dropped && R->r[i].name.present && R->r[i].name.len == n && !memcmp(R->r[i].name.b, b, n)) return true;
+    return false;
+}
+
+static void aentry_set(aentry *e, uint64_t at, const uint8_t cm[32], const uint8_t *salt, const uint8_t *b, uint32_t n)
+{
+    memset(e, 0, sizeof *e);
+    e->at = at;
+    memcpy(e->commit, cm, 32);
+    e->present = true;
+    memcpy(e->salt, salt, 16);
+    e->len = n;
+    memcpy(e->b, b, n);
+}
+
+/* L stage 2: a redacted entry: erased, its bytes unknown, pending the ERASE that names it */
+static void aentry_pend(aroles *R, aentry *e, uint64_t at, const uint8_t cm[32])
+{
+    memset(e, 0, sizeof *e);
+    e->at = at;
+    memcpy(e->commit, cm, 32);
+    e->erased = e->pending = true;
+    R->npending++;
+}
+
+/* an entry superseded: into the earlier ones by (commit, what) */
+static void ahist_ins(arole *x, const aentry *e, uint8_t what)
+{
+    uint32_t i = x->nh;
+    while (i && (x->h[i - 1].at > e->at || (x->h[i - 1].at == e->at && x->h[i - 1].what > what))) i--;
+    x->h = xrealloc(x->h, (size_t)x->nh + 1, sizeof *x->h);
+    memmove(&x->h[i + 1], &x->h[i], (size_t)(x->nh - i) * sizeof *x->h);
+    x->h[i].at = e->at;
+    x->h[i].what = what;
+    memcpy(x->h[i].commit, e->commit, 32);
+    x->h[i].pending = e->pending;
+    x->nh++;
+}
+
+static uint32_t apriv_at(const arole *x, uint8_t okind, uint32_t oid)
+{
+    uint32_t lo = 0, hi = x->np;
+    while (lo < hi) {
+        uint32_t m = lo + (hi - lo) / 2;
+        if (x->p[m].okind < okind || (x->p[m].okind == okind && x->p[m].oid < oid)) lo = m + 1;
+        else hi = m;
+    }
+    return lo;
+}
+
+static uint32_t privs_of(const arole *x, uint8_t okind, uint32_t oid)
+{
+    uint32_t i = apriv_at(x, okind, oid);
+    return i < x->np && x->p[i].okind == okind && x->p[i].oid == oid ? x->p[i].privs : 0;
+}
+
+static uint32_t agroup_at(const arole *x, uint32_t g)
+{
+    uint32_t lo = 0, hi = x->ng;
+    while (lo < hi) {
+        uint32_t m = lo + (hi - lo) / 2;
+        if (x->g[m] < g) lo = m + 1;
+        else hi = m;
+    }
+    return lo;
+}
+
+static bool member_of(const arole *x, uint32_t g)
+{
+    uint32_t i = agroup_at(x, g);
+    return i < x->ng && x->g[i] == g;
+}
+
+static void priv_change(aroles *R, arole *x, uint8_t okind, uint32_t oid, uint32_t bits, bool revoke)
+{
+    uint32_t i = apriv_at(x, okind, oid);
+    bool has = i < x->np && x->p[i].okind == okind && x->p[i].oid == oid;
+    if (has) {
+        x->p[i].privs = revoke ? x->p[i].privs & ~bits : x->p[i].privs | bits;
+        if (!x->p[i].privs) {
+            memmove(&x->p[i], &x->p[i + 1], (size_t)(x->np - i - 1) * sizeof *x->p);
+            x->np--;
+            R->ngrants--;
+        }
+    } else if (!revoke) {
+        x->p = xrealloc(x->p, (size_t)x->np + 1, sizeof *x->p);
+        memmove(&x->p[i + 1], &x->p[i], (size_t)(x->np - i) * sizeof *x->p);
+        x->p[i] = (apriv){.okind = okind, .oid = oid, .privs = bits};
+        x->np++;
+        R->ngrants++;
+    }
+}
+
+static void group_change(aroles *R, arole *x, uint32_t g, bool revoke)
+{
+    uint32_t i = agroup_at(x, g);
+    bool has = i < x->ng && x->g[i] == g;
+    if (revoke && has) {
+        memmove(&x->g[i], &x->g[i + 1], (size_t)(x->ng - i - 1) * sizeof *x->g);
+        x->ng--;
+        R->ngrants--;
+    } else if (!revoke && !has) {
+        x->g = xrealloc(x->g, (size_t)x->ng + 1, sizeof *x->g);
+        memmove(&x->g[i + 1], &x->g[i], (size_t)(x->ng - i) * sizeof *x->g);
+        x->g[i] = g;
+        x->ng++;
+        R->ngrants++;
+    }
+}
+
+/* from reaches to through the memberships held and the op's records rec[0, k) */
+static bool reaches(aroles *R, const agr *rec, uint32_t k, uint32_t from, uint32_t to)
+{
+    uint8_t *seen = xcalloc(R->n ? R->n : 1, 1);
+    uint32_t *st = xcalloc((size_t)R->n + 1, sizeof *st), top = 0;
+    bool hit = false;
+    arole *f = arole_at(R, from);
+    if (f) {
+        seen[f - R->r] = 1;
+        st[top++] = (uint32_t)(f - R->r);
+    }
+    while (top && !hit) {
+        const arole *x = &R->r[st[--top]];
+        if (x->id == to) {
+            hit = true;
+            break;
+        }
+        for (uint32_t j = 0; j < x->ng + k; j++) {
+            uint32_t gid;
+            if (j < x->ng) gid = x->g[j];
+            else if (rec[j - x->ng].kind == 2 && rec[j - x->ng].a == x->id) gid = rec[j - x->ng].b;
+            else continue;
+            arole *y = arole_at(R, gid);
+            if (y && !seen[y - R->r]) {
+                seen[y - R->r] = 1;
+                st[top++] = (uint32_t)(y - R->r);
+            }
+        }
+    }
+    free(seen);
+    free(st);
+    return hit;
+}
+
+static bool object_live(const state *S, uint8_t okind, uint32_t oid)
+{
+    if (okind == 1) return oid < S->nt && !S->t[oid].dropped_at;
+    return okind == 2 && oid < S->nv && !S->v[oid].dropped_at;
+}
+
+/* ops 33 to 37, each alone in its commit */
+static int apply_role_op(state *S, const op *o, uint64_t seq)
+{
+    aroles *R = &S->ro;
+    const arop *x = o->ro;
+    unsigned long long sq = (unsigned long long)seq;
+    if (o->code == 33 || o->code == 34) {
+        /* L stage 2: a redacted entry pending its ERASE (an unknown name: no uniqueness to check) */
+        arole *r = NULL;
+        if (o->code == 33) {
+            if (x->rid != R->last + 1) return fail("commit %llu: CREATE ROLE out of sequence", sq);
+            if (R->n >= MAX_ROLES) return fail("commit %llu: CREATE ROLE past %u roles held", sq, MAX_ROLES);
+        } else {
+            if (!(r = arole_live(R, x->rid))) return fail("commit %llu: ALTER ROLE of a role that is not live", sq);
+            if (((x->fields & 1) && x->attrs == r->attrs) || ((x->fields & 4) && !x->vhas && !r->has_ver))
+                return fail("commit %llu: ALTER ROLE of a field that changes nothing", sq);
+            if (r->nh + ((x->fields & 2) ? 1u : 0u) + ((x->fields & 4) && r->has_ver ? 1u : 0u) > MAX_ROLE_HISTORY)
+                return fail("commit %llu: ALTER ROLE past %u earlier entries", sq, MAX_ROLE_HISTORY);
+        }
+        if ((x->fields & 2) && x->npresent && arole_named(R, x->nb, x->nlen))
+            return fail("commit %llu: role %u takes a live role's name", sq, x->rid);
+        if (o->code == 33) {
+            if (R->n == R->cap) {
+                R->cap = R->cap ? R->cap * 2 : 8;
+                R->r = xrealloc(R->r, R->cap, sizeof *R->r);
+            }
+            arole *n = &R->r[R->n++];
+            memset(n, 0, sizeof *n);
+            n->id = x->rid;
+            n->created = seq;
+            n->attrs = x->attrs;
+            if (x->npresent) aentry_set(&n->name, seq, x->ncommit, x->nsalt, x->nb, x->nlen);
+            else aentry_pend(R, &n->name, seq, x->ncommit);
+            if (x->fields & 4) {
+                if (x->vpresent) aentry_set(&n->ver, seq, x->vcommit, x->vsalt, x->vb, x->vlen);
+                else aentry_pend(R, &n->ver, seq, x->vcommit);
+                n->has_ver = true;
+            }
+            R->last = x->rid;
+            return 0;
+        }
+        if (x->fields & 1) r->attrs = x->attrs;
+        if (x->fields & 2) {
+            ahist_ins(r, &r->name, 1);
+            if (x->npresent) aentry_set(&r->name, seq, x->ncommit, x->nsalt, x->nb, x->nlen);
+            else aentry_pend(R, &r->name, seq, x->ncommit);
+        }
+        if (x->fields & 4) {
+            if (r->has_ver) ahist_ins(r, &r->ver, 2);
+            memset(&r->ver, 0, sizeof r->ver);
+            r->has_ver = x->vhas;
+            if (x->vhas && x->vpresent) aentry_set(&r->ver, seq, x->vcommit, x->vsalt, x->vb, x->vlen);
+            else if (x->vhas) aentry_pend(R, &r->ver, seq, x->vcommit);
+        }
+        return 0;
+    }
+    if (o->code == 35) {
+        arole *r = arole_live(R, x->rid);
+        if (!r) return fail("commit %llu: DROP ROLE of a role that is not live", sq);
+        if (r->np || r->ng) return fail("commit %llu: DROP ROLE of a role holding a privilege or a membership", sq);
+        for (uint32_t i = 0; i < R->n; i++)
+            if (member_of(&R->r[i], r->id)) return fail("commit %llu: DROP ROLE of a role with a member", sq);
+        r->dropped = seq;
+        return 0;
+    }
+    bool revoke = o->code == 37;
+    uint32_t newrecs = 0;
+    for (uint32_t k = 0; k < x->ng; k++) {
+        const agr *g = &x->g[k];
+        arole *ra = arole_live(R, g->a);
+        if (!ra) return fail("commit %llu: a %s names a role that is not live", sq, revoke ? "REVOKE" : "GRANT");
+        if (g->kind == 1) {
+            if (!object_live(S, g->okind, g->b)) return fail("commit %llu: a %s names a table or view that is not live", sq, revoke ? "REVOKE" : "GRANT");
+            uint32_t held = privs_of(ra, g->okind, g->b);
+            if (revoke ? (g->privs & ~held) != 0 : (g->privs & held) != 0)
+                return fail("commit %llu: a %s record's privileges are not exactly those it changes", sq, revoke ? "REVOKE" : "GRANT");
+            newrecs += !revoke && !held;
+        } else {
+            if (!arole_live(R, g->b)) return fail("commit %llu: a %s names a role that is not live", sq, revoke ? "REVOKE" : "GRANT");
+            if (member_of(ra, g->b) != revoke) return fail("commit %llu: a %s record's membership is not what it changes", sq, revoke ? "REVOKE" : "GRANT");
+            if (!revoke && reaches(R, x->g, k, g->b, g->a)) return fail("commit %llu: a GRANT's membership closes a cycle", sq);
+            newrecs += !revoke;
+        }
+    }
+    if (!revoke && R->ngrants + newrecs > MAX_GRANTS) return fail("commit %llu: a GRANT past %u records", sq, MAX_GRANTS);
+    for (uint32_t k = 0; k < x->ng; k++) {
+        const agr *g = &x->g[k];
+        arole *ra = arole_at(R, g->a);
+        if (g->kind == 1) priv_change(R, ra, g->okind, g->b, g->privs, revoke);
+        else group_change(R, ra, g->b, revoke);
+    }
+    return 0;
+}
+
+/* ---- L stage 2: ERASE ROLE's entries (docs/roles-design.md §11), by this auditor's own model ------------------------- */
+
+static aentry *acur_find(arole *r, uint64_t at, uint8_t what) /* the current entry an op set at commit at */
+{
+    aentry *e = what == 1 ? &r->name : r->has_ver ? &r->ver : NULL;
+    return e && e->at == at ? e : NULL;
+}
+
+static uint32_t ahist_find(const arole *r, uint64_t at, uint8_t what) /* an earlier entry's place, or nh */
+{
+    for (uint32_t k = 0; k < r->nh; k++)
+        if (r->h[k].at == at && r->h[k].what == what) return k;
+    return r->nh;
+}
+
+/* a role no longer held: dropped, its current entries erased (none pending), no earlier one */
+static bool arole_gone(const arole *r)
+{
+    return r->dropped && r->name.erased && !r->name.pending && (!r->has_ver || (r->ver.erased && !r->ver.pending)) && !r->nh;
+}
+
+/* op 12's role entries: each an entry its role keeps, by its commitment; a current one a dropped role's, erased already
+ * only as a pending one (a redacted copy's); one this model holds with its bytes past the floor is still in the log:
+ * erasure incomplete. Then each erased (an earlier one leaves the list) and a role holding nothing more removed */
+/* what an ERASE ROLE of r names: a live role's earlier entries, a dropped role's every one held (a pending one too) */
+static uint32_t aerasable(const arole *r)
+{
+    if (!r->dropped) return r->nh;
+    return r->nh + !(r->name.erased && !r->name.pending) + (r->has_ver && !(r->ver.erased && !r->ver.pending));
+}
+
+static int apply_role_erase(state *S, const op *o, uint64_t seq)
+{
+    aroles *R = &S->ro;
+    unsigned long long sq = (unsigned long long)seq;
+    uint32_t run = 0; /* entries of the role so far in its run */
+    for (uint32_t k = 0; k < o->n_rer; k++) {
+        const arer *x = &o->rer[k];
+        arole *r = arole_at(R, x->role);
+        run = k && o->rer[k - 1].role == x->role ? run + 1 : 1; /* a role's entries all at once, never a part */
+        aentry *cur = r ? acur_find(r, x->seq, x->what) : NULL;
+        uint32_t h = r && !cur ? ahist_find(r, x->seq, x->what) : 0;
+        const uint8_t *cm = cur ? cur->commit : r && h < r->nh ? r->h[h].commit : NULL;
+        if (!cm) return fail("commit %llu: an ERASE names a role entry no role keeps", sq);
+        if (memcmp(cm, x->commit, 32)) return fail("commit %llu: an ERASE's role entry with another commitment", sq);
+        if (cur && !r->dropped) return fail("commit %llu: an ERASE of a live role's current name or verifier", sq);
+        if (cur && cur->erased && !cur->pending) return fail("commit %llu: an ERASE of a role entry erased already", sq);
+        if (r && (k + 1 == o->n_rer || o->rer[k + 1].role != x->role) && run != aerasable(r))
+            return fail("commit %llu: an ERASE names part of role %u's entries", sq, x->role);
+        bool pending = cur ? cur->pending : r->h[h].pending;
+        if (!pending && x->seq > S->floor)
+            return fail("erasure incomplete: an erased name or verifier of role %u (commit %llu) is still in the log", x->role,
+                        (unsigned long long)x->seq);
+    }
+    for (uint32_t k = 0; k < o->n_rer; k++) {
+        const arer *x = &o->rer[k];
+        arole *r = arole_at(R, x->role);
+        aentry *cur = acur_find(r, x->seq, x->what);
+        if (cur) {
+            if (cur->pending) R->npending--;
+            uint64_t at = cur->at;
+            uint8_t cm[32];
+            memcpy(cm, cur->commit, 32);
+            memset(cur, 0, sizeof *cur); /* its bytes and salt gone; its commit and commitment kept (section 5's kind 1) */
+            cur->at = at;
+            memcpy(cur->commit, cm, 32);
+            cur->erased = true;
+        } else {
+            uint32_t h = ahist_find(r, x->seq, x->what);
+            if (r->h[h].pending) R->npending--;
+            memmove(&r->h[h], &r->h[h + 1], (size_t)(r->nh - h - 1) * sizeof *r->h);
+            r->nh--;
+        }
+    }
+    for (uint32_t k = 0; k < o->n_rer; k++) {
+        if (k && o->rer[k].role == o->rer[k - 1].role) continue;
+        arole *r = arole_at(R, o->rer[k].role);
+        if (r && arole_gone(r)) {
+            free(r->h);
+            free(r->p);
+            free(r->g);
+            size_t i = (size_t)(r - R->r);
+            memmove(&R->r[i], &R->r[i + 1], (R->n - i - 1) * sizeof *R->r);
+            R->n--;
+        }
+    }
+    return 0;
+}
+
+/* a DROP TABLE's or DROP VIEW's: every privilege record on it ends */
+static void grants_end(aroles *R, uint8_t okind, uint32_t oid)
+{
+    for (uint32_t i = 0; i < R->n; i++) {
+        arole *x = &R->r[i];
+        if (privs_of(x, okind, oid)) priv_change(R, x, okind, oid, 15u, true);
+    }
+}
+
+static void aroles_free(aroles *R)
+{
+    for (uint32_t i = 0; i < R->n; i++) {
+        free(R->r[i].h);
+        free(R->r[i].p);
+        free(R->r[i].g);
+    }
+    free(R->r);
+    memset(R, 0, sizeof *R);
+}
+
+static void aentry_write(abuf *b, const aentry *e)
+{
+    ab_u64(b, e->at);
+    ab_put(b, e->commit, 32);
+    ab_u8(b, e->erased ? 1 : 0);
+}
+
+/* the roles object of a model: "IMDBRLO1" | u32 n | each current entry not erased, by (role, what): u32 role | u8 what
+ * | salt16 | u32 len | bytes; none (n 0): no object, a zero hash */
+static void roles_obj(const aroles *R, abuf *o, uint8_t h[32])
+{
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < R->n; i++) n += R->r[i].name.present + (R->r[i].has_ver && R->r[i].ver.present);
+    memset(h, 0, 32);
+    if (!n) return;
+    ab_put(o, "IMDBRLO1", 8);
+    ab_u32(o, n);
+    for (uint32_t i = 0; i < R->n; i++)
+        for (uint8_t w = 1; w <= 2; w++) {
+            const aentry *e = w == 1 ? &R->r[i].name : R->r[i].has_ver ? &R->r[i].ver : NULL;
+            if (!e || !e->present) continue;
+            ab_u32(o, R->r[i].id);
+            ab_u8(o, w);
+            ab_put(o, e->salt, 16);
+            ab_u32(o, e->len);
+            ab_put(o, e->b, e->len);
+        }
+    a_sha256_ctx c;
+    a_sha256_init(&c);
+    a_sha256_update(&c, o->p, o->n);
+    a_sha256_final(&c, h);
+}
+
+/* manifest 18's sections 5 and 6 of a model, as this auditor makes them, section 5 naming the roles object objhash */
+static void roles_enc(const aroles *R, const uint8_t objhash[32], abuf *s5, abuf *s6)
+{
+    ab_put(s5, objhash, 32);
+    ab_u32(s5, R->last);
+    ab_u32(s5, R->n);
+    uint32_t ng = 0;
+    for (uint32_t i = 0; i < R->n; i++) {
+        const arole *x = &R->r[i];
+        ab_u32(s5, x->id);
+        ab_u64(s5, x->created);
+        ab_u64(s5, x->dropped);
+        ab_u32(s5, x->attrs);
+        aentry_write(s5, &x->name);
+        ab_u8(s5, x->has_ver);
+        if (x->has_ver) aentry_write(s5, &x->ver);
+        ab_u32(s5, x->nh);
+        for (uint32_t k = 0; k < x->nh; k++) {
+            ab_u64(s5, x->h[k].at);
+            ab_u8(s5, x->h[k].what);
+            ab_put(s5, x->h[k].commit, 32);
+        }
+        ng += x->np + x->ng;
+    }
+    ab_u32(s6, ng);
+    for (uint32_t i = 0; i < R->n; i++)
+        for (uint32_t k = 0; k < R->r[i].np; k++)
+            agr_write(s6, &(agr){.kind = 1, .okind = R->r[i].p[k].okind, .a = R->r[i].id, .b = R->r[i].p[k].oid, .privs = R->r[i].p[k].privs});
+    for (uint32_t i = 0; i < R->n; i++)
+        for (uint32_t k = 0; k < R->r[i].ng; k++) agr_write(s6, &(agr){.kind = 2, .a = R->r[i].id, .b = R->r[i].g[k]});
+}
+
+/* a roles object's entries into a model's current entries, each its commitment's and its shape; strict: every current
+ * entry not erased filled, nothing else, a live name once among the live roles (lenient: a FLOOR seed from the current
+ * lake's object, F's entries it still holds) */
+static int roles_fill(aroles *R, const uint8_t *obj, size_t len, bool strict)
+{
+    if (obj) {
+        rd r = {obj, len, 0, false};
+        const uint8_t *mg = rd_bytes(&r, 8);
+        uint32_t n = rd_u32(&r), prole = 0, pwhat = 0;
+        if (r.bad || memcmp(mg, "IMDBRLO1", 8) || !n || n > rd_left(&r) / 25) return fail("a bad roles object");
+        for (uint32_t k = 0; k < n; k++) {
+            uint32_t id = rd_u32(&r);
+            uint8_t w = rd_u8(&r);
+            const uint8_t *salt = rd_bytes(&r, 16);
+            uint32_t l = rd_u32(&r);
+            if (r.bad || (w != 1 && w != 2) || (k && (id < prole || (id == prole && w <= pwhat))) || l > (w == 1 ? 63u : VERIFIER_MAX))
+                return fail("a bad roles object");
+            const uint8_t *b = rd_bytes(&r, l);
+            if (!b) return fail("a bad roles object");
+            prole = id, pwhat = w;
+            arole *x = arole_at(R, id);
+            aentry *e = !x ? NULL : w == 1 ? &x->name : x->has_ver ? &x->ver : NULL;
+            uint8_t h[32];
+            role_commit(id, w, salt, b, l, h);
+            if (!e || e->erased || e->present || memcmp(h, e->commit, 32) || (w == 1 ? !rname_ok(b, l) : !verifier_ok(b, l))) {
+                if (strict) return fail("the roles object holds an entry its manifest does not name, or not its commitment's");
+                continue;
+            }
+            e->present = true;
+            memcpy(e->salt, salt, 16);
+            e->len = l;
+            memcpy(e->b, b, l);
+        }
+        if (rd_left(&r)) return fail("a bad roles object");
+    }
+    for (uint32_t i = 0; strict && i < R->n; i++) {
+        const arole *x = &R->r[i];
+        if ((!x->name.erased && !x->name.present) || (x->has_ver && !x->ver.erased && !x->ver.present))
+            return fail("the roles object lacks role %u's current entries", x->id);
+        for (uint32_t k = 0; k < i && !x->dropped && x->name.present; k++)
+            if (!R->r[k].dropped && R->r[k].name.present && R->r[k].name.len == x->name.len &&
+                !memcmp(R->r[k].name.b, x->name.b, x->name.len))
+                return fail("two live roles of one name");
+    }
+    return 0;
+}
+
 
 /* F3g: a row's ENUM values, each a label of its column's type at this commit (labels only grow) */
 static int enum_row(const state *S, const schema *s, const val *vals, uint64_t seq)
@@ -3142,6 +3921,7 @@ static int apply_op(state *S, const op *o, uint64_t seq)
     if (o->code == 13) return 0; /* WRITER_KEY: keys, not data (decode_body follows it) */
     if (o->code == 20 || o->code == 21) return apply_view_op(S, o, seq); /* P2 S7 */
     if (o->code >= 30 && o->code <= 32) return apply_enum_op(S, o, seq); /* F3g */
+    if (o->code >= 33 && o->code <= 37) return apply_role_op(S, o, seq); /* L */
     if (o->code == 1) {
         if (o->table != S->nt) return fail("commit %llu: table id out of sequence", (unsigned long long)seq);
         if (enum_cols_live(S, o->sch, seq)) return -1; /* F3g: each ENUM column a live type's */
@@ -3395,6 +4175,7 @@ static int apply_op(state *S, const op *o, uint64_t seq)
         t->dropped_at = seq;
         t->live_nokey = 0;
         seq_drop_owned(S, o->table, UINT16_MAX, seq); /* F2a-2: its IDENTITYs' sequences */
+        grants_end(&S->ro, 1, o->table); /* L: its grants end with it */
         return 0;
     }
     if ((o->code == 2 || o->code == 3 || o->code == 4 || o->code == 11 || o->code == 14 || o->code == 15 || o->code == 16) &&
@@ -3504,6 +4285,7 @@ static int apply_op(state *S, const op *o, uint64_t seq)
                             (unsigned long long)en->vid, S->t[en->table].s.name);
             v->stub = true;
         }
+        if (o->n_rer && apply_role_erase(S, o, seq)) return -1; /* L stage 2: its role entries */
         S->last_erase = seq;
         for (uint32_t ti = 0; ti < S->nt; ti++) fkc_free(&S->t[ti]); /* F2b-2: an erased row blocks nothing: counted again */
         S->fk_erase_op = o;
@@ -3958,6 +4740,14 @@ static int replay(state *S, int dirfd, uint64_t *commits)
                 S->en_lake = S->nen ? xcalloc(S->nen, sizeof *S->en_lake) : NULL;
                 for (uint32_t k = 0; k < S->nen; k++) aenum_copy(&S->en_lake[k], &S->en[k]);
                 S->nen_lake = S->nen;
+                free(S->s5_lake); /* L: the roles and grants then, as the manifest's sections must be */
+                free(S->s6_lake);
+                free(S->o_lake);
+                abuf e5 = {0}, e6 = {0}, eo = {0};
+                uint8_t oh[32];
+                roles_obj(&S->ro, &eo, oh);
+                roles_enc(&S->ro, oh, &e5, &e6);
+                S->s5_lake = e5.p, S->n5_lake = e5.n, S->s6_lake = e6.p, S->n6_lake = e6.n, S->o_lake = eo.p, S->no_lake = eo.n;
                 free(S->sq_lake); /* F2a-2: the sequences' states at the lake snapshot */
                 S->sq_lake = S->nsq ? xcalloc(S->nsq, sizeof *S->sq_lake) : NULL;
                 if (S->nsq) memcpy(S->sq_lake, S->sq, S->nsq * sizeof *S->sq_lake);
@@ -4036,6 +4826,8 @@ static int replay(state *S, int dirfd, uint64_t *commits)
                 return fail("version %llu of table %s: redacted payload not authorised by any ERASE",
                             (unsigned long long)vid, S->t[ti].s.name);
         }
+    if (S->ro.npending) /* L stage 2: a role's redacted name or verifier too */
+        return fail("%llu redacted names or verifiers of roles not authorised by any ERASE", (unsigned long long)S->ro.npending);
     *commits = S->seq;
     return 0;
 }
@@ -4485,6 +5277,10 @@ typedef struct manifest {
     uint32_t nsq;
     struct aenum *en; /* version 17 (F3g): every ENUM type, by id (en[id - 1]), its labels' commits */
     uint32_t nen;
+    aroles ro; /* version 18 (L): the roles held and their grants; s5 and s6 the sections' bytes (copied) */
+    uint8_t rhash[32]; /* section 5's roles object (zero: none) */
+    uint8_t *s5, *s6;
+    size_t n5, n6;
 } manifest;
 
 static void manifest_free(manifest *m)
@@ -4508,6 +5304,9 @@ static void manifest_free(manifest *m)
     free(m->sq); /* F2a-2 */
     for (uint32_t i = 0; i < m->nen; i++) aenum_free(&m->en[i]); /* F3g */
     free(m->en);
+    aroles_free(&m->ro); /* L */
+    free(m->s5);
+    free(m->s6);
     memset(m, 0, sizeof *m);
 }
 
@@ -4537,7 +5336,7 @@ static bool obj_name_ok(const char *n)
     if (l < 67 || l > 68) return false;
     for (int i = 0; i < 64; i++)
         if (!((n[i] >= '0' && n[i] <= '9') || (n[i] >= 'a' && n[i] <= 'f'))) return false;
-    return strcmp(n + 64, ".seg") == 0 || strcmp(n + 64, ".dv") == 0 || strcmp(n + 64, ".man") == 0;
+    return strcmp(n + 64, ".seg") == 0 || strcmp(n + 64, ".dv") == 0 || strcmp(n + 64, ".man") == 0 || strcmp(n + 64, ".rol") == 0;
 }
 
 /* LAKE_HEAD, then the manifest it names. */
@@ -4579,14 +5378,135 @@ static int man_section(rd *r, uint32_t kind, size_t *end)
     return 0;
 }
 
+/* ---- L: manifest 18's sections 5 and 6, strictly (docs/roles-design.md §10) --------------------------------------- */
+
+static bool aentry_read(rd *r, const arole *x, uint64_t mseq, aentry *e)
+{
+    memset(e, 0, sizeof *e);
+    e->at = rd_u64(r);
+    const uint8_t *cm = rd_bytes(r, 32);
+    uint8_t kind = rd_u8(r);
+    if (r->bad || kind > 1 || e->at < x->created || e->at > mseq || (x->dropped && e->at >= x->dropped)) return false;
+    memcpy(e->commit, cm, 32);
+    e->erased = kind == 1; /* a dropped role's, or a redacted copy's pending its ERASE; else its bytes in the roles object */
+    return true;
+}
+
+static int parse_roles5(rd *r, size_t end, uint64_t mseq, aroles *R, uint8_t rhash[32])
+{
+    memset(R, 0, sizeof *R);
+    const uint8_t *rh = rd_bytes(r, 32);
+    if (rh) memcpy(rhash, rh, 32);
+    R->last = rd_u32(r);
+    uint32_t n = rd_u32(r);
+    if (r->bad || R->last == UINT32_MAX || n > MAX_ROLES || n > R->last || n > rd_left(r) / 70)
+        return fail("manifest: a bad roles section");
+    R->r = n ? xcalloc(n, sizeof *R->r) : NULL;
+    R->cap = n;
+    for (uint32_t i = 0; i < n; i++) {
+        arole *x = &R->r[R->n++];
+        x->id = rd_u32(r);
+        x->created = rd_u64(r);
+        x->dropped = rd_u64(r);
+        x->attrs = rd_u32(r);
+        if (r->bad || !x->id || x->id > R->last || (i && x->id <= R->r[i - 1].id) || !x->created || x->created > mseq ||
+            (x->dropped && (x->dropped <= x->created || x->dropped > mseq)) || (x->attrs & ~3u) ||
+            !aentry_read(r, x, mseq, &x->name))
+            return fail("manifest: role %u is bad", i + 1);
+        uint8_t hv = rd_u8(r);
+        if (r->bad || hv > 1 || (hv && !aentry_read(r, x, mseq, &x->ver))) return fail("manifest: role %u's verifier is bad", i + 1);
+        x->has_ver = hv;
+        uint32_t nh = rd_u32(r);
+        if (r->bad || nh > MAX_ROLE_HISTORY || nh > rd_left(r) / 41) return fail("manifest: role %u's earlier entries are bad", i + 1);
+        x->h = nh ? xcalloc(nh, sizeof *x->h) : NULL;
+        for (uint32_t k = 0; k < nh; k++) {
+            ahist *h = &x->h[x->nh++];
+            h->at = rd_u64(r);
+            h->what = rd_u8(r);
+            const uint8_t *cm = rd_bytes(r, 32);
+            if (r->bad) return fail("manifest: a bad roles section");
+            memcpy(h->commit, cm, 32);
+            if ((h->what != 1 && h->what != 2) || h->at < x->created ||
+                (k && (h->at < x->h[k - 1].at || (h->at == x->h[k - 1].at && h->what <= x->h[k - 1].what))) ||
+                (h->what == 1 ? h->at >= x->name.at : x->has_ver ? h->at >= x->ver.at : h->at > mseq))
+                return fail("manifest: role %u's earlier entries are out of order", i + 1);
+        }
+        if (arole_gone(x)) return fail("manifest: role %u holds nothing, and is listed", i + 1); /* L stage 2: one encoding */
+    }
+    if (r->bad || r->o != end) return fail("manifest: the roles section's length is not its bytes");
+    return 0;
+}
+
+/* no role reaches itself by its memberships: one walk, each role once a start */
+static bool roles_acyclic(aroles *R)
+{
+    uint32_t m = R->n ? R->n : 1;
+    uint8_t *color = xcalloc(m, 1); /* 0 unseen, 1 on the path, 2 done */
+    uint32_t *st = xcalloc(m, sizeof *st), *nx = xcalloc(m, sizeof *nx);
+    bool ok = true;
+    for (uint32_t s = 0; ok && s < R->n; s++) {
+        if (color[s]) continue;
+        uint32_t top = 0;
+        st[top++] = s;
+        nx[s] = 0;
+        color[s] = 1;
+        while (top && ok) {
+            uint32_t xi = st[top - 1];
+            const arole *x = &R->r[xi];
+            if (nx[xi] == x->ng) {
+                color[xi] = 2;
+                top--;
+                continue;
+            }
+            arole *y = arole_at(R, x->g[nx[xi]++]);
+            if (!y) continue;
+            uint32_t yi = (uint32_t)(y - R->r);
+            if (color[yi] == 1) ok = false;
+            else if (!color[yi]) {
+                color[yi] = 1;
+                nx[yi] = 0;
+                st[top++] = yi;
+            }
+        }
+    }
+    free(color);
+    free(st);
+    free(nx);
+    return ok;
+}
+
+static int parse_grants6(rd *r, size_t end, const manifest *m, aroles *R)
+{
+    uint32_t n = rd_u32(r);
+    if (r->bad || n > MAX_GRANTS || n > rd_left(r) / 17) return fail("manifest: a bad grants section");
+    agr prev;
+    memset(&prev, 0, sizeof prev);
+    for (uint32_t k = 0; k < n; k++) {
+        agr g;
+        if (!agr_read(r, &g) || (k && agr_cmp(&prev, &g) >= 0)) return fail("manifest: a grant out of its rules or order");
+        prev = g;
+        arole *ra = arole_live(R, g.a);
+        bool live = g.kind == 1 ? (g.okind == 1 ? g.b < m->nt && !m->t[g.b].dropped_at : g.b < m->nv && !m->v[g.b].dropped_at)
+                                : arole_live(R, g.b) != NULL;
+        if (!ra || !live) return fail("manifest: a grant names a role, table or view that is not live");
+        if (g.kind == 1) priv_change(R, ra, g.okind, g.b, g.privs, false);
+        else group_change(R, ra, g.b, false);
+    }
+    if (r->bad || r->o != end) return fail("manifest: the grants section's length is not its bytes");
+    if (!roles_acyclic(R)) return fail("manifest: a membership cycle");
+    return 0;
+}
+
 static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
 {
     memset(m, 0, sizeof *m);
     rd r = {b, len, 0, false};
     const uint8_t *mg = rd_bytes(&r, 8);
     uint32_t mver = mg && memcmp(mg, "IMDBMAN1", 8) == 0 ? rd_u32(&r) : 0;
-    if (mver != 17) return fail("manifest: bad header (version 17 only: ENUM types, F3g)");
-    uint32_t nsec = rd_u32(&r); /* every section, in order: 1 tables, 2 views, 3 sequences (F2a-2), 4-11 reserved and empty */
+    if (mver == 17) return fail("manifest version 17: written before roles (manifest 18), which this auditor does not read");
+    if (mver != 18) return fail("manifest: bad header (version 18 only: roles, L)");
+    uint32_t nsec = rd_u32(&r); /* every section, in order: 1 tables, 2 views, 3 sequences (F2a-2), 4 ENUM types (F3g), 5 roles
+                                 * and 6 grants (L), 7-11 reserved and empty */
     const uint8_t *id = rd_bytes(&r, 16);
     m->seq = rd_u64(&r);
     const uint8_t *prev = rd_bytes(&r, 32), *st = rd_bytes(&r, 32), *pm = rd_bytes(&r, 32);
@@ -4821,7 +5741,25 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
         for (uint16_t k = 0; !m->v[i].dropped_at && m->v[i].def && k < m->v[i].def->ndeps; k++)
             if (m->v[i].def->dep_kind[k] == 3 && (m->v[i].def->dep_id[k] > nen || m->en[m->v[i].def->dep_id[k] - 1].dropped_at))
                 return fail("manifest: a live view names an ENUM type that is not live");
-    for (uint32_t k = 5; k <= 11; k++) { /* reserved until their slices: present, in order, empty */
+    if (man_section(&r, 5, &send)) return fail("manifest: section 5 missing or out of order"); /* L: the roles */
+    size_t s5o = r.o;
+    if (parse_roles5(&r, send, m->seq, &m->ro, m->rhash)) return -1;
+    m->n5 = send - s5o;
+    m->s5 = xcalloc(m->n5, 1);
+    memcpy(m->s5, b + s5o, m->n5);
+    if (man_section(&r, 6, &send)) return fail("manifest: section 6 missing or out of order"); /* L: the grants */
+    size_t s6o = r.o;
+    if (parse_grants6(&r, send, m, &m->ro)) return -1;
+    m->n6 = send - s6o;
+    m->s6 = xcalloc(m->n6, 1);
+    memcpy(m->s6, b + s6o, m->n6);
+    abuf e5 = {0}, e6 = {0}; /* one encoding: the bytes are what this auditor makes of what they hold */
+    roles_enc(&m->ro, m->rhash, &e5, &e6);
+    bool canon = e5.n == m->n5 && !memcmp(e5.p, m->s5, e5.n) && e6.n == m->n6 && !memcmp(e6.p, m->s6, e6.n);
+    free(e5.p);
+    free(e6.p);
+    if (!canon) return fail("manifest: the roles or grants sections are not in their one encoding");
+    for (uint32_t k = 7; k <= 11; k++) { /* reserved until their slices: present, in order, empty */
         if (man_section(&r, k, &send)) return fail("manifest: section %u missing or out of order", k);
         size_t sl = send - r.o; /* a u32 count of 0; any other count a later format's, whatever its length */
         if (sl >= 4 && rd_u32(&r) != 0) return fail("manifest: section %u not empty (a later format's)", k);
@@ -4866,6 +5804,7 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
 static bool manifest_refs(const manifest *m, const uint8_t h[32])
 {
     if (memcmp(h, m->hash, 32) == 0) return true;
+    if (!all_zero(m->rhash, 32) && memcmp(h, m->rhash, 32) == 0) return true; /* L: its roles object */
     for (uint32_t ti = 0; ti < m->nt; ti++)
         for (uint32_t k = 0; k < m->t[ti].nseg; k++)
             if (memcmp(h, m->t[ti].seg[k], 32) == 0 || (!all_zero(m->t[ti].dv[k], 32) && memcmp(h, m->t[ti].dv[k], 32) == 0))
@@ -5460,6 +6399,13 @@ static int floor_seed(int dirfd, state *S, flr *f)
         for (uint32_t i = 0; i < f->m.nen; i++) aenum_copy(&S->en[i], &f->m.en[i]), aenum_copy(&S->en_lake[i], &f->m.en[i]);
         S->nen = S->capen = S->nen_lake = f->m.nen;
     }
+    S->ro = f->m.ro; /* L: F's roles and grants, at F (the lake's snapshot may be F itself) */
+    memset(&f->m.ro, 0, sizeof f->m.ro);
+    S->n5_lake = f->m.n5, S->n6_lake = f->m.n6;
+    S->s5_lake = xcalloc(f->m.n5, 1);
+    S->s6_lake = xcalloc(f->m.n6, 1);
+    memcpy(S->s5_lake, f->m.s5, f->m.n5);
+    memcpy(S->s6_lake, f->m.s6, f->m.n6);
     for (uint32_t i = 0; i < f->m.nv; i++) /* P2 S7: F's views, a live one's definition the replay's rules read */
         view_push(S, f->m.v[i].name, f->m.v[i].created_at, f->m.v[i].dropped_at, f->m.v[i].def);
     for (uint32_t i = 0; i < f->m.nv; i++) /* P2 S7b: each live one's text against F's catalog, as at its own commit (what
@@ -5481,6 +6427,20 @@ static int floor_seed(int dirfd, state *S, flr *f)
     uint64_t rows = 0;
     int rc = walk_lake(dirfd, S->m.alg, &m, seed_row, &x, &rows); /* LAKE_HEAD's manifest: the walk parses it into m */
     free(x.buf);
+    if (!rc && !all_zero(m.rhash, 32)) { /* L: F's names and verifiers the current lake's roles object still holds */
+        int rofd = openat(dirfd, "objects", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        uint8_t *rb = NULL;
+        size_t rl = 0;
+        rc = rofd < 0 ? fail("objects/: cannot open") : obj_read(rofd, m.rhash, ".rol", &rb, &rl) ? -1 : roles_fill(&S->ro, rb, rl, false);
+        free(rb);
+        if (rofd >= 0) close(rofd);
+    }
+    if (!rc && S->lake_seq == f->seq) { /* the lake is F's: its roles object as the model's */
+        abuf eo = {0};
+        uint8_t oh[32];
+        roles_obj(&S->ro, &eo, oh);
+        S->o_lake = eo.p, S->no_lake = eo.n;
+    }
     manifest_free(&m);
     for (uint32_t i = 0; !rc && i < S->nt; i++) {
         uint8_t got[2048];
@@ -5627,6 +6587,19 @@ static int cmd_verify(const char *dir, const char *anchor)
         for (uint32_t ei = 0; !rc && ei < m.nen; ei++)
             if (!aenum_same(&m.en[ei], &S.en_lake[ei]))
                 rc = fail("ENUM type %s in the manifest differs from the log's at its commit", S.en_lake[ei].name);
+        if (!rc && (m.n5 != S.n5_lake || memcmp(m.s5, S.s5_lake, m.n5) || m.n6 != S.n6_lake || memcmp(m.s6, S.s6_lake, m.n6)))
+            rc = fail("the manifest's roles or grants differ from the log's at its commit"); /* L */
+        if (!rc) { /* L: its roles object, the model's at the commit as this auditor makes it */
+            int rofd = openat(dirfd, "objects", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            uint8_t *rb = NULL;
+            size_t rl = 0;
+            if (rofd < 0) rc = fail("objects/: cannot open");
+            else if (!all_zero(m.rhash, 32) && obj_read(rofd, m.rhash, ".rol", &rb, &rl)) rc = -1;
+            else if (rl != S.no_lake || (rl && memcmp(rb, S.o_lake, rl)))
+                rc = fail("the manifest's roles object differs from the log's at its commit");
+            free(rb);
+            if (rofd >= 0) close(rofd);
+        }
         if (!rc && m.nsq != S.nsq_lake) rc = fail("the manifest's sequences differ from the log's at its commit"); /* F2a-2 */
         for (uint32_t qi = 0; !rc && qi < m.nsq; qi++) {
             const aseq *qa = &m.sq[qi], *qb = &S.sq_lake[qi];
@@ -5716,6 +6689,10 @@ static int cmd_verify(const char *dir, const char *anchor)
     free(S.en);
     for (uint32_t k = 0; k < S.nen_lake; k++) aenum_free(&S.en_lake[k]);
     free(S.en_lake);
+    aroles_free(&S.ro); /* L */
+    free(S.s5_lake);
+    free(S.s6_lake);
+    free(S.o_lake);
     free(S.sq_lake);
     for (uint32_t i = 0; i < S.nv; i++) /* P2 S7, S7b, F1 */
         free(S.v[i].dep_kind), free(S.v[i].dep_id), free(S.v[i].cols), free(S.v[i].text);

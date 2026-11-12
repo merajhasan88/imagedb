@@ -9,6 +9,7 @@
 #include "cpu.h"
 #include "fsio.h"
 #include "repl.h"
+#include "scram.h"
 
 void imdb_stream_init(imdb_stream *s, const uint8_t writer_pk[IMDB_PUBKEY_LEN], imdb_read_fn read, void *ctx)
 {
@@ -271,7 +272,7 @@ int imdb_stream_next_ex(imdb_stream *s, uint64_t expect_seq, const uint8_t prev[
 
     /* 4. payload length, bounded by the authenticated ops */
     uint64_t npay = 0;
-    for (uint32_t i = 0; i < c.nops; i++) npay += imdb_op_has_payload(c.ops[i].code);
+    for (uint32_t i = 0; i < c.nops; i++) npay += imdb_op_npayload(&c.ops[i]); /* L: a role op's name and verifier too */
     size_t poff;
     if ((rc = need_frame(s, 4, &poff, e))) goto out;
     uint32_t plen = imdb_get_le32(s->frame.p + poff);
@@ -282,35 +283,42 @@ int imdb_stream_next_ex(imdb_stream *s, uint64_t expect_seq, const uint8_t prev[
         goto out;
     }
 
-    /* 5. rows, one at a time, each checked against its signed commitment */
+    /* 5. rows and role entries (L), one at a time, each checked against its signed commitment */
     uint64_t left = plen;
     for (uint32_t i = 0; i < c.nops && !rc; i++) {
         const imdb_op *o = &c.ops[i];
-        if (!imdb_op_has_payload(o->code)) continue;
-        size_t at;
-        if (left < 1 || (rc = need_frame(s, 1, &at, e))) break;
-        left--;
-        uint8_t kind = s->frame.p[at];
-        if (kind == IMDB_PAYLOAD_REDACTED) continue;
-        if (kind != IMDB_PAYLOAD_ROW || left < 20) {
-            rc = imdb_fail(e, IMDB_ERR_CORRUPT, "stream: commit %llu: bad payload entry", (unsigned long long)seq);
-            break;
+        for (unsigned j = 0, np = imdb_op_npayload(o); j < np && !rc; j++) {
+            bool role = !imdb_op_is_row(o->code);
+            uint8_t what = role && j == 0 && (o->ro->rfields & IMDB_RF_NAME) ? IMDB_RPAY_NAME : IMDB_RPAY_VERIFIER;
+            uint32_t max = !role ? IMDB_MAX_ROW : what == IMDB_RPAY_NAME ? IMDB_MAX_IDENT : IMDB_SCRAM_BYTES_MAX;
+            size_t at;
+            if (left < 1 || (rc = need_frame(s, 1, &at, e))) break;
+            left--;
+            uint8_t kind = s->frame.p[at];
+            if (kind == IMDB_PAYLOAD_REDACTED) continue;
+            if (kind != IMDB_PAYLOAD_ROW || left < 20) {
+                rc = imdb_fail(e, IMDB_ERR_CORRUPT, "stream: commit %llu: bad payload entry", (unsigned long long)seq);
+                break;
+            }
+            if ((rc = need_frame(s, 20, &at, e))) break;
+            left -= 20;
+            uint32_t rl = imdb_get_le32(s->frame.p + at + 16);
+            if (rl > max || rl > left) {
+                rc = imdb_fail(e, IMDB_ERR_CORRUPT, "stream: commit %llu: bad payload entry length", (unsigned long long)seq);
+                break;
+            }
+            size_t ro;
+            if ((rc = need_frame(s, rl, &ro, e))) break;
+            left -= rl;
+            uint8_t cm[32];
+            if (role) imdb_role_commit(o->ro->rid, what, s->frame.p + at, s->frame.p + ro, rl, cm);
+            else imdb_row_commit(o->table, s->frame.p + at, s->frame.p + ro, rl, cm);
+            const uint8_t *want = role ? (what == IMDB_RPAY_NAME ? o->ro->rname.commit : o->ro->rver.commit)
+                                       : o->code == IMDB_OP_INSERT ? o->commit : o->new_commit;
+            if (memcmp(cm, want, 32) != 0)
+                rc = imdb_fail(e, IMDB_ERR_VERIFY, "stream: commit %llu: a %s does not match its signed commitment",
+                               (unsigned long long)seq, role ? "role's entry" : "row");
         }
-        if ((rc = need_frame(s, 20, &at, e))) break;
-        left -= 20;
-        uint32_t rl = imdb_get_le32(s->frame.p + at + 16);
-        if (rl > IMDB_MAX_ROW || rl > left) {
-            rc = imdb_fail(e, IMDB_ERR_CORRUPT, "stream: commit %llu: bad row length", (unsigned long long)seq);
-            break;
-        }
-        size_t ro;
-        if ((rc = need_frame(s, rl, &ro, e))) break;
-        left -= rl;
-        uint8_t cm[32];
-        imdb_row_commit(o->table, s->frame.p + at, s->frame.p + ro, rl, cm);
-        if (memcmp(cm, o->code == IMDB_OP_INSERT ? o->commit : o->new_commit, 32) != 0)
-            rc = imdb_fail(e, IMDB_ERR_VERIFY, "stream: commit %llu: a row does not match its signed commitment",
-                           (unsigned long long)seq);
     }
     if (!rc && left)
         rc = imdb_fail(e, IMDB_ERR_CORRUPT, "stream: commit %llu: trailing payload bytes", (unsigned long long)seq);

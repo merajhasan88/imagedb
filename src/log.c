@@ -3,6 +3,8 @@
 #include <stdlib.h>
 
 #include "cpu.h"
+#include "scram.h"
+#include "sha256.h"
 
 static const uint8_t kChainTag[8] = {'I', 'M', 'D', 'B', 'C', 'H', 'N', '2'};
 static const uint8_t kSigTag[8] = {'I', 'M', 'D', 'B', 'S', 'I', 'G', '2'};
@@ -581,18 +583,195 @@ void imdb_commit_free(imdb_commit_rec *c)
             imdb_free(c->ops[i].schema);
             imdb_free(c->ops[i].erase);
             imdb_free(c->ops[i].rewrites);
+            imdb_free(c->ops[i].rerase); /* L stage 2 */
             imdb_free(c->ops[i].iname);
             imdb_free(c->ops[i].aname);
             imdb_free(c->ops[i].defs); /* F2a */
             imdb_free(c->ops[i].chk); /* F2b-1 */
             imdb_free(c->ops[i].fk); /* F2b-2 */
             imdb_free(c->ops[i].sdef); /* F2a-2 */
+            if (c->ops[i].ro) { /* L: a decoded op holds no carrier (the apply's install takes it) */
+                imdb_free(c->ops[i].ro->grants);
+                imdb_free(c->ops[i].ro);
+            }
             imdb_enumdef_free(c->ops[i].edef); /* F3g */
             imdb_viewdef_free(c->ops[i].vdef);
         }
         imdb_free(c->ops);
     }
     memset(c, 0, sizeof *c);
+}
+
+/* ---- L: roles and grants (docs/roles-design.md) -------------------------------------------------------------------- */
+
+void imdb_role_commit(uint32_t role, uint8_t what, const uint8_t salt[16], const uint8_t *bytes, uint32_t len,
+                      uint8_t out[32])
+{
+    static const uint8_t tag[8] = {'I', 'M', 'D', 'B', 'R', 'O', 'L', '1'};
+    uint8_t hdr[8 + 4 + 1 + 16 + 4];
+    memcpy(hdr, tag, 8);
+    imdb_le32(hdr + 8, role);
+    hdr[12] = what;
+    memcpy(hdr + 13, salt, 16);
+    imdb_le32(hdr + 29, len);
+    imdb_sha256_ctx c;
+    imdb_sha256_init(&c);
+    imdb_sha256_update(&c, hdr, sizeof hdr);
+    if (len) imdb_sha256_update(&c, bytes, len);
+    imdb_sha256_final(&c, out);
+}
+
+bool imdb_role_name_reserved(const char *n)
+{
+    return !strcmp(n, "public") || !strcmp(n, "none") || !strcmp(n, "current_user") || !strcmp(n, "session_user") ||
+           !strcmp(n, "current_role") || !strncmp(n, "pg_", 3);
+}
+
+bool imdb_role_name_ok(const uint8_t *p, size_t len)
+{
+    char n[IMDB_MAX_IDENT + 1];
+    if (!imdb_ident_valid((const char *)p, len)) return false;
+    for (size_t i = 0; i < len; i++)
+        if (p[i] >= 'A' && p[i] <= 'Z') return false; /* as the parser folds it: one spelling */
+    memcpy(n, p, len);
+    n[len] = '\0';
+    return !imdb_role_name_reserved(n);
+}
+
+/* ops 33 and 34's body by its own rules: a role id, known fields and attributes; CREATE has its attributes and name,
+ * and a verifier field only with a verifier (CREATE without a password has no field: one encoding) */
+static bool role_body_ok(const imdb_op *o)
+{
+    if (!o->ro->rid || o->ro->rid == UINT32_MAX || !o->ro->rfields || (o->ro->rfields & ~(uint32_t)IMDB_RF_KNOWN)) return false;
+    if ((o->ro->rfields & IMDB_RF_ATTRS) && (o->ro->rattrs & ~(uint32_t)IMDB_RA_KNOWN)) return false;
+    if (o->code == IMDB_OP_CREATE_ROLE &&
+        ((o->ro->rfields & (IMDB_RF_ATTRS | IMDB_RF_NAME)) != (IMDB_RF_ATTRS | IMDB_RF_NAME) ||
+         ((o->ro->rfields & IMDB_RF_VERIFIER) && o->ro->rvnone)))
+        return false;
+    return true;
+}
+
+static void role_body_put(imdb_buf *b, const imdb_op *o)
+{
+    imdb_buf_put_u32(b, o->ro->rid);
+    imdb_buf_put_u32(b, o->ro->rfields);
+    if (o->ro->rfields & IMDB_RF_ATTRS) imdb_buf_put_u32(b, o->ro->rattrs);
+    if (o->ro->rfields & IMDB_RF_NAME) imdb_buf_put(b, o->ro->rname.commit, 32);
+    if (o->ro->rfields & IMDB_RF_VERIFIER) {
+        imdb_buf_put_u8(b, o->ro->rvnone ? 0 : 1);
+        if (!o->ro->rvnone) imdb_buf_put(b, o->ro->rver.commit, 32);
+    }
+}
+
+static void role_body_get(imdb_rd *r, imdb_op *o)
+{
+    o->ro->rid = imdb_rd_u32(r);
+    o->ro->rfields = imdb_rd_u32(r);
+    if (o->ro->rfields & IMDB_RF_ATTRS) o->ro->rattrs = imdb_rd_u32(r);
+    if (o->ro->rfields & IMDB_RF_NAME) imdb_rd_copy(r, o->ro->rname.commit, 32);
+    if (o->ro->rfields & IMDB_RF_VERIFIER) {
+        uint8_t has = imdb_rd_u8(r);
+        if (has > 1) r->err = IMDB_ERR_CORRUPT;
+        o->ro->rvnone = has == 0;
+        if (has == 1) imdb_rd_copy(r, o->ro->rver.commit, 32);
+    }
+}
+
+int imdb_grant_cmp(const imdb_grant_rec *x, const imdb_grant_rec *y)
+{
+    if (x->kind != y->kind) return x->kind < y->kind ? -1 : 1;
+    if (x->a != y->a) return x->a < y->a ? -1 : 1;
+    if (x->okind != y->okind) return x->okind < y->okind ? -1 : 1;
+    if (x->b != y->b) return x->b < y->b ? -1 : 1;
+    return 0;
+}
+
+/* a record by its own rules: a privilege's grantee (0, PUBLIC, reserved), a table or a view (a view SELECT alone),
+ * known bits; a membership of two roles; the reserved fields 0 */
+static bool grant_rec_ok(const imdb_grant_rec *g)
+{
+    if (g->gopt || g->ncols || g->grantor || !g->a) return false;
+    if (g->kind == IMDB_GRANT_PRIV)
+        return (g->okind == IMDB_OBJ_TABLE || g->okind == IMDB_OBJ_VIEW) && g->privs && !(g->privs & ~(uint32_t)IMDB_PRIV_ALL) &&
+               (g->okind != IMDB_OBJ_VIEW || g->privs == IMDB_PRIV_SELECT);
+    if (g->kind == IMDB_GRANT_MEMBER) return !g->okind && !g->privs && g->b && g->a != g->b;
+    return false;
+}
+
+bool imdb_grants_ok(const imdb_grant_rec *g, uint32_t n)
+{
+    if (!n || n > IMDB_MAX_GRANT_RECORDS) return false;
+    for (uint32_t k = 0; k < n; k++)
+        if (!grant_rec_ok(&g[k]) || (k && imdb_grant_cmp(&g[k - 1], &g[k]) >= 0)) return false;
+    return true;
+}
+
+void imdb_grant_put(imdb_buf *b, const imdb_grant_rec *g)
+{
+    imdb_buf_put_u8(b, g->kind);
+    imdb_buf_put_u32(b, g->a);
+    if (g->kind == IMDB_GRANT_PRIV) {
+        imdb_buf_put_u8(b, g->okind);
+        imdb_buf_put_u32(b, g->b);
+        imdb_buf_put_u32(b, g->privs);
+        imdb_buf_put_u32(b, g->gopt);
+        imdb_buf_put_u16(b, g->ncols);
+    } else {
+        imdb_buf_put_u32(b, g->b);
+        imdb_buf_put_u32(b, g->privs); /* a membership's options */
+    }
+    imdb_buf_put_u32(b, g->grantor);
+}
+
+void imdb_grant_get(imdb_rd *r, imdb_grant_rec *g)
+{
+    memset(g, 0, sizeof *g);
+    g->kind = imdb_rd_u8(r);
+    g->a = imdb_rd_u32(r);
+    if (g->kind == IMDB_GRANT_PRIV) {
+        g->okind = imdb_rd_u8(r);
+        g->b = imdb_rd_u32(r);
+        g->privs = imdb_rd_u32(r);
+        g->gopt = imdb_rd_u32(r);
+        g->ncols = imdb_rd_u16(r);
+    } else {
+        g->b = imdb_rd_u32(r);
+        g->privs = imdb_rd_u32(r);
+    }
+    g->grantor = imdb_rd_u32(r);
+}
+
+static void rpay_put(imdb_buf *b, const imdb_rpay *p)
+{
+    imdb_buf_put_u8(b, p->pkind);
+    if (p->pkind != IMDB_PAYLOAD_ROW) return;
+    imdb_buf_put(b, p->salt, 16);
+    imdb_buf_put_u32(b, p->len);
+    imdb_buf_put(b, p->bytes, p->len);
+}
+
+/* an entry, its bytes pointing into the record: present, its commitment and its shape checked here, for every
+ * reader of a frame (a redacted one is checked by the ERASE that names it) */
+static int rpay_get(imdb_rd *r, uint32_t role, uint8_t what, imdb_rpay *p, imdb_err *e)
+{
+    const char *w = what == IMDB_RPAY_NAME ? "name" : "verifier";
+    p->pkind = imdb_rd_u8(r);
+    if (r->err) return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: payload truncated");
+    if (p->pkind == IMDB_PAYLOAD_REDACTED) return IMDB_OK;
+    if (p->pkind != IMDB_PAYLOAD_ROW) return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: bad payload kind");
+    imdb_rd_copy(r, p->salt, 16);
+    p->len = imdb_rd_u32(r);
+    if (r->err || p->len > (what == IMDB_RPAY_NAME ? IMDB_MAX_IDENT : IMDB_SCRAM_BYTES_MAX))
+        return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: a role's %s: bad length", w);
+    if (!(p->bytes = imdb_rd_bytes(r, p->len))) return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: a role's %s truncated", w);
+    uint8_t cm[32];
+    imdb_role_commit(role, what, p->salt, p->bytes, p->len, cm);
+    if (memcmp(cm, p->commit, 32)) return imdb_fail(e, IMDB_ERR_VERIFY, "commit: a role's %s does not match its commitment", w);
+    imdb_scram v;
+    imdb_err e2 = {0};
+    if (what == IMDB_RPAY_NAME ? !imdb_role_name_ok(p->bytes, p->len) : imdb_scram_decode(p->bytes, p->len, &v, &e2) != 0)
+        return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: a role's %s is malformed", w);
+    return IMDB_OK;
 }
 
 /* ---- encoding ------------------------------------------------------------ */
@@ -858,6 +1037,10 @@ void imdb_commit_encode_header(const imdb_commit_rec *c, imdb_buf *b)
             imdb_buf_put(b, o->manifest, 32);
             break;
         case IMDB_OP_ERASE:
+            if (o->n_erase ? o->n_rerase != 0 : !o->n_rerase || o->n_rewrites) { /* L stage 2: rows, or role entries alone */
+                b->err = IMDB_ERR_INVALID;
+                break;
+            }
             imdb_buf_put_u32(b, o->n_erase);
             for (uint32_t k = 0; k < o->n_erase; k++) {
                 imdb_buf_put_u32(b, o->erase[k].table);
@@ -869,6 +1052,13 @@ void imdb_commit_encode_header(const imdb_commit_rec *c, imdb_buf *b)
                 imdb_buf_put_u32(b, o->rewrites[k].table);
                 imdb_buf_put(b, o->rewrites[k].old_hash, 32);
                 imdb_buf_put(b, o->rewrites[k].new_hash, 32);
+            }
+            imdb_buf_put_u32(b, o->n_rerase); /* L stage 2: the role entries, before the manifest */
+            for (uint32_t k = 0; k < o->n_rerase; k++) {
+                imdb_buf_put_u32(b, o->rerase[k].role);
+                imdb_buf_put_u64(b, o->rerase[k].seq);
+                imdb_buf_put_u8(b, o->rerase[k].what);
+                imdb_buf_put(b, o->rerase[k].commit, 32);
             }
             imdb_buf_put(b, o->manifest, 32);
             break;
@@ -956,6 +1146,30 @@ void imdb_commit_encode_header(const imdb_commit_rec *c, imdb_buf *b)
             imdb_viewdef_encode(o->vdef, b);
             break;
         }
+        case IMDB_OP_CREATE_ROLE: /* L: alone, its body by its rules (the engine made it) */
+        case IMDB_OP_ALTER_ROLE:
+            if (c->nops != 1 || !o->ro || !role_body_ok(o)) {
+                b->err = IMDB_ERR_INVALID;
+                break;
+            }
+            role_body_put(b, o);
+            break;
+        case IMDB_OP_DROP_ROLE:
+            if (c->nops != 1 || !o->ro || !o->ro->rid || o->ro->rid == UINT32_MAX) {
+                b->err = IMDB_ERR_INVALID;
+                break;
+            }
+            imdb_buf_put_u32(b, o->ro->rid);
+            break;
+        case IMDB_OP_GRANT: /* L: alone, its records canonical (imdb_grants_ok) */
+        case IMDB_OP_REVOKE:
+            if (c->nops != 1 || !o->ro || !imdb_grants_ok(o->ro->grants, o->ro->ngrants)) {
+                b->err = IMDB_ERR_INVALID;
+                break;
+            }
+            imdb_buf_put_u32(b, o->ro->ngrants);
+            for (uint32_t k = 0; k < o->ro->ngrants; k++) imdb_grant_put(b, &o->ro->grants[k]);
+            break;
         case IMDB_OP_CREATE_ENUM: /* F3g: alone, its definition checked (imdb_enumdef_make made it) */
             if (c->nops != 1 || !o->edef) {
                 b->err = IMDB_ERR_INVALID;
@@ -1129,7 +1343,12 @@ void imdb_commit_encode_payload(const imdb_commit_rec *c, imdb_buf *b)
 {
     for (uint32_t i = 0; i < c->nops; i++) {
         const imdb_op *o = &c->ops[i];
-        if (o->code != IMDB_OP_INSERT && o->code != IMDB_OP_UPDATE) continue;
+        if (o->code == IMDB_OP_CREATE_ROLE || o->code == IMDB_OP_ALTER_ROLE) { /* L: its name, then its verifier */
+            if (o->ro->rfields & IMDB_RF_NAME) rpay_put(b, &o->ro->rname);
+            if ((o->ro->rfields & IMDB_RF_VERIFIER) && !o->ro->rvnone) rpay_put(b, &o->ro->rver);
+            continue;
+        }
+        if (!imdb_op_is_row(o->code)) continue;
         imdb_buf_put_u8(b, o->pkind);
         if (o->pkind == IMDB_PAYLOAD_ROW) {
             imdb_buf_put(b, o->salt, 16);
@@ -1185,6 +1404,13 @@ static int cmp_erase(const imdb_erase_ent *a, const imdb_erase_ent *b)
     if (a->table != b->table) return a->table < b->table ? -1 : 1;
     if (a->vid != b->vid) return a->vid < b->vid ? -1 : 1;
     return 0;
+}
+
+int imdb_rerase_cmp(const imdb_rerase *a, const imdb_rerase *b)
+{
+    if (a->role != b->role) return a->role < b->role ? -1 : 1;
+    if (a->seq != b->seq) return a->seq < b->seq ? -1 : 1;
+    return a->what < b->what ? -1 : a->what > b->what;
 }
 
 static int cmp_rewrite(const imdb_rewrite *a, const imdb_rewrite *b)
@@ -1258,7 +1484,7 @@ int imdb_commit_decode_header(const uint8_t *h, size_t hlen, imdb_commit_rec *c,
             break;
         case IMDB_OP_ERASE: {
             uint32_t n = imdb_rd_u32(&r);
-            if (r.err || n == 0 || n > IMDB_MAX_ERASE_ENTRIES || n > imdb_rd_left(&r) / 44)
+            if (r.err || n > IMDB_MAX_ERASE_ENTRIES || n > imdb_rd_left(&r) / 44) /* L stage 2: none with role entries */
                 return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: erase count out of range");
             o->erase = imdb_alloc_array(n ? n : 1, sizeof *o->erase, e);
             if (!o->erase) return e->code;
@@ -1282,6 +1508,24 @@ int imdb_commit_decode_header(const uint8_t *h, size_t hlen, imdb_commit_rec *c,
                 imdb_rd_copy(&r, o->rewrites[k].new_hash, 32);
                 if (k && cmp_rewrite(&o->rewrites[k - 1], &o->rewrites[k]) >= 0)
                     return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: rewrites not strictly sorted");
+            }
+            uint32_t k = imdb_rd_u32(&r); /* L stage 2: the role entries */
+            if (r.err || k > IMDB_MAX_ROLE_ERASE || k > imdb_rd_left(&r) / IMDB_RERASE_BYTES || (!n && (!k || m)) || (n && k))
+                return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: an ERASE names no version and no role entry, both (no writer "
+                                 "signs one), or its counts are out of range");
+            o->rerase = imdb_alloc_array(k ? k : 1, sizeof *o->rerase, e);
+            if (!o->rerase) return e->code;
+            o->n_rerase = k;
+            for (uint32_t q = 0; q < k; q++) {
+                imdb_rerase *x = &o->rerase[q];
+                x->role = imdb_rd_u32(&r);
+                x->seq = imdb_rd_u64(&r);
+                x->what = imdb_rd_u8(&r);
+                imdb_rd_copy(&r, x->commit, 32);
+                if (r.err || !x->role || !x->seq || x->seq >= c->seq ||
+                    (x->what != IMDB_RPAY_NAME && x->what != IMDB_RPAY_VERIFIER) ||
+                    (q && imdb_rerase_cmp(&o->rerase[q - 1], x) >= 0))
+                    return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: an ERASE's role entries out of range or not strictly sorted");
             }
             imdb_rd_copy(&r, o->manifest, 32);
             break;
@@ -1357,6 +1601,34 @@ int imdb_commit_decode_header(const uint8_t *h, size_t hlen, imdb_commit_rec *c,
             if (imdb_viewdef_decode(&r, &o->vdef, e)) return e->code;
             if (nops != 1) return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: a view op must be the only op");
             break;
+        case IMDB_OP_CREATE_ROLE: /* L: alone */
+        case IMDB_OP_ALTER_ROLE:
+            if (!(o->ro = imdb_alloc(sizeof *o->ro, e))) return e->code;
+            role_body_get(&r, o);
+            if (!r.err && (nops != 1 || !role_body_ok(o)))
+                return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: a role op must be the only op, its fields known");
+            break;
+        case IMDB_OP_DROP_ROLE:
+            if (!(o->ro = imdb_alloc(sizeof *o->ro, e))) return e->code;
+            o->ro->rid = imdb_rd_u32(&r);
+            if (!r.err && (nops != 1 || !o->ro->rid || o->ro->rid == UINT32_MAX))
+                return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: DROP ROLE must be the only op, its role in range");
+            break;
+        case IMDB_OP_GRANT: /* L: alone */
+        case IMDB_OP_REVOKE: {
+            if (!(o->ro = imdb_alloc(sizeof *o->ro, e))) return e->code;
+            uint32_t n = imdb_rd_u32(&r);
+            if (r.err) break;
+            if (nops != 1 || !n || n > IMDB_MAX_GRANT_RECORDS || n > imdb_rd_left(&r) / IMDB_GRANT_REC_MEMBER)
+                return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: a GRANT or REVOKE must be the only op, of 1 to %u records",
+                                 IMDB_MAX_GRANT_RECORDS);
+            if (!(o->ro->grants = imdb_alloc_array(n, sizeof *o->ro->grants, e))) return e->code;
+            o->ro->ngrants = n;
+            for (uint32_t k = 0; k < n && !r.err; k++) imdb_grant_get(&r, &o->ro->grants[k]);
+            if (!r.err && !imdb_grants_ok(o->ro->grants, n))
+                return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: a GRANT's or REVOKE's records out of their rules or order");
+            break;
+        }
         case IMDB_OP_CREATE_ENUM: /* F3g: alone */
             if (imdb_enumdef_decode(&r, &o->edef, "commit", e)) return e->code;
             if (nops != 1) return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: an ENUM op must be the only op");
@@ -1439,7 +1711,13 @@ static int decode_payload(const uint8_t *p, size_t plen, imdb_commit_rec *c, imd
     imdb_rd_init(&r, p, plen);
     for (uint32_t i = 0; i < c->nops; i++) {
         imdb_op *o = &c->ops[i];
-        if (o->code != IMDB_OP_INSERT && o->code != IMDB_OP_UPDATE) continue;
+        if (o->code == IMDB_OP_CREATE_ROLE || o->code == IMDB_OP_ALTER_ROLE) { /* L: its name, then its verifier */
+            if ((o->ro->rfields & IMDB_RF_NAME) && rpay_get(&r, o->ro->rid, IMDB_RPAY_NAME, &o->ro->rname, e)) return e->code;
+            if ((o->ro->rfields & IMDB_RF_VERIFIER) && !o->ro->rvnone && rpay_get(&r, o->ro->rid, IMDB_RPAY_VERIFIER, &o->ro->rver, e))
+                return e->code;
+            continue;
+        }
+        if (!imdb_op_is_row(o->code)) continue;
         o->pkind = imdb_rd_u8(&r);
         if (r.err) return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: payload truncated");
         if (o->pkind == IMDB_PAYLOAD_REDACTED) continue;

@@ -54,9 +54,19 @@ INSERT INTO fe (m, w) VALUES ('ecstatic', 3);
 CREATE TYPE fgone AS ENUM ('g');
 DROP TYPE fgone;
 CREATE VIEW fev AS SELECT m, CAST('ok' AS fmood) AS k FROM fe;
+CREATE ROLE fr LOGIN PASSWORD 'fuzz-pw';
+CREATE ROLE fstaff;
+GRANT SELECT, INSERT ON txns TO fstaff;
+GRANT fstaff TO fr;
+ALTER ROLE fr PASSWORD 'fuzz-pw2';
+ALTER ROLE fstaff RENAME TO fcrew;
+CREATE ROLE fgoner PASSWORD 'fuzz-gone';
+DROP ROLE fgoner;
 CHECKPOINT;
 DROP INDEX meas_x;
 ERASE SUBJECT 7;
+ERASE ROLE fgoner;
+ERASE ROLE fr;
 COMPACT txns PURGE BEFORE 3;
 "
 "$BIN" sql "$D" --nosync -c "$SQL" >/dev/null
@@ -207,4 +217,20 @@ printf 'SELECT t.id, u.v FROM t JOIN u USING (id) -- c\n WHERE EXISTS (SELECT * 
 printf 'SELECT g FROM t UNION SELECT v FROM u INTERSECT (SELECT tid FROM u ORDER BY 1 LIMIT 3)' > "$OUT/abind/setop"
 printf 'SELECT id, LAG(d, 1, 0.5) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS l FROM t' > "$OUT/abind/window"
 printf 'SELECT id, (SELECT MAX(u.d) FROM u WHERE u.tid = t.id) AS m FROM (SELECT id, g FROM t) AS t' > "$OUT/abind/nested"
+# L: fuzz_role's three readers (fuzz/fuzz_role.c: the first byte picks one): RFC 7677's verifier as PostgreSQL's text, the
+# same as a payload entry's bytes, and a roles section of one role whose name is in the roles object (its commitment
+# SHA-256("IMDBROL1" | u32 role | u8 what | salt | u32 len | bytes)), the section's length first
+mkdir -p "$OUT/role"
+V='SCRAM-SHA-256$4096:W22ZaJ0SNY7soEsUEjb6gQ==$WG5d8oPm3OtcPnkdi4Uo7BkeZkBFzpcXkuLmtbsT4qY=:wfPLwcE6nTWhTAmQ7tl2KeoiWGPlZqQxSrmfPwDl2dU='
+{ printf '\000'; printf '%s' "$V"; } > "$OUT/role/text"
+{ printf '\001\000\020\000\000\020'; printf 'W22ZaJ0SNY7soEsUEjb6gQ==' | base64 -d
+  printf 'WG5d8oPm3OtcPnkdi4Uo7BkeZkBFzpcXkuLmtbsT4qY=' | base64 -d; printf 'wfPLwcE6nTWhTAmQ7tl2KeoiWGPlZqQxSrmfPwDl2dU=' | base64 -d
+} > "$OUT/role/bytes"
+SALT=00112233445566778899aabbccddeeff
+CM=$( { printf 'IMDBROL1'; printf '01000000' | xxd -r -p; printf '01' | xxd -r -p; printf '%s' "$SALT" | xxd -r -p
+        printf '05000000' | xxd -r -p; printf 'alice'; } | sha256sum | cut -c1-64)
+OBJ=494d4442524c4f31010000000100000001${SALT}05000000616c696365
+S5=$(printf '%064d' 0)01000000010000000100000001000000000000000000000000000000000000000100000000000000${CM}000000000000
+{ printf '\002'; printf '%08x' $(( ${#S5} / 2 )) | sed 's/\(..\)\(..\)\(..\)\(..\)/\4\3\2\1/' | xxd -r -p
+  printf '%s%s' "$S5" "$OBJ" | xxd -r -p; } > "$OUT/role/section"
 echo "corpus: $(find "$OUT" -type f | wc -l) seeds in $OUT"

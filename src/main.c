@@ -61,7 +61,8 @@ static int usage(void)
           "                                             allowlist a replica's key for acknowledgements\n"
           "  imagedb verify <dir> [--anchor FILE]       re-verify log, chain, signatures, digests, erasure, lake\n"
           "  imagedb info <dir>                         head, digest, tables, lake\n"
-          "  imagedb dump <dir> [--batch N]             a logical dump on stdout: every table's CREATE TABLE, rows\n"
+          "  imagedb dump <dir> [--batch N] [--role-passwords]\n"
+          "                                             a logical dump on stdout: every table's CREATE TABLE, rows\n"
           "                                             (COPY ... FROM STDIN, BATCH N rows a commit; 10000) and\n"
           "                                             indexes at one commit; imagedb sql NEW -f FILE restores it\n"
           "  imagedb stats <file>                       a running copy's export (--stats FILE on sql, apply, follow)\n"
@@ -1800,18 +1801,21 @@ int main(int argc, char **argv)
     if (strcmp(cmd, "stats") == 0 && argc == 3) return cmd_stats(argv[2]); /* P1 M1 */
     if (strcmp(cmd, "health") == 0 && argc >= 3) return cmd_health(argc, argv);
     if (strcmp(cmd, "backups") == 0 && argc >= 3) return cmd_backups(argc, argv);
-    if (strcmp(cmd, "dump") == 0 && (argc == 3 || (argc == 5 && strcmp(argv[3], "--batch") == 0))) { /* P2 S17 */
-        uint32_t batch = 0;
-        if (argc == 5) {
-            char *end = NULL;
-            unsigned long v = strtoul(argv[4], &end, 10);
-            if (!end || *end || !v || v > UINT32_MAX) return usage();
-            batch = (uint32_t)v;
+    if (strcmp(cmd, "dump") == 0 && argc >= 3) { /* P2 S17; L: --role-passwords writes the roles' verifiers */
+        uint32_t batch = 0, flags = 0;
+        for (int a = 3; a < argc; a++) {
+            if (strcmp(argv[a], "--role-passwords") == 0) flags |= IMDB_DUMP_ROLE_PASSWORDS;
+            else if (strcmp(argv[a], "--batch") == 0 && a + 1 < argc) {
+                char *end = NULL;
+                unsigned long v = strtoul(argv[++a], &end, 10);
+                if (!end || *end || !v || v > UINT32_MAX) return usage();
+                batch = (uint32_t)v;
+            } else return usage();
         }
         imdb_db *db = open_or_die(argv[2], true, 0); /* read-only: a live primary's or a replica's, never the writer's */
         if (!db) return 1;
         imdb_err de = {0};
-        int rc = imdb_dump(db, batch, copy_write, NULL, &de);
+        int rc = imdb_dump_ex(db, batch, flags, copy_write, NULL, &de);
         if (!rc && fflush(stdout) != 0) rc = imdb_fail(&de, IMDB_ERR_IO, "dump: writing stdout failed");
         imdb_close(db);
         if (rc) {

@@ -201,3 +201,40 @@ int imdb_erase_subject(imdb_db *db, const imdb_value *subject, imdb_erase_report
     imdb_op_leave(db);
     return rc;
 }
+
+/* L stage 2: ERASE ROLE (db.h, docs/roles-design.md §11). The entries are doomed for the plan, so the one encoder writes
+ * the manifest the op names as the catalog will be after the install; any failure before the install clears the marks */
+int imdb_erase_role(imdb_db *db, const char *name, imdb_erase_report *rep, imdb_err *e)
+{
+    memset(rep, 0, sizeof *rep);
+    if (db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "ERASE must run outside an explicit transaction");
+    imdb_rerase *x = NULL;
+    uint32_t n = 0;
+    if (imdb_role_erase_collect(&db->rc, name, &x, &n, e)) return e->code;
+    if (!n) return IMDB_OK; /* a known role with nothing left */
+    uint32_t held = db->rc.n;
+    if (imdb_begin(db, e)) {
+        imdb_free(x);
+        return e->code;
+    }
+    imdb_role_doom(&db->rc, x, n);
+    imdb_rewrite *rw = NULL;
+    uint32_t nrw = 0;
+    uint8_t manifest[32];
+    if (imdb_lake_plan_erase(db, NULL, 0, &rw, &nrw, manifest, e) || imdb_tx_add_erase(db, NULL, 0, rw, nrw, manifest, e)) {
+        imdb_role_undoom(&db->rc);
+        imdb_rollback(db);
+        imdb_free(x);
+        imdb_free(rw);
+        return e->code;
+    }
+    imdb_op *op = &db->tx[db->ntx - 1]; /* the op takes the list: tx_op_free frees it */
+    op->rerase = x;
+    op->n_rerase = n;
+    rep->role_entries = n;
+    int rc = imdb_commit(db, e);
+    imdb_role_undoom(&db->rc); /* the install erased every doomed entry; after a failure, none is */
+    if (!rc) rep->roles_removed = held - db->rc.n;
+    rep->redaction_pending = !rc && (db->needs_redaction || db->lake_pending || db->gc_pending || db->failed);
+    return rc;
+}

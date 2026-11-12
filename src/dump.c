@@ -201,7 +201,90 @@ static int by_name(const void *a, const void *b)
     return strcmp((*(imdb_table *const *)a)->s.name, (*(imdb_table *const *)b)->s.name);
 }
 
+/* L: the live roles (CREATE ROLE, their verifiers' texts only when asked), then the memberships (GRANT role TO role): before
+ * everything, as pg_dumpall's globals come first */
+static int roles_text(dumper *d, imdb_db *db, bool passwords, imdb_err *e)
+{
+    bool any = false;
+    for (uint32_t i = 0; i < db->rc.n; i++) any |= !db->rc.roles[i]->dropped_at; /* the note whatever they hold: a dump
+                                                                                * restored dumps again the same */
+    if (any && !passwords) {
+        imdb_buf_put_str(&d->b, "-- the roles come without passwords (imagedb dump --role-passwords writes their SCRAM-SHA-256 "
+                                "verifiers: an offline-guessing target, keep such a dump as a secret)\n");
+        if (put(d, e)) return e->code;
+    }
+    for (uint32_t i = 0; i < db->rc.n; i++) {
+        const imdb_role *r = db->rc.roles[i];
+        if (r->dropped_at) continue;
+        imdb_buf_printf(&d->b, "CREATE ROLE %s%s%s", r->name, (r->attrs & IMDB_RA_LOGIN) ? " LOGIN" : "",
+                        (r->attrs & IMDB_RA_SUPERUSER) ? " SUPERUSER" : "");
+        imdb_scram v;
+        imdb_err e2 = {0};
+        char t[IMDB_SCRAM_TEXT_MAX];
+        if (passwords && r->has_ver && r->vent.bytes && !imdb_scram_decode(r->vent.bytes, r->vent.len, &v, &e2) &&
+            imdb_scram_format(&v, t, sizeof t))
+            imdb_buf_printf(&d->b, " PASSWORD '%s'", t);
+        imdb_wipe(&v, sizeof v);
+        imdb_buf_put_str(&d->b, ";\n");
+        if (put(d, e)) return e->code;
+    }
+    for (uint32_t i = 0; i < db->rc.n; i++)
+        for (uint32_t k = 0; k < db->rc.roles[i]->ngroups; k++) {
+            const imdb_role *g = imdb_role_by_id(db, db->rc.roles[i]->groups[k]);
+            if (!g) continue;
+            imdb_buf_printf(&d->b, "GRANT %s TO %s;\n", g->name, db->rc.roles[i]->name);
+            if (put(d, e)) return e->code;
+        }
+    return IMDB_OK;
+}
+
+typedef struct gname { /* a privilege of a role's, by its object's name: a restore renumbers the objects, not their names */
+    const char *obj;
+    uint32_t privs;
+} gname;
+
+static int by_obj(const void *a, const void *b) { return strcmp(((const gname *)a)->obj, ((const gname *)b)->obj); }
+
+/* L: each role's privileges, after every table and view, by role and then by object name */
+static int grants_text(dumper *d, imdb_db *db, imdb_err *e)
+{
+    static const char *const pn[] = {"SELECT", "INSERT", "UPDATE", "DELETE"};
+    gname *gs = NULL;
+    uint32_t capg = 0;
+    int rc = IMDB_OK;
+    for (uint32_t i = 0; !rc && i < db->rc.n; i++) {
+        const imdb_role *r = db->rc.roles[i];
+        if (r->nprivs > capg) {
+            imdb_free(gs);
+            if (!(gs = imdb_alloc_array(r->nprivs, sizeof *gs, e))) return e->code;
+            capg = r->nprivs;
+        }
+        uint32_t ng = 0;
+        for (uint32_t k = 0; k < r->nprivs; k++) {
+            const imdb_rpriv *p = &r->privs[k];
+            const imdb_table *t = p->okind == IMDB_OBJ_TABLE ? imdb_table_by_id(db, p->oid) : NULL;
+            const char *obj = t ? t->s.name : p->okind == IMDB_OBJ_VIEW && p->oid < db->nviews ? db->views[p->oid].name : NULL;
+            if (obj) gs[ng++] = (gname){.obj = obj, .privs = p->privs};
+        }
+        if (ng) qsort(gs, ng, sizeof *gs, by_obj); /* gs is NULL until a role holds a privilege */
+        for (uint32_t k = 0; !rc && k < ng; k++) {
+            imdb_buf_put_str(&d->b, "GRANT ");
+            for (int b = 0, n = 0; b < 4; b++)
+                if (gs[k].privs & (1u << b)) imdb_buf_printf(&d->b, "%s%s", n++ ? ", " : "", pn[b]);
+            imdb_buf_printf(&d->b, " ON %s TO %s;\n", gs[k].obj, r->name);
+            rc = put(d, e);
+        }
+    }
+    imdb_free(gs);
+    return rc;
+}
+
 int imdb_dump(imdb_db *db, uint32_t batch, imdb_copy_write_fn wr, void *arg, imdb_err *e)
+{
+    return imdb_dump_ex(db, batch, 0, wr, arg, e);
+}
+
+int imdb_dump_ex(imdb_db *db, uint32_t batch, uint32_t flags, imdb_copy_write_fn wr, void *arg, imdb_err *e)
 {
     if (batch > IMDB_MAX_OPS_PER_COMMIT)
         return imdb_fail(e, IMDB_ERR_INVALID, "a dump's BATCH is 1 to %u rows", (unsigned)IMDB_MAX_OPS_PER_COMMIT);
@@ -240,6 +323,7 @@ int imdb_dump(imdb_db *db, uint32_t batch, imdb_copy_write_fn wr, void *arg, imd
                         (unsigned long long)d->s.txn.snap, head, (unsigned)db->meta.digest_alg);
         rc = put(d, e);
     }
+    if (!rc) rc = roles_text(d, db, (flags & IMDB_DUMP_ROLE_PASSWORDS) != 0, e); /* L */
     for (uint32_t i = 0; !rc && i < db->nenums; i++) { /* F3g: each live ENUM type, its labels as they are now, before the tables */
         const imdb_enum *t = &db->enums[i];
         if (t->dropped_at || !t->def) continue;
@@ -312,6 +396,7 @@ int imdb_dump(imdb_db *db, uint32_t batch, imdb_copy_write_fn wr, void *arg, imd
         imdb_buf_printf(&d->b, "SELECT setval('%s', %lld, %s);\n", s->d.name, (long long)s->last, s->called ? "true" : "false");
         rc = put(d, e);
     }
+    if (!rc) rc = grants_text(d, db, e); /* L: after every table and view */
     if (!rc) {
         imdb_buf_printf(&d->b, "-- the end of the dump: %u tables, %u views, %llu rows\n", (unsigned)n, (unsigned)nviews,
                         (unsigned long long)rows);

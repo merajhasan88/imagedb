@@ -99,7 +99,7 @@ typedef struct sql_item {
 
 enum {
     ST_CREATE = 1, ST_INSERT, ST_UPDATE, ST_DELETE, ST_SELECT, ST_BEGIN, ST_COMMIT, ST_ROLLBACK,
-    ST_CHECKPOINT, ST_COMPACT, ST_ERASE_SUBJECT, ST_ERASE_WHERE, ST_VERIFY,
+    ST_CHECKPOINT, ST_COMPACT, ST_ERASE_SUBJECT, ST_ERASE_WHERE, ST_ERASE_ROLE, ST_VERIFY,
     ST_SHOW_TABLES, ST_SHOW_DIGEST, ST_SHOW_HISTORY, ST_SHOW_LOG, ST_SHOW_LAKE, ST_SHOW_IDENTITY, ST_SHOW_REPLICAS, ST_SHOW_REPLICATION, ST_SHOW_ERASURE, ST_SHOW_MEMORY, ST_SET, ST_EMPTY,
     ST_SAVEPOINT, ST_ROLLBACK_TO, ST_RELEASE, ST_SET_TXN,
     ST_CREATE_INDEX, ST_DROP_INDEX, ST_SHOW_INDEXES, ST_DROP_TABLE,
@@ -112,6 +112,7 @@ enum {
     ST_SHOW_TIMEZONE, /* P2: SHOW TIME ZONE, SHOW timezone */
     ST_CREATE_SEQUENCE, ST_DROP_SEQUENCE, /* F2a-2 */
     ST_CREATE_TYPE, ST_ALTER_TYPE, ST_DROP_TYPE, /* F3g: ENUM types */
+    ST_CREATE_ROLE, ST_ALTER_ROLE, ST_DROP_ROLE, ST_GRANT, ST_REVOKE, ST_SHOW_ROLES, ST_SHOW_GRANTS, /* L: roles and grants */
 };
 
 /* P2 S3: a join's kind as written (RIGHT keeps side 1's rows, FULL both sides'; CROSS and FROM a, b have no ON) */
@@ -278,6 +279,18 @@ typedef struct sql_stmt {
     char (*ctname)[IMDB_MAX_IDENT + 1];         /* F3g: CREATE TABLE's (and ADD COLUMN's, at 0) ENUM columns' type names by
                                                    position, allocated (IMDB_MAX_COLS) at the first one; NULL: none */
     bool if_exists, if_not_exists;              /* F3g: DROP TYPE IF EXISTS; ALTER TYPE ... ADD VALUE IF NOT EXISTS */
+    /* L: a role statement's attributes named (rattr_set) and their values, its options counted, PASSWORD (rpw 0 none,
+     * 1 NULL, 2 rpw_lit), CREATE USER (ruser), RENAME TO (rrename, rnew); GRANT and REVOKE: the privileges (gprivs, 0:
+     * a membership; gall: ALL), the objects or the roles granted (gobj) and the grantees or members (gto), each list
+     * allocated (IMDB_MAX_GRANT_NAMES) */
+    uint32_t rattr_set, rattr_val, gprivs;
+    uint16_t ropts, ngobj, ngto;
+    uint8_t rpw;
+    bool ruser, rrename, gall;
+    sql_lit rpw_lit;
+    char rnew[IMDB_MAX_IDENT + 1];
+    char (*gobj)[IMDB_MAX_IDENT + 1];
+    char (*gto)[IMDB_MAX_IDENT + 1];
     char set_name[IMDB_MAX_IDENT + 1];          /* SET */
     char set_value[IMDB_MAX_IDENT + 1];
     bool set_zone;                              /* P2: SET TIME ZONE / timezone: set_value the zone's name as written, "" for
