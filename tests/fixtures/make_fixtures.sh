@@ -1,7 +1,7 @@
 #!/bin/sh
 # Makes the format's fixtures (2026-11-12, its first pair: META 5, log version 3, manifest version 16 and segment format 3 (F1 stage 4:
-# a segment names its schema version by its hash with positions), ops 16, 19, 20, 21, 22's kinds and 23 to 29; alg1-20261112a.tar.gz
-# and alg2-20261112a.tar.gz beside this script): a primary and its replica under digest algorithm ALG, by
+# a segment names its schema version by its hash with positions), ops 16, 19, 20, 21, 22's kinds and 23 to 32; alg1-20261112b.tar.gz
+# and alg2-20261112b.tar.gz beside this script): a primary and its replica under digest algorithm ALG, by
 # make_alg2.sh's steps, which reach every reader of the format: a log of several segments (each manifest
 # publish ends one), CHECKPOINTs (manifests, segments, the lanes), a two-column index and a unique one,
 # an UPDATE and a DELETE, ERASE SUBJECT (redacted log payloads, rewritten segments), commits after it, and
@@ -27,7 +27,10 @@
 # 14), and (F3e) a table of DECIMALs to 38 digits at their bounds (a wide key, a wide DEFAULT, a view of wide values and of
 # places past 18; a widening within the wide form and rows from the log: manifest 15), and (F3f) a table of INTERVALs (each
 # field at its ends, the equal-span trio '1 mon', '30 days', '720:00:00', a DEFAULT, a view of their arithmetic; an ADD
-# with an INTERVAL DEFAULT after the first CHECKPOINT, rows and an update from the log: manifest 16). The live
+# with an INTERVAL DEFAULT after the first CHECKPOINT, rows and an update from the log: manifest 16), and (F3g) ENUM
+# types (a type holding the empty label, a dropped type's tombstone, a table keyed by one with an index and a DEFAULT,
+# a view with a CAST to the type; after the first CHECKPOINT an ADD VALUE, an ADD COLUMN of the type with a DEFAULT,
+# rows and an update from the log: manifest 17, each label's commit). The live
 # tables are RETENTION FOREVER and the dropped one is kept a century, the longest but FOREVER: a fixture is frozen
 # data, so its history
 # never expires under the tests that open it (the 24-hour default is tested by the unit tests). Every
@@ -41,10 +44,10 @@
 # alg2-20261109d, manifest version 11: before generated columns; alg1-20261109e and alg2-20261109e, manifest version 12:
 # before FOREIGN KEYs; alg1-20261109f and alg2-20261109f, manifest version 13: before UUID and BYTEA; alg1-20261109g and
 # alg2-20261109g, manifest version 14: before DECIMALs of 38 digits; alg1-20261110a and alg2-20261110a, manifest version
-# 15: before INTERVAL) stay as
+# 15: before INTERVAL; alg1-20261112a and alg2-20261112a, manifest version 16: before ENUM types) stay as
 # directories this format refuses.
 #   sh tests/fixtures/make_fixtures.sh BIN AUDIT ALG OUTDIR   (OUTDIR must not exist)
-#   tar -czf tests/fixtures/algALG-20261112a.tar.gz -C OUTDIR primary replica
+#   tar -czf tests/fixtures/algALG-20261112b.tar.gz -C OUTDIR primary replica
 set -eu
 BIN=$1
 AUD=$2
@@ -124,6 +127,13 @@ sql "CREATE TABLE spans (id INT64 PRIMARY KEY, iv INTERVAL, at TIMESTAMP, d INTE
 sql "INSERT INTO spans (id, iv, at) VALUES (1, '1 mon', '2024-01-31 10:00:00'), (2, '30 days', '2024-01-31 10:00:00'), (3, '720:00:00', '2024-02-29 00:00:00'), (4, NULL, NULL)"
 sql "INSERT INTO spans VALUES (5, '178956970 years 7 mons 2147483647 days 2562047788:00:54.775807', '0001-01-01 00:00:00', '-178956970 years -8 mons -2147483648 days -2562047788:00:54.775808')" # each field's ends
 sql "CREATE VIEW spansv AS SELECT id, at + iv AS later, iv - INTERVAL '1 day' AS less, -d AS neg FROM spans WHERE id < 5" # F3f: arithmetic
+sql "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy', '')"   # F3g: op 30, the empty label among them
+sql "CREATE TYPE gonetype AS ENUM ('g')"
+sql "DROP TYPE gonetype"                              # op 31: a tombstone in the manifest
+sql "CREATE TABLE moods (m mood PRIMARY KEY, n mood NOT NULL DEFAULT 'ok', w INT64) RETENTION FOREVER" # an ENUM key
+sql "CREATE INDEX moods_n ON moods (n)"
+sql "INSERT INTO moods VALUES ('sad', 'happy', 1), ('happy', 'sad', 2), ('', '', 3)"
+sql "CREATE VIEW moodsv AS SELECT m, n, CAST('happy' AS mood) AS h FROM moods WHERE n > 'sad'" # a TYPE dependency
 sql "CHECKPOINT"
 ship
 sql "ALTER TABLE pair ADD w TEXT DEFAULT 'w0'"          # F1: op 22; pair's rows so far are in a segment of version 1
@@ -164,6 +174,10 @@ sql "ALTER TABLE wide ALTER COLUMN x TYPE DECIMAL(38,0)"  # F3e: a widening with
 sql "ALTER TABLE spans ADD COLUMN e INTERVAL DEFAULT INTERVAL '-1 mons +1 day -01:00:00'" # F3f: older rows read it (a 16-byte cell)
 sql "UPDATE spans SET iv = iv + INTERVAL '1 day', at = at - INTERVAL '1 mon' WHERE id = 2" # from the log
 sql "INSERT INTO spans (id, iv, at) VALUES (6, '-1 days +02:00:00', '2000-03-31 00:00:00')"
+sql "ALTER TYPE mood ADD VALUE 'ecstatic'"               # F3g: op 32 after the first CHECKPOINT
+sql "INSERT INTO moods (m, w) VALUES ('ecstatic', 4)"
+sql "ALTER TABLE moods ADD COLUMN p mood DEFAULT 'happy'" # older rows read it
+sql "UPDATE moods SET n = 'ecstatic' WHERE m = 'sad'"   # from the log
 sql "UPDATE wide SET w = w - 1, x = x * 1000000000000 WHERE id = 1" # from the log
 sql "INSERT INTO wide (id, x) VALUES (2, -12345678901234567890123456789012345678)"
 sql "UPDATE stamp SET at = TIMESTAMPTZ '2030-01-01 12:00:00+05:45' WHERE id = 3" # P2: an instant from the log

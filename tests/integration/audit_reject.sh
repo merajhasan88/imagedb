@@ -301,7 +301,7 @@ echo "== FA-FE: manifest 7 (the format design's slice 1) breaking one of its rul
 PFA=$WORK/fa; make_db "$PFA"
 "$FORGE" manifest-lie "$PFA" section
 must_fail "a later imagedb's format" "$BIN" verify "$PFA"
-must_fail "manifest: section 4 not empty" "$AUD" verify "$PFA"
+must_fail "manifest: section 5 not empty" "$AUD" verify "$PFA"
 PFB=$WORK/fb; make_db "$PFB"
 "$FORGE" manifest-lie "$PFB" keylist
 must_fail "physical divergence" "$BIN" verify "$PFB"   # an unreadable manifest: the open replays and rebuilds it (as X)
@@ -597,6 +597,51 @@ must_fail "a PRIMARY KEY column cannot be an INTERVAL" "$BIN" verify "$PJB"
 must_fail "schema: bad PRIMARY KEY" "$AUD" verify "$PJB"
 echo "   JA a signed INSERT whose INTERVAL is 15 bytes (the row codec takes 16), JB a signed CREATE whose key is an
    INTERVAL (deferred.md D26): the replay and the auditor refuse each"
+
+
+echo "== KA-KG: ENUM types (F3g) broken, each signed or in the manifest: an ordinal past the labels, a CREATE of an unknown or a
+   dropped type, a DROP TYPE under a live column, an ADD VALUE of a label held, a manifest's label the log never made, an
+   ADD COLUMN's DEFAULT past the labels"
+k_db() { # $1: a directory holding type kmood ('ka', 'kb', 'kc'), a dropped type, a table ke (id, m kmood NOT NULL) of a row
+  "$BIN" init "$1" >/dev/null
+  "$BIN" sql "$1" --nosync -c "CREATE TYPE kmood AS ENUM ('ka', 'kb', 'kc');" -c "CREATE TYPE kgone AS ENUM ('z');" \
+    -c "DROP TYPE kgone;" -c "CREATE TABLE ke (id INT64 PRIMARY KEY, m kmood NOT NULL);" -c "INSERT INTO ke VALUES (1, 'kb');" >/dev/null
+  "$BIN" verify "$1" >/dev/null && "$AUD" verify "$1" >/dev/null || fail "the honest directory must verify"
+}
+PKA=$WORK/ka; k_db "$PKA"
+"$FORGE" index-lie "$PKA" enum-ord
+must_fail "label of its ENUM type" "$BIN" verify "$PKA"
+must_fail "holds no label of its ENUM type" "$AUD" verify "$PKA"
+PKB=$WORK/kb; k_db "$PKB"
+"$FORGE" index-lie "$PKB" create-enum-unknown
+must_fail "ENUM type that is not live" "$BIN" verify "$PKB"
+must_fail "ENUM type that is not live" "$AUD" verify "$PKB"
+PKC=$WORK/kc; k_db "$PKC"
+"$FORGE" index-lie "$PKC" create-enum-dropped
+must_fail "ENUM type that is not live" "$BIN" verify "$PKC"
+must_fail "ENUM type that is not live" "$AUD" verify "$PKC"
+PKD=$WORK/kd; k_db "$PKD"
+"$FORGE" index-lie "$PKD" enum-drop-used
+must_fail "DROP of ENUM type" "$BIN" verify "$PKD"
+must_fail "DROP TYPE kmood, a column of table ke" "$AUD" verify "$PKD"
+PKE=$WORK/ke; k_db "$PKE"
+"$FORGE" index-lie "$PKE" enum-add-dup
+must_fail "ADD VALUE of a label" "$BIN" verify "$PKE"
+must_fail "a label the type holds" "$AUD" verify "$PKE"
+PKF=$WORK/kf; k_db "$PKF"
+"$BIN" sql "$PKF" --nosync -c "CHECKPOINT;" >/dev/null
+"$BIN" verify "$PKF" >/dev/null && "$AUD" verify "$PKF" >/dev/null || fail "the honest directory must verify"
+"$FORGE" manifest-lie "$PKF" enum-label
+must_fail "ENUM type kmood" "$BIN" verify "$PKF"
+must_fail "ENUM type kmood in the manifest differs" "$AUD" verify "$PKF"
+PKG=$WORK/kg; k_db "$PKG"
+"$FORGE" index-lie "$PKG" enum-default-ord
+must_fail "no label of its ENUM type" "$BIN" verify "$PKG"
+must_fail "no label of its ENUM type" "$AUD" verify "$PKG"
+echo "   KA a signed row whose ordinal is its type's label count, KB and KC a signed CREATE naming an unknown and a dropped
+   type, KD a signed DROP TYPE under a live column, KE a signed ADD VALUE of a label the type holds, KG a signed ADD COLUMN
+   whose DEFAULT is past the labels: the replay and the auditor refuse each; KF a manifest whose type holds a label the
+   log never made: VERIFY and the auditor refuse it"
 
 echo "== Z: a commit naming the other digest algorithm, re-signed by the writer (both ways round); META naming an unknown one"
 for a in 1 2; do # explicit algorithms: under IMDB_DIGEST_ALG=2 make_db's would all be alg 2

@@ -281,13 +281,17 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
         switch (o->code) {
         case IMDB_OP_CREATE_TABLE:
             if (o->table != db->nt) rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: table id out of sequence", (unsigned long long)seq);
-            else if (imdb_view_by_name(db, o->schema->name) || imdb_seq_by_name(db, o->schema->name)) /* P2 S7, F2a-2: one name space */
+            else if (imdb_view_by_name(db, o->schema->name) || imdb_seq_by_name(db, o->schema->name) || /* P2 S7, F2a-2 */
+                     imdb_enum_by_name(db, o->schema->name)) /* F3g: one name space */
                 rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: table %u takes a live view's name", (unsigned long long)seq,
                                o->table);
+            else if (imdb_enum_cols_live(db, o->schema, e)) /* F3g: each ENUM column a live type's (e says which) */
+                rc = IMDB_ERR_CORRUPT, e->code = IMDB_ERR_CORRUPT;
             else if (!(rc = imdb_table_new(db, o->schema, e))) db->t[db->nt - 1]->created_at = seq;
             break;
         case IMDB_OP_COLUMN_DEFAULTS: /* F2a: its CREATE's defaults (the codec checked them against the CREATE's schema) */
             rc = gen_texts_bind(&t->s, o->defs, o->ndefs, seq, e); /* F2c: each generated column's text binds */
+            if (!rc && imdb_coldefs_enum_ok(db, &t->s, o->defs, o->ndefs, e)) rc = IMDB_ERR_CORRUPT, e->code = IMDB_ERR_CORRUPT; /* F3g */
             if (!rc && !(rc = imdb_hist_create_defaults(&t->hist, o->defs, o->ndefs, e)))
                 rc = imdb_seq_own(db, o->table, o->defs, o->ndefs, seq, e); /* F2a-2: an IDENTITY's sequence is its column's */
             break;
@@ -351,7 +355,8 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
             const imdb_viewdef *d = o->vdef;
             if (d->id != db->nviews)
                 rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: view id out of sequence", (unsigned long long)seq);
-            else if (imdb_table_by_name(db, d->name) || imdb_view_by_name(db, d->name) || imdb_seq_by_name(db, d->name))
+            else if (imdb_table_by_name(db, d->name) || imdb_view_by_name(db, d->name) || imdb_seq_by_name(db, d->name) ||
+                     imdb_enum_by_name(db, d->name)) /* F3g */
                 rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: view %u takes a live table's or view's name",
                                (unsigned long long)seq, d->id);
             else if (!imdb_view_deps_live(db, d))
@@ -363,6 +368,11 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
             }
             break;
         }
+        case IMDB_OP_CREATE_ENUM: /* F3g: the catalog's rules (db.c imdb_enum_apply) */
+        case IMDB_OP_DROP_ENUM:
+        case IMDB_OP_ENUM_ADD:
+            rc = imdb_enum_apply(db, o, seq, e);
+            break;
         case IMDB_OP_CREATE_SEQUENCE: /* F2a-2: the catalog's rules (db.c imdb_seq_apply) */
         case IMDB_OP_DROP_SEQUENCE:
         case IMDB_OP_SEQ_ADVANCE:

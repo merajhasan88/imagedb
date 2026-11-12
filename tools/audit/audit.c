@@ -58,12 +58,16 @@
 #define RETAIN_MAX_US (36525ull * 24 * 3600 * 1000000) /* ... to a century, or all ones (FOREVER) */
 
 enum { T_INT64 = 1, T_DECIMAL = 2, T_TEXT = 3, T_BOOL = 4, T_TIMESTAMP = 5, T_FLOAT64 = 6, T_TIMESTAMPTZ = 7, T_DATE = 8, T_TIME = 9,
-       T_UUID = 10, T_BYTEA = 11, T_INTERVAL = 12 }; /* F3d: UUID 16 bytes, BYTEA any bytes: byte strings as TEXT is
-                                                       * (bytes_t); F3f: INTERVAL, months, days, microseconds (16 bytes) */
+       T_UUID = 10, T_BYTEA = 11, T_INTERVAL = 12, T_ENUM = 13 }; /* F3d: UUID 16 bytes, BYTEA any bytes: byte strings as TEXT is
+                                                       * (bytes_t); F3f: INTERVAL, months, days, microseconds (16 bytes);
+                                                       * F3g: ENUM, a label's ordinal (4 bytes), its type's id the column's */
 #define UUID_LEN 16
 static bool bytes_t(uint8_t t) { return t == T_TEXT || t == T_UUID || t == T_BYTEA; }
-#define T_LAST T_INTERVAL /* P2: TIMESTAMPTZ an instant (UTC microseconds), its zone only how a session shows it; F3b: DATE (days since
+#define T_LAST T_ENUM /* P2: TIMESTAMPTZ an instant (UTC microseconds), its zone only how a session shows it; F3b: DATE (days since
                       * 1970-01-01, 0001-01-01 to 9999-12-31) and TIME (microseconds since midnight, below a day) */
+#define MAX_ENUMS 4096u      /* F3g: ENUM types, dropped ones counted (ids 1 to it) */
+#define MAX_ENUM_LABELS 1024u /* a type's labels */
+#define MAX_ENUM_LABEL 63u    /* a label's bytes */
 #define DATE_MIN (-719162LL)
 #define DATE_MAX 2932896LL
 #define TIME_MAX 86399999999LL
@@ -335,13 +339,18 @@ static aviewdef *decode_viewdef(rd *r)
     for (uint16_t i = 0; i < nc; i++) {
         uint8_t cl = rd_u8(r);
         const uint8_t *c = rd_bytes(r, cl);
-        uint8_t type = rd_u8(r), scale = rd_u8(r);
-        if (r->bad || !ident_ok(c, cl) || type < T_INT64 || type > T_LAST || (type == T_DECIMAL ? scale > 38 : scale != 0)) /* F3e */
+        uint8_t type = rd_u8(r), scale = 0;
+        uint16_t eid = 0;
+        if (type == T_ENUM) eid = rd_u16(r); /* F3g: its type's id where another type logs its scale */
+        else scale = rd_u8(r);
+        if (r->bad || !ident_ok(c, cl) || type < T_INT64 || type > T_LAST || (type == T_DECIMAL ? scale > 38 : scale != 0) || /* F3e */
+            (type == T_ENUM && (eid < 1 || eid > MAX_ENUMS))) /* F3g */
             goto bad;
         memcpy(cn[i], c, cl);
         memcpy(d->cols[i].name, c, cl); /* P2 S7b */
         d->cols[i].type = type;
         d->cols[i].scale = scale;
+        d->cols[i].eid = eid; /* F3g */
         cn[i][cl] = 0;
         for (uint16_t j = 0; j < i; j++)
             if (!strcmp(cn[j], cn[i])) goto bad;
@@ -353,7 +362,8 @@ static aviewdef *decode_viewdef(rd *r)
     for (uint16_t k = 0; k < d->ndeps; k++) {
         d->dep_kind[k] = rd_u8(r);
         d->dep_id[k] = rd_u32(r);
-        bool ok = d->dep_kind[k] == 1 ? d->dep_id[k] < MAX_TABLES : d->dep_kind[k] == 2 && d->dep_id[k] < d->id;
+        bool ok = d->dep_kind[k] == 1 ? d->dep_id[k] < MAX_TABLES : d->dep_kind[k] == 2 ? d->dep_id[k] < d->id
+                                                                 : d->dep_kind[k] == 3 && d->dep_id[k] >= 1 && d->dep_id[k] <= MAX_ENUMS; /* F3g */
         if (r->bad || !ok) goto bad;
         if (k && (d->dep_kind[k - 1] > d->dep_kind[k] ||
                   (d->dep_kind[k - 1] == d->dep_kind[k] && d->dep_id[k - 1] >= d->dep_id[k])))
@@ -378,6 +388,7 @@ typedef struct col {
     char name[64];
     uint8_t type, prec, scale, flags;
     uint16_t vlen; /* F3c: a TEXT's VARCHAR length (the schema's precision and scale bytes), 0 unbounded */
+    uint16_t eid;  /* F3g: an ENUM's type id (the schema's precision and scale bytes), 0 for every other type */
 } col;
 
 typedef struct schema {
@@ -433,6 +444,11 @@ static int decode_schema(rd *r, schema *s)
             c->vlen = (uint16_t)(c->prec | c->scale << 8);
             c->prec = c->scale = 0;
         }
+        if (c->type == T_ENUM) { /* F3g: the two bytes its type's id */
+            c->eid = (uint16_t)(c->prec | c->scale << 8);
+            c->prec = c->scale = 0;
+            if (c->eid < 1 || c->eid > MAX_ENUMS) return fail("schema: an ENUM column of no type id");
+        }
         if (r->bad) return fail("schema: truncated");
         if (c->type < T_INT64 || c->type > T_LAST || (c->flags & ~(F_PK | F_SUBJECT | F_NULLABLE)) ||
             ((c->flags & F_NULLABLE) && (c->flags & (F_PK | F_SUBJECT))))
@@ -482,6 +498,16 @@ typedef struct val {
 static bool dwide(const col *c) { return c->type == T_DECIMAL && c->prec > 18; }
 /* F3f: a value of 16 bytes in a row and a 16-byte cell in a segment: a wide DECIMAL, an INTERVAL */
 static bool fix16(const col *c) { return dwide(c) || c->type == T_INTERVAL; }
+/* F3g: a value's bytes in a row and a DEFAULT, one rule (the hand-kept ternaries became this): 0 for a TEXT or a BYTEA,
+ * a u32 length and its bytes */
+static uint32_t fixed_width(const col *c)
+{
+    if (c->type == T_TEXT || c->type == T_BYTEA) return 0;
+    if (c->type == T_UUID || fix16(c)) return 16;
+    if (c->type == T_BOOL) return 1;
+    if (c->type == T_ENUM) return 4; /* F3g: its ordinal, u32 */
+    return 8;
+}
 static __int128 dval(const val *v)
 {
     return v->wide ? (__int128)(((unsigned __int128)(uint64_t)v->hi << 64) | (uint64_t)v->i) : (__int128)v->i;
@@ -570,6 +596,8 @@ static int decode_row(const schema *s, const uint8_t *row, size_t n, val *out)
             v->len = v->s ? UUID_LEN : 0;
         } else if (t == T_BOOL) {
             v->i = rd_u8(&r);
+        } else if (t == T_ENUM) { /* F3g: its ordinal (the type's labels are the model's check) */
+            v->i = rd_u32(&r);
         } else if (t == T_INTERVAL) { /* F3f: months, days, microseconds */
             v->mon = (int32_t)rd_u32(&r);
             v->day = (int32_t)rd_u32(&r);
@@ -594,8 +622,7 @@ static size_t encode_row(const schema *s, const val *v, uint8_t **buf, size_t *c
     int nn = count_nullable(s);
     size_t need = (size_t)(nn + 7) / 8;
     for (int i = 0; i < s->ncols; i++)
-        if (!v[i].null) need += s->c[i].type == T_TEXT || s->c[i].type == T_BYTEA ? 4 + v[i].len : s->c[i].type == T_UUID ? UUID_LEN : s->c[i].type == T_BOOL ? 1
-                              : fix16(&s->c[i]) ? 16 : 8; /* F3e, F3f */
+        if (!v[i].null) need += fixed_width(&s->c[i]) ? fixed_width(&s->c[i]) : 4 + v[i].len; /* F3g: one rule */
     if (need > *cap) {
         *buf = xrealloc(*buf, need, 1);
         *cap = need;
@@ -619,6 +646,9 @@ static size_t encode_row(const schema *s, const val *v, uint8_t **buf, size_t *c
             p += UUID_LEN;
         } else if (s->c[i].type == T_BOOL) {
             *p++ = (uint8_t)v[i].i;
+        } else if (s->c[i].type == T_ENUM) { /* F3g */
+            put32(p, (uint32_t)v[i].i);
+            p += 4;
         } else if (s->c[i].type == T_INTERVAL) { /* F3f */
             put32(p, (uint32_t)v[i].mon);
             put32(p + 4, (uint32_t)v[i].day);
@@ -866,6 +896,117 @@ typedef struct aseq {
     uint16_t owner_pos;
 } aseq;
 
+
+/* F3g: an ENUM type (op 30's definition, a manifest's): its labels as they grew, each with the commit that made it (a
+ * manifest's after the definition; the model's from each op), its life. The auditor's own: no code shared with src/ */
+typedef struct aenum {
+    uint32_t id;
+    char name[64];
+    uint16_t n, cap;
+    uint32_t *off; /* cap + 1: label k is text[off[k], off[k + 1]) */
+    uint8_t *text;
+    uint64_t *at;  /* cap: the commit that made label k */
+    uint64_t created_at, dropped_at;
+} aenum;
+
+static void aenum_free(aenum *e)
+{
+    free(e->off);
+    free(e->text);
+    free(e->at);
+    memset(e, 0, sizeof *e);
+}
+
+static int aenum_find(const aenum *e, const uint8_t *lab, uint32_t len)
+{
+    for (uint16_t k = 0; k < e->n; k++)
+        if (e->off[k + 1] - e->off[k] == len && (!len || memcmp(e->text + e->off[k], lab, len) == 0)) return k;
+    return -1;
+}
+
+static bool label_ok(const uint8_t *lab, uint32_t len) { return len <= MAX_ENUM_LABEL && (!len || utf8_ok(lab, len)); }
+
+/* append a label made at commit at (each once; at most MAX_ENUM_LABELS) */
+static int aenum_add(aenum *e, const uint8_t *lab, uint32_t len, uint64_t at, const char *what)
+{
+    if (!label_ok(lab, len) || aenum_find(e, lab, len) >= 0 || e->n >= MAX_ENUM_LABELS)
+        return fail("%s: an ENUM label not 0 to %u bytes of UTF-8, a label the type holds, or past %u labels", what,
+                    MAX_ENUM_LABEL, MAX_ENUM_LABELS);
+    if (e->n == e->cap) {
+        uint16_t nc = e->cap ? (uint16_t)(e->cap * 2 > MAX_ENUM_LABELS ? MAX_ENUM_LABELS : e->cap * 2) : 8;
+        e->off = xrealloc(e->off, (size_t)nc + 1, sizeof *e->off);
+        e->at = xrealloc(e->at, nc, sizeof *e->at);
+        e->text = xrealloc(e->text, (size_t)nc * MAX_ENUM_LABEL + 1, 1);
+        if (!e->cap) e->off[0] = 0;
+        e->cap = nc;
+    }
+    if (len) memcpy(e->text + e->off[e->n], lab, len);
+    e->off[e->n + 1] = e->off[e->n] + len;
+    e->at[e->n] = at;
+    e->n++;
+    return 0;
+}
+
+static void aenum_copy(aenum *dst, const aenum *src)
+{
+    *dst = *src;
+    dst->off = xcalloc((size_t)src->cap + 1, sizeof *dst->off);
+    dst->at = xcalloc(src->cap ? src->cap : 1, sizeof *dst->at);
+    dst->text = xcalloc((size_t)src->cap * MAX_ENUM_LABEL + 1, 1);
+    if (src->cap) {
+        memcpy(dst->off, src->off, ((size_t)src->n + 1) * sizeof *dst->off);
+        memcpy(dst->at, src->at, src->n * sizeof *dst->at);
+        memcpy(dst->text, src->text, src->off[src->n]);
+    }
+}
+
+static bool aenum_same(const aenum *a, const aenum *b)
+{
+    if (a->id != b->id || strcmp(a->name, b->name) || a->n != b->n || a->created_at != b->created_at ||
+        a->dropped_at != b->dropped_at)
+        return false;
+    for (uint16_t k = 0; k < a->n; k++)
+        if (a->at[k] != b->at[k] || a->off[k + 1] - a->off[k] != b->off[k + 1] - b->off[k] ||
+            memcmp(a->text + a->off[k], b->text + b->off[k], a->off[k + 1] - a->off[k]))
+            return false;
+    return true;
+}
+
+/* a built-in type's name, which no ENUM type takes (a column's type name is never ambiguous) */
+static bool builtin_type(const char *n)
+{
+    static const char *const B[] = {"int64", "bigint", "int8", "integer", "int", "int4", "smallint", "int2", "text", "varchar",
+                                    "character", "bool", "boolean", "timestamp", "timestamptz", "date", "time", "uuid",
+                                    "bytea", "interval", "decimal", "numeric", "float64", "float8", "float", "double", "real",
+                                    "float4", "serial", "bigserial", "smallserial"}; /* a column's SERIAL words too */
+    for (size_t i = 0; i < sizeof B / sizeof *B; i++)
+        if (!strcmp(n, B[i])) return true;
+    return false;
+}
+
+/* op 30's definition (a manifest's too): u32 id (1 to MAX_ENUMS), u8 length and the name (not a built-in type's), u16 n
+ * (to MAX_ENUM_LABELS), n labels (u8 length to MAX_ENUM_LABEL, strict UTF-8 without NUL, each once); its labels' commits
+ * 0 until the caller sets them */
+static int decode_enumdef(rd *r, aenum *e, const char *what)
+{
+    memset(e, 0, sizeof *e);
+    e->id = rd_u32(r);
+    uint8_t nl = rd_u8(r);
+    const uint8_t *nm = rd_bytes(r, nl);
+    if (r->bad || !nm || !ident_ok(nm, nl) || !e->id || e->id > MAX_ENUMS) return fail("%s: bad ENUM type", what);
+    memcpy(e->name, nm, nl);
+    if (builtin_type(e->name)) return fail("%s: an ENUM type of a built-in type's name", what);
+    uint16_t n = rd_u16(r);
+    if (r->bad || n > MAX_ENUM_LABELS) return fail("%s: bad ENUM type", what);
+    for (uint16_t k = 0; k < n; k++) {
+        uint8_t ln = rd_u8(r);
+        const uint8_t *lb = rd_bytes(r, ln);
+        if (r->bad) return fail("%s: truncated ENUM type", what);
+        if (aenum_add(e, lb, ln, 0, what)) return -1;
+    }
+    return 0;
+}
+
 /* F2a: one of a CREATE's DEFAULTs (op 23, a manifest's version 1): its column, kind (1 a value, 2-5 a clock) and value */
 typedef struct acdef {
     uint16_t col;
@@ -929,6 +1070,10 @@ typedef struct op {
     uint32_t seqid;
     int64_t sval;
     uint8_t scalled;
+    struct aenum *ed;     /* F3g: CREATE_ENUM (30): its definition; DROP_ENUM (31), ENUM_ADD (32): eid, and 32's label */
+    uint32_t eid;
+    const uint8_t *lab;
+    uint8_t lablen;
     /* payload */
     bool redacted;
     const uint8_t *salt, *row;
@@ -956,6 +1101,8 @@ static void commit_free(commit *c)
         for (uint16_t k = 0; c->ops[i].ck && k < c->ops[i].nck; k++) free(c->ops[i].ck[k].text); /* F2b-1 */
         free(c->ops[i].ck);
         free(c->ops[i].fk); /* F2b-2 */
+        if (c->ops[i].ed) aenum_free(c->ops[i].ed); /* F3g */
+        free(c->ops[i].ed);
     }
     free(c->ops);
     memset(c, 0, sizeof *c);
@@ -982,7 +1129,7 @@ static bool defk_fits(uint8_t k, uint8_t ty)
 static int one_value(rd *hr, const col *ac, const uint8_t **def, uint32_t *len, const char *what)
 {
     size_t at = hr->o;
-    uint32_t dl = ac->type == T_TEXT || ac->type == T_BYTEA ? 4 + rd_u32(hr) : ac->type == T_UUID ? UUID_LEN : ac->type == T_BOOL ? 1 : fix16(ac) ? 16 : 8; /* F3d; F3e; F3f */
+    uint32_t dl = fixed_width(ac) ? fixed_width(ac) : 4 + rd_u32(hr); /* F3g: one rule */
     hr->o = at;
     *def = rd_bytes(hr, dl);
     *len = dl;
@@ -1208,11 +1355,16 @@ static int alter_body(rd *hr, op *o, const char *what)
             o->acol.vlen = (uint16_t)(o->acol.prec | o->acol.scale << 8);
             o->acol.prec = o->acol.scale = 0;
         }
+        if (o->acol.type == T_ENUM) { /* F3g: the two bytes its type's id, as the schema's encoding */
+            o->acol.eid = (uint16_t)(o->acol.prec | o->acol.scale << 8);
+            o->acol.prec = o->acol.scale = 0;
+        }
         const col *ac = &o->acol;
         if (!hr->bad && (ac->type < T_INT64 || ac->type > T_LAST || (ac->flags & ~F_NULLABLE) ||
                          (ac->type == T_DECIMAL ? (ac->prec < 1 || ac->prec > 38 || ac->scale > ac->prec) /* F3e */
                           : ac->type == T_INT64  ? !int_width_ok(ac->prec) || ac->scale
-                                                : (ac->prec || ac->scale))))
+                                                : (ac->prec || ac->scale)) ||
+                         (ac->type == T_ENUM && (ac->eid < 1 || ac->eid > MAX_ENUMS)))) /* F3g */
             return fail("%s: bad added column", what);
         uint8_t has = rd_u8(hr);
         if (!hr->bad && has > 2) return fail("%s: bad DEFAULT", what);
@@ -1224,7 +1376,7 @@ static int alter_body(rd *hr, op *o, const char *what)
         o->has_def = has;
         if (has) { /* the row encoding of one value: a one-column NOT NULL row, which decode_row checks */
             size_t at = hr->o;
-            uint32_t dl = ac->type == T_TEXT || ac->type == T_BYTEA ? 4 + rd_u32(hr) : ac->type == T_UUID ? UUID_LEN : ac->type == T_BOOL ? 1 : fix16(ac) ? 16 : 8; /* F3d; F3e; F3f */
+            uint32_t dl = fixed_width(ac) ? fixed_width(ac) : 4 + rd_u32(hr); /* F3g: one rule */
             hr->o = at;
             o->def = rd_bytes(hr, dl);
             o->def_len = dl;
@@ -1255,16 +1407,22 @@ static int alter_body(rd *hr, op *o, const char *what)
             o->acol.vlen = (uint16_t)(o->acol.prec | o->acol.scale << 8);
             o->acol.prec = o->acol.scale = 0;
         }
+        if (o->acol.type == T_ENUM) { /* F3g: the two bytes its type's id, as the schema's encoding */
+            o->acol.eid = (uint16_t)(o->acol.prec | o->acol.scale << 8);
+            o->acol.prec = o->acol.scale = 0;
+        }
         const col *ac = &o->acol;
         if (!hr->bad && (ac->type < T_INT64 || ac->type > T_LAST ||
                          (ac->type == T_DECIMAL ? (ac->prec < 1 || ac->prec > 38 || ac->scale > ac->prec) /* F3e */
                           : ac->type == T_INT64  ? !int_width_ok(ac->prec) || ac->scale
-                                                : (ac->prec || ac->scale))))
+                                                : (ac->prec || ac->scale)) ||
+                         (ac->type == T_ENUM && (ac->eid < 1 || ac->eid > MAX_ENUMS)))) /* F3g */
             return fail("%s: bad column type", what);
+        if (!hr->bad && o->akind == 9 && ac->type == T_ENUM) return fail("%s: SET TYPE to an ENUM", what); /* F3g: not this slice */
         if (o->akind == 9 || hr->bad) return 0;
         o->has_def = true; /* never NULL: no marker, the row encoding of one NOT NULL value */
         size_t at = hr->o;
-        uint32_t dl = ac->type == T_TEXT || ac->type == T_BYTEA ? 4 + rd_u32(hr) : ac->type == T_UUID ? UUID_LEN : ac->type == T_BOOL ? 1 : fix16(ac) ? 16 : 8; /* F3d; F3e; F3f */
+        uint32_t dl = fixed_width(ac) ? fixed_width(ac) : 4 + rd_u32(hr); /* F3g: one rule */
         hr->o = at;
         o->def = rd_bytes(hr, dl);
         o->def_len = dl;
@@ -1444,6 +1602,21 @@ static int decode_body(const uint8_t *b, size_t n, const meta *m, keys *ks, comm
         case 21: /* DROP_VIEW: u32 view, alone */
             o->view = rd_u32(&hr);
             if (!hr.bad && (nops != 1 || o->view >= MAX_VIEWS)) return fail("header: a view op must be the only op, in range");
+            break;
+        case 30: /* CREATE_ENUM (F3g): alone, its definition */
+            o->ed = xcalloc(1, sizeof *o->ed);
+            if (decode_enumdef(&hr, o->ed, "header")) return -1;
+            if (nops != 1) return fail("header: an ENUM op must be the only op");
+            break;
+        case 31: /* DROP_ENUM: u32 type; ENUM_ADD: and u8 length and the label; each alone */
+        case 32:
+            o->eid = rd_u32(&hr);
+            if (o->code == 32) {
+                o->lablen = rd_u8(&hr);
+                o->lab = rd_bytes(&hr, o->lablen);
+                if (!hr.bad && !label_ok(o->lab, o->lablen)) return fail("header: a bad ENUM label");
+            }
+            if (!hr.bad && (nops != 1 || !o->eid || o->eid > MAX_ENUMS)) return fail("header: an ENUM op must be the only op, its type in range");
             break;
         case 24: /* CREATE_SEQUENCE (F2a-2): its definition */
             o->sd = xcalloc(1, sizeof *o->sd);
@@ -1729,6 +1902,10 @@ typedef struct state {
     uint32_t nsq, capsq;
     aseq *sq_lake;
     uint32_t nsq_lake;
+    struct aenum *en;        /* F3g: the ENUM types the log made, by id (en[id - 1]); en_lake at the lake snapshot */
+    uint32_t nen, capen;
+    struct aenum *en_lake;
+    uint32_t nen_lake;
     char note[200];
 } state;
 
@@ -1928,8 +2105,9 @@ static void schema_reencode(schema *s)
         memcpy(b + o, s->c[c].name, cl);
         o += cl;
         b[o++] = s->c[c].type;
-        b[o++] = s->c[c].type == T_TEXT ? (uint8_t)(s->c[c].vlen & 0xff) : s->c[c].prec; /* F3c: as the engine writes it */
-        b[o++] = s->c[c].type == T_TEXT ? (uint8_t)(s->c[c].vlen >> 8) : s->c[c].scale;
+        b[o++] = s->c[c].type == T_TEXT ? (uint8_t)(s->c[c].vlen & 0xff) /* F3c: as the engine writes it; F3g: an ENUM's id */
+                 : s->c[c].type == T_ENUM ? (uint8_t)(s->c[c].eid & 0xff) : s->c[c].prec;
+        b[o++] = s->c[c].type == T_TEXT ? (uint8_t)(s->c[c].vlen >> 8) : s->c[c].type == T_ENUM ? (uint8_t)(s->c[c].eid >> 8) : s->c[c].scale;
         b[o++] = s->c[c].flags;
     }
     b[o++] = (uint8_t)s->npk;
@@ -2066,7 +2244,8 @@ static int alter_next(const aver *cur, const op *o, aver *nv, uint64_t seq, cons
         cc->flags = (uint8_t)(o->akind == 5 ? cc->flags & ~F_NULLABLE : cc->flags | F_NULLABLE);
         break;
     case 7: /* SET DEFAULT: of the column's type (alter_body decoded its value as one) */
-        if (o->acol.type != cc->type || o->acol.prec != cc->prec || o->acol.scale != cc->scale || o->acol.vlen != cc->vlen) /* F3c */
+        if (o->acol.type != cc->type || o->acol.prec != cc->prec || o->acol.scale != cc->scale || o->acol.vlen != cc->vlen || /* F3c */
+            o->acol.eid != cc->eid) /* F3g */
             return fail("commit %llu: SET DEFAULT of another type than its column's", sq);
         nv->def = xcalloc(o->def_len ? o->def_len : 1, 1);
         memcpy(nv->def, o->def, o->def_len);
@@ -2184,8 +2363,12 @@ static bool name_live(const state *S, const char *name)
         if (!S->v[i].dropped_at && strcmp(S->v[i].name, name) == 0) return true;
     for (uint32_t i = 0; i < S->nsq; i++) /* F2a-2: one name space */
         if (!S->sq[i].dropped_at && strcmp(S->sq[i].name, name) == 0) return true;
+    for (uint32_t i = 0; i < S->nen; i++) /* F3g: and the types' */
+        if (!S->en[i].dropped_at && strcmp(S->en[i].name, name) == 0) return true;
     return false;
 }
+
+static bool enum_live(const state *S, uint32_t id) { return id >= 1 && id <= S->nen && !S->en[id - 1].dropped_at; }
 
 /* P2 S7: a live view names the table (kind 1) or view (kind 2) */
 static const aview *view_naming(const state *S, uint8_t kind, uint32_t id)
@@ -2265,6 +2448,7 @@ static bool cat_lookup(void *arg, const char *name, ab_rel *out)
             snprintf(c->cols[k].name, sizeof c->cols[k].name, "%s", s->c[k].name);
             c->cols[k].type = s->c[k].type;
             c->cols[k].scale = s->c[k].type == T_DECIMAL ? s->c[k].scale : 0;
+            c->cols[k].eid = s->c[k].eid; /* F3g */
         }
         *out = (ab_rel){1, i, (uint16_t)s->ncols, c->cols};
         return true;
@@ -2275,6 +2459,11 @@ static bool cat_lookup(void *arg, const char *name, ab_rel *out)
         *out = (ab_rel){2, i, v->ncols, v->cols};
         return true;
     }
+    for (uint32_t i = 0; i < S->nen; i++) /* F3g: a live ENUM type, what a CAST names */
+        if (!S->en[i].dropped_at && strcmp(S->en[i].name, name) == 0) {
+            *out = (ab_rel){3, S->en[i].id, 0, NULL};
+            return true;
+        }
     return false;
 }
 
@@ -2293,7 +2482,7 @@ static int view_bind_check(const state *S, const aviewdef *d, const char *where)
     else if (r->ncols != d->ncols)
         rc = fail("%s: view %s: its text yields %u columns, the log says %u", where, d->name, r->ncols, d->ncols);
     for (uint16_t k = 0; !rc && k < d->ncols; k++)
-        if (r->cols[k].type != d->cols[k].type || r->cols[k].scale != d->cols[k].scale)
+        if (r->cols[k].type != d->cols[k].type || r->cols[k].scale != d->cols[k].scale || r->cols[k].eid != d->cols[k].eid) /* F3g */
             rc = fail("%s: view %s: its column %u (%s) is %s, scale %u, by its text and %s, scale %u, in the log", where,
                       d->name, k + 1u, d->cols[k].name, TN[r->cols[k].type <= 6 ? r->cols[k].type : 0], r->cols[k].scale,
                       TN[d->cols[k].type <= 6 ? d->cols[k].type : 0], d->cols[k].scale);
@@ -2302,7 +2491,8 @@ static int view_bind_check(const state *S, const aviewdef *d, const char *where)
     for (uint16_t k = 0; !rc && k < d->ndeps; k++)
         if (r->dep_kind[k] != d->dep_kind[k] || r->dep_id[k] != d->dep_id[k])
             rc = fail("%s: view %s: its dependency %u is %s %u by its text and %s %u in the log", where, d->name, k + 1u,
-                      r->dep_kind[k] == 1 ? "table" : "view", r->dep_id[k], d->dep_kind[k] == 1 ? "table" : "view",
+                      r->dep_kind[k] == 1 ? "table" : r->dep_kind[k] == 2 ? "view" : "type", r->dep_id[k],
+                      d->dep_kind[k] == 1 ? "table" : d->dep_kind[k] == 2 ? "view" : "type",
                       d->dep_id[k]);
     free(c);
     free(r);
@@ -2324,6 +2514,7 @@ static int apply_view_op(state *S, const op *o, uint64_t seq)
     if (name_live(S, d->name)) return fail("commit %llu: view %s takes a live table's or view's name", (unsigned long long)seq, d->name);
     for (uint16_t k = 0; k < d->ndeps; k++) {
         bool live = d->dep_kind[k] == 1 ? d->dep_id[k] < S->nt && !S->t[d->dep_id[k]].dropped_at
+                        : d->dep_kind[k] == 3 ? enum_live(S, d->dep_id[k]) /* F3g */
                                         : d->dep_id[k] < S->nv && !S->v[d->dep_id[k]].dropped_at;
         if (!live) return fail("commit %llu: view %s names a table or view that is not live", (unsigned long long)seq, d->name);
     }
@@ -2331,6 +2522,67 @@ static int apply_view_op(state *S, const op *o, uint64_t seq)
     snprintf(where, sizeof where, "commit %llu", (unsigned long long)seq);
     if (view_bind_check(S, d, where)) return -1;
     view_push(S, d->name, seq, 0, d);
+    return 0;
+}
+
+/* F3g: ops 30-32 by the rules design.md §5 states (its own code): CREATE in id order with a free name; DROP of a live
+ * type no table ever created holds a column of in any schema version, and no live view names; ADD VALUE of a live type,
+ * a label it lacks, appended */
+
+static int apply_enum_op(state *S, const op *o, uint64_t seq)
+{
+    unsigned long long sq = (unsigned long long)seq;
+    if (o->code == 30) {
+        if (o->ed->id != S->nen + 1 || name_live(S, o->ed->name))
+            return fail("commit %llu: CREATE TYPE out of sequence or of a name taken", sq);
+        if (S->nen == S->capen) {
+            S->capen = S->capen ? S->capen * 2 : 8;
+            S->en = xrealloc(S->en, S->capen, sizeof *S->en);
+        }
+        aenum *e = &S->en[S->nen++];
+        aenum_copy(e, o->ed);
+        for (uint16_t k = 0; k < e->n; k++) e->at[k] = seq;
+        e->created_at = seq;
+        return 0;
+    }
+    if (!enum_live(S, o->eid)) return fail("commit %llu: an ENUM op of no live type", sq);
+    aenum *e = &S->en[o->eid - 1];
+    if (o->code == 31) {
+        for (uint32_t i = 0; i < S->nt; i++) {
+            const table *t = &S->t[i];
+            for (int c = 0; c < t->s.ncols; c++)
+                if (t->s.c[c].type == T_ENUM && t->s.c[c].eid == o->eid)
+                    return fail("commit %llu: DROP TYPE %s, a column of table %s's", sq, e->name, t->s.name);
+            for (uint32_t v = 0; v < t->nvers; v++)
+                for (int c = 0; c < t->vers[v].s.ncols; c++)
+                    if (t->vers[v].s.c[c].type == T_ENUM && t->vers[v].s.c[c].eid == o->eid)
+                        return fail("commit %llu: DROP TYPE %s, a column of table %s's history", sq, e->name, t->s.name);
+        }
+        const aview *v = view_naming(S, 3, o->eid);
+        if (v) return fail("commit %llu: DROP TYPE %s, which view %s names", sq, e->name, v->name);
+        e->dropped_at = seq;
+        return 0;
+    }
+    char what[48];
+    snprintf(what, sizeof what, "commit %llu: ADD VALUE", sq);
+    return aenum_add(e, o->lab, o->lablen, seq, what);
+}
+
+/* F3g: a row's ENUM values, each a label of its column's type at this commit (labels only grow) */
+static int enum_row(const state *S, const schema *s, const val *vals, uint64_t seq)
+{
+    for (int c = 0; c < s->ncols; c++)
+        if (s->c[c].type == T_ENUM && !vals[c].null &&
+            (!enum_live(S, s->c[c].eid) || vals[c].i < 0 || vals[c].i >= S->en[s->c[c].eid - 1].n))
+            return fail("commit %llu: column %s holds no label of its ENUM type", (unsigned long long)seq, s->c[c].name);
+    return 0;
+}
+
+static int enum_cols_live(const state *S, const schema *s, uint64_t seq)
+{
+    for (int c = 0; c < s->ncols; c++)
+        if (s->c[c].type == T_ENUM && !enum_live(S, s->c[c].eid))
+            return fail("commit %llu: column %s of an ENUM type that is not live", (unsigned long long)seq, s->c[c].name);
     return 0;
 }
 
@@ -2703,7 +2955,7 @@ static int afk_def(const state *S, const table *t, uint32_t tid, const afk *f, u
         if (c < 0) return fail("commit %llu: foreign key %s names a column table %s does not have", sq, f->name, t->s.name);
         if (f->pcols[i] != pc->pos[pk]) return fail("commit %llu: foreign key %s references another than its parent's key", sq, f->name);
         const col *a = &t->s.c[c], *b = &p->s.c[pk];
-        if (a->type != b->type || (a->type == T_DECIMAL && a->scale != b->scale))
+        if (a->type != b->type || (a->type == T_DECIMAL && a->scale != b->scale) || (a->type == T_ENUM && a->eid != b->eid)) /* F3g */
             return fail("commit %llu: foreign key %s: column %s of another type than the key column it references", sq, f->name, a->name);
         if (dwide(a) != dwide(b)) /* F3e: DECIMALs of one form (the engine's rule: deferred.md D25) */
             return fail("commit %llu: foreign key %s: column %s a DECIMAL of another form than the key column it references", sq,
@@ -2889,8 +3141,10 @@ static int apply_op(state *S, const op *o, uint64_t seq)
 {
     if (o->code == 13) return 0; /* WRITER_KEY: keys, not data (decode_body follows it) */
     if (o->code == 20 || o->code == 21) return apply_view_op(S, o, seq); /* P2 S7 */
+    if (o->code >= 30 && o->code <= 32) return apply_enum_op(S, o, seq); /* F3g */
     if (o->code == 1) {
         if (o->table != S->nt) return fail("commit %llu: table id out of sequence", (unsigned long long)seq);
+        if (enum_cols_live(S, o->sch, seq)) return -1; /* F3g: each ENUM column a live type's */
         S->t = xrealloc(S->t, S->nt + 1, sizeof *S->t);
         memset(&S->t[S->nt], 0, sizeof S->t[S->nt]);
         S->t[S->nt].s = *o->sch;
@@ -2923,6 +3177,9 @@ static int apply_op(state *S, const op *o, uint64_t seq)
         table *t = &S->t[o->table];
         for (uint16_t k = 0; k < o->ncd; k++) {
             const acdef *d = &o->cd[k];
+            if (d->kind == 1 && t->s.c[d->col].type == T_ENUM && /* F3g: a constant of an ENUM column a label of its type then */
+                (!enum_live(S, t->s.c[d->col].eid) || le32(d->def) >= S->en[t->s.c[d->col].eid - 1].n))
+                return fail("commit %llu: a DEFAULT of column %s is no label of its ENUM type", (unsigned long long)seq, t->s.c[d->col].name);
             t->ckind[d->col] = d->kind;
             if (d->kind == 1 || d->kind == 9) { /* F2c: a generated column's text, the table's own likewise */
                 t->cdef[d->col] = xcalloc(d->def_len ? d->def_len : 1, 1);
@@ -2986,6 +3243,12 @@ static int apply_op(state *S, const op *o, uint64_t seq)
         if (t->nvers >= 256) return fail("commit %llu: table %s past 256 schema versions", (unsigned long long)seq, t->s.name);
         const aver *cur = &t->vers[t->nvers - 1];
         aver nv;
+        if (o->akind == 1 && o->acol.type == T_ENUM && !enum_live(S, o->acol.eid)) /* F3g: an ADD names a live type */
+            return fail("commit %llu: ADD COLUMN %s of an ENUM type that is not live", (unsigned long long)seq, o->acol.name);
+        if (o->akind == 1 && o->acol.type == T_ENUM && o->has_def && le32(o->def) >= S->en[o->acol.eid - 1].n) /* F3g */
+            return fail("commit %llu: ADD COLUMN %s with a DEFAULT that is no label of its ENUM type", (unsigned long long)seq, o->acol.name);
+        if (o->akind == 7 && o->acol.type == T_ENUM && (!enum_live(S, o->acol.eid) || le32(o->def) >= S->en[o->acol.eid - 1].n))
+            return fail("commit %llu: SET DEFAULT that is no label of its ENUM type", (unsigned long long)seq);
         if (alter_next(cur, o, &nv, seq, t->has_wdef)) return -1;
         int cc = o->akind == 1 || o->akind == 3 ? -1 : cur->at[o->apos]; /* the column it names (live: alter_next) */
         int rc = 0;
@@ -3270,6 +3533,7 @@ static int apply_op(state *S, const op *o, uint64_t seq)
             row_commit(o->table, o->salt, o->row, o->row_len, chk);
             if (memcmp(chk, cm, 32) != 0) return fail("commit %llu: payload does not match its commitment", (unsigned long long)seq);
             if (decode_row(&t->s, o->row, o->row_len, vals)) return -1;
+            if (enum_row(S, &t->s, vals, seq)) return -1; /* F3g: each ENUM value a label then */
             if (gen_row(t, vals, seq)) return -1; /* F2c: its generated columns, as the writer computed them */
             if (ck_row(t, vals, seq)) return -1; /* F2b-1: its table's CHECKs, as the writer evaluated them */
             S->payload_rows++;
@@ -3689,6 +3953,11 @@ static int replay(state *S, int dirfd, uint64_t *commits)
                 }
                 S->boundary_at_lake = S->boundary;
                 S->nv_at_lake = S->nv; /* P2 S7 */
+                for (uint32_t k = 0; k < S->nen_lake; k++) aenum_free(&S->en_lake[k]); /* F3g: the types then */
+                free(S->en_lake);
+                S->en_lake = S->nen ? xcalloc(S->nen, sizeof *S->en_lake) : NULL;
+                for (uint32_t k = 0; k < S->nen; k++) aenum_copy(&S->en_lake[k], &S->en[k]);
+                S->nen_lake = S->nen;
                 free(S->sq_lake); /* F2a-2: the sequences' states at the lake snapshot */
                 S->sq_lake = S->nsq ? xcalloc(S->nsq, sizeof *S->sq_lake) : NULL;
                 if (S->nsq) memcpy(S->sq_lake, S->sq, S->nsq * sizeof *S->sq_lake);
@@ -3809,7 +4078,8 @@ static void seg_free(seg *g)
 
 static bool is_int(uint8_t t)
 {
-    return t == T_INT64 || t == T_DECIMAL || t == T_TIMESTAMP || t == T_FLOAT64 || t == T_TIMESTAMPTZ || t == T_DATE || t == T_TIME;
+    return t == T_INT64 || t == T_DECIMAL || t == T_TIMESTAMP || t == T_FLOAT64 || t == T_TIMESTAMPTZ || t == T_DATE || t == T_TIME ||
+           t == T_ENUM; /* F3g: its ordinal, in the int64 path */
 }
 
 /* F3e: a column's segment layout by the column, not its type alone: a wide DECIMAL as a UUID is held, offsets and
@@ -4213,6 +4483,8 @@ typedef struct manifest {
     uint32_t nv;
     aseq *sq; /* version 10 (F2a-2): every sequence, by id, its state at the snapshot */
     uint32_t nsq;
+    struct aenum *en; /* version 17 (F3g): every ENUM type, by id (en[id - 1]), its labels' commits */
+    uint32_t nen;
 } manifest;
 
 static void manifest_free(manifest *m)
@@ -4234,6 +4506,8 @@ static void manifest_free(manifest *m)
     for (uint32_t i = 0; i < m->nv; i++) aviewdef_free(m->v[i].def); /* P2 S7 */
     free(m->v);
     free(m->sq); /* F2a-2 */
+    for (uint32_t i = 0; i < m->nen; i++) aenum_free(&m->en[i]); /* F3g */
+    free(m->en);
     memset(m, 0, sizeof *m);
 }
 
@@ -4311,7 +4585,7 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
     rd r = {b, len, 0, false};
     const uint8_t *mg = rd_bytes(&r, 8);
     uint32_t mver = mg && memcmp(mg, "IMDBMAN1", 8) == 0 ? rd_u32(&r) : 0;
-    if (mver != 16) return fail("manifest: bad header (version 16 only: INTERVAL, F3f)");
+    if (mver != 17) return fail("manifest: bad header (version 17 only: ENUM types, F3g)");
     uint32_t nsec = rd_u32(&r); /* every section, in order: 1 tables, 2 views, 3 sequences (F2a-2), 4-11 reserved and empty */
     const uint8_t *id = rd_bytes(&r, 16);
     m->seq = rd_u64(&r);
@@ -4473,6 +4747,7 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
             return fail("manifest: bad view definition");
         for (uint16_t k = 0; k < v->def->ndeps; k++) { /* what a live view names is live */
             uint32_t di = v->def->dep_id[k];
+            if (v->def->dep_kind[k] == 3) continue; /* F3g: checked after the types' section */
             if (v->def->dep_kind[k] == 1 ? di >= nt || m->t[di].dropped_at : m->v[di].dropped_at)
                 return fail("manifest: a live view names a table or view that is not live");
         }
@@ -4502,7 +4777,51 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
             return fail("manifest: bad sequence %u", i);
     }
     if (r.bad || r.o != send) return fail("manifest: bad sequences section");
-    for (uint32_t k = 4; k <= 11; k++) { /* reserved until their slices: present, in order, empty */
+    if (man_section(&r, 4, &send)) return fail("manifest: the ENUM types section missing or out of order"); /* F3g */
+    uint32_t nen = rd_u32(&r);
+    if (r.bad || nen > MAX_ENUMS || nen > rd_left(&r) / 24) return fail("manifest: bad ENUM type count");
+    m->en = xcalloc(nen ? nen : 1, sizeof *m->en);
+    for (uint32_t i = 0; i < nen; i++) {
+        aenum *e = &m->en[i];
+        if (decode_enumdef(&r, e, "manifest")) return -1;
+        m->nen = i + 1;
+        e->created_at = rd_u64(&r);
+        e->dropped_at = rd_u64(&r);
+        for (uint16_t k = 0; k < e->n; k++) e->at[k] = rd_u64(&r);
+        bool ok = !r.bad && e->id == i + 1 && e->created_at && e->created_at <= m->seq &&
+                  (!e->dropped_at || (e->dropped_at > e->created_at && e->dropped_at <= m->seq));
+        for (uint16_t k = 0; ok && k < e->n; k++) /* the CREATE's labels at its commit, then one an ADD, each later */
+            ok = e->at[k] >= e->created_at && e->at[k] <= m->seq && (!e->dropped_at || e->at[k] < e->dropped_at) &&
+                 (e->at[k] == e->created_at ? !k || e->at[k - 1] == e->created_at : !k || e->at[k] > e->at[k - 1]);
+        if (!ok) return fail("manifest: bad ENUM type %u", i + 1);
+    }
+    if (r.bad || r.o != send) return fail("manifest: bad ENUM types section");
+    for (uint32_t i = 0; i < nt; i++) { /* F3g: each ENUM DEFAULT of a history a label at its version's commit */
+        const mtable *mt = &m->t[i];
+        uint32_t hv = mt->nvers ? mt->nvers : 1;
+        for (uint32_t v = 0; v < hv; v++) {
+            const schema *vs = mt->nvers ? &mt->vers[v].s : &mt->s;
+            uint64_t since = mt->nvers && v ? mt->vers[v].since : mt->created_at; /* version 1 at its CREATE */
+            uint8_t ak = mt->nvers ? mt->vers[v].akind : 0;
+            uint16_t ap = mt->nvers ? mt->vers[v].apos : 0;
+            for (int c = 0; c < vs->ncols; c++) {
+                if (vs->c[c].type != T_ENUM) continue;
+                uint16_t p = mt->nvers ? mt->vers[v].pos[c] : (uint16_t)c;
+                int64_t ord = v == 0 && mt->ckind[p] == 1 && mt->cdef[p]   ? (int64_t)le32(mt->cdef[p])
+                              : ak == 1 && ap == p && !mt->missing[p].null ? mt->missing[p].i
+                              : ak == 7 && ap == p && mt->vers[v].def      ? (int64_t)le32(mt->vers[v].def)
+                                                                           : -1;
+                uint32_t eid = vs->c[c].eid, n = 0;
+                for (uint16_t k = 0; eid >= 1 && eid <= m->nen && k < m->en[eid - 1].n; k++) n += m->en[eid - 1].at[k] <= since;
+                if (ord >= (int64_t)n) return fail("manifest: a DEFAULT of table %s's column %s is no label of its ENUM type", mt->s.name, vs->c[c].name);
+            }
+        }
+    }
+    for (uint32_t i = 0; i < nv; i++) /* F3g: what a live view names is live: its types too */
+        for (uint16_t k = 0; !m->v[i].dropped_at && m->v[i].def && k < m->v[i].def->ndeps; k++)
+            if (m->v[i].def->dep_kind[k] == 3 && (m->v[i].def->dep_id[k] > nen || m->en[m->v[i].def->dep_id[k] - 1].dropped_at))
+                return fail("manifest: a live view names an ENUM type that is not live");
+    for (uint32_t k = 5; k <= 11; k++) { /* reserved until their slices: present, in order, empty */
         if (man_section(&r, k, &send)) return fail("manifest: section %u missing or out of order", k);
         size_t sl = send - r.o; /* a u32 count of 0; any other count a later format's, whatever its length */
         if (sl >= 4 && rd_u32(&r) != 0) return fail("manifest: section %u not empty (a later format's)", k);
@@ -4511,6 +4830,7 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
     size_t nlive = 0; /* the live tables' and views' names: one each */
     for (uint32_t i = 0; i < nt; i++) nlive += !m->t[i].dropped_at;
     for (uint32_t i = 0; i < nv; i++) nlive += !m->v[i].dropped_at;
+    for (uint32_t i = 0; i < m->nen; i++) nlive += !m->en[i].dropped_at; /* F3g: one name space with the types */
     if (nlive) {
         const char **ln = xcalloc(nlive, sizeof *ln);
         size_t k = 0;
@@ -4518,6 +4838,8 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
             if (!m->t[i].dropped_at) ln[k++] = m->t[i].s.name;
         for (uint32_t i = 0; i < nv; i++)
             if (!m->v[i].dropped_at) ln[k++] = m->v[i].name;
+        for (uint32_t i = 0; i < m->nen; i++)
+            if (!m->en[i].dropped_at) ln[k++] = m->en[i].name;
         qsort(ln, nlive, sizeof *ln, cmp_str);
         bool dup = false;
         for (size_t i = 1; i < nlive; i++) dup |= strcmp(ln[i - 1], ln[i]) == 0;
@@ -5132,6 +5454,12 @@ static int floor_seed(int dirfd, state *S, flr *f)
         t->nfk0 = mt->nfk0;
         lfk_rebuild(t);
     }
+    if (f->m.nen) { /* F3g: F's ENUM types (before its views, whose CASTs name them), at F */
+        S->en = xcalloc(f->m.nen, sizeof *S->en);
+        S->en_lake = xcalloc(f->m.nen, sizeof *S->en_lake); /* the lake's snapshot may be F itself */
+        for (uint32_t i = 0; i < f->m.nen; i++) aenum_copy(&S->en[i], &f->m.en[i]), aenum_copy(&S->en_lake[i], &f->m.en[i]);
+        S->nen = S->capen = S->nen_lake = f->m.nen;
+    }
     for (uint32_t i = 0; i < f->m.nv; i++) /* P2 S7: F's views, a live one's definition the replay's rules read */
         view_push(S, f->m.v[i].name, f->m.v[i].created_at, f->m.v[i].dropped_at, f->m.v[i].def);
     for (uint32_t i = 0; i < f->m.nv; i++) /* P2 S7b: each live one's text against F's catalog, as at its own commit (what
@@ -5295,6 +5623,10 @@ static int cmd_verify(const char *dir, const char *anchor)
             rc = fail("manifest's retirement boundary differs from the log's at its commit");
         if (!rc) rc = check_objects(dirfd, &m, &S);
         if (!rc && m.nt > S.nt) rc = fail("manifest names tables the log does not have");
+        if (!rc && m.nen != S.nen_lake) rc = fail("the manifest's ENUM types differ from the log's at its commit"); /* F3g */
+        for (uint32_t ei = 0; !rc && ei < m.nen; ei++)
+            if (!aenum_same(&m.en[ei], &S.en_lake[ei]))
+                rc = fail("ENUM type %s in the manifest differs from the log's at its commit", S.en_lake[ei].name);
         if (!rc && m.nsq != S.nsq_lake) rc = fail("the manifest's sequences differ from the log's at its commit"); /* F2a-2 */
         for (uint32_t qi = 0; !rc && qi < m.nsq; qi++) {
             const aseq *qa = &m.sq[qi], *qb = &S.sq_lake[qi];
@@ -5380,6 +5712,10 @@ static int cmd_verify(const char *dir, const char *anchor)
     keys_free(&S.K);
     free(S.t);
     free(S.sq); /* F2a-2 */
+    for (uint32_t k = 0; k < S.nen; k++) aenum_free(&S.en[k]); /* F3g */
+    free(S.en);
+    for (uint32_t k = 0; k < S.nen_lake; k++) aenum_free(&S.en_lake[k]);
+    free(S.en_lake);
     free(S.sq_lake);
     for (uint32_t i = 0; i < S.nv; i++) /* P2 S7, S7b, F1 */
         free(S.v[i].dep_kind), free(S.v[i].dep_id), free(S.v[i].cols), free(S.v[i].text);
@@ -5920,6 +6256,7 @@ static int parse_filter(const schema *s, const char *arg, filt *f)
     /* stored as an order-preserving key, not as the digits: an integer here would match the wrong rows */
     if (c->type == T_FLOAT64) return fail("filters on FLOAT64 column %s are not supported", c->name);
     if (c->type == T_INTERVAL) return fail("filters on INTERVAL column %s are not supported", c->name); /* F3f: three fields */
+    if (c->type == T_ENUM) return fail("filters on ENUM column %s are not supported", c->name); /* F3g: a label, not a number */
     bool neg = *v == '-';
     if (*v == '-' || *v == '+') v++;
     __int128 acc = 0;

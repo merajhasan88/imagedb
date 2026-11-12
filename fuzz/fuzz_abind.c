@@ -9,16 +9,18 @@
 
 #include "../tools/audit/abind.h"
 
-static const ab_col T[] = {{"id", 1, 0}, {"g", 1, 0}, {"d", 2, 2}, {"f", 6, 0}, {"s", 3, 0}, {"k", 4, 0}, {"ts", 5, 0},
-                           {"e", 2, 4}, {"iv", 12, 0}}; /* F3f: iv an INTERVAL */
-static const ab_col U[] = {{"id", 1, 0}, {"tid", 1, 0}, {"v", 1, 0}, {"s", 3, 0}, {"d", 2, 3}};
-static const ab_col V[] = {{"id", 1, 0}, {"m", 2, 8}};
+static const ab_col T[] = {{"id", 1, 0, 0}, {"g", 1, 0, 0}, {"d", 2, 2, 0}, {"f", 6, 0, 0}, {"s", 3, 0, 0}, {"k", 4, 0, 0}, {"ts", 5, 0, 0},
+                           {"e", 2, 4, 0}, {"iv", 12, 0, 0}, {"en", 13, 0, 1}}; /* F3f: iv an INTERVAL; F3g: en an ENUM of type 1 */
+static const ab_col U[] = {{"id", 1, 0, 0}, {"tid", 1, 0, 0}, {"v", 1, 0, 0}, {"s", 3, 0, 0}, {"d", 2, 3, 0}, {"eu", 13, 0, 2}}; /* F3g: eu an ENUM of type 2 */
+static const ab_col V[] = {{"id", 1, 0, 0}, {"m", 2, 8, 0}};
 
 static bool lookup(void *arg, const char *name, ab_rel *out)
 {
     (void)arg;
-    if (!strcmp(name, "t")) *out = (ab_rel){1, 0, 9, T};
-    else if (!strcmp(name, "u")) *out = (ab_rel){1, 1, 5, U};
+    if (!strcmp(name, "t")) *out = (ab_rel){1, 0, 10, T};
+    else if (!strcmp(name, "u")) *out = (ab_rel){1, 1, 6, U};
+    else if (!strcmp(name, "mood")) *out = (ab_rel){3, 1, 0, NULL}; /* F3g: two ENUM types, what a CAST names */
+    else if (!strcmp(name, "ab")) *out = (ab_rel){3, 2, 0, NULL};
     else if (!strcmp(name, "w")) *out = (ab_rel){2, 0, 2, V};
     else return false;
     return true;
@@ -26,8 +28,8 @@ static bool lookup(void *arg, const char *name, ab_rel *out)
 
 /* F2b-1: the same text as a CHECK of t's columns, evaluated on rows at the types' edges: a verdict or an error, never a
  * crash, an overflow (the UBSan build) or a leak */
-static const ab_col C[] = {{"id", 1, 0}, {"g", 1, 0}, {"d", 2, 2}, {"s", 3, 0}, {"k", 4, 0}, {"ts", 5, 0}, {"e", 2, 18},
-                           {"dt", 8, 0}, {"tm", 9, 0}, {"tz", 7, 0}, {"x", 2, 6}}; /* F3e: x a DECIMAL(38,6), wide */
+static const ab_col C[] = {{"id", 1, 0, 0}, {"g", 1, 0, 0}, {"d", 2, 2, 0}, {"s", 3, 0, 0}, {"k", 4, 0, 0}, {"ts", 5, 0, 0}, {"e", 2, 18, 0},
+                           {"dt", 8, 0, 0}, {"tm", 9, 0, 0}, {"tz", 7, 0, 0}, {"x", 2, 6, 0}}; /* F3e: x a DECIMAL(38,6), wide */
 
 /* F3e: a wide value at the pool's edges: 0, 1, -1, 10^38 - 1 and its negative, 2^64 and its negative */
 static ab_val wide_at(int k)
@@ -70,8 +72,8 @@ static void check_text(const uint8_t *data, size_t size)
 /* F2c: the same text as a generated column's expression into each target of a type (the catalog C, its last column
  * generated): bound or refused, then each row's value assigned to the target's type by INSERT's rules: a value, an
  * evaluation's error or an assignment's, never a crash, an overflow or a leak; a value assigned within its column */
-static const ab_col G[] = {{"id", 1, 0}, {"g", 1, 0}, {"d", 2, 2}, {"s", 3, 0}, {"k", 4, 0}, {"ts", 5, 0}, {"e", 2, 18},
-                           {"dt", 8, 0}, {"tm", 9, 0}, {"tz", 7, 0}, {"x", 2, 6}, {"w", 1, 0}}; /* F3e: x wide */
+static const ab_col G[] = {{"id", 1, 0, 0}, {"g", 1, 0, 0}, {"d", 2, 2, 0}, {"s", 3, 0, 0}, {"k", 4, 0, 0}, {"ts", 5, 0, 0}, {"e", 2, 18, 0},
+                           {"dt", 8, 0, 0}, {"tm", 9, 0, 0}, {"tz", 7, 0, 0}, {"x", 2, 6, 0}, {"w", 1, 0, 0}}; /* F3e: x wide */
 static const ab_gcol GT[] = {{1, 16, 0, 0, true}, {1, 0, 0, 0, false}, {2, 6, 2, 0, true}, {3, 0, 0, 4, true}, {4, 0, 0, 0, true},
                              {5, 0, 0, 0, true}, {8, 0, 0, 0, true}, {9, 0, 0, 0, true}, {7, 0, 0, 0, true},
                              {2, 38, 6, 0, true}, {2, 20, 2, 0, false}}; /* F3e: wide targets */
@@ -129,10 +131,11 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     if (ab_bind((const char *)data, size, lookup, NULL, &r, err, sizeof err)) return 0;
     if (r.ncols < 1 || r.ncols > AB_MAX_COLS || r.ndeps > AB_MAX_DEPS) abort();
     for (uint16_t c = 0; c < r.ncols; c++)
-        if (r.cols[c].type < 1 || r.cols[c].type > 6 || (r.cols[c].type == 2 ? r.cols[c].scale > 38 : r.cols[c].scale != 0))
+        if (r.cols[c].type < 1 || r.cols[c].type > 13 || (r.cols[c].type == 2 ? r.cols[c].scale > 38 : r.cols[c].scale != 0) ||
+            (r.cols[c].type == 13 ? r.cols[c].eid < 1 || r.cols[c].eid > 2 : r.cols[c].eid != 0)) /* F3f: INTERVAL; F3g: an ENUM's id */
             abort();
     for (uint16_t k = 0; k < r.ndeps; k++) {
-        if ((r.dep_kind[k] != 1 && r.dep_kind[k] != 2) || r.dep_id[k] > 1) abort();
+        if (r.dep_kind[k] < 1 || r.dep_kind[k] > 3 || (r.dep_kind[k] == 3 ? r.dep_id[k] < 1 || r.dep_id[k] > 2 : r.dep_id[k] > 1)) abort();
         if (k && (r.dep_kind[k - 1] > r.dep_kind[k] || (r.dep_kind[k - 1] == r.dep_kind[k] && r.dep_id[k - 1] >= r.dep_id[k])))
             abort();
     }

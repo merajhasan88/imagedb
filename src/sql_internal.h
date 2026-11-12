@@ -111,6 +111,7 @@ enum {
     ST_CREATE_VIEW, ST_DROP_VIEW, ST_SHOW_VIEWS, /* P2 S7 */
     ST_SHOW_TIMEZONE, /* P2: SHOW TIME ZONE, SHOW timezone */
     ST_CREATE_SEQUENCE, ST_DROP_SEQUENCE, /* F2a-2 */
+    ST_CREATE_TYPE, ST_ALTER_TYPE, ST_DROP_TYPE, /* F3g: ENUM types */
 };
 
 /* P2 S3: a join's kind as written (RIGHT keeps side 1's rows, FULL both sides'; CROSS and FROM a, b have no ON) */
@@ -134,6 +135,7 @@ enum { SQL_ISO_SNAPSHOT = 1, SQL_ISO_READ_COMMITTED, SQL_ISO_SERIALIZABLE };
 enum { SQL_UPSERT_NOTHING = 1, SQL_UPSERT_UPDATE }; /* P2 S8: ON CONFLICT DO NOTHING | DO UPDATE */
 typedef struct sql_ptype { /* P2 S9: a parameter PREPARE declares: a column's type */
     uint8_t type, scale, precision;
+    char tname[IMDB_MAX_IDENT + 1]; /* F3g: an ENUM type's name, resolved at each EXECUTE (DDL between runs) */
 } sql_ptype;
 
 /* F2a-2: a sequence's options as written (CREATE SEQUENCE, an IDENTITY's), each with its own given flag */
@@ -273,6 +275,9 @@ typedef struct sql_stmt {
                                                    one (every nested SELECT) carries a pointer, not 19 KB */
     struct sql_fkdef *fks;
     bool has_alter_def;
+    char (*ctname)[IMDB_MAX_IDENT + 1];         /* F3g: CREATE TABLE's (and ADD COLUMN's, at 0) ENUM columns' type names by
+                                                   position, allocated (IMDB_MAX_COLS) at the first one; NULL: none */
+    bool if_exists, if_not_exists;              /* F3g: DROP TYPE IF EXISTS; ALTER TYPE ... ADD VALUE IF NOT EXISTS */
     char set_name[IMDB_MAX_IDENT + 1];          /* SET */
     char set_value[IMDB_MAX_IDENT + 1];
     bool set_zone;                              /* P2: SET TIME ZONE / timezone: set_value the zone's name as written, "" for
@@ -309,6 +314,7 @@ typedef struct imdb_xval {
     uint8_t type;
     uint8_t scale;           /* DECIMAL */
     bool null;
+    uint16_t eid;            /* F3g: an ENUM's type id (its ordinal in i), beside the type: a tripwire, the node's own the rule */
     __int128 i;
     double f;
     const uint8_t *s;
@@ -327,6 +333,8 @@ typedef struct imdb_xset {
 
 typedef struct imdb_xnode {
     uint8_t type, scale;
+    uint16_t eid;            /* F3g: an ENUM's type id beside its type (0 for every other type): every rule that passes
+                              * a type passes it, so two ENUMs meet only within one type */
     uint8_t outer;           /* P2 S4b: an EX_COL naming a column of a statement around this one: k, a constant for
                               * the run (col -1) */
     uint8_t corr;            /* P2 S4b: an EX_SUBQ that is correlated: computed on each row by env->subq */
@@ -352,7 +360,18 @@ int imdb_x_arith(uint8_t op, const imdb_xval *a, const imdb_xval *b, uint8_t rt,
                  imdb_err *e);
 int imdb_x_neg(const imdb_xval *a, imdb_xval *out, imdb_err *e);
 /* two non-NULL values of comparable types (both numbers, or one type): -1, 0, 1, exactly; never an error */
-bool imdb_x_comparable(uint8_t ta, uint8_t tb);
+/* F3g: a SQL type as the rules pass it: an ENUM's id beside type and scale (0 for every other type), so a site that
+ * compares, unifies or joins two types takes the ids too (the compiler lists each) */
+typedef struct imdb_xty {
+    uint8_t type, scale;
+    uint16_t eid;
+} imdb_xty;
+static inline imdb_xty imdb_xty_of(uint8_t type, uint8_t scale, uint16_t eid)
+{
+    imdb_xty t = {type, scale, eid};
+    return t;
+}
+bool imdb_x_comparable(imdb_xty a, imdb_xty b); /* both numbers, or one type (an ENUM: one id) */
 int imdb_x_cmp(const imdb_xval *a, const imdb_xval *b);
 /* a value stored into a column: the assignment's conversions, then imdb_value_check (TEXT points into v) */
 int imdb_x_assign(const imdb_column *c, const imdb_xval *v, imdb_value *out, imdb_err *e);
@@ -412,17 +431,22 @@ typedef struct imdb_xenv {
      * a bind-only pass and wherever no sequence can be called (an internal error if needed) */
     int (*seqfn)(void *ctx, uint8_t fn, const imdb_xval *a, uint8_t nargs, imdb_xval *out, imdb_err *e);
     uint8_t tzc_next;
+    /* F3g: the catalog whose ENUM types a value is read by (imdb_enum_def: tombstones too) and the read point whose labels
+     * a CAST from TEXT takes (imdb_enumdef_count_at: snapshot_of sets it); NULL where no type can be read (an internal
+     * error if needed) */
+    const imdb_db *edb;
+    uint64_t enum_snap;
 } imdb_xenv;
 /* the tree at k on a row (columns by the bound col) and the aggregates' final values (slots); env may be NULL (no
  * cancellation: constants) */
 int imdb_x_eval(const sql_stmt *st, const imdb_xnode *xn, uint16_t k, const imdb_value *row, const imdb_xval *slots,
                 imdb_xenv *env, imdb_xval *out, imdb_err *e);
 /* P2 S1: a function's result type from its arguments' (fn: FN_*), or the error a wrong call is */
-int imdb_x_fn_type(uint8_t fn, uint8_t nargs, const uint8_t *ta, const uint8_t *sa, const imdb_xval *const *kv,
-                   uint8_t *rt, uint8_t *rs, imdb_err *e); /* kv[i]: argument i's constant, or NULL */
+int imdb_x_fn_type(uint8_t fn, uint8_t nargs, const uint8_t *ta, const uint8_t *sa, const uint16_t *ea, const imdb_xval *const *kv,
+                   uint8_t *rt, uint8_t *rs, uint16_t *re, imdb_err *e); /* kv[i]: argument i's constant, or NULL; ea, *re: ENUM ids (F3g) */
 /* P2 S1: the type CASE's results and COALESCE's arguments share (t, s), widened by one more (t2, s2): one type, or
  * INT64 and DECIMAL as a DECIMAL at the larger scale (exact); 0, an untyped NULL, takes the others'; what names the form */
-int imdb_x_unify(uint8_t *t, uint8_t *s, uint8_t t2, uint8_t s2, const char *what, imdb_err *e);
+int imdb_x_unify(imdb_xty *t, imdb_xty t2, const char *what, imdb_err *e);
 /* P2 S1: v (of a type CASE or COALESCE unified) as their type rt at scale rs: exact */
 int imdb_x_widen(imdb_xval *v, uint8_t rt, uint8_t rs, imdb_err *e);
 

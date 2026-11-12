@@ -267,6 +267,15 @@ typedef struct imdb_view {
     uint64_t created_at, dropped_at; /* dropped_at 0: live */
 } imdb_view;
 
+/* F3g: an ENUM type (design.md §5, ENUM; docs/f3g-design.md): its definition (ADD VALUE swaps in the definition with
+ * one more label: labels only grow, so a reader of an older snapshot finds every label it holds) and its life; a
+ * dropped one a tombstone keeping its labels, resolved by snapshot (imdb_enum_at) as a dropped view is. Its id is
+ * its index + 1 (an ENUM column's eid; 0 none) */
+typedef struct imdb_enum {
+    imdb_enumdef *def; /* allocated */
+    uint64_t created_at, dropped_at; /* dropped_at 0: live */
+} imdb_enum;
+
 /* vid's entry in sparse chunk c (UINT32_MAX: none) */
 static inline uint32_t imdb_vchunk_find(const imdb_vchunk *c, uint64_t vid)
 {
@@ -507,6 +516,8 @@ typedef struct imdb_db {
     uint32_t nt;
     imdb_view *views; /* P2 S7: views[i] is view i, a dropped one a tombstone */
     uint32_t nviews, capviews;
+    imdb_enum *enums; /* F3g: enums[id - 1] is type id, a dropped one a tombstone */
+    uint32_t nenums, capenums;
     imdb_sequence *seqs; /* F2a-2: seqs[i] is sequence i, a dropped one a tombstone */
     uint32_t nseqs, capseqs;
     uint32_t *txseq;     /* F2a-2: the active transaction's sequences nextval touched, by id (SEQ_ADVANCE at its commit) */
@@ -688,6 +699,34 @@ const imdb_view *imdb_view_dependent(const imdb_db *db, uint8_t kind, uint32_t i
  * durable (imdb_view_install, imdb_view_drop_install: no allocation; replay calls them too) */
 int imdb_create_view(imdb_db *db, imdb_viewdef *def, imdb_err *e);
 int imdb_drop_view(imdb_db *db, imdb_view *v, imdb_err *e);
+
+/* F3g: ENUM types. imdb_enum_by_name: a live type; imdb_enum_at: the type a read at snapshot snap sees by that name;
+ * imdb_enum_def: type id's definition, a tombstone's too (NULL: no such id). CREATE TYPE (op 30), DROP TYPE (op 31) and
+ * ADD VALUE (op 32), each alone in its transaction, install once their frame is durable (no allocation: ADD VALUE's
+ * definition is made beforehand); DROP TYPE refused while a table, live or dropped and still retained, has a column of
+ * it in any version of its history, or a live view names it (IMDB_VIEWDEP_TYPE). One name space with tables, views
+ * and sequences; no built-in type's name */
+imdb_enum *imdb_enum_by_name(imdb_db *db, const char *name);
+imdb_enum *imdb_enum_at(imdb_db *db, const char *name, uint64_t snap);
+const imdb_enumdef *imdb_enum_def(const imdb_db *db, uint32_t id);
+bool imdb_enum_name_builtin(const char *name);
+int imdb_create_enum(imdb_db *db, const char *name, const char *const *lab, const size_t *len, uint16_t n, imdb_err *e);
+int imdb_drop_enum(imdb_db *db, imdb_enum *en, imdb_err *e);
+int imdb_enum_add_value(imdb_db *db, imdb_enum *en, const char *lab, size_t len, bool if_not_exists, imdb_err *e);
+int imdb_enum_cols_live(const imdb_db *db, const imdb_schema *s, imdb_err *e); /* each ENUM column names a live type */
+int imdb_enum_apply(imdb_db *db, imdb_op *o, uint64_t seq, imdb_err *e); /* replay's ops 30 to 32, by the catalog's rules */
+int imdb_enum_reserve(imdb_db *db, imdb_err *e);
+void imdb_enum_install(imdb_db *db, imdb_enumdef *def, uint64_t seq);
+void imdb_enum_drop_install(imdb_db *db, uint32_t id, uint64_t seq);
+void imdb_enum_add_install(imdb_db *db, uint32_t id, imdb_enumdef *def, uint64_t seq);
+/* a row's ENUM values against their types' labels (an ordinal past the count refused): every write's, replay's too */
+int imdb_enum_row_check(const imdb_db *db, const imdb_schema *s, const imdb_value *vals, imdb_err *e);
+/* F3g: an ordinal a label of type eid now; a CREATE's constant DEFAULTs (op 23) of ENUM columns labels; a history's every ENUM
+ * DEFAULT (version 1's, an ADD's missing value, a SET DEFAULT's) a label at its version's commit (count: the labels then) */
+bool imdb_enum_ord_ok(const imdb_db *db, uint32_t eid, int64_t ord);
+int imdb_coldefs_enum_ok(const imdb_db *db, const imdb_schema *s, const imdb_coldef *defs, uint16_t n, imdb_err *e);
+bool imdb_hist_enum_ok(const imdb_schema_hist *h, uint64_t created_at, uint16_t (*count)(const void *arg, uint32_t eid, uint64_t at),
+                       const void *arg); /* version 1 at created_at (its since is 0) */
 int imdb_view_reserve(imdb_db *db, imdb_err *e);
 void imdb_view_install(imdb_db *db, imdb_viewdef *def, uint64_t seq);
 void imdb_view_drop_install(imdb_db *db, imdb_view *v, uint64_t seq);

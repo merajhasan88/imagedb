@@ -108,7 +108,7 @@ static bool schema_same(const imdb_schema *a, const imdb_schema *b)
     for (uint16_t c = 0; c < a->ncols; c++) {
         const imdb_column *x = &a->cols[c], *y = &b->cols[c];
         if (strcmp(x->name, y->name) != 0 || x->type != y->type || x->precision != y->precision || x->scale != y->scale ||
-            x->flags != y->flags || x->vlen != y->vlen) /* F3c */
+            x->flags != y->flags || x->vlen != y->vlen || x->eid != y->eid) /* F3c; F3g */
             return false;
     }
     for (uint8_t k = 0; k < a->npk; k++)
@@ -487,7 +487,10 @@ static void segcol_get(const imdb_column *col, const imdb_segcol *sc, uint32_t r
         v->null = true;
         return;
     }
-    if (sc->i64) v->i = sc->i64[row];
+    if (sc->i64) {
+        v->i = sc->i64[row];
+        if (col->type == IMDB_T_ENUM) v->eid = col->eid; /* F3g: its type's id, as the row codec gives it */
+    }
     else if (sc->u8) v->i = sc->u8[row];
     else if (col->type == IMDB_T_INTERVAL) { /* F3f: its 16-byte cell (a row that keeps no value has none: zero) */
         uint32_t a = sc->off[row], z = sc->off[row + 1];
@@ -1030,6 +1033,8 @@ void imdb_manifest_free(imdb_manifest *m)
     for (uint32_t i = 0; i < m->nv; i++) imdb_viewdef_free(m->v[i].def); /* P2 S7 */
     imdb_free(m->v);
     imdb_free(m->sq); /* F2a-2 */
+    for (uint32_t i = 0; i < m->nen; i++) imdb_enumdef_free(m->en[i].def); /* F3g */
+    imdb_free(m->en);
     for (uint32_t i = 0; i < m->nt; i++) {
         imdb_free(m->t[i].seg);
         imdb_hist_free(&m->t[i].hist); /* F1: what no consumer took */
@@ -1082,6 +1087,7 @@ static int manifest_views_ok(const imdb_manifest *m, imdb_err *e)
         for (uint16_t d = 0; d < v->def->ndeps && !rc; d++) {
             const imdb_viewdep *dp = &v->def->deps[d];
             bool live = dp->kind == IMDB_VIEWDEP_TABLE ? dp->id < m->nt && !m->t[dp->id].dropped_at
+                        : dp->kind == IMDB_VIEWDEP_TYPE ? dp->id >= 1 && dp->id <= m->nen && !m->en[dp->id - 1].dropped_at /* F3g */
                                                        : dp->id < i && !m->v[dp->id].dropped_at;
             if (!live) rc = imdb_fail(e, IMDB_ERR_CORRUPT, "manifest: a live view names a table or view that is not live");
         }
@@ -1125,6 +1131,9 @@ static int old_manifest(uint32_t ver, imdb_err *e)
     if (ver == 5)
         return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 5: this lake was written by an imagedb before views' "
                          "format (manifest 6, P2 S7), which this version does not read");
+    if (ver == 16) /* F3g: no ENUM type */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 16: this lake was written by an imagedb before ENUM "
+                         "types (manifest 17, 2026-11-12), which this version does not read");
     if (ver == 15) /* F3f: no INTERVAL column */
         return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 15: this lake was written by an imagedb before INTERVAL "
                          "(manifest 16, 2026-11-12), which this version does not read");
@@ -1165,6 +1174,43 @@ static bool manifest_owner_ok(const imdb_manifest *m, const imdb_sequence *s)
     if (!h->nvers || s->owner_pos >= h->vers[0].s.ncols) return false;
     const imdb_tcol *tc = &h->tcol[s->owner_pos];
     return (tc->cclock == IMDB_DEFK_IDENTITY_ALWAYS || tc->cclock == IMDB_DEFK_IDENTITY) && tc->cseq == s->d.id;
+}
+
+/* F3g: every ENUM column of every table's history names a live type (DROP TYPE's RESTRICT: a retained table keeps its
+ * types), and a live type's name is no live table's, view's or sequence's (one name space) */
+/* F3g: type eid's labels at commit at, by the manifest's section (0: no such type) */
+static uint16_t man_enum_count(const void *arg, uint32_t eid, uint64_t at)
+{
+    const imdb_manifest *m = arg;
+    return eid >= 1 && eid <= m->nen ? imdb_enumdef_count_at(m->en[eid - 1].def, at) : 0;
+}
+
+static bool manifest_enums_named(const imdb_manifest *m)
+{
+    for (uint32_t i = 0; i < m->nt; i++) {
+        const imdb_manifest_tab *mt = &m->t[i];
+        for (uint16_t c = 0; c < mt->s.ncols; c++)
+            if (mt->s.cols[c].type == IMDB_T_ENUM && (mt->s.cols[c].eid < 1 || mt->s.cols[c].eid > m->nen ||
+                                                       m->en[mt->s.cols[c].eid - 1].dropped_at))
+                return false;
+        for (uint32_t v = 0; v < mt->hist.nvers; v++)
+            for (uint16_t c = 0; c < mt->hist.vers[v].s.ncols; c++) {
+                const imdb_column *col = &mt->hist.vers[v].s.cols[c];
+                if (col->type == IMDB_T_ENUM && (col->eid < 1 || col->eid > m->nen || m->en[col->eid - 1].dropped_at))
+                    return false;
+            }
+    }
+    for (uint32_t i = 0; i < m->nen; i++) {
+        if (m->en[i].dropped_at) continue;
+        const char *n = m->en[i].def->name;
+        for (uint32_t k = 0; k < m->nt; k++)
+            if (!m->t[k].dropped_at && !strcmp(m->t[k].s.name, n)) return false;
+        for (uint32_t k = 0; k < m->nv; k++)
+            if (!m->v[k].dropped_at && !strcmp(m->v[k].name, n)) return false;
+        for (uint32_t k = 0; k < m->nsq; k++)
+            if (!m->sq[k].dropped_at && !strcmp(m->sq[k].d.name, n)) return false;
+    }
+    return true;
 }
 
 static bool manifest_owners_listed(const imdb_manifest *m)
@@ -1392,7 +1438,41 @@ int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err
             goto bad;
     }
     if (r.err || r.off != send || !manifest_owners_listed(m)) goto bad;
-    for (uint32_t k = IMDB_MAN_SEQUENCES + 1; k <= IMDB_MAN_TRIGGERS; k++) { /* reserved: empty until their slices */
+    if (man_section(&r, IMDB_MAN_ENUMS, &send)) goto bad; /* F3g (manifest 17): each ENUM type by id, a tombstone too */
+    uint32_t nen = imdb_rd_u32(&r);
+    if (r.err || nen > IMDB_MAX_ENUMS || nen > imdb_rd_left(&r) / 23) goto bad;
+    if (nen && !(m->en = imdb_alloc_array(nen, sizeof *m->en, e))) {
+        imdb_manifest_free(m);
+        return e->code;
+    }
+    m->nen = nen;
+    for (uint32_t i = 0; i < nen; i++) {
+        imdb_enum *t = &m->en[i];
+        imdb_err es = {0};
+        if (imdb_enumdef_decode(&r, &t->def, "manifest", &es)) {
+            if (es.code == IMDB_ERR_NOMEM) {
+                imdb_manifest_free(m);
+                return imdb_fail(e, es.code, "%s", es.msg);
+            }
+            goto bad;
+        }
+        t->created_at = imdb_rd_u64(&r);
+        t->dropped_at = imdb_rd_u64(&r);
+        for (uint16_t k = 0; k < t->def->n; k++) {
+            t->def->at[k] = imdb_rd_u64(&r);
+            if (r.err || t->def->at[k] > m->seq || (t->dropped_at && t->def->at[k] >= t->dropped_at)) goto bad;
+        }
+        if (!imdb_enumdef_at_ok(t->def, t->created_at)) goto bad;
+        if (r.err || t->def->id != i + 1 || imdb_enum_name_builtin(t->def->name) || !t->created_at || t->created_at > m->seq ||
+            (t->dropped_at && (t->dropped_at <= t->created_at || t->dropped_at > m->seq)))
+            goto bad;
+        for (uint32_t k = 0; k < i && !t->dropped_at; k++) /* a live name once among the live types */
+            if (!m->en[k].dropped_at && !strcmp(m->en[k].def->name, t->def->name)) goto bad;
+    }
+    if (r.err || r.off != send || !manifest_enums_named(m)) goto bad;
+    for (uint32_t i = 0; i < m->nt; i++) /* F3g: each ENUM DEFAULT of a history a label at its version's commit */
+        if (!imdb_hist_enum_ok(&m->t[i].hist, m->t[i].created_at, man_enum_count, m)) goto bad;
+    for (uint32_t k = IMDB_MAN_ENUMS + 1; k <= IMDB_MAN_TRIGGERS; k++) { /* reserved: empty until their slices */
         if (man_section(&r, k, &send)) goto bad;
         size_t sl = send - r.off; /* a u32 count of 0; any other count is a later format's, whatever its length */
         if (sl >= 4 && imdb_rd_u32(&r) != 0) {
@@ -1980,6 +2060,7 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
                 o.acol.precision = c->precision;
                 o.acol.scale = c->scale;
                 o.acol.vlen = c->vlen; /* F3c: a VARCHAR's length */
+                o.acol.eid = c->eid;   /* F3g: an ENUM's type */
                 o.adef = v->adef;
             } else if (v->akind == IMDB_ALTER_ADD_CHECK) { /* F2b-1: its name and text */
                 ckw = (imdb_check){.len = v->clen, .text = v->ctext};
@@ -2027,7 +2108,16 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
         imdb_buf_put_u16(mb, s->owner == UINT32_MAX ? 0 : s->owner_pos);
     }
     man_close(mb, sec);
-    for (uint32_t k = IMDB_MAN_SEQUENCES + 1; k <= IMDB_MAN_TRIGGERS; k++) { /* reserved: present and empty */
+    sec = man_open(mb, IMDB_MAN_ENUMS); /* F3g (manifest 17): each ENUM type by id, its labels at the snapshot */
+    imdb_buf_put_u32(mb, db->nenums);
+    for (uint32_t i = 0; i < db->nenums; i++) {
+        imdb_enumdef_encode(db->enums[i].def, mb);
+        imdb_buf_put_u64(mb, db->enums[i].created_at);
+        imdb_buf_put_u64(mb, db->enums[i].dropped_at);
+        for (uint16_t k = 0; k < db->enums[i].def->n; k++) imdb_buf_put_u64(mb, db->enums[i].def->at[k]); /* each label's commit */
+    }
+    man_close(mb, sec);
+    for (uint32_t k = IMDB_MAN_ENUMS + 1; k <= IMDB_MAN_TRIGGERS; k++) { /* reserved: present and empty */
         sec = man_open(mb, k);
         imdb_buf_put_u32(mb, 0);
         man_close(mb, sec);
@@ -3558,6 +3648,14 @@ int imdb_lake_load_snapshot(imdb_db *db, uint64_t *seq, bool *moved, imdb_err *e
             m.v[i].def = NULL;
         }
         if (!rc) db->nviews = db->capviews = m.nv;
+    }
+    if (!rc && m.nen) { /* F3g: the ENUM types at the snapshot, tombstones too (the log's tail replays the rest) */
+        if (!(db->enums = imdb_alloc_array(m.nen, sizeof *db->enums, e))) rc = e->code;
+        else {
+            memcpy(db->enums, m.en, m.nen * sizeof *db->enums);
+            db->nenums = db->capenums = m.nen;
+            for (uint32_t i = 0; i < m.nen; i++) m.en[i].def = NULL; /* the catalog's now */
+        }
     }
     if (!rc && m.nsq) { /* F2a-2: the sequences, their state at the snapshot (the log's tail replays the rest) */
         if (!(db->seqs = imdb_alloc_array(m.nsq, sizeof *db->seqs, e))) rc = e->code;

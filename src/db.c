@@ -2015,7 +2015,8 @@ int imdb_lookup_pk_at(imdb_db *db, imdb_table *t, const imdb_value *kv, uint64_t
     imdb_pkey k;
     for (int c = 0; c < t->s.npk; c++) { /* a key's columns are NOT NULL: another value names no row */
         const imdb_column *col = &t->s.cols[t->s.key[c]];
-        if (kv[c].null || kv[c].type != col->type || (col->type == IMDB_T_DECIMAL && kv[c].scale != col->scale))
+        if (kv[c].null || kv[c].type != col->type || (col->type == IMDB_T_DECIMAL && kv[c].scale != col->scale) ||
+            (col->type == IMDB_T_ENUM && kv[c].eid != col->eid)) /* F3g: another type's value names no row */
             return IMDB_OK;
         k.kv[c] = kv[c];
         if (col->type == IMDB_T_DECIMAL) { /* F3e: in the column's form, so every search below reads one; a value past its
@@ -2139,6 +2140,8 @@ static void tx_op_free(imdb_op *o)
     o->nfk = 0;
     imdb_free(o->sdef);  /* F2a-2: CREATE_SEQUENCE's */
     o->sdef = NULL;
+    imdb_enumdef_free(o->edef); /* F3g: CREATE_ENUM's and ENUM_ADD's */
+    o->edef = NULL;
     o->defs = NULL;
     imdb_viewdef_free(o->vdef);
     o->schema = NULL;
@@ -2263,6 +2266,8 @@ int imdb_create_table_ex(imdb_db *db, imdb_schema *s, uint64_t retention_us, imd
     if (imdb_view_by_name(db, s->name)) /* P2 S7: one name space for the live tables, views (and F2a-2's sequences) */
         return imdb_fail(e, IMDB_ERR_INVALID, "view %s exists already", s->name);
     if (imdb_seq_by_name(db, s->name)) return imdb_fail(e, IMDB_ERR_INVALID, "sequence %s exists already", s->name);
+    if (imdb_enum_by_name(db, s->name)) return imdb_fail(e, IMDB_ERR_INVALID, "type %s exists already", s->name); /* F3g */
+    if (imdb_enum_cols_live(db, s, e)) return e->code;
     s->id = db->nt;
     if (imdb_table_new(db, s, e)) return e->code;
     imdb_undo u = {.kind = UNDO_CREATE, .table = s->id};
@@ -2304,6 +2309,10 @@ int imdb_create_table_defs(imdb_db *db, imdb_schema *s, uint64_t retention_us, c
 {
     if (ndefs && !imdb_coldefs_ok(s, defs, ndefs))
         return imdb_fail(e, IMDB_ERR_INVALID, "a column's DEFAULT is not a value of its type");
+    /* F3g: an ENUM DEFAULT a label of its type, the replay's op 23 rule (labels are only appended, so one now is one at
+     * the commit); SQL looks a label up, the API hands an ordinal (one past the labels was signed, then refused by the
+     * next open) */
+    if (ndefs && (imdb_enum_cols_live(db, s, e) || imdb_coldefs_enum_ok(db, s, defs, ndefs, e))) return e->code;
     if (imdb_create_table_ex(db, s, retention_us, e) || !ndefs) return e->code;
     size_t text = 0;
     for (uint16_t k = 0; k < ndefs; k++) {
@@ -2504,7 +2513,7 @@ int imdb_sver_next(const imdb_schema_hist *h, const imdb_sver *cur, const imdb_o
             return imdb_fail(e, IMDB_ERR_INVALID, "column %s is an IDENTITY: its values are its sequence's", col->name);
         imdb_err e2 = {0};
         if (o->acol.type != col->type || o->acol.precision != col->precision || o->acol.scale != col->scale ||
-            o->acol.vlen != col->vlen || /* F3c */
+            o->acol.vlen != col->vlen || o->acol.eid != col->eid || /* F3c; F3g */
             o->adef.null || imdb_value_check(col, &o->adef, &e2))
             return imdb_fail(e, IMDB_ERR_INVALID, "column %s: its DEFAULT is not a value of its type", col->name);
         return IMDB_OK; /* catalog state: the schema and its positions stay, so the version's hash does */
@@ -2597,6 +2606,11 @@ int imdb_alter_check(imdb_db *db, imdb_table *t, const imdb_op *o, imdb_err *e)
     const imdb_sver *cur = &t->hist.vers[t->hist.nvers - 1];
     imdb_sver nx;
     if (imdb_sver_next(&t->hist, cur, o, &nx, e)) return e->code; /* the schema's and the history's rules */
+    if (o->akind == IMDB_ALTER_ADD_COLUMN && o->acol.type == IMDB_T_ENUM && !o->adef.null && !imdb_enum_ord_ok(db, o->acol.eid, o->adef.i))
+        return imdb_fail(e, IMDB_ERR_INVALID, "column %s: its DEFAULT is no label of its ENUM type", o->acol.name); /* F3g */
+    if (o->akind == IMDB_ALTER_SET_DEFAULT && o->apos < cur->npos && cur->at[o->apos] >= 0 && t->s.cols[cur->at[o->apos]].type == IMDB_T_ENUM &&
+        !imdb_enum_ord_ok(db, t->s.cols[cur->at[o->apos]].eid, o->adef.i))
+        return imdb_fail(e, IMDB_ERR_INVALID, "column %s: its DEFAULT is no label of its ENUM type", t->s.cols[cur->at[o->apos]].name);
     const char *name = o->akind == IMDB_ALTER_ADD_COLUMN ? o->acol.name
                        : o->akind == IMDB_ALTER_RENAME_TABLE || o->akind == IMDB_ALTER_ADD_CHECK || o->akind == IMDB_ALTER_DROP_CHECK ||
                                o->akind == IMDB_ALTER_ADD_FK || o->akind == IMDB_ALTER_DROP_FK
@@ -2626,6 +2640,9 @@ int imdb_alter_check(imdb_db *db, imdb_table *t, const imdb_op *o, imdb_err *e)
         return imdb_fk_rows_check(db, t, o->fk, e);
     }
     case IMDB_ALTER_ADD_COLUMN:
+        if (o->acol.type == IMDB_T_ENUM && (o->acol.eid < 1 || o->acol.eid > db->nenums || db->enums[o->acol.eid - 1].dropped_at))
+            return imdb_fail(e, IMDB_ERR_INVALID, "column %s names an ENUM type that is not live", o->acol.name); /* F3g */
+        /* fall through */
     case IMDB_ALTER_DROP_COLUMN: { /* a view that reads the table and holds the name: an ADD's column could capture it,
                                       a DROP's would leave its re-bind nothing (imdb_view_names_col) */
         const char *vn = NULL;
@@ -2642,7 +2659,8 @@ int imdb_alter_check(imdb_db *db, imdb_table *t, const imdb_op *o, imdb_err *e)
         return IMDB_OK;
     }
     case IMDB_ALTER_RENAME_TABLE:
-        if (imdb_table_by_name(db, o->aname) || imdb_view_by_name(db, o->aname) || imdb_seq_by_name(db, o->aname))
+        if (imdb_table_by_name(db, o->aname) || imdb_view_by_name(db, o->aname) || imdb_seq_by_name(db, o->aname) ||
+            imdb_enum_by_name(db, o->aname)) /* F3g */
             return imdb_fail(e, IMDB_ERR_CONSTRAINT, "a table or view %s already exists", o->aname);
         /* fall through */
     case IMDB_ALTER_RENAME_COLUMN: {
@@ -2947,7 +2965,8 @@ bool imdb_view_deps_live(const imdb_db *db, const imdb_viewdef *def)
     for (uint16_t k = 0; k < def->ndeps; k++) {
         const imdb_viewdep *p = &def->deps[k];
         bool live = p->kind == IMDB_VIEWDEP_TABLE ? p->id < db->nt && !db->t[p->id]->dropped_at
-                                                  : p->kind == IMDB_VIEWDEP_VIEW && p->id < db->nviews &&
+                    : p->kind == IMDB_VIEWDEP_TYPE ? p->id >= 1 && p->id <= db->nenums && !db->enums[p->id - 1].dropped_at /* F3g */
+                    : p->kind == IMDB_VIEWDEP_VIEW && p->id < db->nviews &&
                                                         !db->views[p->id].dropped_at;
         if (!live) return false;
     }
@@ -3010,6 +3029,7 @@ int imdb_create_view(imdb_db *db, imdb_viewdef *def, imdb_err *e)
     else if (imdb_table_by_name(db, def->name)) rc = imdb_fail(e, IMDB_ERR_INVALID, "table %s exists already", def->name);
     else if (imdb_view_by_name(db, def->name)) rc = imdb_fail(e, IMDB_ERR_INVALID, "view %s exists already", def->name);
     else if (imdb_seq_by_name(db, def->name)) rc = imdb_fail(e, IMDB_ERR_INVALID, "sequence %s exists already", def->name);
+    else if (imdb_enum_by_name(db, def->name)) rc = imdb_fail(e, IMDB_ERR_INVALID, "type %s exists already", def->name); /* F3g */
     else if (db->nviews >= IMDB_MAX_VIEWS)
         rc = imdb_fail(e, IMDB_ERR_LIMIT, "a database holds at most %u views, dropped ones counted", IMDB_MAX_VIEWS);
     if (!rc) {
@@ -3045,6 +3065,282 @@ int imdb_drop_view(imdb_db *db, imdb_view *v, imdb_err *e)
     if (!op) return e->code;
     op->code = IMDB_OP_DROP_VIEW;
     op->view = v->id;
+    return IMDB_OK;
+}
+
+/* ---- F3g: ENUM types (design.md §5, ENUM; docs/f3g-design.md) ------------------------------------------------------- */
+
+static const char *const k_builtin_types[] = {"int64", "bigint", "int8", "integer", "int", "int4", "smallint", "int2", "text",
+                                             "varchar", "character", "bool", "boolean", "timestamp", "timestamptz", "date",
+                                             "time", "uuid", "bytea", "interval", "decimal", "numeric", "float64", "float8",
+                                             "float", "double", "real", "float4", "serial", "bigserial", "smallserial"}; /* SERIAL's too: a column's type word */
+
+bool imdb_enum_name_builtin(const char *name)
+{
+    for (size_t k = 0; k < sizeof k_builtin_types / sizeof *k_builtin_types; k++)
+        if (!strcmp(name, k_builtin_types[k])) return true;
+    return false;
+}
+
+imdb_enum *imdb_enum_by_name(imdb_db *db, const char *name)
+{
+    for (uint32_t i = 0; i < db->nenums; i++)
+        if (!db->enums[i].dropped_at && db->enums[i].def && strcmp(db->enums[i].def->name, name) == 0) return &db->enums[i];
+    return NULL;
+}
+
+imdb_enum *imdb_enum_at(imdb_db *db, const char *name, uint64_t snap)
+{
+    for (uint32_t i = 0; i < db->nenums; i++) { /* at most one: a name is free again only after its type's drop */
+        imdb_enum *t = &db->enums[i];
+        if (t->def && t->created_at <= snap && (!t->dropped_at || snap < t->dropped_at) && strcmp(t->def->name, name) == 0)
+            return t;
+    }
+    return NULL;
+}
+
+const imdb_enumdef *imdb_enum_def(const imdb_db *db, uint32_t id)
+{
+    return id >= 1 && id <= db->nenums ? db->enums[id - 1].def : NULL;
+}
+
+int imdb_enum_reserve(imdb_db *db, imdb_err *e)
+{
+    if (db->nenums < db->capenums) return IMDB_OK;
+    if (db->nenums >= IMDB_MAX_ENUMS)
+        return imdb_fail(e, IMDB_ERR_LIMIT, "a database holds at most %u ENUM types, dropped ones counted", IMDB_MAX_ENUMS);
+    uint32_t cap = db->capenums ? db->capenums * 2 : 8;
+    if (cap > IMDB_MAX_ENUMS) cap = IMDB_MAX_ENUMS;
+    imdb_enum *n = imdb_alloc_array(cap, sizeof *n, e);
+    if (!n) return e->code;
+    if (db->nenums) memcpy(n, db->enums, db->nenums * sizeof *n);
+    imdb_free(db->enums);
+    db->enums = n;
+    db->capenums = cap;
+    return IMDB_OK;
+}
+
+void imdb_enum_install(imdb_db *db, imdb_enumdef *def, uint64_t seq)
+{
+    if (db->nenums >= db->capenums || def->id != db->nenums + 1) { /* imdb_enum_reserve made the room before the frame */
+        imdb_enumdef_free(def);
+        db->failed = true;
+        snprintf(db->warning, sizeof db->warning, "commit %llu created an ENUM type with no room reserved; reopen",
+                 (unsigned long long)seq);
+        return;
+    }
+    imdb_enumdef_stamp(def, 0, seq); /* each label made at this commit */
+    imdb_enum *t = &db->enums[db->nenums++];
+    memset(t, 0, sizeof *t);
+    t->def = def;
+    t->created_at = seq;
+}
+
+void imdb_enum_drop_install(imdb_db *db, uint32_t id, uint64_t seq)
+{
+    if (id >= 1 && id <= db->nenums) db->enums[id - 1].dropped_at = seq; /* its labels stay: older snapshots read them */
+}
+
+void imdb_enum_add_install(imdb_db *db, uint32_t id, imdb_enumdef *def, uint64_t seq)
+{
+    if (id < 1 || id > db->nenums) { /* the op's checks named a live type: never here */
+        imdb_enumdef_free(def);
+        return;
+    }
+    if (def->n) imdb_enumdef_stamp(def, (uint16_t)(def->n - 1), seq); /* the label it appended: this commit's */
+    imdb_enumdef_free(db->enums[id - 1].def);
+    db->enums[id - 1].def = def;
+}
+
+static void enums_free(imdb_db *db)
+{
+    for (uint32_t i = 0; i < db->nenums; i++) imdb_enumdef_free(db->enums[i].def);
+    imdb_free(db->enums);
+    db->enums = NULL;
+    db->nenums = db->capenums = 0;
+}
+
+/* a table, live or dropped and still retained, one of whose schema versions has a column of type id */
+static const imdb_table *enum_used_by(const imdb_db *db, uint32_t id)
+{
+    for (uint32_t i = 0; i < db->nt; i++) {
+        const imdb_table *t = db->t[i];
+        for (uint16_t c = 0; c < t->s.ncols; c++)
+            if (t->s.cols[c].type == IMDB_T_ENUM && t->s.cols[c].eid == id) return t;
+        for (uint32_t v = 0; v < t->hist.nvers; v++)
+            for (uint16_t c = 0; c < t->hist.vers[v].s.ncols; c++)
+                if (t->hist.vers[v].s.cols[c].type == IMDB_T_ENUM && t->hist.vers[v].s.cols[c].eid == id) return t;
+    }
+    return NULL;
+}
+
+
+/* DROP TYPE's RESTRICT (the statement's and the replay's one rule) */
+static int enum_drop_rule(const imdb_db *db, const imdb_enumdef *d, imdb_err *e)
+{
+    const imdb_table *t = enum_used_by(db, d->id);
+    if (t)
+        return imdb_fail(e, IMDB_ERR_INVALID, "table %s%s has a column of type %s: drop it first", t->s.name,
+                         t->dropped_at ? " (dropped, its history still kept)" : "", d->name);
+    const imdb_view *v = imdb_view_dependent(db, IMDB_VIEWDEP_TYPE, d->id);
+    if (v) return imdb_fail(e, IMDB_ERR_INVALID, "view %s uses type %s: drop it first", v->name, d->name);
+    return IMDB_OK;
+}
+
+/* replay's ops 30 to 32, the catalog's rules: the next id, a free name not a built-in type's; a live type, its RESTRICT;
+ * a live type, a label it does not hold (an op past a rule is CORRUPT: no writer signs it) */
+int imdb_enum_apply(imdb_db *db, imdb_op *o, uint64_t seq, imdb_err *e)
+{
+    imdb_err e2 = {0};
+    if (o->code == IMDB_OP_CREATE_ENUM) {
+        const imdb_enumdef *d = o->edef;
+        if (d->id != db->nenums + 1)
+            return imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: ENUM type id out of sequence", (unsigned long long)seq);
+        if (imdb_enum_name_builtin(d->name) || imdb_table_by_name(db, d->name) || imdb_view_by_name(db, d->name) ||
+            imdb_seq_by_name(db, d->name) || imdb_enum_by_name(db, d->name))
+            return imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: ENUM type %u takes a live name or a built-in type's",
+                             (unsigned long long)seq, d->id);
+        if (imdb_enum_reserve(db, e)) return e->code;
+        imdb_enum_install(db, o->edef, seq);
+        o->edef = NULL; /* the catalog's now */
+        return IMDB_OK;
+    }
+    imdb_enum *en = o->eid >= 1 && o->eid <= db->nenums ? &db->enums[o->eid - 1] : NULL;
+    if (!en || en->dropped_at)
+        return imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: ENUM type %u unknown or dropped", (unsigned long long)seq, o->eid);
+    if (o->code == IMDB_OP_DROP_ENUM) {
+        if (enum_drop_rule(db, en->def, &e2))
+            return imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: DROP of ENUM type %u: %s", (unsigned long long)seq, o->eid, e2.msg);
+        imdb_enum_drop_install(db, o->eid, seq);
+        return IMDB_OK;
+    }
+    size_t len = strlen(o->aname);
+    if (imdb_enumdef_find(en->def, o->aname, len) >= 0)
+        return imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: ADD VALUE of a label ENUM type %u holds", (unsigned long long)seq,
+                         o->eid);
+    imdb_enumdef *nd = NULL;
+    if (imdb_enumdef_append(en->def, o->aname, len, &nd, &e2))
+        return e2.code == IMDB_ERR_NOMEM ? imdb_fail(e, e2.code, "%s", e2.msg)
+                                         : imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: ADD VALUE: %s", (unsigned long long)seq, e2.msg);
+    imdb_enum_add_install(db, o->eid, nd, seq);
+    return IMDB_OK;
+}
+
+int imdb_enum_cols_live(const imdb_db *db, const imdb_schema *s, imdb_err *e)
+{
+    for (uint16_t c = 0; c < s->ncols; c++)
+        if (s->cols[c].type == IMDB_T_ENUM && (s->cols[c].eid < 1 || s->cols[c].eid > db->nenums ||
+                                                db->enums[s->cols[c].eid - 1].dropped_at))
+            return imdb_fail(e, IMDB_ERR_INVALID, "column %s names an ENUM type that is not live", s->cols[c].name);
+    return IMDB_OK;
+}
+
+static int enum_ddl_alone(imdb_db *db, const char *what, imdb_err *e)
+{
+    if (!db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "no transaction");
+    if (db->ntx || db->ntxseq) return imdb_fail(e, IMDB_ERR_STATE, "%s commits on its own", what);
+    return IMDB_OK;
+}
+
+int imdb_create_enum(imdb_db *db, const char *name, const char *const *lab, const size_t *len, uint16_t n, imdb_err *e)
+{
+    if (enum_ddl_alone(db, "CREATE TYPE", e)) return e->code;
+    if (imdb_enum_name_builtin(name)) return imdb_fail(e, IMDB_ERR_INVALID, "type %s: a built-in type's name", name);
+    if (imdb_table_by_name(db, name) || imdb_view_by_name(db, name) || imdb_seq_by_name(db, name) || imdb_enum_by_name(db, name))
+        return imdb_fail(e, IMDB_ERR_INVALID, "a table, view, sequence or type %s exists already", name);
+    if (db->nenums >= IMDB_MAX_ENUMS)
+        return imdb_fail(e, IMDB_ERR_LIMIT, "a database holds at most %u ENUM types, dropped ones counted", IMDB_MAX_ENUMS);
+    imdb_enumdef *def = NULL;
+    if (imdb_enumdef_make(db->nenums + 1, name, lab, len, n, &def, e)) return e->code;
+    imdb_op *op = imdb_enum_reserve(db, e) ? NULL : tx_push(db, e);
+    if (!op) {
+        imdb_enumdef_free(def);
+        return e->code;
+    }
+    op->code = IMDB_OP_CREATE_ENUM;
+    op->edef = def; /* the install takes it */
+    return IMDB_OK;
+}
+
+int imdb_drop_enum(imdb_db *db, imdb_enum *en, imdb_err *e)
+{
+    if (enum_ddl_alone(db, "DROP TYPE", e)) return e->code;
+    if (en->dropped_at) return imdb_fail(e, IMDB_ERR_NOTFOUND, "type %s was dropped already", en->def->name);
+    if (enum_drop_rule(db, en->def, e)) return e->code;
+    imdb_op *op = tx_push(db, e);
+    if (!op) return e->code;
+    op->code = IMDB_OP_DROP_ENUM;
+    op->eid = en->def->id;
+    return IMDB_OK;
+}
+
+int imdb_enum_add_value(imdb_db *db, imdb_enum *en, const char *lab, size_t len, bool if_not_exists, imdb_err *e)
+{
+    if (enum_ddl_alone(db, "ALTER TYPE", e)) return e->code;
+    if (en->dropped_at) return imdb_fail(e, IMDB_ERR_NOTFOUND, "type %s was dropped", en->def->name);
+    if (!imdb_enum_label_ok(lab, len))
+        return imdb_fail(e, IMDB_ERR_INVALID, "an ENUM label is 0 to %u bytes of UTF-8 without NUL", IMDB_MAX_ENUM_LABEL);
+    if (imdb_enumdef_find(en->def, lab, len) >= 0)
+        return if_not_exists ? IMDB_OK : imdb_fail(e, IMDB_ERR_CONSTRAINT, "type %s holds that label already", en->def->name);
+    imdb_enumdef *nd = NULL;
+    if (imdb_enumdef_append(en->def, lab, len, &nd, e)) return e->code;
+    char *a = imdb_alloc(len + 1, e);
+    imdb_op *op = a ? tx_push(db, e) : NULL;
+    if (!op) {
+        imdb_free(a);
+        imdb_enumdef_free(nd);
+        return e->code;
+    }
+    if (len) memcpy(a, lab, len);
+    op->code = IMDB_OP_ENUM_ADD;
+    op->eid = en->def->id;
+    op->aname = a;
+    op->edef = nd; /* the install swaps it in */
+    return IMDB_OK;
+}
+
+bool imdb_enum_ord_ok(const imdb_db *db, uint32_t eid, int64_t ord)
+{
+    const imdb_enumdef *d = imdb_enum_def(db, eid);
+    return d && ord >= 0 && ord < d->n;
+}
+
+int imdb_coldefs_enum_ok(const imdb_db *db, const imdb_schema *s, const imdb_coldef *defs, uint16_t n, imdb_err *e)
+{
+    for (uint16_t k = 0; k < n; k++)
+        if (defs[k].kind == IMDB_DEFK_VALUE && defs[k].col < s->ncols && s->cols[defs[k].col].type == IMDB_T_ENUM &&
+            !imdb_enum_ord_ok(db, s->cols[defs[k].col].eid, defs[k].v.i))
+            return imdb_fail(e, IMDB_ERR_INVALID, "column %s: its DEFAULT is no label of its ENUM type", s->cols[defs[k].col].name);
+    return IMDB_OK;
+}
+
+bool imdb_hist_enum_ok(const imdb_schema_hist *h, uint64_t created_at, uint16_t (*count)(const void *arg, uint32_t eid, uint64_t at),
+                       const void *arg)
+{
+    for (uint32_t v = 0; v < h->nvers; v++) {
+        const imdb_sver *sv = &h->vers[v];
+        for (uint16_t c = 0; c < sv->s.ncols; c++) {
+            const imdb_column *col = &sv->s.cols[c];
+            if (col->type != IMDB_T_ENUM) continue;
+            const imdb_tcol *tc = &h->tcol[sv->pos[c]];
+            const imdb_value *d = v == 0                                                            ? &tc->cdef
+                                  : sv->akind == IMDB_ALTER_ADD_COLUMN && sv->apos == sv->pos[c] ? &tc->missing
+                                  : sv->akind == IMDB_ALTER_SET_DEFAULT && sv->apos == sv->pos[c] ? &sv->adef
+                                                                                                  : NULL;
+            if (d && !d->null && (d->i < 0 || d->i >= count(arg, col->eid, v ? sv->since : created_at))) return false; /* version 1: since 0 */
+        }
+    }
+    return true;
+}
+
+int imdb_enum_row_check(const imdb_db *db, const imdb_schema *s, const imdb_value *vals, imdb_err *e)
+{
+    for (uint16_t c = 0; c < s->ncols; c++) {
+        if (s->cols[c].type != IMDB_T_ENUM || vals[c].null) continue;
+        const imdb_enumdef *d = imdb_enum_def(db, s->cols[c].eid);
+        if (!d || vals[c].i < 0 || vals[c].i >= d->n)
+            return imdb_fail(e, IMDB_ERR_INVALID, "column %s: not a label of its ENUM type", s->cols[c].name);
+    }
     return IMDB_OK;
 }
 
@@ -3097,7 +3393,8 @@ static void seqs_free(imdb_db *db)
 int imdb_create_sequence(imdb_db *db, imdb_seqdef *d, imdb_err *e)
 {
     if (!db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "no transaction");
-    if (imdb_table_by_name(db, d->name) || imdb_view_by_name(db, d->name) || imdb_seq_by_name(db, d->name))
+    if (imdb_table_by_name(db, d->name) || imdb_view_by_name(db, d->name) || imdb_seq_by_name(db, d->name) ||
+        imdb_enum_by_name(db, d->name)) /* F3g: one name space with the types */
         return imdb_fail(e, IMDB_ERR_INVALID, "a table, view or sequence %s exists already", d->name);
     d->id = db->nseqs;
     if (!imdb_seqdef_ok(d))
@@ -4242,9 +4539,13 @@ static int altered_since(imdb_db *db, const imdb_table *t, imdb_err *e)
  * PostgreSQL computes them before it checks. Neither: nothing decoded */
 static int row_checks(imdb_db *db, imdb_table *t, const uint8_t *row, size_t len, imdb_err *e)
 {
-    if (!t->hist.nchk && !t->hist.ngen) return IMDB_OK;
+    bool en = false; /* F3g: an ENUM column's ordinal against its type's labels */
+    for (uint16_t c = 0; c < t->s.ncols && !en; c++) en = t->s.cols[c].type == IMDB_T_ENUM;
+    if (!t->hist.nchk && !t->hist.ngen && !en) return IMDB_OK;
     imdb_value vals[IMDB_MAX_COLS];
     if (imdb_row_decode(&t->s, row, len, vals, e)) return e->code;
+    if (en && imdb_enum_row_check(db, &t->s, vals, e)) return e->code;
+    if (!t->hist.nchk && !t->hist.ngen) return IMDB_OK;
     if (t->hist.ngen && imdb_gen_verify(db, t, vals, e)) return e->code;
     return imdb_check_row(db, t, vals, e);
 }
@@ -5455,7 +5756,8 @@ static int commit_body(imdb_db *db, imdb_err *e)
             code == IMDB_OP_CREATE_INDEX || code == IMDB_OP_DROP_INDEX || code == IMDB_OP_SET_RETENTION ||
             code == IMDB_OP_EXPIRE || code == IMDB_OP_DROP_TABLE || code == IMDB_OP_CREATE_VIEW || code == IMDB_OP_DROP_VIEW ||
             code == IMDB_OP_ALTER_TABLE || code == IMDB_OP_CREATE_SEQUENCE || code == IMDB_OP_DROP_SEQUENCE ||
-            code == IMDB_OP_SEQ_ADVANCE || code == IMDB_OP_SEQ_SET) /* F2a-2: the manifest keeps sequences too */
+            code == IMDB_OP_SEQ_ADVANCE || code == IMDB_OP_SEQ_SET || code == IMDB_OP_CREATE_ENUM || code == IMDB_OP_DROP_ENUM ||
+            code == IMDB_OP_ENUM_ADD) /* F2a-2: the manifest keeps sequences too; F3g: and types */
             db->lake_dirty = true; /* the manifest records the definitions, the retentions, the horizons, the drops,
                                     * the views (P2 S7) */
         if (code == IMDB_OP_CREATE_TABLE) db->t[db->tx[i].table]->created_at = c.seq;
@@ -5476,6 +5778,15 @@ static int commit_body(imdb_db *db, imdb_err *e)
             db->tx[i].vdef = NULL;
         }
         if (code == IMDB_OP_DROP_VIEW && db->tx[i].view < db->nviews) imdb_view_drop_install(db, &db->views[db->tx[i].view], c.seq);
+        if (code == IMDB_OP_CREATE_ENUM) { /* F3g: the definition passes to the catalog */
+            imdb_enum_install(db, db->tx[i].edef, c.seq);
+            db->tx[i].edef = NULL;
+        }
+        if (code == IMDB_OP_DROP_ENUM) imdb_enum_drop_install(db, db->tx[i].eid, c.seq);
+        if (code == IMDB_OP_ENUM_ADD) {
+            imdb_enum_add_install(db, db->tx[i].eid, db->tx[i].edef, c.seq);
+            db->tx[i].edef = NULL;
+        }
     }
     db->seq = c.seq;
     memcpy(db->head, c.hash, 32);
@@ -5578,6 +5889,7 @@ void imdb_reset_state(imdb_db *db)
     imdb_lake_db_free(db);
     for (uint32_t i = 0; i < db->nt; i++) imdb_table_free(db->t[i]);
     views_free(db); /* P2 S7 */
+    enums_free(db); /* F3g */
     seqs_free(db); /* F2a-2 */
 #ifdef IMDB_STORE_CHECKS
     if (db->segcache.resident) { /* every image charged was credited as it left (lake.c: seg_img_bytes) */
@@ -5626,6 +5938,7 @@ int imdb_close(imdb_db *db)
     imdb_lake_db_free(db);
     for (uint32_t i = 0; i < db->nt; i++) imdb_table_free(db->t[i]);
     views_free(db); /* P2 S7 */
+    enums_free(db); /* F3g */
     seqs_free(db); /* F2a-2 */
     imdb_free(db->t);
     for (uint32_t i = 0; i < db->ntx; i++) tx_op_free(&db->tx[i]);

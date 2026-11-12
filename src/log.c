@@ -32,6 +32,8 @@ bool imdb_defk_fits(uint8_t kind, uint8_t type) /* F2a: a clock kind and the typ
 static bool alter_type_ok(const imdb_column *c)
 {
     if (c->type < IMDB_T_INT64 || c->type > IMDB_T_LAST) return false;
+    if (c->type == IMDB_T_ENUM) return c->eid >= 1 && c->eid <= IMDB_MAX_ENUMS && !c->precision && !c->scale; /* F3g */
+    if (c->eid) return false;
     if (c->type == IMDB_T_DECIMAL) return c->precision >= 1 && c->precision <= IMDB_DEC_MAX_DIGITS && c->scale <= c->precision; /* F3e */
     if (c->type == IMDB_T_INT64) return imdb_int_width_ok(c->precision) && !c->scale; /* F3a: SMALLINT, INTEGER, INT64 */
     return !c->precision && !c->scale;
@@ -68,6 +70,8 @@ static void put_value(imdb_buf *b, const imdb_column *c, const imdb_value *v)
     } else if (c->type == IMDB_T_DECIMAL && imdb_dec_wide(c->precision)) { /* F3e: the row codec's 16 bytes, i then hi */
         imdb_buf_put_u64(b, (uint64_t)v->i);
         imdb_buf_put_u64(b, (uint64_t)v->hi);
+    } else if (c->type == IMDB_T_ENUM) { /* F3g: its ordinal, u32 (imdb_fixed_width) */
+        imdb_buf_put_u32(b, (uint32_t)v->i);
     } else if (c->type == IMDB_T_BOOL) {
         imdb_buf_put_u8(b, (uint8_t)v->i);
     } else {
@@ -146,6 +150,9 @@ static int get_value(imdb_rd *r, const imdb_column *c, imdb_value *v, const char
         v->wide = true;
         v->i = (int64_t)imdb_rd_u64(r);
         v->hi = (int64_t)imdb_rd_u64(r);
+    } else if (c->type == IMDB_T_ENUM) { /* F3g */
+        v->i = imdb_rd_u32(r);
+        v->eid = c->eid;
     } else if (c->type == IMDB_T_BOOL) {
         v->i = imdb_rd_u8(r);
     } else {
@@ -407,7 +414,7 @@ int imdb_alter_put(imdb_buf *b, const imdb_op *o)
           (o->aclock && (o->aclock == IMDB_DEFK_RANDOM_UUID || !imdb_defk_fits(o->aclock, o->acol.type) || o->adef.null)))) || /* F2a; F3d */
         (o->akind == IMDB_ALTER_SET_DEFAULT &&
          (!alter_bare_ok(&o->acol) || o->adef.null || imdb_value_check(&o->acol, &o->adef, &e2))) ||
-        (o->akind == IMDB_ALTER_SET_TYPE && !alter_bare_ok(&o->acol)) ||
+        (o->akind == IMDB_ALTER_SET_TYPE && (!alter_bare_ok(&o->acol) || o->acol.type == IMDB_T_ENUM)) || /* F3g: not to an ENUM */
         (o->akind == IMDB_ALTER_SET_DEFAULT_CLOCK && (o->aclock <= IMDB_DEFK_VALUE || (o->aclock > IMDB_DEFK_CLOCK_LAST && o->aclock != IMDB_DEFK_RANDOM_UUID))) ||
         (o->akind < IMDB_ALTER_ADD_COLUMN || o->akind > IMDB_ALTER_LAST)) {
         b->err = IMDB_ERR_INVALID;
@@ -420,8 +427,10 @@ int imdb_alter_put(imdb_buf *b, const imdb_op *o)
         imdb_buf_put_u8(b, (uint8_t)cl);
         imdb_buf_put(b, o->acol.name, cl);
         imdb_buf_put_u8(b, o->acol.type);
-        imdb_buf_put_u8(b, o->acol.type == IMDB_T_TEXT ? (uint8_t)(o->acol.vlen & 0xff) : o->acol.precision); /* F3c */
-        imdb_buf_put_u8(b, o->acol.type == IMDB_T_TEXT ? (uint8_t)(o->acol.vlen >> 8) : o->acol.scale);
+        imdb_buf_put_u8(b, o->acol.type == IMDB_T_TEXT ? (uint8_t)(o->acol.vlen & 0xff) /* F3c; F3g: an ENUM's id, as the schema's */
+                           : o->acol.type == IMDB_T_ENUM ? (uint8_t)(o->acol.eid & 0xff) : o->acol.precision);
+        imdb_buf_put_u8(b, o->acol.type == IMDB_T_TEXT ? (uint8_t)(o->acol.vlen >> 8)
+                           : o->acol.type == IMDB_T_ENUM ? (uint8_t)(o->acol.eid >> 8) : o->acol.scale);
         imdb_buf_put_u8(b, o->acol.flags);
         if (o->aclock) { /* F2a: the clock's value at the ALTER, which the rows before it read, and the kind writes use */
             imdb_buf_put_u8(b, 2);
@@ -442,8 +451,10 @@ int imdb_alter_put(imdb_buf *b, const imdb_op *o)
     case IMDB_ALTER_SET_TYPE:
         imdb_buf_put_u16(b, o->apos);
         imdb_buf_put_u8(b, o->acol.type);
-        imdb_buf_put_u8(b, o->acol.type == IMDB_T_TEXT ? (uint8_t)(o->acol.vlen & 0xff) : o->acol.precision); /* F3c */
-        imdb_buf_put_u8(b, o->acol.type == IMDB_T_TEXT ? (uint8_t)(o->acol.vlen >> 8) : o->acol.scale);
+        imdb_buf_put_u8(b, o->acol.type == IMDB_T_TEXT ? (uint8_t)(o->acol.vlen & 0xff) /* F3c; F3g: an ENUM's id, as the schema's */
+                           : o->acol.type == IMDB_T_ENUM ? (uint8_t)(o->acol.eid & 0xff) : o->acol.precision);
+        imdb_buf_put_u8(b, o->acol.type == IMDB_T_TEXT ? (uint8_t)(o->acol.vlen >> 8)
+                           : o->acol.type == IMDB_T_ENUM ? (uint8_t)(o->acol.eid >> 8) : o->acol.scale);
         if (o->akind == IMDB_ALTER_SET_DEFAULT) put_value(b, &o->acol, &o->adef);
         return IMDB_OK;
     default:
@@ -501,6 +512,10 @@ int imdb_alter_get(imdb_rd *r, imdb_op *o, const char *what, imdb_err *e)
             o->acol.vlen = (uint16_t)(o->acol.precision | o->acol.scale << 8);
             o->acol.precision = o->acol.scale = 0;
         }
+        if (o->acol.type == IMDB_T_ENUM) { /* F3g: the two bytes its type's id, as the schema's encoding writes it */
+            o->acol.eid = (uint16_t)(o->acol.precision | o->acol.scale << 8);
+            o->acol.precision = o->acol.scale = 0;
+        }
         o->acol.flags = imdb_rd_u8(r);
         if (!r->err && !alter_col_ok(&o->acol)) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad added column", what);
         if (!r->err && get_default(r, &o->acol, &o->adef, &o->aclock, what, e)) return e->code;
@@ -524,7 +539,12 @@ int imdb_alter_get(imdb_rd *r, imdb_op *o, const char *what, imdb_err *e)
             o->acol.vlen = (uint16_t)(o->acol.precision | o->acol.scale << 8);
             o->acol.precision = o->acol.scale = 0;
         }
-        if (!r->err && !alter_bare_ok(&o->acol)) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad column type", what);
+        if (o->acol.type == IMDB_T_ENUM) { /* F3g: the two bytes its type's id, as the schema's encoding writes it */
+            o->acol.eid = (uint16_t)(o->acol.precision | o->acol.scale << 8);
+            o->acol.precision = o->acol.scale = 0;
+        }
+        if (!r->err && (!alter_bare_ok(&o->acol) || (o->akind == IMDB_ALTER_SET_TYPE && o->acol.type == IMDB_T_ENUM))) /* F3g */
+            return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad column type", what);
         if (!r->err && o->akind == IMDB_ALTER_SET_DEFAULT) return get_value(r, &o->acol, &o->adef, what, e);
         return IMDB_OK;
     }
@@ -567,6 +587,7 @@ void imdb_commit_free(imdb_commit_rec *c)
             imdb_free(c->ops[i].chk); /* F2b-1 */
             imdb_free(c->ops[i].fk); /* F2b-2 */
             imdb_free(c->ops[i].sdef); /* F2a-2 */
+            imdb_enumdef_free(c->ops[i].edef); /* F3g */
             imdb_viewdef_free(c->ops[i].vdef);
         }
         imdb_free(c->ops);
@@ -613,6 +634,155 @@ int imdb_seqdef_decode(imdb_rd *r, imdb_seqdef *d, const char *what, imdb_err *e
     if (!r->err && !imdb_seqdef_ok(d)) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad sequence definition", what);
     return IMDB_OK;
 }
+
+
+/* ---- F3g: an ENUM type's definition (log.h imdb_enumdef) ---- */
+
+bool imdb_enum_label_ok(const char *s, size_t n)
+{
+    size_t at = 0;
+    return n <= IMDB_MAX_ENUM_LABEL && (!n || imdb_utf8_valid((const uint8_t *)s, n, &at));
+}
+
+int imdb_enumdef_find(const imdb_enumdef *d, const char *lab, size_t len)
+{
+    for (uint16_t k = 0; k < d->n; k++)
+        if (d->off[k + 1] - d->off[k] == len && (!len || memcmp(d->text + d->off[k], lab, len) == 0)) return k;
+    return -1;
+}
+
+/* the one checked builder: id, name, n labels within bounds, each a label and once */
+int imdb_enumdef_make(uint32_t id, const char *name, const char *const *lab, const size_t *len, uint16_t n,
+                      imdb_enumdef **out, imdb_err *e)
+{
+    *out = NULL;
+    size_t nl = strnlen(name, IMDB_MAX_IDENT + 1), bytes = 0;
+    if (!id || id > IMDB_MAX_ENUMS || !imdb_ident_valid(name, nl) || n > IMDB_MAX_ENUM_LABELS)
+        return imdb_fail(e, IMDB_ERR_INVALID, "an ENUM type of 0 to %u labels, its name an identifier", IMDB_MAX_ENUM_LABELS);
+    for (uint16_t k = 0; k < n; k++) {
+        if (!imdb_enum_label_ok(lab[k], len[k]))
+            return imdb_fail(e, IMDB_ERR_INVALID, "an ENUM label is 0 to %u bytes of UTF-8 without NUL", IMDB_MAX_ENUM_LABEL);
+        bytes += len[k];
+    }
+    size_t sz = sizeof(imdb_enumdef) + (size_t)n * sizeof(uint64_t) + ((size_t)n + 1) * sizeof(uint32_t) + bytes + 1;
+    imdb_enumdef *d = imdb_alloc(sz, e);
+    if (!d) return e->code;
+    d->id = id;
+    memcpy(d->name, name, nl);
+    d->at = (uint64_t *)(void *)(d + 1); /* zeroed: the install stamps each label's commit */
+    d->off = (uint32_t *)(void *)(d->at + n);
+    d->text = (char *)(d->off + n + 1);
+    uint32_t at = 0;
+    for (uint16_t k = 0; k < n; k++) {
+        d->n = k; /* the labels so far: a duplicate of one of them is refused */
+        if (imdb_enumdef_find(d, lab[k], len[k]) >= 0) {
+            imdb_free(d);
+            return imdb_fail(e, IMDB_ERR_INVALID, "an ENUM label given twice");
+        }
+        d->off[k] = at;
+        if (len[k]) memcpy(d->text + at, lab[k], len[k]);
+        at += (uint32_t)len[k];
+        d->off[k + 1] = at;
+    }
+    d->off[n] = at;
+    d->n = n;
+    *out = d;
+    return IMDB_OK;
+}
+
+int imdb_enumdef_append(const imdb_enumdef *d, const char *lab, size_t len, imdb_enumdef **out, imdb_err *e)
+{
+    *out = NULL;
+    if (d->n >= IMDB_MAX_ENUM_LABELS) return imdb_fail(e, IMDB_ERR_LIMIT, "an ENUM type holds at most %u labels", IMDB_MAX_ENUM_LABELS);
+    const char *l[IMDB_MAX_ENUM_LABELS];
+    size_t n[IMDB_MAX_ENUM_LABELS];
+    for (uint16_t k = 0; k < d->n; k++) l[k] = d->text + d->off[k], n[k] = d->off[k + 1] - d->off[k];
+    l[d->n] = lab;
+    n[d->n] = len;
+    if (imdb_enumdef_make(d->id, d->name, l, n, (uint16_t)(d->n + 1), out, e)) return e->code;
+    if (d->n) memcpy((*out)->at, d->at, d->n * sizeof *d->at); /* the new label's commit stamped by its install */
+    return IMDB_OK;
+}
+
+void imdb_enumdef_encode(const imdb_enumdef *d, imdb_buf *b)
+{
+    size_t nl = strlen(d->name);
+    imdb_buf_put_u32(b, d->id);
+    imdb_buf_put_u8(b, (uint8_t)nl);
+    imdb_buf_put(b, d->name, nl);
+    imdb_buf_put_u16(b, d->n);
+    for (uint16_t k = 0; k < d->n; k++) {
+        imdb_buf_put_u8(b, (uint8_t)(d->off[k + 1] - d->off[k]));
+        imdb_buf_put(b, d->text + d->off[k], d->off[k + 1] - d->off[k]);
+    }
+}
+
+int imdb_enumdef_decode(imdb_rd *r, imdb_enumdef **out, const char *what, imdb_err *e)
+{
+    *out = NULL;
+    uint32_t id = imdb_rd_u32(r);
+    char name[IMDB_MAX_IDENT + 1];
+    imdb_err e2 = {0};
+    if (!r->err && imdb_rd_ident(r, name, &e2)) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad ENUM type name", what);
+    uint16_t n = imdb_rd_u16(r);
+    if (r->err || n > IMDB_MAX_ENUM_LABELS) return imdb_fail(e, IMDB_ERR_CORRUPT, "%s: bad ENUM type", what);
+    const char **lab = imdb_alloc_array(n ? n : 1, sizeof *lab, e);
+    size_t *len = imdb_alloc_array(n ? n : 1, sizeof *len, e);
+    int rc = !lab || !len ? e->code : IMDB_OK;
+    for (uint16_t k = 0; !rc && k < n; k++) {
+        len[k] = imdb_rd_u8(r);
+        lab[k] = (const char *)imdb_rd_bytes(r, len[k]);
+        if (r->err) rc = imdb_fail(e, IMDB_ERR_CORRUPT, "%s: truncated ENUM type", what);
+    }
+    if (!rc && imdb_enumdef_make(id, name, lab, len, n, out, &e2)) rc = imdb_fail(e, IMDB_ERR_CORRUPT, "%s: %s", what, e2.msg);
+    imdb_free(lab);
+    imdb_free(len);
+    return rc;
+}
+
+int imdb_enumdef_copy(const imdb_enumdef *d, imdb_enumdef **out, imdb_err *e)
+{
+    size_t sz = sizeof(imdb_enumdef) + (size_t)d->n * sizeof(uint64_t) + ((size_t)d->n + 1) * sizeof(uint32_t) + d->off[d->n] + 1;
+    imdb_enumdef *c = imdb_alloc(sz, e);
+    *out = c;
+    if (!c) return e->code;
+    *c = *d;
+    c->at = (uint64_t *)(void *)(c + 1);
+    if (d->n) memcpy(c->at, d->at, d->n * sizeof *d->at);
+    c->off = (uint32_t *)(void *)(c->at + d->n);
+    c->text = (char *)(c->off + d->n + 1);
+    memcpy(c->off, d->off, ((size_t)d->n + 1) * sizeof(uint32_t));
+    if (d->off[d->n]) memcpy(c->text, d->text, d->off[d->n]);
+    return IMDB_OK;
+}
+
+void imdb_enumdef_stamp(imdb_enumdef *d, uint16_t from, uint64_t seq)
+{
+    for (uint16_t k = from; k < d->n; k++) d->at[k] = seq;
+}
+
+uint16_t imdb_enumdef_count_at(const imdb_enumdef *d, uint64_t snap)
+{
+    uint16_t k = d->n;
+    while (k && d->at[k - 1] > snap) k--; /* the commits never go down: the labels at snap are a prefix */
+    return k;
+}
+
+bool imdb_enumdef_at_ok(const imdb_enumdef *d, uint64_t created_at)
+{
+    for (uint16_t k = 0; k < d->n; k++) /* the CREATE's labels at its commit, then one an ADD, each later than the last */
+        if (d->at[k] < created_at || (d->at[k] == created_at ? k && d->at[k - 1] != created_at : k && d->at[k] <= d->at[k - 1]))
+            return false;
+    return true;
+}
+
+bool imdb_enumdef_same(const imdb_enumdef *a, const imdb_enumdef *b)
+{
+    return a->id == b->id && !strcmp(a->name, b->name) && a->n == b->n && !memcmp(a->at, b->at, a->n * sizeof *a->at) &&
+           !memcmp(a->off, b->off, ((size_t)a->n + 1) * sizeof(uint32_t)) && !memcmp(a->text, b->text, a->off[a->n]);
+}
+
+void imdb_enumdef_free(imdb_enumdef *d) { imdb_free(d); }
 
 /* F2a-2 (log.h): DROP_SEQUENCE alone; the SEQ_ADVANCEs last, by sequence, one each; SEQ_SETs only beside SEQ_SETs
  * and SEQ_ADVANCEs, before them, by sequence, one each */
@@ -786,6 +956,27 @@ void imdb_commit_encode_header(const imdb_commit_rec *c, imdb_buf *b)
             imdb_viewdef_encode(o->vdef, b);
             break;
         }
+        case IMDB_OP_CREATE_ENUM: /* F3g: alone, its definition checked (imdb_enumdef_make made it) */
+            if (c->nops != 1 || !o->edef) {
+                b->err = IMDB_ERR_INVALID;
+                break;
+            }
+            imdb_enumdef_encode(o->edef, b);
+            break;
+        case IMDB_OP_DROP_ENUM:
+        case IMDB_OP_ENUM_ADD:
+            if (c->nops != 1 || !o->eid || o->eid > IMDB_MAX_ENUMS ||
+                (o->code == IMDB_OP_ENUM_ADD && (!o->aname || !imdb_enum_label_ok(o->aname, strlen(o->aname))))) {
+                b->err = IMDB_ERR_INVALID;
+                break;
+            }
+            imdb_buf_put_u32(b, o->eid);
+            if (o->code == IMDB_OP_ENUM_ADD) {
+                size_t ln = strlen(o->aname);
+                imdb_buf_put_u8(b, (uint8_t)ln);
+                imdb_buf_put(b, o->aname, ln);
+            }
+            break;
         case IMDB_OP_CREATE_SEQUENCE: /* F2a-2 */
             if (!o->sdef || !imdb_seqdef_ok(o->sdef)) {
                 b->err = IMDB_ERR_INVALID;
@@ -1165,6 +1356,25 @@ int imdb_commit_decode_header(const uint8_t *h, size_t hlen, imdb_commit_rec *c,
         case IMDB_OP_CREATE_VIEW: /* P2 S7: alone */
             if (imdb_viewdef_decode(&r, &o->vdef, e)) return e->code;
             if (nops != 1) return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: a view op must be the only op");
+            break;
+        case IMDB_OP_CREATE_ENUM: /* F3g: alone */
+            if (imdb_enumdef_decode(&r, &o->edef, "commit", e)) return e->code;
+            if (nops != 1) return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: an ENUM op must be the only op");
+            break;
+        case IMDB_OP_DROP_ENUM:
+        case IMDB_OP_ENUM_ADD:
+            o->eid = imdb_rd_u32(&r);
+            if (o->code == IMDB_OP_ENUM_ADD) {
+                uint8_t ln = imdb_rd_u8(&r);
+                const uint8_t *lp = imdb_rd_bytes(&r, ln);
+                if (!r.err) {
+                    if (!imdb_enum_label_ok((const char *)lp, ln)) return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: a bad ENUM label");
+                    if (!(o->aname = imdb_alloc((size_t)ln + 1, e))) return e->code;
+                    if (ln) memcpy(o->aname, lp, ln);
+                }
+            }
+            if (!r.err && (nops != 1 || !o->eid || o->eid > IMDB_MAX_ENUMS))
+                return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: an ENUM op must be the only op, its type in range");
             break;
         case IMDB_OP_CREATE_SEQUENCE: /* F2a-2 */
             if (!(o->sdef = imdb_alloc(sizeof *o->sdef, e))) return e->code;
@@ -1843,7 +2053,8 @@ int imdb_viewdef_check(const imdb_viewdef *d, imdb_err *e)
         if (!lower_ident(c->name)) return imdb_fail(e, IMDB_ERR_CORRUPT, "view: bad column name");
         for (uint16_t j = 0; j < i; j++)
             if (!strcmp(d->cols[j].name, c->name)) return imdb_fail(e, IMDB_ERR_CORRUPT, "view: two columns of one name");
-        if (c->type < IMDB_T_INT64 || c->type > IMDB_T_LAST || (c->type == IMDB_T_DECIMAL ? c->scale > IMDB_DEC_MAX_DIGITS : c->scale)) /* F3e: 38 */
+        if (c->type < IMDB_T_INT64 || c->type > IMDB_T_LAST || (c->type == IMDB_T_DECIMAL ? c->scale > IMDB_DEC_MAX_DIGITS : c->scale) || /* F3e: 38 */
+            (c->type == IMDB_T_ENUM ? c->eid < 1 || c->eid > IMDB_MAX_ENUMS : c->eid != 0)) /* F3g: an ENUM's id alone */
             return imdb_fail(e, IMDB_ERR_CORRUPT, "view: bad column type");
     }
     if (d->ndeps > IMDB_MAX_VIEW_DEPS || (d->ndeps && !d->deps))
@@ -1851,7 +2062,8 @@ int imdb_viewdef_check(const imdb_viewdef *d, imdb_err *e)
     for (uint16_t i = 0; i < d->ndeps; i++) {
         const imdb_viewdep *p = &d->deps[i];
         bool ok = p->kind == IMDB_VIEWDEP_TABLE ? p->id < IMDB_MAX_TABLES
-                                                : p->kind == IMDB_VIEWDEP_VIEW && p->id < d->id; /* an earlier view */
+                  : p->kind == IMDB_VIEWDEP_VIEW ? p->id < d->id /* an earlier view */
+                                                 : p->kind == IMDB_VIEWDEP_TYPE && p->id >= 1 && p->id <= IMDB_MAX_ENUMS; /* F3g */
         if (!ok || (i && !imdb_viewdep_less(&d->deps[i - 1], p)))
             return imdb_fail(e, IMDB_ERR_CORRUPT, "view: a bad dependency, or not strictly sorted");
     }
@@ -1873,7 +2085,8 @@ void imdb_viewdef_encode(const imdb_viewdef *d, imdb_buf *b)
         imdb_buf_put_u8(b, (uint8_t)cl);
         imdb_buf_put(b, d->cols[i].name, cl);
         imdb_buf_put_u8(b, d->cols[i].type);
-        imdb_buf_put_u8(b, d->cols[i].scale);
+        if (d->cols[i].type == IMDB_T_ENUM) imdb_buf_put_u16(b, d->cols[i].eid); /* F3g: its type's id in the scale's place */
+        else imdb_buf_put_u8(b, d->cols[i].scale);
     }
     imdb_buf_put_u16(b, d->ndeps);
     for (uint16_t i = 0; i < d->ndeps; i++) {
@@ -1898,7 +2111,8 @@ int imdb_viewdef_decode(imdb_rd *r, imdb_viewdef **out, imdb_err *e)
     for (uint16_t i = 0; i < d->ncols; i++) {
         if (imdb_rd_ident(r, d->cols[i].name, &e2)) goto bad;
         d->cols[i].type = imdb_rd_u8(r);
-        d->cols[i].scale = imdb_rd_u8(r);
+        if (d->cols[i].type == IMDB_T_ENUM) d->cols[i].eid = imdb_rd_u16(r); /* F3g */
+        else d->cols[i].scale = imdb_rd_u8(r);
     }
     d->ndeps = imdb_rd_u16(r);
     if (r->err || d->ndeps > IMDB_MAX_VIEW_DEPS || d->ndeps > imdb_rd_left(r) / 5) goto bad;

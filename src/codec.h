@@ -33,8 +33,10 @@ typedef enum imdb_type {
     IMDB_T_BYTEA = 11,      /* F3d: 0 to IMDB_MAX_TEXT bytes in s, any byte; memcmp, then the shorter first */
     IMDB_T_INTERVAL = 12,   /* F3f: PostgreSQL 14's months, days and microseconds: i the microseconds, iv.mon and
                              * iv.day the others; SQL compares the span (imdb_iv_span), identity is the triple */
+    IMDB_T_ENUM = 13,       /* F3g: a label's ordinal (0-based, declaration order) in i, u32 in a row; its type's id in
+                             * the column (eid) and, a tripwire, in the value (eid in s's place) */
 } imdb_type;
-#define IMDB_T_LAST IMDB_T_INTERVAL /* the highest tag a schema may hold */
+#define IMDB_T_LAST IMDB_T_ENUM /* the highest tag a schema may hold */
 #define IMDB_UUID_LEN 16
 
 #define IMDB_COL_PK       0x01
@@ -49,6 +51,8 @@ typedef struct imdb_column {
     uint8_t flags;
     uint16_t vlen;     /* F3c: a TEXT's VARCHAR length in characters, 0 unbounded; written in the precision and scale
                         * bytes (little-endian) of the schema's encoding, its precision and scale in memory 0 */
+    uint16_t eid;      /* F3g: an ENUM column's type id (1..IMDB_MAX_ENUMS), written in the precision and scale bytes as
+                        * a VARCHAR's length is; 0 for every other type */
 } imdb_column;
 
 typedef struct imdb_schema {
@@ -74,6 +78,7 @@ typedef struct imdb_value {
         struct {
             int32_t mon, day; /* F3f: an INTERVAL's months and days, in s's place (an INTERVAL has no bytes) */
         } iv;
+        uint32_t eid;     /* F3g: an ENUM's type id, a tripwire beside its column's (imdb_value_check; an ENUM has no bytes) */
     };
 } imdb_value;
 /* F3e: 24 bytes, as before: every array of held values (join pairs, sorted rows, group keys, cells) costs what it did */
@@ -123,9 +128,25 @@ static inline bool imdb_col_i64(const imdb_column *c)
     case IMDB_T_FLOAT64:
     case IMDB_T_TIMESTAMPTZ:
     case IMDB_T_DATE:
-    case IMDB_T_TIME: return true;
+    case IMDB_T_TIME:
+    case IMDB_T_ENUM: return true; /* F3g: its ordinal */
     case IMDB_T_DECIMAL: return !imdb_dec_wide(c->precision);
     default: return false;
+    }
+}
+
+/* F3g: a value's width in a row and in a DEFAULT (log.c), one function for both: a TEXT's and a BYTEA's 0 (a u32 length
+ * and its bytes), a BOOL's 1, an ENUM's 4 (its ordinal, u32), a UUID's, a wide DECIMAL's and an INTERVAL's 16, every
+ * other's 8 */
+static inline uint32_t imdb_fixed_width(const imdb_column *c)
+{
+    switch (c->type) {
+    case IMDB_T_TEXT:
+    case IMDB_T_BYTEA: return 0;
+    case IMDB_T_BOOL: return 1;
+    case IMDB_T_ENUM: return 4;
+    case IMDB_T_UUID: return IMDB_UUID_LEN;
+    default: return imdb_col_fixed16(c) ? 16 : 8;
     }
 }
 

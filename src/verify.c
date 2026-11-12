@@ -89,6 +89,8 @@ typedef struct vsnap {
     uint32_t nv;
     imdb_sequence *sq; /* F2a-2: the sequences then */
     uint32_t nsq;
+    imdb_enum *en;     /* F3g: the ENUM types then (each definition copied) */
+    uint32_t nen;
 } vsnap;
 
 typedef struct vstart { /* a log segment's first commit, and its time: what an EXPIRE may name (log.h) */
@@ -135,6 +137,8 @@ typedef struct vctx {
     uint32_t nv;
     imdb_sequence *sq;       /* F2a-2: the sequences the log made, by id: replay's rules (db.c imdb_seq_apply), its own */
     uint32_t nsq, capsq;
+    imdb_enum *en;           /* F3g: the ENUM types the log made, by id (en[id - 1]): replay's rules, its own */
+    uint32_t nen, capen;
 } vctx;
 
 /* ---- F2a-2: the sequences, by replay's rules (db.c imdb_seq_apply, imdb_seq_own) on the model -------------------- */
@@ -241,6 +245,8 @@ static bool v_name_live(const vctx *x, const char *name)
         if (!x->v[i].dropped_at && !strcmp(x->v[i].name, name)) return true;
     for (uint32_t i = 0; i < x->nsq; i++) /* F2a-2: one name space */
         if (!x->sq[i].dropped_at && !strcmp(x->sq[i].d.name, name)) return true;
+    for (uint32_t i = 0; i < x->nen; i++) /* F3g: and the types */
+        if (!x->en[i].dropped_at && !strcmp(x->en[i].def->name, name)) return true;
     return false;
 }
 
@@ -251,6 +257,126 @@ static bool v_named(const vctx *x, uint8_t kind, uint32_t id) /* a live view nam
             if (x->v[i].deps[k].kind == kind && x->v[i].deps[k].id == id) return true;
     return false;
 }
+
+/* ---- F3g: the ENUM types, replay's rules (db.c imdb_enum_apply) on the model ---------------------------------------- */
+
+/* a table of the model, live or dropped, with a column of type id in any version of its history */
+static bool v_enum_used(const vctx *x, uint32_t id)
+{
+    for (uint32_t i = 0; i < x->nt; i++) {
+        const vtab *t = &x->t[i];
+        for (uint16_t c = 0; c < t->s.ncols; c++)
+            if (t->s.cols[c].type == IMDB_T_ENUM && t->s.cols[c].eid == id) return true;
+        for (uint32_t v = 0; v < t->hist.nvers; v++)
+            for (uint16_t c = 0; c < t->hist.vers[v].s.ncols; c++)
+                if (t->hist.vers[v].s.cols[c].type == IMDB_T_ENUM && t->hist.vers[v].s.cols[c].eid == id) return true;
+    }
+    return false;
+}
+
+static bool v_enum_live(const vctx *x, uint32_t id) { return id >= 1 && id <= x->nen && !x->en[id - 1].dropped_at; }
+
+static int v_enum_cols(const vctx *x, const imdb_schema *s, uint64_t seq, imdb_err *e)
+{
+    for (uint16_t c = 0; c < s->ncols; c++)
+        if (s->cols[c].type == IMDB_T_ENUM && !v_enum_live(x, s->cols[c].eid))
+            return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: column %s names an ENUM type that is not live",
+                             (unsigned long long)seq, s->cols[c].name);
+    return IMDB_OK;
+}
+
+/* a row's ENUM values below their types' label counts at this commit (replay's row_checks, on the model) */
+static int v_enum_row(const vctx *x, const imdb_schema *s, const imdb_op *o, uint64_t seq, imdb_err *e)
+{
+    bool any = false;
+    for (uint16_t c = 0; c < s->ncols && !any; c++) any = s->cols[c].type == IMDB_T_ENUM;
+    if (!any || o->pkind != IMDB_PAYLOAD_ROW) return IMDB_OK;
+    imdb_value vals[IMDB_MAX_COLS];
+    imdb_err e2 = {0};
+    if (imdb_row_decode(s, o->row, o->row_len, vals, &e2))
+        return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: %s", (unsigned long long)seq, e2.msg);
+    for (uint16_t c = 0; c < s->ncols; c++)
+        if (s->cols[c].type == IMDB_T_ENUM && !vals[c].null &&
+            (!v_enum_live(x, s->cols[c].eid) || vals[c].i >= x->en[s->cols[c].eid - 1].def->n))
+            return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: column %s holds no label of its ENUM type",
+                             (unsigned long long)seq, s->cols[c].name);
+    return IMDB_OK;
+}
+
+static int v_enum_op(vctx *x, const imdb_op *o, uint64_t seq, imdb_err *e)
+{
+    unsigned long long sq = (unsigned long long)seq;
+    if (o->code == IMDB_OP_CREATE_ENUM) {
+        const imdb_enumdef *d = o->edef;
+        if (d->id != x->nen + 1 || v_name_live(x, d->name) || imdb_enum_name_builtin(d->name))
+            return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: CREATE TYPE out of sequence or of a name taken", sq);
+        if (x->nen == x->capen) {
+            uint32_t nc = x->capen ? x->capen * 2 : 8;
+            imdb_enum *n = imdb_realloc_array(x->en, x->capen, nc, sizeof *n, e);
+            if (!n) return e->code;
+            x->en = n;
+            x->capen = nc;
+        }
+        imdb_enum *t = &x->en[x->nen];
+        memset(t, 0, sizeof *t);
+        if (imdb_enumdef_copy(d, &t->def, e)) return e->code;
+        imdb_enumdef_stamp(t->def, 0, seq);
+        t->created_at = seq;
+        x->nen++;
+        return IMDB_OK;
+    }
+    if (!v_enum_live(x, o->eid)) return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: an ENUM op of no live type", sq);
+    imdb_enum *t = &x->en[o->eid - 1];
+    if (o->code == IMDB_OP_DROP_ENUM) {
+        if (v_enum_used(x, o->eid) || v_named(x, IMDB_VIEWDEP_TYPE, o->eid))
+            return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: DROP TYPE of a type a column or a live view uses", sq);
+        t->dropped_at = seq;
+        return IMDB_OK;
+    }
+    size_t len = strlen(o->aname);
+    if (imdb_enumdef_find(t->def, o->aname, len) >= 0)
+        return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: ADD VALUE of a label type %s holds", sq, t->def->name);
+    imdb_enumdef *nd = NULL;
+    imdb_err e2 = {0};
+    if (imdb_enumdef_append(t->def, o->aname, len, &nd, &e2))
+        return imdb_fail(e, e2.code == IMDB_ERR_NOMEM ? e2.code : IMDB_ERR_VERIFY, "verify: commit %llu: %s", sq, e2.msg);
+    imdb_enumdef_stamp(nd, (uint16_t)(nd->n - 1), seq);
+    imdb_enumdef_free(t->def);
+    t->def = nd;
+    return IMDB_OK;
+}
+
+static bool v_enum_same(const imdb_enum *a, const imdb_enum *b)
+{
+    return a->created_at == b->created_at && a->dropped_at == b->dropped_at && imdb_enumdef_same(a->def, b->def);
+}
+
+/* a copy of n types (each definition its own allocation) into *out */
+static int v_enums_copy(const imdb_enum *src, uint32_t n, imdb_enum **out, imdb_err *e)
+{
+    *out = NULL;
+    if (!n) return IMDB_OK;
+    imdb_enum *c = imdb_alloc_array(n, sizeof *c, e);
+    if (!c) return e->code;
+    for (uint32_t i = 0; i < n; i++) {
+        c[i] = src[i];
+        c[i].def = NULL;
+        if (imdb_enumdef_copy(src[i].def, &c[i].def, e)) {
+            for (uint32_t k = 0; k < i; k++) imdb_enumdef_free(c[k].def);
+            imdb_free(c);
+            return e->code;
+        }
+    }
+    *out = c;
+    return IMDB_OK;
+}
+
+static void v_enums_free(imdb_enum *en, uint32_t n)
+{
+    for (uint32_t i = 0; i < n; i++) imdb_enumdef_free(en[i].def);
+    imdb_free(en);
+}
+
 
 
 /* F1: imdb_view_names_col over the model's views at this commit: the first live one reading table (directly or through
@@ -652,6 +778,7 @@ static int v_insert(vctx *x, vtab *t, const vbatch *b, size_t fi, uint32_t k, ui
                 return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: %s", (unsigned long long)seq, e2.msg);
             if (t->s.subject >= 0) subj_key(&vals[t->s.subject], subj);
         }
+        if (v_enum_row(x, &t->s, o, seq, e)) return e->code; /* F3g: each ENUM value a label of its type then */
         x->rep->payload_rows_checked++;
     }
     if (vt_push(t, e)) return e->code;
@@ -735,6 +862,7 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
         switch (o->code) {
         case IMDB_OP_CREATE_TABLE: {
             if (o->table != x->nt) return imdb_fail(e, IMDB_ERR_VERIFY, "verify: table id out of sequence");
+            if (v_enum_cols(x, o->schema, seq, e)) return e->code; /* F3g: each ENUM column a live type's */
             if (v_name_live(x, o->schema->name)) /* P2 S7: one name space for the live tables and views */
                 return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: CREATE TABLE takes a live view's name",
                                  (unsigned long long)seq);
@@ -751,6 +879,12 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
             break;
         }
         case IMDB_OP_COLUMN_DEFAULTS: /* F2a: its CREATE's defaults into the model's first version (the codec checked them) */
+            for (uint16_t q = 0; q < o->ndefs; q++) /* F3g: a constant of an ENUM column a label of its type then */
+                if (o->defs[q].kind == IMDB_DEFK_VALUE && o->defs[q].col < t->s.ncols && t->s.cols[o->defs[q].col].type == IMDB_T_ENUM &&
+                    (!v_enum_live(x, t->s.cols[o->defs[q].col].eid) || o->defs[q].v.i < 0 ||
+                     o->defs[q].v.i >= x->en[t->s.cols[o->defs[q].col].eid - 1].def->n))
+                    return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: a DEFAULT of column %s is no label of its ENUM type",
+                                     (unsigned long long)seq, t->s.cols[o->defs[q].col].name);
             for (uint16_t q = 0; q < o->ndefs; q++) { /* F2c: each generated column's text binds against the CREATE's schema */
                 if (o->defs[q].kind != IMDB_DEFK_GENERATED) continue;
                 uint64_t gm = 0;
@@ -790,6 +924,11 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
             rc = imdb_hist_create_fks(&t->hist, o->fk, o->nfk, e);
             break;
         }
+        case IMDB_OP_CREATE_ENUM: /* F3g: replay's rules on the model */
+        case IMDB_OP_DROP_ENUM:
+        case IMDB_OP_ENUM_ADD:
+            rc = v_enum_op(x, o, seq, e);
+            break;
         case IMDB_OP_CREATE_SEQUENCE: /* F2a-2: replay's rules on the model */
         case IMDB_OP_DROP_SEQUENCE:
         case IMDB_OP_SEQ_ADVANCE:
@@ -865,6 +1004,7 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
             for (uint16_t q = 0; q < d->ndeps; q++)
                 deps_live &= d->deps[q].kind == IMDB_VIEWDEP_TABLE
                                  ? d->deps[q].id < x->nt && !x->t[d->deps[q].id].dropped_at
+                                 : d->deps[q].kind == IMDB_VIEWDEP_TYPE ? v_enum_live(x, d->deps[q].id) /* F3g */
                                  : d->deps[q].id < x->nv && !x->v[d->deps[q].id].dropped_at;
             if (d->id != x->nv || v_name_live(x, d->name) || !deps_live)
                 return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: CREATE VIEW out of sequence, its name taken, or "
@@ -884,6 +1024,17 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
             imdb_sver ns;
             imdb_err e2 = {0};
             const imdb_sver *cur = &t->hist.vers[t->hist.nvers - 1];
+            if (o->akind == IMDB_ALTER_ADD_COLUMN && o->acol.type == IMDB_T_ENUM && (!v_enum_live(x, o->acol.eid) || /* F3g */
+                (!o->adef.null && (o->adef.i < 0 || o->adef.i >= x->en[o->acol.eid - 1].def->n))))
+                return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: ADD COLUMN %s names an ENUM type that is not live, or a "
+                                                     "DEFAULT that is no label of it",
+                                 (unsigned long long)seq, o->acol.name);
+            if (o->akind == IMDB_ALTER_SET_DEFAULT && o->apos < cur->npos && cur->at[o->apos] >= 0 && /* the position bounded first */
+                cur->s.cols[cur->at[o->apos]].type == IMDB_T_ENUM &&
+                (!v_enum_live(x, cur->s.cols[cur->at[o->apos]].eid) || o->adef.i < 0 ||
+                 o->adef.i >= x->en[cur->s.cols[cur->at[o->apos]].eid - 1].def->n)) /* F3g */
+                return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: SET DEFAULT of column %s is no label of its ENUM type",
+                                 (unsigned long long)seq, cur->s.cols[cur->at[o->apos]].name);
             if (t->hist.nvers >= IMDB_MAX_SCHEMA_VERSIONS || imdb_sver_next(&t->hist, cur, o, &ns, &e2))
                 return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: ALTER TABLE %s: %s", (unsigned long long)seq,
                                  t->s.name, t->hist.nvers >= IMDB_MAX_SCHEMA_VERSIONS ? "too many schema versions" : e2.msg);
@@ -1056,6 +1207,8 @@ static int snapshot_at_s(vctx *x, const imdb_commit_rec *c, const uint8_t *publi
         s->v[i].ndeps = 0;
     }
     s->nv = x->nv;
+    if (v_enums_copy(x->en, x->nen, &s->en, e)) return e->code; /* F3g */
+    s->nen = x->nen;
     if (x->nsq && !(s->sq = imdb_alloc_array(x->nsq, sizeof *s->sq, e))) return e->code; /* F2a-2 */
     if (x->nsq) memcpy(s->sq, x->sq, x->nsq * sizeof *s->sq);
     s->nsq = x->nsq;
@@ -1668,6 +1821,12 @@ static int verify_lake(imdb_db *db, const vctx *x, imdb_verify_report *rep, imdb
             rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: the manifest's definition of view %s differs from the log's",
                            w->name);
     }
+    if (!rc && m.nen != at->nen) /* F3g: the manifest's types, the log's at its commit */
+        rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: the manifest's ENUM types differ from the log at commit %llu",
+                       (unsigned long long)m.seq);
+    for (uint32_t i = 0; i < m.nen && !rc; i++)
+        if (!v_enum_same(&m.en[i], &at->en[i]))
+            rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: ENUM type %s in the manifest differs from the log", at->en[i].def->name);
     if (!rc && m.nsq != at->nsq) /* F2a-2: the manifest's sequences, the log's at its commit */
         rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: the manifest's sequences differ from the log at commit %llu",
                        (unsigned long long)m.seq);
@@ -1821,6 +1980,10 @@ static int verify_engine(imdb_db *db, const vctx *x, imdb_verify_report *rep, im
     if (x->nt != db->nt) return imdb_fail(e, IMDB_ERR_VERIFY, "verify: table count differs");
     if (db->boundary != x->boundary)
         return imdb_fail(e, IMDB_ERR_VERIFY, "verify: the engine's retirement boundary differs from the log's");
+    if (x->nen != db->nenums) return imdb_fail(e, IMDB_ERR_VERIFY, "verify: ENUM type count differs"); /* F3g */
+    for (uint32_t i = 0; i < x->nen; i++)
+        if (!v_enum_same(&x->en[i], &db->enums[i]))
+            return imdb_fail(e, IMDB_ERR_VERIFY, "verify: ENUM type %s differs from the log", x->en[i].def->name);
     if (x->nsq != db->nseqs) return imdb_fail(e, IMDB_ERR_VERIFY, "verify: sequence count differs"); /* F2a-2 */
     for (uint32_t i = 0; i < x->nsq; i++)
         if (!v_seq_same(&x->sq[i], &db->seqs[i]))
@@ -1975,6 +2138,10 @@ static int verify_seed(imdb_db *db, vctx *x, imdb_err *e)
     }
     for (uint32_t i = 0; !rc && i < fm.nv; i++) /* P2 S7: F's views, a live one's definition the replay's rules read */
         rc = v_view_push(x, fm.v[i].name, fm.v[i].created_at, fm.v[i].dropped_at, fm.v[i].def, e);
+    if (!rc && fm.nen) { /* F3g: F's ENUM types, tombstones too */
+        if (v_enums_copy(fm.en, fm.nen, &x->en, e)) rc = e->code;
+        else x->nen = x->capen = fm.nen;
+    }
     if (!rc && fm.nsq) { /* F2a-2: F's sequences, their state at F */
         if (!(x->sq = imdb_alloc_array(fm.nsq, sizeof *x->sq, e))) rc = e->code;
         else {
@@ -2211,6 +2378,8 @@ static int verify_body(imdb_db *db, imdb_verify_report *rep, imdb_err *e)
     v_views_free(x.v, x.nv); /* P2 S7 */
     imdb_free(x.at_s.v);
     imdb_free(x.at_s.sq); /* F2a-2 */
+    v_enums_free(x.at_s.en, x.at_s.nen); /* F3g */
+    v_enums_free(x.en, x.nen);
     imdb_free(x.sq);
     imdb_free(x.pin);
     imdb_free(x.starts);

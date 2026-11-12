@@ -73,12 +73,13 @@ enum {
 
 #define IMDB_SEG_HEADER 64u
 #define IMDB_SEG_VERSION 3u /* F1 stage 4: the header names its schema version by imdb_sver_hash (2: by the schema alone) */
-#define IMDB_MANIFEST_VERSION 16u /* F3f: INTERVAL columns (16-byte cells and DEFAULTs); 15 before them (F3e: DECIMAL columns to 38
+#define IMDB_MANIFEST_VERSION 17u /* F3g: ENUM types (the enums section, ENUM columns); 16 before them (F3f: INTERVAL columns,
+                                   16-byte cells and DEFAULTs); 15 before those (F3e: DECIMAL columns to 38
                                    digits, a wide one's 16-byte cells); 14 before those (F3d: UUID and
                                    BYTEA columns and op 23's kind 10 (gen_random_uuid) in version 1's
                                    DEFAULTs (13 before them: F2b-2, version 1's FOREIGN KEYs; 12: F2c, a CREATE's generated
                                    columns; 11: F2b-1, version 1's CHECKs; 10: F2a-2, the sequences section; 9: F2a, a
-                                   CREATE's DEFAULTs; 8; 7: segment format 2); 2 to 15 refused by name (old_manifest) */
+                                   CREATE's DEFAULTs; 8; 7: segment format 2); 2 to 16 refused by name (old_manifest) */
 #define IMDB_SEG_STUB 1u   /* erased: vid, begin and commitment only */
 #define IMDB_SEG_PURGED 2u /* purged by COMPACT ... PURGE: vid, begin, commitment and the SUBJECT value */
 
@@ -285,6 +286,8 @@ typedef struct imdb_manifest {
     uint32_t nt;
     imdb_manifest_view *v; /* P2 S7: every view ever created, by id */
     imdb_sequence *sq;     /* F2a-2 (manifest 10): every sequence ever created, by id, its state at the snapshot */
+    imdb_enum *en;         /* F3g (manifest 17): every ENUM type ever created, by id (en[id - 1]), a tombstone its labels */
+    uint32_t nen;
     uint32_t nsq;
     uint32_t nv;
 } imdb_manifest;

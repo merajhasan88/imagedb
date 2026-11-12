@@ -37,6 +37,7 @@ static bool eng_lookup(void *arg, const char *name, ab_rel *out)
             snprintf(cols[c].name, sizeof cols[c].name, "%s", t->s.cols[c].name);
             cols[c].type = t->s.cols[c].type;
             cols[c].scale = t->s.cols[c].type == IMDB_T_DECIMAL ? t->s.cols[c].scale : 0;
+            cols[c].eid = t->s.cols[c].eid; /* F3g */
         }
         *out = (ab_rel){IMDB_VIEWDEP_TABLE, t->s.id, t->s.ncols, cols};
         return true;
@@ -47,8 +48,14 @@ static bool eng_lookup(void *arg, const char *name, ab_rel *out)
             snprintf(cols[c].name, sizeof cols[c].name, "%s", v->def->cols[c].name);
             cols[c].type = v->def->cols[c].type;
             cols[c].scale = v->def->cols[c].scale;
+            cols[c].eid = v->def->cols[c].eid; /* F3g */
         }
         *out = (ab_rel){IMDB_VIEWDEP_VIEW, v->id, v->def->ncols, cols};
+        return true;
+    }
+    imdb_enum *en = imdb_enum_by_name(db, name); /* F3g: a live ENUM type, what a CAST names */
+    if (en) {
+        *out = (ab_rel){IMDB_VIEWDEP_TYPE, en->def->id, 0, NULL};
         return true;
     }
     return false;
@@ -77,7 +84,7 @@ static int same(imdb_db *db, const char *name, char *why, size_t n)
     if (ab_bind(d->text, d->text_len, eng_lookup, db, r, e, sizeof e)) rc = mis(why, n, "the binder refused it: %s", e);
     else if (r->ncols != d->ncols) rc = mis(why, n, "%u columns, the engine's %u", r->ncols, d->ncols);
     for (uint16_t c = 0; !rc && c < d->ncols; c++)
-        if (r->cols[c].type != d->cols[c].type || r->cols[c].scale != d->cols[c].scale)
+        if (r->cols[c].type != d->cols[c].type || r->cols[c].scale != d->cols[c].scale || r->cols[c].eid != d->cols[c].eid) /* F3g */
             rc = mis(why, n, "column %u (%s): type %u scale %u, the engine's type %u scale %u", c + 1u, d->cols[c].name,
                           r->cols[c].type, r->cols[c].scale, d->cols[c].type, d->cols[c].scale);
     if (!rc && r->ndeps != d->ndeps) rc = mis(why, n, "%u dependencies, the engine's %u", r->ndeps, d->ndeps);
@@ -203,6 +210,29 @@ static const char *const g_body[] = {
     "MIN(iv) OVER (ORDER BY id) AS c FROM ivt",
     "SELECT x FROM (SELECT iv AS x FROM ivt UNION ALL SELECT INTERVAL '1 day') AS q",
     "SELECT a.id FROM ivt AS a JOIN ivt AS b ON a.iv = b.iv",
+    /* F3g: ENUM columns of two types; a CAST to a type by its name (a TYPE dependency, in WHERE too); a string beside one a
+     * label; MIN, MAX, COUNT(DISTINCT), GROUP BY, a window, a derived table's UNION, a value subquery, a CTE, a join */
+    "SELECT id, m, n, x FROM et",
+    "SELECT m, CAST(m AS TEXT) AS t2, CAST('ok' AS mood) AS c, CAST(CAST('a' AS ab) AS TEXT) AS d FROM et",
+    "SELECT id FROM et WHERE m > 'sad' AND n IN ('ok', 'happy') AND m BETWEEN 'sad' AND 'happy'",
+    "SELECT CASE WHEN id > 0 THEN m ELSE 'ok' END AS a, COALESCE(m, 'happy') AS b, NULLIF(n, 'ok') AS c FROM et",
+    "SELECT MIN(m) AS a, MAX(n) AS b, COUNT(DISTINCT x) AS c FROM et",
+    "SELECT n, COUNT(*) AS c FROM et GROUP BY n",
+    "SELECT id, LAG(m) OVER (ORDER BY id) AS p, MAX(n) OVER (PARTITION BY x) AS w FROM et",
+    "SELECT q.m FROM (SELECT m FROM et UNION SELECT n FROM et) AS q",
+    "SELECT (SELECT MAX(m) FROM et) AS mx FROM et",
+    "SELECT id FROM et WHERE CAST('happy' AS mood) = m",
+    "WITH c AS (SELECT x FROM et) SELECT x FROM c",
+    "SELECT a.id FROM et AS a JOIN et AS b ON a.m = b.n",
+    /* a CAST to an ENUM type in each place the binder walks untyped: the engine binds each, so each is a dependency */
+    "SELECT id FROM et WHERE EXISTS (SELECT CAST('ok' AS mood) AS c FROM et AS z WHERE z.id = et.id)",
+    "SELECT CASE WHEN id < 0 THEN CAST(CAST('a' AS ab) AS TEXT) ELSE 'x' END AS c FROM et",
+    "SELECT n, COUNT(*) AS c FROM et GROUP BY n HAVING MAX(m) > CAST('sad' AS mood)",
+    "SELECT id FROM et ORDER BY m = CAST('ok' AS mood), id",
+    "SELECT id, ROW_NUMBER() OVER (PARTITION BY m = CAST('ok' AS mood) ORDER BY id) AS r FROM et",
+    "SELECT a.id FROM et AS a JOIN et AS b ON a.m = b.n AND b.x = CAST('b' AS ab)",
+    "SELECT d.id FROM (SELECT id FROM (SELECT id, x FROM et WHERE x = CAST('a' AS ab)) AS e2) AS d",
+    "SELECT id FROM et WHERE m IN (SELECT CAST('happy' AS mood) FROM et)",
 };
 #define NBODY (sizeof g_body / sizeof *g_body)
 
@@ -218,6 +248,9 @@ static imdb_db *setup(void)
         run("CREATE TABLE u (id INT64 PRIMARY KEY, tid INT64, v INT64, s TEXT, d DECIMAL(10,3))") ||
         run("CREATE TABLE dt (id INT64 PRIMARY KEY, d DATE, tm TIME, ts TIMESTAMP)") || /* F3b */
         run("CREATE TABLE ivt (id INT64 PRIMARY KEY, iv INTERVAL, ts TIMESTAMP, tz TIMESTAMPTZ, d DATE)") || /* F3f */
+        run("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')") || run("CREATE TYPE ab AS ENUM ('a', 'b')") || /* F3g */
+        run("CREATE TABLE et (id INT64 PRIMARY KEY, m mood, n mood NOT NULL, x ab)") ||
+        run("INSERT INTO et VALUES (1, 'ok', 'happy', 'b')") ||
         run("INSERT INTO ivt VALUES (1, '1 mon', '2026-01-31 00:00:00', '2026-01-31 00:00:00+00', '2026-01-31')") ||
         run("INSERT INTO dt VALUES (1, '2026-11-09', '12:30:00', '2026-11-09 12:30:00')") ||
         run("INSERT INTO t VALUES (1, 1, 1.25, 0.5, 'ab', TRUE, TIMESTAMP '2026-01-01 00:00:00', 2.5)") ||
@@ -334,6 +367,16 @@ static void t_abind_refusals(void)
         {"SELECT CAST(iv AS INT64) AS x FROM ivt", "CAST"},
         {"SELECT CASE WHEN id > 0 THEN iv ELSE ts END AS x FROM ivt", "not converted"},
         {"SELECT AVG(iv) AS x FROM ivt", "SUM and AVG"},
+        {"SELECT m + 1 AS y FROM et", "arithmetic"}, /* F3g */
+        {"SELECT CASE WHEN id > 0 THEN m ELSE x END AS y FROM et", "two ENUM types"},
+        {"SELECT m FROM et UNION SELECT x FROM et", "two ENUM types"},
+        {"SELECT CAST(m AS INT64) AS y FROM et", "CAST"},
+        {"SELECT CAST(x AS mood) AS y FROM et", "CAST to an ENUM type"},
+        {"SELECT CAST('a' AS nosuch) AS y FROM et", "no type nosuch"},
+        {"SELECT id FROM et WHERE CAST('a' AS nosuch) IS NULL", "no type nosuch"},
+        {"SELECT SUM(m) AS y FROM et", "SUM"},
+        {"SELECT m || 'x' AS y FROM et", "TEXT"},
+        {"SELECT LENGTH(m) AS y FROM et", "TEXT"},
         /* fuzz_abind's find (2026-11-09): a window function inside a window's keys overflowed them */
         {"SELECT LAG(d, 1) OVER (PARTITION BY s, LAG(d, 6) OVER (PARTITION BY g)) AS x FROM t",
          "a window function inside a window's definition"},

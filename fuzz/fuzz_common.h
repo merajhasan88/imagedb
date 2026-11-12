@@ -13,8 +13,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 
 /* The fixed schemas that seed segments and rows can belong to; they must match
  * the tables fuzz/make_corpus.sh creates, in order (table id = which). */
-#define FUZZ_NSCHEMAS 5 /* F3e: the fourth, fw, DECIMALs past 18 digits; the fifth, fu, F3d's UUID and BYTEA (make_corpus.sh
-                          * makes them fourth and fifth: table ids 3 and 4) */
+#define FUZZ_NSCHEMAS 6 /* F3e: the fourth, fw, DECIMALs past 18 digits; the fifth, fu, F3d's UUID and BYTEA; F3g: the sixth, fe,
+                          * ENUMs of type 1 (make_corpus.sh makes them fourth, fifth and sixth: table ids 3, 4 and 5) */
 static inline void fuzz_schema(int which, imdb_schema *s)
 {
     memset(s, 0, sizeof *s);
@@ -89,6 +89,21 @@ static inline void fuzz_schema(int which, imdb_schema *s)
         s->cols[2].type = IMDB_T_DECIMAL;
         s->cols[2].precision = 10;
         s->cols[2].scale = 2;
+        s->cols[2].flags = IMDB_COL_NULLABLE;
+        s->npk = 1;
+        s->key[0] = 0;
+    } else if (which == 5) { /* fe (F3g): an ENUM key and an ENUM, both of type 1, and an INT64: ordinals in the int64 path */
+        strcpy(s->name, "fe");
+        s->ncols = 3;
+        strcpy(s->cols[0].name, "m");
+        s->cols[0].type = IMDB_T_ENUM;
+        s->cols[0].eid = 1;
+        s->cols[0].flags = IMDB_COL_PK;
+        strcpy(s->cols[1].name, "n");
+        s->cols[1].type = IMDB_T_ENUM;
+        s->cols[1].eid = 1;
+        strcpy(s->cols[2].name, "w");
+        s->cols[2].type = IMDB_T_INT64;
         s->cols[2].flags = IMDB_COL_NULLABLE;
         s->npk = 1;
         s->key[0] = 0;

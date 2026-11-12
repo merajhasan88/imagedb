@@ -261,7 +261,8 @@ static void t_compare(void)
     imdb_xval s2 = {.type = IMDB_T_TEXT, .s = (const uint8_t *)"abc", .len = 3};
     imdb_xval s3 = {.type = IMDB_T_TEXT, .s = (const uint8_t *)"b", .len = 1};
     CHECK(imdb_x_cmp(&s1, &s2) == -1 && imdb_x_cmp(&s3, &s2) == 1 && imdb_x_cmp(&s2, &s2) == 0);
-    CHECK(imdb_x_comparable(IMDB_T_INT64, IMDB_T_FLOAT64) && !imdb_x_comparable(IMDB_T_TEXT, IMDB_T_INT64));
+    CHECK(imdb_x_comparable(imdb_xty_of(IMDB_T_INT64, 0, 0), imdb_xty_of(IMDB_T_FLOAT64, 0, 0)) &&
+          !imdb_x_comparable(imdb_xty_of(IMDB_T_TEXT, 0, 0), imdb_xty_of(IMDB_T_INT64, 0, 0)));
     /* through SQL: a filter never fails on a row's magnitude (m is 2^62) */
     imdb_db *db = with_one();
     CHECK(db);

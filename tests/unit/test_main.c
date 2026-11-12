@@ -134,6 +134,7 @@ int main(int argc, char **argv)
         {"ub", ub_tests, &ub_ntests},          /* F3d: UUID and BYTEA */
         {"dec38", dec38_tests, &dec38_ntests}, /* F3e: NUMERIC to 38 digits */
         {"iv", iv_tests, &iv_ntests},          /* F3f: INTERVAL */
+        {"enum", enum_tests, &enum_ntests},    /* F3g: ENUM types */
         {"tz", tz_tests, &tz_ntests}, /* P2: time zones */
         {"tzsql", tzsql_tests, &tzsql_ntests}, /* P2: time zones through the engine */
     };

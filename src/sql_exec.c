@@ -51,6 +51,7 @@ void imdb_result_free(imdb_result *r)
 {
     if (r->cells) imdb_wipe(r->cells, (size_t)(r->caprows * r->ncols) * sizeof *r->cells); /* result values */
     imdb_free(r->cells);
+    for (uint16_t c = 0; c < IMDB_MAX_COLS + 4; c++) imdb_enumdef_free(r->clab[c]); /* F3g */
     imdb_buf_wipe_free(&r->text);
     memset(r, 0, sizeof *r);
 }
@@ -147,6 +148,26 @@ static void res_zone(imdb_result *r, imdb_xenv *env)
         imdb_cell *cl = &r->cells[i];
         if (cl->v.type == IMDB_T_TIMESTAMPTZ && !cl->null && !cl->v.null) cl->tz_off = imdb_x_tz_off(env, env->zone, cl->v.i);
     }
+}
+
+/* F3g: the labels of each ENUM column of the result a statement hands out, copied once (its cells keep ordinals): a
+ * column's type id is its binding's (ceid), else its cells' (a result no binding typed: RETURNING's), one id a column */
+static int res_labels(imdb_result *r, const imdb_db *db, imdb_err *e)
+{
+    for (uint16_t c = 0; c < r->ncols && c < IMDB_MAX_COLS + 4; c++) {
+        if (r->ctype[c] && r->ctype[c] != IMDB_T_ENUM) continue; /* typed by its binding, another type: no cell to read */
+        uint32_t id = r->ctype[c] == IMDB_T_ENUM ? r->ceid[c] : 0;
+        for (uint64_t i = 0; i < r->nrows; i++) {
+            const imdb_cell *cl = &r->cells[i * r->ncols + c];
+            if (cl->null || cl->v.null || cl->v.type != IMDB_T_ENUM) continue;
+            if (id && cl->v.eid != id) return imdb_fail(e, IMDB_ERR_STATE, "a result column of two ENUM types");
+            id = cl->v.eid;
+        }
+        const imdb_enumdef *d = id ? imdb_enum_def(db, id) : NULL;
+        if (id && !d) return imdb_fail(e, IMDB_ERR_STATE, "a result's ENUM column of no type");
+        if (d && !r->clab[c] && imdb_enumdef_copy(d, &r->clab[c], e)) return e->code;
+    }
+    return IMDB_OK;
 }
 
 static void res_name(imdb_result *r, uint16_t i, const char *n) { snprintf(r->names[i], sizeof r->names[i], "%s", n); }
@@ -486,6 +507,10 @@ static int dec_form(const imdb_column *c, imdb_value *v, imdb_err *e)
     return IMDB_OK;
 }
 
+static int enum_label(xctx *x, const sql_stmt *st, uint32_t eid, const char *txt, size_t tl, int32_t *k, imdb_err *e);
+static int enum_named(xctx *x, const sql_stmt *st, const char *name, uint16_t *eid, imdb_err *e);
+static int enum_ord(xctx *x, const sql_stmt *st, uint32_t eid, int64_t ord, imdb_err *e);
+
 static int bind_lit(xctx *x, const sql_lit *l, const imdb_column *c, bool compare, imdb_value *out, imdb_err *e)
 {
     memset(out, 0, sizeof *out);
@@ -495,11 +520,13 @@ static int bind_lit(xctx *x, const sql_lit *l, const imdb_column *c, bool compar
     if (l->kind == LIT_PARAM) {
         if (l->param > x->nparams) return imdb_fail(e, IMDB_ERR_INVALID, "parameter $%u was not supplied", (unsigned)l->param);
         const imdb_value *pv = &x->params[l->param - 1];
-        if (pv->type != c->type || (c->type == IMDB_T_DECIMAL && pv->scale != c->scale))
+        if (pv->type != c->type || (c->type == IMDB_T_DECIMAL && pv->scale != c->scale) ||
+            (c->type == IMDB_T_ENUM && !pv->null && pv->eid != c->eid)) /* F3g: an ENUM of the column's type */
             return imdb_fail(e, IMDB_ERR_INVALID, "parameter $%u does not have the type of column %s (give it that type; an "
                                                   "EXECUTE's: PREPARE name (type, ...) declares it)", (unsigned)l->param, c->name);
         *out = *pv;
         if (c->type == IMDB_T_DECIMAL && !out->null && dec_form(c, out, e)) return e->code; /* F3e: the column's form */
+        if (c->type == IMDB_T_ENUM && !out->null && enum_ord(x, x->st, c->eid, out->i, e)) return e->code; /* F3g: a label then */
     } else {
         char num[IMDB_MAX_NUMERIC + 2];
         const char *txt = x->sql + l->off;
@@ -593,6 +620,14 @@ static int bind_lit(xctx *x, const sql_lit *l, const imdb_column *c, bool compar
             out->len = (uint32_t)k;
             break;
         }
+        case IMDB_T_ENUM: { /* F3g: a string, a label of the column's type at the statement's read point */
+            if (l->kind != LIT_STR) return imdb_fail(e, IMDB_ERR_INVALID, "column %s expects a label of its ENUM type", c->name);
+            int32_t k;
+            if (enum_label(x, x->st, c->eid, txt, tl, &k, e)) return e->code;
+            out->i = k;
+            out->eid = c->eid;
+            break;
+        }
         case IMDB_T_INTERVAL: { /* F3f: a string read by PostgreSQL's verbose form, or INTERVAL '...' */
             if (l->kind != LIT_INTERVAL && l->kind != LIT_STR)
                 return imdb_fail(e, IMDB_ERR_INVALID, "column %s expects INTERVAL '...'", c->name);
@@ -644,6 +679,7 @@ typedef struct xscope {
 typedef struct xcorr {
     bool bound;                   /* its bind-only pass ran (cross_check's second plan binds again: reused) */
     uint8_t ctype, cscale;        /* a value's or IN's column */
+    uint16_t ceid;                /* F3g: its ENUM type's id */
     uint16_t ncols;               /* its result's columns (one, but for EXISTS) */
     uint16_t noref;
     uint16_t oref[2 * IMDB_MAX_COLS]; /* the enclosing row's columns it reads: the memo's key */
@@ -688,7 +724,8 @@ static int bind_xlit(xctx *x, const sql_lit *l, imdb_xval *v, imdb_err *e)
         if (pv->type < IMDB_T_INT64 || pv->type > IMDB_T_LAST ||
             (pv->type == IMDB_T_DECIMAL && !pv->null &&
              (pv->scale > IMDB_DEC_MAX_DIGITS || imdb_dec_value(pv) >= imdb_pow10_128(IMDB_DEC_MAX_DIGITS) ||
-              imdb_dec_value(pv) <= -imdb_pow10_128(IMDB_DEC_MAX_DIGITS)))) /* F3e: to 38 digits, either form */
+              imdb_dec_value(pv) <= -imdb_pow10_128(IMDB_DEC_MAX_DIGITS))) || /* F3e: to 38 digits, either form */
+            (pv->type == IMDB_T_ENUM && !pv->null && (!x->db || enum_ord(x, x->st, pv->eid, pv->i, e)))) /* F3g: a label of a type */
             return imdb_fail(e, IMDB_ERR_INVALID, "parameter $%u: not a value of a column type", (unsigned)l->param);
         imdb_x_from_value(pv, v); /* a NULL keeps its type: NULL + 1 is NULL */
         return IMDB_OK;
@@ -789,12 +826,22 @@ static int bind_xlit(xctx *x, const sql_lit *l, imdb_xval *v, imdb_err *e)
 
 /* node k, if a string literal, read again as a timestamp of type t: a TIMESTAMP, or (P2) a TIMESTAMPTZ by its literal's
  * rules, its offset, its zone or the session's (a malformed one is the parse's error) */
-static int ts_lit(xctx *x, const sql_stmt *st, uint16_t k, uint8_t t, imdb_err *e)
+static int ts_lit(xctx *x, const sql_stmt *st, uint16_t k, uint8_t t, uint16_t eid, imdb_err *e)
 {
     const sql_expr *n = &st->ex[k];
     if (n->op != EX_LIT || n->lit.kind != LIT_STR) return IMDB_OK;
     int64_t us;
     const char *s = x->sql + n->lit.off; /* F3b: a DATE's and a TIME's by their own literal rules */
+    if (t == IMDB_T_ENUM) { /* F3g: a label of eid's type at the statement's read point (an unknown one an error) */
+        int32_t ord;
+        if (enum_label(x, st, eid, s, n->lit.len, &ord, e)) return e->code;
+        imdb_xnode *bn = &x->xn[k];
+        memset(&bn->k, 0, sizeof bn->k);
+        bn->k.type = bn->type = t;
+        bn->k.eid = bn->eid = eid;
+        bn->k.i = ord;
+        return IMDB_OK;
+    }
     if (t == IMDB_T_UUID || t == IMDB_T_BYTEA) { /* F3d: a UUID's and a BYTEA's text forms, the bytes the statement's */
         size_t m = t == IMDB_T_UUID ? IMDB_UUID_LEN : n->lit.len >= 2 ? (n->lit.len - 2) / 2 : 0, got = IMDB_UUID_LEN;
         uint8_t *buf = xalloc(x, m ? m : 1, e);
@@ -832,7 +879,8 @@ static int ts_lit(xctx *x, const sql_stmt *st, uint16_t k, uint8_t t, imdb_err *
 static bool is_ts(uint8_t t)
 {
     return t == IMDB_T_TIMESTAMP || t == IMDB_T_TIMESTAMPTZ || t == IMDB_T_DATE || t == IMDB_T_TIME || t == IMDB_T_UUID ||
-           t == IMDB_T_BYTEA || t == IMDB_T_INTERVAL; /* F3d: a UUID's and a BYTEA's text forms too; F3f: an INTERVAL's */
+           t == IMDB_T_BYTEA || t == IMDB_T_INTERVAL || /* F3d: a UUID's and a BYTEA's text forms too; F3f: an INTERVAL's */
+           t == IMDB_T_ENUM;                         /* F3g: an ENUM's label */
 }
 
 /* CAST between the temporal types: TIMESTAMP and TIMESTAMPTZ each way (the session's zone), and (F3b) a TIMESTAMP's or
@@ -856,35 +904,38 @@ static int xbind_v(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
         memset(&b->k, 0, sizeof b->k);
         b->k.null = true;
         b->type = b->scale = 0;
+        b->eid = 0;
         return IMDB_OK;
     }
     return xbind(x, sc, k, e);
 }
 
 /* P2 S1: an untyped NULL at k takes the type its siblings unified to */
-static void x_type_null(xctx *x, uint16_t k, uint8_t t, uint8_t s)
+static void x_type_null(xctx *x, uint16_t k, imdb_xty t)
 {
     imdb_xnode *b = &x->xn[k];
     if (b->type) return;
-    b->type = b->k.type = t;
-    b->scale = b->k.scale = s;
+    b->type = b->k.type = t.type;
+    b->scale = b->k.scale = t.scale;
+    b->eid = b->k.eid = t.eid; /* F3g */
 }
 
 /* P2 S1: values that must share one type (CASE's results, COALESCE's arguments): a string literal beside a TIMESTAMP is
  * a timestamp (as in a comparison), then each unified; the untyped NULLs take the result */
-static int x_unify_all(xctx *x, const sql_stmt *st, const uint16_t *v, unsigned n, const char *what, uint8_t *rt,
-                       uint8_t *rs, imdb_err *e)
+static int x_unify_all(xctx *x, const sql_stmt *st, const uint16_t *v, unsigned n, const char *what, imdb_xty *rt,
+                       imdb_err *e)
 {
-    uint8_t ts = 0; /* a TIMESTAMP or (P2) a TIMESTAMPTZ among them: its string literals are of its type */
+    uint8_t ts = 0; /* a TIMESTAMP or (P2) a TIMESTAMPTZ among them: its string literals are of its type (F3g: an ENUM's labels) */
+    uint16_t tse = 0;
     for (unsigned i = 0; i < n; i++)
-        if (is_ts(x->xn[v[i]].type)) ts = x->xn[v[i]].type;
+        if (is_ts(x->xn[v[i]].type)) ts = x->xn[v[i]].type, tse = x->xn[v[i]].eid;
     for (unsigned i = 0; ts && i < n; i++)
-        if (ts_lit(x, st, v[i], ts, e)) return e->code;
-    *rt = *rs = 0;
+        if (ts_lit(x, st, v[i], ts, tse, e)) return e->code;
+    *rt = imdb_xty_of(0, 0, 0);
     for (unsigned i = 0; i < n; i++)
-        if (imdb_x_unify(rt, rs, x->xn[v[i]].type, x->xn[v[i]].scale, what, e)) return e->code;
-    if (!*rt) return imdb_fail(e, IMDB_ERR_INVALID, "%s NULL alone has no type", what);
-    for (unsigned i = 0; i < n; i++) x_type_null(x, v[i], *rt, *rs);
+        if (imdb_x_unify(rt, imdb_xty_of(x->xn[v[i]].type, x->xn[v[i]].scale, x->xn[v[i]].eid), what, e)) return e->code;
+    if (!rt->type) return imdb_fail(e, IMDB_ERR_INVALID, "%s NULL alone has no type", what);
+    for (unsigned i = 0; i < n; i++) x_type_null(x, v[i], *rt);
     return IMDB_OK;
 }
 
@@ -900,13 +951,22 @@ static int xbind_s1(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
         const imdb_xnode *a = &x->xn[n->l];
         bool num = a->type == IMDB_T_INT64 || a->type == IMDB_T_DECIMAL || a->type == IMDB_T_FLOAT64;
         bool to_num = n->ctype == IMDB_T_INT64 || n->ctype == IMDB_T_DECIMAL || n->ctype == IMDB_T_FLOAT64;
+        uint16_t teid = 0;
+        if (n->ctype == IMDB_T_ENUM) { /* F3g: the type a name says at the read point; from a TEXT (its label), itself, NULL */
+            if (enum_named(x, st, n->col, &teid, e)) return e->code;
+            if (a->type && a->type != IMDB_T_TEXT && (a->type != IMDB_T_ENUM || a->eid != teid))
+                return imdb_fail(e, IMDB_ERR_INVALID, "CAST to ENUM type %s takes a TEXT or that type", n->col);
+        } else if (a->type == IMDB_T_ENUM && n->ctype != IMDB_T_TEXT) {
+            return imdb_fail(e, IMDB_ERR_INVALID, "CAST of an ENUM to %s is not defined (to TEXT: its label)", imdb_type_name(n->ctype));
+        }
         if (a->type && a->type != IMDB_T_TEXT && n->ctype != IMDB_T_TEXT && a->type != n->ctype && !(num && to_num) &&
             !dt_cast_ok(a->type, n->ctype)) /* P2: TIMESTAMP and TIMESTAMPTZ each way, by the session's zone; F3b: DATE, TIME */
             return imdb_fail(e, IMDB_ERR_INVALID, "CAST of %s to %s is not defined", imdb_type_name(a->type),
                              imdb_type_name(n->ctype));
-        x_type_null(x, n->l, n->ctype, n->cscale);
+        x_type_null(x, n->l, imdb_xty_of(n->ctype, n->cscale, teid));
         b->type = n->ctype;
         b->scale = n->ctype == IMDB_T_DECIMAL ? n->cscale : 0;
+        b->eid = teid;
         return IMDB_OK;
     }
     uint16_t v[256];
@@ -920,8 +980,8 @@ static int xbind_s1(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
             if (!n->l && x->xn[wx->l].type != IMDB_T_BOOL)
                 return imdb_fail(e, IMDB_ERR_INVALID, "CASE WHEN takes a condition");
             if (n->l) { /* a simple CASE compares its operand with each WHEN, as = does */
-                if (is_ts(x->xn[n->l].type) && ts_lit(x, st, wx->l, x->xn[n->l].type, e)) return e->code;
-                if (!imdb_x_comparable(x->xn[n->l].type, x->xn[wx->l].type))
+                if (is_ts(x->xn[n->l].type) && ts_lit(x, st, wx->l, x->xn[n->l].type, x->xn[n->l].eid, e)) return e->code;
+                if (!imdb_x_comparable(imdb_xty_of(x->xn[n->l].type, 0, x->xn[n->l].eid), imdb_xty_of(x->xn[wx->l].type, 0, x->xn[wx->l].eid)))
                     return imdb_fail(e, IMDB_ERR_INVALID, "a CASE of %s compared with %s: values are not converted",
                                      imdb_type_name(x->xn[n->l].type), imdb_type_name(x->xn[wx->l].type));
             }
@@ -934,10 +994,14 @@ static int xbind_s1(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
             if (nv >= sizeof v / sizeof *v) return imdb_fail(e, IMDB_ERR_LIMIT, "a CASE of more than %zu results", sizeof v / sizeof *v);
             v[nv++] = n->x3;
         }
-        return x_unify_all(x, st, v, nv, "a CASE of", &b->type, &b->scale, e);
+        imdb_xty u;
+        if (x_unify_all(x, st, v, nv, "a CASE of", &u, e)) return e->code;
+        b->type = u.type, b->scale = u.scale, b->eid = u.eid;
+        return IMDB_OK;
     }
     /* EX_FN */
     uint8_t ta[256], sa[256];
+    uint16_t ea[256]; /* F3g */
     const imdb_xval *kv[256];
     imdb_xlist_start(&it, st, n->l);
     for (uint16_t a = imdb_xlist_next(&it); a; a = imdb_xlist_next(&it)) {
@@ -946,17 +1010,24 @@ static int xbind_s1(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
         if (nul ? xbind_v(x, sc, a, e) : xbind(x, sc, a, e)) return e->code;
         v[nv++] = a;
     }
-    if (n->fn == FN_COALESCE) return x_unify_all(x, st, v, nv, "COALESCE of", &b->type, &b->scale, e);
-    if (n->fn == FN_NULLIF && nv == 2 && is_ts(x->xn[v[0]].type) && ts_lit(x, st, v[1], x->xn[v[0]].type, e)) return e->code;
+    if (n->fn == FN_COALESCE) {
+        imdb_xty u;
+        if (x_unify_all(x, st, v, nv, "COALESCE of", &u, e)) return e->code;
+        b->type = u.type, b->scale = u.scale, b->eid = u.eid;
+        return IMDB_OK;
+    }
+    if (n->fn == FN_NULLIF && nv == 2 && is_ts(x->xn[v[0]].type) && ts_lit(x, st, v[1], x->xn[v[0]].type, x->xn[v[0]].eid, e))
+        return e->code;
     if (n->fn == FN_CONCAT && nv == 2) /* F3d: a string literal beside a BYTEA is one (PostgreSQL's unknown literal) */
         for (unsigned i = 0; i < 2; i++)
-            if (x->xn[v[1 - i]].type == IMDB_T_BYTEA && ts_lit(x, st, v[i], IMDB_T_BYTEA, e)) return e->code;
+            if (x->xn[v[1 - i]].type == IMDB_T_BYTEA && ts_lit(x, st, v[i], IMDB_T_BYTEA, 0, e)) return e->code;
     for (unsigned i = 0; i < nv; i++) {
         ta[i] = x->xn[v[i]].type;
         sa[i] = x->xn[v[i]].scale;
+        ea[i] = x->xn[v[i]].eid;
         kv[i] = st->ex[v[i]].op == EX_LIT ? &x->xn[v[i]].k : NULL;
     }
-    if (imdb_x_fn_type(n->fn, (uint8_t)nv, ta, sa, kv, &b->type, &b->scale, e)) return e->code;
+    if (imdb_x_fn_type(n->fn, (uint8_t)nv, ta, sa, ea, kv, &b->type, &b->scale, &b->eid, e)) return e->code;
     if (n->fn == FN_DATE_TRUNC && imdb_x_trunc_unit(kv[0]->s, kv[0]->len, &b->unit, e)) return e->code; /* P2 */
     b->tz = NULL;
     if (n->fn == FN_DATE_TRUNC || n->fn == FN_TIMEZONE) { /* P2: a constant zone looked up once, in a run alone */
@@ -965,7 +1036,7 @@ static int xbind_s1(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
             imdb_db_zone(x->db, (const char *)kv[zi]->s, kv[zi]->len, &b->tz, e))
             return e->code;
     }
-    if (n->fn == FN_NULLIF) x_type_null(x, v[1], b->type, b->scale);
+    if (n->fn == FN_NULLIF) x_type_null(x, v[1], imdb_xty_of(b->type, b->scale, b->eid));
     return IMDB_OK;
 }
 
@@ -973,16 +1044,17 @@ static int xbind_s1(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
  * read here as a constant (a value, EXISTS) or a sorted set (IN) ------------------------------------------------- */
 
 /* a result cell as a value of the column's bound type (a wide SUM or DECIMAL whole: values hold 38 digits) */
-static void cell_xval(const imdb_cell *c, uint8_t type, uint8_t scale, imdb_xval *out)
+static void cell_xval(const imdb_cell *c, uint8_t type, uint8_t scale, uint16_t eid, imdb_xval *out)
 {
     if (c->null || c->v.null) {
-        *out = (imdb_xval){.type = type, .scale = scale, .null = true};
+        *out = (imdb_xval){.type = type, .scale = scale, .eid = eid, .null = true};
         return;
     }
     imdb_x_from_value(&c->v, out);
     if (c->wide) out->i = c->i128;
     out->type = type;
     out->scale = scale;
+    out->eid = eid; /* F3g */
 }
 
 /* the result of the statement's nested SELECT k, which rset_prepare made */
@@ -1023,6 +1095,7 @@ static int bind_corr(xctx *x, const xscope *sc, uint8_t sub, xcorr **out, imdb_e
         c->ncols = r.ncols;
         c->ctype = r.ctype[0];
         c->cscale = r.cscale[0];
+        c->ceid = r.ceid[0]; /* F3g */
         imdb_result_free(&r);
         if (rc) return rc;
         c->scope = *sc;
@@ -1047,12 +1120,13 @@ static int bind_inset(xctx *x, const xscope *sc, uint16_t k, imdb_err *e)
         if (c->ncols != 1) return imdb_fail(e, IMDB_ERR_INVALID, "IN (SELECT ...) takes one column");
         uint8_t ta = x->xn[n->l].type;
         if (!ta) return imdb_fail(e, IMDB_ERR_INVALID, "NULL cannot be an operand: the result would always be unknown (use IS NULL)");
-        if (!imdb_x_comparable(ta, c->ctype))
+        if (!imdb_x_comparable(imdb_xty_of(ta, 0, x->xn[n->l].eid), imdb_xty_of(c->ctype, 0, c->ceid)))
             return imdb_fail(e, IMDB_ERR_INVALID, "IN compares %s with %s: values are not converted", imdb_type_name(ta),
                              imdb_type_name(c->ctype));
         x->xn[n->r].corr = 1;
         x->xn[n->r].type = c->ctype;
         x->xn[n->r].scale = c->cscale;
+        x->xn[n->r].eid = c->ceid;
         return IMDB_OK;
     }
     const imdb_result *r = sub_result(x, q->sub, e);
@@ -1060,14 +1134,14 @@ static int bind_inset(xctx *x, const xscope *sc, uint16_t k, imdb_err *e)
     if (r->ncols != 1) return imdb_fail(e, IMDB_ERR_INVALID, "IN (SELECT ...) takes one column");
     uint8_t ta = x->xn[n->l].type, tb = r->ctype[0];
     if (!ta) return imdb_fail(e, IMDB_ERR_INVALID, "NULL cannot be an operand: the result would always be unknown (use IS NULL)");
-    if (!imdb_x_comparable(ta, tb))
+    if (!imdb_x_comparable(imdb_xty_of(ta, 0, x->xn[n->l].eid), imdb_xty_of(tb, 0, r->ceid[0])))
         return imdb_fail(e, IMDB_ERR_INVALID, "IN compares %s with %s: values are not converted", imdb_type_name(ta),
                          imdb_type_name(tb));
     imdb_xset *s = xalloc(x, sizeof *s, e);
     if (!s || !(s->v = xalloc(x, (r->nrows ? r->nrows : 1) * sizeof *s->v, e))) return e->code;
     for (uint64_t i = 0; i < r->nrows; i++) {
         imdb_xval v;
-        cell_xval(&r->cells[i], tb, r->cscale[0], &v);
+        cell_xval(&r->cells[i], tb, r->cscale[0], r->ceid[0], &v);
         if (v.null) s->has_null = true;
         else s->v[s->n++] = v;
     }
@@ -1075,6 +1149,7 @@ static int bind_inset(xctx *x, const xscope *sc, uint16_t k, imdb_err *e)
     x->xn[n->r].set = s;
     x->xn[n->r].type = tb;
     x->xn[n->r].scale = r->cscale[0];
+    x->xn[n->r].eid = r->ceid[0];
     return IMDB_OK;
 }
 
@@ -1096,6 +1171,7 @@ static int bind_subq(xctx *x, const xscope *sc, uint16_t k, imdb_err *e)
         if (c->ncols != 1) return imdb_fail(e, IMDB_ERR_INVALID, "a subquery as a value returns one column");
         b->type = c->ctype;
         b->scale = c->cscale;
+        b->eid = c->ceid;
         return IMDB_OK;
     }
     const imdb_result *r = sub_result(x, n->sub, e);
@@ -1110,8 +1186,9 @@ static int bind_subq(xctx *x, const xscope *sc, uint16_t k, imdb_err *e)
     if (r->nrows > 1) return imdb_fail(e, IMDB_ERR_INVALID, "a subquery as a value returned more than one row");
     b->type = r->ctype[0];
     b->scale = r->cscale[0];
-    if (r->nrows) cell_xval(&r->cells[0], b->type, b->scale, &b->k);
-    else b->k = (imdb_xval){.type = b->type, .scale = b->scale, .null = true};
+    b->eid = r->ceid[0];
+    if (r->nrows) cell_xval(&r->cells[0], b->type, b->scale, b->eid, &b->k);
+    else b->k = (imdb_xval){.type = b->type, .scale = b->scale, .eid = b->eid, .null = true};
     return IMDB_OK;
 }
 
@@ -1163,10 +1240,11 @@ static int bind_outer(xctx *x, const xscope *sc, uint16_t k, imdb_err *e)
     b->col = -1;
     b->type = os->s->cols[c].type;
     b->scale = os->s->cols[c].scale;
+    b->eid = os->s->cols[c].eid; /* F3g */
     if (x->upv) imdb_x_from_value(&x->upv[c], &b->k);
     else if (!x->probe) /* P2 S11: a run for no row is an uncorrelated one's, whose bind-only pass read nothing around */
         return imdb_fail(e, IMDB_ERR_STATE, "a nested SELECT read a column around it in a run for no row");
-    else b->k = (imdb_xval){.type = b->type, .scale = b->scale, .null = true};
+    else b->k = (imdb_xval){.type = b->type, .scale = b->scale, .eid = b->eid, .null = true};
     uint16_t i = 0;
     while (i < x->noref && x->oref[i] != c) i++;
     if (i == x->noref) {
@@ -1193,6 +1271,7 @@ static int bind_win(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
         return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "an aggregate inside a window function's arguments: a later step");
     b->type = IMDB_T_INT64;
     b->scale = 0;
+    b->eid = 0;
     switch (n->fn) {
     case WF_ROW_NUMBER:
     case WF_RANK:
@@ -1218,11 +1297,14 @@ static int bind_win(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
         if (xbind_v(x, sc, n->l, e)) return e->code;
         b->type = x->xn[n->l].type;
         b->scale = x->xn[n->l].scale;
+        b->eid = x->xn[n->l].eid;
         if (n->x3) { /* the default: one type with the value (an untyped NULL takes the value's) */
             if (xbind_v(x, sc, n->x3, e)) return e->code;
-            if (imdb_x_unify(&b->type, &b->scale, x->xn[n->x3].type, x->xn[n->x3].scale, "LAG's and LEAD's value and default are", e))
+            imdb_xty u = imdb_xty_of(b->type, b->scale, b->eid);
+            if (imdb_x_unify(&u, imdb_xty_of(x->xn[n->x3].type, x->xn[n->x3].scale, x->xn[n->x3].eid), "LAG's and LEAD's value and default are", e))
                 return e->code;
-            x_type_null(x, n->x3, b->type, b->scale);
+            b->type = u.type, b->scale = u.scale, b->eid = u.eid;
+            x_type_null(x, n->x3, u);
         }
         if (!b->type) b->type = IMDB_T_TEXT; /* LAG(NULL): a TEXT NULL, as SELECT NULL is */
         return IMDB_OK;
@@ -1237,6 +1319,7 @@ static int bind_win(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
         if (n->agg == AGG_COUNT) return IMDB_OK;
         b->type = a->type;
         b->scale = a->scale;
+        b->eid = a->eid; /* F3g: MIN's and MAX's */
         if (n->agg == AGG_AVG && a->type != IMDB_T_FLOAT64) { /* SUM / COUNT by the division rule, as AVG is (1e) */
             unsigned s = (a->type == IMDB_T_DECIMAL ? a->scale : 0u) + 6u;
             if (s > IMDB_X_MAX_SCALE) return imdb_fail(e, IMDB_ERR_LIMIT, "AVG of a DECIMAL past %u decimal places", IMDB_X_MAX_SCALE - 6);
@@ -1258,6 +1341,7 @@ static int xbind_node(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
         if (bind_xlit(x, &n->lit, &b->k, e)) return e->code;
         b->type = b->k.type;
         b->scale = b->k.scale;
+        b->eid = b->k.eid; /* F3g: a parameter's */
         return IMDB_OK;
     case EX_COL: {
         if (!sc->cols) return imdb_fail(e, IMDB_ERR_INVALID, "column %s cannot be read here: VALUES takes constants", n->col);
@@ -1280,6 +1364,7 @@ static int xbind_node(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
         b->col = (int16_t)c;
         b->type = cd->type;
         b->scale = cd->scale;
+        b->eid = cd->eid; /* F3g */
         return IMDB_OK;
     }
     case EX_AGG: {
@@ -1298,7 +1383,7 @@ static int xbind_node(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
             if ((n->agg == AGG_SUM || n->agg == AGG_AVG) && !num && !(n->agg == AGG_SUM && a->type == IMDB_T_INTERVAL)) /* F3f */
                 return imdb_fail(e, IMDB_ERR_INVALID, n->agg == AGG_SUM ? "SUM needs an INT64, DECIMAL, FLOAT64 or INTERVAL value"
                                                                       : "AVG needs an INT64, DECIMAL or FLOAT64 value");
-            if (n->agg != AGG_COUNT) b->type = a->type, b->scale = a->scale;
+            if (n->agg != AGG_COUNT) b->type = a->type, b->scale = a->scale, b->eid = a->eid; /* F3g: MIN's and MAX's */
             if (n->agg == AGG_AVG && a->type != IMDB_T_FLOAT64) { /* 1e: SUM / COUNT by the division rule: six more places */
                 unsigned s = (a->type == IMDB_T_DECIMAL ? a->scale : 0u) + 6u;
                 if (s > IMDB_X_MAX_SCALE)
@@ -1343,12 +1428,12 @@ static int xbind_node(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
             imdb_xlist_start(&it, sc->st, n->r);
             for (uint16_t a = imdb_xlist_next(&it); a; a = imdb_xlist_next(&it)) {
                 if (xbind_v(x, sc, a, e)) return e->code;
-                if (is_ts(x->xn[n->l].type) && ts_lit(x, sc->st, a, x->xn[n->l].type, e)) return e->code;
+                if (is_ts(x->xn[n->l].type) && ts_lit(x, sc->st, a, x->xn[n->l].type, x->xn[n->l].eid, e)) return e->code;
                 uint8_t ta = x->xn[n->l].type, tb = x->xn[a].type;
-                if (tb && !imdb_x_comparable(ta, tb))
+                if (tb && !imdb_x_comparable(imdb_xty_of(ta, 0, x->xn[n->l].eid), imdb_xty_of(tb, 0, x->xn[a].eid)))
                     return imdb_fail(e, IMDB_ERR_INVALID, "IN compares %s with %s: values are not converted",
                                      imdb_type_name(ta), imdb_type_name(tb));
-                x_type_null(x, a, ta, x->xn[n->l].scale);
+                x_type_null(x, a, imdb_xty_of(ta, x->xn[n->l].scale, x->xn[n->l].eid));
             }
             return IMDB_OK;
         }
@@ -1364,10 +1449,10 @@ static int xbind_node(xctx *x, xscope *sc, uint16_t k, imdb_err *e)
             if (xbind(x, sc, ops[i], e)) return e->code;
             /* a string literal against a TIMESTAMP is a timestamp, as against a TIMESTAMP column in today's form
              * (ts >= '2026-01-01' OR k): read as one, never compared as text */
-            if (is_ts(x->xn[n->l].type) && ts_lit(x, sc->st, ops[i], x->xn[n->l].type, e)) return e->code;
-            if (is_ts(x->xn[ops[i]].type) && ts_lit(x, sc->st, n->l, x->xn[ops[i]].type, e)) return e->code;
+            if (is_ts(x->xn[n->l].type) && ts_lit(x, sc->st, ops[i], x->xn[n->l].type, x->xn[n->l].eid, e)) return e->code;
+            if (is_ts(x->xn[ops[i]].type) && ts_lit(x, sc->st, n->l, x->xn[ops[i]].type, x->xn[ops[i]].eid, e)) return e->code;
             uint8_t ta = x->xn[n->l].type, tb = x->xn[ops[i]].type;
-            if (!imdb_x_comparable(ta, tb))
+            if (!imdb_x_comparable(imdb_xty_of(ta, 0, x->xn[n->l].eid), imdb_xty_of(tb, 0, x->xn[ops[i]].eid)))
                 return imdb_fail(e, IMDB_ERR_INVALID, "a comparison of %s with %s: values are not converted",
                                  imdb_type_name(ta), imdb_type_name(tb));
             if (ta == IMDB_T_BOOL && n->cmp != CMP_EQ && n->cmp != CMP_NE) /* as a BOOL column's own predicates */
@@ -1416,6 +1501,7 @@ static bool x_same(const xctx *x, const xscope *sc, uint16_t a, uint16_t b)
         return p->lit.kind == q->lit.kind && p->lit.neg == q->lit.neg && p->lit.bval == q->lit.bval &&
                p->lit.param == q->lit.param && p->lit.len == q->lit.len && p->lit.kind != LIT_EXPR &&
                (!p->lit.len || !memcmp(x->sql + p->lit.off, x->sql + q->lit.off, p->lit.len));
+    if (p->op == EX_CAST && p->ctype == IMDB_T_ENUM && strcmp(p->col, q->col)) return false; /* F3g: its type's name */
     if (p->op == EX_COL) {
         int ca = col_quiet(sc, p);
         return ca >= 0 && ca == col_quiet(sc, q);
@@ -1662,7 +1748,8 @@ static bool corr_pred(xctx *x, const sql_stmt *st, uint16_t i, qspec *q)
         return false;
     }
     const imdb_column *cd = &q->t->s.cols[ci], *od = &os->s->cols[c];
-    if (od->type != cd->type || (cd->type == IMDB_T_DECIMAL && (od->scale != cd->scale || dec_wide_col(od) != dec_wide_col(cd))))
+    if (od->type != cd->type || (cd->type == IMDB_T_DECIMAL && (od->scale != cd->scale || dec_wide_col(od) != dec_wide_col(cd))) ||
+        (cd->type == IMDB_T_ENUM && od->eid != cd->eid)) /* F3g */
         return false; /* F3e: a DECIMAL of the same form too (a wide outer value is no int64 bound): else a residual */
     if (cd->type == IMDB_T_BOOL && op != CMP_EQ && op != CMP_NE) return false;
     if (q->np >= IMDB_MAX_PREDICATES) return false;
@@ -1915,6 +2002,7 @@ static int xacc_value(xacc *a, uint8_t agg, const imdb_xnode *b, uint8_t ta, uin
     memset(out, 0, sizeof *out);
     out->type = b->type;
     out->scale = b->scale;
+    out->eid = b->eid; /* F3g */
     if (agg == AGG_COUNT_STAR || agg == AGG_COUNT) {
         out->i = (__int128)a->count;
         return IMDB_OK;
@@ -2499,6 +2587,7 @@ static int rset_row(const xrset *rs, uint64_t i, imdb_value *vals, imdb_err *e)
         }
         *v = cl->v;
         v->type = s->cols[c].type;
+        if (v->type == IMDB_T_ENUM) v->eid = s->cols[c].eid; /* F3g */
         if (v->type == IMDB_T_DECIMAL) { /* F3e: a row set's DECIMAL column is wide (rset_table): every value in that form */
             __int128 x = cl->wide ? cl->i128 : imdb_dec_value(&cl->v);
             if (x >= imdb_pow10_128(IMDB_DEC_MAX_DIGITS) || x <= -imdb_pow10_128(IMDB_DEC_MAX_DIGITS))
@@ -2553,6 +2642,8 @@ static int rset_table(xctx *x, xrset *rs, imdb_err *e)
         if (!r->ctype[c]) return imdb_fail(e, IMDB_ERR_STATE, "a nested SELECT's column %s has no type", col->name);
         col->type = r->ctype[c];
         col->scale = r->cscale[c];
+        col->eid = r->ctype[c] == IMDB_T_ENUM ? r->ceid[c] : 0; /* F3g */
+        if (col->type == IMDB_T_ENUM && !col->eid) return imdb_fail(e, IMDB_ERR_STATE, "a nested SELECT's ENUM column %s has no type", col->name);
         if (col->type == IMDB_T_DECIMAL && col->scale > IMDB_DEC_MAX_DIGITS)
             return imdb_fail(e, IMDB_ERR_LIMIT, "a nested SELECT's DECIMAL %s has more than 38 places: CAST it", col->name);
         /* F3e: 38 digits, whatever its values hold: a type decided before any row (a bind-only pass has none) */
@@ -2641,6 +2732,8 @@ static int run_nested(xctx *x, const sql_stmt *in, imdb_result *r, uint8_t mode,
     s.env.seqfn = s.probe ? NULL : x->env.seqfn; /* F2a-2: a bind-only pass calls no sequence */
     s.noxc = x->noxc;
     s.env.zone_get = s.probe ? NULL : xenv_zone;
+    s.env.edb = x->env.edb; /* F3g */
+    s.env.enum_snap = x->env.enum_snap;
     struct xplain *xp = NULL;
     if (s.probe && !(xp = xp_scratch(e))) return e->code;
     r->byte_cap = workspace_of(x->ss);
@@ -2748,7 +2841,7 @@ static int corr_answer(xctx *x, const sql_expr *n, const xcorr *c, const imdb_re
     if (!s || !(s->v = xalloc(x, (r->nrows ? r->nrows : 1) * sizeof *s->v, e))) return e->code;
     for (uint64_t i = 0; i < r->nrows; i++) {
         imdb_xval v;
-        cell_xval(&r->cells[i], c->ctype, c->cscale, &v);
+        cell_xval(&r->cells[i], c->ctype, c->cscale, c->ceid, &v);
         if (v.null) {
             s->has_null = true;
             continue;
@@ -2761,7 +2854,7 @@ static int corr_answer(xctx *x, const sql_expr *n, const xcorr *c, const imdb_re
         s->v[s->n++] = v;
     }
     if (n->subk == 0) { /* a value: the set's one element, or NULL */
-        if (!s->n) s->v[0] = (imdb_xval){.type = c->ctype, .scale = c->cscale, .null = true};
+        if (!s->n) s->v[0] = (imdb_xval){.type = c->ctype, .scale = c->cscale, .eid = c->ceid, .null = true};
         *a = (uint64_t)(uintptr_t)&s->v[0];
         return IMDB_OK;
     }
@@ -2994,6 +3087,7 @@ static int path_ordered(xctx *x, const qspec *q, sink *k, imdb_err *e)
         memset(&vals[q->ord_idx->d.cols[c]], 0, sizeof vals[0]);
         vals[q->ord_idx->d.cols[c]].type = cd->type;
         vals[q->ord_idx->d.cols[c]].scale = cd->scale;
+        if (cd->type == IMDB_T_ENUM) vals[q->ord_idx->d.cols[c]].eid = cd->eid; /* F3g */
     }
     int rc = imdb_oidx_range(q->ord_idx->ox, lo, hi, q->ord_only ? ord_only_visit : ord_visit, &o);
     /* the reader's own pending versions are not in the structure yet (db.h idx_upto) */
@@ -3140,6 +3234,7 @@ static int fg_group(sink *k, const imdb_table *t, bool isnull, int64_t key, uint
     uint64_t g, *gi;
     if (!k->gen) {
         imdb_value kv = {.type = col->type, .scale = col->scale, .null = isnull, .i = isnull ? 0 : key};
+        if (col->type == IMDB_T_ENUM && !isnull) kv.eid = col->eid; /* F3g */
         gi = isnull ? (k->has_null_group ? &k->null_group : NULL) : imdb_hmap_get(&k->gmap, &kv);
         if (gi) {
             g = *gi;
@@ -3158,6 +3253,7 @@ static int fg_group(sink *k, const imdb_table *t, bool isnull, int64_t key, uint
         memset(&xv, 0, sizeof xv);
         xv.type = k->fg_kind == FG_COL ? col->type : k->fg_kind == FG_TRUNC ? k->fg_type : IMDB_T_INT64;
         xv.scale = k->fg_kind == FG_COL ? col->scale : 0;
+        if (k->fg_kind == FG_COL && col->type == IMDB_T_ENUM) xv.eid = col->eid; /* F3g */
         xv.null = isnull;
         if (!isnull && xv.type == IMDB_T_FLOAT64) xv.f = imdb_f64_value(key); /* as imdb_x_from_value holds one */
         else if (!isnull) xv.i = key;
@@ -3725,6 +3821,7 @@ static void cell_x(const imdb_result *r, const imdb_cell *c, imdb_xval *v)
     else if (c->v.type == IMDB_T_FLOAT64) v->f = imdb_f64_value(c->v.i);
     else if (imdb_type_bytes(c->v.type)) v->s = r->text.p + c->v.i, v->len = c->v.len;
     else if (c->v.type == IMDB_T_INTERVAL) v->i = c->v.i, v->mon = c->v.iv.mon, v->day = c->v.iv.day; /* F3f */
+    else if (c->v.type == IMDB_T_ENUM) v->i = c->v.i, v->eid = (uint16_t)c->v.eid; /* F3g */
     else v->i = c->v.i;
 }
 
@@ -3975,7 +4072,7 @@ static int bind_item(xctx *x, sink *k, xscope *si, uint16_t root, bool item, boo
 {
     k->trees = true;
     if (xnodes(x, si->st, e) || (item ? xbind_v(x, si, root, e) : xbind(x, si, root, e))) return e->code;
-    if (item) x_type_null(x, root, IMDB_T_TEXT, 0); /* P2 S8: SELECT NULL with FROM: a TEXT NULL, as without it */
+    if (item) x_type_null(x, root, imdb_xty_of(IMDB_T_TEXT, 0, 0)); /* P2 S8: SELECT NULL with FROM: a TEXT NULL, as without it */
     if (imdb_sql_has_agg(si->st, root)) *any_agg = true;
     else if (ex_reads(si->st, root)) *any_plain = true;
     return IMDB_OK;
@@ -4181,6 +4278,7 @@ static void res_put_x(imdb_result *r, imdb_cell *c, const imdb_xval *v)
     if (v->type == IMDB_T_FLOAT64) iv.i = imdb_f64_key(v->f);
     else if (imdb_type_bytes(v->type)) iv.s = v->s, iv.len = v->len;
     else if (v->type == IMDB_T_INTERVAL) imdb_x_to_iv(v, &iv); /* F3f */
+    else if (v->type == IMDB_T_ENUM) iv.i = (int64_t)v->i, iv.eid = v->eid; /* F3g */
     else iv.i = (int64_t)v->i;
     res_put(r, c, &iv);
 }
@@ -4313,20 +4411,25 @@ static void col_types(const xctx *x, const sql_stmt *st, const sink *k, const im
     uint16_t n = st->star ? s->ncols : st->nitems;
     for (uint16_t i = 0; i < n && i < IMDB_MAX_COLS; i++) {
         uint8_t ty = 0, sc = 0;
+        uint16_t ei = 0; /* F3g */
         if (st->star) {
             ty = s->cols[i].type;
             sc = s->cols[i].scale;
+            ei = s->cols[i].eid;
         } else if (st->items[i].expr) {
             ty = x->xn[st->items[i].expr].type ? x->xn[st->items[i].expr].type : IMDB_T_TEXT;
             sc = x->xn[st->items[i].expr].scale;
+            ei = x->xn[st->items[i].expr].eid;
         } else if (st->items[i].agg == AGG_COUNT_STAR || st->items[i].agg == AGG_COUNT) {
             ty = IMDB_T_INT64;
         } else if (k && k->item_col[i] >= 0) {
             ty = s->cols[k->item_col[i]].type;
             sc = s->cols[k->item_col[i]].scale;
+            ei = s->cols[k->item_col[i]].eid;
         }
         r->ctype[i] = ty;
         r->cscale[i] = sc;
+        r->ceid[i] = ty == IMDB_T_ENUM ? ei : 0;
     }
 }
 
@@ -4550,6 +4653,7 @@ static int snapshot_of(xctx *x, const sql_stmt *st, uint64_t *snap, uint64_t *pe
             if (imdb_seq_at_time(db, (uint64_t)ts, snap, e)) return e->code;
         }
     }
+    x->env.enum_snap = *snap; /* F3g: the labels a CAST from TEXT reads */
     return IMDB_OK;
 }
 
@@ -4567,6 +4671,31 @@ typedef struct xdeps {
     bool over;
 } xdeps;
 
+/* F3g: a DDL statement's ENUM type, live now, by its name (a CREATE TABLE's or an ADD COLUMN's column) */
+static int enum_live(imdb_db *db, const char *name, uint16_t *eid, imdb_err *e)
+{
+    imdb_enum *t = imdb_enum_by_name(db, name);
+    if (!t) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no type %s", name);
+    *eid = (uint16_t)t->def->id;
+    return IMDB_OK;
+}
+
+/* F3g: a string literal's bytes as written, '' its quote, into the statement's memory (*n of them) */
+static int lit_text(xctx *x, const sql_lit *l, char **out, size_t *n, imdb_err *e)
+{
+    const char *t = x->sql + l->off;
+    char *b = xalloc(x, l->len ? l->len : 1, e);
+    if (!b) return e->code;
+    size_t k = 0;
+    for (size_t i = 0; i < l->len; i++) {
+        b[k++] = t[i];
+        if (t[i] == '\'') i++;
+    }
+    *out = b;
+    *n = k;
+    return IMDB_OK;
+}
+
 static void deps_note(xctx *x, uint8_t kind, uint32_t id)
 {
     xdeps *p = x->deps;
@@ -4580,6 +4709,59 @@ static void deps_note(xctx *x, uint8_t kind, uint32_t id)
     p->d[p->n].kind = kind;
     p->d[p->n].id = id;
     p->n++;
+}
+
+/* F3g: the ENUM type a statement names (a CAST's target, a declared parameter's), at its read point (a dropped one's tombstone
+ * below its drop, as a view's; else the live one: a type made since, whose labels at the read point are none), noted
+ * as a view's dependency: a view's TYPE dependencies are its CASTs' targets alone (a label literal and an ENUM column
+ * take a type from a column, which its table's dependency keeps, or from a CAST; docs/f3g-design.md section 4) */
+static int enum_named(xctx *x, const sql_stmt *st, const char *name, uint16_t *eid, imdb_err *e)
+{
+    if (!x->db) /* a CHECK's or a generated column's subset (chk_compile): no catalog, and no ENUM there (deferred.md D27) */
+        return imdb_fail(e, IMDB_ERR_INVALID, "a CHECK or a generated column reads no ENUM value yet: a later step (deferred.md D27)");
+    uint64_t snap, pend;
+    if (snapshot_of(x, st, &snap, &pend, e)) return e->code;
+    imdb_enum *t = imdb_enum_at(x->db, name, snap);
+    if (!t) t = imdb_enum_by_name(x->db, name);
+    if (!t) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no type %s", name);
+    deps_note(x, IMDB_VIEWDEP_TYPE, t->def->id);
+    *eid = (uint16_t)t->def->id;
+    return IMDB_OK;
+}
+
+/* F3g: an ordinal a parameter holds (the API's, an EXECUTE's) a label of type eid at the statement's read point */
+static int enum_ord(xctx *x, const sql_stmt *st, uint32_t eid, int64_t ord, imdb_err *e)
+{
+    const imdb_enumdef *d = x->db ? imdb_enum_def(x->db, eid) : NULL;
+    if (!d) return imdb_fail(e, IMDB_ERR_INVALID, "an ENUM parameter of no type");
+    uint64_t snap, pend;
+    if (snapshot_of(x, st, &snap, &pend, e)) return e->code;
+    if (ord < 0 || ord >= imdb_enumdef_count_at(d, snap)) return imdb_fail(e, IMDB_ERR_INVALID, "a parameter that is no label of type %s", d->name);
+    return IMDB_OK;
+}
+
+/* F3g: a string literal's text (as written: '' its quote) as a label of type eid at the statement's read point: its
+ * ordinal, or an error naming the type, never the text (a row's value, design.md §5) */
+static int enum_label(xctx *x, const sql_stmt *st, uint32_t eid, const char *txt, size_t tl, int32_t *k, imdb_err *e)
+{
+    if (!x->db)
+        return imdb_fail(e, IMDB_ERR_INVALID, "a CHECK or a generated column reads no ENUM value yet: a later step (deferred.md D27)");
+    const imdb_enumdef *d = imdb_enum_def(x->db, eid);
+    if (!d) return imdb_fail(e, IMDB_ERR_STATE, "an ENUM value of no type");
+    char lab[2 * IMDB_MAX_ENUM_LABEL + 2];
+    size_t n = 0;
+    for (size_t i = 0; i < tl; i++) { /* '' -> ': a label is at most 63 bytes, so a longer text is no label */
+        if (n > IMDB_MAX_ENUM_LABEL) break;
+        lab[n++] = txt[i];
+        if (txt[i] == '\'') i++;
+    }
+    uint64_t snap, pend;
+    if (snapshot_of(x, st, &snap, &pend, e)) return e->code;
+    int ord = n <= IMDB_MAX_ENUM_LABEL ? imdb_enumdef_find(d, lab, n) : -1;
+    if (ord < 0 || ord >= imdb_enumdef_count_at(d, snap))
+        return imdb_fail(e, IMDB_ERR_INVALID, "not a label of type %s", d->name);
+    *k = ord;
+    return IMDB_OK;
 }
 
 /* P2 S7: a view a read names, run as `(its query) AS name` would be: its text parsed again (each statement that names
@@ -4621,7 +4803,8 @@ static int expand_view(xctx *x, const sql_stmt *st, imdb_view *v, imdb_table **o
     if (rc) return rc;
     bool same = rs->r.ncols == d->ncols;
     for (uint16_t c = 0; same && c < d->ncols; c++)
-        same = rs->r.ctype[c] == d->cols[c].type && (d->cols[c].type != IMDB_T_DECIMAL || rs->r.cscale[c] == d->cols[c].scale);
+        same = rs->r.ctype[c] == d->cols[c].type && (d->cols[c].type != IMDB_T_DECIMAL || rs->r.cscale[c] == d->cols[c].scale) &&
+               (d->cols[c].type != IMDB_T_ENUM || rs->r.ceid[c] == d->cols[c].eid); /* F3g */
     if (!same) return imdb_fail(e, IMDB_ERR_STATE, "view %s no longer matches its definition", v->name);
     for (uint16_t c = 0; c < d->ncols; c++) res_name(&rs->r, c, d->cols[c].name);
     if (rset_table(x, rs, e)) return e->code;
@@ -4754,6 +4937,7 @@ static int exec_create_view(xctx *x, const sql_stmt *st, imdb_result *r, imdb_er
             snprintf(def->cols[c].name, sizeof def->cols[c].name, "%s", st->nset ? st->set_cols[c] : pr.names[c]);
             def->cols[c].type = pr.ctype[c];
             def->cols[c].scale = pr.ctype[c] == IMDB_T_DECIMAL ? pr.cscale[c] : 0;
+            def->cols[c].eid = pr.ctype[c] == IMDB_T_ENUM ? pr.ceid[c] : 0; /* F3g */
         }
         if (deps->n) memcpy(def->deps, deps->d, deps->n * sizeof *def->deps);
         memcpy(def->text, x->sql + st->body_off, st->body_len);
@@ -4792,6 +4976,8 @@ static int exec_show_views(xctx *x, imdb_result *r, imdb_err *e)
             const imdb_viewcol *vc = &v->def->cols[c];
             if (vc->type == IMDB_T_DECIMAL)
                 at += (size_t)snprintf(cols + at, sizeof cols - at, "%s%s DECIMAL(38,%u)", c ? ", " : "", vc->name, vc->scale); /* F3e: a row set's */
+            else if (vc->type == IMDB_T_ENUM && imdb_enum_def(db, vc->eid)) /* F3g: its type's name */
+                at += (size_t)snprintf(cols + at, sizeof cols - at, "%s%s %s", c ? ", " : "", vc->name, imdb_enum_def(db, vc->eid)->name);
             else at += (size_t)snprintf(cols + at, sizeof cols - at, "%s%s %s", c ? ", " : "", vc->name, imdb_type_name(vc->type));
         }
         imdb_cell *row = res_row(r, e);
@@ -4912,6 +5098,8 @@ static int chk_types(const sql_stmt *st, const imdb_xnode *xn, uint16_t k, uint6
             return imdb_fail(e, IMDB_ERR_INVALID, "%s computes no FLOAT64 value: a later step (deferred.md D19)", w);
         if (xn[k].type == IMDB_T_UUID || xn[k].type == IMDB_T_BYTEA) /* F3d: the verifiers' evaluators lack them: a second pass */
             return imdb_fail(e, IMDB_ERR_INVALID, "%s reads no UUID or BYTEA value yet: a later step (f3d-design.md section 7)", w);
+        if (xn[k].type == IMDB_T_ENUM) /* F3g: the verifiers' evaluators lack the labels (deferred.md D27) */
+            return imdb_fail(e, IMDB_ERR_INVALID, "%s reads no ENUM value yet: a later step (deferred.md D27)", w);
         if (xn[k].type == IMDB_T_INTERVAL) /* F3f: the verifiers' evaluators lack it (deferred.md D26) */
             return imdb_fail(e, IMDB_ERR_INVALID, "%s reads no INTERVAL value yet: a later step (deferred.md D26)", w);
         if (x->op == EX_LIT && x->lit.kind != LIT_NULL && xn[k].type == IMDB_T_TIMESTAMPTZ) /* a NULL is no instant */
@@ -5523,7 +5711,8 @@ int imdb_view_rebind(imdb_db *db, const imdb_viewdef *def, imdb_err *e)
                                                                       "against the catalog at its commit (%s)", def->id, pe.msg);
     bool same = !rc && pr.ncols == def->ncols && deps->n == def->ndeps;
     for (uint16_t c = 0; same && c < def->ncols; c++)
-        same = pr.ctype[c] == def->cols[c].type && (def->cols[c].type != IMDB_T_DECIMAL || pr.cscale[c] == def->cols[c].scale);
+        same = pr.ctype[c] == def->cols[c].type && (def->cols[c].type != IMDB_T_DECIMAL || pr.cscale[c] == def->cols[c].scale) &&
+               (def->cols[c].type != IMDB_T_ENUM || pr.ceid[c] == def->cols[c].eid); /* F3g */
     for (uint16_t k = 0; same && k < def->ndeps; k++)
         same = deps->d[k].kind == def->deps[k].kind && deps->d[k].id == def->deps[k].id;
     if (!rc && !same)
@@ -6754,7 +6943,8 @@ static int join_pair_add(jctx *j, int c0, int c1, imdb_err *e)
 {
     const imdb_column *k0 = &j->t[0]->s.cols[c0], *k1 = &j->t[1]->s.cols[c1];
     if (k0->type == IMDB_T_INTERVAL) return iv_unsupported(e, "USING"); /* F3f */
-    if (k0->type != k1->type || (k0->type == IMDB_T_DECIMAL && k0->scale != k1->scale))
+    if (k0->type != k1->type || (k0->type == IMDB_T_DECIMAL && k0->scale != k1->scale) ||
+        (k0->type == IMDB_T_ENUM && k0->eid != k1->eid)) /* F3g: one ENUM type */
         return imdb_fail(e, IMDB_ERR_INVALID, "a join's key compares %s with %s: values are not converted",
                          imdb_type_name(k0->type), imdb_type_name(k1->type));
     if (j->nkey >= IMDB_MAX_JOIN_KEYS)
@@ -6775,7 +6965,8 @@ static int join_eq_pair(jctx *j, const sql_stmt *st, uint16_t k, imdb_err *e)
     if (join_col(st, j->t, a->qual, a->col, &sa, &ca, e) || join_col(st, j->t, b->qual, b->col, &sb, &cb, e)) return e->code;
     if (sa == sb) return 0;
     const imdb_column *x = &j->t[sa]->s.cols[ca], *y = &j->t[sb]->s.cols[cb];
-    if (x->type != y->type || (x->type == IMDB_T_DECIMAL && x->scale != y->scale)) return 0; /* compared as a condition */
+    if (x->type != y->type || (x->type == IMDB_T_DECIMAL && x->scale != y->scale) || (x->type == IMDB_T_ENUM && x->eid != y->eid))
+        return 0; /* compared as a condition (F3g: two ENUM types, refused there) */
     if (x->type == IMDB_T_INTERVAL) return 0; /* F3f: compared as a condition, by its span (a key map compares the triple) */
     int rc = sa == 0 ? join_pair_add(j, ca, cb, e) : join_pair_add(j, cb, ca, e);
     return rc ? rc : 1;
@@ -6854,7 +7045,8 @@ static int exec_join(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, im
             j->key[s0] = c0;
             j->key[s1] = c1;
             const imdb_column *k0 = &t[0]->s.cols[j->key[0]], *k1 = &t[1]->s.cols[j->key[1]];
-            if (k0->type != k1->type || (k0->type == IMDB_T_DECIMAL && k0->scale != k1->scale))
+            if (k0->type != k1->type || (k0->type == IMDB_T_DECIMAL && k0->scale != k1->scale) ||
+                (k0->type == IMDB_T_ENUM && k0->eid != k1->eid)) /* F3g: one ENUM type */
                 rc = imdb_fail(e, IMDB_ERR_INVALID, "a join's ON compares %s with %s: values are not converted",
                                imdb_type_name(k0->type), imdb_type_name(k1->type));
         }
@@ -7007,7 +7199,7 @@ static int exec_select_const(xctx *x, const sql_stmt *st, imdb_result *r, xplain
             return imdb_fail(e, IMDB_ERR_INVALID, "an aggregate or a column needs FROM");
         if (ex_reads(st, it->expr)) return imdb_fail(e, IMDB_ERR_INVALID, "a column needs FROM");
         if (xbind_v(x, &sc, it->expr, e)) return e->code;
-        x_type_null(x, it->expr, IMDB_T_TEXT, 0); /* SELECT NULL: a TEXT NULL, as PostgreSQL types an unknown one */
+        x_type_null(x, it->expr, imdb_xty_of(IMDB_T_TEXT, 0, 0)); /* SELECT NULL: a TEXT NULL, as PostgreSQL types an unknown one */
     }
     if (xp) {
         if (x->probe_r) probe_types(x, st, NULL, NULL, x->probe_r); /* P2 S4b: the bind-only pass */
@@ -7102,13 +7294,12 @@ static int arm_run(xctx *x, const sql_stmt *a, imdb_result *r, imdb_err *e)
 
 /* a row of r as values of the unified types ut, us (exact: imdb_x_widen), and their encoding: two rows are one where
  * their encodings are (NULLs equal, as a set operation takes them) */
-static int setop_row(const imdb_result *r, uint64_t i, const uint8_t *ut, const uint8_t *us, imdb_xval *v, imdb_buf *b,
-                     imdb_err *e)
+static int setop_row(const imdb_result *r, uint64_t i, const imdb_xty *u, imdb_xval *v, imdb_buf *b, imdb_err *e)
 {
     b->len = 0;
     for (uint16_t c = 0; c < r->ncols; c++) {
-        cell_xval(&r->cells[i * r->ncols + c], r->ctype[c], r->cscale[c], &v[c]);
-        if (imdb_x_widen(&v[c], ut[c], us[c], e)) return e->code;
+        cell_xval(&r->cells[i * r->ncols + c], r->ctype[c], r->cscale[c], r->ceid[c], &v[c]);
+        if (imdb_x_widen(&v[c], u[c].type, u[c].scale, e)) return e->code;
         key_enc(b, &v[c]);
     }
     imdb_buf_put_u8(b, 0); /* never empty */
@@ -7132,22 +7323,22 @@ static int setop_fold(xctx *x, uint8_t op, const imdb_result *acc, const imdb_re
         return imdb_fail(e, IMDB_ERR_INVALID, "a set operation's SELECTs return %u and %u columns: one count", acc->ncols,
                          b->ncols);
     uint16_t n = acc->ncols;
-    uint8_t ut[IMDB_MAX_COLS + 4], us[IMDB_MAX_COLS + 4];
+    imdb_xty u[IMDB_MAX_COLS + 4];
     for (uint16_t c = 0; c < n; c++) {
         char what[64];
         snprintf(what, sizeof what, "a set operation's column %u is", c + 1u);
-        ut[c] = acc->ctype[c];
-        us[c] = acc->cscale[c];
-        if (imdb_x_unify(&ut[c], &us[c], b->ctype[c], b->cscale[c], what, e)) return e->code;
-        if (ut[c] == IMDB_T_INTERVAL && op != (SQL_SET_UNION | SQL_SET_ALL)) /* F3f: the rest match rows by equality */
+        u[c] = imdb_xty_of(acc->ctype[c], acc->cscale[c], acc->ceid[c]);
+        if (imdb_x_unify(&u[c], imdb_xty_of(b->ctype[c], b->cscale[c], b->ceid[c]), what, e)) return e->code;
+        if (u[c].type == IMDB_T_INTERVAL && op != (SQL_SET_UNION | SQL_SET_ALL)) /* F3f: the rest match rows by equality */
             return iv_unsupported(e, "a set operation other than UNION ALL");
     }
     res_cols(out, n);
     out->byte_cap = workspace_of(x->ss);
     for (uint16_t c = 0; c < n; c++) {
         res_name(out, c, acc->names[c]);
-        out->ctype[c] = ut[c];
-        out->cscale[c] = us[c];
+        out->ctype[c] = u[c].type;
+        out->cscale[c] = u[c].scale;
+        out->ceid[c] = u[c].eid;
     }
     bool all = op & SQL_SET_ALL;
     uint8_t o = op & (uint8_t)~SQL_SET_ALL;
@@ -7161,7 +7352,7 @@ static int setop_fold(xctx *x, uint8_t op, const imdb_result *acc, const imdb_re
     if (!rc && o != SQL_SET_UNION) rc = imdb_hmap_init(&cnt, IMDB_T_TEXT, e);
     for (uint64_t i = 0; !rc && o != SQL_SET_UNION && i < b->nrows; i++) { /* b's rows counted */
         if (++x->ticks >= x->next_check && (rc = xcheck(x, e))) break;
-        if ((rc = setop_row(b, i, ut, us, v, &kb, e))) break;
+        if ((rc = setop_row(b, i, u, v, &kb, e))) break;
         imdb_value k = {.type = IMDB_T_TEXT, .s = kb.p, .len = (uint32_t)kb.len};
         uint64_t *h = imdb_hmap_get(&cnt, &k);
         if (h) (*h)++;
@@ -7171,7 +7362,7 @@ static int setop_fold(xctx *x, uint8_t op, const imdb_result *acc, const imdb_re
         const imdb_result *r = side ? b : acc;
         for (uint64_t i = 0; !rc && i < r->nrows; i++) {
             if (++x->ticks >= x->next_check && (rc = xcheck(x, e))) break;
-            if ((rc = setop_row(r, i, ut, us, v, &kb, e))) break;
+            if ((rc = setop_row(r, i, u, v, &kb, e))) break;
             imdb_value k = {.type = IMDB_T_TEXT, .s = kb.p, .len = (uint32_t)kb.len};
             bool keep = true;
             if (o != SQL_SET_UNION) {
@@ -7207,8 +7398,8 @@ static int cmp_setrow(const void *pa, const void *pb, void *ctx)
     for (uint8_t o = 0; o < c->st->norder; o++) {
         uint16_t k = c->key[o];
         imdb_xval u, w;
-        cell_xval(&c->r->cells[i * c->r->ncols + k], c->r->ctype[k], c->r->cscale[k], &u);
-        cell_xval(&c->r->cells[j * c->r->ncols + k], c->r->ctype[k], c->r->cscale[k], &w);
+        cell_xval(&c->r->cells[i * c->r->ncols + k], c->r->ctype[k], c->r->cscale[k], c->r->ceid[k], &u);
+        cell_xval(&c->r->cells[j * c->r->ncols + k], c->r->ctype[k], c->r->cscale[k], c->r->ceid[k], &w);
         int d = 0;
         if (u.null || w.null) d = u.null == w.null ? 0 : (u.null == c->st->ord_nulls_first[o]) ? -1 : 1;
         else d = c->st->ord_desc[o] ? -imdb_x_cmp(&u, &w) : imdb_x_cmp(&u, &w);
@@ -7320,6 +7511,7 @@ static int exec_setop(xctx *x, const sql_stmt *st, imdb_result *r, struct xplain
             memcpy(x->probe_r->names, acc.names, sizeof acc.names);
             memcpy(x->probe_r->ctype, acc.ctype, sizeof acc.ctype);
             memcpy(x->probe_r->cscale, acc.cscale, sizeof acc.cscale);
+            memcpy(x->probe_r->ceid, acc.ceid, sizeof acc.ceid); /* F3g */
         }
         imdb_result_free(&acc);
         return IMDB_OK;
@@ -7382,6 +7574,7 @@ static void rec_open(imdb_result *r, const imdb_result *like, uint64_t cap)
         res_name(r, c, like->names[c]);
         r->ctype[c] = like->ctype[c];
         r->cscale[c] = like->cscale[c];
+        r->ceid[c] = like->ceid[c];
     }
 }
 
@@ -7392,11 +7585,13 @@ static int rec_take(xctx *x, const imdb_result *n, imdb_result *all, imdb_result
                     imdb_buf *kb, imdb_err *e)
 {
     imdb_xval v[IMDB_MAX_COLS + 4];
+    imdb_xty u[IMDB_MAX_COLS + 4]; /* the base's types (F3g: an ENUM's id too) */
+    for (uint16_t c = 0; c < all->ncols; c++) u[c] = imdb_xty_of(all->ctype[c], all->cscale[c], all->ceid[c]);
     for (uint16_t c = 0; !keep_all && c < all->ncols; c++) /* F3f: UNION matches rows by equality (UNION ALL keeps them) */
         if (all->ctype[c] == IMDB_T_INTERVAL) return iv_unsupported(e, "WITH RECURSIVE's UNION");
     for (uint64_t i = 0; i < n->nrows; i++) {
         if (++x->ticks >= x->next_check && xcheck(x, e)) return e->code;
-        if (setop_row(n, i, all->ctype, all->cscale, v, kb, e)) return e->code;
+        if (setop_row(n, i, u, v, kb, e)) return e->code;
         if (!keep_all) {
             imdb_value k = {.type = IMDB_T_TEXT, .s = kb->p, .len = (uint32_t)kb->len};
             if (imdb_hmap_get(seen, &k)) continue;
@@ -7413,12 +7608,12 @@ static int rec_fits(const char *name, const imdb_result *all, const imdb_result 
     if (n->ncols != all->ncols)
         return imdb_fail(e, IMDB_ERR_INVALID, "WITH RECURSIVE %s: its SELECTs return %u and %u columns", name, all->ncols, n->ncols);
     for (uint16_t k = 0; k < n->ncols; k++) {
-        uint8_t t = all->ctype[k], s = all->cscale[k];
+        imdb_xty t = imdb_xty_of(all->ctype[k], all->cscale[k], all->ceid[k]);
         char what[96];
         snprintf(what, sizeof what, "WITH RECURSIVE %s's column %u is", name, k + 1u);
-        int rc = imdb_x_unify(&t, &s, n->ctype[k], n->cscale[k], what, e);
+        int rc = imdb_x_unify(&t, imdb_xty_of(n->ctype[k], n->cscale[k], n->ceid[k]), what, e);
         if (rc) return rc;
-        if (t != all->ctype[k] || s != all->cscale[k])
+        if (t.type != all->ctype[k] || t.scale != all->cscale[k])
             return imdb_fail(e, IMDB_ERR_INVALID, "WITH RECURSIVE %s: its second SELECT's column %u is wider than its first's: "
                                                   "CAST it", name, k + 1u);
     }
@@ -7545,6 +7740,7 @@ static bool ex_alike(const xctx *x, const sql_stmt *st, uint16_t a, uint16_t b)
         return p->lit.kind == q->lit.kind && p->lit.neg == q->lit.neg && p->lit.bval == q->lit.bval &&
                p->lit.param == q->lit.param && p->lit.len == q->lit.len && p->lit.kind != LIT_EXPR &&
                (!p->lit.len || !memcmp(x->sql + p->lit.off, x->sql + q->lit.off, p->lit.len));
+    if (p->op == EX_CAST && p->ctype == IMDB_T_ENUM && strcmp(p->col, q->col)) return false; /* F3g: its type's name */
     if (p->op == EX_COL) return !strcmp(p->qual, q->qual) && !strcmp(p->col, q->col);
     return ex_alike(x, st, p->l, q->l) && ex_alike(x, st, p->r, q->r) && ex_alike(x, st, p->x3, q->x3);
 }
@@ -7575,7 +7771,7 @@ typedef struct witem { /* a window function of the SELECT list */
 
 static void rval(const imdb_result *R, uint64_t row, uint16_t col, imdb_xval *v)
 {
-    cell_xval(&R->cells[row * R->ncols + col], R->ctype[col], R->cscale[col], v);
+    cell_xval(&R->cells[row * R->ncols + col], R->ctype[col], R->cscale[col], R->ceid[col], v);
 }
 
 /* two rows alike in columns c[0..n) (NULLs alike: one partition, one peer group) */
@@ -7700,7 +7896,7 @@ static int slide_to(xctx *x, wslide *w, const imdb_result *R, const uint64_t *sr
         w->dq[w->dt++] = w->hi;
     }
     if (!ext) return xacc_value(&w->acc, agg, b, ta, sa, out, e);
-    if (w->dh == w->dt) *out = (imdb_xval){.type = b->type, .scale = b->scale, .null = true};
+    if (w->dh == w->dt) *out = (imdb_xval){.type = b->type, .scale = b->scale, .eid = b->eid, .null = true};
     else rval(R, srt[w->dq[w->dh]], vcol, out);
     return IMDB_OK;
 }
@@ -7736,7 +7932,7 @@ static int win_compute(xctx *x, const sql_stmt *st, const witem *v, const imdb_r
             dense++;
             for (int64_t p = gs; p < ge && !rc; p++) {
                 if (++x->ticks >= x->next_check && (rc = xcheck(x, e))) break;
-                imdb_xval out = {.type = b->type, .scale = b->scale};
+                imdb_xval out = {.type = b->type, .scale = b->scale, .eid = b->eid};
                 switch (n->fn) {
                 case WF_ROW_NUMBER: out.i = p - ps + 1; break;
                 case WF_RANK: out.i = gs - ps + 1; break;
@@ -7911,6 +8107,7 @@ static int exec_window(xctx *x, const sql_stmt *st, imdb_result *r, struct xplai
         for (uint8_t q = 0; q < nwi; q++) {
             W.ctype[q] = R.ctype[wi[q].item];
             W.cscale[q] = R.cscale[wi[q].item];
+            W.ceid[q] = R.ceid[wi[q].item];
         }
         for (uint64_t i = 0; !rc && i < N; i++)
             if (!res_row(&W, e)) rc = e->code;
@@ -7943,6 +8140,7 @@ static int exec_window(xctx *x, const sql_stmt *st, imdb_result *r, struct xplai
             res_name(r, i, R.names[i]);
             r->ctype[i] = R.ctype[i];
             r->cscale[i] = R.cscale[i];
+            r->ceid[i] = R.ceid[i];
         }
     }
     imdb_hmap seen;
@@ -8230,7 +8428,7 @@ static int ret_prepare(xctx *x, const sql_stmt *st, imdb_table *t, imdb_table *u
     if (u) sc.jt = jt, sc.nc0 = t->s.ncols;
     for (uint16_t i = 0; !st->star && i < st->nitems; i++) {
         if (xnodes(x, st, e) || xbind_v(x, &sc, st->items[i].expr, e)) return e->code;
-        x_type_null(x, st->items[i].expr, IMDB_T_TEXT, 0);
+        x_type_null(x, st->items[i].expr, imdb_xty_of(IMDB_T_TEXT, 0, 0));
     }
     uint16_t nt = t->s.ncols, n = st->star ? (uint16_t)(nt + (u ? u->s.ncols : 0)) : st->nitems;
     if (res_cols(r, n)) return imdb_fail(e, IMDB_ERR_NOMEM, "a result's columns");
@@ -8248,6 +8446,7 @@ static int ret_prepare(xctx *x, const sql_stmt *st, imdb_table *t, imdb_table *u
         const imdb_column *c = i < nt ? &t->s.cols[i] : &u->s.cols[i - nt];
         r->ctype[i] = c->type;
         r->cscale[i] = c->scale;
+        r->ceid[i] = c->eid; /* F3g */
     }
     return IMDB_OK;
 }
@@ -8480,7 +8679,7 @@ static int insert_query(xctx *x, const sql_stmt *st, imdb_table *t, const int *m
         if ((rc = xtick(x, 64, e))) break; /* a write weighs more than a read */
         for (uint16_t i = 0; i < width && !rc; i++) {
             imdb_xval v;
-            cell_xval(&q.cells[row * q.ncols + i], q.ctype[i], q.cscale[i], &v);
+            cell_xval(&q.cells[row * q.ncols + i], q.ctype[i], q.cscale[i], q.ceid[i], &v);
             imdb_err e2 = {0};
             if (imdb_x_assign(&t->s.cols[map[i]], &v, &vals[map[i]], &e2))
                 rc = imdb_fail(e, e2.code, "row %llu: %s", (unsigned long long)(row + 1), e2.msg);
@@ -8618,7 +8817,7 @@ static int exec_insert(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
 
 
 /* ---- P2 S10: COPY (design.md §5, Import and export) -------------------------------------------------------------- */
-static void cell_text(const imdb_cell *c, imdb_buf *out, bool safe);
+static void cell_text(const imdb_cell *c, const imdb_enumdef *lab, imdb_buf *out, bool safe);
 
 /* COPY's columns: a list as INSERT's (FROM: a column left out is its DEFAULT, F1: an ADD's, else NULL, refused when NOT
  * NULL; TO, vals NULL: any of them, P2 S17: S10 refused a TO that left out a NOT NULL column), else every column in
@@ -8716,6 +8915,15 @@ static int copy_value(const imdb_column *col, const char *s, uint32_t n, bool qu
         v->len = (uint32_t)got;
         return IMDB_OK;
     }
+    case IMDB_T_ENUM: { /* F3g: a label of its type at the statement's read point (a quoted empty field the empty label) */
+        const imdb_enumdef *d = env && env->edb ? imdb_enum_def(env->edb, col->eid) : NULL;
+        if (!d) return imdb_fail(e, IMDB_ERR_STATE, "COPY: an ENUM column of no type");
+        int k = imdb_enumdef_find(d, s, n);
+        if (k < 0 || k >= imdb_enumdef_count_at(d, env->enum_snap)) return imdb_fail(e, IMDB_ERR_INVALID, "not a label of type %s", d->name);
+        v->i = k;
+        v->eid = col->eid;
+        return IMDB_OK;
+    }
     case IMDB_T_INTERVAL: { /* F3f: PostgreSQL's verbose form, which COPY TO writes */
         int32_t mon, day;
         if (imdb_parse_interval(s, n, &mon, &day, &x, e)) return e->code;
@@ -8761,6 +8969,8 @@ static int exec_copy_from(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err 
     uint16_t width;
     imdb_value vals[IMDB_MAX_COLS];
     seqfill f = {0}; /* F2a-2 */
+    uint64_t rsnap, rpend; /* F3g: the read point whose labels an ENUM field takes */
+    if (snapshot_of(x, st, &rsnap, &rpend, e)) return e->code;
     if (copy_columns(t, st, map, &width, vals, &x->env, &f, e)) return e->code;
     imdb_csv c;
     if (imdb_csv_init(&c, ss->copy_rd, ss->copy_arg, st->copy_delim, e)) return e->code;
@@ -8884,7 +9094,7 @@ static void copy_row(sink *k, const imdb_value *vals)
         imdb_cell cl = {.v = *v};
         if (v->type == IMDB_T_TIMESTAMPTZ) cl.tz_off = imdb_x_tz_off(&k->x->env, k->x->env.zone, v->i); /* P2: as SELECT shows it */
         k->ctmp->len = 0;
-        cell_text(&cl, k->ctmp, false);
+        cell_text(&cl, v->type == IMDB_T_ENUM ? imdb_enum_def(k->x->db, v->eid) : NULL, k->ctmp, false); /* F3g */
         if (imdb_buf_check(k->ctmp, k->e) || out_field(o, (const char *)k->ctmp->p, k->ctmp->len, k->cdelim, k->e)) goto fail;
     }
     if (out_put(o, "\n", 1, k->e)) goto fail;
@@ -8991,7 +9201,7 @@ static int exec_copy_to(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e
             if (c && out_put(&o, &d, 1, e)) rc = e->code;
             else if (!cl->null) {
                 tmp.len = 0;
-                cell_text(cl, &tmp, false);
+                cell_text(cl, cl->v.type == IMDB_T_ENUM ? imdb_enum_def(x->db, cl->v.eid) : NULL, &tmp, false); /* F3g */
                 if (imdb_buf_check(&tmp, e) || out_field(&o, (const char *)tmp.p, tmp.len, d, e)) rc = e->code;
             }
         }
@@ -9046,8 +9256,8 @@ static int pkrow_keys(const pkrow *a, const pkrow *b, const pkctx *c)
     for (int k = 1; !r && k < c->s->npk; k++) {
         uint16_t col = c->s->key[k];
         imdb_xval u, v;
-        cell_xval(&c->q->cells[a->i * c->q->ncols + col], c->q->ctype[col], c->q->cscale[col], &u);
-        cell_xval(&c->q->cells[b->i * c->q->ncols + col], c->q->ctype[col], c->q->cscale[col], &v);
+        cell_xval(&c->q->cells[a->i * c->q->ncols + col], c->q->ctype[col], c->q->cscale[col], c->q->ceid[col], &u);
+        cell_xval(&c->q->cells[b->i * c->q->ncols + col], c->q->ctype[col], c->q->cscale[col], c->q->ceid[col], &v);
         r = imdb_x_cmp(&u, &v);
     }
     return r;
@@ -9109,7 +9319,7 @@ static int exec_join_write(xctx *x, const sql_stmt *st, bool upd, imdb_result *r
     if (!rc && q.ncols != nt + nu) rc = imdb_fail(e, IMDB_ERR_STATE, "%s's join returned %u columns", what, q.ncols);
     if (!rc && q.nrows && !(pr = imdb_alloc_array(q.nrows, sizeof *pr, e))) rc = e->code;
     for (uint64_t i = 0; !rc && i < q.nrows; i++) {
-        cell_xval(&q.cells[i * q.ncols + t->s.key[0]], q.ctype[t->s.key[0]], q.cscale[t->s.key[0]], &pr[i].k);
+        cell_xval(&q.cells[i * q.ncols + t->s.key[0]], q.ctype[t->s.key[0]], q.cscale[t->s.key[0]], q.ceid[t->s.key[0]], &pr[i].k);
         pr[i].i = i;
     }
     pkctx pc = {&q, &t->s};
@@ -9136,7 +9346,7 @@ static int exec_join_write(xctx *x, const sql_stmt *st, bool upd, imdb_result *r
         imdb_xmark m = imdb_xarena_mark(&x->arena);
         for (uint16_t c = 0; c < nt + nu && !rc; c++) { /* the pair as the join read it: t's row, then u's */
             imdb_xval v;
-            cell_xval(&q.cells[row * q.ncols + c], q.ctype[c], q.cscale[c], &v);
+            cell_xval(&q.cells[row * q.ncols + c], q.ctype[c], q.cscale[c], q.ceid[c], &v);
             rc = imdb_x_assign(c < nt ? &t->s.cols[c] : &u->s.cols[c - nt], &v, &both[c], e);
         }
         imdb_value kv[IMDB_MAX_KEY_COLS];
@@ -9512,6 +9722,7 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
                 imdb_buf_printf(&cols, "%s%s %s", c ? ", " : "", cd->name,
                                 cd->type == IMDB_T_INT64                 ? imdb_int_name(cd->precision)
                                 : cd->type == IMDB_T_TEXT && cd->vlen ? "VARCHAR" /* F3c */
+                                : cd->type == IMDB_T_ENUM && imdb_enum_def(db, cd->eid) ? imdb_enum_def(db, cd->eid)->name /* F3g */
                                                                         : imdb_type_name(cd->type)); /* F3a */
                 if (cd->type == IMDB_T_DECIMAL) imdb_buf_printf(&cols, "(%u,%u)", cd->precision, cd->scale);
                 if (cd->type == IMDB_T_TEXT && cd->vlen) imdb_buf_printf(&cols, "(%u)", cd->vlen); /* F3c: VARCHAR(n) */
@@ -10016,7 +10227,8 @@ static bool is_write(uint8_t k)
     return k == ST_CREATE || k == ST_INSERT || k == ST_UPDATE || k == ST_DELETE || k == ST_CREATE_INDEX ||
            k == ST_DROP_INDEX || k == ST_ALTER_RETENTION || k == ST_ALTER_TABLE || k == ST_DROP_TABLE || k == ST_COPY_FROM || /* P2 S10 */
            k == ST_CREATE_VIEW || k == ST_DROP_VIEW || /* P2 S7 */
-           k == ST_CREATE_SEQUENCE || k == ST_DROP_SEQUENCE; /* F2a-2 */
+           k == ST_CREATE_SEQUENCE || k == ST_DROP_SEQUENCE || /* F2a-2 */
+           k == ST_CREATE_TYPE || k == ST_ALTER_TYPE || k == ST_DROP_TYPE; /* F3g */
 }
 
 /* A read statement's workspace (P0 R2): what SET statement_memory says, else a quarter of the memory budget, at most
@@ -10269,6 +10481,7 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
     x.env.seqfn = xenv_seqfn; /* F2a-2 */
     x.noxc = st->seq_write || st->rand_call; /* F3d: gen_random_uuid draws at each call: one plan */
     x.env.zone_get = xenv_zone;
+    x.env.edb = ss->db; /* F3g */
     imdb_db *db = ss->db;
     uint64_t seq_before = db->seq;
     if (db->failed) {
@@ -10327,12 +10540,14 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
     x.checks = !physical && st->kind != ST_COMMIT && st->kind != ST_CREATE && st->kind != ST_CREATE_INDEX &&
                st->kind != ST_DROP_INDEX && st->kind != ST_ALTER_RETENTION && st->kind != ST_ALTER_TABLE && st->kind != ST_DROP_TABLE &&
                st->kind != ST_CREATE_VIEW && st->kind != ST_DROP_VIEW && st->kind != ST_CREATE_SEQUENCE &&
-               st->kind != ST_DROP_SEQUENCE; /* each commits on its own (F2a-2: the sequence statements too) */
+               st->kind != ST_DROP_SEQUENCE && st->kind != ST_CREATE_TYPE && st->kind != ST_ALTER_TYPE &&
+               st->kind != ST_DROP_TYPE; /* each commits on its own (F2a-2: the sequence statements too; F3g: the types') */
     x.next_check = TICK_ROWS;
     if (x.checks && ss->stmt_timeout_ms) x.deadline_ns = mono_ns() + (uint64_t)ss->stmt_timeout_ms * 1000000u;
     if (txn && (st->kind == ST_CREATE || st->kind == ST_CREATE_INDEX || st->kind == ST_DROP_INDEX ||
                 st->kind == ST_ALTER_RETENTION || st->kind == ST_ALTER_TABLE || st->kind == ST_DROP_TABLE || st->kind == ST_CREATE_VIEW ||
-                st->kind == ST_DROP_VIEW || st->kind == ST_CREATE_SEQUENCE || st->kind == ST_DROP_SEQUENCE)) {
+                st->kind == ST_DROP_VIEW || st->kind == ST_CREATE_SEQUENCE || st->kind == ST_DROP_SEQUENCE ||
+                st->kind == ST_CREATE_TYPE || st->kind == ST_ALTER_TYPE || st->kind == ST_DROP_TYPE)) {
         rc = imdb_fail(e, IMDB_ERR_STATE, "%s commits on its own: run it outside the transaction",
                        st->kind == ST_CREATE         ? "CREATE TABLE"
                        : st->kind == ST_CREATE_INDEX ? "CREATE INDEX"
@@ -10342,6 +10557,9 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
                        : st->kind == ST_DROP_VIEW    ? "DROP VIEW"
                        : st->kind == ST_CREATE_SEQUENCE ? "CREATE SEQUENCE" /* F2a-2: DDL, as CREATE TABLE is */
                        : st->kind == ST_DROP_SEQUENCE ? "DROP SEQUENCE"
+                       : st->kind == ST_CREATE_TYPE ? "CREATE TYPE" /* F3g */
+                       : st->kind == ST_ALTER_TYPE ? "ALTER TYPE"
+                       : st->kind == ST_DROP_TYPE ? "DROP TYPE"
                                                      : "ALTER TABLE");
         goto done;
     }
@@ -10378,6 +10596,8 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
     switch (st->kind) {
     case ST_EMPTY: break;
     case ST_CREATE: { /* F2a: its columns' DEFAULTs (op 23): each a value of its column, or a clock its type suits */
+        for (uint16_t c = 0; !rc && c < st->schema.ncols; c++) /* F3g: an ENUM column's type, live, by its name */
+            if (st->schema.cols[c].type == IMDB_T_ENUM) rc = enum_live(db, st->ctname ? st->ctname[c] : "", &st->schema.cols[c].eid, e);
         imdb_coldef cd[IMDB_MAX_COLS];
         uint16_t ncd = 0;
         uint64_t genmask = 0; /* F2c: the generated columns, which no generated column's expression names */
@@ -10446,6 +10666,38 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
         if (!rc) snprintf(r->status, sizeof r->status, "CREATE TABLE %s", st->schema.name);
         break;
     }
+    case ST_CREATE_TYPE: { /* F3g: op 30, alone: the labels as written, each read ('' its quote) and checked by the builder */
+        const char **lab = xalloc(&x, (st->rowlen ? st->rowlen : 1) * sizeof *lab, e);
+        size_t *lln = lab ? xalloc(&x, (st->rowlen ? st->rowlen : 1) * sizeof *lln, e) : NULL;
+        if (!lln) {
+            rc = e->code;
+            break;
+        }
+        for (uint16_t i = 0; !rc && i < st->rowlen; i++) {
+            char *b = NULL;
+            if ((rc = lit_text(&x, &st->vals[i], &b, &lln[i], e))) break;
+            lab[i] = b;
+        }
+        if (!rc) rc = imdb_create_enum(db, st->table, lab, lln, st->rowlen, e);
+        if (!rc) snprintf(r->status, sizeof r->status, "CREATE TYPE %s", st->table);
+        break;
+    }
+    case ST_ALTER_TYPE: { /* F3g: ADD VALUE, op 32 alone (IF NOT EXISTS: none for a label it holds) */
+        imdb_enum *t = imdb_enum_by_name(db, st->table);
+        char *b = NULL;
+        size_t n = 0;
+        if (!t) rc = imdb_fail(e, IMDB_ERR_NOTFOUND, "no type %s", st->table);
+        else if (!(rc = lit_text(&x, &st->alter_def, &b, &n, e))) rc = imdb_enum_add_value(db, t, b, n, st->if_not_exists, e);
+        if (!rc) snprintf(r->status, sizeof r->status, "ALTER TYPE %s", st->table);
+        break;
+    }
+    case ST_DROP_TYPE: { /* F3g: RESTRICT (op 31, alone); IF EXISTS: none for a name no live type holds */
+        imdb_enum *t = imdb_enum_by_name(db, st->table);
+        if (t) rc = imdb_drop_enum(db, t, e);
+        else if (!st->if_exists) rc = imdb_fail(e, IMDB_ERR_NOTFOUND, "no type %s", st->table);
+        if (!rc) snprintf(r->status, sizeof r->status, "DROP TYPE %s", st->table);
+        break;
+    }
     case ST_CREATE_SEQUENCE: { /* F2a-2: its definition from the options, PostgreSQL's defaults (op 24) */
         imdb_seqdef d;
         if (!(rc = seqdef_from(&st->seqopt, st->table, st->seqopt.width, &d, e)))
@@ -10471,9 +10723,11 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
         o.akind = st->alter_kind;
         if (o.akind == IMDB_ALTER_ADD_COLUMN) {
             o.acol = st->schema.cols[0];
+            if (o.acol.type == IMDB_T_ENUM) rc = enum_live(db, st->ctname ? st->ctname[0] : "", &o.acol.eid, e); /* F3g */
             o.adef = (imdb_value){.type = o.acol.type, .scale = o.acol.scale, .null = true};
             imdb_err e2 = {0};
-            if (o.acol.type == IMDB_T_DECIMAL &&
+            if (rc) {
+            } else if (o.acol.type == IMDB_T_DECIMAL &&
                 (o.acol.precision < 1 || o.acol.precision > IMDB_DEC_MAX_DIGITS || o.acol.scale > o.acol.precision)) /* F3e */
                 rc = imdb_fail(e, IMDB_ERR_INVALID, "column %s: DECIMAL(p,s) needs 1<=p<=38, 0<=s<=p", o.acol.name);
             else if (st->has_alter_def && st->alter_clock == IMDB_DEFK_RANDOM_UUID) /* F3d: PostgreSQL draws one a row there */
@@ -10519,6 +10773,7 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
                 o.acol.precision = col->precision;
                 o.acol.scale = col->scale;
                 o.acol.vlen = col->vlen; /* F3c: a VARCHAR's length (its DEFAULT within it) */
+                o.acol.eid = col->eid; /* F3g: an ENUM's type */
                 if (bind_lit(&x, &st->alter_def, col, false, &o.adef, e)) rc = e->code;
                 else if (o.adef.null || imdb_value_check(col, &o.adef, &e2))
                     rc = imdb_fail(e, IMDB_ERR_INVALID, "column %s: its DEFAULT: %s", col->name,
@@ -10830,6 +11085,7 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
     }
     if (ceiling) imdb_heap_ceiling_set(0, 0);
     wceil_lift(&x); /* P2 S8: a write that left before lifting its own (an error), before its savepoint is restored */
+    if (!rc) rc = res_labels(r, db, e); /* F3g: its ENUM columns' labels, before any commit: a failure rolls a write back */
     if (wr) {
         if (!rc && db->in_txn) rc = imdb_fk_check(db, sp.ntx, e); /* F2b-2: its writes' FOREIGN KEYs, at the statement's end */
         if (rc) {
@@ -10958,6 +11214,7 @@ static int exec_execute(imdb_session *ss, const sql_stmt *st, const char *sql, c
     px.env.now_us = ss->txn.open ? ss->txn.begin_us : imdb_now_us(); /* F2a */
     px.env.has_now = true;
     px.env.zone_get = xenv_zone;
+    px.env.edb = ss->db; /* F3g */
     imdb_value vals[IMDB_MAX_PARAMS];
     int rc = IMDB_OK;
     for (uint16_t i = 0; !rc && i < st->rowlen; i++) {
@@ -10969,6 +11226,10 @@ static int exec_execute(imdb_session *ss, const sql_stmt *st, const char *sql, c
             c.type = p->ptypes[i].type;
             c.scale = p->ptypes[i].scale;
             c.precision = p->ptypes[i].precision;
+            if (c.type == IMDB_T_ENUM && enum_named(&px, st, p->ptypes[i].tname, &c.eid, &e2)) { /* F3g: by its name, now */
+                rc = imdb_fail(e, e2.code, "EXECUTE %s, value %u: %s", p->name, i + 1u, e2.msg);
+                break;
+            }
             c.flags = IMDB_COL_NULLABLE;
             snprintf(c.name, sizeof c.name, "$%u", i + 1u);
             if (bind_lit(&px, l, &c, false, &vals[i], &e2))
@@ -11148,10 +11409,24 @@ int imdb_split_complete(const char *s, size_t n, imdb_stmt_cb cb, void *arg, siz
 
 /* ---- rendering ---------------------------------------------------------------------- */
 
-static void cell_text(const imdb_cell *c, imdb_buf *out, bool safe)
+static void cell_text(const imdb_cell *c, const imdb_enumdef *lab, imdb_buf *out, bool safe)
 {
     if (c->null) {
         imdb_buf_put_str(out, "null");
+        return;
+    }
+    if (c->v.type == IMDB_T_ENUM && !c->v.null) { /* F3g: its label (lab: the result's table, or the catalog's) */
+        if (!lab || c->v.i < 0 || c->v.i >= lab->n) {
+#ifdef IMDB_STORE_CHECKS
+            abort(); /* a caller without the labels is a bug */
+#endif
+            if (!out->err) out->err = IMDB_ERR_STATE; /* the render fails, never a wrong text */
+            return;
+        }
+        imdb_value tv = {.type = IMDB_T_TEXT, .s = (const uint8_t *)lab->text + lab->off[c->v.i],
+                         .len = lab->off[c->v.i + 1] - lab->off[c->v.i]};
+        if (safe) imdb_format_value_safe(&tv, out);
+        else imdb_format_value(&tv, out);
         return;
     }
     if (c->wide) {
@@ -11180,7 +11455,7 @@ static size_t disp_width(const uint8_t *p, size_t n)
  * the table's width pass made every cell's text, then its output pass made it again): a TIMESTAMP in range 19, 26 with
  * microseconds; an INT64 or DECIMAL its digits, sign and point; a BOOL and a NULL their words. TEXT (its escapes),
  * FLOAT64 (the shortest text that reads back) and a wide sum are made and measured as before. */
-static size_t cell_width_fast(const imdb_cell *c, imdb_buf *tmp)
+static size_t cell_width_fast(const imdb_cell *c, const imdb_enumdef *lab, imdb_buf *tmp)
 {
     if (c->null || c->v.null) return 4; /* "null" */
     if (!c->wide) {
@@ -11209,16 +11484,16 @@ static size_t cell_width_fast(const imdb_cell *c, imdb_buf *tmp)
         }
     }
     tmp->len = 0;
-    cell_text(c, tmp, true);
+    cell_text(c, lab, tmp, true);
     return disp_width(tmp->p, tmp->len);
 }
 
-static size_t cell_width(const imdb_cell *c, imdb_buf *tmp)
+static size_t cell_width(const imdb_cell *c, const imdb_enumdef *lab, imdb_buf *tmp)
 {
-    size_t w = cell_width_fast(c, tmp);
+    size_t w = cell_width_fast(c, lab, tmp);
 #ifdef IMDB_STORE_CHECKS /* the SAN and fuzz builds: every width the arithmetic gives is the text's */
     tmp->len = 0;
-    cell_text(c, tmp, true);
+    cell_text(c, lab, tmp, true);
     if (!tmp->err && w != disp_width(tmp->p, tmp->len)) abort();
 #endif
     return w;
@@ -11242,8 +11517,8 @@ void imdb_result_render(const imdb_result *r, bool csv, imdb_buf *out)
                 if (c) imdb_buf_put_u8(out, ',');
                 if (r->cells[i * nc + c].null) continue; /* NULL: an empty field (TEXT is always quoted) */
                 tmp.len = 0;
-                cell_text(&r->cells[i * nc + c], &tmp, false);
-                bool quote = r->cells[i * nc + c].v.type == IMDB_T_TEXT;
+                cell_text(&r->cells[i * nc + c], r->clab[c], &tmp, false);
+                bool quote = r->cells[i * nc + c].v.type == IMDB_T_TEXT || r->cells[i * nc + c].v.type == IMDB_T_ENUM; /* F3g: '' not NULL */
                 if (quote) imdb_buf_put_u8(out, '"');
                 for (size_t k = 0; k < tmp.len; k++) {
                     if (tmp.p[k] == '"') imdb_buf_put_u8(out, '"');
@@ -11261,7 +11536,7 @@ void imdb_result_render(const imdb_result *r, bool csv, imdb_buf *out)
     for (uint16_t c = 0; c < nc; c++) w[c] = strlen(r->names[c]);
     for (uint64_t i = 0; i < r->nrows; i++)
         for (uint16_t c = 0; c < nc; c++) {
-            size_t dw = cell_width(&r->cells[i * nc + c], &tmp);
+            size_t dw = cell_width(&r->cells[i * nc + c], r->clab[c], &tmp);
             if (dw > w[c]) w[c] = dw > 60 ? 60 : dw;
         }
     for (uint16_t c = 0; c < nc; c++) imdb_buf_printf(out, "%s %-*s", c ? " |" : "", (int)w[c], r->names[c]);
@@ -11275,11 +11550,11 @@ void imdb_result_render(const imdb_result *r, bool csv, imdb_buf *out)
         for (uint16_t c = 0; c < nc; c++) {
             tmp.len = 0;
             const imdb_cell *cell = &r->cells[i * nc + c];
-            cell_text(cell, &tmp, true);
+            cell_text(cell, r->clab[c], &tmp, true);
             size_t dw = disp_width(tmp.p, tmp.len);
             bool right = !cell->null && !imdb_type_bytes(cell->v.type) && cell->v.type != IMDB_T_TIMESTAMP &&
                          cell->v.type != IMDB_T_TIMESTAMPTZ && cell->v.type != IMDB_T_DATE && cell->v.type != IMDB_T_TIME &&
-                         cell->v.type != IMDB_T_INTERVAL; /* F3f: left, as psql sets it */
+                         cell->v.type != IMDB_T_INTERVAL && cell->v.type != IMDB_T_ENUM; /* F3f, F3g: left, as psql sets them */
             imdb_buf_put_str(out, c ? " | " : " ");
             if (right)
                 for (size_t k = dw; k < w[c]; k++) imdb_buf_put_u8(out, ' ');

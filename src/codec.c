@@ -87,6 +87,7 @@ const char *imdb_type_name(uint8_t t)
     case IMDB_T_UUID: return "UUID";
     case IMDB_T_BYTEA: return "BYTEA";
     case IMDB_T_INTERVAL: return "INTERVAL";
+    case IMDB_T_ENUM: return "ENUM";
     }
     return "?";
 }
@@ -199,6 +200,8 @@ int imdb_schema_check(const imdb_schema *s, imdb_err *e)
         } else if (c->precision || c->scale) {
             return imdb_fail(e, IMDB_ERR_INVALID, "column %s: precision/scale only valid for DECIMAL", c->name);
         }
+        if (c->type == IMDB_T_ENUM ? !c->eid : c->eid != 0) /* F3g: an ENUM column names its type, no other column does */
+            return imdb_fail(e, IMDB_ERR_INVALID, "column %s: an ENUM names its type, no other type does", c->name);
         if (c->flags & ~(IMDB_COL_PK | IMDB_COL_SUBJECT | IMDB_COL_NULLABLE))
             return imdb_fail(e, IMDB_ERR_INVALID, "column %s: unknown flags", c->name);
         if ((c->flags & IMDB_COL_NULLABLE) && (c->flags & (IMDB_COL_PK | IMDB_COL_SUBJECT)))
@@ -246,8 +249,9 @@ void imdb_schema_encode(const imdb_schema *s, imdb_buf *b)
         imdb_buf_put_u8(b, (uint8_t)cl);
         imdb_buf_put(b, c->name, cl);
         imdb_buf_put_u8(b, c->type);
-        imdb_buf_put_u8(b, c->type == IMDB_T_TEXT ? (uint8_t)(c->vlen & 0xff) : c->precision); /* F3c: a VARCHAR's length */
-        imdb_buf_put_u8(b, c->type == IMDB_T_TEXT ? (uint8_t)(c->vlen >> 8) : c->scale);
+        imdb_buf_put_u8(b, c->type == IMDB_T_TEXT ? (uint8_t)(c->vlen & 0xff) /* F3c: a VARCHAR's length; F3g: an ENUM's type */
+                           : c->type == IMDB_T_ENUM ? (uint8_t)(c->eid & 0xff) : c->precision);
+        imdb_buf_put_u8(b, c->type == IMDB_T_TEXT ? (uint8_t)(c->vlen >> 8) : c->type == IMDB_T_ENUM ? (uint8_t)(c->eid >> 8) : c->scale);
         imdb_buf_put_u8(b, c->flags);
     }
     /* the key, in key order (the format design's slice 1; F4: up to IMDB_MAX_KEY_COLS columns; each keeps its flag) */
@@ -285,6 +289,10 @@ int imdb_schema_decode(imdb_rd *r, imdb_schema *s, imdb_err *e)
         c->flags = imdb_rd_u8(r);
         if (c->type == IMDB_T_TEXT) { /* F3c: the two bytes a VARCHAR's length; a TEXT's precision and scale 0 */
             c->vlen = (uint16_t)(c->precision | c->scale << 8);
+            c->precision = c->scale = 0;
+        }
+        if (c->type == IMDB_T_ENUM) { /* F3g: the two bytes its type's id */
+            c->eid = (uint16_t)(c->precision | c->scale << 8);
             c->precision = c->scale = 0;
         }
         if (c->flags & IMDB_COL_SUBJECT) s->subject = (int16_t)i;
@@ -383,6 +391,10 @@ int imdb_value_check(const imdb_column *c, const imdb_value *v, imdb_err *e)
     case IMDB_T_UUID: /* F3d: 16 bytes always */
         if (v->len != IMDB_UUID_LEN || !v->s) return imdb_fail(e, IMDB_ERR_INVALID, "column %s: a UUID is 16 bytes", c->name);
         return IMDB_OK;
+    case IMDB_T_ENUM: /* F3g: its ordinal a u32, its type the column's (the count of labels is the catalog's check) */
+        if (v->wide || !c->eid || v->eid != c->eid || v->i < 0 || v->i > (int64_t)UINT32_MAX)
+            return imdb_fail(e, IMDB_ERR_INVALID, "column %s: not a value of its ENUM", c->name);
+        return IMDB_OK;
     case IMDB_T_INTERVAL: /* F3f: every triple is a value (PostgreSQL 14's range); the form an INTERVAL's alone */
         if (v->wide) return imdb_fail(e, IMDB_ERR_INVALID, "column %s: not an INTERVAL value", c->name);
         return IMDB_OK;
@@ -401,10 +413,10 @@ static uint32_t nullable_count(const imdb_schema *s)
     return n;
 }
 
-static size_t value_width(uint8_t type, const imdb_value *v)
+static size_t value_width(const imdb_column *c, const imdb_value *v) /* F3g: by imdb_fixed_width, the one width rule */
 {
-    return type == IMDB_T_TEXT || type == IMDB_T_BYTEA ? 4 + (size_t)v->len : type == IMDB_T_UUID ? IMDB_UUID_LEN : type == IMDB_T_BOOL ? 1
-         : (type == IMDB_T_DECIMAL && v->wide) || type == IMDB_T_INTERVAL ? 16 : 8; /* F3e: a wide DECIMAL; F3f: an INTERVAL */
+    uint32_t w = imdb_fixed_width(c);
+    return w ? w : 4 + (size_t)v->len;
 }
 
 int imdb_row_encode(const imdb_schema *s, const imdb_value *vals, imdb_buf *out, imdb_err *e)
@@ -419,7 +431,7 @@ int imdb_row_encode(const imdb_schema *s, const imdb_value *vals, imdb_buf *out,
             k++;
         }
         if (vals[i].null) continue;
-        if (imdb_add_ovf(total, value_width(s->cols[i].type, &vals[i]), &total) || total > IMDB_MAX_ROW)
+        if (imdb_add_ovf(total, value_width(&s->cols[i], &vals[i]), &total) || total > IMDB_MAX_ROW)
             return imdb_fail(e, IMDB_ERR_LIMIT, "row exceeds %u bytes", IMDB_MAX_ROW);
     }
     if (!imdb_buf_reserve(out, total)) return imdb_buf_check(out, e);
@@ -435,6 +447,7 @@ int imdb_row_encode(const imdb_schema *s, const imdb_value *vals, imdb_buf *out,
             break;
         case IMDB_T_UUID: imdb_buf_put(out, v->s, IMDB_UUID_LEN); break; /* F3d: no length: 16 always */
         case IMDB_T_BOOL: imdb_buf_put_u8(out, (uint8_t)v->i); break;
+        case IMDB_T_ENUM: imdb_buf_put_u32(out, (uint32_t)v->i); break; /* F3g: its ordinal */
         case IMDB_T_INTERVAL: /* F3f: months, days, microseconds */
             imdb_buf_put_u32(out, (uint32_t)v->iv.mon);
             imdb_buf_put_u32(out, (uint32_t)v->iv.day);
@@ -494,6 +507,10 @@ int imdb_row_decode(const imdb_schema *s, const uint8_t *row, size_t len, imdb_v
             if (!v->s) return imdb_fail(e, IMDB_ERR_CORRUPT, "row: truncated UUID");
             break;
         case IMDB_T_BOOL: v->i = imdb_rd_u8(&r); break;
+        case IMDB_T_ENUM: /* F3g: its ordinal, its type's id from the column */
+            v->i = imdb_rd_u32(&r);
+            v->eid = c->eid;
+            break;
         case IMDB_T_INTERVAL: /* F3f */
             v->iv.mon = (int32_t)imdb_rd_u32(&r);
             v->iv.day = (int32_t)imdb_rd_u32(&r);
@@ -534,8 +551,7 @@ void imdb_row_get(const imdb_schema *s, const uint8_t *row, size_t len, int col,
                 uint32_t n = imdb_rd_u32(&r);
                 (void)imdb_rd_bytes(&r, n);
             } else {
-                (void)imdb_rd_bytes(&r, t == IMDB_T_BOOL ? 1 : t == IMDB_T_UUID ? IMDB_UUID_LEN
-                                      : (t == IMDB_T_DECIMAL && imdb_dec_wide(c->precision)) || t == IMDB_T_INTERVAL ? 16 : 8);
+                (void)imdb_rd_bytes(&r, imdb_fixed_width(c)); /* F3g: the one width rule */
             }
             continue;
         }
@@ -550,6 +566,9 @@ void imdb_row_get(const imdb_schema *s, const uint8_t *row, size_t len, int col,
         } else if (t == IMDB_T_UUID) {
             v->s = imdb_rd_bytes(&r, IMDB_UUID_LEN);
             v->len = v->s ? IMDB_UUID_LEN : 0;
+        } else if (t == IMDB_T_ENUM) { /* F3g */
+            v->i = imdb_rd_u32(&r);
+            v->eid = c->eid;
         } else if (t == IMDB_T_BOOL) {
             v->i = imdb_rd_u8(&r);
         } else if (t == IMDB_T_INTERVAL) { /* F3f */
@@ -574,6 +593,12 @@ int imdb_value_cmp(const imdb_value *a, const imdb_value *b)
         int c = n ? memcmp(a->s, b->s, n) : 0;
         if (c) return c < 0 ? -1 : 1;
         return a->len < b->len ? -1 : a->len > b->len;
+    }
+    if (a->type == IMDB_T_ENUM) { /* F3g: one type's ordinals; two types never meet (a checked build stops: a tripwire) */
+#ifdef IMDB_STORE_CHECKS
+        if (a->eid != b->eid) abort();
+#endif
+        return a->i < b->i ? -1 : a->i > b->i;
     }
     if (a->type == IMDB_T_INTERVAL) { /* F3f: SQL's order is the span (PostgreSQL 14's interval_cmp): equal spans tie */
         __int128 x = imdb_iv_span(a->iv.mon, a->iv.day, a->i), y = imdb_iv_span(b->iv.mon, b->iv.day, b->i);
@@ -1529,6 +1554,12 @@ void imdb_format_value(const imdb_value *v, imdb_buf *out)
     case IMDB_T_UUID: imdb_format_uuid(v->s, out); break;
     case IMDB_T_BYTEA: imdb_format_bytea(v->s, v->len, out); break;
     case IMDB_T_INTERVAL: imdb_format_interval(v->iv.mon, v->iv.day, v->i, out); break;
+    case IMDB_T_ENUM: /* F3g: its label is its type's, which the caller holds: a checked build stops here */
+#ifdef IMDB_STORE_CHECKS
+        abort();
+#endif
+        imdb_format_int64(v->i, out);
+        break;
     }
 }
 

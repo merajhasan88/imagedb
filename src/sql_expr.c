@@ -9,6 +9,7 @@
  * when exact (|v| <= 2^53), a DECIMAL correctly rounded. Comparisons are exact and never fail; a NULL operand makes
  * an operation NULL. Messages never carry a value (the rule for every error the engine reports). */
 #include <math.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
@@ -105,11 +106,13 @@ void imdb_x_from_value(const imdb_value *v, imdb_xval *out)
     out->type = v->type;
     out->scale = v->scale;
     out->null = v->null;
+    if (v->type == IMDB_T_ENUM) out->eid = v->eid; /* F3g: a NULL keeps its type's id too */
     if (v->null) return;
     if (v->type == IMDB_T_FLOAT64) out->f = imdb_f64_value(v->i);
     else if (imdb_type_bytes(v->type)) out->s = v->s, out->len = v->len; /* F3d: UUID and BYTEA too */
     else if (v->type == IMDB_T_DECIMAL) out->i = imdb_dec_value(v); /* F3e: either form */
     else if (v->type == IMDB_T_INTERVAL) out->i = v->i, out->mon = v->iv.mon, out->day = v->iv.day; /* F3f */
+    else if (v->type == IMDB_T_ENUM) out->i = v->i, out->eid = v->eid; /* F3g: its ordinal and its type's id */
     else out->i = v->i;
 }
 
@@ -367,7 +370,11 @@ int imdb_x_neg(const imdb_xval *a, imdb_xval *out, imdb_err *e)
     return IMDB_OK;
 }
 
-bool imdb_x_comparable(uint8_t ta, uint8_t tb) { return ta == tb || (is_num(ta) && is_num(tb)); }
+bool imdb_x_comparable(imdb_xty a, imdb_xty b)
+{
+    if (a.type == b.type) return a.type != IMDB_T_ENUM || a.eid == b.eid; /* F3g: two ENUMs of one type alone */
+    return is_num(a.type) && is_num(b.type);
+}
 
 /* an integer against a double, exactly: no conversion that could round or fail */
 static int cmp_i_f(__int128 i, double d)
@@ -397,6 +404,10 @@ static int cmp_dec(__int128 x, int sx, __int128 y, int sy)
 
 int imdb_x_cmp(const imdb_xval *a, const imdb_xval *b)
 {
+#ifdef IMDB_STORE_CHECKS
+    if ((a->type == IMDB_T_ENUM || b->type == IMDB_T_ENUM) && (a->type != b->type || a->eid != b->eid || !a->eid))
+        abort(); /* F3g: the binder lets two ENUMs meet within one type alone: a site that compares across types is a bug */
+#endif
     if (imdb_type_bytes(a->type)) { /* F3d: memcmp, then the shorter first, for each byte string */
         uint32_t n = a->len < b->len ? a->len : b->len;
         int c = n ? memcmp(a->s, b->s, n) : 0;
@@ -424,6 +435,7 @@ int imdb_x_assign(const imdb_column *c, const imdb_xval *v, imdb_value *out, imd
     memset(out, 0, sizeof *out);
     out->type = c->type;
     out->scale = c->scale;
+    if (c->type == IMDB_T_ENUM) out->eid = c->eid; /* F3g */
     if (v->null) {
         out->null = true;
         return imdb_value_check(c, out, e);
@@ -454,6 +466,12 @@ int imdb_x_assign(const imdb_column *c, const imdb_xval *v, imdb_value *out, imd
         imdb_dec_set(out, r, imdb_dec_wide(c->precision));
         break;
     }
+    case IMDB_T_ENUM: /* F3g: a value of its own type alone (a label is read at binding, values are not converted) */
+        if (v->type != IMDB_T_ENUM || v->eid != c->eid)
+            return imdb_fail(e, IMDB_ERR_INVALID, "column %s expects a value of its ENUM type", c->name);
+        out->i = (int64_t)v->i;
+        out->eid = c->eid;
+        break;
     case IMDB_T_FLOAT64: {
         double d;
         if (!is_num(v->type))
@@ -651,6 +669,13 @@ static int cast_to_text(const imdb_xval *v, imdb_xenv *env, imdb_xval *out, imdb
     } else if (v->type == IMDB_T_UUID || v->type == IMDB_T_BYTEA) { /* F3d: the text forms */
         imdb_value iv = {.type = v->type, .s = v->s, .len = v->len};
         imdb_format_value(&iv, &b);
+    } else if (v->type == IMDB_T_ENUM) { /* F3g: its label */
+        const imdb_enumdef *d = env && env->edb ? imdb_enum_def(env->edb, v->eid) : NULL;
+        if (!d || v->i < 0 || v->i >= d->n) {
+            imdb_buf_free(&b);
+            return imdb_fail(e, IMDB_ERR_STATE, "an ENUM value with no labels to read it by");
+        }
+        imdb_buf_put(&b, d->text + d->off[v->i], d->off[v->i + 1] - d->off[v->i]);
     } else if (v->type == IMDB_T_INTERVAL) { /* F3f: PostgreSQL's IntervalStyle postgres */
         imdb_format_interval(v->mon, v->day, (int64_t)v->i, &b);
     } else {
@@ -671,26 +696,27 @@ static int cast_to_text(const imdb_xval *v, imdb_xenv *env, imdb_xval *out, imdb
 
 /* ---- P2 S1: functions, CASE, CAST, IN, LIKE (design.md §5, Functions) ---------------------------------------- */
 
-int imdb_x_unify(uint8_t *t, uint8_t *s, uint8_t t2, uint8_t s2, const char *what, imdb_err *e)
+int imdb_x_unify(imdb_xty *t, imdb_xty t2, const char *what, imdb_err *e)
 {
-    if (!t2) return IMDB_OK; /* an untyped NULL: the others' type */
-    if (!*t) {
+    if (!t2.type) return IMDB_OK; /* an untyped NULL: the others' type */
+    if (!t->type) {
         *t = t2;
-        *s = s2;
         return IMDB_OK;
     }
-    if (*t == t2) {
-        if (t2 == IMDB_T_DECIMAL && s2 > *s) *s = s2;
+    if (t->type == t2.type && t2.type == IMDB_T_ENUM && t->eid != t2.eid) /* F3g: one ENUM type, or none */
+        return imdb_fail(e, IMDB_ERR_INVALID, "%s two ENUM types: values are not converted", what);
+    if (t->type == t2.type) {
+        if (t2.type == IMDB_T_DECIMAL && t2.scale > t->scale) t->scale = t2.scale;
         return IMDB_OK;
     }
-    if ((*t == IMDB_T_INT64 && t2 == IMDB_T_DECIMAL) || (*t == IMDB_T_DECIMAL && t2 == IMDB_T_INT64)) {
-        uint8_t a = *t == IMDB_T_DECIMAL ? *s : 0, b = t2 == IMDB_T_DECIMAL ? s2 : 0;
-        *t = IMDB_T_DECIMAL;
-        *s = a > b ? a : b;
+    if ((t->type == IMDB_T_INT64 && t2.type == IMDB_T_DECIMAL) || (t->type == IMDB_T_DECIMAL && t2.type == IMDB_T_INT64)) {
+        uint8_t a = t->type == IMDB_T_DECIMAL ? t->scale : 0, b = t2.type == IMDB_T_DECIMAL ? t2.scale : 0;
+        t->type = IMDB_T_DECIMAL;
+        t->scale = a > b ? a : b;
         return IMDB_OK;
     }
-    return imdb_fail(e, IMDB_ERR_INVALID, "%s %s and %s: values are not converted", what, imdb_type_name(*t),
-                     imdb_type_name(t2));
+    return imdb_fail(e, IMDB_ERR_INVALID, "%s %s and %s: values are not converted", what, imdb_type_name(t->type),
+                     imdb_type_name(t2.type));
 }
 
 int imdb_x_widen(imdb_xval *v, uint8_t rt, uint8_t rs, imdb_err *e)
@@ -730,9 +756,10 @@ static int fn_args(uint8_t fn, uint8_t nargs, unsigned lo, unsigned hi, imdb_err
     return imdb_fail(e, IMDB_ERR_INVALID, "%s takes %u to %u arguments", fn_name(fn), lo, hi);
 }
 
-int imdb_x_fn_type(uint8_t fn, uint8_t nargs, const uint8_t *ta, const uint8_t *sa, const imdb_xval *const *kv,
-                   uint8_t *rt, uint8_t *rs, imdb_err *e)
+int imdb_x_fn_type(uint8_t fn, uint8_t nargs, const uint8_t *ta, const uint8_t *sa, const uint16_t *ea, const imdb_xval *const *kv,
+                   uint8_t *rt, uint8_t *rs, uint16_t *re, imdb_err *e)
 {
+    *re = 0;
     *rt = 0;
     *rs = 0;
     switch (fn) {
@@ -819,7 +846,9 @@ int imdb_x_fn_type(uint8_t fn, uint8_t nargs, const uint8_t *ta, const uint8_t *
             return IMDB_OK;
         }
         for (unsigned i = 0; i < nargs; i++)
-            if (ta[i] != IMDB_T_TEXT) return imdb_fail(e, IMDB_ERR_INVALID, "%s takes TEXT values", fn_name(fn));
+            if (ta[i] == IMDB_T_ENUM) /* F3g: PostgreSQL's anynonarray || text, not taken: values are not converted */
+                return imdb_fail(e, IMDB_ERR_INVALID, "%s of an ENUM: CAST it to TEXT first", fn_name(fn));
+            else if (ta[i] != IMDB_T_TEXT) return imdb_fail(e, IMDB_ERR_INVALID, "%s takes TEXT values", fn_name(fn));
         *rt = IMDB_T_TEXT;
         return IMDB_OK;
     case FN_SUBSTR:
@@ -858,18 +887,23 @@ int imdb_x_fn_type(uint8_t fn, uint8_t nargs, const uint8_t *ta, const uint8_t *
         return IMDB_OK;
     case FN_COALESCE:
         if (fn_args(fn, nargs, 1, 255, e)) return e->code;
+        imdb_xty u = imdb_xty_of(0, 0, 0);
         for (unsigned i = 0; i < nargs; i++)
-            if (imdb_x_unify(rt, rs, ta[i], sa[i], "COALESCE of", e)) return e->code;
+            if (imdb_x_unify(&u, imdb_xty_of(ta[i], sa[i], ea[i]), "COALESCE of", e)) return e->code;
+        *rt = u.type;
+        *rs = u.scale;
+        *re = u.eid;
         if (!*rt) return imdb_fail(e, IMDB_ERR_INVALID, "COALESCE of NULL alone has no type");
         return IMDB_OK;
     case FN_NULLIF:
         if (fn_args(fn, nargs, 2, 2, e)) return e->code;
         if (!ta[0]) return imdb_fail(e, IMDB_ERR_INVALID, "NULLIF of NULL has no type");
-        if (ta[1] && !imdb_x_comparable(ta[0], ta[1]))
+        if (ta[1] && !imdb_x_comparable(imdb_xty_of(ta[0], sa[0], ea[0]), imdb_xty_of(ta[1], sa[1], ea[1])))
             return imdb_fail(e, IMDB_ERR_INVALID, "NULLIF of %s and %s: values are not converted", imdb_type_name(ta[0]),
                              imdb_type_name(ta[1]));
         *rt = ta[0];
         *rs = sa[0];
+        *re = ea[0];
         return IMDB_OK;
     default: return imdb_fail(e, IMDB_ERR_STATE, "an unknown function");
     }
@@ -1118,8 +1152,23 @@ int imdb_x_cast(const imdb_xval *v, const imdb_column *c, imdb_xenv *env, imdb_x
     memset(out, 0, sizeof *out);
     out->type = c->type;
     out->scale = c->type == IMDB_T_DECIMAL ? c->scale : 0;
+    if (c->type == IMDB_T_ENUM) out->eid = c->eid; /* F3g */
     if (v->null) {
         out->null = true;
+        return IMDB_OK;
+    }
+    if (c->type == IMDB_T_ENUM) { /* F3g: a TEXT by its label at the statement's read point, an ENUM of the type itself */
+        if (v->type == IMDB_T_ENUM && v->eid == c->eid) {
+            out->i = v->i;
+            return IMDB_OK;
+        }
+        if (v->type != IMDB_T_TEXT) return imdb_fail(e, IMDB_ERR_INVALID, "CAST to an ENUM type takes a TEXT or that type");
+        const imdb_enumdef *d = env && env->edb ? imdb_enum_def(env->edb, c->eid) : NULL;
+        if (!d) return imdb_fail(e, IMDB_ERR_STATE, "a CAST to an ENUM type with no labels to read it by");
+        int k = imdb_enumdef_find(d, (const char *)v->s, v->len);
+        if (k < 0 || k >= imdb_enumdef_count_at(d, env->enum_snap)) /* never the text: a row's value (design.md §5) */
+            return imdb_fail(e, IMDB_ERR_INVALID, "CAST: a text that is not a label of type %s", d->name);
+        out->i = k;
         return IMDB_OK;
     }
     if (v->type == IMDB_T_TEXT && c->type != IMDB_T_TEXT) { /* the literal's own syntax, no spaces around it */
@@ -1541,6 +1590,7 @@ int imdb_x_eval(const sql_stmt *st, const imdb_xnode *xn, uint16_t k, const imdb
         c.scale = x->cscale;
         c.precision = x->cprec;
         c.vlen = x->cvlen; /* F3c: CAST(x AS VARCHAR(n)) refuses a longer value */
+        c.eid = b->eid; /* F3g: CAST(x AS an ENUM type): the binder's id for its name */
         return imdb_x_cast(&l, &c, env, out, e);
     }
     default:

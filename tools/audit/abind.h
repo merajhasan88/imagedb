@@ -15,10 +15,12 @@ typedef struct ab_col {
     char name[72];       /* an identifier, or (a result's column) a tree's text as the engine names it: up to 70 bytes */
     uint8_t type, scale; /* the log's type tags (1 INT64, 2 DECIMAL, 3 TEXT, 4 BOOL, 5 TIMESTAMP, 6 FLOAT64); a DECIMAL's
                           * scale, else 0 */
+    uint16_t eid;        /* F3g: an ENUM's type id (tag 13), 0 for every other type */
 } ab_col;
 
 /* a relation the catalog holds by name at the view's commit: a live table (kind 1), or a live view (kind 2) with its
- * logged columns (a view is never expanded again: its own text was bound at its own commit) */
+ * logged columns (a view is never expanded again: its own text was bound at its own commit); F3g: or a live ENUM type
+ * (kind 3: its id, no columns), what a CAST names */
 typedef struct ab_rel {
     uint8_t kind;
     uint32_t id;

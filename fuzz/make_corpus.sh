@@ -9,14 +9,18 @@ WORK=$(mktemp -d "${IMDB_TEST_TMP:-/tmp}/imdb-corpus.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 D=$WORK/db
 "$BIN" init "$D" --digest-alg 1 >/dev/null
-# fw and fu must stay the fourth and fifth tables made (ids 3 and 4): fuzz_common.h's fourth and fifth schemas are
-# theirs, so their segment seeds parse whole (a seed's first byte is its table id; another id meets another schema)
+# fw, fu and fe must stay the fourth, fifth and sixth tables made (ids 3, 4 and 5), fmood the first type (id 1):
+# fuzz_common.h's fourth to sixth schemas are theirs, so their segment seeds parse whole (a seed's first byte is its
+# table id; another id meets another schema)
 SQL="
 CREATE TABLE txns (id INT64 PRIMARY KEY, user_id INT64 SUBJECT, amount DECIMAL(12,2) NOT NULL, memo TEXT NOT NULL, at TIMESTAMP NOT NULL);
 CREATE TABLE flags (k TEXT PRIMARY KEY SUBJECT, b BOOL NOT NULL, n INT64 NOT NULL);
 CREATE TABLE meas (id INT64 PRIMARY KEY, u INT64 SUBJECT, x FLOAT64, note TEXT, ok BOOL NOT NULL);
 CREATE TABLE fw (id DECIMAL(38,0) PRIMARY KEY, w DECIMAL(30,4) DEFAULT 18446744073709551616.0001, n DECIMAL(10,2));
 CREATE TABLE fu (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), b BYTEA, n INT64, iv INTERVAL);
+CREATE TYPE fmood AS ENUM ('sad', 'ok', 'happy', '');
+CREATE TABLE fe (m fmood PRIMARY KEY, n fmood NOT NULL DEFAULT 'ok', w INT64);
+INSERT INTO fe VALUES ('sad', 'happy', 1), ('', 'sad', NULL);
 INSERT INTO txns VALUES (1, 42, 19.99, 'coffee', '2026-10-01 08:00:00'), (2, 42, -5.25, 'café', '2026-10-01 08:05:00.5'), (3, 7, 100.00, '', '1970-01-01');
 INSERT INTO flags VALUES ('a', true, 1), ('bb', false, -2);
 INSERT INTO meas VALUES (1, 42, 1.5, NULL, true), (2, 42, -2.5e-3, 'n', false), (3, 7, NULL, NULL, true), (4, 9, 6.02e23, 'x', false);
@@ -45,6 +49,11 @@ INSERT INTO fu (b, n, iv) VALUES ('\x0000ff', 1, '1 mon -2 days 03:00:00.5'), ('
 CREATE INDEX fu_b ON fu (b);
 INSERT INTO fw VALUES (99999999999999999999999999999999999999, -99999999999999999999999999.9999, 1.5), (-18446744073709551616, NULL, NULL);
 INSERT INTO fw (id) VALUES (18446744073709551617);
+ALTER TYPE fmood ADD VALUE 'ecstatic';
+INSERT INTO fe (m, w) VALUES ('ecstatic', 3);
+CREATE TYPE fgone AS ENUM ('g');
+DROP TYPE fgone;
+CREATE VIEW fev AS SELECT m, CAST('ok' AS fmood) AS k FROM fe;
 CHECKPOINT;
 DROP INDEX meas_x;
 ERASE SUBJECT 7;
@@ -130,6 +139,10 @@ for q in "SELECT COUNT(*), SUM(amount) FROM txns AS OF 3 WHERE user_id = 42 AND 
          "DEALLOCATE ALL" \
          "((((((((((((((((((((((((((((((((((((((((SELECT 1))))))))))))))))))))))))))))))))))))))))" \
          "SELECT id, (SELECT COUNT(*) FROM u WHERE u.tid = t.id) FROM t WHERE g IN (SELECT v FROM u AS ci WHERE ci.tid = t.id)" \
+         "CREATE TYPE mood AS ENUM ('sad', 'ok', '', 'it''s')" "ALTER TYPE mood ADD VALUE IF NOT EXISTS 'x' BEFORE 'ok'" \
+         "DROP TYPE IF EXISTS mood CASCADE" "CREATE TABLE e (m mood PRIMARY KEY, n mood NOT NULL DEFAULT 'ok')" \
+         "SELECT CAST(m AS TEXT), CAST('ok' AS mood) FROM e WHERE m > 'sad' AND n IN ('ok', '')" \
+         "PREPARE q (mood, TEXT) AS SELECT m FROM e WHERE m = \$1 AND CAST(n AS TEXT) <> \$2" \
          "SELECT AVG(f) FROM t HAVING COUNT(*) BETWEEN 1 AND 10 OFFSET 0 LIMIT 0"; do
   printf '%s' "$q" > "$OUT/sql/q$i"; i=$((i+1))
 done

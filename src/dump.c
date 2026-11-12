@@ -59,8 +59,22 @@ static int retention_text(const imdb_table *t, char *out, size_t n, imdb_err *e)
 
 /* a value as a literal the column's type reads back: its text (COPY's), TEXT, TIMESTAMP and TIMESTAMPTZ (in UTC, +00:
  * never the session's zone) quoted with '' */
+/* F3g: bytes as a string literal, ' doubled */
+static void quoted(dumper *d, const char *p, size_t n)
+{
+    imdb_buf_put_str(&d->b, "'");
+    for (size_t i = 0; i < n; i++) imdb_buf_put(&d->b, p[i] == '\'' ? "''" : &p[i], p[i] == '\'' ? 2 : 1);
+    imdb_buf_put_str(&d->b, "'");
+}
+
 static int literal_text(dumper *d, const imdb_value *v, imdb_err *e)
 {
+    if (v->type == IMDB_T_ENUM) { /* F3g: its label, quoted */
+        const imdb_enumdef *ed = imdb_enum_def(d->s.db, v->eid);
+        if (!ed || v->i < 0 || v->i >= ed->n) return imdb_fail(e, IMDB_ERR_STATE, "dump: an ENUM value of no label");
+        quoted(d, ed->text + ed->off[v->i], ed->off[v->i + 1] - ed->off[v->i]);
+        return IMDB_OK;
+    }
     if (!imdb_type_bytes(v->type) && v->type != IMDB_T_TIMESTAMP && v->type != IMDB_T_TIMESTAMPTZ && v->type != IMDB_T_DATE &&
         v->type != IMDB_T_TIME && v->type != IMDB_T_INTERVAL) { /* F3b: a DATE and a TIME quoted, as their literals are
                                                                 * strings; F3d: a UUID and a BYTEA; F3f: an INTERVAL */
@@ -132,6 +146,7 @@ static int column_text(dumper *d, const imdb_table *t, uint16_t i, imdb_err *e)
     imdb_buf_printf(&d->b, "%s ", c->name);
     if (c->type == IMDB_T_DECIMAL) imdb_buf_printf(&d->b, "DECIMAL(%u,%u)", c->precision, c->scale);
     else if (c->type == IMDB_T_TEXT && c->vlen) imdb_buf_printf(&d->b, "VARCHAR(%u)", c->vlen); /* F3c */
+    else if (c->type == IMDB_T_ENUM && imdb_enum_def(d->s.db, c->eid)) imdb_buf_put_str(&d->b, imdb_enum_def(d->s.db, c->eid)->name); /* F3g */
     else imdb_buf_put_str(&d->b, c->type == IMDB_T_INT64 ? imdb_int_name(c->precision) : imdb_type_name(c->type)); /* F3a */
     if ((c->flags & IMDB_COL_PK) && t->s.npk == 1) imdb_buf_put_str(&d->b, " PRIMARY KEY");
     if (c->flags & IMDB_COL_SUBJECT) imdb_buf_put_str(&d->b, " SUBJECT");
@@ -223,6 +238,17 @@ int imdb_dump(imdb_db *db, uint32_t batch, imdb_copy_write_fn wr, void *arg, imd
                         "-- imagedb dump of commit %llu (head %s, digest algorithm %u): its tables' rows now, no history; "
                         "restore it into an empty database with imagedb sql DIR -f FILE\n",
                         (unsigned long long)d->s.txn.snap, head, (unsigned)db->meta.digest_alg);
+        rc = put(d, e);
+    }
+    for (uint32_t i = 0; !rc && i < db->nenums; i++) { /* F3g: each live ENUM type, its labels as they are now, before the tables */
+        const imdb_enum *t = &db->enums[i];
+        if (t->dropped_at || !t->def) continue;
+        imdb_buf_printf(&d->b, "CREATE TYPE %s AS ENUM (", t->def->name);
+        for (uint16_t k = 0; k < t->def->n; k++) {
+            if (k) imdb_buf_put_str(&d->b, ", ");
+            quoted(d, t->def->text + t->def->off[k], t->def->off[k + 1] - t->def->off[k]);
+        }
+        imdb_buf_put_str(&d->b, ");\n");
         rc = put(d, e);
     }
     for (uint32_t i = 0; !rc && i < db->nseqs; i++) { /* F2a-2: the sequences no column owns, before the tables naming them */

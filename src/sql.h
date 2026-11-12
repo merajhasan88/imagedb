@@ -106,6 +106,10 @@ typedef struct imdb_result {
     char names[IMDB_MAX_COLS + 4][IMDB_MAX_IDENT + 8];
     uint8_t ctype[IMDB_MAX_COLS + 4], cscale[IMDB_MAX_COLS + 4]; /* P2 S4: a SELECT's column types as its statement bound
                                                                 * them (0: not known), a nested SELECT's schema */
+    uint16_t ceid[IMDB_MAX_COLS + 4];      /* F3g: an ENUM column's type id beside its ctype (0: another type) */
+    imdb_enumdef *clab[IMDB_MAX_COLS + 4]; /* F3g: the result a statement hands out: each ENUM column's labels, copied once
+                                            * at its finish (res_labels), so the renderer reads no catalog and a result
+                                            * outlives DDL; NULL elsewhere (imdb_result_free frees them) */
     imdb_cell *cells;        /* nrows * ncols */
     uint64_t nrows, caprows;
     imdb_buf text;           /* backing store for TEXT cells */

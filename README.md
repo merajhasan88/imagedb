@@ -595,6 +595,7 @@ is refused; snapshot write skew is possible.
 
 Types: INT64 (BIGINT, INT8), INTEGER (INT, INT4: 32 bits), SMALLINT (INT2: 16 bits),
 DECIMAL(p,s) (NUMERIC(p,s): p 1 to 38), TEXT, VARCHAR(n), BOOL, TIMESTAMP, TIMESTAMPTZ, DATE, TIME, UUID, BYTEA, INTERVAL,
+ENUM types (CREATE TYPE),
 finite FLOAT64 (exact SUM, rounded once) and nullable non-key columns. A DECIMAL of up to 18 digits is held in 64 bits
 and one of 19 to 38 in 128 (16 bytes a value); both compare, join and group with each other by value. Not yet on a
 DECIMAL past 18 digits: CREATE INDEX on it, a FOREIGN KEY between it and one of 18 or fewer, and SET TYPE across 18
@@ -627,6 +628,16 @@ read as one). It compares and sorts by its span, a month 30 days: `'1 mon' = '30
 each way with TEXT; COPY and the dump carry it. Not yet: GROUP BY, DISTINCT, UNION (UNION ALL works), a window's
 PARTITION BY or ORDER BY over one, a key or an index on one, a CHECK or a generated column reading one, `*`, `/`,
 AVG, EXTRACT, ISO 8601 or SQL-standard input, `INTERVAL YEAR TO MONTH`, and TIMESTAMPTZ or TIME with one.
+ENUM types: `CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')` (up to 1,024 labels of up to 63 bytes, byte-exact),
+`ALTER TYPE mood ADD VALUE [IF NOT EXISTS] 'ecstatic'` (appended at the end), `DROP TYPE [IF EXISTS] mood`
+(refused while any table, a dropped one too, has had a column of it, or a view CASTs to it); a column of the type
+(`m mood DEFAULT 'ok'`), a key, an index, a FOREIGN KEY within one type. A string beside one is one of its labels
+(`m = 'happy'`; not a label is an error); values compare, sort, group, join and union in declaration order and
+only with values of the same type; `CAST(m AS TEXT)` gives the label and `CAST('ok' AS mood)` reads one. An AS OF read
+sees the labels as they were then. `PREPARE p (mood) AS ...` declares an ENUM parameter by its type's name; the API
+passes an `imdb_value` of type ENUM with its type's id. COPY, the CSV output and the dump write a label as TEXT
+(`""` the empty one). Not yet: ADD VALUE BEFORE or AFTER, RENAME VALUE, CASCADE, enum_range and enum_first, a cast
+between two ENUM types, `||` of one (CAST it to TEXT), one in a CHECK or a generated column, SET TYPE to or from one.
 Comparisons with NULL, including NULL parameters, are refused: use IS NULL / IS NOT
 NULL.
 

@@ -496,7 +496,8 @@ static int seq_options(parser *p, sql_seqopt *o, bool create)
 
 static int bexpr(parser *p, uint16_t *out, unsigned depth);
 static int aexpr(parser *p, uint16_t *out, unsigned depth);
-static int col_type(parser *p, imdb_column *c);
+static int col_type(parser *p, imdb_column *c, char *tname);
+static int col_tname(parser *p, uint16_t at, const char *tname);
 
 static int ex_new(parser *p, uint8_t op, uint16_t l, uint16_t r, uint16_t *out)
 {
@@ -662,7 +663,8 @@ static int cast_expr(parser *p, uint16_t *out, unsigned depth)
     uint16_t a;
     imdb_column c;
     memset(&c, 0, sizeof c);
-    if (expect(p, TK_LP, "(") || bexpr(p, &a, depth + 1) || expect_kw(p, "as") || col_type(p, &c) ||
+    char tn[IMDB_MAX_IDENT + 1] = "";
+    if (expect(p, TK_LP, "(") || bexpr(p, &a, depth + 1) || expect_kw(p, "as") || col_type(p, &c, tn) ||
         expect(p, TK_RP, ")") || ex_new(p, EX_CAST, a, 0, out))
         return p->e->code;
     sql_expr *x = &p->st->ex[*out];
@@ -670,6 +672,7 @@ static int cast_expr(parser *p, uint16_t *out, unsigned depth)
     x->cscale = c.scale;
     x->cprec = c.precision;
     x->cvlen = c.vlen; /* F3c */
+    if (c.type == IMDB_T_ENUM) memcpy(x->col, tn, sizeof tn); /* F3g: its type's name, resolved at binding */
     return IMDB_OK;
 }
 
@@ -1163,7 +1166,7 @@ static int preds(parser *p, sql_stmt *st)
     return conjunct(p, st, k);
 }
 
-static int col_type(parser *p, imdb_column *c)
+static int col_type(parser *p, imdb_column *c, char *tname)
 {
     if (kw(p, "int64") || kw(p, "bigint") || kw(p, "int8")) c->type = IMDB_T_INT64;
     else if (kw(p, "integer") || kw(p, "int") || kw(p, "int4")) c->type = IMDB_T_INT64, c->precision = 32; /* F3a */
@@ -1225,6 +1228,9 @@ static int col_type(parser *p, imdb_column *c)
         c->type = IMDB_T_FLOAT64;
     } else if (kw(p, "real") || kw(p, "float4")) {
         return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "REAL is single precision; imagedb has FLOAT64 (DOUBLE PRECISION)");
+    } else if (tname && p->t[p->i].kind == TK_IDENT && !is_reserved(p, p->i)) { /* F3g: an ENUM type by its name */
+        if (ident(p, tname)) return p->e->code;
+        c->type = IMDB_T_ENUM; /* its id the statement's at its read point (the executor's) */
     } else {
         return fail_at(p, "a type (INT64, DECIMAL(p,s), FLOAT64, TEXT, BOOL, TIMESTAMP, TIMESTAMPTZ)");
     }
@@ -1502,7 +1508,8 @@ static int parse_alter(parser *p, sql_stmt *st)
         st->alter_kind = IMDB_ALTER_ADD_COLUMN;
         imdb_column *c = &st->schema.cols[0];
         memset(c, 0, sizeof *c);
-        if (ident(p, c->name) || col_type(p, c)) return p->e->code;
+        char tn[IMDB_MAX_IDENT + 1] = "";
+        if (ident(p, c->name) || col_type(p, c, tn) || (c->type == IMDB_T_ENUM && col_tname(p, 0, tn))) return p->e->code;
         int null_spec = 0; /* 1 NULL, 2 NOT NULL */
         for (;;) {
             if (kw(p, "not")) {
@@ -1576,7 +1583,11 @@ static int parse_alter(parser *p, sql_stmt *st)
         st->alter_kind = IMDB_ALTER_SET_TYPE;
         imdb_column *c = &st->schema.cols[0];
         memset(c, 0, sizeof *c);
-        return col_type(p, c);
+        char tn[IMDB_MAX_IDENT + 1] = "";
+        if (col_type(p, c, tn)) return p->e->code;
+        if (c->type == IMDB_T_ENUM) /* F3g: deferred.md D27 */
+            return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "SET TYPE to an ENUM type is not in imagedb yet");
+        return IMDB_OK;
     }
     if (!kw(p, "rename")) return fail_at(p, "SET RETENTION, ADD, DROP, ALTER or RENAME");
     if (kw(p, "to")) {
@@ -1626,8 +1637,9 @@ static int parse_create(parser *p, sql_stmt *st)
             c->precision = (uint8_t)(serial == 64 ? 0 : serial);
             st->cdef_kind[s->ncols] = IMDB_DEFK_IDENTITY; /* PostgreSQL's SERIAL: a sequence of its own, a value given taken */
             memset(&st->idopt[s->ncols], 0, sizeof st->idopt[s->ncols]);
-        } else if (col_type(p, c)) {
-            return p->e->code;
+        } else {
+            char tn[IMDB_MAX_IDENT + 1] = "";
+            if (col_type(p, c, tn) || (c->type == IMDB_T_ENUM && col_tname(p, s->ncols, tn))) return p->e->code;
         }
         int null_spec = 0; /* 1 NULL, 2 NOT NULL */
         for (;;) {
@@ -1774,8 +1786,10 @@ static int parse_prepare(parser *p, sql_stmt *st)
             if (!st->ptypes && !(st->ptypes = imdb_alloc_array(IMDB_MAX_PARAMS, sizeof *st->ptypes, p->e))) return p->e->code;
             imdb_column c;
             memset(&c, 0, sizeof c);
-            if (col_type(p, &c)) return p->e->code;
-            st->ptypes[st->nptype++] = (sql_ptype){c.type, c.scale, c.precision};
+            char tn[IMDB_MAX_IDENT + 1] = "";
+            if (col_type(p, &c, tn)) return p->e->code;
+            st->ptypes[st->nptype] = (sql_ptype){c.type, c.scale, c.precision, ""};
+            memcpy(st->ptypes[st->nptype++].tname, tn, sizeof tn); /* F3g: an ENUM's name, resolved at each EXECUTE */
         } while (tok(p, TK_COMMA));
         if (expect(p, TK_RP, ")")) return p->e->code;
     }
@@ -2485,6 +2499,8 @@ void imdb_sql_stmt_free(sql_stmt *st)
     st->narm = 0;
     imdb_free(st->ptypes); /* P2 S9 */
     st->ptypes = NULL;
+    imdb_free(st->ctname); /* F3g */
+    st->ctname = NULL;
     imdb_free(st->fks); /* F2b-2 */
     st->fks = NULL;
     st->nfks = 0;
@@ -2556,6 +2572,61 @@ static int set_zone_value(parser *p, sql_stmt *st)
     return IMDB_OK;
 }
 
+/* F3g: an ENUM column's type name at position at (CREATE TABLE's, ADD COLUMN's at 0), into the statement's list */
+static int col_tname(parser *p, uint16_t at, const char *tname)
+{
+    sql_stmt *st = p->st;
+    if (!st->ctname && !(st->ctname = imdb_alloc_array(IMDB_MAX_COLS, sizeof *st->ctname, p->e))) return p->e->code;
+    memcpy(st->ctname[at], tname, IMDB_MAX_IDENT + 1);
+    return IMDB_OK;
+}
+
+/* F3g: CREATE TYPE name AS ENUM ('label', ...) (TYPE eaten): the labels as string literals in vals (rowlen of them; the
+ * executor reads each, its bytes, its UTF-8 and its uniqueness); another kind of type refused by name */
+static int parse_create_type(parser *p, sql_stmt *st)
+{
+    st->kind = ST_CREATE_TYPE;
+    if (ident(p, st->table) || expect_kw(p, "as")) return p->e->code;
+    if (!kw(p, "enum"))
+        return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "CREATE TYPE ... AS ENUM alone (composite, range and base types are not in imagedb)");
+    if (expect(p, TK_LP, "(")) return p->e->code;
+    if (!(st->vals = imdb_alloc_array(IMDB_MAX_ENUM_LABELS, sizeof *st->vals, p->e))) return p->e->code;
+    st->nrows = 1;
+    if (tok(p, TK_RP)) return IMDB_OK; /* no label, as PostgreSQL takes */
+    do {
+        if (st->rowlen >= IMDB_MAX_ENUM_LABELS)
+            return imdb_fail(p->e, IMDB_ERR_LIMIT, "an ENUM type holds at most %u labels", IMDB_MAX_ENUM_LABELS);
+        const sql_tok *t = &p->t[p->i];
+        if (t->kind != TK_STR) return fail_at(p, "a label (a string)");
+        st->vals[st->rowlen++] = (sql_lit){.kind = LIT_STR, .off = t->off, .len = t->len};
+        p->i++;
+    } while (tok(p, TK_COMMA));
+    return expect(p, TK_RP, ")");
+}
+
+/* F3g: ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'label' (TYPE eaten): appended; BEFORE and AFTER refused by name (an
+ * ordinal is a value's identity and order: deferred.md D27), as RENAME and the rest are */
+static int parse_alter_type(parser *p, sql_stmt *st)
+{
+    st->kind = ST_ALTER_TYPE;
+    if (ident(p, st->table)) return p->e->code;
+    if (tok_is_kw(p, p->i, "rename") || tok_is_kw(p, p->i, "owner") || tok_is_kw(p, p->i, "set"))
+        return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "ALTER TYPE ... ADD VALUE alone (RENAME VALUE and RENAME TO are not in imagedb yet)");
+    if (!kw(p, "add") || !kw(p, "value")) return fail_at(p, "ADD VALUE");
+    if (tok_is_kw(p, p->i, "if") && tok_is_kw(p, p->i + 1, "not") && tok_is_kw(p, p->i + 2, "exists")) {
+        p->i += 3;
+        st->if_not_exists = true;
+    }
+    const sql_tok *t = &p->t[p->i];
+    if (t->kind != TK_STR) return fail_at(p, "a label (a string)");
+    st->alter_def = (sql_lit){.kind = LIT_STR, .off = t->off, .len = t->len};
+    p->i++;
+    if (tok_is_kw(p, p->i, "before") || tok_is_kw(p, p->i, "after"))
+        return imdb_fail(p->e, IMDB_ERR_UNSUPPORTED, "ADD VALUE ... BEFORE or AFTER: a label is appended (an ordinal is a value's "
+                                                    "identity and its order: placing one would rewrite every row of the type)");
+    return IMDB_OK;
+}
+
 int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
 {
     memset(st, 0, sizeof *st);
@@ -2574,6 +2645,7 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
         if (tok_is_kw(&p, p.i, "or") && tok_is_kw(&p, p.i + 1, "replace")) /* P2 S7 */
             rc = imdb_fail(e, IMDB_ERR_UNSUPPORTED, "CREATE OR REPLACE: drop the view and create it again");
         else if (kw(&p, "view")) rc = parse_create_view(&p, st);
+        else if (kw(&p, "type")) rc = parse_create_type(&p, st); /* F3g */
         else if (kw(&p, "sequence")) { /* F2a-2 */
             st->kind = ST_CREATE_SEQUENCE;
             memset(&st->seqopt, 0, sizeof st->seqopt);
@@ -2586,6 +2658,17 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
         }
     }
     else if (kw(&p, "drop")) {
+        if (kw(&p, "type")) { /* F3g: RESTRICT, the default and only one */
+            st->kind = ST_DROP_TYPE;
+            if (tok_is_kw(&p, p.i, "if") && tok_is_kw(&p, p.i + 1, "exists")) {
+                p.i += 2;
+                st->if_exists = true;
+            }
+            if (!(rc = ident(&p, st->table))) {
+                if (kw(&p, "cascade")) rc = imdb_fail(e, IMDB_ERR_UNSUPPORTED, "DROP TYPE ... CASCADE: drop the columns and views that use it first");
+                else kw(&p, "restrict");
+            }
+        } else
         if (kw(&p, "sequence")) { /* F2a-2: RESTRICT, the default and only one */
             st->kind = ST_DROP_SEQUENCE;
             if (!(rc = ident(&p, st->table))) {
@@ -2608,7 +2691,8 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
         }
     }
     else if (kw(&p, "alter")) { /* ALTER TABLE t SET RETENTION ... | ADD ... | RENAME ... (F1) */
-        if (!(rc = expect_kw(&p, "table")) && !(rc = ident(&p, st->table))) rc = parse_alter(&p, st);
+        if (kw(&p, "type")) rc = parse_alter_type(&p, st); /* F3g */
+        else if (!(rc = expect_kw(&p, "table")) && !(rc = ident(&p, st->table))) rc = parse_alter(&p, st);
     }
     else if (kw(&p, "insert")) rc = parse_insert(&p, st);
     else if (kw(&p, "prepare")) rc = parse_prepare(&p, st); /* P2 S9 */

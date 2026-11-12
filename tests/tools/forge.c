@@ -985,8 +985,8 @@ static void manifest_lie(const char *dir, const char *kind)
                                           * and the nine empty ones (16 each) */
         nb.p[nb.len - 195] = (uint8_t)(c >> 8);
     } else if (strcmp(kind, "section") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION && mn > 144 + 144) {
-        imdb_buf_put(&nb, man, mn); /* the format design's slice 1: the nine reserved sections end it, 16 bytes each */
-        nb.p[nb.len - 116] = 1;     /* the enums section's u32 count: a later format's (F2a-2: the sequences section, 3, is read now) */
+        imdb_buf_put(&nb, man, mn); /* the format design's slice 1: the seven reserved sections end it, 16 bytes each */
+        nb.p[nb.len - 100] = 1;     /* the roles section's u32 count: a later format's (F2a-2, F3g: sections 3 and 4 are read now) */
     } else if (strcmp(kind, "nsections") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION && mn > 144 + 144) {
         imdb_buf_put(&nb, man, mn);
         nb.p[12] = 10; /* the header's section count: ten, with eleven there */
@@ -1059,6 +1059,15 @@ static void manifest_lie(const char *dir, const char *kind)
             if (memcmp(nb.p + i, pat, sizeof pat) == 0) at = i + sizeof pat - 1;
         if (!at) exit(1);
         nb.p[at] = '1';
+    } else if (strcmp(kind, "enum-label") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION) {
+        /* F3g (KF): a label of the enums section (u8 2, "kc") made "kd": a label the log never made */
+        imdb_buf_put(&nb, man, mn);
+        static const uint8_t pat[] = {2, 'k', 'c'};
+        size_t at = 0;
+        for (size_t i = mn - sizeof pat; i > 0 && !at; i--)
+            if (memcmp(nb.p + i, pat, sizeof pat) == 0) at = i + 2;
+        if (!at) exit(1);
+        nb.p[at] = 'd';
     } else if (strcmp(kind, "dec-precision") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION) {
         /* F3e: a schema's DECIMAL(30,2) column w (u8 1, "w", type, precision, scale) made DECIMAL(39,2): past 38 digits */
         imdb_buf_put(&nb, man, mn);
@@ -1084,7 +1093,8 @@ static void manifest_lie(const char *dir, const char *kind)
               " format's, longer) | keylist (table 0's key list another column) | default (an added column n's DEFAULT"
               " another in the history) | create-default (a CREATE's DEFAULT 77 of column 2 another) | seq-state (fu_seq's last on)"
               " | check-text (z_a_check's 'a > 0' another) | gen-text (w's 'a * 2' another) | fk-def (c_pid_fkey's CASCADE another)"
-              " | dec-precision (a DECIMAL(30,2) w made DECIMAL(39,2))\n", stderr);
+              " | dec-precision (a DECIMAL(30,2) w made DECIMAL(39,2))"
+              " | enum-label (an ENUM label kc made kd)\n", stderr);
         exit(1);
     }
     if (nb.err) exit(1);
@@ -1373,6 +1383,107 @@ static void index_lie(const char *dir, const char *kind)
         append_commit_digest(dir, db, &op, 1, &sg, NULL, dg);
         imdb_close(db);
         return;
+    } else if (strcmp(kind, "enum-ord") == 0) {
+        /* F3g (KA): an INSERT into the last table, (id INT64 PRIMARY KEY, m an ENUM NOT NULL), of a row whose ordinal is its
+         * type's label count: no label; its commitment and digest right */
+        imdb_table *t = db->t[db->nt - 1];
+        const imdb_enumdef *d = t->s.ncols == 2 && t->s.cols[1].type == IMDB_T_ENUM ? imdb_enum_def(db, t->s.cols[1].eid) : NULL;
+        if (!d || (t->s.cols[1].flags & IMDB_COL_NULLABLE)) {
+            fputs("imdb-forge: index-lie enum-ord needs a last table (id INT64 PRIMARY KEY, m an ENUM NOT NULL)\n", stderr);
+            exit(1);
+        }
+        static uint8_t row[8 + 4];
+        imdb_le64(row, 999);
+        row[8] = (uint8_t)d->n, row[9] = (uint8_t)(d->n >> 8), row[10] = row[11] = 0;
+        memset(op.salt, 0x61, sizeof op.salt);
+        op.code = IMDB_OP_INSERT;
+        op.table = t->s.id;
+        op.vid = t->nver;
+        op.pkind = IMDB_PAYLOAD_ROW;
+        op.row = row;
+        op.row_len = sizeof row;
+        op.iname = NULL;
+        imdb_row_commit(t->s.id, op.salt, row, sizeof row, op.commit);
+        imdb_lthash g = db->global;
+        imdb_lthash_add_commit(db->meta.digest_alg, &g, op.commit);
+        uint8_t dg[32];
+        imdb_lthash_digest(db->meta.digest_alg, &g, dg);
+        append_commit_digest(dir, db, &op, 1, &sg, NULL, dg);
+        imdb_close(db);
+        return;
+    } else if (strcmp(kind, "create-enum-unknown") == 0 || strcmp(kind, "create-enum-dropped") == 0) {
+        /* F3g (KB, KC): CREATE TABLE kb (id INT64 PRIMARY KEY, m ...) with its retention, m an ENUM of a type id no type has,
+         * or of the last dropped type's */
+        uint32_t eid = db->nenums + 7;
+        if (kind[12] == 'd') {
+            eid = 0;
+            for (uint32_t i = 0; i < db->nenums; i++)
+                if (db->enums[i].dropped_at) eid = i + 1;
+            if (!eid) {
+                fputs("imdb-forge: index-lie create-enum-dropped needs a dropped type\n", stderr);
+                exit(1);
+            }
+        }
+        static imdb_schema s;
+        memset(&s, 0, sizeof s);
+        snprintf(s.name, sizeof s.name, "kb");
+        s.id = db->nt;
+        s.ncols = 2;
+        s.subject = -1;
+        snprintf(s.cols[0].name, sizeof s.cols[0].name, "id");
+        s.cols[0].type = IMDB_T_INT64;
+        s.cols[0].flags = IMDB_COL_PK;
+        snprintf(s.cols[1].name, sizeof s.cols[1].name, "m");
+        s.cols[1].type = IMDB_T_ENUM;
+        s.cols[1].eid = (uint16_t)eid;
+        s.cols[1].flags = IMDB_COL_NULLABLE;
+        s.npk = 1;
+        s.key[0] = 0;
+        imdb_op ops[2];
+        memset(ops, 0, sizeof ops);
+        ops[0] = (imdb_op){.code = IMDB_OP_CREATE_TABLE, .table = s.id, .schema = &s};
+        ops[1] = (imdb_op){.code = IMDB_OP_SET_RETENTION, .table = s.id, .retention_us = IMDB_RETAIN_DEFAULT_US};
+        append_commit(dir, db, ops, 2, &sg, NULL);
+        imdb_close(db);
+        return;
+    } else if (strcmp(kind, "enum-drop-used") == 0 || strcmp(kind, "enum-add-dup") == 0) {
+        /* F3g (KD, KE): DROP TYPE of the type the last table's column 1 has; ADD VALUE of that type's first label */
+        imdb_table *t = db->t[db->nt - 1];
+        const imdb_enumdef *d = t->s.ncols >= 2 && t->s.cols[1].type == IMDB_T_ENUM ? imdb_enum_def(db, t->s.cols[1].eid) : NULL;
+        if (!d || !d->n) {
+            fputs("imdb-forge: index-lie enum-drop-used and enum-add-dup need a last table whose column 1 is an ENUM of labels\n", stderr);
+            exit(1);
+        }
+        static char lab[IMDB_MAX_ENUM_LABEL + 1];
+        memcpy(lab, d->text + d->off[0], d->off[1] - d->off[0]);
+        lab[d->off[1] - d->off[0]] = 0;
+        op.code = kind[5] == 'd' ? IMDB_OP_DROP_ENUM : IMDB_OP_ENUM_ADD;
+        op.eid = d->id;
+        op.aname = op.code == IMDB_OP_ENUM_ADD ? lab : NULL;
+        op.iname = NULL;
+        append_commit(dir, db, &op, 1, &sg, NULL);
+        op.aname = NULL;
+        imdb_close(db);
+        return;
+    } else if (strcmp(kind, "enum-default-ord") == 0) {
+        /* F3g (KG): ADD COLUMN kg (the type of the last table's column 1, NULL) with a DEFAULT whose ordinal is the type's
+         * label count: every older row's missing value, no label */
+        imdb_table *t = db->t[db->nt - 1];
+        const imdb_enumdef *d = t->s.ncols >= 2 && t->s.cols[1].type == IMDB_T_ENUM ? imdb_enum_def(db, t->s.cols[1].eid) : NULL;
+        if (!d) {
+            fputs("imdb-forge: index-lie enum-default-ord needs a last table whose column 1 is an ENUM\n", stderr);
+            exit(1);
+        }
+        op.code = IMDB_OP_ALTER_TABLE;
+        op.table = t->s.id;
+        op.akind = IMDB_ALTER_ADD_COLUMN;
+        snprintf(op.acol.name, sizeof op.acol.name, "kg");
+        op.acol.type = IMDB_T_ENUM;
+        op.acol.eid = (uint16_t)d->id;
+        op.acol.flags = IMDB_COL_NULLABLE;
+        op.adef = (imdb_value){.type = IMDB_T_ENUM, .i = d->n};
+        op.adef.eid = d->id;
+        op.iname = NULL;
     } else if (strcmp(kind, "create-interval-key") == 0) {
         /* F3f: CREATE TABLE jb (jbkey TIMESTAMP PRIMARY KEY, n INT64) with its retention, the key's type byte then made
          * INTERVAL (12): a key the schema check refuses (deferred.md D26) */
@@ -1779,7 +1890,9 @@ static void index_lie(const char *dir, const char *kind)
               "fk-erase-other | fk-erase-named (that DELETE beside an ERASE of an ended version, or of the row itself) | dec-range (a\n"
               "DECIMAL(30,2) of 10^28 in the last table) | uuid-short (a\n"
               "UUID of 15 bytes in the last table) | create-default-uuid (gen_random_uuid on a TIMESTAMPTZ) | iv-short (an\n"
-              "INTERVAL of 15 bytes in the last table) | create-interval-key (a CREATE whose key is an INTERVAL)\n", stderr);
+              "INTERVAL of 15 bytes in the last table) | create-interval-key (a CREATE whose key is an INTERVAL) |\n"
+              "enum-ord | enum-drop-used | enum-add-dup | enum-default-ord (the last table (id, m an ENUM)) | create-enum-unknown |\n"
+              "create-enum-dropped\n", stderr);
         exit(1);
     }
     append_commit(dir, db, &op, 1, &sg, NULL);

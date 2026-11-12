@@ -3770,7 +3770,13 @@ static void exec_imdb_p(eng *e, const char *sql, bool rows, const int *ty, int n
                     put_scaled(&row, cl->wide ? cl->i128 : (__int128)cl->v.i, cl->v.scale);
                     break;
                 case CT_FLT: canon_flt(&row, imdb_f64_value(cl->v.i)); break;
-                case CT_TXT: sb_put(&row, (const char *)cl->v.s, cl->v.len); break;
+                case CT_TXT:
+                    if (cl->v.type == IMDB_T_ENUM) { /* F3g: its label, the result's own */
+                        const imdb_enumdef *ed = ir.clab[c];
+                        if (!ed || cl->v.i < 0 || cl->v.i >= ed->n) res_fail(r, "imagedb answered an ENUM with no label");
+                        else sb_put(&row, ed->text + ed->off[cl->v.i], ed->off[cl->v.i + 1] - ed->off[cl->v.i]);
+                    } else sb_put(&row, (const char *)cl->v.s, cl->v.len);
+                    break;
                 case CT_IV: { /* F3f */
                     imdb_buf t;
                     imdb_buf_init(&t);
@@ -5075,6 +5081,8 @@ static int dec38_battery(unsigned seed)
  * SQL Server's DATEADD as well (SQLite's date() does not clamp a month's end: not asked) */
 static bool g_iv;
 static unsigned long g_iv_compared, g_iv_unit_compared, g_iv_text_compared, g_iv_text_refused;
+static bool g_en;                  /* F3g: --enum (en_battery) */
+static int en_battery(unsigned seed);
 
 typedef struct ivv {
     int32_t mon, day;
@@ -5561,7 +5569,168 @@ static int run_seed(unsigned seed, int steps)
     }
     if (g_bytes && bytes_battery(seed)) return -1; /* F3d: after the steps: its draws change none of theirs */
     if (g_dec38 && dec38_battery(seed)) return -1; /* F3e: after it, likewise */
-    return g_iv ? iv_battery(seed) : 0;            /* F3f: likewise */
+    if (g_iv && iv_battery(seed)) return -1;      /* F3f: likewise */
+    return g_en ? en_battery(seed) : 0;            /* F3g: likewise */
+}
+
+
+/* ---- F3g, --enum: ENUM types against every engine, a battery per seed ------------------------------------------------
+ * A table x3 (id, m an ENUM, NULLs among it, n an ENUM NOT NULL) a seed, of 3 to 8 labels drawn per seed, lowercase
+ * letters and digits (distinct beyond case: MySQL and MariaDB compare an ENUM with a string by its text, without case):
+ * imagedb (a fresh directory a seed) and PostgreSQL a type om (CREATE TYPE; PostgreSQL's dropped and made again a seed),
+ * MySQL and MariaDB an inline ENUM(...) column, SQL Server a VARCHAR in a binary collation, SQLite a TEXT.
+ * Asked of all five: equality, IN, IS NULL, <>, two columns equal, COUNT, GROUP BY's keys and counts as a set. Of
+ * PostgreSQL, MySQL and MariaDB (an ENUM's order its declaration's): ORDER BY with the NULLs left out (MySQL sorts them
+ * first), GROUP BY in order. Of PostgreSQL alone (MySQL and MariaDB compare a range, take MIN and MAX by the text):
+ * ranges, BETWEEN, MIN and MAX. Every answer its rows' text, a label as its text */
+static unsigned long g_en_all, g_en_ord, g_en_pg;
+
+static int en_battery(unsigned seed)
+{
+    char lab[8][8];
+    int nl = (int)rr(3, 8);
+    for (int i = 0; i < nl; i++) {
+        for (;;) {
+            int len = (int)rr(1, 6);
+            for (int k = 0; k < len; k++) lab[i][k] = "abcdefghijklmnopqrstuvwxyz0123456789"[rr(0, 35)];
+            lab[i][len] = 0;
+            bool dup = false;
+            for (int k = 0; k < i && !dup; k++) dup = !strcmp(lab[k], lab[i]);
+            if (!dup) break;
+        }
+    }
+    int nrow = (int)rr(10, 24), m[24], n[24]; /* m -1: NULL */
+    for (int i = 0; i < nrow; i++) m[i] = chance(10) ? -1 : (int)rr(0, nl - 1), n[i] = (int)rr(0, nl - 1);
+    sb lst = {0}; /* the labels, quoted, in declaration order */
+    for (int i = 0; i < nl; i++) sb_printf(&lst, "%s'%s'", i ? ", " : "", lab[i]);
+    for (int d = 0; d < ND; d++) {
+        if (!g_eng[d].on) continue;
+        sb ddl = {0};
+        if (d == D_IMDB || d == D_PG) {
+            if (d == D_PG && (bx_exec(seed, d, "DROP TABLE IF EXISTS x3") || bx_exec(seed, d, "DROP TYPE IF EXISTS om CASCADE"))) {
+                free(lst.p);
+                return -1;
+            }
+            sb ct = {0};
+            sb_printf(&ct, "CREATE TYPE %s AS ENUM (%s)", "om", lst.p);
+            int crc = bx_exec(seed, d, ct.p);
+            free(ct.p);
+            if (crc) {
+                free(lst.p);
+                return -1;
+            }
+            sb_printf(&ddl, "CREATE TABLE x3 (id %s PRIMARY KEY, m %s, n %s NOT NULL)", d == D_PG ? "BIGINT" : "INT64",
+                      "om", "om");
+        } else {
+            if (bx_exec(seed, d, "DROP TABLE IF EXISTS x3")) {
+                free(lst.p);
+                return -1;
+            }
+            if (d == D_MY || d == D_MA) sb_printf(&ddl, "CREATE TABLE x3 (id BIGINT PRIMARY KEY, m ENUM(%s), n ENUM(%s) NOT NULL)", lst.p, lst.p);
+            else if (d == D_MS)
+                sb_str(&ddl, "CREATE TABLE x3 (id BIGINT NOT NULL PRIMARY KEY, m VARCHAR(16) COLLATE Latin1_General_BIN2, n VARCHAR(16) "
+                             "COLLATE Latin1_General_BIN2 NOT NULL)");
+            else sb_str(&ddl, "CREATE TABLE x3 (id INTEGER PRIMARY KEY, m TEXT, n TEXT NOT NULL)");
+        }
+        int drc = bx_exec(seed, d, ddl.p);
+        free(ddl.p);
+        if (drc) {
+            free(lst.p);
+            return -1;
+        }
+        sb ins = {0};
+        sb_str(&ins, "INSERT INTO x3 VALUES ");
+        for (int i = 0; i < nrow; i++) {
+            sb_printf(&ins, "%s(%d, ", i ? ", " : "", i + 1);
+            if (m[i] < 0) sb_str(&ins, "NULL");
+            else sb_printf(&ins, "'%s'", lab[m[i]]);
+            sb_printf(&ins, ", '%s')", lab[n[i]]);
+        }
+        int irc = bx_exec(seed, d, ins.p);
+        free(ins.p);
+        if (irc) {
+            free(lst.p);
+            return -1;
+        }
+    }
+    free(lst.p);
+    int a = (int)rr(0, nl - 1), b = (int)rr(0, nl - 1);
+    if (a > b) {
+        int t = a;
+        a = b;
+        b = t;
+    }
+    enum { NQ = 12 };
+    for (int qn = 0; qn < NQ; qn++) {
+        static res out[ND];
+        int ty[4], nty = 0;
+        bool multiset = false;
+        int who = qn < 7 ? 0 : qn < 9 ? 1 : 2; /* 0 all five, 1 PostgreSQL, MySQL and MariaDB, 2 PostgreSQL alone */
+        char sql[ND][600];
+        for (int d = 0; d < ND; d++) {
+            if (!g_eng[d].on || (who >= 1 && d != D_IMDB && d != D_PG && (who == 2 || (d != D_MY && d != D_MA)))) continue;
+            sb s = {0};
+            switch (qn) {
+            case 0: sb_printf(&s, "SELECT id FROM x3 WHERE m = '%s' ORDER BY id", lab[a]); ty[0] = TY(CT_INT, 0), nty = 1; break;
+            case 1:
+                sb_printf(&s, "SELECT id FROM x3 WHERE m IN ('%s', '%s') ORDER BY id", lab[a], lab[b]);
+                ty[0] = TY(CT_INT, 0), nty = 1;
+                break;
+            case 2: sb_str(&s, "SELECT id FROM x3 WHERE m IS NULL ORDER BY id"); ty[0] = TY(CT_INT, 0), nty = 1; break;
+            case 3: sb_printf(&s, "SELECT id FROM x3 WHERE m <> '%s' ORDER BY id", lab[b]); ty[0] = TY(CT_INT, 0), nty = 1; break;
+            case 4: sb_str(&s, "SELECT id FROM x3 WHERE m = n ORDER BY id"); ty[0] = TY(CT_INT, 0), nty = 1; break;
+            case 5: sb_str(&s, "SELECT COUNT(m), COUNT(*) FROM x3"); ty[0] = TY(CT_INT, 0), ty[1] = TY(CT_INT, 0), nty = 2; break;
+            case 6:
+                sb_str(&s, "SELECT n, COUNT(*) FROM x3 GROUP BY n");
+                ty[0] = TY(CT_TXT, 0), ty[1] = TY(CT_INT, 0), nty = 2, multiset = true;
+                break;
+            case 7:
+                sb_str(&s, "SELECT id, m FROM x3 WHERE m IS NOT NULL ORDER BY m, id");
+                ty[0] = TY(CT_INT, 0), ty[1] = TY(CT_TXT, 0), nty = 2;
+                break;
+            case 8:
+                sb_str(&s, "SELECT n, COUNT(*) FROM x3 GROUP BY n ORDER BY n");
+                ty[0] = TY(CT_TXT, 0), ty[1] = TY(CT_INT, 0), nty = 2;
+                break;
+            case 9: sb_printf(&s, "SELECT id FROM x3 WHERE m > '%s' ORDER BY id", lab[a]); ty[0] = TY(CT_INT, 0), nty = 1; break;
+            case 10:
+                sb_printf(&s, "SELECT id FROM x3 WHERE m BETWEEN '%s' AND '%s' ORDER BY id", lab[a], lab[b]);
+                ty[0] = TY(CT_INT, 0), nty = 1;
+                break;
+            default:
+                sb_str(&s, "SELECT MIN(m), MAX(m), MIN(n), MAX(n) FROM x3");
+                for (int k = 0; k < 4; k++) ty[k] = TY(CT_TXT, 0);
+                nty = 4;
+                break;
+            }
+            snprintf(sql[d], sizeof sql[d], "%s", s.p ? s.p : "");
+            free(s.p);
+            exec_eng(&g_eng[d], sql[d], true, ty, nty, &out[d]);
+            if (multiset && !out[d].err && out[d].n > 1) qsort(out[d].rows, out[d].n, sizeof *out[d].rows, rows_cmp);
+        }
+        const res *base = &out[D_IMDB];
+        for (int d = 1; d < ND; d++) {
+            if (!g_eng[d].on || (who >= 1 && d != D_PG && (who == 2 || (d != D_MY && d != D_MA)))) continue;
+            if (who == 0) g_en_all++;
+            else if (who == 1) g_en_ord++;
+            else g_en_pg++;
+            const res *o = &out[d];
+            const char *why = base->err != o->err ? "one refused it" : base->err ? NULL : base->n != o->n ? "another number of rows" : NULL;
+            size_t at = 0;
+            for (at = 0; !why && !base->err && at < base->n; at++)
+                if (strcmp(base->rows[at], o->rows[at])) why = "another row";
+            if (!why) continue;
+            g_mismatches++;
+            fprintf(stderr, "MISMATCH seed %u (--enum, query %d), imagedb against %s: %s\n  imagedb: %s\n  %s: %s\n", seed, qn,
+                    DNAME[d], why, sql[D_IMDB], DNAME[d], sql[d]);
+            fprintf(stderr, "  imagedb: %s (%zu rows)\n", base->err ? base->msg : "ok", base->n);
+            if (!base->err) show_rows(base, at ? at - 1 : 0);
+            fprintf(stderr, "  %s: %s (%zu rows)\n", DNAME[d], o->err ? o->msg : "ok", o->n);
+            if (!o->err) show_rows(o, at ? at - 1 : 0);
+            return -1;
+        }
+    }
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -5590,6 +5759,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--bytes")) g_bytes = true; /* F3d */
         else if (!strcmp(argv[i], "--dec38")) g_dec38 = true; /* F3e */
         else if (!strcmp(argv[i], "--interval")) g_iv = true; /* F3f */
+        else if (!strcmp(argv[i], "--enum")) g_en = true; /* F3g */
         else if (!strcmp(argv[i], "--tz")) g_tz = true; /* P2: time zones */
         else if (!strcmp(argv[i], "--date")) g_dt = 1; /* F3b */
         else if (!strcmp(argv[i], "--time")) g_dt = 2;
@@ -5695,6 +5865,10 @@ int main(int argc, char **argv)
                "a seed, fourteen queries), %lu of drawn verbose texts (%lu refused by both), %lu of a timestamp plus one unit "
                "against PostgreSQL, MySQL, MariaDB and SQL Server (SQLite not asked: its date() does not clamp a month's end)\n",
                g_iv_compared, g_iv_text_compared, g_iv_text_refused, g_iv_unit_compared);
+    if (g_en)
+        printf("oracle: %lu comparisons of F3g's ENUM battery against all five engines (a table x3 a seed, seven queries), %lu "
+               "of its order against PostgreSQL, MySQL and MariaDB, %lu of its ranges, MIN and MAX against PostgreSQL alone\n",
+               g_en_all, g_en_ord, g_en_pg);
     if (g_bytes && g_ms_pad >= 0) printf("oracle: SQL Server's 0x01 = 0x0100 is %s (the battery's BYTEAs hold no 0x00 byte either way)\n",
                                      g_ms_pad == 1 ? "true: it pads the shorter VARBINARY with zeros" : g_ms_pad == 0 ? "false: no padding" : "unread");
     printf("oracle: %ld comparisons of P2 S4b's correlated subqueries\n", g_corr_compared);

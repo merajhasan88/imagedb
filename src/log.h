@@ -146,6 +146,10 @@ enum {
     IMDB_OP_TABLE_FKS = 29,       /* F2b-2: a CREATE's FOREIGN KEYs, right after its CREATE_TABLE, SET_RETENTION and any
                                      COLUMN_DEFAULTS and TABLE_CHECKS, in their commit: u32 table, then imdb_fks_put's list
                                      (1 to IMDB_MAX_FKS, by name). Catalog state, as a CHECK (docs/fk-design.md) */
+    IMDB_OP_CREATE_ENUM = 30,     /* F3g: an ENUM type's definition (imdb_enumdef_encode: id, name, labels); alone */
+    IMDB_OP_DROP_ENUM = 31,       /* F3g: u32 type (live; no column, in any retained table's history, and no live view
+                                     naming it): its tombstone keeps its labels; alone */
+    IMDB_OP_ENUM_ADD = 32,        /* F3g: u32 type (live), a label (u8 length, bytes) it does not hold, appended; alone */
 };
 
 /* op 22's kinds (F1) */
@@ -250,9 +254,11 @@ int imdb_coldefs_get(imdb_rd *r, const imdb_schema *s, bool none_ok, imdb_coldef
  * text: strict UTF-8 without NUL, 1 to IMDB_MAX_VIEW_TEXT bytes. Every name is an identifier folded to lowercase. */
 #define IMDB_VIEWDEP_TABLE 1
 #define IMDB_VIEWDEP_VIEW 2
+#define IMDB_VIEWDEP_TYPE 3 /* F3g: an ENUM type the view uses (a column's, its text's): DROP TYPE's RESTRICT reads it */
 typedef struct imdb_viewcol {
     char name[IMDB_MAX_IDENT + 1];
     uint8_t type, scale;
+    uint16_t eid; /* F3g: an ENUM column's type id, logged where another type logs its scale byte (u16) */
 } imdb_viewcol;
 typedef struct imdb_viewdep {
     uint8_t kind;
@@ -281,6 +287,35 @@ typedef struct imdb_viewdef {
     char *text;         /* allocated: text_len bytes and a NUL (the text holds none) */
 } imdb_viewdef;
 void imdb_viewdef_free(imdb_viewdef *d); /* its arrays and itself; NULL is nothing */
+
+/* F3g: an ENUM type's definition, as op 30 logs it and a manifest keeps it (imdb_enumdef_encode): u32 id (1 to
+ * IMDB_MAX_ENUMS), the name (u8 length, bytes), u16 n (0 to IMDB_MAX_ENUM_LABELS), n labels (u8 length 0 to
+ * IMDB_MAX_ENUM_LABEL, bytes: strict UTF-8 without NUL, each once). One allocation: the struct, the n + 1 offsets of its
+ * labels in text, their bytes back to back */
+typedef struct imdb_enumdef {
+    uint32_t id;
+    char name[IMDB_MAX_IDENT + 1];
+    uint16_t n;
+    uint64_t *at;   /* n: the commit that made label k (the CREATE's, or its ADD VALUE's; 0 until the install stamps it):
+                     * not logged (the commit is the op's), in the manifest after the definition; an AS OF read sees a prefix */
+    uint32_t *off;  /* n + 1: label k is text[off[k], off[k + 1]) */
+    char *text;
+} imdb_enumdef;
+bool imdb_enum_label_ok(const char *s, size_t n);
+/* a definition from n labels (each its bytes and length), checked; *out allocated (imdb_enumdef_free) */
+int imdb_enumdef_make(uint32_t id, const char *name, const char *const *lab, const size_t *len, uint16_t n,
+                      imdb_enumdef **out, imdb_err *e);
+/* d with one label appended (ADD VALUE), checked: *out allocated */
+int imdb_enumdef_append(const imdb_enumdef *d, const char *lab, size_t len, imdb_enumdef **out, imdb_err *e);
+int imdb_enumdef_find(const imdb_enumdef *d, const char *lab, size_t len); /* its ordinal, or -1 */
+void imdb_enumdef_encode(const imdb_enumdef *d, imdb_buf *b);
+int imdb_enumdef_decode(imdb_rd *r, imdb_enumdef **out, const char *what, imdb_err *e);
+void imdb_enumdef_free(imdb_enumdef *d);
+int imdb_enumdef_copy(const imdb_enumdef *d, imdb_enumdef **out, imdb_err *e); /* one allocation, as made */
+bool imdb_enumdef_same(const imdb_enumdef *a, const imdb_enumdef *b); /* the labels and their commits */
+void imdb_enumdef_stamp(imdb_enumdef *d, uint16_t from, uint64_t seq);  /* labels from.. made at commit seq */
+uint16_t imdb_enumdef_count_at(const imdb_enumdef *d, uint64_t snap);  /* the labels a read at snap sees */
+bool imdb_enumdef_at_ok(const imdb_enumdef *d, uint64_t created_at);   /* the commits well formed (a manifest's) */
 void imdb_viewdef_encode(const imdb_viewdef *d, imdb_buf *b);
 int imdb_viewdef_decode(imdb_rd *r, imdb_viewdef **out, imdb_err *e); /* *out allocated; strict (above) */
 int imdb_viewdef_check(const imdb_viewdef *d, imdb_err *e);           /* the decoder's rules, for the writer's side */
@@ -365,6 +400,9 @@ typedef struct imdb_op {
      * the value) and scalled */
     imdb_seqdef *sdef;
     uint32_t seq;
+    /* F3g: CREATE_ENUM's definition (allocated); DROP_ENUM's and ENUM_ADD's type; ENUM_ADD's label in aname */
+    imdb_enumdef *edef;
+    uint32_t eid;
     int64_t sval;
     uint8_t scalled;
     /* WRITER_KEY */

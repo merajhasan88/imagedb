@@ -129,6 +129,7 @@ static void s1(const uint8_t *data, size_t size, const imdb_xval *a, const imdb_
             const imdb_xval *av[3];
             imdb_xval args[3];
             uint8_t ta[3], sa[3], rt, rs;
+            uint16_t ea[3] = {0, 0, 0}, re; /* F3g: no ENUM drawn here */
             for (int i = 0; i < nargs; i++) {
                 av[i] = pool[(sel >> (2 * i)) & 3];
                 args[i] = *av[i];
@@ -136,7 +137,7 @@ static void s1(const uint8_t *data, size_t size, const imdb_xval *a, const imdb_
                 sa[i] = args[i].scale;
             }
             imdb_err_clear(&e);
-            if (imdb_x_fn_type(fn, nargs, ta, sa, av, &rt, &rs, &e)) continue;
+            if (imdb_x_fn_type(fn, nargs, ta, sa, ea, av, &rt, &rs, &re, &e)) continue;
             imdb_xval out;
             imdb_xmark mk = imdb_xarena_mark(&arena);
             imdb_err_clear(&e);
@@ -293,7 +294,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     if (a.type != IMDB_T_TEXT && imdb_x_neg(&a, &r, &e) == 0 && a.type == IMDB_T_INT64 && !a.null &&
         (r.i < INT64_MIN || r.i > INT64_MAX))
         abort();
-    if (!a.null && !b.null && imdb_x_comparable(a.type, b.type)) {
+    if (!a.null && !b.null && imdb_x_comparable(imdb_xty_of(a.type, a.scale, a.eid), imdb_xty_of(b.type, b.scale, b.eid))) {
         if (imdb_x_cmp(&a, &b) != -imdb_x_cmp(&b, &a) || imdb_x_cmp(&a, &a) != 0) abort();
     }
     static const uint8_t CT[] = {IMDB_T_INT64, IMDB_T_DECIMAL, IMDB_T_FLOAT64, IMDB_T_TEXT};

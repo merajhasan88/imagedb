@@ -474,7 +474,7 @@ static void t_view_dump(void)
 /* the definition's codec: a round trip, and each field broken refused */
 static void t_view_codec(void)
 {
-    imdb_viewcol cols[2] = {{"a", IMDB_T_INT64, 0}, {"b", IMDB_T_DECIMAL, 2}};
+    imdb_viewcol cols[2] = {{"a", IMDB_T_INT64, 0, 0}, {"b", IMDB_T_DECIMAL, 2, 0}};
     imdb_viewdep deps[2] = {{IMDB_VIEWDEP_TABLE, 3}, {IMDB_VIEWDEP_VIEW, 1}};
     char text[] = "SELECT a, b FROM t";
     imdb_viewdef d = {.id = 4, .name = "v", .ncols = 2, .ndeps = 2, .text_len = sizeof text - 1, .cols = cols, .deps = deps,
@@ -505,7 +505,7 @@ static void t_view_codec(void)
         {11, 1},  /* an INT64 with a scale */
         {15, 39}, /* a DECIMAL past 38 places (F3e: 38 are the most) */
         {13, 'a'}, /* two columns named a */
-        {18, 3},  /* a dependency of an unknown kind */
+        {18, 4},  /* a dependency of an unknown kind (F3g: 3 is a TYPE) */
         {24, 4},  /* a view's dependency on itself, not an earlier one */
         {18, 2},  /* the dependencies out of order: view 3, then view 1 */
         {16, 3},  /* three dependencies claimed: the text length read from the third's bytes */

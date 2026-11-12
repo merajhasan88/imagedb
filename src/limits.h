@@ -63,6 +63,9 @@
 #define IMDB_MAX_WINDOWS        8u           /* window functions in one SELECT (P2 S6) */
 #define IMDB_MAX_VIEWS          1024u        /* views per database, dropped ones counted: their ids are never reused (P2 S7) */
 #define IMDB_MAX_SEQUENCES      4096u        /* sequences per database, dropped ones counted: ids never reused (F2a-2) */
+#define IMDB_MAX_ENUMS          4096u        /* F3g: ENUM types per database, dropped ones counted: ids never reused (1..4096: a u16) */
+#define IMDB_MAX_ENUM_LABELS    1024u        /* F3g: an ENUM's labels */
+#define IMDB_MAX_ENUM_LABEL     63u          /* F3g: bytes in a label (PostgreSQL's NAMEDATALEN - 1; the empty label taken) */
 #define IMDB_MAX_CHECKS         32u          /* F2b-1: a table's live CHECK constraints */
 #define IMDB_MAX_FKS            16u          /* F2b-2: a table's live FOREIGN KEY constraints */
 #define IMDB_MAX_CHECK_TEXT     8192u        /* F2b-1: bytes in a CHECK's text, and in a table's live ones' together (so their

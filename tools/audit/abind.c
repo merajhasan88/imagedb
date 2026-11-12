@@ -31,8 +31,8 @@
 #include "abind.h"
 
 enum { T_INT64 = 1, T_DECIMAL = 2, T_TEXT = 3, T_BOOL = 4, T_TIMESTAMP = 5, T_FLOAT64 = 6, T_TIMESTAMPTZ = 7, T_DATE = 8, T_TIME = 9,
-       T_UUID = 10, T_BYTEA = 11, T_INTERVAL = 12 }; /* F3d; F3f */
-enum { DEP_TABLE = 1, DEP_VIEW = 2 };
+       T_UUID = 10, T_BYTEA = 11, T_INTERVAL = 12, T_ENUM = 13 }; /* F3d; F3f; F3g: a label's ordinal, its type's id beside */
+enum { DEP_TABLE = 1, DEP_VIEW = 2, DEP_TYPE = 3 }; /* F3g: a CAST's ENUM type */
 
 #define MAX_IDENT 63
 #define MAX_COLS 64
@@ -130,6 +130,7 @@ struct aq {
 
 typedef struct ty {
     uint8_t t, s; /* t 0: an untyped NULL */
+    uint16_t e;   /* F3g: an ENUM's type id (0 for every other type): two ENUMs meet within one type alone */
 } ty;
 
 typedef struct rel {
@@ -648,6 +649,9 @@ static int col_type(ab *b, uint8_t *type, uint8_t *scale) /* a CAST's type, as a
     } else if (kw(b, "double")) {
         kw(b, "precision");
         *type = T_FLOAT64;
+    } else if (b->t[b->i].k == K_ID && !reserved(b, b->i)) { /* F3g: an ENUM type by its name (the caller keeps the token) */
+        *type = T_ENUM;
+        b->i++;
     } else {
         return fail(b, "expected a type at offset %u", b->t[b->i].off);
     }
@@ -658,11 +662,13 @@ static int cast_expr(ab *b, uint16_t *out, unsigned d) /* CAST eaten */
 {
     uint16_t a;
     uint8_t t = 0, s = 0; /* set by col_type on its every success */
-    if (expect(b, K_LP, "(") || bexpr(b, &a, d + 1) || expect_kw(b, "as") || col_type(b, &t, &s) ||
+    uint32_t tat = 0; /* F3g: the type's name token, an ENUM's */
+    if (expect(b, K_LP, "(") || bexpr(b, &a, d + 1) || expect_kw(b, "as") || ((tat = b->i), col_type(b, &t, &s)) ||
         expect(b, K_RP, ")") || nnew(b, X_CAST, a, 0, out))
         return -1;
     X(*out)->ctype = t;
     X(*out)->cscale = s;
+    if (t == T_ENUM) X(*out)->off = b->t[tat].off, X(*out)->len = b->t[tat].len; /* F3g: resolved at binding (cast_type) */
     return 0;
 }
 
@@ -1435,7 +1441,7 @@ static const char *tname(uint8_t t)
 {
     static const char *const N[] = {"NULL", "INT64", "DECIMAL", "TEXT", "BOOL", "TIMESTAMP", "FLOAT64", "TIMESTAMPTZ", "DATE", "TIME",
                                     "UUID", "BYTEA", "INTERVAL"};
-    return t <= T_INTERVAL ? N[t] : "?";
+    return t <= T_INTERVAL ? N[t] : t == T_ENUM ? "ENUM" : "?";
 }
 
 static int dep_note(ab *b, uint8_t kind, uint32_t id)
@@ -1631,6 +1637,7 @@ static int scope_col(ab *b, const scope *s, const char *qual, const char *name, 
     if (!found) return qual[0] ? fail(b, "no column %s in %s", name, qual) : 0;
     out->t = s->r[side].cols[col].type;
     out->s = s->r[side].cols[col].scale;
+    out->e = s->r[side].cols[col].eid; /* F3g */
     return 1;
 }
 
@@ -1666,37 +1673,37 @@ static int arith(ab *b, uint8_t op, ty l, ty r, ty *out)
      * TIMESTAMPTZ - TIMESTAMPTZ (an INTERVAL), as the engine's imdb_x_type */
     if (l.t == T_INTERVAL || r.t == T_INTERVAL || (op == X_SUB && l.t == r.t && (l.t == T_TIMESTAMP || l.t == T_TIMESTAMPTZ))) {
         bool dl = l.t == T_TIMESTAMP || l.t == T_DATE, dr = r.t == T_TIMESTAMP || r.t == T_DATE;
-        if (l.t == T_INTERVAL && r.t == T_INTERVAL && (op == X_ADD || op == X_SUB)) *out = (ty){T_INTERVAL, 0};
-        else if ((op == X_ADD || op == X_SUB) && dl && r.t == T_INTERVAL) *out = (ty){T_TIMESTAMP, 0};
-        else if (op == X_ADD && l.t == T_INTERVAL && dr) *out = (ty){T_TIMESTAMP, 0};
-        else if (op == X_SUB && l.t == r.t && l.t != T_INTERVAL) *out = (ty){T_INTERVAL, 0};
+        if (l.t == T_INTERVAL && r.t == T_INTERVAL && (op == X_ADD || op == X_SUB)) *out = (ty){T_INTERVAL, 0, 0};
+        else if ((op == X_ADD || op == X_SUB) && dl && r.t == T_INTERVAL) *out = (ty){T_TIMESTAMP, 0, 0};
+        else if (op == X_ADD && l.t == T_INTERVAL && dr) *out = (ty){T_TIMESTAMP, 0, 0};
+        else if (op == X_SUB && l.t == r.t && l.t != T_INTERVAL) *out = (ty){T_INTERVAL, 0, 0};
         else return fail(b, "interval arithmetic: INTERVAL + or - INTERVAL, a TIMESTAMP or DATE + or - an INTERVAL, "
                             "TIMESTAMP - TIMESTAMP");
         return 0;
     }
     /* F3b: a DATE plus or minus days, DATE minus DATE (days), DATE plus TIME (a TIMESTAMP); the rest refused */
     if (l.t == T_DATE || r.t == T_DATE || l.t == T_TIME || r.t == T_TIME) {
-        if (op == X_ADD && ((l.t == T_DATE && r.t == T_INT64) || (l.t == T_INT64 && r.t == T_DATE))) *out = (ty){T_DATE, 0};
-        else if (op == X_SUB && l.t == T_DATE && r.t == T_INT64) *out = (ty){T_DATE, 0};
-        else if (op == X_SUB && l.t == T_DATE && r.t == T_DATE) *out = (ty){T_INT64, 0};
-        else if (op == X_ADD && ((l.t == T_DATE && r.t == T_TIME) || (l.t == T_TIME && r.t == T_DATE))) *out = (ty){T_TIMESTAMP, 0};
+        if (op == X_ADD && ((l.t == T_DATE && r.t == T_INT64) || (l.t == T_INT64 && r.t == T_DATE))) *out = (ty){T_DATE, 0, 0};
+        else if (op == X_SUB && l.t == T_DATE && r.t == T_INT64) *out = (ty){T_DATE, 0, 0};
+        else if (op == X_SUB && l.t == T_DATE && r.t == T_DATE) *out = (ty){T_INT64, 0, 0};
+        else if (op == X_ADD && ((l.t == T_DATE && r.t == T_TIME) || (l.t == T_TIME && r.t == T_DATE))) *out = (ty){T_TIMESTAMP, 0, 0};
         else return fail(b, "date arithmetic: DATE + or - INT64, DATE - DATE, DATE + TIME");
         return 0;
     }
     if (!num(l.t) || !num(r.t)) return fail(b, "arithmetic takes INT64, DECIMAL and FLOAT64 values");
     if (l.t == T_FLOAT64 || r.t == T_FLOAT64) {
         if (op == X_MOD) return fail(b, "%% is not defined on FLOAT64");
-        *out = (ty){T_FLOAT64, 0};
+        *out = (ty){T_FLOAT64, 0, 0};
         return 0;
     }
     if (l.t == T_INT64 && r.t == T_INT64) {
-        *out = (ty){T_INT64, 0};
+        *out = (ty){T_INT64, 0, 0};
         return 0;
     }
     int s1 = l.t == T_DECIMAL ? l.s : 0, s2 = r.t == T_DECIMAL ? r.s : 0, big = s1 > s2 ? s1 : s2;
     int s = op == X_MUL ? s1 + s2 : op == X_DIV ? big + 6 : big;
     if (s > MAX_SCALE) return fail(b, "a DECIMAL result of more than %u decimal places", MAX_SCALE);
-    *out = (ty){T_DECIMAL, (uint8_t)s};
+    *out = (ty){T_DECIMAL, (uint8_t)s, 0};
     return 0;
 }
 
@@ -1709,13 +1716,14 @@ static int unify(ab *b, ty *acc, ty v, const char *what)
         *acc = v;
         return 0;
     }
+    if (acc->t == v.t && v.t == T_ENUM && acc->e != v.e) return fail(b, "%s two ENUM types: values are not converted", what); /* F3g */
     if (acc->t == v.t) {
         if (v.t == T_DECIMAL && v.s > acc->s) acc->s = v.s;
         return 0;
     }
     if ((acc->t == T_INT64 && v.t == T_DECIMAL) || (acc->t == T_DECIMAL && v.t == T_INT64)) {
         uint8_t a = acc->t == T_DECIMAL ? acc->s : 0, c = v.t == T_DECIMAL ? v.s : 0;
-        *acc = (ty){T_DECIMAL, a > c ? a : c};
+        *acc = (ty){T_DECIMAL, a > c ? a : c, 0};
         return 0;
     }
     return fail(b, "%s %s and %s: values are not converted", what, tname(acc->t), tname(v.t));
@@ -1727,15 +1735,16 @@ static int unify_all(ab *b, const scope *sc, const uint16_t *v, unsigned n, cons
 {
     ty t[MAX_ARGS + 1];
     uint8_t ts = 0; /* a TIMESTAMP or (P2) a TIMESTAMPTZ among them: a string literal is of its type */
+    uint16_t tse = 0; /* F3g: an ENUM's type id */
     for (unsigned i = 0; i < n; i++) {
         if (type_of(b, sc, v[i], true, &t[i])) return -1;
         if (t[i].t == T_TIMESTAMP || t[i].t == T_TIMESTAMPTZ || t[i].t == T_DATE || t[i].t == T_TIME || t[i].t == T_UUID ||
-            t[i].t == T_BYTEA || t[i].t == T_INTERVAL) /* F3f: a string literal beside an INTERVAL is one */
-            ts = t[i].t; /* F3b; F3d: a string literal beside a UUID or a BYTEA is one, as the engine's is_ts */
+            t[i].t == T_BYTEA || t[i].t == T_INTERVAL || t[i].t == T_ENUM) /* F3f: a string literal beside an INTERVAL is one; F3g: an ENUM's label */
+            ts = t[i].t, tse = t[i].e; /* F3b; F3d: a string literal beside a UUID or a BYTEA is one, as the engine's is_ts */
     }
-    *out = (ty){0, 0};
+    *out = (ty){0, 0, 0};
     for (unsigned i = 0; i < n; i++) {
-        ty x = ts && str_lit(sc->q, v[i]) ? (ty){ts, 0} : t[i];
+        ty x = ts && str_lit(sc->q, v[i]) ? (ty){ts, 0, tse} : t[i];
         if (unify(b, out, x, what)) return -1;
     }
     return out->t ? 0 : fail(b, "%s NULL alone has no type", what);
@@ -1758,15 +1767,15 @@ static int fn_type(ab *b, const scope *sc, const xn *x, ty *out)
         if (type_of(b, sc, v[i], x->fn == F_NULLIF && i == 1, &a[i])) return -1;
     if (x->fn == F_CONCAT && n == 2) /* F3d: a string literal beside a BYTEA is one, as the engine binds it */
         for (unsigned i = 0; i < 2; i++)
-            if (a[1 - i].t == T_BYTEA && str_lit(q, v[i])) a[i] = (ty){T_BYTEA, 0};
-    *out = (ty){0, 0};
+            if (a[1 - i].t == T_BYTEA && str_lit(q, v[i])) a[i] = (ty){T_BYTEA, 0, 0};
+    *out = (ty){0, 0, 0};
     switch (x->fn) {
     case F_NOW: /* F2a: the clock's types; their values are a run's, never a bind's */
     case F_LOCALTIMESTAMP:
     case F_CURRENT_DATE:
     case F_LOCALTIME:
         if (fn_args(b, n, 0, 0)) return -1;
-        *out = (ty){x->fn == F_NOW ? T_TIMESTAMPTZ : x->fn == F_LOCALTIMESTAMP ? T_TIMESTAMP : x->fn == F_CURRENT_DATE ? T_DATE : T_TIME, 0};
+        *out = (ty){x->fn == F_NOW ? T_TIMESTAMPTZ : x->fn == F_LOCALTIMESTAMP ? T_TIMESTAMP : x->fn == F_CURRENT_DATE ? T_DATE : T_TIME, 0, 0};
         return 0;
     case F_ABS:
     case F_SIGN:
@@ -1774,7 +1783,7 @@ static int fn_type(ab *b, const scope *sc, const xn *x, ty *out)
     case F_FLOOR:
         if (fn_args(b, n, 1, 1)) return -1;
         if (!num(a[0].t)) return fail(b, "that function takes a number");
-        *out = (ty){x->fn == F_SIGN ? T_INT64 : a[0].t, x->fn == F_ABS && a[0].t == T_DECIMAL ? a[0].s : 0};
+        *out = (ty){x->fn == F_SIGN ? T_INT64 : a[0].t, x->fn == F_ABS && a[0].t == T_DECIMAL ? a[0].s : 0, 0};
         return 0;
     case F_ROUND: {
         if (fn_args(b, n, 1, 2)) return -1;
@@ -1788,7 +1797,7 @@ static int fn_type(ab *b, const scope *sc, const xn *x, ty *out)
             if (d < 0 || d > MAX_SCALE) return fail(b, "ROUND's places are 0 to %u", MAX_SCALE);
         }
         if (a[0].t == T_FLOAT64 && d) return fail(b, "ROUND of a FLOAT64 rounds to an integer");
-        *out = (ty){a[0].t, a[0].t == T_DECIMAL ? (uint8_t)(a[0].s < d ? a[0].s : d) : 0};
+        *out = (ty){a[0].t, a[0].t == T_DECIMAL ? (uint8_t)(a[0].s < d ? a[0].s : d) : 0, 0};
         return 0;
     }
     case F_MOD: return fn_args(b, n, 2, 2) || arith(b, X_MOD, a[0], a[1], out);
@@ -1800,38 +1809,38 @@ static int fn_type(ab *b, const scope *sc, const xn *x, ty *out)
     case F_RTRIM:
         if (fn_args(b, n, 1, 1)) return -1;
         if (x->fn == F_LENGTH && a[0].t == T_BYTEA) { /* F3d: its bytes */
-            *out = (ty){T_INT64, 0};
+            *out = (ty){T_INT64, 0, 0};
             return 0;
         }
         if (a[0].t != T_TEXT) return fail(b, "that function takes a TEXT value");
-        *out = (ty){x->fn == F_LENGTH ? T_INT64 : T_TEXT, 0};
+        *out = (ty){x->fn == F_LENGTH ? T_INT64 : T_TEXT, 0, 0};
         return 0;
     case F_OCTET_LENGTH: /* F3d */
         if (fn_args(b, n, 1, 1)) return -1;
         if (a[0].t != T_TEXT && a[0].t != T_BYTEA) return fail(b, "OCTET_LENGTH takes a TEXT or a BYTEA");
-        *out = (ty){T_INT64, 0};
+        *out = (ty){T_INT64, 0, 0};
         return 0;
     case F_REPLACE:
     case F_CONCAT:
         if (fn_args(b, n, x->fn == F_REPLACE ? 3 : 2, x->fn == F_REPLACE ? 3 : 2)) return -1;
         if (x->fn == F_CONCAT && a[0].t == T_BYTEA && a[1].t == T_BYTEA) { /* F3d */
-            *out = (ty){T_BYTEA, 0};
+            *out = (ty){T_BYTEA, 0, 0};
             return 0;
         }
         for (unsigned i = 0; i < n; i++)
             if (a[i].t != T_TEXT) return fail(b, "that function takes TEXT values");
-        *out = (ty){T_TEXT, 0};
+        *out = (ty){T_TEXT, 0, 0};
         return 0;
     case F_SUBSTR:
         if (fn_args(b, n, 2, 3)) return -1;
         if (a[0].t != T_TEXT || a[1].t != T_INT64 || (n == 3 && a[2].t != T_INT64))
             return fail(b, "SUBSTR takes a TEXT value, a start and a length");
-        *out = (ty){T_TEXT, 0};
+        *out = (ty){T_TEXT, 0, 0};
         return 0;
     case F_POSITION:
         if (fn_args(b, n, 2, 2)) return -1;
         if (a[0].t != T_TEXT || a[1].t != T_TEXT) return fail(b, "POSITION takes TEXT values");
-        *out = (ty){T_INT64, 0};
+        *out = (ty){T_INT64, 0, 0};
         return 0;
     case F_DATE_TRUNC: { /* P2: date_trunc(unit, x [, zone]): x's type; the unit a string constant of PostgreSQL's names */
         static const char *const U[] = {"microseconds", "microsecond", "milliseconds", "millisecond", "second", "seconds",
@@ -1846,14 +1855,14 @@ static int fn_type(ab *b, const scope *sc, const xn *x, ty *out)
         if (!found) return fail(b, "date_trunc's unit is a string constant of a unit's name");
         if (a[1].t != T_TIMESTAMP && a[1].t != T_TIMESTAMPTZ) return fail(b, "date_trunc takes a TIMESTAMP or a TIMESTAMPTZ");
         if (n == 3 && (a[1].t != T_TIMESTAMPTZ || a[2].t != T_TEXT)) return fail(b, "date_trunc's zone is a TIMESTAMPTZ's");
-        *out = (ty){a[1].t, 0};
+        *out = (ty){a[1].t, 0, 0};
         return 0;
     }
     case F_TIMEZONE: /* P2: x AT TIME ZONE z: a TIMESTAMPTZ's wall clock (TIMESTAMP), a TIMESTAMP's instant (TIMESTAMPTZ) */
         if (fn_args(b, n, 2, 2)) return -1;
         if (a[0].t != T_TEXT) return fail(b, "AT TIME ZONE takes a zone's name (TEXT)");
         if (a[1].t != T_TIMESTAMP && a[1].t != T_TIMESTAMPTZ) return fail(b, "AT TIME ZONE converts a TIMESTAMP or a TIMESTAMPTZ");
-        *out = (ty){a[1].t == T_TIMESTAMP ? T_TIMESTAMPTZ : T_TIMESTAMP, 0};
+        *out = (ty){a[1].t == T_TIMESTAMP ? T_TIMESTAMPTZ : T_TIMESTAMP, 0, 0};
         return 0;
     case F_NULLIF:
         if (fn_args(b, n, 2, 2)) return -1;
@@ -1878,16 +1887,37 @@ static int case_type(ab *b, const scope *sc, const xn *x, ty *out)
     return unify_all(b, sc, v, nv, "a CASE of", out);
 }
 
+/* F3g: a CAST's ENUM type by its name: live in the catalog, its dependency noted wherever the CAST stands (a WHERE
+ * too, which the binder walks untyped, as the engine binds every tree) */
+static int cast_enum(ab *b, const xn *x, uint32_t *id)
+{
+    char nm[64];
+    fold(b->s + x->off, x->len, nm);
+    ab_rel cr;
+    memset(&cr, 0, sizeof cr);
+    if (!b->lookup || !b->lookup(b->arg, nm, &cr) || cr.kind != DEP_TYPE) return fail(b, "no type %s", nm);
+    *id = cr.id;
+    return dep_note(b, DEP_TYPE, cr.id);
+}
+
 static int cast_type(ab *b, const scope *sc, const xn *x, ty *out)
 {
     ty a;
     if (type_of(b, sc, x->l, true, &a)) return -1;
+    if (x->ctype == T_ENUM) { /* F3g: the type a name says now (live: the catalog's), its dependency; from a TEXT, itself, NULL */
+        uint32_t id;
+        if (cast_enum(b, x, &id)) return -1;
+        if (a.t && a.t != T_TEXT && (a.t != T_ENUM || a.e != id)) return fail(b, "CAST to an ENUM type takes a TEXT or that type");
+        *out = (ty){T_ENUM, 0, (uint16_t)id};
+        return 0;
+    }
+    if (a.t == T_ENUM && x->ctype != T_TEXT) return fail(b, "CAST of an ENUM to %s is not defined", tname(x->ctype)); /* F3g */
     bool to_num = num(x->ctype);
     bool fts = a.t == T_TIMESTAMP || a.t == T_TIMESTAMPTZ, tts = x->ctype == T_TIMESTAMP || x->ctype == T_TIMESTAMPTZ;
     bool ts2 = (fts && (tts || x->ctype == T_DATE || x->ctype == T_TIME)) || (a.t == T_DATE && tts); /* P2; F3b: the engine's dt_cast_ok */
     if (a.t && a.t != T_TEXT && x->ctype != T_TEXT && a.t != x->ctype && !(num(a.t) && to_num) && !ts2)
         return fail(b, "CAST of %s to %s is not defined", tname(a.t), tname(x->ctype));
-    *out = (ty){x->ctype, x->ctype == T_DECIMAL ? x->cscale : 0};
+    *out = (ty){x->ctype, x->ctype == T_DECIMAL ? x->cscale : 0, 0};
     return 0;
 }
 
@@ -1896,7 +1926,7 @@ static int cast_type(ab *b, const scope *sc, const xn *x, ty *out)
 static int agg_type(ab *b, const scope *sc, uint8_t agg, uint16_t arg, ty *out)
 {
     if (agg == A_COUNT_STAR || agg == A_COUNT) {
-        *out = (ty){T_INT64, 0};
+        *out = (ty){T_INT64, 0, 0};
         return walk(b, sc, arg);
     }
     ty a;
@@ -1907,7 +1937,7 @@ static int agg_type(ab *b, const scope *sc, uint8_t agg, uint16_t arg, ty *out)
     if (agg == A_AVG && a.t != T_FLOAT64) {
         unsigned s = (a.t == T_DECIMAL ? a.s : 0u) + 6u;
         if (s > MAX_SCALE) return fail(b, "AVG of a DECIMAL past %u decimal places", MAX_SCALE - 6);
-        *out = (ty){T_DECIMAL, (uint8_t)s};
+        *out = (ty){T_DECIMAL, (uint8_t)s, 0};
     }
     return 0;
 }
@@ -1924,18 +1954,18 @@ static int win_type(ab *b, const scope *sc, const xn *x, ty *out)
     case W_RANK:
     case W_DENSE_RANK:
     case W_NTILE:
-        *out = (ty){T_INT64, 0};
+        *out = (ty){T_INT64, 0, 0};
         return walk(b, sc, x->l);
     case W_LAG:
     case W_LEAD:
     case W_FIRST:
     case W_LAST: {
         if (walk(b, sc, x->r)) return -1; /* LAG's and LEAD's offset */
-        ty v, d = {0, 0};
+        ty v, d = {0, 0, 0};
         if (type_of(b, sc, x->l, true, &v)) return -1;
         if (x->x3 && (type_of(b, sc, x->x3, true, &d) || unify(b, &v, d, "LAG's and LEAD's value and default are")))
             return -1;
-        *out = v.t ? v : (ty){T_TEXT, 0};
+        *out = v.t ? v : (ty){T_TEXT, 0, 0};
         return 0;
     }
     case W_AGG: return agg_type(b, sc, x->agg, x->l, out);
@@ -1949,6 +1979,8 @@ static int walk(ab *b, const scope *sc, uint16_t k)
     if (!k) return 0;
     const aq *q = sc->q;
     const xn *x = QX(q, k);
+    uint32_t eid;
+    if (x->op == X_CAST && x->ctype == T_ENUM && cast_enum(b, x, &eid)) return -1;
     if (x->op == X_SUBQ) {
         if (x->sub >= q->nsub) return fail(b, "a subquery this statement lacks");
         return bind_query(b, q->sub[x->sub], sc, M_DEPS, NULL, NULL);
@@ -1974,7 +2006,7 @@ static int int_lit_type(ab *b, const xn *x, ty *out)
         if (digits > MAX_SCALE) return fail(b, "integer literal out of INT64 range");
         m = m * 10 + (unsigned)(c - '0');
     }
-    *out = m <= (unsigned __int128)INT64_MAX + (x->neg ? 1u : 0u) ? (ty){T_INT64, 0} : (ty){T_DECIMAL, 0};
+    *out = m <= (unsigned __int128)INT64_MAX + (x->neg ? 1u : 0u) ? (ty){T_INT64, 0, 0} : (ty){T_DECIMAL, 0, 0};
     return 0;
 }
 
@@ -2000,22 +2032,22 @@ static int type_of(ab *b, const scope *sc, uint16_t k, bool null_ok, ty *out)
                 if (sig || c != '0') sig = true, digits++;
             }
             if (digits > MAX_SCALE || s > MAX_SCALE) return fail(b, "a DECIMAL literal of more than %u digits", MAX_SCALE);
-            *out = (ty){T_DECIMAL, (uint8_t)s};
+            *out = (ty){T_DECIMAL, (uint8_t)s, 0};
             return 0;
         }
-        case L_FLT: *out = (ty){T_FLOAT64, 0}; return 0;
-        case L_STR: *out = (ty){T_TEXT, 0}; return 0;
-        case L_BOOL: *out = (ty){T_BOOL, 0}; return 0;
-        case L_TS: *out = (ty){T_TIMESTAMP, 0}; return 0;
-        case L_TSTZ: *out = (ty){T_TIMESTAMPTZ, 0}; return 0; /* P2 */
-        case L_DATE: *out = (ty){T_DATE, 0}; return 0; /* F3b */
-        case L_TIME: *out = (ty){T_TIME, 0}; return 0;
-        case L_UUID: *out = (ty){T_UUID, 0}; return 0; /* F3d */
-        case L_BYTEA: *out = (ty){T_BYTEA, 0}; return 0;
-        case L_INTERVAL: *out = (ty){T_INTERVAL, 0}; return 0; /* F3f */
+        case L_FLT: *out = (ty){T_FLOAT64, 0, 0}; return 0;
+        case L_STR: *out = (ty){T_TEXT, 0, 0}; return 0;
+        case L_BOOL: *out = (ty){T_BOOL, 0, 0}; return 0;
+        case L_TS: *out = (ty){T_TIMESTAMP, 0, 0}; return 0;
+        case L_TSTZ: *out = (ty){T_TIMESTAMPTZ, 0, 0}; return 0; /* P2 */
+        case L_DATE: *out = (ty){T_DATE, 0, 0}; return 0; /* F3b */
+        case L_TIME: *out = (ty){T_TIME, 0, 0}; return 0;
+        case L_UUID: *out = (ty){T_UUID, 0, 0}; return 0; /* F3d */
+        case L_BYTEA: *out = (ty){T_BYTEA, 0, 0}; return 0;
+        case L_INTERVAL: *out = (ty){T_INTERVAL, 0, 0}; return 0; /* F3f */
         case L_NULL:
             if (!null_ok) return fail(b, "NULL cannot be an operand");
-            *out = (ty){0, 0};
+            *out = (ty){0, 0, 0};
             return 0;
         default: return fail(b, "a parameter in a view's query");
         }
@@ -2036,7 +2068,7 @@ static int type_of(ab *b, const scope *sc, uint16_t k, bool null_ok, ty *out)
     case X_AND:
     case X_OR:
     case X_NOT:
-        *out = (ty){T_BOOL, 0};
+        *out = (ty){T_BOOL, 0, 0};
         return walk(b, sc, k);
     case X_FN: return fn_type(b, sc, x, out);
     case X_CASE: return case_type(b, sc, x, out);
@@ -2048,14 +2080,14 @@ static int type_of(ab *b, const scope *sc, uint16_t k, bool null_ok, ty *out)
     case X_SUBQ: {
         if (x->sub >= q->nsub) return fail(b, "a subquery this statement lacks");
         if (x->subk != S_VALUE) {
-            *out = (ty){T_BOOL, 0};
+            *out = (ty){T_BOOL, 0, 0};
             return bind_query(b, q->sub[x->sub], sc, M_DEPS, NULL, NULL);
         }
         ab_col c[MAX_COLS];
         uint16_t n = 0;
         if (bind_query(b, q->sub[x->sub], sc, M_TYPED, c, &n)) return -1;
         if (n != 1) return fail(b, "a subquery as a value returns one column");
-        *out = (ty){c[0].type, c[0].scale};
+        *out = (ty){c[0].type, c[0].scale, c[0].eid}; /* F3g */
         return 0;
     }
     default: return fail(b, "an expression the binder does not know");
@@ -2116,19 +2148,20 @@ static int bind_core(ab *b, const aq *q, const scope *up, int mode, ab_col *out,
         for (uint16_t i = 0; !rc && i < q->nitems; i++) {
             const aitem *it = &q->items[i];
             const xn *x = QX(q, it->ex);
-            ty t = {0, 0};
+            ty t = {0, 0, 0};
             if (it->shape == 2) {
-                if (x->agg == A_COUNT || x->agg == A_COUNT_STAR) t = (ty){T_INT64, 0};
+                if (x->agg == A_COUNT || x->agg == A_COUNT_STAR) t = (ty){T_INT64, 0, 0};
                 else if (!(rc = col_of(b, &sc, QX(q, x->l), &t)) && x->agg == A_SUM && !num(t.t) && t.t != T_INTERVAL) /* F3f */
                     rc = fail(b, "SUM needs an INT64, DECIMAL or FLOAT64 value");
             } else {
                 rc = type_of(b, &sc, it->ex, true, &t);
             }
             if (rc) break;
-            if (!t.t) t = (ty){T_TEXT, 0}; /* SELECT NULL: a TEXT NULL */
+            if (!t.t) t = (ty){T_TEXT, 0, 0}; /* SELECT NULL: a TEXT NULL */
             item_name(b, q, it, out[i].name);
             out[i].type = t.t;
             out[i].scale = t.t == T_DECIMAL ? t.s : 0;
+            out[i].eid = t.t == T_ENUM ? t.e : 0; /* F3g */
         }
         if (!rc) *nout = q->nitems;
     } else if (!rc) {
@@ -2164,10 +2197,11 @@ static int bind_query(ab *b, const aq *q, const scope *up, int mode, ab_col *out
                 break;
             }
             for (uint16_t k = 0; !rc && k < na; k++) {
-                ty t = {acc[k].type, acc[k].scale};
-                if (!(rc = unify(b, &t, (ty){c[k].type, c[k].scale}, "a set operation's column is"))) {
+                ty t = {acc[k].type, acc[k].scale, acc[k].eid};
+                if (!(rc = unify(b, &t, (ty){c[k].type, c[k].scale, c[k].eid}, "a set operation's column is"))) {
                     acc[k].type = t.t;
                     acc[k].scale = t.t == T_DECIMAL ? t.s : 0;
+                    acc[k].eid = t.t == T_ENUM ? t.e : 0; /* F3g */
                 }
             }
         }
@@ -2738,6 +2772,7 @@ static int ck_bind(ck *x, uint16_t k, bool null_ok)
                 if (d->t == T_FLOAT64) return fail(x->b, "a CHECK computes no FLOAT64 value");
                 if (d->t == T_UUID || d->t == T_BYTEA) return fail(x->b, "a CHECK reads no UUID or BYTEA value yet"); /* F3d */
                 if (d->t == T_INTERVAL) return fail(x->b, "a CHECK reads no INTERVAL value yet"); /* F3f */
+                if (d->t == T_ENUM) return fail(x->b, "a CHECK reads no ENUM value yet"); /* F3g: deferred.md D27 */
                 return 0;
             }
         return fail(x->b, "no column %s in its table", nm);
