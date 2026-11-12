@@ -361,7 +361,7 @@ static void t_schema_codec(void)
     imdb_err_clear(&e);
     CHECK(imdb_schema_check(&s, &e) != 0); /* duplicate column */
     schema3(&s);
-    s.cols[2].precision = 19;
+    s.cols[2].precision = 39; /* F3e: 38 digits are the most */
     imdb_err_clear(&e);
     CHECK(imdb_schema_check(&s, &e) != 0);
     schema3(&s);

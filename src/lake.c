@@ -23,11 +23,30 @@ static const uint8_t kManMagic[8] = {'I', 'M', 'D', 'B', 'M', 'A', 'N', '1'};
 
 static size_t align8(size_t x) { return (x + 7) & ~(size_t)7; }
 
-static bool is_int_col(uint8_t type)
+/* F3e: a DECIMAL past 18 digits is held as a UUID is, through the byte-string layout (offsets and data), each value its
+ * 16 bytes (i then hi, little-endian) or none, with no zone map; every other DECIMAL an int64 column as before */
+static bool dec_wide(const imdb_column *c) { return c->type == IMDB_T_DECIMAL && imdb_dec_wide(c->precision); }
+
+static bool is_int_col(const imdb_column *c)
 {
-    return type == IMDB_T_INT64 || type == IMDB_T_DECIMAL || type == IMDB_T_TIMESTAMP || type == IMDB_T_FLOAT64 || type == IMDB_T_DATE ||
-           type == IMDB_T_TIME ||
-           type == IMDB_T_TIMESTAMPTZ;
+    uint8_t type = c->type;
+    return type == IMDB_T_INT64 || (type == IMDB_T_DECIMAL && !dec_wide(c)) || type == IMDB_T_TIMESTAMP || type == IMDB_T_FLOAT64 ||
+           type == IMDB_T_DATE || type == IMDB_T_TIME || type == IMDB_T_TIMESTAMPTZ;
+}
+
+/* the columns laid out as offsets and data: TEXT, UUID, BYTEA (F3d) and a wide DECIMAL (F3e) */
+static bool seg_bytes(const imdb_column *c) { return imdb_type_bytes(c->type) || dec_wide(c); }
+
+/* F3e: a wide DECIMAL's 16-byte cell (i then hi, little-endian) as its value, and its range (10^p - 1 either way) */
+static __int128 dec_cell(const uint8_t *p)
+{
+    return (__int128)(((unsigned __int128)imdb_get_le64(p + 8) << 64) | imdb_get_le64(p));
+}
+
+static bool dec_cell_fits(const uint8_t *p, const imdb_column *c)
+{
+    __int128 x = dec_cell(p), lim = imdb_pow10_128(c->precision) - 1;
+    return x <= lim && x >= -lim;
 }
 
 static bool nullable(const imdb_column *c) { return (c->flags & IMDB_COL_NULLABLE) != 0; }
@@ -55,7 +74,7 @@ static uint32_t seg_layout(const imdb_schema *s, uint32_t n, const uint64_t *tex
     d[k++] = (secdesc){SEG_COMMIT, 0, 32ull * n};
     for (uint32_t c = 0; c < s->ncols; c++) {
         uint8_t t = s->cols[c].type;
-        if (is_int_col(t)) d[k++] = (secdesc){SEG_I64, c, 8ull * n};
+        if (is_int_col(&s->cols[c])) d[k++] = (secdesc){SEG_I64, c, 8ull * n};
         else if (t == IMDB_T_BOOL) d[k++] = (secdesc){SEG_U8, c, n};
         else {
             d[k++] = (secdesc){SEG_TEXT_OFF, c, 4ull * ((uint64_t)n + 1)};
@@ -342,7 +361,7 @@ int imdb_segment_parse(const imdb_schema *s, const uint8_t vhash[32], uint8_t *b
          * when NULLABLE, has its bit set: every other row holds zero data */
         const uint8_t *vb = NULL;
         if (nullable(col)) {
-            uint32_t vk = k + (imdb_type_bytes(col->type) ? 2 : 1); /* F3d: a byte string's offsets and data */
+            uint32_t vk = k + (seg_bytes(col) ? 2 : 1); /* F3d: a byte string's offsets and data (F3e: a wide DECIMAL's) */
             vb = sec[vk];
             if ((n & 7) && (vb[n >> 3] >> (n & 7)) != 0) rc = imdb_fail(e, IMDB_ERR_CORRUPT, "segment: VALID padding");
             for (uint32_t i = 0; i < n && !rc; i++)
@@ -350,7 +369,7 @@ int imdb_segment_parse(const imdb_schema *s, const uint8_t vhash[32], uint8_t *b
                     rc = imdb_fail(e, IMDB_ERR_CORRUPT, "segment: erased or purged row marked VALID in column %s", col->name);
             sc->valid = vb;
         }
-        if (is_int_col(col->type)) {
+        if (is_int_col(col)) {
             sc->i64 = (const int64_t *)(const void *)sec[k++];
             int64_t lim = col->type == IMDB_T_DECIMAL ? imdb_pow10(col->precision) - 1 : 0;
             for (uint32_t i = 0; i < n && !rc; i++) {
@@ -386,6 +405,10 @@ int imdb_segment_parse(const imdb_schema *s, const uint8_t vhash[32], uint8_t *b
                     rc = imdb_fail(e, IMDB_ERR_CORRUPT, "segment: a UUID of %u bytes in column %s", z - a, col->name);
                 else if (col->type == IMDB_T_UUID && z == a && seg_keeps(gi->flags[i], s, c) && !(vb && !valid_bit(vb, i)))
                     rc = imdb_fail(e, IMDB_ERR_CORRUPT, "segment: a UUID of no bytes in column %s", col->name);
+                else if (dec_wide(col) && (z > a ? z - a != 16 : seg_keeps(gi->flags[i], s, c) && !(vb && !valid_bit(vb, i))))
+                    rc = imdb_fail(e, IMDB_ERR_CORRUPT, "segment: a DECIMAL of %u bytes in column %s", z - a, col->name);
+                else if (dec_wide(col) && z > a && !dec_cell_fits(sc->data + a, col))
+                    rc = imdb_fail(e, IMDB_ERR_CORRUPT, "segment: value out of range in column %s", col->name);
                 else if (col->type == IMDB_T_TEXT && z > a && !imdb_utf8_valid(sc->data + a, z - a, &bad))
                     rc = imdb_fail(e, IMDB_ERR_CORRUPT, "segment: invalid UTF-8 in column %s", col->name);
                 else if (col->vlen && z > a && imdb_utf8_chars(sc->data + a, z - a) > col->vlen) /* F3c */
@@ -402,7 +425,7 @@ int imdb_segment_parse(const imdb_schema *s, const uint8_t vhash[32], uint8_t *b
         bool has = false, has_null = false;
         int64_t mn = 0, mx = 0;
         for (uint32_t i = 0; sc->valid && i < n; i++) has_null |= !gi->flags[i] && !valid_bit(sc->valid, i);
-        if (!imdb_type_bytes(s->cols[c].type)) /* F3d: a byte string's zone map is TEXT's: none */
+        if (!seg_bytes(&s->cols[c])) /* F3d: a byte string's zone map is TEXT's: none; F3e: a wide DECIMAL's too */
             for (uint32_t i = 0; i < n; i++) {
                 if (gi->flags[i] || (sc->valid && !valid_bit(sc->valid, i))) continue;
                 int64_t v = sc->i64 ? sc->i64[i] : sc->u8[i];
@@ -463,7 +486,10 @@ static void segcol_get(const imdb_column *col, const imdb_segcol *sc, uint32_t r
     }
     if (sc->i64) v->i = sc->i64[row];
     else if (sc->u8) v->i = sc->u8[row];
-    else {
+    else if (dec_wide(col)) { /* F3e: its 16-byte cell (a row that keeps no value has none: 0, as an int column's zero) */
+        uint32_t a = sc->off[row], z = sc->off[row + 1];
+        imdb_dec_set(v, z - a == 16 ? dec_cell(sc->data + a) : 0, true);
+    } else {
         v->s = sc->data + sc->off[row];
         v->len = sc->off[row + 1] - sc->off[row];
     }
@@ -479,7 +505,7 @@ static bool value_same(const imdb_value *a, const imdb_value *b)
 {
     if (a->null || b->null) return a->null == b->null;
     if (imdb_type_bytes(a->type)) return a->len == b->len && (!a->len || memcmp(a->s, b->s, a->len) == 0);
-    return a->i == b->i;
+    return a->i == b->i && a->hi == b->hi && a->wide == b->wide; /* F3e: a wide DECIMAL's high half and form too */
 }
 
 void imdb_seg_get(const imdb_schema *s, const imdb_segimg *gi, uint32_t row, uint32_t c, imdb_value *v)
@@ -705,12 +731,14 @@ static uint32_t src_ver(const imdb_table *t, const seg_src *s)
 }
 
 /* F1 stage 4: the runs src[0..n) is built in (design.md §5, Schema versions): rows in vid order, each run the longest
- * prefix, at most max rows, whose rows with values (a stub keeps only its SUBJECT, which no ALTER drops or changes)
- * all reach one version (max w <= min reach), built at the least reach (the last version when nothing cuts: every
- * build before stage 4 was). Writes run k's end and version at end[k], ver[k] when they are not NULL; returns the
- * runs. One pass, the same for every copy: a replica builds the same segments */
-static uint64_t seg_runs(const imdb_table *t, const seg_src *src, uint64_t n, const erased_set *es, uint64_t purge_before,
-                         uint32_t max, uint64_t *end, uint32_t *ver)
+ * prefix, at most max rows, whose rows all reach one version (max w <= min reach), built at the least reach (the last
+ * version when nothing cuts: every build before stage 4 was). A stub or a purged row counts as a row with values does,
+ * by the version it began in, though it keeps only its SUBJECT (which no ALTER drops or changes): a replica whose log
+ * was redacted holds an erased row as a stub from its INSERT, the primary until its ERASE, so runs that let a stub
+ * float would cut the same rows otherwise on the two (a replica's flush one segment, the primary's two: 2026-11-10).
+ * Writes run k's end and version at end[k], ver[k] when they are not NULL; returns the runs. One pass, the same for
+ * every copy: a replica builds the same segments */
+static uint64_t seg_runs(const imdb_table *t, const seg_src *src, uint64_t n, uint32_t max, uint64_t *end, uint32_t *ver)
 {
     const imdb_schema_hist *h = &t->hist;
     uint32_t last = h->nvers - 1;
@@ -721,7 +749,7 @@ static uint64_t seg_runs(const imdb_table *t, const seg_src *src, uint64_t n, co
         uint32_t lo = 0, hi = last; /* the run's max w and min reach so far */
         uint64_t j = i;
         for (; j < n && j - i < max; j++) {
-            if (!last || src_flags(t, &src[j], es, purge_before)) continue; /* one version: only the row limit cuts */
+            if (!last) continue; /* one version: only the row limit cuts */
             uint32_t rw = src_ver(t, &src[j]), nlo = rw > lo ? rw : lo, nhi = reach[rw] < hi ? reach[rw] : hi;
             if (nlo > nhi) break; /* row j begins the next run */
             lo = nlo, hi = nhi;
@@ -756,12 +784,12 @@ static int seg_build(const imdb_table *t, uint32_t gver, const seg_src *src, uin
     }
     uint64_t text_len[IMDB_MAX_COLS] = {0};
     for (uint32_t c = 0; c < s->ncols; c++) {
-        if (!imdb_type_bytes(s->cols[c].type)) continue;
+        if (!seg_bytes(&s->cols[c])) continue;
         for (uint32_t i = 0; i < n; i++) {
             if (!seg_keeps(fl[i], s, c)) continue;
             imdb_value v;
             src_get(t, &src[i], &t->hist.vers[rver[i]], bv, c, &v);
-            text_len[c] += v.len;
+            text_len[c] += dec_wide(&s->cols[c]) ? (v.null ? 0 : 16) : v.len; /* F3e: a wide DECIMAL's cell */
         }
         if (text_len[c] > UINT32_MAX) {
             imdb_free(fl);
@@ -814,8 +842,8 @@ static int seg_build(const imdb_table *t, uint32_t gver, const seg_src *src, uin
     for (uint32_t c = 0; c < s->ncols; c++) {
         bool has = false, has_null = false;
         int64_t mn = 0, mx = 0;
-        uint8_t *vb = nullable(&s->cols[c]) ? b + off[k + (imdb_type_bytes(s->cols[c].type) ? 2 : 1)] : NULL;
-        if (imdb_type_bytes(s->cols[c].type)) { /* F3d: TEXT, UUID and BYTEA: offsets and data */
+        uint8_t *vb = nullable(&s->cols[c]) ? b + off[k + (seg_bytes(&s->cols[c]) ? 2 : 1)] : NULL;
+        if (seg_bytes(&s->cols[c])) { /* F3d: TEXT, UUID and BYTEA: offsets and data; F3e: a wide DECIMAL's 16-byte cells */
             uint8_t *o = b + off[k], *data = b + off[k + 1];
             uint32_t at = 0;
             for (uint32_t i = 0; i < n; i++) {
@@ -829,6 +857,13 @@ static int seg_build(const imdb_table *t, uint32_t gver, const seg_src *src, uin
                     continue;
                 }
                 if (vb) vb[i >> 3] |= (uint8_t)(1u << (i & 7));
+                if (dec_wide(&s->cols[c])) { /* F3e: i then hi, little-endian (the value's 128 bits, either form) */
+                    unsigned __int128 x = (unsigned __int128)imdb_dec_value(&v);
+                    imdb_le64(data + at, (uint64_t)x);
+                    imdb_le64(data + at + 8, (uint64_t)(x >> 64));
+                    at += 16;
+                    continue;
+                }
                 if (v.len) memcpy(data + at, v.s, v.len);
                 at += v.len;
             }
@@ -881,17 +916,17 @@ static int seg_build(const imdb_table *t, uint32_t gver, const seg_src *src, uin
     return IMDB_OK;
 }
 
-/* One segment's rows built again (RETIRE's split, ERASE's rewrite, whose record maps one segment to one): one run,
- * since the rows were together at their segment's version and each reaches at least that far; refused, not trusted */
-static int seg_build_one(const imdb_table *t, const seg_src *src, uint32_t n, const erased_set *es, imdb_segment **out,
-                         imdb_err *e)
+/* One segment's rows built again (RETIRE's split, whose record maps one segment to one): one run, since the rows were
+ * together at their segment's version and each reaches at least that far; refused, not trusted. ERASE's rewrite is
+ * not this: it keeps its segment's own version (plan_build) */
+static int seg_build_one(const imdb_table *t, const seg_src *src, uint32_t n, imdb_segment **out, imdb_err *e)
 {
     uint64_t end;
     uint32_t ver;
-    if (!n || seg_runs(t, src, n, es, 0, IMDB_MAX_SEGMENT_ROWS, NULL, NULL) != 1)
+    if (!n || seg_runs(t, src, n, IMDB_MAX_SEGMENT_ROWS, NULL, NULL) != 1)
         return imdb_fail(e, IMDB_ERR_STATE, "segment rebuild: its rows do not fit one schema version");
-    seg_runs(t, src, n, es, 0, IMDB_MAX_SEGMENT_ROWS, &end, &ver);
-    return seg_build(t, ver, src, n, es, 0, out, e);
+    seg_runs(t, src, n, IMDB_MAX_SEGMENT_ROWS, &end, &ver);
+    return seg_build(t, ver, src, n, NULL, 0, out, e);
 }
 
 /* ---- deletion vectors ----------------------------------------------------- */
@@ -1076,6 +1111,9 @@ static int old_manifest(uint32_t ver, imdb_err *e)
     if (ver == 5)
         return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 5: this lake was written by an imagedb before views' "
                          "format (manifest 6, P2 S7), which this version does not read");
+    if (ver == 14) /* F3e: no DECIMAL past 18 digits */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 14: this lake was written by an imagedb before DECIMALs "
+                         "of 38 digits (manifest 15, 2026-11-10), which this version does not read");
     if (ver == 13) /* F3d: no UUID or BYTEA column, no gen_random_uuid DEFAULT */
         return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 13: this lake was written by an imagedb before UUID and "
                          "BYTEA (manifest 14, 2026-11-09), which this version does not read");
@@ -1188,7 +1226,7 @@ int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err
             d->flags = imdb_rd_u8(&r);
             d->ncols = imdb_rd_u8(&r);
             for (uint8_t c = 0; c < d->ncols && c < IMDB_MAX_INDEX_COLS; c++) d->cols[c] = imdb_rd_u16(&r);
-            if (r.err || !imdb_index_def_ok(d, t->s.ncols)) goto bad;
+            if (r.err || !imdb_index_def_ok(d, &t->s)) goto bad;
             if (k && strcmp(t->idx[k - 1].d.name, d->name) >= 0) goto bad; /* sorted, unique */
         }
         t->retention_us = imdb_rd_u64(&r);
@@ -1636,7 +1674,7 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
                 for (uint32_t i = 0, n = 0; i < g->nrows; i++)
                     if (!ended_by(gi->end[i], purge_before)) srcs[n++] = (seg_src){gi, i, gi->vid[i]}; /* vid order kept */
                 imdb_segment *ng;
-                if ((rc = seg_build_one(t, srcs, keep, NULL, &ng, e))) break;
+                if ((rc = seg_build_one(t, srcs, keep, &ng, e))) break;
                 if ((rc = pt_push(pt, ng, true, e))) {
                     imdb_segment_free(ng);
                     break;
@@ -1657,7 +1695,9 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
             }
             src_rows(g, gi, srcs);
             imdb_segment *ng;
-            if ((rc = seg_build_one(t, srcs, g->nrows, es, &ng, e))) break;
+            /* at the segment's own version, never a later one its rows now reach: a copy holding the erased rows as
+             * stubs already (a replica of a redacted log) keeps the segment it built, unrewritten (2026-11-10) */
+            if ((rc = seg_build(t, g->gver, srcs, g->nrows, es, 0, &ng, e))) break;
             if ((rc = pt_push(pt, ng, true, e))) {
                 imdb_segment_free(ng);
                 break;
@@ -1697,7 +1737,7 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
             for (uint64_t i = 0; i < cnt; i++) srcs[i] = (seg_src){NULL, 0, t->mem_first + i};
             /* F1 stage 4: one segment, or one a run when a DROP COLUMN or a SET NOT NULL cuts them (seg_runs); a few
              * runs' ends on the stack, so a flush allocates no more than it did */
-            uint64_t nr = seg_runs(t, srcs, cnt, es, 0, IMDB_MAX_SEGMENT_ROWS, NULL, NULL), at = 0, end4[4];
+            uint64_t nr = seg_runs(t, srcs, cnt, IMDB_MAX_SEGMENT_ROWS, NULL, NULL), at = 0, end4[4];
             uint32_t ver4[4];
             uint64_t *rend = end4;
             uint32_t *rver = ver4;
@@ -1710,7 +1750,7 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
                     break;
                 }
             }
-            seg_runs(t, srcs, cnt, es, 0, IMDB_MAX_SEGMENT_ROWS, rend, rver);
+            seg_runs(t, srcs, cnt, IMDB_MAX_SEGMENT_ROWS, rend, rver);
             for (uint64_t k = 0; k < nr && !rc; at = rend[k++]) {
                 imdb_segment *ng;
                 if ((rc = seg_build(t, rver[k], srcs + at, (uint32_t)(rend[k] - at), es, 0, &ng, e))) break;
@@ -1748,7 +1788,7 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
             if (rc) break;
             /* the runs first (F1 stage 4: the row limit's, and a DROP COLUMN's or SET NOT NULL's cuts), then the room; a
              * few runs' ends on the stack */
-            uint64_t nr = seg_runs(t, srcs, m, es, purge_before, IMDB_MAX_SEGMENT_ROWS, NULL, NULL), end4[4];
+            uint64_t nr = seg_runs(t, srcs, m, IMDB_MAX_SEGMENT_ROWS, NULL, NULL), end4[4];
             uint32_t ver4[4];
             uint64_t *rend = end4;
             uint32_t *rver = ver4;
@@ -1763,7 +1803,7 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
                 rc = e->code;
                 break;
             }
-            seg_runs(t, srcs, m, es, purge_before, IMDB_MAX_SEGMENT_ROWS, rend, rver);
+            seg_runs(t, srcs, m, IMDB_MAX_SEGMENT_ROWS, rend, rver);
             uint32_t nm = 0;
             for (uint64_t k = 0, at = 0; k < nr && !rc; at = rend[k++]) {
                 rc = seg_build(t, rver[k], srcs + at, (uint32_t)(rend[k] - at), es, purge_before, &merged[nm], e);

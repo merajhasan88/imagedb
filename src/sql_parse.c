@@ -1186,8 +1186,8 @@ static int col_type(parser *p, imdb_column *c)
         if (expect(p, TK_LP, "(") || uint_lit(p, &prec)) return p->e->code;
         if (tok(p, TK_COMMA) && uint_lit(p, &scale)) return p->e->code;
         if (expect(p, TK_RP, ")")) return p->e->code;
-        if (prec < 1 || prec > 18 || scale > prec)
-            return imdb_fail(p->e, IMDB_ERR_INVALID, "DECIMAL(p,s) needs 1 <= p <= 18 and 0 <= s <= p");
+        if (prec < 1 || prec > IMDB_DEC_MAX_DIGITS || scale > prec) /* F3e: to 38 digits */
+            return imdb_fail(p->e, IMDB_ERR_INVALID, "DECIMAL(p,s) needs 1 <= p <= 38 and 0 <= s <= p");
         c->precision = (uint8_t)prec;
         c->scale = (uint8_t)scale;
     } else if (kw(p, "float64") || kw(p, "float8") || kw(p, "float")) {

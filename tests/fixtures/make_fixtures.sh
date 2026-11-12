@@ -1,7 +1,7 @@
 #!/bin/sh
-# Makes the format's fixtures (2026-11-09, seventh pair: META 5, log version 3, manifest version 14 and segment format 3 (F1 stage 4:
-# a segment names its schema version by its hash with positions), ops 16, 19, 20, 21, 22's kinds and 23 to 29; alg1-20261109g.tar.gz
-# and alg2-20261109g.tar.gz beside this script): a primary and its replica under digest algorithm ALG, by
+# Makes the format's fixtures (2026-11-10, its first pair: META 5, log version 3, manifest version 15 and segment format 3 (F1 stage 4:
+# a segment names its schema version by its hash with positions), ops 16, 19, 20, 21, 22's kinds and 23 to 29; alg1-20261110a.tar.gz
+# and alg2-20261110a.tar.gz beside this script): a primary and its replica under digest algorithm ALG, by
 # make_alg2.sh's steps, which reach every reader of the format: a log of several segments (each manifest
 # publish ends one), CHECKPOINTs (manifests, segments, the lanes), a two-column index and a unique one,
 # an UPDATE and a DELETE, ERASE SUBJECT (redacted log payloads, rewritten segments), commits after it, and
@@ -23,7 +23,9 @@
 # kind 9: an INT64, a VARCHAR and a DECIMAL rounding both signs; rows leaving them out, a NULL source), a source column
 # updated and the generated column itself renamed after the first CHECKPOINT (manifest 12: version 1's expressions). And (F2b-2)
 # FOREIGN KEYs (op 29: a CASCADE and a SET NULL over two levels), an ADD FOREIGN KEY after the first CHECKPOINT, a parent
-# deleted with its actions from the log, a DROP CONSTRAINT (manifest 13: version 1's FOREIGN KEYs). The live
+# deleted with its actions from the log, a DROP CONSTRAINT (manifest 13: version 1's FOREIGN KEYs), and (F3d) UUID and BYTEA (manifest
+# 14), and (F3e) a table of DECIMALs to 38 digits at their bounds (a wide key, a wide DEFAULT, a view of wide values and of
+# places past 18; a widening within the wide form and rows from the log: manifest 15). The live
 # tables are RETENTION FOREVER and the dropped one is kept a century, the longest but FOREVER: a fixture is frozen
 # data, so its history
 # never expires under the tests that open it (the 24-hour default is tested by the unit tests). Every
@@ -35,10 +37,11 @@
 # and alg2-20261109, manifest version 8: before CREATE TABLE's DEFAULTs; alg1-20261109b and alg2-20261109b, manifest version 9:
 # before sequences; alg1-20261109c and alg2-20261109c, manifest version 10: before CHECK constraints; alg1-20261109d and
 # alg2-20261109d, manifest version 11: before generated columns; alg1-20261109e and alg2-20261109e, manifest version 12:
-# before FOREIGN KEYs) stay as
+# before FOREIGN KEYs; alg1-20261109f and alg2-20261109f, manifest version 13: before UUID and BYTEA; alg1-20261109g and
+# alg2-20261109g, manifest version 14: before DECIMALs of 38 digits) stay as
 # directories this format refuses.
 #   sh tests/fixtures/make_fixtures.sh BIN AUDIT ALG OUTDIR   (OUTDIR must not exist)
-#   tar -czf tests/fixtures/algALG-20261109g.tar.gz -C OUTDIR primary replica
+#   tar -czf tests/fixtures/algALG-20261110a.tar.gz -C OUTDIR primary replica
 set -eu
 BIN=$1
 AUD=$2
@@ -110,6 +113,10 @@ sql "INSERT INTO ub (k, b, n) VALUES ('00000000-0000-0000-0000-000000000000', '\
 sql "CREATE INDEX ub_k ON ub (k)"
 sql "CREATE INDEX ub_b ON ub (b)"
 sql "CREATE VIEW ubv AS SELECT k, b, n FROM ub WHERE b > '\\x00'"   # F3d: a view reading both
+sql "CREATE TABLE wide (id DECIMAL(38,0) PRIMARY KEY, w DECIMAL(30,4) DEFAULT 18446744073709551616.0001, n DECIMAL(18,2), x DECIMAL(25,0)) RETENTION FOREVER" # F3e
+sql "INSERT INTO wide VALUES (99999999999999999999999999999999999999, 99999999999999999999999999.9999, 9999999999999999.99, 1), (-99999999999999999999999999999999999999, -99999999999999999999999999.9999, -9999999999999999.99, NULL), (18446744073709551616, 0, 0, 18446744073709551617)"
+sql "INSERT INTO wide (id, n) VALUES (1, 1.25)"  # w its DEFAULT, 2^64 + 0.0001
+sql "CREATE VIEW widev AS SELECT id, w * 2 AS w2, CAST(n AS DECIMAL(38,16)) / 3 AS m FROM wide" # F3e: a view of wide values; m 22 places
 sql "CHECKPOINT"
 ship
 sql "ALTER TABLE pair ADD w TEXT DEFAULT 'w0'"          # F1: op 22; pair's rows so far are in a segment of version 1
@@ -146,6 +153,9 @@ sql "ALTER TABLE fkc DROP CONSTRAINT fkc_q"           # kind 14
 sql "INSERT INTO ub (k, b, n) VALUES (gen_random_uuid(), '\\x0102', 4)" # F3d: from the log
 sql "UPDATE ub SET b = '\\x6869' WHERE n = 1"
 sql "ALTER TABLE ub ALTER COLUMN k SET DEFAULT gen_random_uuid()" # op 22 kind 10, kind 10
+sql "ALTER TABLE wide ALTER COLUMN x TYPE DECIMAL(38,0)"  # F3e: a widening within the wide form, after the first CHECKPOINT
+sql "UPDATE wide SET w = w - 1, x = x * 1000000000000 WHERE id = 1" # from the log
+sql "INSERT INTO wide (id, x) VALUES (2, -12345678901234567890123456789012345678)"
 sql "UPDATE stamp SET at = TIMESTAMPTZ '2030-01-01 12:00:00+05:45' WHERE id = 3" # P2: an instant from the log
 sql "UPDATE acct SET balance = 1.00 WHERE id <= 10"
 sql "DELETE FROM ev WHERE id BETWEEN 1 AND 5"

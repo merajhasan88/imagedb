@@ -503,7 +503,7 @@ static void t_view_codec(void)
         {6, 0},   /* no column (u16 2 -> 0) */
         {10, 12}, /* a column of an unknown type (F3d: 11 is BYTEA, the last) */
         {11, 1},  /* an INT64 with a scale */
-        {15, 19}, /* a DECIMAL past 18 places */
+        {15, 39}, /* a DECIMAL past 38 places (F3e: 38 are the most) */
         {13, 'a'}, /* two columns named a */
         {18, 3},  /* a dependency of an unknown kind */
         {24, 4},  /* a view's dependency on itself, not an earlier one */

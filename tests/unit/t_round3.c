@@ -754,12 +754,12 @@ static void fixture_check(const char *tgz, uint8_t alg, const char *meta_head, b
  * digest algorithm: they pin the format, so a change to it fails here first */
 static void t_round3_alg1_fixture(void)
 {
-    fixture_check("tests/fixtures/alg1-20261109g.tar.gz", IMDB_DIGEST_ALG_LTHASH16, "imagedb-meta 5\n", true, 91);
+    fixture_check("tests/fixtures/alg1-20261110a.tar.gz", IMDB_DIGEST_ALG_LTHASH16, "imagedb-meta 5\n", true, 98);
 }
 
 static void t_round3_alg2_fixture(void)
 {
-    fixture_check("tests/fixtures/alg2-20261109g.tar.gz", IMDB_DIGEST_ALG_LTHASH16_TREE, "imagedb-meta 5\n", true, 91);
+    fixture_check("tests/fixtures/alg2-20261110a.tar.gz", IMDB_DIGEST_ALG_LTHASH16_TREE, "imagedb-meta 5\n", true, 98);
 }
 
 /* The fixtures of the formats before the current one (alg1-20261026: META 2; alg2-20261026 and
@@ -797,7 +797,8 @@ static void t_round3_old_fixtures(void)
      * the format design's slice 1), 7 (alg1-20261108, alg2-20261108: before F1 stage 4's schema versions by position) and 8
      * (alg1-20261109, alg2-20261109: before CREATE TABLE's DEFAULTs, F2a) and 9 (alg1-20261109b, alg2-20261109b: before
      * sequences, F2a-2), 10 (alg1-20261109c, alg2-20261109c: before CHECK constraints, F2b-1) and 11 (alg1-20261109d,
-     * alg2-20261109d: before generated columns, F2c), 12 (alg1-20261109e, alg2-20261109e: before FOREIGN KEYs, F2b-2) and 13 (alg1-20261109f, alg2-20261109f: before UUID and BYTEA, F3d):
+     * alg2-20261109d: before generated columns, F2c), 12 (alg1-20261109e, alg2-20261109e: before FOREIGN KEYs, F2b-2), 13 (alg1-20261109f, alg2-20261109f: before UUID and BYTEA, F3d)
+     * and 14 (alg1-20261109g, alg2-20261109g: before DECIMALs of 38 digits, F3e):
      * META reads, and the open refuses the lake (or the log) by name, never replaying past it to a rebuilt manifest of
      * another version */
     static const char *const tgz4[] = {"tests/fixtures/alg1-20261029.tar.gz", "tests/fixtures/alg2-20261029.tar.gz",
@@ -809,13 +810,15 @@ static void t_round3_old_fixtures(void)
                                        "tests/fixtures/alg1-20261109c.tar.gz", "tests/fixtures/alg2-20261109c.tar.gz",
                                        "tests/fixtures/alg1-20261109d.tar.gz", "tests/fixtures/alg2-20261109d.tar.gz",
                                        "tests/fixtures/alg1-20261109e.tar.gz", "tests/fixtures/alg2-20261109e.tar.gz",
-                                       "tests/fixtures/alg1-20261109f.tar.gz", "tests/fixtures/alg2-20261109f.tar.gz"};
+                                       "tests/fixtures/alg1-20261109f.tar.gz", "tests/fixtures/alg2-20261109f.tar.gz",
+                                       "tests/fixtures/alg1-20261109g.tar.gz", "tests/fixtures/alg2-20261109g.tar.gz"};
     static const char *const why4[] = {"before DROP TABLE", "before DROP TABLE", "before views", "before views",
                                        "before the format design", "before the format design",
                                        "before schema versions by position", "before schema versions by position",
                                        "before CREATE TABLE's DEFAULTs", "before CREATE TABLE's DEFAULTs",
                                        "before sequences", "before sequences", "before CHECK constraints", "before CHECK constraints",
-                                       "before generated columns", "before generated columns", "before FOREIGN KEYs", "before FOREIGN KEYs", "before UUID and BYTEA", "before UUID and BYTEA"};
+                                       "before generated columns", "before generated columns", "before FOREIGN KEYs", "before FOREIGN KEYs", "before UUID and BYTEA", "before UUID and BYTEA",
+                                       "before DECIMALs of 38 digits", "before DECIMALs of 38 digits"};
     for (size_t i = 0; i < sizeof tgz4 / sizeof *tgz4; i++) {
         struct stat st;
         if (stat(tgz4[i], &st) != 0) {

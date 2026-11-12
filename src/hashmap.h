@@ -17,8 +17,11 @@ typedef struct imdb_hslot {
     uint64_t hash;   /* 0 = empty */
     uint64_t val;
     int64_t ikey;
-    uint8_t *skey;   /* owned copy for TEXT keys */
-    uint32_t slen;
+    uint8_t *skey;   /* owned copy for TEXT keys; NULL in an INT64 map */
+    union {
+        uint32_t slen;   /* TEXT keys: the copy's length */
+        int64_t ikey_hi; /* F3e: an INT64 map's key's high half: a DECIMAL's 128-bit value (either form), else 0 */
+    };
 } imdb_hslot;
 
 typedef struct imdb_hmap {

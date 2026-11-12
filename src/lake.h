@@ -73,10 +73,11 @@ enum {
 
 #define IMDB_SEG_HEADER 64u
 #define IMDB_SEG_VERSION 3u /* F1 stage 4: the header names its schema version by imdb_sver_hash (2: by the schema alone) */
-#define IMDB_MANIFEST_VERSION 14u /* F3d: UUID and BYTEA columns and op 23's kind 10 (gen_random_uuid) in version 1's
+#define IMDB_MANIFEST_VERSION 15u /* F3e: DECIMAL columns to 38 digits (a wide one's 16-byte cells); 14 before them (F3d: UUID and
+                                   BYTEA columns and op 23's kind 10 (gen_random_uuid) in version 1's
                                    DEFAULTs (13 before them: F2b-2, version 1's FOREIGN KEYs; 12: F2c, a CREATE's generated
                                    columns; 11: F2b-1, version 1's CHECKs; 10: F2a-2, the sequences section; 9: F2a, a
-                                   CREATE's DEFAULTs; 8; 7: segment format 2); 2 to 13 refused by name (old_manifest) */
+                                   CREATE's DEFAULTs; 8; 7: segment format 2); 2 to 14 refused by name (old_manifest) */
 #define IMDB_SEG_STUB 1u   /* erased: vid, begin and commitment only */
 #define IMDB_SEG_PURGED 2u /* purged by COMPACT ... PURGE: vid, begin, commitment and the SUBJECT value */
 
@@ -191,7 +192,10 @@ static inline const imdb_segzone *imdb_seg_zone(const imdb_table *t, const imdb_
     const imdb_sver *cur = &t->hist.vers[t->hist.nvers - 1], *gv = &t->hist.vers[g->gver];
     int k = gv->at[cur->pos[c]];
     if (k >= 0) return &g->zone[k];
-    bool any = g->ndata > 0, text = cur->s.cols[c].type == IMDB_T_TEXT;
+    /* a column with no zone map (TEXT, F3d's UUID and BYTEA, F3e's wide DECIMAL: lake.c seg_bytes) never sets has: a
+     * missing value's i is no bound of theirs (latent: every reader passes their zones over; 2026-11-11) */
+    const imdb_column *cc = &cur->s.cols[c];
+    bool any = g->ndata > 0, text = imdb_type_bytes(cc->type) || (cc->type == IMDB_T_DECIMAL && imdb_dec_wide(cc->precision));
     const imdb_value *m = &t->hist.tcol[cur->pos[c]].missing;
     memset(tmp, 0, sizeof *tmp);
     tmp->has = any && !m->null && !text; /* as a file's own: a TEXT column's has is never set */

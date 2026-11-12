@@ -1983,11 +1983,11 @@ static int lake_lookup_pk(const imdb_table *t, const imdb_value *kv, uint64_t sn
         for (int c = 0; c < t->s.npk && !out; c++) { /* each key column's zone map (flag-0 rows), from the descriptor */
             imdb_segzone zt; /* F1: by the version that built the segment (a key column is in every version) */
             const imdb_segzone *z = imdb_seg_zone(t, g, (uint32_t)t->s.key[c], &zt);
-            uint8_t ty = t->s.cols[t->s.key[c]].type; /* the columns whose zone map bounds values (lake.c's is_int_col) */
-            out = (ty == IMDB_T_INT64 || ty == IMDB_T_DECIMAL || ty == IMDB_T_TIMESTAMP || ty == IMDB_T_FLOAT64 || ty == IMDB_T_DATE ||
-                   ty == IMDB_T_TIME ||
-                   ty == IMDB_T_TIMESTAMPTZ) &&
-                  (!z->has || kv[c].i < z->min || kv[c].i > z->max);
+            const imdb_column *kc = &t->s.cols[t->s.key[c]];
+            uint8_t ty = kc->type; /* the columns whose zone map bounds values (lake.c's is_int_col: F3e, a wide DECIMAL none) */
+            out = (ty == IMDB_T_INT64 || (ty == IMDB_T_DECIMAL && !imdb_dec_wide(kc->precision)) || ty == IMDB_T_TIMESTAMP ||
+                   ty == IMDB_T_FLOAT64 || ty == IMDB_T_DATE || ty == IMDB_T_TIME || ty == IMDB_T_TIMESTAMPTZ) &&
+                  (!z->has || kv[c].i < z->min || kv[c].i > z->max); /* kv in the columns' forms (imdb_lookup_pk_at) */
         }
         if (out) continue; /* no image read */
         const imdb_segimg *gi = imdb_seg_pin(t, g, e);
@@ -2013,13 +2013,19 @@ int imdb_lookup_pk_at(imdb_db *db, imdb_table *t, const imdb_value *kv, uint64_t
                       imdb_err *e)
 {
     *vid = IMDB_NONE;
+    imdb_pkey k;
     for (int c = 0; c < t->s.npk; c++) { /* a key's columns are NOT NULL: another value names no row */
         const imdb_column *col = &t->s.cols[t->s.key[c]];
         if (kv[c].null || kv[c].type != col->type || (col->type == IMDB_T_DECIMAL && kv[c].scale != col->scale))
             return IMDB_OK;
+        k.kv[c] = kv[c];
+        if (col->type == IMDB_T_DECIMAL) { /* F3e: in the column's form, so every search below reads one; a value past its
+                                            * precision names no row */
+            __int128 x = imdb_dec_value(&kv[c]);
+            if (x >= imdb_pow10_128(col->precision) || x <= -imdb_pow10_128(col->precision)) return IMDB_OK;
+            imdb_dec_set(&k.kv[c], x, imdb_dec_wide(col->precision));
+        }
     }
-    imdb_pkey k;
-    memcpy(k.kv, kv, (size_t)t->s.npk * sizeof *kv);
     if (imdb_pkey_make(&t->s, &k, e)) return e->code;
     uint64_t *head = imdb_hmap_get(&t->pk, &k.v);
     imdb_pkey_done(&k);
@@ -2029,7 +2035,7 @@ int imdb_lookup_pk_at(imdb_db *db, imdb_table *t, const imdb_value *kv, uint64_t
             return IMDB_OK;
         }
     /* below the memory floor a key's chain holds only its versions ended past it: the lake has the rest */
-    return snap < db->mem_floor ? lake_lookup_pk(t, kv, snap, pend, vid, e) : IMDB_OK;
+    return snap < db->mem_floor ? lake_lookup_pk(t, k.kv, snap, pend, vid, e) : IMDB_OK; /* F3e: the column-form key */
 }
 
 
@@ -2402,7 +2408,7 @@ static int live_col(const imdb_schema *s, const char *name)
 }
 
 /* F1 stage 4: SET TYPE's one rule, a widening: every stored value stays valid as the new type and reads the same. A
- * DECIMAL to more digits of its scale (18 at most: one encoding), F3a's integers to a wider one (SMALLINT, INTEGER,
+ * DECIMAL to more digits of its scale within its form (to 18, or 19 to 38: F3e, each form one encoding), F3a's integers to a wider one (SMALLINT, INTEGER,
  * INT64: eight bytes each, so the width is the column's check alone) */
 static unsigned int_rank(uint8_t width) { return width == 16 ? 1 : width == 32 ? 2 : 3; }
 
@@ -2412,7 +2418,8 @@ static bool alter_widens(const imdb_column *from, const imdb_column *to)
     if (from->type == IMDB_T_TEXT && to->type == IMDB_T_TEXT) /* F3c: a VARCHAR longer, or a TEXT (unbounded) */
         return from->vlen && (!to->vlen || to->vlen > from->vlen);
     return from->type == IMDB_T_DECIMAL && to->type == IMDB_T_DECIMAL && to->scale == from->scale &&
-           to->precision > from->precision && to->precision <= 18;
+           to->precision > from->precision && to->precision <= IMDB_DEC_MAX_DIGITS &&
+           imdb_dec_wide(to->precision) == imdb_dec_wide(from->precision); /* F3e: within one form (the rows' encodings differ) */
 }
 
 int imdb_sver_next(const imdb_schema_hist *h, const imdb_sver *cur, const imdb_op *o, imdb_sver *out, imdb_err *e)
@@ -2548,6 +2555,10 @@ int imdb_sver_next(const imdb_schema_hist *h, const imdb_sver *cur, const imdb_o
             return imdb_fail(e, IMDB_ERR_NOTFOUND, "constraint %s of table %s does not exist", o->aname ? o->aname : "?", cur->s.name);
         return IMDB_OK;
     case IMDB_ALTER_SET_TYPE:
+        if (col->type == IMDB_T_DECIMAL && o->acol.type == IMDB_T_DECIMAL && o->acol.scale == col->scale &&
+            o->acol.precision > col->precision && imdb_dec_wide(o->acol.precision) != imdb_dec_wide(col->precision))
+            return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "column %s: a DECIMAL of 18 digits or fewer to one of more re-encodes every "
+                             "row: not yet (deferred.md D25; rewrite the table, CREATE TABLE ... AS SELECT)", col->name);
         if (!alter_widens(col, &o->acol))
             return imdb_fail(e, IMDB_ERR_INVALID, "column %s: only a widening keeps every stored value (a wider DECIMAL of its "
                              "scale, a wider integer, a longer VARCHAR or TEXT; another type: rewrite the table, CREATE TABLE "
@@ -3321,11 +3332,13 @@ imdb_table *imdb_index_find(const imdb_db *db, const char *name, uint32_t *pos)
     return NULL;
 }
 
-bool imdb_index_def_ok(const imdb_index_def *d, uint16_t ncols)
+bool imdb_index_def_ok(const imdb_index_def *d, const imdb_schema *s)
 {
     if (!d->name[0] || (d->flags & ~IMDB_INDEX_UNIQUE) || !d->ncols || d->ncols > IMDB_MAX_INDEX_COLS) return false;
     for (uint8_t i = 0; i < d->ncols; i++) {
-        if (d->cols[i] >= ncols) return false;
+        if (d->cols[i] >= s->ncols) return false;
+        const imdb_column *c = &s->cols[d->cols[i]]; /* F3e: no index on a DECIMAL past 18 digits yet (deferred.md D25) */
+        if (c->type == IMDB_T_DECIMAL && imdb_dec_wide(c->precision)) return false;
         for (uint8_t j = 0; j < i; j++)
             if (d->cols[i] == d->cols[j]) return false;
     }
@@ -4042,7 +4055,11 @@ int imdb_create_index(imdb_db *db, imdb_table *t, const imdb_index_def *d, imdb_
     if (!imdb_ident_valid(d->name, n)) return imdb_fail(e, IMDB_ERR_INVALID, "invalid index name");
     for (size_t i = 0; i < n; i++)
         if (d->name[i] >= 'A' && d->name[i] <= 'Z') return imdb_fail(e, IMDB_ERR_INVALID, "index name not folded to lowercase");
-    if (!imdb_index_def_ok(d, t->s.ncols))
+    for (uint8_t i = 0; i < d->ncols && i < IMDB_MAX_INDEX_COLS; i++) /* F3e: its own words (D25), not yet */
+        if (d->cols[i] < t->s.ncols && t->s.cols[d->cols[i]].type == IMDB_T_DECIMAL && imdb_dec_wide(t->s.cols[d->cols[i]].precision))
+            return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "an index on %s, a DECIMAL of more than 18 digits: not yet",
+                             t->s.cols[d->cols[i]].name);
+    if (!imdb_index_def_ok(d, &t->s))
         return imdb_fail(e, IMDB_ERR_INVALID, "an index takes 1 to %u distinct columns of table %s", IMDB_MAX_INDEX_COLS,
                          t->s.name);
     if (imdb_index_find(db, d->name, NULL)) return imdb_fail(e, IMDB_ERR_INVALID, "index %s exists already", d->name);

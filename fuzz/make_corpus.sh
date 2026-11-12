@@ -9,10 +9,14 @@ WORK=$(mktemp -d "${IMDB_TEST_TMP:-/tmp}/imdb-corpus.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 D=$WORK/db
 "$BIN" init "$D" --digest-alg 1 >/dev/null
+# fw and fu must stay the fourth and fifth tables made (ids 3 and 4): fuzz_common.h's fourth and fifth schemas are
+# theirs, so their segment seeds parse whole (a seed's first byte is its table id; another id meets another schema)
 SQL="
 CREATE TABLE txns (id INT64 PRIMARY KEY, user_id INT64 SUBJECT, amount DECIMAL(12,2) NOT NULL, memo TEXT NOT NULL, at TIMESTAMP NOT NULL);
 CREATE TABLE flags (k TEXT PRIMARY KEY SUBJECT, b BOOL NOT NULL, n INT64 NOT NULL);
 CREATE TABLE meas (id INT64 PRIMARY KEY, u INT64 SUBJECT, x FLOAT64, note TEXT, ok BOOL NOT NULL);
+CREATE TABLE fw (id DECIMAL(38,0) PRIMARY KEY, w DECIMAL(30,4) DEFAULT 18446744073709551616.0001, n DECIMAL(10,2));
+CREATE TABLE fu (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), b BYTEA, n INT64);
 INSERT INTO txns VALUES (1, 42, 19.99, 'coffee', '2026-10-01 08:00:00'), (2, 42, -5.25, 'café', '2026-10-01 08:05:00.5'), (3, 7, 100.00, '', '1970-01-01');
 INSERT INTO flags VALUES ('a', true, 1), ('bb', false, -2);
 INSERT INTO meas VALUES (1, 42, 1.5, NULL, true), (2, 42, -2.5e-3, 'n', false), (3, 7, NULL, NULL, true), (4, 9, 6.02e23, 'x', false);
@@ -37,9 +41,10 @@ ALTER TABLE fp ADD CONSTRAINT fp_n CHECK (LENGTH(n) < 9);
 DELETE FROM fp WHERE id = 2;
 ALTER TABLE fc DROP CONSTRAINT fc_two;
 SELECT nextval('sq');
-CREATE TABLE fu (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), b BYTEA, n INT64);
 INSERT INTO fu (b, n) VALUES ('\x0000ff', 1), ('\x', 2), (NULL, 3);
 CREATE INDEX fu_b ON fu (b);
+INSERT INTO fw VALUES (99999999999999999999999999999999999999, -99999999999999999999999999.9999, 1.5), (-18446744073709551616, NULL, NULL);
+INSERT INTO fw (id) VALUES (18446744073709551617);
 CHECKPOINT;
 DROP INDEX meas_x;
 ERASE SUBJECT 7;

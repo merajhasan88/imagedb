@@ -7,8 +7,9 @@
  *     rejected, never reinterpreted (PostgreSQL CVE class D: type confusion);
  *   - TEXT is strict UTF-8 without NUL, validated at every ingress *and* on
  *     every decode from disk or network (CVE class C: multibyte validation);
- *   - DECIMAL is a scaled int64 with declared precision: no float, no silent
- *     rounding, overflow is an error.
+ *   - DECIMAL is a scaled integer with declared precision: no float, no silent
+ *     rounding, overflow is an error. To 18 digits an int64; from 19 to 38 (F3e)
+ *     an int128 in i and hi, its form decided by the column's precision alone.
  */
 #ifndef IMDB_CODEC_H
 #define IMDB_CODEC_H
@@ -41,7 +42,7 @@ typedef enum imdb_type {
 typedef struct imdb_column {
     char name[IMDB_MAX_IDENT + 1];
     uint8_t type;
-    uint8_t precision; /* DECIMAL only: 1..18 */
+    uint8_t precision; /* DECIMAL only: 1..38 (F3e: past 18 a wide value, imdb_dec_wide) */
     uint8_t scale;     /* DECIMAL only: 0..precision */
     uint8_t flags;
     uint16_t vlen;     /* F3c: a TEXT's VARCHAR length in characters, 0 unbounded; written in the precision and scale
@@ -62,10 +63,45 @@ typedef struct imdb_value {
     uint8_t type;      /* imdb_type tag; must match the column */
     uint8_t scale;     /* DECIMAL: scale of i */
     bool null;         /* SQL NULL, only in a NULLABLE column: i, len and s stay zero */
+    bool wide;         /* F3e: a DECIMAL of a column past 18 digits: its scaled value is hi:i (imdb_dec_value) */
     uint32_t len;      /* TEXT length */
-    int64_t i;         /* INT64, DECIMAL (scaled), TIMESTAMP, BOOL (0/1), FLOAT64 (key) */
-    const uint8_t *s;  /* TEXT bytes (not owned) */
+    int64_t i;         /* INT64, DECIMAL (scaled; a wide one's low 64 bits), TIMESTAMP, BOOL (0/1), FLOAT64 (key) */
+    union {
+        const uint8_t *s; /* TEXT, UUID, BYTEA bytes (not owned): read only after the type says a byte string */
+        int64_t hi;       /* F3e: a wide DECIMAL's high 64 bits, in s's place (a DECIMAL never has bytes); 0 in a narrow one */
+    };
 } imdb_value;
+/* F3e: 24 bytes, as before: every array of held values (join pairs, sorted rows, group keys, cells) costs what it did */
+_Static_assert(sizeof(imdb_value) == 24, "imdb_value: wide in null's padding, hi in s's place");
+/* The contract wide adds: every imdb_value is zeroed whole before its fields are set (memset, = {0}, a compound literal
+ * or a copy of one so made), so wide is false and hi 0 unless imdb_dec_set made the value wide. wide sits where padding
+ * was, which a field-by-field fill used to leave unread; every DECIMAL reader now reads it (imdb_dec_value), and
+ * imdb_value_check refuses a form other than the column's. make tsan builds the unit suite with
+ * -ftrivial-auto-var-init=pattern (Makefile TSAN_FLAGS), so every tsan run (a matrix's tsan job) has each stack
+ * variable a fill could leave unzeroed holding a pattern (2026-11-10, the advisor's check; once by hand on the auditor
+ * too). */
+
+/* F3e: NUMERIC to 38 digits. A DECIMAL column's precision decides its values' form, never a value: to 18 digits the
+ * scaled int64 i, past 18 (wide) the scaled int128 hi:i, 16 bytes in a row (low half first). Every reader of a DECIMAL
+ * takes imdb_dec_value (both forms); every writer into a column's value imdb_dec_set with the column's imdb_dec_wide,
+ * and imdb_value_check refuses a form other than the column's. */
+#define IMDB_DEC_MAX_DIGITS 38
+#define IMDB_DEC_NARROW_DIGITS 18
+static inline bool imdb_dec_wide(uint8_t precision) { return precision > IMDB_DEC_NARROW_DIGITS; }
+static inline __int128 imdb_dec_value(const imdb_value *v)
+{
+    if (!v->wide) return (__int128)v->i;
+    return (__int128)(((unsigned __int128)(uint64_t)v->hi << 64) | (uint64_t)v->i);
+}
+/* x must fit the form: a narrow value an int64 (the callers' precision checks bound it) */
+static inline void imdb_dec_set(imdb_value *v, __int128 x, bool wide)
+{
+    v->wide = wide;
+    v->i = (int64_t)(uint64_t)(unsigned __int128)x;
+    v->hi = wide ? (int64_t)(uint64_t)((unsigned __int128)x >> 64) : 0;
+}
+/* 10^n for n in 0..38 as an int128 (0 outside), the one table: the codec's checks, the expressions' rescaling */
+__int128 imdb_pow10_128(int n);
 
 /* ---- text ----------------------------------------------------------- */
 /* Strict UTF-8 (Unicode 15 Table 3-7), U+0000 rejected. On failure *bad gets
@@ -117,7 +153,8 @@ int64_t imdb_pow10(int n); /* n in 0..18 */
 int imdb_value_check(const imdb_column *c, const imdb_value *v, imdb_err *e);
 /* Canonical row: a null bitmap of ceil(nullable columns / 8) bytes (bit k: the k-th
  * NULLABLE column is NULL; padding bits zero), then each non-null value in column order:
- *   INT64/DECIMAL/TIMESTAMP/FLOAT64 (key): 8 bytes LE; BOOL: 1 byte; TEXT: u32 LE length + bytes */
+ *   INT64/DECIMAL/TIMESTAMP/FLOAT64 (key): 8 bytes LE; BOOL: 1 byte; TEXT: u32 LE length + bytes;
+ *   F3e: a DECIMAL of a column past 18 digits 16 bytes, i then hi, each LE */
 int imdb_row_encode(const imdb_schema *s, const imdb_value *vals, imdb_buf *out, imdb_err *e);
 /* Strict decode with full validation; TEXT values point into row. */
 int imdb_row_decode(const imdb_schema *s, const uint8_t *row, size_t len, imdb_value *vals, imdb_err *e);
@@ -132,8 +169,12 @@ void imdb_row_commit(uint32_t table_id, const uint8_t salt[16], const uint8_t *r
                      uint8_t out[32]);
 
 /* ---- literals (used by the SQL front-end and tools) ----------------- */
-/* Exact decimal text -> scaled int64; rejects excess fractional digits. */
+/* Exact decimal text -> scaled int64; rejects excess fractional digits. precision 1..18. */
 int imdb_parse_decimal(const char *s, size_t n, int precision, int scale, int64_t *out, imdb_err *e);
+/* F3e: the same rules to 38 digits, into an int128 (the one parser: imdb_parse_decimal is this one narrowed) */
+int imdb_parse_decimal128(const char *s, size_t n, int precision, int scale, __int128 *out, imdb_err *e);
+/* F3e: a DECIMAL column's literal text into its value (the column's form: imdb_dec_set) */
+int imdb_parse_decimal_col(const char *s, size_t n, const imdb_column *c, imdb_value *v, imdb_err *e);
 int imdb_parse_int64(const char *s, size_t n, int64_t *out, imdb_err *e);
 /* [+-]digits[.digits][(e|E)[+-]digits] correctly rounded to the nearest double, as its key;
  * a literal that overflows, or a non-zero one that rounds to zero, is refused. */

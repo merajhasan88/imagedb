@@ -108,6 +108,7 @@ TESTS(check) /* F2b-1: CHECK constraints */
 TESTS(gen)   /* F2c: generated columns */
 TESTS(fk)    /* F2b-2: FOREIGN KEYs */
 TESTS(ub)    /* F3d: UUID and BYTEA */
+TESTS(dec38) /* F3e: NUMERIC to 38 digits */
 TESTS(tz) /* P2: time zones */
 TESTS(tzsql) /* P2: time zones through the engine */
 

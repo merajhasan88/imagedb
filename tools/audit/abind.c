@@ -627,17 +627,17 @@ static int col_type(ab *b, uint8_t *type, uint8_t *scale) /* a CAST's type, as a
         const tk *t = &b->t[b->i];
         if (expect(b, K_LP, "(")) return -1;
         t = &b->t[b->i];
-        if (t->k != K_INT || t->len > 2) return fail(b, "DECIMAL(p,s) needs 1 <= p <= 18 and 0 <= s <= p");
+        if (t->k != K_INT || t->len > 2) return fail(b, "DECIMAL(p,s) needs 1 <= p <= 38 and 0 <= s <= p");
         p = (uint32_t)atoi(b->s + t->off) % 1000u;
         b->i++;
         if (tok(b, K_COMMA)) {
             t = &b->t[b->i];
-            if (t->k != K_INT || t->len > 2) return fail(b, "DECIMAL(p,s) needs 1 <= p <= 18 and 0 <= s <= p");
+            if (t->k != K_INT || t->len > 2) return fail(b, "DECIMAL(p,s) needs 1 <= p <= 38 and 0 <= s <= p");
             s = (uint32_t)atoi(b->s + t->off) % 1000u;
             b->i++;
         }
         if (expect(b, K_RP, ")")) return -1;
-        if (p < 1 || p > 18 || s > p) return fail(b, "DECIMAL(p,s) needs 1 <= p <= 18 and 0 <= s <= p");
+        if (p < 1 || p > 38 || s > p) return fail(b, "DECIMAL(p,s) needs 1 <= p <= 38 and 0 <= s <= p"); /* F3e */
         *scale = (uint8_t)s;
     } else if (kw(b, "float64") || kw(b, "float8") || kw(b, "float")) {
         *type = T_FLOAT64;
@@ -1459,7 +1459,7 @@ static int rel_set(ab *b, rel *r, const char *name, const ab_col *cols, uint16_t
     return 0;
 }
 
-/* a row set's columns (a derived table, a WITH): each named within 63 bytes, once, typed, a DECIMAL within 18 places */
+/* a row set's columns (a derived table, a WITH): each named within 63 bytes, once, typed, a DECIMAL within 38 places (F3e) */
 static int rowset_rules(ab *b, const ab_col *c, uint16_t n)
 {
     for (uint16_t i = 0; i < n; i++) {
@@ -1467,8 +1467,8 @@ static int rowset_rules(ab *b, const ab_col *c, uint16_t n)
         for (uint16_t j = 0; j < i; j++)
             if (!strcmp(c[i].name, c[j].name)) return fail(b, "a nested SELECT names two columns %s", c[i].name);
         if (!c[i].type) return fail(b, "a nested SELECT's column %s has no type", c[i].name);
-        if (c[i].type == T_DECIMAL && c[i].scale > 18)
-            return fail(b, "a nested SELECT's DECIMAL %s has more than 18 places", c[i].name);
+        if (c[i].type == T_DECIMAL && c[i].scale > 38)
+            return fail(b, "a nested SELECT's DECIMAL %s has more than 38 places", c[i].name);
     }
     return 0;
 }
@@ -1940,6 +1940,22 @@ static int walk(ab *b, const scope *sc, uint16_t k)
     return walk(b, sc, x->l) || walk(b, sc, x->r) || walk(b, sc, x->x3) ? -1 : 0; /* height-bounded */
 }
 
+/* F3e: an integer literal's type, as the engine's (bind_xlit): INT64 within its range (the sign the literal's), else a
+ * DECIMAL of scale 0 to 38 significant digits (PostgreSQL's numeric); past that its INT64 refusal */
+static int int_lit_type(ab *b, const xn *x, ty *out)
+{
+    unsigned __int128 m = 0;
+    unsigned digits = 0;
+    for (uint32_t i = 0; i < x->len; i++) {
+        char c = b->s[x->off + i];
+        if (m || c != '0') digits++;
+        if (digits > MAX_SCALE) return fail(b, "integer literal out of INT64 range");
+        m = m * 10 + (unsigned)(c - '0');
+    }
+    *out = m <= (unsigned __int128)INT64_MAX + (x->neg ? 1u : 0u) ? (ty){T_INT64, 0} : (ty){T_DECIMAL, 0};
+    return 0;
+}
+
 static int type_of(ab *b, const scope *sc, uint16_t k, bool null_ok, ty *out)
 {
     const aq *q = sc->q;
@@ -1948,7 +1964,7 @@ static int type_of(ab *b, const scope *sc, uint16_t k, bool null_ok, ty *out)
     switch (x->op) {
     case X_LIT:
         switch (x->lit) {
-        case L_INT: *out = (ty){T_INT64, 0}; return 0;
+        case L_INT: return int_lit_type(b, x, out); /* F3e: past INT64 a DECIMAL of scale 0 */
         case L_DEC: { /* at its written scale; significant digits (not leading zeros) and the scale within 38 */
             uint32_t s = 0, digits = 0;
             bool point = false, sig = false;
@@ -2171,7 +2187,7 @@ int ab_bind(const char *text, size_t len, ab_lookup_fn lookup, void *arg, ab_res
     if (!rc) rc = parse_text(&b, q) || shape(&b, q, false) || bind_query(&b, q, NULL, M_TYPED, cols, &n) ? -1 : 0;
     for (uint16_t c = 0; !rc && c < n; c++) {
         if (!cols[c].type) rc = fail(&b, "its column %u has no type", c + 1u);
-        else if (cols[c].type == T_DECIMAL && cols[c].scale > 18) rc = fail(&b, "its DECIMAL column %u has more than 18 places", c + 1u);
+        else if (cols[c].type == T_DECIMAL && cols[c].scale > 38) rc = fail(&b, "its DECIMAL column %u has more than 38 places", c + 1u);
     }
     if (!rc && (n < 1 || n > AB_MAX_COLS)) rc = fail(&b, "a view of %u columns", n);
     if (!rc) {
@@ -2402,10 +2418,18 @@ static int ck_lit(ck *x, uint16_t k, bool null_ok)
     case L_INT: {
         unsigned __int128 m = 0;
         for (uint32_t i = 0; i < n->len; i++) {
+            if (m > ((unsigned __int128)1 << 124)) return fail(x->b, "integer literal out of INT64 range"); /* F3e: past 38 digits; no wrap */
             m = m * 10 + (unsigned)(s[i] - '0');
-            if (m > (unsigned __int128)INT64_MAX + 1) return fail(x->b, "integer literal out of INT64 range");
         }
-        if (!n->neg && m > (unsigned __int128)INT64_MAX) return fail(x->b, "integer literal out of INT64 range");
+        if (m > (unsigned __int128)INT64_MAX + (n->neg ? 1u : 0u)) { /* F3e: a DECIMAL of scale 0 to 38 digits, the engine's */
+            unsigned digits = 0;
+            for (uint32_t i = 0; i < n->len; i++) digits += digits || s[i] != '0';
+            if (digits > MAX_SCALE) return fail(x->b, "integer literal out of INT64 range");
+            d->k.i = n->neg ? -(__int128)m : (__int128)m;
+            d->t = d->k.t = T_DECIMAL;
+            d->s = d->k.s = 0;
+            return 0;
+        }
         d->k.i = n->neg ? -(__int128)m : (__int128)m;
         d->t = d->k.t = T_INT64;
         return 0;
@@ -3055,6 +3079,7 @@ static int ceval(cx *e, uint16_t k, cv *out)
         out->null = v->null;
         if (!v->null) {
             if (d->t == T_TEXT) out->p = v->s, out->n = v->len;
+            else if (v->wide) out->i = (__int128)(((unsigned __int128)(uint64_t)v->hi << 64) | (uint64_t)v->i); /* F3e */
             else out->i = v->i;
         }
         return 0;
@@ -3295,8 +3320,10 @@ static int gassign(cx *e, const cv *v, const ab_gcol *col, ab_val *out)
             if (rem >= d - rem) q++;
             r = r < 0 ? -(__int128)q : (__int128)q;
         }
-        if (cmag(r) >= cp10(18) || cmag(r) > cp10(col->prec) - 1) return cfail(e, "past its DECIMAL"), -2;
-        out->i = (int64_t)r;
+        if (cmag(r) > cp10(col->prec) - 1) return cfail(e, "past its DECIMAL"), -2; /* F3e: to 38 digits */
+        out->wide = col->prec > 18; /* the column's form: past 18 digits the 128 bits in i and hi */
+        out->i = (int64_t)(uint64_t)(unsigned __int128)r;
+        out->hi = out->wide ? (int64_t)(uint64_t)((unsigned __int128)r >> 64) : 0;
         return 0;
     }
     case T_TEXT: {

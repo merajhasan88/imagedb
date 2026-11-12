@@ -580,7 +580,8 @@ static void g_expr(gen *g, int ty, int d);
 static void g_atom(gen *g, int ty)
 {
     static const char *num[] = {"i", "j", "d", "e", "0", "1", "-1", "7", "100", "9223372036854775807", "-9223372036854775808",
-                                "3037000500", "1.5", "-0.25", "0.005", "-0.005", "99999999.995", "0.5", "2", "-3", "32767", "0.125"};
+                                "3037000500", "1.5", "-0.25", "0.005", "-0.005", "99999999.995", "0.5", "2", "-3", "32767", "0.125", "w", "w",
+                                "99999999999999999999999999999999.999999", "18446744073709551616", "-18446744073709551616.005"}; /* F3e */
     static const char *text[] = {"s", "v", "'a'", "''", "'abc'", "'ABC'", "'it''s'", "'\xc3\xa9'", "'hello'", "'\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9'"};
     static const char *bools[] = {"b", "TRUE", "FALSE"};
     static const char *dates[] = {"dt", "DATE '2000-01-01'", "DATE '0001-01-01'", "DATE '9999-12-31'"};
@@ -714,7 +715,8 @@ static void g_expr(gen *g, int ty, int d)
 }
 
 /* the schema's sources (id 0 to f 12) and its targets (13 on), which no expression names */
-enum { C_GI = 13, C_GN, C_GJ, C_GD, C_GE, C_GS, C_GV, C_GB, C_GDT, C_GTM, C_GTS, C_GTZ, C_NCOLS };
+/* F3e: gw DECIMAL(38,6) and gx DECIMAL(20,2), wide targets, and w DECIMAL(38,6), a source after them (no target names it) */
+enum { C_GI = 13, C_GN, C_GJ, C_GD, C_GE, C_GS, C_GV, C_GB, C_GDT, C_GTM, C_GTS, C_GTZ, C_GW, C_GX, C_W, C_NCOLS };
 
 /* the fixed corpus: each by its target; the assignment's rules at their edges, then the refusals */
 static const struct {
@@ -737,6 +739,15 @@ static const struct {
     {C_GDT, "'2000-01-01'"}, {C_GTZ, "'2000-01-01 00:00:00+00'"}, {C_GI, "NULL"}, {C_GI, "gn"}, {C_GI, "gi + 1"},
     {C_GI, "f"}, {C_GI, "now()"}, {C_GI, "(SELECT 1)"}, {C_GI, "COUNT(i)"}, {C_GI, "CAST(i AS INT64)"}, {C_GI, "t.i"},
     {C_GI, "i, j"}, {C_GI, "i)"}, {C_GI, "$1"}, {C_GI, "x"},
+    /* F3e: into a wide target from wide, narrow and integer sources; a wide source into narrower targets (rounded half
+     * away from zero, refused past their digits, never cut to 64 bits); literals past 18 digits */
+    {C_GW, "w"}, {C_GW, "w * 2"}, {C_GW, "w + d"}, {C_GW, "e"}, {C_GW, "d * 0.5"}, {C_GW, "i"}, {C_GW, "-w"},
+    {C_GW, "w / 3"}, {C_GW, "w * 0.0000001"}, {C_GW, "99999999999999999999999999999999.999999"},
+    {C_GW, "100000000000000000000000000000000"}, {C_GW, "18446744073709551616"}, {C_GW, "COALESCE(w, e, 0)"},
+    {C_GW, "CASE WHEN b THEN w ELSE d END"}, {C_GW, "e * 100000000000000000000"}, {C_GX, "w"}, {C_GX, "w * 0.5"},
+    {C_GX, "18446744073709551616.005"}, {C_GX, "-18446744073709551616.005"}, {C_GX, "999999999999999999.994"},
+    {C_GX, "999999999999999999.995"}, {C_GX, "e"}, {C_GD, "w"}, {C_GD, "w / 1000000000000000000000000"}, {C_GE, "w"},
+    {C_GJ, "w"}, {C_GI, "w"}, {C_GW, "gw"}, {C_GW, "s"},
 };
 
 static void ival(imdb_value *v, uint8_t t, uint8_t s, bool null, int64_t i, const char *txt)
@@ -761,7 +772,7 @@ static void t_gen_differential(void)
     OK(run("CREATE TABLE t (id INT64 PRIMARY KEY, i INT64, j SMALLINT, d DECIMAL(10,2), e DECIMAL(18,0), s TEXT, "
            "v VARCHAR(10), b BOOL, dt DATE, tm TIME, ts TIMESTAMP, tz TIMESTAMPTZ, f FLOAT64, gi INT64 NOT NULL, gn INT64, "
            "gj SMALLINT, gd DECIMAL(10,2), ge DECIMAL(4,1), gs TEXT, gv VARCHAR(4), gb BOOL NOT NULL, gdt DATE, gtm TIME, "
-           "gts TIMESTAMP, gtz TIMESTAMPTZ)"));
+           "gts TIMESTAMP, gtz TIMESTAMPTZ, gw DECIMAL(38,6), gx DECIMAL(20,2), w DECIMAL(38,6))"));
     imdb_table *t = imdb_table_by_name(db, "t");
     CHECK(t && t->s.ncols == C_NCOLS);
     if (!t || t->s.ncols != C_NCOLS) {
@@ -770,7 +781,7 @@ static void t_gen_differential(void)
     }
     const imdb_schema *s = &t->s;
     uint64_t gm = 0;
-    for (int c = C_GI; c < C_NCOLS; c++) gm |= 1ull << c;
+    for (int c = C_GI; c <= C_GX; c++) gm |= 1ull << c;
     ab_col cols[IMDB_MAX_COLS];
     for (uint16_t c = 0; c < s->ncols; c++) {
         memset(&cols[c], 0, sizeof cols[c]);
@@ -787,6 +798,9 @@ static void t_gen_differential(void)
     static const int64_t VDT[] = {IMDB_DATE_MIN, IMDB_DATE_MAX, 0, 10957, 18262};
     static const int64_t VTM[] = {0, IMDB_TIME_MAX, 43200000000LL};
     static const int64_t VTS[] = {-62135596800000000LL, 253402300799999999LL, 0, 946684800000000LL};
+    const __int128 P38 = (__int128)10000000000000000000ull * 10000000000000000000ull, P64 = (__int128)1 << 64; /* 10^38 */
+    const __int128 VW[] = {0, 1, -1, P38 - 1, -(P38 - 1), P64, -P64, 3 * P64 + 7, (__int128)5000000000000000000ll * 1000000,
+                           (__int128)123456789012345678ll * 1000000000000000000ll + 901234567890123456ll, 5000, -5000, 4999};
     enum { NR = 48 };
     imdb_value *rows = calloc((size_t)NR * s->ncols, sizeof *rows), *vals = calloc(NR, sizeof *vals);
     ab_val *arows = calloc((size_t)NR * s->ncols, sizeof *arows);
@@ -815,13 +829,16 @@ static void t_gen_differential(void)
         ival(&v[10], IMDB_T_TIMESTAMP, 0, nul || r % 9 == 7, PICK(VTS, 3), NULL);
         ival(&v[11], IMDB_T_TIMESTAMPTZ, 0, nul || r % 3 == 2, PICK(VTS, 1), NULL);
         ival(&v[12], IMDB_T_FLOAT64, 0, true, 0, NULL);
-        for (int c = C_GI; c < C_NCOLS; c++) /* never read: the expressions name no target */
+        ival(&v[C_W], IMDB_T_DECIMAL, 6, nul || r % 7 == 5, 0, NULL); /* F3e: w, its 128 bits */
+        if (!v[C_W].null) imdb_dec_set(&v[C_W], VW[(r * 3) % (sizeof VW / sizeof *VW)], true);
+        for (int c = C_GI; c <= C_GX; c++) /* never read: the expressions name no target */
             ival(&v[c], s->cols[c].type, s->cols[c].type == IMDB_T_DECIMAL ? s->cols[c].scale : 0, true, 0, NULL);
 #undef PICK
         for (uint16_t c = 0; c < s->ncols; c++)
-            arows[(size_t)r * s->ncols + c] = (ab_val){.i = v[c].i, .s = v[c].s, .len = v[c].len, .null = v[c].null};
+            arows[(size_t)r * s->ncols + c] = (ab_val){.i = v[c].i, .s = v[c].type == IMDB_T_TEXT ? v[c].s : NULL, .len = v[c].len,
+                                                       .null = v[c].null, .wide = v[c].wide, .hi = v[c].wide ? v[c].hi : 0};
     }
-    static const int tnum[] = {C_GI, C_GN, C_GJ, C_GD, C_GE};
+    static const int tnum[] = {C_GI, C_GN, C_GJ, C_GD, C_GE, C_GW, C_GX};
     static const int ttext[] = {C_GS, C_GV};
     char buf[4096];
     gen g = {0xD1B54A32D192ED03ull, buf, 0, sizeof buf};
@@ -836,7 +853,7 @@ static void t_gen_differential(void)
             tc = kCorpus[k].col;
         } else {
             int ty = (int)rnd(&g, G_TZ + 1);
-            tc = ty == G_NUM ? tnum[rnd(&g, 5)] : ty == G_TEXT ? ttext[rnd(&g, 2)] : ty == G_BOOL ? C_GB : ty == G_DATE ? C_GDT
+            tc = ty == G_NUM ? tnum[rnd(&g, 7)] : ty == G_TEXT ? ttext[rnd(&g, 2)] : ty == G_BOOL ? C_GB : ty == G_DATE ? C_GDT
                  : ty == G_TIME ? C_GTM : ty == G_TS ? C_GTS : C_GTZ;
             g.n = 0;
             buf[0] = 0;
@@ -879,7 +896,8 @@ static void t_gen_differential(void)
                     const imdb_value *ev = &vals[r];
                     same = ev->null == av.null &&
                            (ev->null || (col->type == IMDB_T_TEXT ? ev->len == av.len && (!av.len || !memcmp(ev->s, av.s, av.len))
-                                                                  : ev->i == av.i));
+                                                                  : ev->i == av.i && ev->wide == av.wide &&
+                                                                        (!ev->wide || ev->hi == av.hi))); /* F3e */
                 }
                 free(tb);
                 if (!same) {

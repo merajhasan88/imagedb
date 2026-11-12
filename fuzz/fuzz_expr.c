@@ -156,7 +156,7 @@ static void s1(const uint8_t *data, size_t size, const imdb_xval *a, const imdb_
             memset(&col, 0, sizeof col);
             strcpy(col.name, "c");
             col.type = CT[c];
-            col.precision = (uint8_t)(1 + data[38] % 18);
+            col.precision = (uint8_t)(1 + data[38] % 38); /* F3e: past 18 digits the wide form */
             if (col.type == IMDB_T_INT64) col.precision = (uint8_t)(data[38] % 3 == 1 ? 16 : data[38] % 3 == 2 ? 32 : 0); /* F3a */
             col.scale = (uint8_t)(data[39] % (col.precision + 1u));
             imdb_xval out;
@@ -240,7 +240,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     memset(&c, 0, sizeof c);
     strcpy(c.name, "c");
     c.type = CT[data[37] % 4];
-    c.precision = (uint8_t)(1 + data[38] % 18);
+    c.precision = (uint8_t)(1 + data[38] % 38); /* F3e: past 18 digits the wide form, imdb_value_check its rule */
     if (c.type == IMDB_T_INT64) c.precision = (uint8_t)(data[38] % 3 == 1 ? 16 : data[38] % 3 == 2 ? 32 : 0); /* F3a */
     c.scale = (uint8_t)(data[39] % (c.precision + 1u));
     c.flags = IMDB_COL_NULLABLE;

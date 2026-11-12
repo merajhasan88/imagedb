@@ -193,8 +193,8 @@ int imdb_schema_check(const imdb_schema *s, imdb_err *e)
             if (!imdb_int_width_ok(c->precision) || c->scale)
                 return imdb_fail(e, IMDB_ERR_INVALID, "column %s: an integer of 16, 32 or 64 bits", c->name);
         } else if (c->type == IMDB_T_DECIMAL) {
-            if (c->precision < 1 || c->precision > 18 || c->scale > c->precision)
-                return imdb_fail(e, IMDB_ERR_INVALID, "column %s: DECIMAL(p,s) needs 1<=p<=18, 0<=s<=p", c->name);
+            if (c->precision < 1 || c->precision > IMDB_DEC_MAX_DIGITS || c->scale > c->precision)
+                return imdb_fail(e, IMDB_ERR_INVALID, "column %s: DECIMAL(p,s) needs 1<=p<=38, 0<=s<=p", c->name);
         } else if (c->precision || c->scale) {
             return imdb_fail(e, IMDB_ERR_INVALID, "column %s: precision/scale only valid for DECIMAL", c->name);
         }
@@ -308,6 +308,21 @@ int64_t imdb_pow10(int n)
     return (n >= 0 && n <= 18) ? p[n] : 0;
 }
 
+#define Q18 ((__int128)1000000000000000000LL)
+__int128 imdb_pow10_128(int n)
+{
+    static const __int128 p[IMDB_DEC_MAX_DIGITS + 1] = { /* constant expressions: no table made at run time */
+        1LL, 10LL, 100LL, 1000LL, 10000LL, 100000LL, 1000000LL, 10000000LL, 100000000LL, 1000000000LL,
+        10000000000LL, 100000000000LL, 1000000000000LL, 10000000000000LL, 100000000000000LL, 1000000000000000LL,
+        10000000000000000LL, 100000000000000000LL, 1000000000000000000LL,
+        Q18 * 10LL, Q18 * 100LL, Q18 * 1000LL, Q18 * 10000LL, Q18 * 100000LL, Q18 * 1000000LL, Q18 * 10000000LL,
+        Q18 * 100000000LL, Q18 * 1000000000LL, Q18 * 10000000000LL, Q18 * 100000000000LL, Q18 * 1000000000000LL,
+        Q18 * 10000000000000LL, Q18 * 100000000000000LL, Q18 * 1000000000000000LL, Q18 * 10000000000000000LL,
+        Q18 * 100000000000000000LL, Q18 * Q18, Q18 * Q18 * 10, Q18 * Q18 * 100};
+    return (n >= 0 && n <= IMDB_DEC_MAX_DIGITS) ? p[n] : 0;
+}
+#undef Q18
+
 #define TS_MIN (-62135596800000000LL) /* 0001-01-01 00:00:00 */
 #define TS_MAX (253402300799999999LL) /* 9999-12-31 23:59:59.999999 */
 
@@ -326,8 +341,13 @@ int imdb_value_check(const imdb_column *c, const imdb_value *v, imdb_err *e)
         return IMDB_OK;
     case IMDB_T_DECIMAL: {
         if (v->scale != c->scale) return imdb_fail(e, IMDB_ERR_INVALID, "column %s: decimal scale mismatch", c->name);
-        int64_t lim = imdb_pow10(c->precision) - 1;
-        if (v->i > lim || v->i < -lim)
+        /* F3e: the form is the column's, never the value's: a narrow value in a wide column (or the reverse), and a
+         * narrow value's hi, refused; the bound 10^p - 1 from the one 128-bit table */
+        if (v->wide != imdb_dec_wide(c->precision) || (!v->wide && v->hi))
+            return imdb_fail(e, IMDB_ERR_INVALID, "column %s: a DECIMAL value of another width than DECIMAL(%u,%u)'s", c->name,
+                             c->precision, c->scale);
+        __int128 lim = imdb_pow10_128(c->precision) - 1, x = imdb_dec_value(v);
+        if (x > lim || x < -lim)
             return imdb_fail(e, IMDB_ERR_LIMIT, "column %s: value exceeds DECIMAL(%u,%u)", c->name, c->precision, c->scale);
         return IMDB_OK;
     }
@@ -377,7 +397,8 @@ static uint32_t nullable_count(const imdb_schema *s)
 
 static size_t value_width(uint8_t type, const imdb_value *v)
 {
-    return type == IMDB_T_TEXT || type == IMDB_T_BYTEA ? 4 + (size_t)v->len : type == IMDB_T_UUID ? IMDB_UUID_LEN : type == IMDB_T_BOOL ? 1 : 8;
+    return type == IMDB_T_TEXT || type == IMDB_T_BYTEA ? 4 + (size_t)v->len : type == IMDB_T_UUID ? IMDB_UUID_LEN : type == IMDB_T_BOOL ? 1
+         : type == IMDB_T_DECIMAL && v->wide ? 16 : 8; /* F3e: a wide DECIMAL (its form checked to be its column's) */
 }
 
 int imdb_row_encode(const imdb_schema *s, const imdb_value *vals, imdb_buf *out, imdb_err *e)
@@ -408,6 +429,10 @@ int imdb_row_encode(const imdb_schema *s, const imdb_value *vals, imdb_buf *out,
             break;
         case IMDB_T_UUID: imdb_buf_put(out, v->s, IMDB_UUID_LEN); break; /* F3d: no length: 16 always */
         case IMDB_T_BOOL: imdb_buf_put_u8(out, (uint8_t)v->i); break;
+        case IMDB_T_DECIMAL: /* F3e: a wide one i then hi (imdb_value_check made the form the column's) */
+            imdb_buf_put_u64(out, (uint64_t)v->i);
+            if (v->wide) imdb_buf_put_u64(out, (uint64_t)v->hi);
+            break;
         default: imdb_buf_put_u64(out, (uint64_t)v->i); break;
         }
     }
@@ -458,6 +483,10 @@ int imdb_row_decode(const imdb_schema *s, const uint8_t *row, size_t len, imdb_v
             if (!v->s) return imdb_fail(e, IMDB_ERR_CORRUPT, "row: truncated UUID");
             break;
         case IMDB_T_BOOL: v->i = imdb_rd_u8(&r); break;
+        case IMDB_T_DECIMAL: /* F3e: the column's precision decides the form */
+            v->i = (int64_t)imdb_rd_u64(&r);
+            if ((v->wide = imdb_dec_wide(c->precision))) v->hi = (int64_t)imdb_rd_u64(&r);
+            break;
         default: v->i = (int64_t)imdb_rd_u64(&r); break;
         }
         if (r.err) return imdb_fail(e, IMDB_ERR_CORRUPT, "row: truncated");
@@ -489,7 +518,8 @@ void imdb_row_get(const imdb_schema *s, const uint8_t *row, size_t len, int col,
                 uint32_t n = imdb_rd_u32(&r);
                 (void)imdb_rd_bytes(&r, n);
             } else {
-                (void)imdb_rd_bytes(&r, t == IMDB_T_BOOL ? 1 : t == IMDB_T_UUID ? IMDB_UUID_LEN : 8);
+                (void)imdb_rd_bytes(&r, t == IMDB_T_BOOL ? 1 : t == IMDB_T_UUID ? IMDB_UUID_LEN
+                                      : t == IMDB_T_DECIMAL && imdb_dec_wide(c->precision) ? 16 : 8);
             }
             continue;
         }
@@ -506,6 +536,10 @@ void imdb_row_get(const imdb_schema *s, const uint8_t *row, size_t len, int col,
             v->len = v->s ? IMDB_UUID_LEN : 0;
         } else if (t == IMDB_T_BOOL) {
             v->i = imdb_rd_u8(&r);
+        } else if (t == IMDB_T_DECIMAL && imdb_dec_wide(c->precision)) { /* F3e */
+            v->wide = true;
+            v->i = (int64_t)imdb_rd_u64(&r);
+            v->hi = (int64_t)imdb_rd_u64(&r);
         } else {
             v->i = (int64_t)imdb_rd_u64(&r);
         }
@@ -520,6 +554,10 @@ int imdb_value_cmp(const imdb_value *a, const imdb_value *b)
         int c = n ? memcmp(a->s, b->s, n) : 0;
         if (c) return c < 0 ? -1 : 1;
         return a->len < b->len ? -1 : a->len > b->len;
+    }
+    if (a->type == IMDB_T_DECIMAL) { /* F3e: either form, by the 128-bit value */
+        __int128 x = imdb_dec_value(a), y = imdb_dec_value(b);
+        return x < y ? -1 : x > y;
     }
     return a->i < b->i ? -1 : a->i > b->i;
 }
@@ -565,6 +603,13 @@ uint64_t imdb_value_hash(const imdb_value *v, uint64_t seed)
 {
     if (v->null) return imdb_siphash24((const uint8_t *)"", 0, seed, 0x6a09e667f3bcc909ull);
     if (imdb_type_bytes(v->type)) return imdb_siphash24(v->s, v->len, seed, 0x9e3779b97f4a7c15ull);
+    if (v->type == IMDB_T_DECIMAL) { /* F3e: the 128-bit value, a narrow one sign-extended: equal numbers meet */
+        uint8_t t[16];
+        unsigned __int128 x = (unsigned __int128)imdb_dec_value(v);
+        imdb_le64(t, (uint64_t)x);
+        imdb_le64(t + 8, (uint64_t)(x >> 64));
+        return imdb_siphash24(t, 16, seed, 0x9e3779b97f4a7c15ull);
+    }
     uint8_t t[8];
     imdb_le64(t, (uint64_t)v->i);
     return imdb_siphash24(t, 8, seed, 0x9e3779b97f4a7c15ull);
@@ -647,6 +692,28 @@ int imdb_parse_float64(const char *s, size_t n, int64_t *key, imdb_err *e)
 
 int imdb_parse_decimal(const char *s, size_t n, int precision, int scale, int64_t *out, imdb_err *e)
 {
+    __int128 v;
+    if (precision > IMDB_DEC_NARROW_DIGITS) return imdb_fail(e, IMDB_ERR_INVALID, "decimal literal: a precision past 18");
+    if (imdb_parse_decimal128(s, n, precision, scale, &v, e)) return e->code;
+    *out = (int64_t)v; /* at most 18 digits */
+    return IMDB_OK;
+}
+
+int imdb_parse_decimal_col(const char *s, size_t n, const imdb_column *c, imdb_value *v, imdb_err *e)
+{
+    __int128 x;
+    if (imdb_parse_decimal128(s, n, c->precision, c->scale, &x, e)) return e->code;
+    memset(v, 0, sizeof *v);
+    v->type = IMDB_T_DECIMAL;
+    v->scale = c->scale;
+    imdb_dec_set(v, x, imdb_dec_wide(c->precision));
+    return IMDB_OK;
+}
+
+int imdb_parse_decimal128(const char *s, size_t n, int precision, int scale, __int128 *out, imdb_err *e)
+{
+    if (precision < 1 || precision > IMDB_DEC_MAX_DIGITS || scale < 0 || scale > precision)
+        return imdb_fail(e, IMDB_ERR_INVALID, "decimal literal: DECIMAL(%d,%d) is no type", precision, scale);
     size_t i = 0;
     bool neg = false;
     if (i < n && (s[i] == '-' || s[i] == '+')) neg = s[i++] == '-';
@@ -674,7 +741,7 @@ int imdb_parse_decimal(const char *s, size_t n, int precision, int scale, int64_
     size_t sig_int = int_start + int_digits - z;
     if (!(sig_int == 1 && s[z] == '0') && sig_int > (size_t)(precision - scale))
         return imdb_fail(e, IMDB_ERR_LIMIT, "decimal literal exceeds DECIMAL(%d,%d)", precision, scale);
-    int64_t v = 0;
+    __int128 v = 0; /* at most precision digits: below 10^38, inside an int128 */
     for (size_t j = z; j < int_start + int_digits; j++) v = v * 10 + (s[j] - '0');
     for (size_t j = 0; j < (size_t)scale; j++) v = v * 10 + (j < frac_digits ? s[frac_start + j] - '0' : 0);
     *out = neg ? -v : v;
@@ -1087,7 +1154,7 @@ void imdb_format_value(const imdb_value *v, imdb_buf *out)
     }
     switch (v->type) {
     case IMDB_T_INT64: imdb_format_int64(v->i, out); break;
-    case IMDB_T_DECIMAL: imdb_format_decimal(v->i, v->scale, out); break;
+    case IMDB_T_DECIMAL: imdb_format_i128(imdb_dec_value(v), v->scale, out); break; /* F3e: either form */
     case IMDB_T_BOOL: imdb_buf_put_str(out, v->i ? "true" : "false"); break;
     case IMDB_T_TIMESTAMP: imdb_format_timestamp(v->i, out); break;
     case IMDB_T_DATE: imdb_format_date(v->i, out); break;
@@ -1162,6 +1229,8 @@ size_t imdb_key_len(const imdb_schema *s, const imdb_value *kv)
         } else if (v->type == IMDB_T_TEXT || v->type == IMDB_T_BYTEA) {
             n += 2; /* the terminator */
             for (uint32_t i = 0; i < v->len; i++) n += v->s[i] == 0 ? 2 : 1;
+        } else if (v->type == IMDB_T_DECIMAL && imdb_dec_wide(s->cols[s->key[k]].precision)) {
+            n += 16; /* F3e: by the column's precision, whatever form the value came in */
         } else {
             n += 8;
         }
@@ -1186,8 +1255,19 @@ void imdb_key_write(const imdb_schema *s, const imdb_value *kv, uint8_t *out)
             }
             out[o++] = 0;
             out[o++] = 0;
+        } else if (v->type == IMDB_T_DECIMAL && imdb_dec_wide(s->cols[s->key[k]].precision)) {
+            /* F3e: 16 bytes big-endian, the sign bit flipped: the high half as an INT64-like word, the low half
+             * unsigned after it, so memcmp order is numeric order */
+            unsigned __int128 x = (unsigned __int128)imdb_dec_value(v);
+            key_put_i64(out + o, (int64_t)(uint64_t)(x >> 64));
+            uint64_t lo = (uint64_t)x;
+            for (int i = 15; i >= 8; i--) {
+                out[o + i] = (uint8_t)lo;
+                lo >>= 8;
+            }
+            o += 16;
         } else {
-            key_put_i64(out + o, v->i);
+            key_put_i64(out + o, v->type == IMDB_T_DECIMAL ? (int64_t)imdb_dec_value(v) : v->i);
             o += 8;
         }
     }

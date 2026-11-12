@@ -293,7 +293,7 @@ static bool ident_ok(const uint8_t *s, size_t n)
 #define MAX_VIEW_DEPS 256u
 
 /* a view's definition, read by this auditor's own rules (op 20; a manifest's live view): u32 id, u8 name length and
- * the name, u16 columns each a name, a type (1-6) and a scale (a DECIMAL's, to 18; else 0), u16 dependencies each a
+ * the name, u16 columns each a name, a type and a scale (a DECIMAL's, to 38 (F3e); else 0), u16 dependencies each a
  * kind (1 a table, 2 an earlier view) and a u32 id, strictly increasing, u32 text length and the text, strict UTF-8.
  * The identity token and the manifest's copy are checked by its bytes' SHA-256: the same encoding in both places */
 typedef struct aviewdef {
@@ -335,7 +335,7 @@ static aviewdef *decode_viewdef(rd *r)
         uint8_t cl = rd_u8(r);
         const uint8_t *c = rd_bytes(r, cl);
         uint8_t type = rd_u8(r), scale = rd_u8(r);
-        if (r->bad || !ident_ok(c, cl) || type < T_INT64 || type > T_LAST || (type == T_DECIMAL ? scale > 18 : scale != 0))
+        if (r->bad || !ident_ok(c, cl) || type < T_INT64 || type > T_LAST || (type == T_DECIMAL ? scale > 38 : scale != 0)) /* F3e */
             goto bad;
         memcpy(cn[i], c, cl);
         memcpy(d->cols[i].name, c, cl); /* P2 S7b */
@@ -389,9 +389,10 @@ typedef struct schema {
     size_t rawlen;
 } schema;
 
-static int64_t pow10i(int n)
+/* F3e: 10^n for n to 38 as an int128, multiplied out (the auditor's own; no table shared with the engine) */
+static __int128 pow10w(int n)
 {
-    int64_t v = 1;
+    __int128 v = 1;
     for (int i = 0; i < n; i++) v *= 10;
     return v;
 }
@@ -435,7 +436,7 @@ static int decode_schema(rd *r, schema *s)
         if (c->type < T_INT64 || c->type > T_LAST || (c->flags & ~(F_PK | F_SUBJECT | F_NULLABLE)) ||
             ((c->flags & F_NULLABLE) && (c->flags & (F_PK | F_SUBJECT))))
             return fail("schema: bad column type or flags");
-        if (c->type == T_DECIMAL ? (c->prec < 1 || c->prec > 18 || c->scale > c->prec)
+        if (c->type == T_DECIMAL ? (c->prec < 1 || c->prec > 38 || c->scale > c->prec) /* F3e: to 38 digits */
                                  : c->type == T_INT64 ? !int_width_ok(c->prec) || c->scale : (c->prec || c->scale))
             return fail("schema: bad precision/scale");
         if (c->flags & F_PK) { /* F4: a key column of any type held exactly: not FLOAT64 */
@@ -471,7 +472,22 @@ typedef struct val {
     const uint8_t *s;
     uint32_t len;
     bool null;
+    bool wide;   /* F3e: a DECIMAL of a column past 18 digits: its value is hi:i (dval) */
+    int64_t hi;  /* its high 64 bits; 0 for every other value */
 } val;
+
+/* F3e: a column's DECIMAL form is its precision's (past 18 wide: 16 bytes in a row, i then hi), never a value's */
+static bool dwide(const col *c) { return c->type == T_DECIMAL && c->prec > 18; }
+static __int128 dval(const val *v)
+{
+    return v->wide ? (__int128)(((unsigned __int128)(uint64_t)v->hi << 64) | (uint64_t)v->i) : (__int128)v->i;
+}
+static void dset(val *v, __int128 x, bool wide)
+{
+    v->wide = wide;
+    v->i = (int64_t)(uint64_t)(unsigned __int128)x;
+    v->hi = wide ? (int64_t)(uint64_t)((unsigned __int128)x >> 64) : 0;
+}
 
 /* A FLOAT64 is stored as an int64 key: a non-negative double's bits as they are, a
  * negative one's with its 63 low bits flipped. Only finite doubles, and +0.0 alone for zero. */
@@ -501,7 +517,9 @@ static int count_nullable(const schema *s)
 static int check_value(const col *c, const val *v)
 {
     if (c->type == T_INT64 && !int_fits(c->prec, v->i)) return fail("value out of its integer's range in column %s", c->name);
-    if (c->type == T_DECIMAL && (v->i > pow10i(c->prec) - 1 || v->i < -(pow10i(c->prec) - 1)))
+    if (c->type == T_DECIMAL && (v->wide != dwide(c) || (!v->wide && v->hi))) /* F3e */
+        return fail("a DECIMAL of another width than its column's in column %s", c->name);
+    if (c->type == T_DECIMAL && (dval(v) > pow10w(c->prec) - 1 || dval(v) < -(pow10w(c->prec) - 1)))
         return fail("value out of DECIMAL range in column %s", c->name);
     if ((c->type == T_TIMESTAMP || c->type == T_TIMESTAMPTZ) && (v->i < TS_MIN || v->i > TS_MAX))
         return fail("TIMESTAMP out of range in column %s", c->name);
@@ -546,6 +564,10 @@ static int decode_row(const schema *s, const uint8_t *row, size_t n, val *out)
             v->len = v->s ? UUID_LEN : 0;
         } else if (t == T_BOOL) {
             v->i = rd_u8(&r);
+        } else if (dwide(&s->c[i])) { /* F3e: 16 bytes, i then hi */
+            v->wide = true;
+            v->i = (int64_t)rd_u64(&r);
+            v->hi = (int64_t)rd_u64(&r);
         } else {
             v->i = (int64_t)rd_u64(&r);
         }
@@ -562,7 +584,8 @@ static size_t encode_row(const schema *s, const val *v, uint8_t **buf, size_t *c
     int nn = count_nullable(s);
     size_t need = (size_t)(nn + 7) / 8;
     for (int i = 0; i < s->ncols; i++)
-        if (!v[i].null) need += s->c[i].type == T_TEXT || s->c[i].type == T_BYTEA ? 4 + v[i].len : s->c[i].type == T_UUID ? UUID_LEN : s->c[i].type == T_BOOL ? 1 : 8;
+        if (!v[i].null) need += s->c[i].type == T_TEXT || s->c[i].type == T_BYTEA ? 4 + v[i].len : s->c[i].type == T_UUID ? UUID_LEN : s->c[i].type == T_BOOL ? 1
+                              : dwide(&s->c[i]) ? 16 : 8;
     if (need > *cap) {
         *buf = xrealloc(*buf, need, 1);
         *cap = need;
@@ -586,6 +609,11 @@ static size_t encode_row(const schema *s, const val *v, uint8_t **buf, size_t *c
             p += UUID_LEN;
         } else if (s->c[i].type == T_BOOL) {
             *p++ = (uint8_t)v[i].i;
+        } else if (dwide(&s->c[i])) { /* F3e: the 128 bits, i then hi, whatever form v came in */
+            unsigned __int128 x = (unsigned __int128)dval(&v[i]);
+            put64(p, (uint64_t)x);
+            put64(p + 8, (uint64_t)(x >> 64));
+            p += 16;
         } else {
             put64(p, (uint64_t)v[i].i);
             p += 8;
@@ -796,6 +824,14 @@ static bool aidx_ok(const aidx *x, int ncols)
     return true;
 }
 
+/* F3e: no index on a DECIMAL past 18 digits (the engine's imdb_index_def_ok: deferred.md D25) */
+static bool aidx_no_wide(const aidx *x, const schema *s)
+{
+    for (int i = 0; i < x->ncols && i < MAX_INDEX_COLS; i++)
+        if (x->cols[i] < s->ncols && dwide(&s->c[x->cols[i]])) return false;
+    return true;
+}
+
 static bool aidx_same(const aidx *a, const aidx *b)
 {
     return strcmp(a->name, b->name) == 0 && a->flags == b->flags && a->ncols == b->ncols &&
@@ -931,7 +967,7 @@ static bool defk_fits(uint8_t k, uint8_t ty)
 static int one_value(rd *hr, const col *ac, const uint8_t **def, uint32_t *len, const char *what)
 {
     size_t at = hr->o;
-    uint32_t dl = ac->type == T_TEXT || ac->type == T_BYTEA ? 4 + rd_u32(hr) : ac->type == T_UUID ? UUID_LEN : ac->type == T_BOOL ? 1 : 8; /* F3d */
+    uint32_t dl = ac->type == T_TEXT || ac->type == T_BYTEA ? 4 + rd_u32(hr) : ac->type == T_UUID ? UUID_LEN : ac->type == T_BOOL ? 1 : dwide(ac) ? 16 : 8; /* F3d; F3e */
     hr->o = at;
     *def = rd_bytes(hr, dl);
     *len = dl;
@@ -1159,7 +1195,7 @@ static int alter_body(rd *hr, op *o, const char *what)
         }
         const col *ac = &o->acol;
         if (!hr->bad && (ac->type < T_INT64 || ac->type > T_LAST || (ac->flags & ~F_NULLABLE) ||
-                         (ac->type == T_DECIMAL ? (ac->prec < 1 || ac->prec > 18 || ac->scale > ac->prec)
+                         (ac->type == T_DECIMAL ? (ac->prec < 1 || ac->prec > 38 || ac->scale > ac->prec) /* F3e */
                           : ac->type == T_INT64  ? !int_width_ok(ac->prec) || ac->scale
                                                 : (ac->prec || ac->scale))))
             return fail("%s: bad added column", what);
@@ -1173,7 +1209,7 @@ static int alter_body(rd *hr, op *o, const char *what)
         o->has_def = has;
         if (has) { /* the row encoding of one value: a one-column NOT NULL row, which decode_row checks */
             size_t at = hr->o;
-            uint32_t dl = ac->type == T_TEXT || ac->type == T_BYTEA ? 4 + rd_u32(hr) : ac->type == T_UUID ? UUID_LEN : ac->type == T_BOOL ? 1 : 8; /* F3d */
+            uint32_t dl = ac->type == T_TEXT || ac->type == T_BYTEA ? 4 + rd_u32(hr) : ac->type == T_UUID ? UUID_LEN : ac->type == T_BOOL ? 1 : dwide(ac) ? 16 : 8; /* F3d; F3e */
             hr->o = at;
             o->def = rd_bytes(hr, dl);
             o->def_len = dl;
@@ -1206,14 +1242,14 @@ static int alter_body(rd *hr, op *o, const char *what)
         }
         const col *ac = &o->acol;
         if (!hr->bad && (ac->type < T_INT64 || ac->type > T_LAST ||
-                         (ac->type == T_DECIMAL ? (ac->prec < 1 || ac->prec > 18 || ac->scale > ac->prec)
+                         (ac->type == T_DECIMAL ? (ac->prec < 1 || ac->prec > 38 || ac->scale > ac->prec) /* F3e */
                           : ac->type == T_INT64  ? !int_width_ok(ac->prec) || ac->scale
                                                 : (ac->prec || ac->scale))))
             return fail("%s: bad column type", what);
         if (o->akind == 9 || hr->bad) return 0;
         o->has_def = true; /* never NULL: no marker, the row encoding of one NOT NULL value */
         size_t at = hr->o;
-        uint32_t dl = ac->type == T_TEXT || ac->type == T_BYTEA ? 4 + rd_u32(hr) : ac->type == T_UUID ? UUID_LEN : ac->type == T_BOOL ? 1 : 8; /* F3d */
+        uint32_t dl = ac->type == T_TEXT || ac->type == T_BYTEA ? 4 + rd_u32(hr) : ac->type == T_UUID ? UUID_LEN : ac->type == T_BOOL ? 1 : dwide(ac) ? 16 : 8; /* F3d; F3e */
         hr->o = at;
         o->def = rd_bytes(hr, dl);
         o->def_len = dl;
@@ -1808,10 +1844,11 @@ static bool uk_key(const schema *s, const val *vals, const aidx *x, uint8_t **ou
             return false;
         }
         bool text = bytes_t(s->c[x->cols[c]].type); /* F3d: a UUID's and a BYTEA's bytes as TEXT's */
-        size_t add = text ? 4 + (size_t)v->len : 8;
+        bool dec = s->c[x->cols[c]].type == T_DECIMAL; /* F3e: every DECIMAL by its 128 bits, either form */
+        size_t add = text ? 4 + (size_t)v->len : dec ? 16 : 8;
         b = xrealloc(b, n + add, 1);
-        uint64_t w = text ? v->len : (uint64_t)v->i;
-        for (int k = 0; k < (text ? 4 : 8); k++) b[n + k] = (uint8_t)(w >> (8 * k));
+        unsigned __int128 w = text ? v->len : dec ? (unsigned __int128)dval(v) : (unsigned __int128)(uint64_t)v->i;
+        for (int k = 0; k < (text ? 4 : dec ? 16 : 8); k++) b[n + k] = (uint8_t)(w >> (8 * k));
         if (text && v->len) memcpy(b + n + 4, v->s, v->len);
         n += add;
     }
@@ -2046,7 +2083,7 @@ static int alter_next(const aver *cur, const op *o, aver *nv, uint64_t seq, cons
         bool wide = cc->type == T_TEXT && o->acol.type == T_TEXT ? cc->vlen && (!o->acol.vlen || o->acol.vlen > cc->vlen) /* F3c */
                     : cc->type == T_INT64 && o->acol.type == T_INT64 ? rt > rf
                     : cc->type == T_DECIMAL && o->acol.type == T_DECIMAL && o->acol.scale == cc->scale &&
-                          o->acol.prec > cc->prec && o->acol.prec <= 18;
+                          o->acol.prec > cc->prec && o->acol.prec <= 38 && (o->acol.prec > 18) == (cc->prec > 18); /* F3e: within one form */
         if (!wide) return fail("commit %llu: SET TYPE that is not a widening", sq);
         cc->prec = o->acol.prec;
         cc->vlen = o->acol.vlen;
@@ -2097,7 +2134,7 @@ static bool val_same(const val *a, const val *b, uint8_t ty)
 {
     if (a->null || b->null) return a->null == b->null;
     if (bytes_t(ty)) return a->len == b->len && (!a->len || memcmp(a->s, b->s, a->len) == 0);
-    return a->i == b->i;
+    return a->i == b->i && a->hi == b->hi && a->wide == b->wide; /* F3e: a wide DECIMAL's halves and form */
 }
 
 /* version vid ends: its key leaves the unique indexes */
@@ -2405,7 +2442,7 @@ static int ck_row(table *t, const val *vals, uint64_t seq)
 {
     if (!t->nlck) return 0;
     ab_val av[MAX_COLS];
-    for (int c = 0; c < t->s.ncols; c++) av[c] = (ab_val){.i = vals[c].i, .s = vals[c].s, .len = vals[c].len, .null = vals[c].null};
+    for (int c = 0; c < t->s.ncols; c++) av[c] = (ab_val){.i = vals[c].i, .s = vals[c].s, .len = vals[c].len, .null = vals[c].null, .wide = vals[c].wide, .hi = vals[c].hi};
     for (uint16_t i = 0; i < t->nlck; i++) {
         if (!t->cc[i] && ck_bind_text(&t->s, t->lck[i].text, t->lck[i].len, &t->cc[i], seq, t->lck[i].name)) return -1;
         char err[256];
@@ -2467,7 +2504,7 @@ static int gen_row(table *t, const val *vals, uint64_t seq)
     uint64_t gm = gen_mask(t);
     if (!gm) return 0;
     ab_val av[MAX_COLS];
-    for (int c = 0; c < t->s.ncols; c++) av[c] = (ab_val){.i = vals[c].i, .s = vals[c].s, .len = vals[c].len, .null = vals[c].null};
+    for (int c = 0; c < t->s.ncols; c++) av[c] = (ab_val){.i = vals[c].i, .s = vals[c].s, .len = vals[c].len, .null = vals[c].null, .wide = vals[c].wide, .hi = vals[c].hi};
     for (int c = 0; c < t->s.ncols; c++) {
         if (!(gm >> c & 1)) continue;
         if (gen_bind(t, c, gm, seq)) return -1;
@@ -2483,7 +2520,7 @@ static int gen_row(table *t, const val *vals, uint64_t seq)
                         r == -1 ? "fails to evaluate" : "takes no value its expression gives", err);
         bool same = out.null == vals[c].null &&
                     (out.null || (cc->type == T_TEXT ? out.len == vals[c].len && (!out.len || !memcmp(out.s, vals[c].s, out.len))
-                                                     : out.i == vals[c].i));
+                                                     : out.i == vals[c].i && out.hi == vals[c].hi && out.wide == vals[c].wide)); /* F3e */
         free(tb);
         if (!same)
             return fail("commit %llu: a row of table %s holds another value in generated column %s than its expression gives",
@@ -2653,6 +2690,9 @@ static int afk_def(const state *S, const table *t, uint32_t tid, const afk *f, u
         const col *a = &t->s.c[c], *b = &p->s.c[pk];
         if (a->type != b->type || (a->type == T_DECIMAL && a->scale != b->scale))
             return fail("commit %llu: foreign key %s: column %s of another type than the key column it references", sq, f->name, a->name);
+        if (dwide(a) != dwide(b)) /* F3e: DECIMALs of one form (the engine's rule: deferred.md D25) */
+            return fail("commit %llu: foreign key %s: column %s a DECIMAL of another form than the key column it references", sq,
+                        f->name, a->name);
         if (f->on_delete == 3 && !(a->flags & F_NULLABLE))
             return fail("commit %llu: foreign key %s: ON DELETE SET NULL of a NOT NULL column", sq, f->name);
     }
@@ -2984,7 +3024,7 @@ static int apply_op(state *S, const op *o, uint64_t seq)
                     break;
                 }
                 for (int q = 0; q < t->s.ncols; q++)
-                    abv[q] = (ab_val){.i = vals[q].i, .s = vals[q].s, .len = vals[q].len, .null = vals[q].null};
+                    abv[q] = (ab_val){.i = vals[q].i, .s = vals[q].s, .len = vals[q].len, .null = vals[q].null, .wide = vals[q].wide, .hi = vals[q].hi};
                 int hv = ab_check_eval(ac, abv, err, sizeof err);
                 if (hv <= 0)
                     rc = fail("commit %llu: ADD CHECK %s of table %s, which a live row %s", (unsigned long long)seq, o->ck->name,
@@ -3104,8 +3144,9 @@ static int apply_op(state *S, const op *o, uint64_t seq)
             for (uint32_t j = 0; !S->t[i].dropped_at && j < S->t[i].nidx; j++) /* a dropped table's names are free */
                 if (strcmp(S->t[i].idx[j].name, o->iname) == 0)
                     return fail("commit %llu: CREATE INDEX with a name in use", (unsigned long long)seq);
-        if (!aidx_ok(&o->ix, t->s.ncols) || t->nidx >= MAX_INDEXES)
-            return fail("commit %llu: CREATE INDEX on a column the table lacks, or past the limit", (unsigned long long)seq);
+        if (!aidx_ok(&o->ix, t->s.ncols) || !aidx_no_wide(&o->ix, &t->s) || t->nidx >= MAX_INDEXES)
+            return fail("commit %llu: CREATE INDEX on a column the table lacks or a DECIMAL past 18 digits, or past the limit",
+                        (unsigned long long)seq);
         while (p < t->nidx && strcmp(t->idx[p].name, o->iname) < 0) p++;
         memmove(&t->idx[p + 1], &t->idx[p], (t->nidx - p) * sizeof *t->idx);
         t->idx[p] = o->ix;
@@ -3756,6 +3797,18 @@ static bool is_int(uint8_t t)
     return t == T_INT64 || t == T_DECIMAL || t == T_TIMESTAMP || t == T_FLOAT64 || t == T_TIMESTAMPTZ || t == T_DATE || t == T_TIME;
 }
 
+/* F3e: a column's segment layout by the column, not its type alone: a wide DECIMAL as a UUID is held, offsets and
+ * data, each cell 16 bytes (i then hi) or none, with no zone map */
+static bool seg_int(const col *c) { return is_int(c->type) && !dwide(c); }
+static bool seg_text(const col *c) { return bytes_t(c->type) || dwide(c); }
+
+/* a wide DECIMAL's cell (a z - a of 16) or nothing stored (0): its value and its stored length */
+static void dcell(const uint8_t *p, uint32_t len, val *v)
+{
+    v->len = len; /* what is stored, for the checks that nothing is under a clear VALID bit or an erased row */
+    dset(v, len == 16 ? (__int128)(((unsigned __int128)le64(p + 8) << 64) | le64(p)) : 0, true);
+}
+
 static bool has_value(const seg *g, int c, uint32_t i)
 {
     if (g->cst[c]) return !g->cstv[c].null;
@@ -3771,9 +3824,12 @@ static void seg_raw(const schema *s, const seg *g, uint32_t i, int c, val *v)
         return;
     }
     uint8_t t = s->c[c].type;
-    if (is_int(t)) v->i = (int64_t)le64(g->colp[c] + 8u * i);
+    if (seg_int(&s->c[c])) v->i = (int64_t)le64(g->colp[c] + 8u * i);
     else if (t == T_BOOL) v->i = g->colp[c][i];
-    else {
+    else if (dwide(&s->c[c])) { /* F3e */
+        uint32_t a = le32(g->colp[c] + 4u * i), z = le32(g->colp[c] + 4u * (i + 1));
+        dcell(g->tdata[c] + a, z - a, v);
+    } else {
         uint32_t a = le32(g->colp[c] + 4u * i), z = le32(g->colp[c] + 4u * (i + 1));
         v->s = g->tdata[c] + a;
         v->len = z - a;
@@ -3798,9 +3854,12 @@ static void seg_own_value(const struct aver *gv, const seg *g, uint32_t i, int c
         return;
     }
     uint8_t t = gv->s.c[c].type;
-    if (is_int(t)) v->i = (int64_t)le64(g->ocolp[c] + 8u * i);
+    if (seg_int(&gv->s.c[c])) v->i = (int64_t)le64(g->ocolp[c] + 8u * i);
     else if (t == T_BOOL) v->i = g->ocolp[c][i];
-    else {
+    else if (dwide(&gv->s.c[c])) { /* F3e */
+        uint32_t a = le32(g->ocolp[c] + 4u * i), z = le32(g->ocolp[c] + 4u * (i + 1));
+        dcell(g->otdata[c] + a, z - a, v);
+    } else {
         uint32_t a = le32(g->ocolp[c] + 4u * i), z = le32(g->ocolp[c] + 4u * (i + 1));
         v->s = g->otdata[c] + a;
         v->len = z - a;
@@ -3838,10 +3897,11 @@ static bool ukey_of(const schema *s, const seg *g, uint32_t i, const aidx *x, uk
         val v;
         seg_value(s, g, i, cn, &v);
         bool text = bytes_t(s->c[cn].type);
-        size_t add = text ? 4 + (size_t)v.len : 8;
+        bool dec = s->c[cn].type == T_DECIMAL; /* F3e: uk_key's encoding, every DECIMAL by its 128 bits */
+        size_t add = text ? 4 + (size_t)v.len : dec ? 16 : 8;
         b = xrealloc(b, n + add, 1);
-        uint64_t w = text ? v.len : (uint64_t)v.i;
-        for (int k = 0; k < (text ? 4 : 8); k++) b[n + k] = (uint8_t)(w >> (8 * k));
+        unsigned __int128 w = text ? v.len : dec ? (unsigned __int128)dval(&v) : (unsigned __int128)(uint64_t)v.i;
+        for (int k = 0; k < (text ? 4 : dec ? 16 : 8); k++) b[n + k] = (uint8_t)(w >> (8 * k));
         if (text && v.len) memcpy(b + n + 4, v.s, v.len);
         n += add;
     }
@@ -3889,7 +3949,7 @@ static int parse_segment(const struct aver *vers, uint32_t nvers, const val *mis
     for (int i = 0; i < 5; i++) want_kind[k] = sys[i], want_col[k] = 0, want_len[k++] = syslen[i];
     for (int c = 0; c < s->ncols; c++) {
         uint8_t t = s->c[c].type;
-        if (is_int(t)) want_kind[k] = S_I64, want_col[k] = (uint32_t)c, want_len[k++] = 8ull * n;
+        if (seg_int(&s->c[c])) want_kind[k] = S_I64, want_col[k] = (uint32_t)c, want_len[k++] = 8ull * n;
         else if (t == T_BOOL) want_kind[k] = S_U8, want_col[k] = (uint32_t)c, want_len[k++] = n;
         else {
             want_kind[k] = S_TOFF, want_col[k] = (uint32_t)c, want_len[k++] = 4ull * (n + 1);
@@ -3939,13 +3999,14 @@ static int parse_segment(const struct aver *vers, uint32_t nvers, const val *mis
     k = 5;
     for (int c = 0; c < s->ncols && !rc; c++) {
         g->colp[c] = sec[k++];
-        if (bytes_t(s->c[c].type)) { /* F3d: offsets and data for each byte string */
+        if (seg_text(&s->c[c])) { /* F3d: offsets and data for each byte string; F3e: a wide DECIMAL's 16-byte cells */
             g->tdata[c] = sec[k];
             uint64_t dl = slen[k++];
             if (le32(g->colp[c]) != 0 || le32(g->colp[c] + 4u * n) != dl) rc = fail("segment: bad TEXT offsets");
             for (uint32_t i = 0; i < n && !rc; i++) {
                 uint32_t a = le32(g->colp[c] + 4u * i), z = le32(g->colp[c] + 4u * (i + 1));
                 if (z < a || z > dl || z - a > MAX_TEXT) rc = fail("segment: bad TEXT offsets");
+                else if (dwide(&s->c[c]) && z - a != 0 && z - a != 16) rc = fail("segment: a DECIMAL cell of %u bytes", z - a);
             }
         }
         if (s->c[c].flags & F_NULLABLE) {
@@ -3975,7 +4036,9 @@ static int parse_segment(const struct aver *vers, uint32_t nvers, const val *mis
             continue;
         }
         for (int c = 0; c < s->ncols && !rc; c++)
-            if (!v[c].null) rc = check_value(&s->c[c], &v[c]);
+            if (dwide(&s->c[c]) && !g->cst[c] && !v[c].null && v[c].len != 16) /* F3e: a stored value is its 16 bytes, never none */
+                rc = fail("segment: a DECIMAL of no bytes in column %s", s->c[c].name);
+            else if (!v[c].null) rc = check_value(&s->c[c], &v[c]);
         if (rc) break;
         /* F1: a row of an older version holds, at each column its version lacks, exactly its missing value (no
          * commitment covers it, a reader reads it); none is of a later version than its segment (built before) */
@@ -4012,7 +4075,7 @@ static int parse_segment(const struct aver *vers, uint32_t nvers, const val *mis
         bool has = false, has_null = false;
         int64_t mn = 0, mx = 0;
         for (uint32_t i = 0; i < n; i++) has_null |= !g->row[i].flags && !has_value(g, c, i);
-        if (!bytes_t(s->c[c].type))
+        if (!seg_text(&s->c[c])) /* F3d: a byte string has no zone map; F3e: nor a wide DECIMAL */
             for (uint32_t i = 0; i < n; i++) {
                 if (g->row[i].flags || !has_value(g, c, i)) continue;
                 val v;
@@ -4217,7 +4280,7 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
     rd r = {b, len, 0, false};
     const uint8_t *mg = rd_bytes(&r, 8);
     uint32_t mver = mg && memcmp(mg, "IMDBMAN1", 8) == 0 ? rd_u32(&r) : 0;
-    if (mver != 14) return fail("manifest: bad header (version 14 only: UUID and BYTEA, F3d)");
+    if (mver != 15) return fail("manifest: bad header (version 15 only: DECIMALs to 38 digits, F3e)");
     uint32_t nsec = rd_u32(&r); /* every section, in order: 1 tables, 2 views, 3 sequences (F2a-2), 4-11 reserved and empty */
     const uint8_t *id = rd_bytes(&r, 16);
     m->seq = rd_u64(&r);
@@ -4267,7 +4330,8 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
             t->idx[k].flags = rd_u8(&r);
             t->idx[k].ncols = rd_u8(&r);
             for (int c = 0; c < t->idx[k].ncols && c < MAX_INDEX_COLS; c++) t->idx[k].cols[c] = rd_u16(&r);
-            if (r.bad || !ident_ok(nm, nl) || !aidx_ok(&t->idx[k], t->s.ncols)) return fail("manifest: bad index");
+            if (r.bad || !ident_ok(nm, nl) || !aidx_ok(&t->idx[k], t->s.ncols) || !aidx_no_wide(&t->idx[k], &t->s))
+                return fail("manifest: bad index");
             memcpy(t->idx[k].name, nm, nl);
             if (k && strcmp(t->idx[k - 1].name, t->idx[k].name) >= 0) return fail("manifest: indexes not sorted");
         }
@@ -5790,6 +5854,7 @@ typedef struct qctx {
     int nfargs;
     uint64_t snap, count;
     __int128 sum[MAX_COLS];
+    int64_t swrap[MAX_COLS]; /* F3e: the times sum[c] wrapped (a wide DECIMAL's), as the engine's exact SUM counts them */
     uint64_t nsum[MAX_COLS]; /* non-null values summed: none means the SUM is NULL */
     afsum fs[MAX_COLS];      /* FLOAT64 columns: exact, by afsum.c */
     uint8_t alg;             /* META's digest algorithm */
@@ -5834,11 +5899,25 @@ static int parse_filter(const schema *s, const char *arg, filt *f)
         }
         if (*v < '0' || *v > '9') return fail("bad number in filter %s", arg);
         if (frac >= 0 && ++frac > c->scale) return fail("too many fractional digits in filter %s", arg);
+        /* F3e: checked before it grows, so acc * 10 + d stays within the bound (10^38 for a wide column, under 2^127):
+         * a 39-digit value would overflow an int128 before a check after it (found 2026-11-11: count=0, not refused) */
+        __int128 lim = dwide(c) ? pow10w(38) : ((__int128)1 << 64);
+        if (acc > (lim - (*v - '0')) / 10) return fail("number out of range in filter %s", arg);
         acc = acc * 10 + (*v - '0');
-        if (acc > ((__int128)1 << 64)) return fail("number out of range in filter %s", arg);
     }
     int scale = c->type == T_DECIMAL ? c->scale : 0;
-    for (int k = frac < 0 ? 0 : frac; k < scale; k++) acc *= 10;
+    for (int k = frac < 0 ? 0 : frac; k < scale; k++) {
+        if (dwide(c) && acc >= pow10w(37)) return fail("number out of range in filter %s", arg); /* F3e: no overflow */
+        acc *= 10;
+    }
+    if (dwide(c)) { /* F3e: a wide column's value, its form */
+        if (acc >= pow10w(c->prec)) return fail("number out of range in filter %s", arg);
+        dset(&f->v, neg ? -acc : acc, true);
+        return 0;
+    }
+    /* within int64, the sign the text's: a value from 2^63 up was taken and wrapped (2^63 matched INT64_MIN's rows, 2^64
+     * zero's), older than F3e, found with its filter probe 2026-11-11 */
+    if (neg ? acc > ((__int128)1 << 63) : acc > INT64_MAX) return fail("number out of range in filter %s", arg);
     f->v.i = (int64_t)(neg ? -acc : acc);
     return 0;
 }
@@ -5898,13 +5977,17 @@ static void q_take(qctx *q, const schema *s, const val *vals, const uint8_t cm[3
     for (int k = 0; k < q->nf; k++) {
         const val *v = &vals[q->f[k].col], *w = &q->f[k].v;
         if (v->null) return;
-        if (bytes_t(s->c[q->f[k].col].type) ? (v->len != w->len || (v->len && memcmp(v->s, w->s, v->len) != 0)) : v->i != w->i)
+        if (bytes_t(s->c[q->f[k].col].type) ? (v->len != w->len || (v->len && memcmp(v->s, w->s, v->len) != 0))
+            : s->c[q->f[k].col].type == T_DECIMAL ? dval(v) != dval(w) /* F3e */
+                                                 : v->i != w->i)
             return;
     }
     q->count++;
     for (int c = 0; c < s->ncols; c++)
         if ((s->c[c].type == T_INT64 || s->c[c].type == T_DECIMAL) && !(s->c[c].flags & (F_PK | F_SUBJECT)) && !vals[c].null) {
-            q->sum[c] += vals[c].i;
+            __int128 x = s->c[c].type == T_DECIMAL ? dval(&vals[c]) : (__int128)vals[c].i, r; /* F3e: wraps counted */
+            if (__builtin_add_overflow(q->sum[c], x, &r)) q->swrap[c] += x < 0 ? -1 : 1;
+            q->sum[c] = r;
             q->nsum[c]++;
         }
         else if (s->c[c].type == T_FLOAT64 && !(s->c[c].flags & (F_PK | F_SUBJECT)) && !vals[c].null) {
@@ -6040,7 +6123,9 @@ static int cmd_query(bool digest, const char *dir, int argc, char **argv)
         for (int c = 0; c < qs->ncols; c++)
             if ((qs->c[c].type == T_INT64 || qs->c[c].type == T_DECIMAL) && !(qs->c[c].flags & (F_PK | F_SUBJECT))) {
                 printf(" sum(%s)=", qs->c[c].name);
-                if (q.nsum[c]) print_i128(q.sum[c], qs->c[c].type == T_DECIMAL ? qs->c[c].scale : 0);
+                if (q.nsum[c] && (q.swrap[c] || q.sum[c] >= pow10w(38) || q.sum[c] <= -pow10w(38)))
+                    fputs("out-of-range", stdout); /* F3e: past 38 digits, which the engine's SUM refuses */
+                else if (q.nsum[c]) print_i128(q.sum[c], qs->c[c].type == T_DECIMAL ? qs->c[c].scale : 0);
                 else fputs("null", stdout);
             }
             else if (qs->c[c].type == T_FLOAT64 && !(qs->c[c].flags & (F_PK | F_SUBJECT))) {

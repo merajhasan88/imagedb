@@ -32,7 +32,7 @@ bool imdb_defk_fits(uint8_t kind, uint8_t type) /* F2a: a clock kind and the typ
 static bool alter_type_ok(const imdb_column *c)
 {
     if (c->type < IMDB_T_INT64 || c->type > IMDB_T_LAST) return false;
-    if (c->type == IMDB_T_DECIMAL) return c->precision >= 1 && c->precision <= 18 && c->scale <= c->precision;
+    if (c->type == IMDB_T_DECIMAL) return c->precision >= 1 && c->precision <= IMDB_DEC_MAX_DIGITS && c->scale <= c->precision; /* F3e */
     if (c->type == IMDB_T_INT64) return imdb_int_width_ok(c->precision) && !c->scale; /* F3a: SMALLINT, INTEGER, INT64 */
     return !c->precision && !c->scale;
 }
@@ -61,6 +61,9 @@ static void put_value(imdb_buf *b, const imdb_column *c, const imdb_value *v)
         imdb_buf_put(b, v->s, v->len);
     } else if (c->type == IMDB_T_UUID) { /* F3d: the row codec's 16 bytes */
         imdb_buf_put(b, v->s, IMDB_UUID_LEN);
+    } else if (c->type == IMDB_T_DECIMAL && imdb_dec_wide(c->precision)) { /* F3e: the row codec's 16 bytes, i then hi */
+        imdb_buf_put_u64(b, (uint64_t)v->i);
+        imdb_buf_put_u64(b, (uint64_t)v->hi);
     } else if (c->type == IMDB_T_BOOL) {
         imdb_buf_put_u8(b, (uint8_t)v->i);
     } else {
@@ -131,6 +134,10 @@ static int get_value(imdb_rd *r, const imdb_column *c, imdb_value *v, const char
     } else if (c->type == IMDB_T_UUID) {
         v->s = imdb_rd_bytes(r, IMDB_UUID_LEN);
         v->len = v->s ? IMDB_UUID_LEN : 0;
+    } else if (c->type == IMDB_T_DECIMAL && imdb_dec_wide(c->precision)) { /* F3e */
+        v->wide = true;
+        v->i = (int64_t)imdb_rd_u64(r);
+        v->hi = (int64_t)imdb_rd_u64(r);
     } else if (c->type == IMDB_T_BOOL) {
         v->i = imdb_rd_u8(r);
     } else {
@@ -1828,7 +1835,7 @@ int imdb_viewdef_check(const imdb_viewdef *d, imdb_err *e)
         if (!lower_ident(c->name)) return imdb_fail(e, IMDB_ERR_CORRUPT, "view: bad column name");
         for (uint16_t j = 0; j < i; j++)
             if (!strcmp(d->cols[j].name, c->name)) return imdb_fail(e, IMDB_ERR_CORRUPT, "view: two columns of one name");
-        if (c->type < IMDB_T_INT64 || c->type > IMDB_T_LAST || (c->type == IMDB_T_DECIMAL ? c->scale > 18 : c->scale))
+        if (c->type < IMDB_T_INT64 || c->type > IMDB_T_LAST || (c->type == IMDB_T_DECIMAL ? c->scale > IMDB_DEC_MAX_DIGITS : c->scale)) /* F3e: 38 */
             return imdb_fail(e, IMDB_ERR_CORRUPT, "view: bad column type");
     }
     if (d->ndeps > IMDB_MAX_VIEW_DEPS || (d->ndeps && !d->deps))

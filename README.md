@@ -594,8 +594,11 @@ round to short ones writing the same row, so retry with backoff). SERIALIZABLE
 is refused; snapshot write skew is possible.
 
 Types: INT64 (BIGINT, INT8), INTEGER (INT, INT4: 32 bits), SMALLINT (INT2: 16 bits),
-DECIMAL, TEXT, VARCHAR(n), BOOL, TIMESTAMP, TIMESTAMPTZ, DATE, TIME, UUID, BYTEA, finite FLOAT64 (exact
-SUM, rounded once) and nullable non-key columns. SMALLINT and INTEGER are INT64 values checked
+DECIMAL(p,s) (NUMERIC(p,s): p 1 to 38), TEXT, VARCHAR(n), BOOL, TIMESTAMP, TIMESTAMPTZ, DATE, TIME, UUID, BYTEA,
+finite FLOAT64 (exact SUM, rounded once) and nullable non-key columns. A DECIMAL of up to 18 digits is held in 64 bits
+and one of 19 to 38 in 128 (16 bytes a value); both compare, join and group with each other by value. Not yet on a
+DECIMAL past 18 digits: CREATE INDEX on it, a FOREIGN KEY between it and one of 18 or fewer, and SET TYPE across 18
+digits (within either side it widens as metadata). SMALLINT and INTEGER are INT64 values checked
 against their range at every write (INSERT, UPDATE, COPY, a DEFAULT) and in
 `CAST(x AS SMALLINT)`; arithmetic over them is INT64's (a SMALLINT sum past 32767
 is a value until it is written back). INT and INTEGER were INT64 before; they are

@@ -379,6 +379,9 @@ int imdb_fk_def_check(const imdb_sver *ccur, const imdb_sver *pcur, bool parent_
         if (a->type != b->type || (a->type == IMDB_T_DECIMAL && a->scale != b->scale))
             return imdb_fail(e, IMDB_ERR_INVALID, "foreign key %s: column %s is %s, the key column %s it references %s (a "
                              "DECIMAL's scale its own)", f->name, a->name, imdb_type_name(a->type), b->name, imdb_type_name(b->type));
+        if (a->type == IMDB_T_DECIMAL && imdb_dec_wide(a->precision) != imdb_dec_wide(b->precision)) /* F3e: deferred.md D25 */
+            return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "foreign key %s: column %s and the key column %s it references are DECIMALs, "
+                             "one of 18 digits or fewer and one of more: not yet", f->name, a->name, b->name);
         if (f->on_delete == IMDB_FK_SET_NULL && !(a->flags & IMDB_COL_NULLABLE))
             return imdb_fail(e, IMDB_ERR_INVALID, "foreign key %s: ON DELETE SET NULL of NOT NULL column %s", f->name, a->name);
     }

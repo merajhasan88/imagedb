@@ -565,6 +565,24 @@ must_fail "a clock DEFAULT its column's type does not take" "$AUD" verify "$PHB"
 echo "   HA a signed INSERT whose UUID is 15 bytes (the row codec takes 16), HB a signed CREATE whose op 23 gives a
    TIMESTAMPTZ column gen_random_uuid() (kind 10, a UUID's alone): the replay and the auditor refuse each"
 
+echo "== IA, IB: DECIMALs to 38 digits (F3e) broken: a signed row past its precision, a manifest's precision of 39"
+PIA=$WORK/ia; "$BIN" init "$PIA" >/dev/null
+"$BIN" sql "$PIA" --nosync -c "CREATE TABLE dw (id INT64 PRIMARY KEY, w DECIMAL(30,2) NOT NULL);" \
+  -c "INSERT INTO dw VALUES (1, 9999999999999999999999999999.99);" >/dev/null
+"$BIN" verify "$PIA" >/dev/null && "$AUD" verify "$PIA" >/dev/null || fail "the honest directory must verify"
+cp -r "$PIA" "$WORK/ib"
+"$FORGE" index-lie "$PIA" dec-range   # w 10^28: one past DECIMAL(30,2)'s 9999999999999999999999999999.99
+must_fail "value exceeds DECIMAL(30,2)" "$BIN" verify "$PIA"
+must_fail "value out of DECIMAL range in column w" "$AUD" verify "$PIA"
+PIB=$WORK/ib
+"$BIN" sql "$PIB" --nosync -c "CHECKPOINT;" >/dev/null
+"$BIN" verify "$PIB" >/dev/null && "$AUD" verify "$PIB" >/dev/null || fail "the honest directory must verify"
+"$FORGE" manifest-lie "$PIB" dec-precision
+must_fail "manifest" "$BIN" verify "$PIB"
+must_fail "schema: bad precision/scale" "$AUD" verify "$PIB"
+echo "   IA a signed INSERT of a DECIMAL(30,2) of 10^28 (16 bytes, one past its precision): the replay and the auditor
+   refuse it; IB a manifest whose schema gives w DECIMAL(39,2): VERIFY and the auditor refuse it"
+
 echo "== Z: a commit naming the other digest algorithm, re-signed by the writer (both ways round); META naming an unknown one"
 for a in 1 2; do # explicit algorithms: under IMDB_DIGEST_ALG=2 make_db's would all be alg 2
   PZ=$WORK/z$a

@@ -1163,6 +1163,136 @@ static void t_alter_reach(void)
     CHECK(audit_dir(dir) == 0);
 }
 
+/* An ERASE of rows in a segment older than the table's last version, against a replica of the primary's whole log
+ * and a full replay (2026-11-10, found by the dec38 group). The log the copies read is redacted: an erased row is a
+ * stub there from its INSERT, at the primary only from its ERASE. The ERASE rewrote its segment at the latest version
+ * its rows reached (after a RENAME, an ADD), where a copy, its rows stubs already, kept the segment it built: the
+ * manifests differed, so the replica stopped (physical divergence) and the full replay was refused; and a flush whose
+ * run held a row erased later let the stub float on a copy (one segment there, two at the primary's). Each case: the
+ * replica applies the log, the full replay opens, both at the primary's digest, VERIFY and the auditor pass; and a
+ * second replica, fed the log up to the first ERASE before it was written (holding the values, so it rewrites the
+ * segments itself) and the rest after, ends at the primary's digest too */
+/* apply the primary's log after `after` to the replica at r; its last applied commit into *seq */
+static void erase_replica_feed(const char *p, const char *r, const char *sf, uint64_t after, uint64_t *seq, size_t k)
+{
+    imdb_err e = {0};
+    imdb_db *rdb = NULL;
+    imdb_open_opts o = {.sync = 0};
+    char m[400];
+    if (imdb_open(r, &o, &rdb, &e)) {
+        snprintf(m, sizeof m, "case %zu: the fed replica's open: %s", k, e.msg);
+        test_fail(__FILE__, __LINE__, m);
+        return;
+    }
+    uint64_t applied = 0;
+    imdb_err_clear(&g_e);
+    if (ship_to_file(p, after, sf, &g_e) || apply_file(rdb, sf, &applied, &g_e)) {
+        snprintf(m, sizeof m, "case %zu: the fed replica after %llu: %s", k, (unsigned long long)after, g_e.msg);
+        test_fail(__FILE__, __LINE__, m);
+    }
+    *seq = rdb->seq;
+    imdb_close(rdb);
+}
+
+static void t_alter_erase_replica(void)
+{
+    static const char *const cases[][10] = {
+        {"CHECKPOINT", "ALTER TABLE s ADD COLUMN a TEXT DEFAULT 'q'", "CHECKPOINT", "ERASE SUBJECT 7", NULL},
+        {"CHECKPOINT", "ALTER TABLE s RENAME COLUMN w TO ww", "ERASE SUBJECT 7", NULL},
+        {"CHECKPOINT", "ALTER TABLE s ADD COLUMN a INT64 DEFAULT 4", "INSERT INTO s VALUES (3, 8, 1, 1, 9)", "CHECKPOINT",
+         "ERASE SUBJECT 7", "ERASE SUBJECT 8", NULL},
+        {"ALTER TABLE s DROP COLUMN x", "INSERT INTO s VALUES (3, 8, 6)", "CHECKPOINT", "ERASE SUBJECT 8", NULL},
+        {"ALTER TABLE s DROP COLUMN x", "INSERT INTO s VALUES (3, 8, 6)", "ERASE SUBJECT 7", "CHECKPOINT", NULL},
+        {"CHECKPOINT", "ALTER TABLE s ADD COLUMN a INT64 DEFAULT 4", "INSERT INTO s VALUES (3, 7, 1, 1, 9)", "CHECKPOINT",
+         "COMPACT s", "ERASE SUBJECT 7", "ALTER TABLE s DROP COLUMN x", "CHECKPOINT", "ERASE SUBJECT 8", NULL},
+    };
+    const char *dir = test_tmpdir();
+    for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) {
+        char p[700], r[700], r2[700], sf[700];
+        snprintf(p, sizeof p, "%s/p%zu", dir, k);
+        snprintf(r, sizeof r, "%s/r%zu", dir, k);
+        snprintf(r2, sizeof r2, "%s/f%zu", dir, k);
+        snprintf(sf, sizeof sf, "%s/stream%zu", dir, k);
+        imdb_err e = {0};
+        imdb_db *db = open_fresh(p);
+        CHECK(db && imdb_init(r, true, p, &e) == 0 && imdb_init(r2, true, p, &e) == 0);
+        if (!db) return;
+        OK(run("CREATE TABLE s (id INT64 PRIMARY KEY, u INT64 SUBJECT, w INT64, x INT64)"));
+        OK(run("INSERT INTO s VALUES (1, 7, 5, 1), (2, 8, 6, 2)"));
+        uint64_t fed = 0;
+        bool cut = false;
+        for (int i = 0; cases[k][i]; i++) {
+            if (!cut && !strncmp(cases[k][i], "ERASE", 5)) { /* the second replica's first part: the log unredacted */
+                cut = true;
+                done(db);
+                erase_replica_feed(p, r2, sf, 0, &fed, k);
+                db = open_at(p, false);
+                CHECK(db);
+            }
+            if (run(cases[k][i])) {
+                char m[300];
+                snprintf(m, sizeof m, "case %zu, %s: %s", k, cases[k][i], g_e.msg);
+                test_fail(__FILE__, __LINE__, m);
+            }
+        }
+        uint8_t dg[32], d2[32];
+        imdb_lthash_digest(db->meta.digest_alg, &db->global, dg);
+        done(db);
+        char m[400];
+        erase_replica_feed(p, r2, sf, fed, &fed, k); /* the rest, the ERASEs among it: it rewrites the segments itself */
+        imdb_db *fdb = NULL;
+        imdb_open_opts ro = {.sync = 0};
+        if (!imdb_open(r2, &ro, &fdb, &e)) {
+            imdb_lthash_digest(fdb->meta.digest_alg, &fdb->global, d2);
+            if (memcmp(dg, d2, 32) != 0) {
+                snprintf(m, sizeof m, "case %zu: the fed replica's digest", k);
+                test_fail(__FILE__, __LINE__, m);
+            }
+            imdb_close(fdb);
+        } else {
+            snprintf(m, sizeof m, "case %zu: the fed replica's reopen: %s", k, e.msg);
+            test_fail(__FILE__, __LINE__, m);
+        }
+        if (audit_dir(r2)) {
+            snprintf(m, sizeof m, "case %zu: the fed replica's audit", k);
+            test_fail(__FILE__, __LINE__, m);
+        }
+        imdb_db *rdb = NULL;
+        imdb_open_opts o = {.sync = 0};
+        CHECK(imdb_open(r, &o, &rdb, &e) == 0);
+        if (rdb) { /* each case reported on its own: no CHECK's return while a handle is open */
+            uint64_t applied = 0;
+            imdb_err_clear(&g_e);
+            if (ship_to_file(p, 0, sf, &g_e) || apply_file(rdb, sf, &applied, &g_e)) {
+                snprintf(m, sizeof m, "case %zu: the replica: %s", k, g_e.msg);
+                test_fail(__FILE__, __LINE__, m);
+            } else {
+                imdb_lthash_digest(rdb->meta.digest_alg, &rdb->global, d2);
+                if (memcmp(dg, d2, 32) != 0) {
+                    snprintf(m, sizeof m, "case %zu: the replica's digest", k);
+                    test_fail(__FILE__, __LINE__, m);
+                }
+            }
+            imdb_close(rdb);
+        }
+        imdb_open_opts fo = {.sync = 0, .full_replay = true};
+        imdb_err_clear(&e);
+        if (imdb_open(p, &fo, &db, &e)) {
+            snprintf(m, sizeof m, "case %zu: the full replay: %s", k, e.msg);
+            test_fail(__FILE__, __LINE__, m);
+            continue;
+        }
+        imdb_session_init(&g_s, db);
+        imdb_lthash_digest(db->meta.digest_alg, &db->global, d2);
+        bool ok = memcmp(dg, d2, 32) == 0 && verify_db(db) == 0;
+        done(db);
+        if (!ok || audit_dir(p) || audit_dir(r)) {
+            snprintf(m, sizeof m, "case %zu: the full replay's digest, VERIFY or the auditor", k);
+            test_fail(__FILE__, __LINE__, m);
+        }
+    }
+}
+
 const test_case alter_tests[] = {
     {"alter_differential", t_alter_differential},
     {"alter_rules", t_alter_rules},
@@ -1179,5 +1309,6 @@ const test_case alter_tests[] = {
     {"alter_widen", t_alter_widen},
     {"alter_drop_rules", t_alter_drop_rules},
     {"alter_reach", t_alter_reach},
+    {"alter_erase_replica", t_alter_erase_replica},
 };
 const size_t alter_ntests = sizeof alter_tests / sizeof *alter_tests;

@@ -636,8 +636,8 @@ int imdb_drop_index(imdb_db *db, const char *name, imdb_err *e);
 /* the table holding index NAME and its position there, or NULL */
 imdb_table *imdb_index_find(const imdb_db *db, const char *name, uint32_t *pos);
 /* a definition's own rules, whatever its table: a name, known flags, 1..IMDB_MAX_INDEX_COLS
- * distinct columns below ncols (the decoders' strictness and CREATE INDEX share it) */
-bool imdb_index_def_ok(const imdb_index_def *d, uint16_t ncols);
+ * distinct columns of s, none a DECIMAL past 18 digits (F3e: D25) (the decoders' strictness and CREATE INDEX share it) */
+bool imdb_index_def_ok(const imdb_index_def *d, const imdb_schema *s);
 /* adds or removes a definition, kept sorted by name (shared by the commit path and replay) */
 int imdb_index_add(imdb_table *t, const imdb_index_def *d, imdb_err *e);
 void imdb_index_remove(imdb_table *t, uint32_t pos);

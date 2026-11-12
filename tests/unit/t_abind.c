@@ -288,7 +288,7 @@ static void t_abind_refusals(void)
         {"SELECT $1 AS p", "parameter"},
         {"SELECT id FROM nosuch", "no table nosuch"},
         {"SELECT nosuch FROM t", "no column nosuch"},
-        {"SELECT e * e * e * e * e AS x FROM t", "more than 18 places"},
+        {"SELECT e * e * e * e * e * e * e * e * e * e AS x FROM t", "more than 38 decimal places"}, /* F3e: 38 places a row set's */
         {"SELECT x FROM (SELECT g AS x, d AS x FROM t) AS q", "two columns x"},
         {"SELECT s + 1 AS x FROM t", "arithmetic"},
         {"SELECT f % 2 AS x FROM t", "FLOAT64"},

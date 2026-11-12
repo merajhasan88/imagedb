@@ -803,7 +803,7 @@ static int v_ops(vctx *x, const vbatch *b, size_t fi, const uint8_t **published,
             d.flags = o->iflags;
             d.ncols = o->incols;
             memcpy(d.cols, o->icols, sizeof d.cols);
-            if (!imdb_index_def_ok(&d, t->s.ncols) || t->nidx >= IMDB_MAX_INDEXES || v_index_taken(x, o->iname))
+            if (!imdb_index_def_ok(&d, &t->s) || t->nidx >= IMDB_MAX_INDEXES || v_index_taken(x, o->iname))
                 return imdb_fail(e, IMDB_ERR_VERIFY, "verify: commit %llu: CREATE INDEX on a column the table lacks, "
                                  "past the limit, or with a name in use", (unsigned long long)seq);
             uint32_t p = 0;
@@ -1536,7 +1536,8 @@ static bool val_eq(const imdb_value *a, const imdb_value *b)
 {
     if (a->null != b->null || a->type != b->type || a->scale != b->scale) return false;
     if (a->null) return true;
-    return imdb_type_bytes(a->type) ? a->len == b->len && (!a->len || memcmp(a->s, b->s, a->len) == 0) : a->i == b->i;
+    return imdb_type_bytes(a->type) ? a->len == b->len && (!a->len || memcmp(a->s, b->s, a->len) == 0)
+                                    : a->i == b->i && a->hi == b->hi && a->wide == b->wide; /* F3e: a wide DECIMAL's halves */
 }
 
 static bool same_hist(const imdb_schema_hist *m, const imdb_schema_hist *x, uint32_t n)

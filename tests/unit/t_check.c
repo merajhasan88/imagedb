@@ -537,7 +537,8 @@ static void g_atom(gen *g, int ty)
 {
     static const char *num[] = {"i", "j", "d", "e", "0", "1", "-1", "7", "100", "9223372036854775807",
                                 "-9223372036854775808", "3037000500", "1.5", "-0.25", "0.001", "99999999.99",
-                                "12345678901234567890.123456789", "2", "-3", "0.5"};
+                                "12345678901234567890.123456789", "2", "-3", "0.5", "w", "w", "99999999999999999999999999999999.999999",
+                                "18446744073709551616", "-18446744073709551616.000001"}; /* F3e: w and 38-digit literals */
     static const char *text[] = {"s", "v", "'a'", "''", "'abc'", "'ABC'", "'%'", "'k%'", "'_b%'", "'it''s'", "'\xc3\xa9'",
                                  "'a%b'", "'x\\y'", "'hello'"};
     static const char *bools[] = {"b", "TRUE", "FALSE"};
@@ -735,6 +736,13 @@ static const char *const kCorpus[] = {
     "i > 0; DROP TABLE t", "i > 0, i < 9", "dt > '2021-02-29'", "tm > '24:00:00'", "ts > '1999-13-01'", "i > 99999999999999999999",
     "d > 123456789012345678901234567890123456789", "d > 0.123456789012345678901234567890123456789", "-- a comment\ni > 0",
     "i > 0 -- a comment", "dt + tm > TIMESTAMP '9999-12-31 23:59:59'", "dt - 2932897 IS NULL", "dt * 2 > dt", "tm + 1 > tm",
+    /* F3e: a DECIMAL(38,6) at its edges, against narrow DECIMALs, INT64s and literals past 18 digits */
+    "w > 0", "w * 2 > w", "w * w > 0", "w + d > 0", "w = e", "w > e", "w < i", "w / 3 > 0", "w % 7 = 0", "-w < 0",
+    "ABS(w) >= 0", "w IN (0, 1, NULL)", "w NOT IN (0.000001, 18446744073709551616)", "w BETWEEN -1 AND 1",
+    "COALESCE(w, 0) >= 0", "NULLIF(w, 0) > 0", "w > 99999999999999999999999999999999.999999",
+    "w >= -99999999999999999999999999999999.999999", "w = 18446744073709551616", "w + 0.000001 > w", "w * 10 > 0",
+    "CASE WHEN w > 0 THEN w ELSE -w END >= 0", "w - e > 1000000000000000000", "w / 0 > 0", "w % 0.000001 = 0",
+    "w > 123456789012345678901234567890123456789", "e * 100000000000000000000 = w", "w + 99999999999999999999999999999999 > 0",
 };
 
 static void ival(imdb_value *v, uint8_t t, uint8_t s, bool null, int64_t i, const char *txt)
@@ -757,7 +765,7 @@ static void t_check_differential(void)
     CHECK(db);
     if (!db) return;
     OK(run("CREATE TABLE t (id INT64 PRIMARY KEY, i INT64, j SMALLINT, d DECIMAL(10,2), e DECIMAL(18,0), s TEXT, "
-           "v VARCHAR(10), b BOOL, dt DATE, tm TIME, ts TIMESTAMP, tz TIMESTAMPTZ, f FLOAT64)"));
+           "v VARCHAR(10), b BOOL, dt DATE, tm TIME, ts TIMESTAMP, tz TIMESTAMPTZ, f FLOAT64, w DECIMAL(38,6))"));
     imdb_table *t = imdb_table_by_name(db, "t");
     CHECK(t);
     if (!t) {
@@ -782,6 +790,9 @@ static void t_check_differential(void)
     static const int64_t VDT[] = {IMDB_DATE_MIN, IMDB_DATE_MAX, 0, 10957, 18262};
     static const int64_t VTM[] = {0, IMDB_TIME_MAX, 43200000000LL};
     static const int64_t VTS[] = {-62135596800000000LL, 253402300799999999LL, 0, 946684800000000LL};
+    const __int128 P38 = (__int128)10000000000000000000ull * 10000000000000000000ull, P64 = (__int128)1 << 64; /* 10^38 */
+    const __int128 VW[] = {0, 1, -1, P38 - 1, -(P38 - 1), P64, -P64, 3 * P64 + 7, (__int128)5000000000000000000ll * 1000000,
+                           (__int128)123456789012345678ll * 1000000000000000000ll + 901234567890123456ll}; /* F3e: w's, scale 6 */
     enum { NR = 48 };
     imdb_value *rows = calloc((size_t)NR * s->ncols, sizeof *rows);
     ab_val *arows = calloc((size_t)NR * s->ncols, sizeof *arows);
@@ -809,9 +820,12 @@ static void t_check_differential(void)
         ival(&v[10], IMDB_T_TIMESTAMP, 0, nul || r % 9 == 7, PICK(VTS, 3), NULL);
         ival(&v[11], IMDB_T_TIMESTAMPTZ, 0, nul || r % 3 == 2, PICK(VTS, 1), NULL);
         ival(&v[12], IMDB_T_FLOAT64, 0, true, 0, NULL);
+        ival(&v[13], IMDB_T_DECIMAL, 6, nul || r % 7 == 5, 0, NULL); /* F3e: w, its 128 bits */
+        if (!v[13].null) imdb_dec_set(&v[13], VW[(r * 3) % (sizeof VW / sizeof *VW)], true);
 #undef PICK
         for (uint16_t c = 0; c < s->ncols; c++)
-            arows[(size_t)r * s->ncols + c] = (ab_val){.i = v[c].i, .s = v[c].s, .len = v[c].len, .null = v[c].null};
+            arows[(size_t)r * s->ncols + c] = (ab_val){.i = v[c].i, .s = v[c].type == IMDB_T_TEXT ? v[c].s : NULL, .len = v[c].len,
+                                                       .null = v[c].null, .wide = v[c].wide, .hi = v[c].wide ? v[c].hi : 0};
     }
     char buf[4096];
     gen g = {0x9E3779B97F4A7C15ull, buf, 0, sizeof buf};

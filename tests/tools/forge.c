@@ -1059,6 +1059,15 @@ static void manifest_lie(const char *dir, const char *kind)
             if (memcmp(nb.p + i, pat, sizeof pat) == 0) at = i + sizeof pat - 1;
         if (!at) exit(1);
         nb.p[at] = '1';
+    } else if (strcmp(kind, "dec-precision") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION) {
+        /* F3e: a schema's DECIMAL(30,2) column w (u8 1, "w", type, precision, scale) made DECIMAL(39,2): past 38 digits */
+        imdb_buf_put(&nb, man, mn);
+        static const uint8_t pat[] = {1, 'w', IMDB_T_DECIMAL, 30, 2};
+        size_t at = 0;
+        for (size_t i = 0; i + sizeof pat <= mn && !at; i++)
+            if (memcmp(nb.p + i, pat, sizeof pat) == 0) at = i + 3;
+        if (!at) exit(1);
+        nb.p[at] = 39;
     } else if (strcmp(kind, "create-default") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION) {
         /* F2a: version 1's DEFAULTs (manifest 9) of a table with no ALTER whose column 2 is an INT64 DEFAULT 77: u32 0
          * (no ALTER), u16 1, u16 column 2, u8 kind 1, then the u64 value, made 78: the history still ends at the schema */
@@ -1074,7 +1083,8 @@ static void manifest_lie(const char *dir, const char *kind)
               " one not empty) | nsections (ten) | order (a reserved one out of order) | later (the last one a later"
               " format's, longer) | keylist (table 0's key list another column) | default (an added column n's DEFAULT"
               " another in the history) | create-default (a CREATE's DEFAULT 77 of column 2 another) | seq-state (fu_seq's last on)"
-              " | check-text (z_a_check's 'a > 0' another) | gen-text (w's 'a * 2' another) | fk-def (c_pid_fkey's CASCADE another)\n", stderr);
+              " | check-text (z_a_check's 'a > 0' another) | gen-text (w's 'a * 2' another) | fk-def (c_pid_fkey's CASCADE another)"
+              " | dec-precision (a DECIMAL(30,2) w made DECIMAL(39,2))\n", stderr);
         exit(1);
     }
     if (nb.err) exit(1);
@@ -1321,6 +1331,37 @@ static void index_lie(const char *dir, const char *kind)
         imdb_le64(row, 999);
         memset(row + 8, 0xab, 15);
         memset(op.salt, 0x5f, sizeof op.salt);
+        op.code = IMDB_OP_INSERT;
+        op.table = t->s.id;
+        op.vid = t->nver;
+        op.pkind = IMDB_PAYLOAD_ROW;
+        op.row = row;
+        op.row_len = sizeof row;
+        op.iname = NULL;
+        imdb_row_commit(t->s.id, op.salt, row, sizeof row, op.commit);
+        imdb_lthash g = db->global;
+        imdb_lthash_add_commit(db->meta.digest_alg, &g, op.commit);
+        uint8_t dg[32];
+        imdb_lthash_digest(db->meta.digest_alg, &g, dg);
+        append_commit_digest(dir, db, &op, 1, &sg, NULL, dg);
+        imdb_close(db);
+        return;
+    } else if (strcmp(kind, "dec-range") == 0) {
+        /* F3e: an INSERT into the last table, (id INT64 PRIMARY KEY, w DECIMAL(30,2) NOT NULL), of a row whose w is 10^28:
+         * past its precision by one (the row codec's 16 bytes, i then hi, of its scaled 10^30); commitment and digest
+         * right */
+        imdb_table *t = db->t[db->nt - 1];
+        if (t->s.ncols != 2 || t->s.cols[1].type != IMDB_T_DECIMAL || t->s.cols[1].precision != 30 ||
+            t->s.cols[1].scale != 2 || (t->s.cols[1].flags & IMDB_COL_NULLABLE)) {
+            fputs("imdb-forge: index-lie dec-range needs a last table (id INT64 PRIMARY KEY, w DECIMAL(30,2) NOT NULL)\n", stderr);
+            exit(1);
+        }
+        static uint8_t row[8 + 16];
+        imdb_le64(row, 999);
+        unsigned __int128 x = (unsigned __int128)imdb_pow10_128(30); /* scaled 10^30: 10^28.00, one past 9999999999999999999999999999.99 */
+        imdb_le64(row + 8, (uint64_t)x);
+        imdb_le64(row + 16, (uint64_t)(x >> 64));
+        memset(op.salt, 0x60, sizeof op.salt);
         op.code = IMDB_OP_INSERT;
         op.table = t->s.id;
         op.vid = t->nver;
@@ -1679,7 +1720,8 @@ static void index_lie(const char *dir, const char *kind)
               "check-add (ADD CHECK forged: a > 100, to table 0) | check-row (a -1 in the last table's column a) | "
               "gen-row | gen-update (column w one past its expression in the last table) | "
               "fk-orphan (a child of no parent in the last table) | fk-delete (table 0's first live row) | "
-              "fk-erase-other | fk-erase-named (that DELETE beside an ERASE of an ended version, or of the row itself) | uuid-short (a\n"
+              "fk-erase-other | fk-erase-named (that DELETE beside an ERASE of an ended version, or of the row itself) | dec-range (a\n"
+              "DECIMAL(30,2) of 10^28 in the last table) | uuid-short (a\n"
               "UUID of 15 bytes in the last table) | create-default-uuid (gen_random_uuid on a TIMESTAMPTZ)\n", stderr);
         exit(1);
     }

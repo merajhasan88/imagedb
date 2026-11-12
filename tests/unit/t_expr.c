@@ -671,7 +671,7 @@ static void t_aggregates(void)
     CHECK(run("SELECT SUM(qty / 0) FROM s") == IMDB_ERR_INVALID);
     CHECK(run("SELECT SUM(qty / 0) FROM s WHERE id > 100") == 0); /* no row reached it */
     /* a SUM of 38-digit values: checked, not wrapped */
-    CHECK(run("SELECT SUM(price * 99999999999999999999999999999) FROM s") == IMDB_ERR_LIMIT);
+    CHECK(run("SELECT SUM(price * 99999999999999999999999999999999999) FROM s") == IMDB_ERR_LIMIT); /* F3e: the literal a DECIMAL */
     RUN("CREATE TABLE wide (id INT64 PRIMARY KEY, m INT64)");
     RUN("INSERT INTO wide VALUES (1, 4611686018427387904), (2, 4611686018427387904), (3, 4611686018427387904)");
     CELL("SELECT SUM(m) FROM wide", "13835058055282163712"); /* past int64: a wide cell */

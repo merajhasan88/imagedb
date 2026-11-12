@@ -327,7 +327,8 @@ KERNEL_SRC = src/cpu.c src/sha256.c src/sha256x8.c src/chacha20x8.c src/vendor/m
 
 # Data-race check (clang ThreadSanitizer; not part of the four-configuration matrix):
 # the whole unit suite with the C kernels, plus the pool tests on their own.
-TSAN_FLAGS = -std=c11 -D_GNU_SOURCE -g -O1 -ffp-contract=off -fsanitize=thread -fno-omit-frame-pointer -pthread -Wno-deprecated-declarations
+TSAN_FLAGS = -std=c11 -D_GNU_SOURCE -g -O1 -ffp-contract=off -fsanitize=thread -fno-omit-frame-pointer -pthread -Wno-deprecated-declarations \
+             -ftrivial-auto-var-init=pattern
 tsan:
 	mkdir -p build-tsan
 	clang $(TSAN_FLAGS) $(filter-out src/main.c,$(wildcard src/*.c)) $(wildcard src/vendor/monocypher/*.c) \

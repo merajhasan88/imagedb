@@ -56,6 +56,8 @@ typedef struct ab_val {
     const uint8_t *s;
     uint32_t len;
     bool null;
+    bool wide;   /* F3e: a DECIMAL of a column past 18 digits: its value hi:i */
+    int64_t hi;
 } ab_val;
 /* 1: the row passes (TRUE or NULL), 0: it fails (FALSE), -1: its evaluation fails (an overflow, a zero divisor ...) */
 int ab_check_eval(const ab_check *c, const ab_val *row, char *err, size_t errn);

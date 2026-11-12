@@ -95,6 +95,11 @@ static void res_put(imdb_result *r, imdb_cell *c, const imdb_value *v)
         return;
     }
     c->v = *v;
+    if (v->type == IMDB_T_DECIMAL && v->wide) { /* F3e: a wide column's value read as a SUM's is: the cell's i128 */
+        c->wide = true;
+        c->i128 = imdb_dec_value(v);
+        return;
+    }
     if (imdb_type_bytes(v->type)) {
         c->v.i = (int64_t)r->text.len;
         c->v.s = NULL;
@@ -456,6 +461,18 @@ static int xpin_row(xctx *x, imdb_value *v, uint16_t n, imdb_err *e)
 
 static int bind_const_tree(xctx *x, const sql_stmt *st, uint16_t k, const imdb_column *c, imdb_value *out, imdb_err *e);
 
+/* F3e: a DECIMAL value in column c's form (codec.h imdb_dec_wide): a value past 18 digits never cut into a narrow
+ * column's form, refused there (an API parameter, a row set's cell); a write's precision is imdb_value_check's */
+static int dec_form(const imdb_column *c, imdb_value *v, imdb_err *e)
+{
+    __int128 x = imdb_dec_value(v);
+    bool wide = imdb_dec_wide(c->precision);
+    if (!wide && (x >= imdb_pow10_128(IMDB_DEC_NARROW_DIGITS) || x <= -imdb_pow10_128(IMDB_DEC_NARROW_DIGITS)))
+        return imdb_fail(e, IMDB_ERR_LIMIT, "column %s: value exceeds DECIMAL(%u,%u)", c->name, c->precision, c->scale);
+    imdb_dec_set(v, x, wide);
+    return IMDB_OK;
+}
+
 static int bind_lit(xctx *x, const sql_lit *l, const imdb_column *c, bool compare, imdb_value *out, imdb_err *e)
 {
     memset(out, 0, sizeof *out);
@@ -469,6 +486,7 @@ static int bind_lit(xctx *x, const sql_lit *l, const imdb_column *c, bool compar
             return imdb_fail(e, IMDB_ERR_INVALID, "parameter $%u does not have the type of column %s (give it that type; an "
                                                   "EXECUTE's: PREPARE name (type, ...) declares it)", (unsigned)l->param, c->name);
         *out = *pv;
+        if (c->type == IMDB_T_DECIMAL && !out->null && dec_form(c, out, e)) return e->code; /* F3e: the column's form */
     } else {
         char num[IMDB_MAX_NUMERIC + 2];
         const char *txt = x->sql + l->off;
@@ -489,10 +507,16 @@ static int bind_lit(xctx *x, const sql_lit *l, const imdb_column *c, bool compar
             if (l->kind != LIT_INT) return imdb_fail(e, IMDB_ERR_INVALID, "column %s expects an integer", c->name);
             if (imdb_parse_int64(txt, tl, &out->i, e)) return e->code;
             break;
-        case IMDB_T_DECIMAL:
+        case IMDB_T_DECIMAL: { /* F3e: a compared literal to its form's digits (18, or 38 for a wide column) */
             if (l->kind != LIT_INT && l->kind != LIT_DEC) return imdb_fail(e, IMDB_ERR_INVALID, "column %s expects a number", c->name);
-            if (imdb_parse_decimal(txt, tl, compare ? 18 : c->precision, c->scale, &out->i, e)) return e->code;
+            bool wide = imdb_dec_wide(c->precision);
+            __int128 dx;
+            if (imdb_parse_decimal128(txt, tl, compare ? (wide ? IMDB_DEC_MAX_DIGITS : IMDB_DEC_NARROW_DIGITS) : c->precision,
+                                      c->scale, &dx, e))
+                return e->code;
+            imdb_dec_set(out, dx, wide);
             break;
+        }
         case IMDB_T_BOOL:
             if (l->kind != LIT_BOOL) return imdb_fail(e, IMDB_ERR_INVALID, "column %s expects TRUE or FALSE", c->name);
             out->i = l->bval;
@@ -639,7 +663,10 @@ static int bind_xlit(xctx *x, const sql_lit *l, imdb_xval *v, imdb_err *e)
     if (l->kind == LIT_PARAM) {
         if (l->param > x->nparams) return imdb_fail(e, IMDB_ERR_INVALID, "parameter $%u was not supplied", (unsigned)l->param);
         const imdb_value *pv = &x->params[l->param - 1];
-        if (pv->type < IMDB_T_INT64 || pv->type > IMDB_T_LAST || (pv->type == IMDB_T_DECIMAL && pv->scale > 18))
+        if (pv->type < IMDB_T_INT64 || pv->type > IMDB_T_LAST ||
+            (pv->type == IMDB_T_DECIMAL && !pv->null &&
+             (pv->scale > IMDB_DEC_MAX_DIGITS || imdb_dec_value(pv) >= imdb_pow10_128(IMDB_DEC_MAX_DIGITS) ||
+              imdb_dec_value(pv) <= -imdb_pow10_128(IMDB_DEC_MAX_DIGITS)))) /* F3e: to 38 digits, either form */
             return imdb_fail(e, IMDB_ERR_INVALID, "parameter $%u: not a value of a column type", (unsigned)l->param);
         imdb_x_from_value(pv, v); /* a NULL keeps its type: NULL + 1 is NULL */
         return IMDB_OK;
@@ -657,7 +684,12 @@ static int bind_xlit(xctx *x, const sql_lit *l, imdb_xval *v, imdb_err *e)
     int64_t i;
     switch (l->kind) {
     case LIT_INT:
-        if (imdb_parse_int64(txt, tl, &i, e)) return e->code;
+        if (imdb_parse_int64(txt, tl, &i, e)) { /* F3e: past INT64, a DECIMAL of scale 0 to 38 digits (PostgreSQL's numeric) */
+            imdb_err e2 = {0};
+            if (e->code != IMDB_ERR_LIMIT || imdb_x_parse_decimal(txt, tl, v, &e2)) return e->code;
+            imdb_err_clear(e);
+            return IMDB_OK;
+        }
         v->type = IMDB_T_INT64;
         v->i = i;
         return IMDB_OK;
@@ -1386,9 +1418,15 @@ typedef struct bpred {
     uint8_t type;
     uint8_t op;
     bool neg;
-    int64_t lo, hi;          /* int-like: inclusive range */
+    bool byval;              /* compared by value (a, b: imdb_value_cmp): TEXT, UUID, BYTEA, a wide DECIMAL (F3e) */
+    int64_t lo, hi;          /* else int-like: inclusive range */
     imdb_value a, b;         /* TEXT */
 } bpred;
+
+/* F3e: a DECIMAL past 18 digits: its segment column is 16-byte cells, no i64 array (lake.c seg_bytes), so no fast path,
+ * no zone map and no int64 range: its predicates compare by value, exactly, as a byte string's do */
+static bool dec_wide_col(const imdb_column *c) { return c->type == IMDB_T_DECIMAL && imdb_dec_wide(c->precision); }
+static bool pred_byval(const imdb_column *c) { return imdb_type_bytes(c->type) || dec_wide_col(c); }
 
 typedef struct qspec {
     imdb_table *t;
@@ -1510,6 +1548,7 @@ static int bind_pred(xctx *x, const sql_cmp *c, int col, bool post, qspec *q, im
     memset(b, 0, sizeof *b);
     b->col = (uint16_t)col;
     b->type = cd->type;
+    b->byval = pred_byval(cd); /* F3e */
     b->op = c->op;
     if (c->op == CMP_ISNULL || c->op == CMP_NOTNULL) {
         if (!post && !(cd->flags & IMDB_COL_NULLABLE)) { /* never NULL: IS NULL matches nothing, IS NOT NULL everything */
@@ -1528,7 +1567,7 @@ static int bind_pred(xctx *x, const sql_cmp *c, int col, bool post, qspec *q, im
         return imdb_fail(e, IMDB_ERR_INVALID, "a comparison with NULL is never true; use IS NULL or IS NOT NULL");
     if (cd->type == IMDB_T_BOOL && c->op != CMP_EQ && c->op != CMP_NE)
         return imdb_fail(e, IMDB_ERR_INVALID, "BOOL column %s supports only = and !=", cd->name);
-    if (!imdb_type_bytes(cd->type)) {
+    if (!b->byval) {
         int64_t v = b->a.i;
         b->lo = INT64_MIN;
         b->hi = INT64_MAX;
@@ -1585,7 +1624,8 @@ static bool corr_pred(xctx *x, const sql_stmt *st, uint16_t i, qspec *q)
         return false;
     }
     const imdb_column *cd = &q->t->s.cols[ci], *od = &os->s->cols[c];
-    if (od->type != cd->type || (cd->type == IMDB_T_DECIMAL && od->scale != cd->scale)) return false;
+    if (od->type != cd->type || (cd->type == IMDB_T_DECIMAL && (od->scale != cd->scale || dec_wide_col(od) != dec_wide_col(cd))))
+        return false; /* F3e: a DECIMAL of the same form too (a wide outer value is no int64 bound): else a residual */
     if (cd->type == IMDB_T_BOOL && op != CMP_EQ && op != CMP_NE) return false;
     if (q->np >= IMDB_MAX_PREDICATES) return false;
     x->asp[i] = true;
@@ -1598,9 +1638,10 @@ static bool corr_pred(xctx *x, const sql_stmt *st, uint16_t i, qspec *q)
     memset(b, 0, sizeof *b);
     b->col = (uint16_t)ci;
     b->type = cd->type;
+    b->byval = pred_byval(cd); /* F3e */
     b->op = op;
     b->a = *v;
-    if (!imdb_type_bytes(cd->type)) {
+    if (!b->byval) {
         b->lo = INT64_MIN;
         b->hi = INT64_MAX;
         switch (op) {
@@ -1649,7 +1690,7 @@ static bool pred_ok(const bpred *b, const imdb_value *v)
     if (b->op == CMP_ISNULL) return v->null;
     if (b->op == CMP_NOTNULL) return !v->null;
     if (v->null) return false; /* a comparison with NULL is not true (WHERE is a conjunction) */
-    if (!imdb_type_bytes(b->type)) {
+    if (!b->byval) {
         bool in = v->i >= b->lo && v->i <= b->hi;
         return b->neg ? !in : in;
     }
@@ -1677,7 +1718,8 @@ static bool preds_ok(const qspec *q, const imdb_value *vals)
 
 typedef struct agg_acc {
     uint64_t count;          /* COUNT(*): rows; otherwise non-null values */
-    __int128 sum;
+    __int128 sum;            /* wrapping, as xacc's (F3e: a wide DECIMAL's values pass 2^127 in two rows): sum + wrap * 2^128 */
+    int64_t wrap;
     imdb_fsum fsum;          /* SUM of a FLOAT64 column, exact */
     bool has;
     imdb_value mn, mx;       /* P2 S15: a TEXT extreme points into mnb / mxb, the accumulator's own copy, never into a
@@ -2079,7 +2121,11 @@ static int acc_add(agg_acc *a, uint8_t agg, const imdb_value *v, imdb_err *e)
     if (v->null) return IMDB_OK; /* aggregates ignore NULLs */
     a->count++;
     if (agg == AGG_SUM && v->type == IMDB_T_FLOAT64 && imdb_fsum_add(&a->fsum, v->i, e)) return e->code;
-    if (agg == AGG_SUM && v->type != IMDB_T_FLOAT64) a->sum += v->i;
+    if (agg == AGG_SUM && v->type != IMDB_T_FLOAT64) { /* F3e: either DECIMAL form; the wraps counted, as xacc_add's */
+        __int128 x = v->type == IMDB_T_DECIMAL ? imdb_dec_value(v) : (__int128)v->i, r;
+        if (__builtin_add_overflow(a->sum, x, &r)) a->wrap += x < 0 ? -1 : 1;
+        a->sum = r;
+    }
     if (agg == AGG_MIN && (!a->has || imdb_value_cmp(v, &a->mn) < 0)) {
         a->mn = *v;
         if (acc_own(&a->mn, &a->mnb, &a->mncap, e)) return e->code;
@@ -2264,7 +2310,8 @@ static void sink_row(sink *k, uint64_t vid, const imdb_value *vals)
             const imdb_value *lk = &k->groups[k->lg].key;
             bool same = key->null || lk->null ? key->null == lk->null
                         : k->gmap.ktype != IMDB_T_INT64 ? lk->len == key->len && (!key->len || !memcmp(lk->s, key->s, key->len))
-                                                         : lk->i == key->i;
+                                                         : lk->type == IMDB_T_DECIMAL ? imdb_dec_value(lk) == imdb_dec_value(key) /* F3e */
+                                                                                      : lk->i == key->i;
             if (same) {
                 group_acc(k, k->lg, vals);
                 return;
@@ -2367,7 +2414,12 @@ static int rset_row(const xrset *rs, uint64_t i, imdb_value *vals, imdb_err *e)
         }
         *v = cl->v;
         v->type = s->cols[c].type;
-        if (cl->wide) {
+        if (v->type == IMDB_T_DECIMAL) { /* F3e: a row set's DECIMAL column is wide (rset_table): every value in that form */
+            __int128 x = cl->wide ? cl->i128 : imdb_dec_value(&cl->v);
+            if (x >= imdb_pow10_128(IMDB_DEC_MAX_DIGITS) || x <= -imdb_pow10_128(IMDB_DEC_MAX_DIGITS))
+                return imdb_fail(e, IMDB_ERR_LIMIT, "a nested SELECT's %s past 38 digits", s->cols[c].name);
+            imdb_dec_set(v, x, imdb_dec_wide(s->cols[c].precision));
+        } else if (cl->wide) {
             if (cl->i128 < INT64_MIN || cl->i128 > INT64_MAX)
                 return imdb_fail(e, IMDB_ERR_LIMIT, "a nested SELECT's %s past 18 digits: CAST it, or keep it in the outer SELECT",
                                  s->cols[c].name);
@@ -2416,9 +2468,10 @@ static int rset_table(xctx *x, xrset *rs, imdb_err *e)
         if (!r->ctype[c]) return imdb_fail(e, IMDB_ERR_STATE, "a nested SELECT's column %s has no type", col->name);
         col->type = r->ctype[c];
         col->scale = r->cscale[c];
-        if (col->type == IMDB_T_DECIMAL && col->scale > 18)
-            return imdb_fail(e, IMDB_ERR_LIMIT, "a nested SELECT's DECIMAL %s has more than 18 places: CAST it", col->name);
-        col->precision = col->type == IMDB_T_DECIMAL ? 18 : 0;
+        if (col->type == IMDB_T_DECIMAL && col->scale > IMDB_DEC_MAX_DIGITS)
+            return imdb_fail(e, IMDB_ERR_LIMIT, "a nested SELECT's DECIMAL %s has more than 38 places: CAST it", col->name);
+        /* F3e: 38 digits, whatever its values hold: a type decided before any row (a bind-only pass has none) */
+        col->precision = col->type == IMDB_T_DECIMAL ? IMDB_DEC_MAX_DIGITS : 0;
         col->flags = IMDB_COL_NULLABLE;
     }
     rs->t = t;
@@ -2781,7 +2834,7 @@ static int path_index(xctx *x, const qspec *q, sink *k, imdb_err *e)
  * prefix, so the range is a superset and every predicate is checked again on each row */
 static void word_bounds(const bpred *b, uint64_t *lo, uint64_t *hi)
 {
-    if (!imdb_type_bytes(b->type)) {
+    if (!b->byval) {
         *lo = (uint64_t)b->lo ^ (1ull << 63);
         *hi = (uint64_t)b->hi ^ (1ull << 63);
         return;
@@ -2870,11 +2923,12 @@ static void mask_tail(uint64_t *bits, uint32_t n)
 
 static bool s_is_f64(const imdb_table *t, int col) { return t->s.cols[col].type == IMDB_T_FLOAT64; }
 
-static bool fast_aggregate(const sink *k)
+static bool fast_aggregate(const sink *k, const imdb_table *t)
 {
     if (k->mode != SINK_AGG || k->nresid || k->trees) return false;
     for (uint16_t i = 0; i < k->st->nitems; i++) {
         uint8_t a = k->st->items[i].agg;
+        if (a == AGG_SUM && k->item_col[i] >= 0 && dec_wide_col(&t->s.cols[k->item_col[i]])) return false;
         if (a == AGG_SUM || a == AGG_COUNT || a == AGG_COUNT_STAR) continue;
         return false;
     }
@@ -2909,13 +2963,13 @@ static bool fast_group_ok(sink *k, const imdb_table *t)
 {
     if (k->mode != SINK_GROUP || k->nresid || k->nxa) return false;
     if (!k->gen) {
-        if (k->gcol < 0 || !fg_int_type(t->s.cols[k->gcol].type)) return false;
+        if (k->gcol < 0 || !fg_int_type(t->s.cols[k->gcol].type) || dec_wide_col(&t->s.cols[k->gcol])) return false;
         k->fg_kind = FG_COL;
         k->fg_col = k->gcol;
     } else {
         if (k->ngk != 1) return false;
         if (k->gk_col[0] >= 0) {
-            if (!fg_int_type(t->s.cols[k->gk_col[0]].type)) return false;
+            if (!fg_int_type(t->s.cols[k->gk_col[0]].type) || dec_wide_col(&t->s.cols[k->gk_col[0]])) return false;
             k->fg_kind = FG_COL;
             k->fg_col = k->gk_col[0];
         } else if (k->st->ex[k->gk_ex[0]].op == EX_FN && k->st->ex[k->gk_ex[0]].fn == FN_DATE_TRUNC) {
@@ -2983,6 +3037,7 @@ static bool fast_group_ok(sink *k, const imdb_table *t)
         if (it->expr || it->agg == AGG_NONE || it->agg == AGG_COUNT_STAR) continue; /* a key, or over the keys alone */
         if (it->agg != AGG_COUNT && it->agg != AGG_SUM) return false;
         if (k->item_col[i] < 0) return false;
+        if (it->agg == AGG_SUM && dec_wide_col(&t->s.cols[k->item_col[i]])) return false; /* F3e: no i64 array to sum */
     }
     return true;
 }
@@ -3185,7 +3240,7 @@ static bool seg_skipped(const qspec *q, const imdb_segment *g)
         imdb_segzone zt;
         const imdb_segzone *zc = imdb_seg_zone(q->t, g, b->col, &zt); /* the descriptor's: no image */
         if (b->op == CMP_ISNULL) skip = !zc->has_null;
-        else if (imdb_type_bytes(b->type)) continue; /* TEXT has no min/max */
+        else if (b->byval) continue; /* TEXT has no min/max; nor (F3e) a wide DECIMAL */
         else if (b->op == CMP_NOTNULL || b->neg) skip = !zc->has;
         else skip = !zc->has || b->hi < zc->min || b->lo > zc->max;
     }
@@ -3201,7 +3256,7 @@ static int path_scan(xctx *x, const qspec *q, sink *k, imdb_err *e)
     imdb_value vals[IMDB_MAX_COLS];
     uint64_t *bits = NULL, *tmp = NULL;
     size_t capw = 0;
-    bool fast = fast_aggregate(k);
+    bool fast = fast_aggregate(k, t);
     bool fgrp = !fast && fast_group_ok(k, t); /* the grouped one: a segment's rows a run at a time */
     int rc = IMDB_OK;
     for (uint32_t s = 0; s < t->nseg && !rc && !k->err; s++) {
@@ -3482,7 +3537,7 @@ enum { COST_VEC = 1, COST_ONLY = 10, COST_SEG_FETCH = 16, COST_MEM_ROW = 55, COS
 /* the two prices scan_cheaper compares (EXPLAIN prints them); false where none applies (not a plain aggregate) */
 static bool scan_price(const qspec *q, const sink *k, unsigned __int128 *ordp, unsigned __int128 *scanp)
 {
-    if (!fast_aggregate(k)) return false;
+    if (!fast_aggregate(k, q->t)) return false;
     const imdb_table *t = q->t;
     uint64_t lo[IMDB_MAX_INDEX_COLS], hi[IMDB_MAX_INDEX_COLS];
     ord_bounds(q, lo, hi);
@@ -3785,6 +3840,8 @@ static int put_agg(imdb_result *r, imdb_cell *c, agg_acc *a, uint8_t agg, const 
             if (imdb_fsum_result(&a->fsum, &c->v.i, e)) return e->code;
             break;
         }
+        if (a->wrap || a->sum >= imdb_pow10_128(IMDB_DEC_MAX_DIGITS) || a->sum <= -imdb_pow10_128(IMDB_DEC_MAX_DIGITS))
+            return imdb_fail(e, IMDB_ERR_LIMIT, "a SUM of more than 38 digits"); /* F3e: the total's rule, xacc_total's */
         c->wide = true;
         c->i128 = a->sum;
         c->v.type = col->type;
@@ -4548,8 +4605,8 @@ static int exec_create_view(xctx *x, const sql_stmt *st, imdb_result *r, imdb_er
             rc = imdb_fail(e, IMDB_ERR_INVALID, "view %s: its column %u needs a name (AS name)", st->table, c + 1);
         else if (!pr.ctype[c])
             rc = imdb_fail(e, IMDB_ERR_INVALID, "view %s: its column %s has no type: CAST it", st->table, nm);
-        else if (pr.ctype[c] == IMDB_T_DECIMAL && pr.cscale[c] > 18)
-            rc = imdb_fail(e, IMDB_ERR_LIMIT, "view %s: its DECIMAL %s has more than 18 places: CAST it", st->table, nm);
+        else if (pr.ctype[c] == IMDB_T_DECIMAL && pr.cscale[c] > IMDB_DEC_MAX_DIGITS) /* F3e: a row set's 38 */
+            rc = imdb_fail(e, IMDB_ERR_LIMIT, "view %s: its DECIMAL %s has more than 38 places: CAST it", st->table, nm);
         for (uint16_t d = 0; !rc && d < c; d++)
             if (!strcmp(nm, st->nset ? st->set_cols[d] : pr.names[d]))
                 rc = imdb_fail(e, IMDB_ERR_INVALID, "view %s names two columns %s", st->table, nm);
@@ -4608,7 +4665,7 @@ static int exec_show_views(xctx *x, imdb_result *r, imdb_err *e)
         for (uint16_t c = 0; c < v->def->ncols; c++) {
             const imdb_viewcol *vc = &v->def->cols[c];
             if (vc->type == IMDB_T_DECIMAL)
-                at += (size_t)snprintf(cols + at, sizeof cols - at, "%s%s DECIMAL(18,%u)", c ? ", " : "", vc->name, vc->scale);
+                at += (size_t)snprintf(cols + at, sizeof cols - at, "%s%s DECIMAL(38,%u)", c ? ", " : "", vc->name, vc->scale); /* F3e: a row set's */
             else at += (size_t)snprintf(cols + at, sizeof cols - at, "%s%s %s", c ? ", " : "", vc->name, imdb_type_name(vc->type));
         }
         imdb_cell *row = res_row(r, e);
@@ -4943,6 +5000,7 @@ static bool gen_same(const imdb_value *a, const imdb_value *b)
 {
     if (a->null || b->null) return a->null == b->null;
     if (imdb_type_bytes(a->type)) return a->len == b->len && (!a->len || !memcmp(a->s, b->s, a->len));
+    if (a->type == IMDB_T_DECIMAL) return imdb_dec_value(a) == imdb_dec_value(b); /* F3e: either form */
     return a->i == b->i;
 }
 
@@ -5449,11 +5507,12 @@ typedef struct jctx {
 
 enum { JOIN_CHUNK = 1u << 16 }; /* more than IMDB_MAX_TEXT: a chunk holds any value whole */
 
-/* a join key as the map takes it: TEXT itself, every other type its int64; false: NULL */
+/* a join key as the map takes it: TEXT (and F3e a DECIMAL) itself, every other type its int64; false: NULL */
 static bool join_key(const imdb_value *v, imdb_value *k)
 {
     if (v->null) return false;
-    *k = imdb_type_bytes(v->type) ? *v : (imdb_value){.type = IMDB_T_INT64, .i = v->i};
+    /* F3e: a DECIMAL keeps its type: the map hashes and compares its 128 bits (either form), never its low 64 alone */
+    *k = imdb_type_bytes(v->type) || v->type == IMDB_T_DECIMAL ? *v : (imdb_value){.type = IMDB_T_INT64, .i = v->i};
     return true;
 }
 
@@ -5817,6 +5876,7 @@ static bool join_probe_setup(jctx *j, const qspec q[2], int in)
     memset(b, 0, sizeof *b);
     b->col = (uint16_t)col;
     b->type = t->s.cols[col].type;
+    b->byval = pred_byval(&t->s.cols[col]); /* F3e */
     b->op = CMP_EQ;
     j->kp = p->np++;
     p->ord_only = false;
@@ -5838,10 +5898,14 @@ static void join_outer_row(sink *k, uint64_t vid, const imdb_value *vals)
     jctx *j = k->j;
     const imdb_value *v = &vals[j->key[j->outer]];
     j->omatched = false;
-    if (!v->null) {
+    /* F3e: a DECIMAL key of the other form (a wide outer value against a narrow inner column) is an int64 bound only
+     * when it fits one; past it no inner value can equal it, so nothing is probed */
+    __int128 dk = !v->null && v->type == IMDB_T_DECIMAL ? imdb_dec_value(v) : 0;
+    bool fits = dk >= INT64_MIN && dk <= INT64_MAX;
+    if (!v->null && (j->probe.p[j->kp].byval || fits)) {
         bpred *b = &j->probe.p[j->kp];
         b->a = *v; /* the outer row's own bytes: read only while it is the row being probed for */
-        if (!imdb_type_bytes(b->type)) b->lo = b->hi = v->i;
+        if (!b->byval) b->lo = b->hi = v->type == IMDB_T_DECIMAL ? (int64_t)dk : v->i;
         j->ovid = vid;
         j->ovals = vals;
         j->inner->err = 0;
@@ -8451,9 +8515,8 @@ static int copy_value(const imdb_column *col, const char *s, uint32_t n, bool qu
     case IMDB_T_INT64:
         if (imdb_parse_int64(s, n, &x, e)) return e->code;
         break;
-    case IMDB_T_DECIMAL:
-        if (imdb_parse_decimal(s, n, col->precision, col->scale, &x, e)) return e->code;
-        break;
+    case IMDB_T_DECIMAL: /* F3e: to the column's precision, in its form (a wide one's 128 bits) */
+        return imdb_parse_decimal_col(s, n, col, v, e);
     case IMDB_T_FLOAT64:
         if (imdb_parse_float64(s, n, &x, e)) return e->code;
         break;
@@ -9711,6 +9774,7 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
         memset(b, 0, sizeof *b);
         b->col = (uint16_t)t->s.subject;
         b->type = t->s.cols[t->s.subject].type;
+        b->byval = pred_byval(&t->s.cols[t->s.subject]); /* a TEXT subject: by value (F3e: byval replaced the type test) */
         b->op = CMP_EQ;
         if (bind_lit(x, &st->subject, &t->s.cols[t->s.subject], true, &b->a, e)) return e->code;
         b->lo = b->hi = b->a.i;
@@ -10242,8 +10306,8 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
             o.adef = (imdb_value){.type = o.acol.type, .scale = o.acol.scale, .null = true};
             imdb_err e2 = {0};
             if (o.acol.type == IMDB_T_DECIMAL &&
-                (o.acol.precision < 1 || o.acol.precision > 18 || o.acol.scale > o.acol.precision))
-                rc = imdb_fail(e, IMDB_ERR_INVALID, "column %s: DECIMAL(p,s) needs 1<=p<=18, 0<=s<=p", o.acol.name);
+                (o.acol.precision < 1 || o.acol.precision > IMDB_DEC_MAX_DIGITS || o.acol.scale > o.acol.precision)) /* F3e */
+                rc = imdb_fail(e, IMDB_ERR_INVALID, "column %s: DECIMAL(p,s) needs 1<=p<=38, 0<=s<=p", o.acol.name);
             else if (st->has_alter_def && st->alter_clock == IMDB_DEFK_RANDOM_UUID) /* F3d: PostgreSQL draws one a row there */
                 rc = imdb_fail(e, IMDB_ERR_UNSUPPORTED, "ADD COLUMN %s ... DEFAULT gen_random_uuid() would give every row there one "
                                "value: ADD the column, then UPDATE it, then SET DEFAULT gen_random_uuid()", o.acol.name);
@@ -10298,8 +10362,8 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
                 o.acol.precision = nt->precision;
                 o.acol.scale = nt->scale;
                 o.acol.vlen = nt->vlen; /* F3c: SET TYPE VARCHAR(m) */
-                if (nt->type == IMDB_T_DECIMAL && (nt->precision < 1 || nt->precision > 18 || nt->scale > nt->precision))
-                    rc = imdb_fail(e, IMDB_ERR_INVALID, "column %s: DECIMAL(p,s) needs 1<=p<=18, 0<=s<=p", col->name);
+                if (nt->type == IMDB_T_DECIMAL && (nt->precision < 1 || nt->precision > IMDB_DEC_MAX_DIGITS || nt->scale > nt->precision))
+                    rc = imdb_fail(e, IMDB_ERR_INVALID, "column %s: DECIMAL(p,s) needs 1<=p<=38, 0<=s<=p", col->name);
             }
         }
         if (!rc) rc = imdb_alter_table(db, t, &o, e);
@@ -10695,7 +10759,11 @@ static int xval_param(const imdb_xval *v, imdb_value *out, imdb_err *e)
     if (v->null) return IMDB_OK; /* NULL has no payload to convert. */
     if (imdb_type_bytes(v->type)) out->s = v->s, out->len = v->len;
     else if (v->type == IMDB_T_FLOAT64) out->i = imdb_f64_key(v->f);
-    else if (v->i < INT64_MIN || v->i > INT64_MAX) return imdb_fail(e, IMDB_ERR_LIMIT, "a value past 18 digits");
+    else if (v->type == IMDB_T_DECIMAL) { /* F3e: to 38 digits, the wide form once past an int64 (a column takes its own) */
+        if (v->i >= imdb_pow10_128(IMDB_DEC_MAX_DIGITS) || v->i <= -imdb_pow10_128(IMDB_DEC_MAX_DIGITS))
+            return imdb_fail(e, IMDB_ERR_LIMIT, "a value past 38 digits");
+        imdb_dec_set(out, v->i, v->i < INT64_MIN || v->i > INT64_MAX);
+    } else if (v->i < INT64_MIN || v->i > INT64_MAX) return imdb_fail(e, IMDB_ERR_LIMIT, "a value past 18 digits");
     else out->i = (int64_t)v->i;
     return IMDB_OK;
 }

@@ -3491,17 +3491,21 @@ static int canon_dec_text(sb *b, const char *s, int sc)
     __int128 x = 0;
     int nd = 0, nf = 0;
     for (; *s >= '0' && *s <= '9'; s++, nd++) {
-        if (x > ((__int128)1 << 120)) return -1;
+        if (x > ((__int128)1 << 123)) return -1; /* F3e: 38 digits read, never wrapped */
         x = x * 10 + (*s - '0');
     }
     if (*s == '.') {
         for (s++; *s >= '0' && *s <= '9'; s++, nf++) {
+            if (nf < sc && x > ((__int128)1 << 123)) return -1;
             if (nf < sc) x = x * 10 + (*s - '0');
             else if (*s != '0') return -1;
         }
     }
     if (*s || (!nd && !nf)) return -1;
-    for (int k = nf; k < sc; k++) x *= 10;
+    for (int k = nf; k < sc; k++) {
+        if (x > ((__int128)1 << 123)) return -1;
+        x *= 10;
+    }
     put_scaled(b, neg ? -x : x, sc);
     return 0;
 }
@@ -4893,6 +4897,165 @@ static int bytes_battery(unsigned seed)
     }
     return 0;
 }
+
+/* ---- F3e, --dec38: DECIMALs to 38 digits against PostgreSQL, MySQL, MariaDB and SQL Server, a battery per seed --------
+ * Its own table y (id, d DECIMAL(38,10), e DECIMAL(30,0)) in each dialect (PostgreSQL numeric; MySQL's and MariaDB's
+ * DECIMAL, to 65 digits; SQL Server's decimal, to 38); SQLite is not asked: its REAL holds 15 or 16 digits. d drawn to 26
+ * integer digits and 10 places (a SUM of thirty stays inside 38), e from a pool of values sharing their low 64 bits
+ * (2^64, 2^64 + 1, 3 * 2^64, their negatives, 0, 1, -1) and the 29-digit bound, so equality, grouping and joins must read
+ * every bit. Every answer the canonical text of its scale (canon_dec_text), compared with imagedb's. */
+static bool g_dec38;
+static unsigned long g_dec38_compared;
+
+static __int128 d38_pool(int k)
+{
+    const __int128 P64 = (__int128)1 << 64, B29 = (__int128)10000000000000000000ull * 10000000000ll - 1; /* 10^29 - 1 */
+    switch (k % 10) {
+    case 0: return 0;
+    case 1: return 1;
+    case 2: return -1;
+    case 3: return P64;
+    case 4: return P64 + 1;
+    case 5: return -P64;
+    case 6: return 3 * P64;
+    case 7: return B29;
+    case 8: return -B29;
+    default: return (__int128)12345678901234567890ull * 1000 + 123;
+    }
+}
+
+static int dec38_battery(unsigned seed)
+{
+    int nrow = (int)rr(12, 30);
+    __int128 dv[32], ev[32];
+    bool dn[32], en[32];
+    for (int i = 0; i < nrow; i++) {
+        __int128 ip = (__int128)rr(0, 99999999) * 1000000000000000000ll + rr(0, 999999999999999999ll); /* to 26 digits */
+        dv[i] = ip * 10000000000ll + rr(0, 9999999999ll);
+        if (chance(50)) dv[i] = -dv[i];
+        if (chance(15) && i) dv[i] = dv[rnd() % (uint64_t)i]; /* a value again: DISTINCT and the order's ties */
+        dn[i] = chance(10);
+        ev[i] = d38_pool((int)(rnd() % 10));
+        en[i] = chance(10);
+    }
+    __int128 lo = dv[rnd() % (uint64_t)nrow], hi = dv[rnd() % (uint64_t)nrow];
+    if (lo > hi) {
+        __int128 t = lo;
+        lo = hi;
+        hi = t;
+    }
+    __int128 e1 = d38_pool((int)(rnd() % 10)), e2 = d38_pool((int)(rnd() % 10));
+    static const char *const DDL[ND] = {
+        "CREATE TABLE y (id INT64 PRIMARY KEY, d DECIMAL(38,10), e DECIMAL(30,0))", "",
+        "CREATE TABLE y (id BIGINT PRIMARY KEY, d NUMERIC(38,10), e NUMERIC(30,0))",
+        "CREATE TABLE y (id BIGINT PRIMARY KEY, d DECIMAL(38,10), e DECIMAL(30,0))",
+        "CREATE TABLE y (id BIGINT PRIMARY KEY, d DECIMAL(38,10), e DECIMAL(30,0))",
+        "CREATE TABLE y (id BIGINT NOT NULL PRIMARY KEY, d DECIMAL(38,10), e DECIMAL(30,0))"};
+    for (int d = 0; d < ND; d++) {
+        if (!g_eng[d].on || d == D_SQLITE) continue;
+        if ((d != D_IMDB && bx_exec(seed, d, "DROP TABLE IF EXISTS y")) || bx_exec(seed, d, DDL[d])) return -1;
+        sb ins = {0};
+        sb_str(&ins, "INSERT INTO y VALUES ");
+        for (int i = 0; i < nrow; i++) {
+            sb_printf(&ins, "%s(%d, ", i ? ", " : "", i + 1);
+            if (dn[i]) sb_str(&ins, "NULL");
+            else put_scaled(&ins, dv[i], 10);
+            sb_str(&ins, ", ");
+            if (en[i]) sb_str(&ins, "NULL");
+            else put_scaled(&ins, ev[i], 0);
+            sb_str(&ins, ")");
+        }
+        int irc = bx_exec(seed, d, ins.p);
+        free(ins.p);
+        if (irc) return -1;
+    }
+    enum { NQ = 9 };
+    for (int qn = 0; qn < NQ; qn++) {
+        static res out[ND];
+        int ty[8];
+        int nty = 0;
+        bool multiset = false;
+        char sql[ND][1600];
+        for (int d = 0; d < ND; d++) {
+            if (!g_eng[d].on || d == D_SQLITE) continue;
+            sb s = {0};
+            switch (qn) {
+            case 0: /* every value in order, ties by the key */
+                sb_str(&s, "SELECT id, d FROM y WHERE d IS NOT NULL ORDER BY d, id");
+                ty[0] = TY(CT_INT, 0), ty[1] = TY(CT_DEC, 10), nty = 2;
+                break;
+            case 1: /* past a literal */
+                sb_str(&s, "SELECT id FROM y WHERE d > ");
+                put_scaled(&s, lo, 10);
+                sb_str(&s, " ORDER BY id");
+                ty[0] = TY(CT_INT, 0), nty = 1;
+                break;
+            case 2: /* the extremes and the counts */
+                sb_str(&s, "SELECT MIN(d), MAX(d), COUNT(d), COUNT(DISTINCT d), MIN(e), MAX(e) FROM y");
+                ty[0] = ty[1] = TY(CT_DEC, 10), ty[2] = ty[3] = TY(CT_INT, 0), ty[4] = ty[5] = TY(CT_DEC, 0), nty = 6;
+                break;
+            case 3: /* the sums: thirty values to 26 digits, inside 38 */
+                sb_str(&s, "SELECT SUM(d), SUM(e) FROM y");
+                ty[0] = TY(CT_DEC, 10), ty[1] = TY(CT_DEC, 0), nty = 2;
+                break;
+            case 4: /* grouped by e: values sharing their low 64 bits are other groups */
+                sb_str(&s, "SELECT e, COUNT(*), MIN(id) FROM y WHERE e IS NOT NULL GROUP BY e");
+                ty[0] = TY(CT_DEC, 0), ty[1] = ty[2] = TY(CT_INT, 0), nty = 3;
+                multiset = true;
+                break;
+            case 5: /* a join on e */
+                sb_str(&s, "SELECT a.id, b.id FROM y AS a JOIN y AS b ON a.e = b.e AND a.id < b.id");
+                ty[0] = ty[1] = TY(CT_INT, 0), nty = 2;
+                multiset = true;
+                break;
+            case 6: /* IN */
+                sb_str(&s, "SELECT id FROM y WHERE e IN (");
+                put_scaled(&s, e1, 0);
+                sb_str(&s, ", ");
+                put_scaled(&s, e2, 0);
+                sb_str(&s, ") ORDER BY id");
+                ty[0] = TY(CT_INT, 0), nty = 1;
+                break;
+            case 7: /* BETWEEN two values */
+                sb_str(&s, "SELECT id FROM y WHERE d BETWEEN ");
+                put_scaled(&s, lo, 10);
+                sb_str(&s, " AND ");
+                put_scaled(&s, hi, 10);
+                sb_str(&s, " ORDER BY id");
+                ty[0] = TY(CT_INT, 0), nty = 1;
+                break;
+            case 8: /* the order of e, descending */
+                sb_str(&s, "SELECT id, e FROM y WHERE e IS NOT NULL ORDER BY e DESC, id");
+                ty[0] = TY(CT_INT, 0), ty[1] = TY(CT_DEC, 0), nty = 2;
+                break;
+            }
+            snprintf(sql[d], sizeof sql[d], "%s", s.p ? s.p : "");
+            free(s.p);
+            exec_eng(&g_eng[d], sql[d], true, ty, nty, &out[d]);
+            if (multiset && !out[d].err && out[d].n > 1) qsort(out[d].rows, out[d].n, sizeof *out[d].rows, rows_cmp);
+        }
+        const res *base = &out[D_IMDB];
+        for (int d = 1; d < ND; d++) {
+            if (!g_eng[d].on || d == D_SQLITE) continue;
+            g_dec38_compared++;
+            const res *o = &out[d];
+            const char *why = base->err != o->err ? "one refused it" : base->err ? NULL : base->n != o->n ? "another number of rows" : NULL;
+            size_t at = 0;
+            for (at = 0; !why && !base->err && at < base->n; at++)
+                if (strcmp(base->rows[at], o->rows[at])) why = "another row";
+            if (!why) continue;
+            g_mismatches++;
+            fprintf(stderr, "MISMATCH seed %u (--dec38, query %d), imagedb against %s: %s\n  imagedb: %s\n  %s: %s\n", seed, qn,
+                    DNAME[d], why, sql[D_IMDB], DNAME[d], sql[d]);
+            fprintf(stderr, "  imagedb: %s (%zu rows)\n", base->err ? base->msg : "ok", base->n);
+            if (!base->err) show_rows(base, at ? at - 1 : 0);
+            fprintf(stderr, "  %s: %s (%zu rows)\n", DNAME[d], o->err ? o->msg : "ok", o->n);
+            if (!o->err) show_rows(o, at ? at - 1 : 0);
+            return -1;
+        }
+    }
+    return 0;
+}
 static int check_state(unsigned seed, int step)
 {
     for (int tab = 0; tab < 2; tab++) {
@@ -5101,7 +5264,8 @@ static int run_seed(unsigned seed, int steps)
             if ((!g_checks && !g_fk && run_stmt(seed, step, &q, false)) || check_state(seed, step)) return -1;
         }
     }
-    return g_bytes ? bytes_battery(seed) : 0; /* F3d: after the steps: its draws change none of theirs */
+    if (g_bytes && bytes_battery(seed)) return -1; /* F3d: after the steps: its draws change none of theirs */
+    return g_dec38 ? dec38_battery(seed) : 0;     /* F3e: after it, likewise */
 }
 
 int main(int argc, char **argv)
@@ -5128,6 +5292,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--generated")) g_gen = true; /* F2c */
         else if (!strcmp(argv[i], "--fk")) g_fk = true; /* F2b-2 */
         else if (!strcmp(argv[i], "--bytes")) g_bytes = true; /* F3d */
+        else if (!strcmp(argv[i], "--dec38")) g_dec38 = true; /* F3e */
         else if (!strcmp(argv[i], "--tz")) g_tz = true; /* P2: time zones */
         else if (!strcmp(argv[i], "--date")) g_dt = 1; /* F3b */
         else if (!strcmp(argv[i], "--time")) g_dt = 2;
@@ -5225,6 +5390,9 @@ int main(int argc, char **argv)
     if (g_fk) printf("oracle: F2b-2's u.tid REFERENCES t (id): seeds with ON DELETE NO ACTION %lu, CASCADE %lu, SET NULL %lu\n",
                      g_fk_seeds[0], g_fk_seeds[1], g_fk_seeds[2]);
     if (g_bytes) printf("oracle: %lu comparisons of F3d's UUID and BYTEA battery (a table x a seed, nine queries)\n", g_bytes_compared);
+    if (g_dec38)
+        printf("oracle: %lu comparisons of F3e's DECIMAL(38,10) and DECIMAL(30,0) battery (a table y a seed, nine queries; SQLite not "
+               "asked)\n", g_dec38_compared);
     if (g_bytes && g_ms_pad >= 0) printf("oracle: SQL Server's 0x01 = 0x0100 is %s (the battery's BYTEAs hold no 0x00 byte either way)\n",
                                      g_ms_pad == 1 ? "true: it pads the shorter VARBINARY with zeros" : g_ms_pad == 0 ? "false: no padding" : "unread");
     printf("oracle: %ld comparisons of P2 S4b's correlated subqueries\n", g_corr_compared);

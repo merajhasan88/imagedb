@@ -459,7 +459,7 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
             d.ncols = o->incols;
             memcpy(d.cols, o->icols, sizeof d.cols);
             uint32_t at = 0;
-            if (!imdb_index_def_ok(&d, t->s.ncols))
+            if (!imdb_index_def_ok(&d, &t->s))
                 rc = imdb_fail(e, IMDB_ERR_CORRUPT, "commit %llu: an index on a column table %s does not have",
                                (unsigned long long)seq, t->s.name);
             else if (imdb_index_find(db, o->iname, NULL))

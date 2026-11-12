@@ -18,8 +18,9 @@
 
 #define U128_MAX (~(unsigned __int128)0)
 
-static unsigned __int128 p10(int n) /* n in 0..38 */
+static unsigned __int128 p10(int n) /* n in 0..38: the codec's one table (F3e); past it, as before, by multiplying */
 {
+    if (n >= 0 && n <= IMDB_DEC_MAX_DIGITS) return (unsigned __int128)imdb_pow10_128(n);
     unsigned __int128 r = 1;
     while (n-- > 0) r *= 10;
     return r;
@@ -87,6 +88,7 @@ void imdb_x_from_value(const imdb_value *v, imdb_xval *out)
     if (v->null) return;
     if (v->type == IMDB_T_FLOAT64) out->f = imdb_f64_value(v->i);
     else if (imdb_type_bytes(v->type)) out->s = v->s, out->len = v->len; /* F3d: UUID and BYTEA too */
+    else if (v->type == IMDB_T_DECIMAL) out->i = imdb_dec_value(v); /* F3e: either form */
     else out->i = v->i;
 }
 
@@ -344,9 +346,10 @@ int imdb_x_assign(const imdb_column *c, const imdb_xval *v, imdb_value *out, imd
             if (rem >= d - rem) q++;
             r = r < 0 ? -(__int128)q : (__int128)q;
         }
-        if (mag(r) >= p10(18))
+        /* F3e: the precision before the form is taken, so a narrow column's value is never cut to 64 bits */
+        if (mag(r) >= p10(c->precision))
             return imdb_fail(e, IMDB_ERR_LIMIT, "column %s: value exceeds DECIMAL(%u,%u)", c->name, c->precision, c->scale);
-        out->i = (int64_t)r; /* the precision: imdb_value_check */
+        imdb_dec_set(out, r, imdb_dec_wide(c->precision));
         break;
     }
     case IMDB_T_FLOAT64: {

@@ -24,10 +24,26 @@ static uint64_t khash(const imdb_hmap *m, const imdb_value *k)
     return h ? h : 1;
 }
 
+/* F3e: an INT64 map's key as two halves: a DECIMAL by its 128-bit value (a narrow one sign-extended, as
+ * imdb_value_hash hashes it), every other value its i and 0 */
+static void ikey_halves(const imdb_value *k, int64_t *lo, int64_t *hi)
+{
+    if (k->type == IMDB_T_DECIMAL) {
+        unsigned __int128 x = (unsigned __int128)imdb_dec_value(k);
+        *lo = (int64_t)(uint64_t)x;
+        *hi = (int64_t)(uint64_t)(x >> 64);
+    } else {
+        *lo = k->i;
+        *hi = 0;
+    }
+}
+
 static bool keq(const imdb_hmap *m, const imdb_hslot *s, const imdb_value *k)
 {
     if (m->ktype != IMDB_T_INT64) return s->slen == k->len && (k->len == 0 || memcmp(s->skey, k->s, k->len) == 0);
-    return s->ikey == k->i;
+    int64_t lo, hi;
+    ikey_halves(k, &lo, &hi);
+    return s->ikey == lo && s->ikey_hi == hi;
 }
 
 int imdb_hmap_init(imdb_hmap *m, uint8_t ktype, imdb_err *e)
@@ -109,7 +125,7 @@ int imdb_hmap_put(imdb_hmap *m, const imdb_value *k, uint64_t val, imdb_err *e)
         s->slen = k->len;
         m->key_bytes += k->len ? k->len : 1;
     } else {
-        s->ikey = k->i;
+        ikey_halves(k, &s->ikey, &s->ikey_hi);
     }
     s->hash = h;
     s->val = val;
