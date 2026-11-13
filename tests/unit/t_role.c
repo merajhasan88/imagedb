@@ -732,6 +732,9 @@ static void t_role_copies(void)
     imdb_err_clear(&g_e);
     OK(imdb_retire(db, first - 1, &g_e));
     OK(run("ALTER ROLE alice NOLOGIN"));
+    /* the advisor 22:4x: pw-two (set at first, above the floor) superseded before the CHECKPOINT r2 is seeded from: an
+     * entry r2's log never holds, though past the primary's floor */
+    OK(run("ALTER ROLE alice PASSWORD 'pw-three'"));
     OK(run("CHECKPOINT"));
     CHECK(db->log_floor >= first - 1);
     CHECK(verify_db(db) == 0);
@@ -792,6 +795,9 @@ static void t_role_copies(void)
     CHECK(!holds(p, "\x04\x00\x00\x00gone", 8) && !keys_held(p, k1) && !holds(p, "subject-nine-secret", 19));
     rep = NULL;
     CHECK(S && imdb_open(r2, &ro, &rep, &e) == 0);
+    /* a seeded copy's floor is its seed's commit, past pw-two's (the primary's is below it): VERIFY's and the auditor's "still in
+     * the log" test reads that floor, so pw-two's erasure is complete here (the advisor 22:4x) */
+    CHECK(!rep || (rep->log_floor >= first && rep->log_floor >= S));
     if (rep) {
         uint64_t applied = 0;
         OK(ship_to_file(p, S, sf, &g_e));

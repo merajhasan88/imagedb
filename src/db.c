@@ -2067,6 +2067,7 @@ int imdb_begin(imdb_db *db, imdb_err *e)
     if (writable(db, e)) return e->code;
     if (db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "transaction already open");
     db->in_txn = true;
+    db->begin_seq = db->seq; /* E3 */
     db->ntxseq = 0; /* F2a-2 */
     db->ntx = 0;
     db->tx_bytes = 0;
@@ -5783,6 +5784,20 @@ static int commit_body(imdb_db *db, imdb_err *e)
                                                                                              sequences too; F3g: types; L: roles */
             db->lake_dirty = true; /* the manifest records the definitions, the retentions, the horizons, the drops,
                                     * the views (P2 S7) */
+        /* E3: a write of a table (a row, or DDL changing what a reader of it sees) for SERIALIZABLE readers of it */
+        if (code == IMDB_OP_INSERT || code == IMDB_OP_DELETE || code == IMDB_OP_UPDATE || code == IMDB_OP_CREATE_INDEX ||
+            code == IMDB_OP_DROP_INDEX || code == IMDB_OP_SET_RETENTION || code == IMDB_OP_DROP_TABLE ||
+            code == IMDB_OP_ALTER_TABLE || code == IMDB_OP_COLUMN_DEFAULTS || code == IMDB_OP_TABLE_CHECKS ||
+            code == IMDB_OP_TABLE_FKS)
+            db->t[db->tx[i].table]->last_write = c.seq;
+        /* E3: the catalog, read by every statement at its snapshot (names, shapes, indexes, views, types); roles
+         * change no statement's answer yet (no session carries one) */
+        if (code == IMDB_OP_CREATE_TABLE || code == IMDB_OP_CREATE_INDEX || code == IMDB_OP_DROP_INDEX ||
+            code == IMDB_OP_SET_RETENTION || code == IMDB_OP_DROP_TABLE || code == IMDB_OP_CREATE_VIEW ||
+            code == IMDB_OP_DROP_VIEW || code == IMDB_OP_ALTER_TABLE || code == IMDB_OP_COLUMN_DEFAULTS ||
+            code == IMDB_OP_CREATE_SEQUENCE || code == IMDB_OP_DROP_SEQUENCE || code == IMDB_OP_TABLE_CHECKS ||
+            code == IMDB_OP_TABLE_FKS || code == IMDB_OP_CREATE_ENUM || code == IMDB_OP_DROP_ENUM || code == IMDB_OP_ENUM_ADD)
+            db->last_ddl = c.seq;
         if (code == IMDB_OP_CREATE_TABLE) db->t[db->tx[i].table]->created_at = c.seq;
         if (code == IMDB_OP_CREATE_SEQUENCE) db->seqs[db->tx[i].seq].created_at = c.seq; /* F2a-2 */
         if (code == IMDB_OP_DROP_SEQUENCE) db->seqs[db->tx[i].seq].dropped_at = c.seq;
@@ -5858,7 +5873,7 @@ static int commit_body(imdb_db *db, imdb_err *e)
         imdb_err e4 = {0};
         if (o->n_rerase && imdb_role_erase_apply(&db->rc, o->rerase, o->n_rerase, c.seq, erase_role_note, db, &e4))
             db->failed = true;
-        imdb_txn_doom_erased(db, o->erase, o->n_erase); /* suspended writes built on erased rows */
+        imdb_txn_doom_erased(db, o->erase, o->n_erase, c.seq); /* suspended writes built on erased rows */
         erased_rows |= o->n_erase != 0;
         erased = true;
         db->last_erase = c.seq;
@@ -5905,6 +5920,14 @@ int imdb_commit(imdb_db *db, imdb_err *e)
 {
     uint64_t t0 = imdb_mono_ns();
     imdb_op_enter(db);
+#ifdef IMDB_STORE_CHECKS
+    if (db->in_txn && db->seq != db->begin_seq) { /* E3: a commit inside an engine transaction would break autocommit's
+                                                  * seriality (none open: commit_body's STATE) */
+        fprintf(stderr, "imagedb: commit %llu landed inside an engine transaction begun at %llu\n",
+                (unsigned long long)db->seq, (unsigned long long)db->begin_seq);
+        abort();
+    }
+#endif
     int rc = commit_body(db, e);
     if (!rc) { /* P1 M1 */
         db->stats.commits++;
@@ -6692,6 +6715,7 @@ int imdb_stats_each(imdb_db *db, imdb_stat_fn fn, void *ctx, bool walk_disk)
     STAT("replication.last_heard_ms", db->following && s->repl_heard_ns ? (int64_t)((now - s->repl_heard_ns) / 1000000u) : -1);
     STAT("replication.primary_seq", s->repl_primary_seq);
     STAT("rollbacks", s->rollbacks);
+    STAT("rollbacks.serializable", s->ser_conflicts); /* E3: SERIALIZABLE commits refused (docs/e3-design.md) */
     STAT("log.bytes_appended", s->log_bytes);
     STAT("process.syncs", syncs.n);
     STAT("process.syncs.p50_us", imdb_hist_quantile(&syncs, 500));

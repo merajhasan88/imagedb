@@ -319,7 +319,9 @@ static void t_txn_sql_surface(void)
     imdb_session a, b;
     imdb_db *db = setup(&a, &b);
     CHECK(db);
-    CHECK(srun(&a, "BEGIN ISOLATION LEVEL SERIALIZABLE") == IMDB_ERR_UNSUPPORTED && !a.txn.open);
+    SRUN(&a, "BEGIN ISOLATION LEVEL SERIALIZABLE"); /* E3 */
+    CHECK(a.txn.open && a.txn.iso == IMDB_ISO_SERIALIZABLE);
+    SRUN(&a, "ROLLBACK");
     SRUN(&a, "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ");
     CHECK(a.txn.iso == IMDB_ISO_SNAPSHOT);
     SRUN(&a, "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED"); /* = READ COMMITTED, never dirty */

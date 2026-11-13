@@ -11,13 +11,19 @@
  *   - a commit that succeeds had no such key, and its writes become the commit's;
  *   - a duplicate key is refused only when the key is there, in the view or committed since;
  * and at the end the table is the model's latest state, before and after a reopen, VERIFY passing. Write skew is
- * lawful here (SNAPSHOT is not SERIALIZABLE), so the model does not look for it. */
+ * lawful under SNAPSHOT, so the model does not look for it there. E3 (docs/e3-design.md), the proof executable: in
+ * conc_ser a third of the transactions are SERIALIZABLE; each read one makes of what it has not written itself (a
+ * point read, a write's read of its key, an aggregate over the keys it has not written) is logged, and when one with
+ * writes commits, every logged read answers the same in the state just before its commit, so it ran as if alone
+ * there and those writers ran serially in commit order (a read-only one's reads are its snapshot's, checked at each
+ * read); a refusal at its COMMIT with no key's cause is genuine only when a commit after its snapshot wrote t, which
+ * each of its statements read. */
 #include <stdlib.h>
 
 #include "../../src/sql.h"
 #include "thelp.h"
 
-enum { NKEYS = 48, NSESS = 200, NSTEPS = 20000, NSP = 6 };
+enum { NKEYS = 48, NSESS = 200, NSTEPS = 20000, NSP = 6, MAXRD = 256 };
 
 typedef struct mver {
     uint64_t stamp; /* the commit that wrote it (0: before any) */
@@ -42,20 +48,32 @@ typedef struct msp {
     mwr wr[NKEYS];
 } msp;
 
+typedef struct mrd { /* E3: a SERIALIZABLE transaction's read of what it had not written itself */
+    int k;           /* the key of a point read (a write's of its key too), or -1: COUNT(*) and SUM(v) */
+    bool there;      /* a point read's answer */
+    int64_t v;
+    uint64_t mask;   /* an aggregate's: the keys it had written by then, whose part is its own */
+    int64_t n, sum;  /* and the rest's count and sum, as answered */
+} mrd;
+
 typedef struct msess {
     imdb_session s;
-    bool open, started, rc, doomed;
+    bool open, started, rc, doomed, ser; /* ser: SERIALIZABLE (E3) */
     uint64_t snap;
     mwr wr[NKEYS];
     bool locked[NKEYS];
     uint64_t lbase[NKEYS];
     msp sp[NSP];
     int nsp;
+    mrd rds[MAXRD]; /* E3: its reads, for the proof at its commit */
+    int nrd;
 } msess;
 
 static mkey g_keys[NKEYS];
 static imdb_db *g_db;
 static char g_fail[600];
+static uint64_t g_ser_proved, g_ser_reads, g_ser_refused, g_ser_engine; /* E3: writers proved, their reads checked,
+                                                                    * refusals by the model and by the engine */
 
 static void model_init(void)
 {
@@ -132,7 +150,8 @@ static bool conflict_genuine(const msess *m, int k)
 
 static void sess_reset(msess *m)
 {
-    m->open = m->started = m->rc = m->doomed = false;
+    m->open = m->started = m->rc = m->doomed = m->ser = false;
+    m->nrd = 0;
     m->snap = 0;
     memset(m->wr, 0, sizeof m->wr);
     memset(m->locked, 0, sizeof m->locked);
@@ -173,6 +192,67 @@ static void wrote(msess *m, int k, bool present, int64_t v, uint64_t seen, bool 
     m->wr[k].v = v;
 }
 
+/* E3: a SERIALIZABLE transaction's read logged (the answer already matched the model's view) */
+static void ser_log_point(msess *m, int k, bool there, int64_t v)
+{
+    if (m->nrd == MAXRD) FAILF("the model's read log is full (%d reads in one transaction)", MAXRD);
+    m->rds[m->nrd++] = (mrd){.k = k, .there = there, .v = there ? v : 0};
+}
+
+static void ser_log_agg(msess *m)
+{
+    if (m->nrd == MAXRD) FAILF("the model's read log is full (%d reads in one transaction)", MAXRD);
+    mrd q = {.k = -1};
+    for (int k = 0; k < NKEYS; k++) {
+        if (m->wr[k].w) {
+            q.mask |= 1ull << k;
+            continue;
+        }
+        const mver *x = at(k, m->snap);
+        if (x->present) {
+            q.n++;
+            q.sum += x->v;
+        }
+    }
+    m->rds[m->nrd++] = q;
+}
+
+/* E3, the proof: a SERIALIZABLE writer whose commit succeeded, the model still the state before it: every read it
+ * logged answers the same there, so it ran as if alone at its commit (its own writes' values follow from those reads
+ * and its statements, the same in that run) */
+static void ser_proof(const msess *m)
+{
+    for (int i = 0; i < m->nrd; i++) {
+        const mrd *q = &m->rds[i];
+        if (q->k >= 0) {
+            const mver *x = latest(q->k);
+            if (x->present != q->there || (x->present && x->v != q->v))
+                FAILF("SERIALIZABLE: key %d, read at snapshot %llu, is otherwise in the state before its commit at %llu",
+                      q->k, (unsigned long long)m->snap, (unsigned long long)g_db->seq);
+        } else {
+            int64_t n = 0, sum = 0;
+            for (int k = 0; k < NKEYS; k++)
+                if (!(q->mask >> k & 1) && latest(k)->present) {
+                    n++;
+                    sum += latest(k)->v;
+                }
+            if (n != q->n || sum != q->sum)
+                FAILF("SERIALIZABLE: an aggregate read at snapshot %llu is otherwise in the state before its commit at %llu",
+                      (unsigned long long)m->snap, (unsigned long long)g_db->seq);
+        }
+    }
+    g_ser_proved++;
+    g_ser_reads += (uint64_t)m->nrd;
+}
+
+/* E3: a commit after m's snapshot wrote t (a CHECKPOINT writes no key) */
+static bool ser_changed(const msess *m)
+{
+    for (int k = 0; k < NKEYS; k++)
+        if (latest(k)->stamp > m->snap) return true;
+    return false;
+}
+
 /* after an autocommit write or a COMMIT that succeeded: the transaction's writes are the new commit's */
 static void committed(msess *m, uint64_t before)
 {
@@ -194,6 +274,7 @@ static void committed(msess *m, uint64_t before)
             FAILF("a lock did not hold: key %d changed (%llu) after it was locked at %llu", k,
                   (unsigned long long)latest(k)->stamp, (unsigned long long)m->lbase[k]);
     }
+    if (m->ser) ser_proof(m); /* E3 */
     for (int k = 0; k < NKEYS; k++)
         if (m->wr[k].w) model_commit(k, stamp, m->wr[k].present, m->wr[k].v);
 }
@@ -221,6 +302,7 @@ static void step_read(msess *m, int k)
         bool ok = there ? r.nrows == 1 && r.cells[0].v.i == v : r.nrows == 0;
         imdb_result_free(&r);
         if (!ok) FAILF("%s: the answer is not the view (%s, snapshot %llu)", q, there ? "a row" : "no row", (unsigned long long)m->snap);
+        if (m->ser && !m->wr[k].w) ser_log_point(m, k, there, v); /* E3 */
     } else {
         snprintf(q, sizeof q, "SELECT COUNT(*), SUM(v) FROM t");
         int rc = run(m, q, &r);
@@ -238,6 +320,7 @@ static void step_read(msess *m, int k)
                      : r.cells[1].null);
         imdb_result_free(&r);
         if (!ok) FAILF("%s: the answer is not the view (count %lld, sum %lld)", q, (long long)n, (long long)sum);
+        if (m->ser) ser_log_agg(m); /* E3 */
     }
 }
 
@@ -267,6 +350,7 @@ static void step_write(msess *m, int kind, int k, int64_t d)
         }
         return conflicted(m, k, q);
     }
+    if (m->open && m->ser && !m->wr[k].w) ser_log_point(m, k, there, v); /* E3: the statement read its key */
     if (kind == 0 && rc == IMDB_ERR_CONSTRAINT) {
         if (!there && !latest(k)->present) FAILF("%s: a duplicate key refused, with no row there", q);
         return;
@@ -307,7 +391,18 @@ static void step_end(msess *m, bool commit)
         return;
     }
     if (commit && rc == IMDB_ERR_CONFLICT) {
-        conflicted(m, -1, "COMMIT");
+        bool wrote_any = false;
+        for (int k = 0; k < NKEYS; k++) wrote_any |= m->wr[k].w;
+        if (m->ser && wrote_any && !conflict_genuine(m, -1)) {
+            /* E3: no key's cause; genuine only when a commit after its snapshot wrote t (a read-only one is not
+             * validated, so the excuse is a writer's alone) */
+            if (!ser_changed(m))
+                FAILF("COMMIT (SERIALIZABLE): refused with t unwritten since snapshot %llu (%s)", (unsigned long long)m->snap,
+                      g_e.msg);
+            g_ser_refused++;
+        } else {
+            conflicted(m, -1, "COMMIT");
+        }
         sess_reset(m);
         return;
     }
@@ -358,7 +453,7 @@ static void check_final(imdb_session *s)
     }
 }
 
-static void conc_run(uint64_t seed)
+static void conc_run(uint64_t seed, int nsess, bool ser)
 {
     const char *dir = test_tmpdir();
     OK(imdb_init(dir, false, NULL, E));
@@ -367,15 +462,15 @@ static void conc_run(uint64_t seed)
     if (!g_db) return;
     g_fail[0] = 0;
     model_init();
-    msess *ss = calloc(NSESS, sizeof *ss);
-    for (int i = 0; i < NSESS; i++) imdb_session_init(&ss[i].s, g_db);
+    msess *ss = calloc((size_t)nsess, sizeof *ss);
+    for (int i = 0; i < nsess; i++) imdb_session_init(&ss[i].s, g_db);
     imdb_result r;
     CHECK(run(&ss[0], "CREATE TABLE t (id INT64 PRIMARY KEY, v INT64)", &r) == 0);
     imdb_result_free(&r);
     test_seed(seed);
     uint64_t conflicts = 0, commits = 0, aborted = 0;
     for (int step = 0; step < NSTEPS && !g_fail[0]; step++) {
-        msess *m = &ss[test_rand() % NSESS];
+        msess *m = &ss[test_rand() % (uint64_t)nsess];
         int k = (int)(test_rand() % NKEYS), dice = (int)(test_rand() % 100);
         int64_t d = (int64_t)(test_rand() % 9) + 1;
         if (m->doomed) {
@@ -384,14 +479,19 @@ static void conc_run(uint64_t seed)
         }
         if (!m->open) {
             if (dice < 30) {
-                bool rc_iso = test_rand() % 3 == 0;
-                if (run(m, rc_iso ? "BEGIN ISOLATION LEVEL READ COMMITTED" : "BEGIN", &r)) {
+                uint64_t lv = test_rand() % 3; /* E3: under ser, 1 is SERIALIZABLE (the draws as before) */
+                bool rc_iso = lv == 0, ser_iso = ser && lv == 1;
+                if (run(m, rc_iso    ? "BEGIN ISOLATION LEVEL READ COMMITTED"
+                           : ser_iso ? "BEGIN ISOLATION LEVEL SERIALIZABLE"
+                                     : "BEGIN",
+                        &r)) {
                     snprintf(g_fail, sizeof g_fail, "BEGIN: %s", g_e.msg);
                     break;
                 }
                 imdb_result_free(&r);
                 m->open = true;
                 m->rc = rc_iso;
+                m->ser = ser_iso;
             } else if (dice < 32) {
                 if (run(m, "CHECKPOINT", &r) == 0) imdb_result_free(&r);
                 else snprintf(g_fail, sizeof g_fail, "CHECKPOINT: %s", g_e.msg);
@@ -417,7 +517,7 @@ static void conc_run(uint64_t seed)
         }
         conflicts += m->doomed;
     }
-    for (int i = 0; i < NSESS; i++) {
+    for (int i = 0; i < nsess; i++) {
         if (ss[i].open && !g_fail[0]) step_end(&ss[i], false);
         imdb_session_close(&ss[i].s);
     }
@@ -433,6 +533,7 @@ static void conc_run(uint64_t seed)
     imdb_verify_report vr;
     memset(&vr, 0, sizeof vr);
     if (!g_fail[0] && imdb_verify(g_db, &vr, E)) snprintf(g_fail, sizeof g_fail, "VERIFY: %s", g_e.msg);
+    g_ser_engine += g_db->stats.ser_conflicts; /* E3: the engine's count of its refusals */
     imdb_close(g_db);
     if (!g_fail[0]) { /* reopened: the same state */
         g_db = open_db(dir);
@@ -461,7 +562,7 @@ static void t_conc_model(void)
 {
     const char *ns = getenv("IMDB_CONC_SEEDS"); /* more seeds by hand; three in the suite */
     uint64_t n = ns && atoi(ns) > 0 ? (uint64_t)atoi(ns) : 3;
-    for (uint64_t seed = 1; seed <= n; seed++) conc_run(seed);
+    for (uint64_t seed = 1; seed <= n; seed++) conc_run(seed, NSESS, false);
 }
 
 
@@ -510,8 +611,28 @@ static void t_conc_starvation(void)
     imdb_close(db);
 }
 
+/* E3: SERIALIZABLE among READ COMMITTED, SNAPSHOT and autocommit, the proof at each SERIALIZABLE writer's commit:
+ * 200 sessions (on one hot table mostly refusals, each one's cause checked) and 4 (most commit, each proved) */
+static void t_conc_ser(void)
+{
+    const char *ns = getenv("IMDB_CONC_SEEDS");
+    uint64_t n = ns && atoi(ns) > 0 ? (uint64_t)atoi(ns) : 2;
+    g_ser_proved = g_ser_reads = g_ser_refused = g_ser_engine = 0;
+    for (uint64_t seed = 1; seed <= n; seed++) {
+        conc_run(seed, NSESS, true);
+        conc_run(seed, 4, true);
+    }
+    if (getenv("IMDB_CONC_STATS"))
+        fprintf(stderr, "    SERIALIZABLE: %llu writers proved (%llu reads), %llu refusals (the engine's %llu)\n",
+                (unsigned long long)g_ser_proved, (unsigned long long)g_ser_reads, (unsigned long long)g_ser_refused,
+                (unsigned long long)g_ser_engine);
+    /* each path ran; and each refusal the model saw with no key's cause is one of the engine's validation's */
+    CHECK(g_ser_proved > 0 && g_ser_reads > 0 && g_ser_refused > 0 && g_ser_refused <= g_ser_engine);
+}
+
 const test_case conc_tests[] = {
     {"conc_model", t_conc_model},
     {"conc_starvation", t_conc_starvation},
+    {"conc_ser", t_conc_ser},
 };
 const size_t conc_ntests = sizeof conc_tests / sizeof *conc_tests;

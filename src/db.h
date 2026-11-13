@@ -231,6 +231,10 @@ typedef struct imdb_table {
     imdb_segcache *segcache;  /* the database's (stage 3c-1): where its segments' images are loaded and kept */
     uint32_t nseg, capseg;
     uint64_t horizon;         /* AS OF below this seq is unavailable (purged) */
+    uint64_t last_write;      /* E3: the commit that last wrote it (a row, or DDL: an index, its schema, its retention, its
+                               * drop), the writer's runtime state: a SERIALIZABLE transaction that read it since fails */
+    uint64_t last_erase;      /* E3: the commit that last erased from it: a SERIALIZABLE snapshot below it reads it no more
+                               * (check_view: what it would read never was a state) */
     uint64_t retention_us;    /* op 16: how long a version stays answerable after it ends; IMDB_RETAIN_FOREVER */
     uint64_t created_at;      /* the commit that created it (a name resolves by a snapshot: imdb_table_at) */
     uint64_t dropped_at;      /* op 19 (1f): the commit that dropped it, its live versions ended there; 0: live */
@@ -396,6 +400,7 @@ typedef struct imdb_stats {
     uint64_t stmts[IMDB_SC_N], fails[IMDB_SF_N];
     imdb_hist stmt_lat[IMDB_SC_N];
     uint64_t commits, rollbacks, log_bytes, applied; /* applied: a replica's commits taken from a stream (apply) */
+    uint64_t ser_conflicts;   /* E3: SERIALIZABLE commits refused because a table they read was written since their snapshot */
     imdb_hist commit_lat;
     uint64_t seg_hits;
     uint64_t maint_n[IMDB_MT_N], maint_ns[IMDB_MT_N], maint_max_ns[IMDB_MT_N], maint_last_ns[IMDB_MT_N];
@@ -528,6 +533,11 @@ typedef struct imdb_db {
     imdb_lthash global;
     /* transaction */
     bool in_txn;
+    uint64_t last_ddl;  /* E3: the last commit that changed the catalog (a name, a table's shape or index, a view's
+                         * or a type's definition), which every statement reads by its snapshot: a SERIALIZABLE
+                         * writer whose snapshot is below it is refused (txn.c ser_reads_current) */
+    uint64_t begin_seq; /* E3: db->seq at imdb_begin: no commit lands inside an engine transaction (the checked builds
+                         * abort at the commit otherwise), so an autocommit statement is serial by construction */
     imdb_op *tx;
     uint64_t *tx_row_off;
     uint32_t ntx, captx;
@@ -836,7 +846,7 @@ void imdb_savepoint_restore(imdb_db *db, imdb_savepoint sp);
  * store (begin or end = seq + 1). The others keep their op lists saved and are
  * replayed (and so re-validated) when they next write or read their own writes.
  * A transaction sees committed data at its snapshot plus its own writes. */
-enum { IMDB_ISO_SNAPSHOT = 0, IMDB_ISO_READ_COMMITTED = 1 };
+enum { IMDB_ISO_SNAPSHOT = 0, IMDB_ISO_READ_COMMITTED = 1, IMDB_ISO_SERIALIZABLE = 2 }; /* E3: docs/e3-design.md */
 enum { IMDB_TXN_READ = 0, IMDB_TXN_WRITE = 1 };
 
 typedef struct imdb_saved_op {
@@ -877,6 +887,8 @@ typedef struct imdb_txn {
     uint32_t timeout_ms, idle_ms; /* SET transaction_timeout and idle_in_transaction_timeout at its BEGIN (0: none) */
     uint32_t *seqs;            /* F2a-2: its sequences nextval touched, while it is not active (db->txseq when it is) */
     uint32_t nseqs;
+    uint32_t rd[IMDB_MAX_TABLES / 32]; /* E3: SERIALIZABLE, the tables it read (by id; never shrunk: ROLLBACK TO keeps it) */
+    bool rd_any;               /* it read a table: the commit's check has work to do */
     char doom[512];            /* why it can only roll back */
 } imdb_txn;
 
@@ -907,7 +919,7 @@ int imdb_txn_lock_rows(imdb_db *db, imdb_txn *x, const imdb_table *t, const uint
                        imdb_err *e);
 /* After a committed ERASE: dooms every transaction whose saved writes or locks
  * name an erased version, and wipes its saved row bytes at once. */
-void imdb_txn_doom_erased(imdb_db *db, const imdb_erase_ent *ents, uint32_t n);
+void imdb_txn_doom_erased(imdb_db *db, const imdb_erase_ent *ents, uint32_t n, uint64_t seq);
 /* After a RETIRE below boundary: dooms every transaction whose snapshot is at or below it (every table's
  * horizon is past it, so none of its reads could be answered). */
 void imdb_txn_doom_retired(imdb_db *db, uint64_t boundary);

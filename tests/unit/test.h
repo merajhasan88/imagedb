@@ -112,6 +112,7 @@ TESTS(dec38) /* F3e: NUMERIC to 38 digits */
 TESTS(iv)    /* F3f: INTERVAL */
 TESTS(enum) /* F3g: ENUM types */
 TESTS(role) /* L: roles and grants */
+TESTS(e3) /* E3: SERIALIZABLE */
 TESTS(tz) /* P2: time zones */
 TESTS(tzsql) /* P2: time zones through the engine */
 

@@ -32,7 +32,9 @@
  *  10 CHECKPOINT   manifest[32]
  *  11 COMPACT      u32 table | u64 purge_before | manifest[32]
  *  12 ERASE        u32 n | n x (u32 table | u64 vid | commit[32]) sorted |
- *                  u32 m | m x (u32 table | old_seg[32] | new_seg[32]) sorted | manifest[32]
+ *                  u32 m | m x (u32 table | old_seg[32] | new_seg[32]) sorted |
+ *                  u32 k | k x (u32 role | u64 seq | u8 what | commit[32]) sorted (L stage 2: role entries,
+ *                  never beside rows) | manifest[32]
  *  13 WRITER_KEY   u32 epoch | new_pk[32] | u8 how      (the only op of its commit)
  *                  how 1 (rotation, a planned handover): signed by the current key;
  *                  every later commit by new_pk.

@@ -3044,7 +3044,9 @@ int imdb_sql_parse(const char *s, size_t n, sql_stmt *st, imdb_err *e)
             else if (!strcmp(st->set_name, "timezone")) rc = set_zone_value(&p, st); /* P2: SET timezone = x */
             else {
                 const sql_tok *v = &p.t[p.i];
-                if ((v->kind == TK_IDENT || v->kind == TK_INT) && v->len <= IMDB_MAX_IDENT) {
+                /* E3: default_transaction_isolation's value as PostgreSQL writes it, quoted (two words: 'read committed') */
+                bool quoted = v->kind == TK_STR && !strcmp(st->set_name, "default_transaction_isolation");
+                if (((v->kind == TK_IDENT || v->kind == TK_INT) || quoted) && v->len <= IMDB_MAX_IDENT) {
                     for (uint32_t k = 0; k < v->len; k++) {
                         char c = s[v->off + k];
                         st->set_value[k] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;

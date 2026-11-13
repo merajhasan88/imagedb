@@ -251,6 +251,19 @@ void imdb_txn_rollback(imdb_db *db, imdb_txn *x)
     close_txn(db, x);
 }
 
+/* E3 stage 1 (docs/e3-design.md): every table a SERIALIZABLE writer read is unwritten since its snapshot, and the
+ * catalog every statement reads (names, shapes, views, types) unchanged since it, so its reads are the state at its
+ * commit and it runs as if alone there: 0, or which rule refuses (1 a table, 2 the catalog) */
+static int ser_reads_current(const imdb_db *db, const imdb_txn *x)
+{
+    if (db->last_ddl > x->snap) return 2;
+    if (!x->rd_any) return 0;
+    for (uint32_t w = 0; w < IMDB_MAX_TABLES / 32; w++)
+        for (uint32_t b = 0, m = x->rd[w]; m; b++, m >>= 1)
+            if ((m & 1u) && w * 32 + b < db->nt && db->t[w * 32 + b]->last_write > x->snap) return 1;
+    return 0;
+}
+
 int imdb_txn_commit(imdb_db *db, imdb_txn *x, imdb_err *e)
 {
     if (!x->open) return imdb_fail(e, IMDB_ERR_STATE, "no transaction is open");
@@ -277,6 +290,15 @@ int imdb_txn_commit(imdb_db *db, imdb_txn *x, imdb_err *e)
     if (!locks_live(db, x)) {
         imdb_txn_rollback(db, x);
         return imdb_fail(e, IMDB_ERR_CONFLICT, "could not serialize access: a row locked FOR UPDATE changed; retry the transaction");
+    }
+    int why = x->iso == IMDB_ISO_SERIALIZABLE ? ser_reads_current(db, x) : 0;
+    if (why) { /* E3: what it read changed since its snapshot */
+        imdb_txn_rollback(db, x);
+        db->stats.ser_conflicts++;
+        return why == 1 ? imdb_fail(e, IMDB_ERR_CONFLICT, "could not serialize access due to a concurrent update of a "
+                                    "table this transaction read; retry the transaction")
+                        : imdb_fail(e, IMDB_ERR_CONFLICT, "could not serialize access due to a concurrent change of "
+                                    "the catalog (DDL) since this transaction's snapshot; retry the transaction");
     }
     rc = imdb_commit(db, e); /* on failure the engine undoes every pending version */
     db->active = NULL;
@@ -380,14 +402,25 @@ void imdb_txn_doom_altered(imdb_db *db, uint32_t table, uint64_t seq)
     }
 }
 
-void imdb_txn_doom_erased(imdb_db *db, const imdb_erase_ent *ents, uint32_t n)
+void imdb_txn_doom_erased(imdb_db *db, const imdb_erase_ent *ents, uint32_t n, uint64_t seq)
 {
+    for (uint32_t i = 0; i < n; i++) /* E3: a SERIALIZABLE snapshot below seq reads these tables no more (check_view) */
+        if (ents[i].table < db->nt) db->t[ents[i].table]->last_erase = seq;
     for (imdb_txn *x = db->txns; x; x = x->next) {
         bool hit = false;
         for (uint32_t i = 0; i < x->nops && !hit; i++)
             hit = x->ops[i].code != IMDB_OP_INSERT && !x->ops[i].base_pending &&
                   erased(ents, n, x->ops[i].table, x->ops[i].base);
         for (uint32_t i = 0; i < x->nlocks && !hit; i++) hit = erased(ents, n, x->locks[i].table, x->locks[i].vid);
+        /* E3: an ERASE changes the history below a snapshot (payloads gone): a SERIALIZABLE transaction that read a
+         * table it touches, a read-only one too, can repeat none of those reads (docs/e3-design.md) */
+        bool ser = false;
+        for (uint32_t i = 0; i < n && !hit && !ser && x->open && x->iso == IMDB_ISO_SERIALIZABLE; i++)
+            ser = ents[i].table < IMDB_MAX_TABLES && (x->rd[ents[i].table / 32] >> (ents[i].table % 32) & 1u);
+        if (ser) {
+            if (!x->doomed) doom(x, "a table this SERIALIZABLE transaction read was erased from");
+            continue;
+        }
         if (!hit) continue;
         if (!x->doomed) doom(x, "a row this transaction writes or locked was erased");
         release_ops(x); /* the saved bytes may be the erased row's last copy */

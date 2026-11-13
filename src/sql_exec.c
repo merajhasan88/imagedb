@@ -4624,8 +4624,31 @@ static int check_view(xctx *x, const imdb_table *t, uint64_t snap, bool asof, im
 {
     if (x->probe) return IMDB_OK; /* P2 S7: a bind-only pass reads no row: the history and readiness rules are its run's
                                    * (a replica's apply re-binds a view while it waits for an ERASE record) */
-    int rc = imdb_check_history(x->db, t, snap, e);
     imdb_txn *tx = &x->ss->txn;
+    /* E3 (docs/e3-design.md): every read of a table passes here, the fast paths, joins, nested SELECTs and the reads
+     * a write makes too; a SERIALIZABLE transaction notes the table (never shrunk; an AS OF read changes nothing) */
+    if (!asof && tx->open && tx->iso == IMDB_ISO_SERIALIZABLE && t->s.id < IMDB_MAX_TABLES) {
+        tx->rd[t->s.id / 32] |= 1u << (t->s.id % 32);
+        tx->rd_any = true;
+        if (t->hist.nvers > 1 && t->hist.vers[t->hist.nvers - 1].since > tx->snap) {
+            /* altered after its snapshot: a read takes the table's last shape (an ADD's value in older rows, a rename, a
+             * column gone), never one its snapshot held */
+            imdb_txn_doom(tx, "a table this SERIALIZABLE transaction reads was altered after its snapshot");
+            return imdb_fail(e, IMDB_ERR_CONFLICT, "table %s was altered after this SERIALIZABLE transaction's snapshot; "
+                             "retry the transaction", t->s.name);
+        }
+        if (t->created_at > tx->snap) { /* made after its snapshot (read_table's live one): its catalog has no such table */
+            imdb_txn_doom(tx, "a table this SERIALIZABLE transaction reads was created after its snapshot");
+            return imdb_fail(e, IMDB_ERR_CONFLICT, "table %s was created after this SERIALIZABLE transaction's snapshot; "
+                             "retry the transaction", t->s.name);
+        }
+        if (t->last_erase > tx->snap) { /* erased from after its snapshot: what it would read never was a state */
+            imdb_txn_doom(tx, "a table this SERIALIZABLE transaction reads was erased from after its snapshot");
+            return imdb_fail(e, IMDB_ERR_CONFLICT, "table %s was erased from after this SERIALIZABLE transaction's "
+                             "snapshot; retry the transaction", t->s.name);
+        }
+    }
+    int rc = imdb_check_history(x->db, t, snap, e);
     if (rc != IMDB_ERR_HISTORY || asof || !tx->open) return rc;
     imdb_err_clear(e); /* the first error wins: this one replaces it */
     imdb_fail(e, IMDB_ERR_CONFLICT,
@@ -4828,6 +4851,13 @@ static int read_table(xctx *x, const sql_stmt *st, const char *name, imdb_table 
     imdb_table *t = imdb_table_at(x->db, name, snap);
     imdb_view *v = t ? NULL : imdb_view_at(x->db, name, snap);
     if (!t && !v && !(t = imdb_table_by_name(x->db, name))) v = imdb_view_by_name(x->db, name);
+    imdb_txn *tx = &x->ss->txn;
+    if (v && !x->probe && !st->has_asof && tx->open && tx->iso == IMDB_ISO_SERIALIZABLE && v->created_at > tx->snap) {
+        /* E3: a SERIALIZABLE transaction reads its snapshot's catalog: a view made after it (the live one) is not there */
+        imdb_txn_doom(tx, "a view this SERIALIZABLE transaction reads was created after its snapshot");
+        return imdb_fail(e, IMDB_ERR_CONFLICT, "view %s was created after this SERIALIZABLE transaction's snapshot; retry "
+                         "the transaction", v->name);
+    }
     if (v) return expand_view(x, st, v, out, e);
     if (!t) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", name);
     deps_note(x, IMDB_VIEWDEP_TABLE, t->s.id);
@@ -9940,7 +9970,8 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
             if (!row) return e->code;
             n++;
             res_put_str(r, &row[0], t->doomed ? "doomed" : db->active == t ? "active" : t->started ? "parked" : "begun");
-            res_put_str(r, &row[1], t->iso == IMDB_ISO_READ_COMMITTED ? "read committed" : "snapshot");
+            res_put_str(r, &row[1], t->iso == IMDB_ISO_READ_COMMITTED ? "read committed"
+                                    : t->iso == IMDB_ISO_SERIALIZABLE ? "serializable" : "snapshot"); /* E3 */
             res_put_int(r, &row[2], (int64_t)((now - t->begin_ns) / 1000000u));
             res_put_int(r, &row[3], (int64_t)((now - t->last_ns) / 1000000u));
             res_put_int(r, &row[4], (int64_t)(db->active == t ? db->ntx : t->nops));
@@ -10359,13 +10390,13 @@ static int exec_verify(xctx *x, imdb_result *r, imdb_err *e)
 
 /* ---- statement dispatch --------------------------------------------------------------- */
 
-/* SERIALIZABLE needs read-set validation, which stage 1 does not have: refused, not weakened. */
-static int check_iso(const sql_stmt *st, imdb_err *e)
+/* a level as written to the engine's (E3: SERIALIZABLE by docs/e3-design.md); none written: the session's default */
+static uint8_t iso_of(const imdb_session *ss, int sql_iso)
 {
-    if (st->iso != SQL_ISO_SERIALIZABLE) return IMDB_OK;
-    return imdb_fail(e, IMDB_ERR_UNSUPPORTED,
-                     "SERIALIZABLE is not available yet: SNAPSHOT (the default) prevents dirty and non-repeatable "
-                     "reads, phantoms and lost updates, but not write skew");
+    return sql_iso == SQL_ISO_READ_COMMITTED ? IMDB_ISO_READ_COMMITTED
+           : sql_iso == SQL_ISO_SERIALIZABLE ? IMDB_ISO_SERIALIZABLE
+           : sql_iso == SQL_ISO_SNAPSHOT     ? IMDB_ISO_SNAPSHOT
+                                             : ss->default_iso;
 }
 
 static bool is_write(uint8_t k)
@@ -11048,8 +11079,7 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
             rc = imdb_fail(e, IMDB_ERR_STATE, "transaction already open");
             break;
         }
-        if ((rc = check_iso(st, e))) break;
-        imdb_txn_begin(db, &ss->txn, st->iso == SQL_ISO_READ_COMMITTED ? IMDB_ISO_READ_COMMITTED : IMDB_ISO_SNAPSHOT);
+        imdb_txn_begin(db, &ss->txn, iso_of(ss, st->iso));
         ss->txn.begin_ns = ss->txn.last_ns = now_ns; /* R4 */
         ss->txn.begin_us = imdb_now_us(); /* F2a: the transaction's now() */
         ss->txn.timeout_ms = ss->txn_timeout_ms;
@@ -11061,8 +11091,7 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
             rc = imdb_fail(e, IMDB_ERR_STATE, "SET TRANSACTION goes right after BEGIN, before the first statement");
             break;
         }
-        if ((rc = check_iso(st, e))) break;
-        ss->txn.iso = st->iso == SQL_ISO_READ_COMMITTED ? IMDB_ISO_READ_COMMITTED : IMDB_ISO_SNAPSHOT;
+        ss->txn.iso = iso_of(ss, st->iso);
         snprintf(r->status, sizeof r->status, "SET TRANSACTION");
         break;
     case ST_SAVEPOINT:
@@ -11271,13 +11300,20 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
                 rc = imdb_fail(e, IMDB_ERR_INVALID, "statement_timeout is 0 (none) to %u milliseconds",
                                IMDB_MAX_STATEMENT_TIMEOUT_MS);
             else ss->stmt_timeout_ms = (uint32_t)v;
+        } else if (strcmp(st->set_name, "default_transaction_isolation") == 0) { /* E3: a BEGIN's level naming none */
+            const char *v = st->set_value;
+            if (!strcmp(v, "serializable")) ss->default_iso = IMDB_ISO_SERIALIZABLE;
+            else if (!strcmp(v, "snapshot") || !strcmp(v, "repeatable read")) ss->default_iso = IMDB_ISO_SNAPSHOT;
+            else if (!strcmp(v, "read committed") || !strcmp(v, "read uncommitted")) ss->default_iso = IMDB_ISO_READ_COMMITTED;
+            else rc = imdb_fail(e, IMDB_ERR_INVALID, "default_transaction_isolation is serializable, snapshot (repeatable read) or "
+                                "read committed (read uncommitted)");
         } else if (strcmp(st->set_name, "min_commit") == 0) {
             int64_t v;
             if (imdb_parse_int64(st->set_value, strlen(st->set_value), &v, e) || v < 0)
                 rc = imdb_fail(e, IMDB_ERR_INVALID, "min_commit is a commit number (0: no requirement)");
             else ss->min_commit = (uint64_t)v;
         } else {
-            rc = imdb_fail(e, IMDB_ERR_NOTFOUND, "unknown setting %s (cross_check, access_path, join_plan, identity, min_commit, idle_in_transaction_timeout, statement_memory, statement_row_limit, statement_timeout, slow_statement_ms, sync_replicas, transaction_timeout, sync_timeout_ms)",
+            rc = imdb_fail(e, IMDB_ERR_NOTFOUND, "unknown setting %s (cross_check, access_path, join_plan, identity, min_commit, idle_in_transaction_timeout, statement_memory, statement_row_limit, statement_timeout, slow_statement_ms, sync_replicas, transaction_timeout, sync_timeout_ms, default_transaction_isolation)",
                            st->set_name);
         }
         if (!rc) snprintf(r->status, sizeof r->status, "SET %s = %s", st->set_name, st->set_value);

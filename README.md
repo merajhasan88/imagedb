@@ -450,7 +450,7 @@ always the same rows: statements by class (read, write, transaction, ddl,
 physical, show, other) with their p50, p99 and largest latency in
 microseconds; failures by kind (conflict, limit, cancelled, other); commits
 and their latency (a replica's applied commits apart: `commits.applied`),
-rollbacks, the log's bytes; the segment cache's hits and
+rollbacks (`rollbacks.serializable`: the commits the SERIALIZABLE check refused), the log's bytes; the segment cache's hits and
 loads; each CHECKPOINT, COMPACT, EXPIRE, RETIRE and eviction's count and time;
 the open's time and the commits it replayed; the open transactions and the
 oldest's age; the bytes on disk of the log and the lake; the running
@@ -571,6 +571,7 @@ statement):
 | `statement_timeout` | 0 to 86,400,000 ms | 0 (none) | cancels a statement that runs longer |
 | `transaction_timeout` | 0 to 86,400,000 ms | 0 (none) | a transaction older than it can only roll back (from the next BEGIN) |
 | `idle_in_transaction_timeout` | 0 to 86,400,000 ms | 0 (none) | a transaction idle that long can only roll back (from the next BEGIN) |
+| `default_transaction_isolation` | serializable, snapshot (or 'repeatable read'), 'read committed' (or 'read uncommitted') | snapshot | a BEGIN's level when it names none |
 | `statement_memory` | 0, or 1 MiB to 16 GiB | 0: a quarter of the budget, or 1 GiB | a statement's hard memory limit for what it reads (a write's too) |
 | `statement_row_limit` | 0 to 2^62 rows | 0 (none) | the rows a statement may test |
 | `slow_statement_ms` | 0 to 86,400,000 ms | 0 (none) | statements at least that long go to the event log |
@@ -578,10 +579,11 @@ statement):
 | `sync_timeout_ms` | 1 to 3,600,000 ms | 10,000 | how long a commit waits for them |
 | `timezone` | a zone's name as a string, DEFAULT or LOCAL (`SET TIME ZONE 'Europe/London'`) | UTC, never the process's TZ | the zone TIMESTAMPTZ values show in and literals without an offset are read in (Time zones) |
 
-`BEGIN ISOLATION LEVEL SNAPSHOT | REPEATABLE READ | READ COMMITTED | READ
-UNCOMMITTED` (or `SET TRANSACTION ISOLATION LEVEL ...`) chooses a transaction's
-isolation: SNAPSHOT by default; REPEATABLE READ is SNAPSHOT, READ UNCOMMITTED is
-READ COMMITTED (uncommitted data is never visible), SERIALIZABLE is refused.
+`BEGIN ISOLATION LEVEL SERIALIZABLE | SNAPSHOT | REPEATABLE READ | READ COMMITTED |
+READ UNCOMMITTED` (or `SET TRANSACTION ISOLATION LEVEL ...` before the transaction's
+first statement) chooses a transaction's isolation: SNAPSHOT by default (or
+`default_transaction_isolation`'s); REPEATABLE READ is SNAPSHOT, READ UNCOMMITTED is
+READ COMMITTED (uncommitted data is never visible).
 
 Environment variables:
 
@@ -596,11 +598,28 @@ Environment variables:
 ## Supported scope
 
 One process and principal, one engine thread with worker parallelism, many
-interleaved sessions. SNAPSHOT and READ COMMITTED transactions, statement
+interleaved sessions. SNAPSHOT, READ COMMITTED and SERIALIZABLE transactions, statement
 rollback, savepoints, `WITH (NOLOCK)` and optimistic `SELECT ... FOR UPDATE`
 (first committer wins, without fairness: a long transaction can lose every
-round to short ones writing the same row, so retry with backoff). SERIALIZABLE
-is refused; snapshot write skew is possible.
+round to short ones writing the same row, so retry with backoff). Under SNAPSHOT
+write skew is possible. SERIALIZABLE (stage 1, by tables): a SERIALIZABLE
+transaction that wrote commits only if no commit since its snapshot wrote a table
+it read (rows, or DDL on it) or changed the catalog (any DDL: views and types resolve
+by the snapshot, so a view dropped or a label added since could change what it saw),
+else it is refused with CONFLICT ("could not
+serialize access": retry it), so the SERIALIZABLE writers run as if one at a time
+in commit order; a read-only one reads its snapshot and is not refused for what
+others wrote since (this implementation's behaviour, not a promise), but an ERASE
+of a table it read refuses its next statement, and one after its snapshot refuses
+its first read of a table the ERASE touched, on the primary and a replica alike.
+A table or view created after its snapshot, or a table altered since (a read takes
+a table's last shape), is refused at its next read (SNAPSHOT reads such a table as
+empty, or in its last shape), so a read-only one sees only its snapshot's catalog.
+The guarantee holds among SERIALIZABLE transactions: a SNAPSHOT or READ COMMITTED
+writer is not checked, while a SERIALIZABLE one is checked against every commit.
+By tables, any concurrent write of a table it read refuses it, whether or not the
+rows met (keys and ranges are a later stage); `SHOW STATS`' `rollbacks.serializable`
+counts the commits that check refused.
 
 Types: INT64 (BIGINT, INT8), INTEGER (INT, INT4: 32 bits), SMALLINT (INT2: 16 bits),
 DECIMAL(p,s) (NUMERIC(p,s): p 1 to 38), TEXT, VARCHAR(n), BOOL, TIMESTAMP, TIMESTAMPTZ, DATE, TIME, UUID, BYTEA, INTERVAL,

@@ -600,6 +600,9 @@ static int apply_commit_body(imdb_db *db, imdb_commit_rec *c, const imdb_commit_
     memcpy(db->head, c->hash, 32);
     imdb_index_catch_up(db); /* a replica's structures follow each applied commit (an open: at its end) */
     for (uint32_t i = 0; i < c->nops; i++)
+        if (c->ops[i].code == IMDB_OP_ERASE && c->ops[i].n_erase) /* E3: a replica's sessions, as the primary's (commit_body) */
+            imdb_txn_doom_erased(db, c->ops[i].erase, c->ops[i].n_erase, seq);
+    for (uint32_t i = 0; i < c->nops; i++)
         if (c->ops[i].code == IMDB_OP_ERASE && c->ops[i].n_erase) /* L stage 2: rows (role entries touch no index) */
             for (uint32_t ti = 0; ti < db->nt; ti++) imdb_index_rebuild_table(db, db->t[ti]); /* stubs out */
     db->last_hlen = c->hlen;

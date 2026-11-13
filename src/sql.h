@@ -76,6 +76,7 @@ typedef struct imdb_session {
     uint32_t stmt_timeout_ms; /* SET statement_timeout = ms: a statement running longer is cancelled (0: none) */
     uint32_t txn_timeout_ms;  /* SET transaction_timeout = ms: a transaction older can only roll back (R4; 0: none) */
     uint32_t idle_timeout_ms; /* SET idle_in_transaction_timeout = ms: one idle longer, the same (R4; 0: none) */
+    uint8_t default_iso;      /* E3: SET default_transaction_isolation: a BEGIN's level when it names none (IMDB_ISO_*) */
     uint64_t stmt_memory;     /* SET statement_memory = bytes: a read statement's workspace ceiling (P0 R2; 0: the default,
                                * a quarter of the memory budget or IMDB_MAX_RESULT_BYTES) */
     struct imdb_prep_set *prep; /* P2 S9: its prepared statements (PREPARE, imdb_prepare), NULL until the first */
