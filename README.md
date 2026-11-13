@@ -888,10 +888,12 @@ SELECT CAST('42' AS INT64), 'a' || CAST(7 AS TEXT), LENGTH('héllo');   -- no FR
   design.md §5 ("Functions, CASE, CAST, IN, LIKE").
 
 The
-lake's segments are Parquet files in a canonical subset of Parquet: any Parquet reader reads them (DuckDB's is
-checked: `make parquet-check`, which links its library, test-only, outside the matrix). The Iceberg tables over
-them, other platforms and the desktop client
-are deferred (deferred.md).
+lake's segments are files in a canonical subset of Parquet, which DuckDB reads (`make parquet-check`, which
+links its library, test-only, outside the matrix); no other Parquet reader is tested yet. A segment holds every
+version of its rows, not a table's current state: ended versions, erased rows as stubs (zero or NULL where their
+values were) and imagedb's system columns (imdb$vid, imdb$begin, imdb$flags, imdb$salt, imdb$commit) beside the
+table's columns. The Iceberg tables that will show each table's current rows, other platforms and the desktop
+client are deferred (deferred.md).
 
 Ordered indexes:
 
