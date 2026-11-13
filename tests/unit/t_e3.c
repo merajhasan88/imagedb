@@ -544,10 +544,42 @@ static void t_ser_alter(void)
     ser_close(db, &a, &b);
 }
 
+/* E3b: a row set's pseudo table (a derived table, a WITH, a view's expansion) is no catalog table: a SERIALIZABLE writer
+ * reading w through each notes w alone (not table 0, t), so a write of t leaves it committing; reading t through a view
+ * still notes t, and a write of t refuses it */
+static void t_ser_rset(void)
+{
+    imdb_session a, b;
+    imdb_db *db = ser_setup(&a, &b, 0); /* t is table 0, w table 1 */
+    CHECK(db);
+    if (!db) return;
+    SRUN(&a, "CREATE VIEW wv AS SELECT id, v FROM w");
+    SRUN(&a, "CREATE VIEW tv AS SELECT id, v FROM t");
+    static const char *const over_w[] = {"SELECT COUNT(*) FROM (SELECT id FROM w) AS d",
+                                         "WITH x AS (SELECT id FROM w) SELECT COUNT(*) FROM x", "SELECT COUNT(*) FROM wv"};
+    char q[96];
+    for (int i = 0; i < 3; i++) {
+        SRUN(&a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+        CHECK(sval(&a, over_w[i]) == 1);
+        CHECK(!(a.txn.rd[0] & 1u) && (a.txn.rd[0] >> 1 & 1u)); /* w noted, t not */
+        snprintf(q, sizeof q, "INSERT INTO t VALUES (%d, 5, 5)", 60 + i);
+        SRUN(&b, q);
+        SRUN(&a, "UPDATE w SET v = v + 1 WHERE id = 1");
+        if (srun(&a, "COMMIT")) test_fail(__FILE__, __LINE__, over_w[i]);
+        if (a.txn.open) SRUN(&a, "ROLLBACK");
+    }
+    SRUN(&a, "BEGIN ISOLATION LEVEL SERIALIZABLE"); /* t through a view: noted */
+    CHECK(sval(&a, "SELECT COUNT(*) FROM tv") == 5);
+    SRUN(&b, "INSERT INTO t VALUES (70, 5, 5)");
+    SRUN(&a, "UPDATE w SET v = v + 1 WHERE id = 1");
+    CONFLICTS(&a, "COMMIT");
+    ser_close(db, &a, &b);
+}
+
 const test_case e3_tests[] = {
     {"e3_write_skew", t_ser_write_skew}, {"e3_phantom", t_ser_phantom}, {"e3_read_only", t_ser_read_only},
     {"e3_paths", t_ser_paths},           {"e3_lake", t_ser_lake},       {"e3_rules", t_ser_rules},
     {"e3_level", t_ser_level},         {"e3_replica", t_ser_replica}, {"e3_erase_order", t_ser_erase_order},
-    {"e3_catalog", t_ser_catalog},     {"e3_alter", t_ser_alter},
+    {"e3_catalog", t_ser_catalog},     {"e3_alter", t_ser_alter},       {"e3_rset", t_ser_rset},
 };
 const size_t e3_ntests = sizeof e3_tests / sizeof *e3_tests;

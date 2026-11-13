@@ -4626,8 +4626,11 @@ static int check_view(xctx *x, const imdb_table *t, uint64_t snap, bool asof, im
                                    * (a replica's apply re-binds a view while it waits for an ERASE record) */
     imdb_txn *tx = &x->ss->txn;
     /* E3 (docs/e3-design.md): every read of a table passes here, the fast paths, joins, nested SELECTs and the reads
-     * a write makes too; a SERIALIZABLE transaction notes the table (never shrunk; an AS OF read changes nothing) */
-    if (!asof && tx->open && tx->iso == IMDB_ISO_SERIALIZABLE && t->s.id < IMDB_MAX_TABLES) {
+     * a write makes too; a SERIALIZABLE transaction notes the table (never shrunk; an AS OF read changes nothing).
+     * E3b: a catalog table alone, the one db->t holds at its id: a row set's pseudo table (a derived table, a WITH, a
+     * view's expansion: rset_table, its id 0) is none, and noting it marked table 0 as read, refusing a writer whenever
+     * the first table was written; the tables its rows came from were noted as they were read */
+    if (!asof && tx->open && tx->iso == IMDB_ISO_SERIALIZABLE && t->s.id < x->db->nt && x->db->t[t->s.id] == t) {
         tx->rd[t->s.id / 32] |= 1u << (t->s.id % 32);
         tx->rd_any = true;
         if (t->hist.nvers > 1 && t->hist.vers[t->hist.nvers - 1].since > tx->snap) {
