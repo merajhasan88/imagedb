@@ -8,14 +8,25 @@
  *                                          recomputed (the payload is outside the signature)
  *   imdb-forge redact-all <segment>        replace every row payload by the redaction
  *                                          marker, keeping descriptors and headers
- *   imdb-forge lie-zonemap <dir>           corrupt a zone map, then re-hash the segment,
+ *   imdb-forge lie-zonemap <dir>           F5: a segment's statistics lie (its first column's max), then re-hash
+ *                                          the segment,
  *                                          the manifest and LAKE_HEAD so all names match
+ *   imdb-forge lie-chunks <dir>            F5: a segment's imagedb.chunks names a chunk by another SHA-256, re-hash
+ *                                          the lake and re-sign the log from the snapshot's commit
  *   imdb-forge lie-tombstone <dir>         move a purged tombstone to another subject, re-hash the
  *                                          lake and re-sign the log from the snapshot's commit
  *                                          (a malicious or buggy writer: everything consistent)
  *   imdb-forge lie-missing <dir>           F1: a row older than its segment's version reads another value than its
- *                                          missing one at a column added since (its zone map made again),
+ *                                          missing one at a column added since (its statistics and chunk list
+ *                                          made again: pq_patch),
  *                                          the lake re-hashed and the log re-signed from the snapshot's commit
+ *   imdb-forge lie-stub <dir>              F5: an erased row (a stub) holds 1000 where a NOT NULL INT64 column's
+ *                                          placeholder, zero, must stand (its page, statistics and chunk list
+ *                                          made again: pq_patch), the lake re-hashed and the log re-signed
+ *   imdb-forge lie-stub-null <dir>         F5: the same, a nullable INT64 column marked VALID at the stub, its value
+ *                                          zero, so that only the VALID rule refuses it (the file
+ *                                          decoded and written again: pq_mark)
+ *   imdb-forge lie-stub-text|-bool|-cell <dir> F5: the same, a NOT NULL TEXT, BOOL or UUID holding a value at the stub
  *   imdb-forge durable-rewind <dir>        DURABLE as a writer that crashed during its last append
  *                                          left it (naming the commit before the last frame)
  *   imdb-forge rotate-foreign <dir>         append a key rotation signed by a key that is not the writer's
@@ -35,6 +46,7 @@
 
 #include "../../src/cpu.h"
 #include "../../src/lake.h"
+#include "../../src/parquet.h" /* F5: segments are Parquet files */
 #include "../../src/log.h"
 #include "../../src/db.h"
 #include "../../src/db_internal.h" /* imdb_version_key: the forged row repeats a live one */
@@ -244,6 +256,162 @@ static int obj_rename(int ofd, const char *old, const uint8_t *b, size_t n, cons
     return 0;
 }
 
+/* F5: segment file f (len bytes, of version v) with user column c's row `row` set to val (w bytes): in its page, and in
+ * its footer's statistics and chunk list made again (stats_only: in the statistics alone, the page as it was), so
+ * that only the rule the value breaks refuses it. The new file (malloc'd), its length at *outlen */
+static uint8_t *pq_patch(const imdb_sver *v, const uint8_t *f, size_t len, uint32_t c, uint32_t row, const uint8_t *val,
+                         unsigned w, bool stats_only, size_t *outlen)
+{
+    imdb_err e = {0};
+    uint8_t *b = malloc(len);
+    memcpy(b, f, len);
+    pq_footer ft;
+    pq_col sh[PQ_MAX_COLUMNS];
+    pq_rcol r[PQ_MAX_COLUMNS];
+    imdb_seg_shapes(v, sh);
+    uint32_t nc = IMDB_SEG_NSYS + v->s.ncols, ci = IMDB_SEG_NSYS + c;
+    if (imdb_pq_footer(b, len, &ft, &e) || imdb_pq_read(b, len, &ft, sh, nc, r, &e)) die("segment", &e);
+    pq_col cols[PQ_MAX_COLUMNS];
+    for (uint32_t k = 0; k < nc; k++) cols[k] = r[k].c;
+    uint8_t *copy = malloc((size_t)ft.nrows * w);
+    memcpy(copy, r[ci].c.fixed, (size_t)ft.nrows * w); /* before the page changes: a REQUIRED column's view is b's */
+    memcpy(copy + (size_t)row * w, val, w);
+    cols[ci].fixed = copy; /* what the statistics are made from */
+    if (!stats_only) {
+        size_t at;
+        if (imdb_pq_value_at(b, len, &ft, ci, &sh[ci], r[ci].c.present, row, &at, &e)) die("segment", &e);
+        memcpy(b + at, val, w);
+    }
+    char list[PQ_MAX_COLUMNS * 112];
+    size_t ll = 0;
+    for (uint32_t k = 0; k < nc; k++) { /* imagedb.chunks again: each chunk's SHA-256 as it now is */
+        uint8_t h[32];
+        char hx[65];
+        imdb_sha256(b + ft.off[k], ft.size[k], h);
+        imdb_hex(h, 32, hx);
+        ll += (size_t)snprintf(list + ll, sizeof list - ll, "%llu,%llu,%s;", (unsigned long long)ft.off[k],
+                               (unsigned long long)ft.size[k], hx);
+    }
+    const uint8_t *vals[PQ_MAX_KV + 1];
+    uint32_t vlen[PQ_MAX_KV + 1];
+    memcpy(vals, ft.val, sizeof vals);
+    memcpy(vlen, ft.vlen, sizeof vlen);
+    vals[0] = (const uint8_t *)list;
+    vlen[0] = (uint32_t)ll;
+    imdb_buf out;
+    imdb_buf_init(&out);
+    imdb_buf_put(&out, b, ft.meta_at);
+    size_t meta = out.len;
+    imdb_pq_footer_encode(&out, cols, nc, ft.nrows, ft.off, ft.size, ft.key, ft.klen, vals, vlen, ft.nkv);
+    imdb_buf_put_u32(&out, (uint32_t)(out.len - meta));
+    imdb_buf_put(&out, "PAR1", 4);
+    if (imdb_buf_check(&out, &e)) die("segment", &e);
+    uint8_t *res = malloc(out.len);
+    memcpy(res, out.p, out.len);
+    *outlen = out.len;
+    imdb_buf_free(&out);
+    imdb_pq_free_read(r, nc);
+    free(copy);
+    free(b);
+    return res;
+}
+
+/* F5: segment file f (len bytes, of version v) with user column c's row `row` given a value by kind: 0 an OPTIONAL INT64
+ * marked present and holding val; 1 a REQUIRED BYTE_ARRAY holding a byte ("q"); 2 a REQUIRED BOOLEAN true; 3 a REQUIRED
+ * FIXED_LEN_BYTE_ARRAY's first byte 1. The file decoded, that column changed, and written again by imdb_pq_write (its
+ * levels, statistics and chunk list made for it, so that only the rule the value breaks refuses it). The new file
+ * (malloc'd), its length at *outlen */
+static uint8_t *pq_mark(const imdb_sver *v, const uint8_t *f, size_t len, uint32_t c, uint32_t row, int kind, int64_t val,
+                        size_t *outlen)
+{
+    imdb_err e = {0};
+    pq_footer ft;
+    pq_col sh[PQ_MAX_COLUMNS];
+    pq_rcol r[PQ_MAX_COLUMNS];
+    imdb_seg_shapes(v, sh);
+    uint32_t nc = IMDB_SEG_NSYS + v->s.ncols, ci = IMDB_SEG_NSYS + c;
+    if (imdb_pq_footer(f, len, &ft, &e) || imdb_pq_read(f, len, &ft, sh, nc, r, &e)) die("segment", &e);
+    static const int want[4] = {PQ_INT64, PQ_BYTE_ARRAY, PQ_BOOLEAN, PQ_FLBA};
+    if (kind < 0 || kind > 3 || (int)sh[ci].phys != want[kind] || (kind == 0) != (r[ci].c.present != NULL)) {
+        fputs("imdb-forge: pq_mark: the column is not of its kind\n", stderr);
+        exit(1);
+    }
+    pq_col cols[PQ_MAX_COLUMNS];
+    for (uint32_t k = 0; k < nc; k++) cols[k] = r[k].c;
+    uint64_t n = ft.nrows;
+    uint8_t *pr = NULL, *fx = NULL, *dt = NULL;
+    uint64_t *of = NULL;
+    if (kind == 0) {
+        pr = calloc((n + 63) / 64 * 8, 1);
+        fx = malloc(n * 8);
+        memcpy(pr, cols[ci].present, (n + 7) / 8);
+        pr[row >> 3] |= (uint8_t)(1u << (row & 7));
+        memcpy(fx, cols[ci].fixed, n * 8);
+        imdb_le64(fx + 8 * (size_t)row, (uint64_t)val);
+        cols[ci].present = pr;
+        cols[ci].fixed = fx;
+    } else if (kind == 1) {
+        of = malloc((n + 1) * sizeof *of);
+        dt = malloc(cols[ci].off[n] + 1);
+        uint64_t at = 0;
+        for (uint64_t i = 0; i < n; i++) {
+            of[i] = at;
+            memcpy(dt + at, cols[ci].data + cols[ci].off[i], cols[ci].off[i + 1] - cols[ci].off[i]);
+            at += cols[ci].off[i + 1] - cols[ci].off[i];
+            if (i == row) dt[at++] = 'q';
+        }
+        of[n] = at;
+        cols[ci].off = of;
+        cols[ci].data = dt;
+    } else {
+        size_t w = kind == 2 ? 1 : (size_t)sh[ci].type_length;
+        fx = malloc(n * w);
+        memcpy(fx, cols[ci].fixed, n * w);
+        fx[(size_t)row * w] = 1;
+        cols[ci].fixed = fx;
+    }
+    static char kb[PQ_MAX_KV][64], vb[PQ_MAX_KV][256]; /* the pairs after imagedb.chunks (the writer makes that one) */
+    pq_kv kv[PQ_MAX_KV];
+    for (uint32_t k = 1; k < ft.nkv; k++) {
+        snprintf(kb[k - 1], sizeof kb[k - 1], "%.*s", (int)ft.klen[k], (const char *)ft.key[k]);
+        snprintf(vb[k - 1], sizeof vb[k - 1], "%.*s", (int)ft.vlen[k], (const char *)ft.val[k]);
+        kv[k - 1].key = kb[k - 1];
+        kv[k - 1].value = vb[k - 1];
+    }
+    imdb_buf out;
+    imdb_buf_init(&out);
+    if (imdb_pq_write(cols, nc, ft.nrows, kv, ft.nkv - 1, &out, &e) || imdb_buf_check(&out, &e)) die("segment", &e);
+    uint8_t *res = malloc(out.len);
+    memcpy(res, out.p, out.len);
+    *outlen = out.len;
+    imdb_buf_free(&out);
+    free(pr);
+    free(fx);
+    free(dt);
+    free(of);
+    imdb_pq_free_read(r, nc);
+    return res;
+}
+
+/* lie_row's stub modes: the column a mode wants at a stub (1 a NOT NULL INT64, 2 a nullable INT64, 3 a NOT NULL TEXT,
+ * 4 a NOT NULL BOOL, 5 a NOT NULL UUID: a 16-byte cell) */
+static bool stub_col(const imdb_sver *gv, const imdb_segimg *gi, uint16_t c, int mode)
+{
+    int t = gv->s.cols[c].type;
+    bool req = !gi->ocol[c].valid;
+    switch (mode) {
+    case 1: return t == IMDB_T_INT64 && gi->ocol[c].i64 && req;
+    case 2: return t == IMDB_T_INT64 && gi->ocol[c].i64 && !req;
+    case 3: return t == IMDB_T_TEXT && req;
+    case 4: return t == IMDB_T_BOOL && req;
+    case 5: return t == IMDB_T_UUID && req;
+    default: return false;
+    }
+}
+
+/* F5: the statistics of a segment's first column lie (its max 999999 where its page holds less), the file otherwise the
+ * writer's (its chunk list made again); segment, manifest and LAKE_HEAD re-hashed, the log not re-signed: the reader's
+ * footer rule refuses it (before F5, the zone map's lie: zone maps live in memory now, made at the load) */
 static void lie_zonemap(const char *dir)
 {
     char p[1200];
@@ -252,45 +420,53 @@ static void lie_zonemap(const char *dir)
     uint8_t *head = slurp(p, &hn);
     char *mpos = strstr((char *)head, "manifest ");
     if (!mpos) exit(1);
-    char mhex[65];
-    memcpy(mhex, mpos + 9, 64);
-    mhex[64] = 0;
+    char mname[80];
+    memcpy(mname, mpos + 9, 64);
+    strcpy(mname + 64, ".man");
     snprintf(p, sizeof p, "%s/objects", dir);
     int ofd = open(p, O_RDONLY | O_DIRECTORY);
-    DIR *d = fdopendir(dup(ofd));
-    struct dirent *de;
-    char segname[300] = {0};
-    while ((de = readdir(d)))
-        if (strstr(de->d_name, ".seg")) {
-            snprintf(segname, sizeof segname, "%s", de->d_name);
-            break;
-        }
-    closedir(d);
-    snprintf(p, sizeof p, "%s/objects/%s", dir, segname);
-    size_t sn;
-    uint8_t *seg = slurp(p, &sn);
-    uint32_t nsec = imdb_get_le32(seg + 56);
-    const uint8_t *zd = seg + IMDB_SEG_HEADER + 24u * (nsec - 1);
-    if (imdb_get_le32(zd) != SEG_ZONEMAP) exit(1);
-    imdb_le64(seg + imdb_get_le64(zd + 8) + 16, 999999); /* max of column 0 is now a lie */
-    char newseg[300], mfile[300], newman[300];
-    if (obj_rename(ofd, segname, seg, sn, ".seg", newseg)) exit(1);
-    snprintf(mfile, sizeof mfile, "%s.man", mhex);
-    snprintf(p, sizeof p, "%s/objects/%s", dir, mfile);
+    snprintf(p, sizeof p, "%s/objects/%s", dir, mname);
     size_t mn;
     uint8_t *man = slurp(p, &mn);
+    imdb_manifest m;
+    imdb_err e = {0};
+    if (imdb_manifest_parse(man, mn, &m, &e)) die("manifest", &e);
+    const imdb_manifest_tab *mt = NULL;
+    for (uint32_t ti = 0; ti < m.nt && !mt; ti++)
+        if (m.t[ti].nseg) mt = &m.t[ti];
+    if (!mt) exit(1);
+    char sname[80];
+    imdb_hex(mt->seg[0].seg, 32, sname);
+    strcat(sname, ".seg");
+    snprintf(p, sizeof p, "%s/objects/%s", dir, sname);
+    size_t sn;
+    uint8_t *raw = slurp(p, &sn);
+    uint8_t *al = aligned_alloc(32, (sn + 31) & ~(size_t)31);
+    memcpy(al, raw, sn);
+    imdb_segment *g;
+    if (imdb_segment_parse_h(&mt->hist, al, sn, NULL, &g, &e)) die("segment", &e);
+    const imdb_sver *gv = &mt->hist.vers[g->gver];
+    imdb_segment_free(g);
+    uint8_t lie[8];
+    imdb_le64(lie, 999999);
+    size_t nl;
+    uint8_t *ns = pq_patch(gv, raw, sn, 0, 0, lie, 8, true, &nl);
+    char newseg[300], newman[300];
+    if (obj_rename(ofd, sname, ns, nl, ".seg", newseg)) exit(1);
     uint8_t oldh[32], newh[32];
-    imdb_unhex(segname, 64, oldh, 32);
+    imdb_unhex(sname, 64, oldh, 32);
     imdb_unhex(newseg, 64, newh, 32);
     for (size_t i = 0; i + 32 <= mn; i++)
         if (memcmp(man + i, oldh, 32) == 0) memcpy(man + i, newh, 32);
-    if (obj_rename(ofd, mfile, man, mn, ".man", newman)) exit(1);
+    if (obj_rename(ofd, mname, man, mn, ".man", newman)) exit(1);
     memcpy(mpos + 9, newman, 64);
     snprintf(p, sizeof p, "%s/LAKE_HEAD", dir);
     spit(p, head, hn);
+    imdb_manifest_free(&m);
     close(ofd);
+    free(ns);
+    free(raw);
     free(head);
-    free(seg);
     free(man);
 }
 
@@ -453,18 +629,25 @@ static void lie_tombstone(const char *dir)
             imdb_segment *g;
             if (imdb_segment_parse_h(&mt->hist, al, sn, NULL, &g, &e)) die("segment", &e); /* F1: by its version */
             const imdb_segimg *gi = imdb_seg_pin(NULL, g, &e); /* a parse of its own: apart, resident */
-            size_t at = SIZE_MAX;
-            for (uint32_t r = 0; r < g->nrows && at == SIZE_MAX; r++)
+            uint32_t row = UINT32_MAX;
+            const imdb_sver *gv = &mt->hist.vers[gi->gver];
+            int sc = gv->s.subject; /* the SUBJECT in the segment's own version */
+            int64_t old = 0;
+            for (uint32_t r = 0; r < g->nrows && row == UINT32_MAX; r++)
                 if (gi->flags[r] == IMDB_SEG_PURGED)
-                    at = (size_t)((const uint8_t *)&gi->col[mt->s.subject].i64[r] - gi->bytes);
+                    row = r, old = gi->ocol[sc].i64[r];
             imdb_segment_free(g);
-            if (at == SIZE_MAX) {
+            if (row == UINT32_MAX) {
                 free(raw);
                 continue;
             }
-            imdb_le64(raw + at, imdb_get_le64(raw + at) + 1000); /* another subject */
+            uint8_t sv[8]; /* another subject: its page, statistics and chunk list (pq_patch) */
+            imdb_le64(sv, (uint64_t)(old + 1000));
+            size_t nl;
+            uint8_t *ns = pq_patch(gv, raw, sn, (uint32_t)sc, row, sv, 8, false, &nl);
             char nseg[80], nman[80];
-            if (obj_rename(ofd, sname, raw, sn, ".seg", nseg)) exit(1);
+            if (obj_rename(ofd, sname, ns, nl, ".seg", nseg)) exit(1);
+            free(ns);
             uint8_t nsh[32];
             imdb_unhex(nseg, 64, nsh, 32);
             if (memcmp(mt->seg[k].dv, (uint8_t[32]){0}, 32) != 0) { /* the DV names its segment */
@@ -504,11 +687,13 @@ static void lie_tombstone(const char *dir)
     free(head);
 }
 
-/* F1: a row of an older version than its segment holds, at a column added after it, another value than its missing one
- * (no commitment covers that value: the readers would read it): the segment's zone map recomputed for it, so that only
- * the rule refuses it; segment, its DV, the manifest and LAKE_HEAD re-hashed, the log re-signed from the snapshot's
- * commit. Wants an INT64 column added by an ALTER and a segment built after it holding a row from before it. */
-static void lie_missing(const char *dir)
+/* A row's value where no commitment covers it, the segment's page, statistics and chunk list made again for it so that
+ * only the rule refuses it; segment, its DV, the manifest and LAKE_HEAD re-hashed, the log re-signed from the snapshot's
+ * commit. F1 (stub false): a row of an older version than its segment holds, at a column added after it, another value
+ * than its missing one (the readers would read it): wants an INT64 column added by an ALTER and a segment built after it
+ * holding a row from before it. F5 (stub true): an erased row (a stub keeps vid, begin and commitment alone) holding a
+ * value where a NOT NULL INT64 column's placeholder, zero, must stand: wants an ERASE's segment. */
+static void lie_row(const char *dir, int mode) /* 0 F1 missing; F5 stubs: 1 NOT NULL INT64, 2 nullable INT64, 3 TEXT, 4 BOOL, 5 UUID */
 {
     char p[1200];
     snprintf(p, sizeof p, "%s/LAKE_HEAD", dir);
@@ -531,7 +716,7 @@ static void lie_missing(const char *dir)
     bool done = false;
     for (uint32_t ti = 0; ti < m.nt && !done; ti++) {
         const imdb_manifest_tab *mt = &m.t[ti];
-        if (mt->hist.nvers < 2) continue;
+        if (!mode && mt->hist.nvers < 2) continue;
         for (uint32_t k = 0; k < mt->nseg && !done; k++) {
             char sname[80];
             imdb_hex(mt->seg[k].seg, 32, sname);
@@ -545,44 +730,37 @@ static void lie_missing(const char *dir)
             if (imdb_segment_parse_h(&mt->hist, al, sn, NULL, &g, &e)) die("segment", &e);
             const imdb_segimg *gi = imdb_seg_pin(NULL, g, &e); /* a parse of its own: apart, resident */
             const imdb_sver *gv = &mt->hist.vers[gi->gver];
-            size_t at = SIZE_MAX;
+            uint32_t row = UINT32_MAX;
+            int64_t old = 0;
             uint32_t col = 0;
-            for (uint32_t r = 0; r < g->nrows && at == SIZE_MAX; r++) {
+            for (uint32_t r = 0; mode && r < g->nrows && row == UINT32_MAX; r++)
+                for (uint16_t c = 0; (gi->flags[r] & IMDB_SEG_STUB) && c < gv->s.ncols && row == UINT32_MAX; c++)
+                    if (stub_col(gv, gi, c, mode)) {
+                        row = r, old = gi->ocol[c].i64 ? gi->ocol[c].i64[r] : 0; /* the placeholder, 0: it becomes 1000 */
+                        col = c;
+                    }
+            for (uint32_t r = 0; !mode && r < g->nrows && row == UINT32_MAX; r++) {
                 const imdb_sver *rv = imdb_hist_at(&mt->hist, gi->begin[r]);
-                for (uint16_t c = 0; !gi->flags[r] && c < gv->s.ncols && at == SIZE_MAX; c++)
+                for (uint16_t c = 0; !gi->flags[r] && c < gv->s.ncols && row == UINT32_MAX; c++)
                     if (rv->at[gv->pos[c]] < 0 && gv->s.cols[c].type == IMDB_T_INT64 && gi->ocol[c].i64 &&
                         (!gi->ocol[c].valid || (gi->ocol[c].valid[r >> 3] >> (r & 7) & 1))) {
-                        at = (size_t)((const uint8_t *)&gi->ocol[c].i64[r] - gi->bytes);
+                        row = r, old = gi->ocol[c].i64[r];
                         col = c;
                     }
             }
-            if (at == SIZE_MAX) {
+            if (row == UINT32_MAX) {
                 imdb_segment_free(g);
                 free(raw);
                 continue;
             }
-            imdb_le64(raw + at, imdb_get_le64(raw + at) + 1000); /* another value than its missing one */
-            /* the zone map of that column made again from the stored values, as the builder makes it */
-            uint32_t nsec = imdb_get_le32(raw + 56);
-            const uint8_t *zd = raw + IMDB_SEG_HEADER + 24u * (nsec - 1);
-            if (imdb_get_le32(zd) != SEG_ZONEMAP) exit(1);
-            uint8_t *z = raw + imdb_get_le64(zd + 8) + 24u * col;
-            size_t base = (size_t)((const uint8_t *)gi->ocol[col].i64 - gi->bytes);
-            bool has = false;
-            int64_t mn2 = 0, mx2 = 0;
-            for (uint32_t r = 0; r < g->nrows; r++) {
-                if (gi->flags[r] || (gi->ocol[col].valid && !(gi->ocol[col].valid[r >> 3] >> (r & 7) & 1))) continue;
-                int64_t v = (int64_t)imdb_get_le64(raw + base + 8u * r);
-                if (!has || v < mn2) mn2 = v;
-                if (!has || v > mx2) mx2 = v;
-                has = true;
-            }
-            z[0] = has;
-            imdb_le64(z + 8, (uint64_t)mn2);
-            imdb_le64(z + 16, (uint64_t)mx2);
+            uint8_t mv[8]; /* another value than its missing one: its page, statistics and chunk list (pq_patch) */
+            imdb_le64(mv, (uint64_t)(old + 1000));
+            size_t nl;
+            uint8_t *ns = mode >= 2 ? pq_mark(gv, raw, sn, col, row, mode - 2, mode == 2 ? 0 : old + 1000, &nl) : pq_patch(gv, raw, sn, col, row, mv, 8, false, &nl);
             imdb_segment_free(g);
             char nseg[80], nman[80];
-            if (obj_rename(ofd, sname, raw, sn, ".seg", nseg)) exit(1);
+            if (obj_rename(ofd, sname, ns, nl, ".seg", nseg)) exit(1);
+            free(ns);
             uint8_t nsh[32];
             imdb_unhex(nseg, 64, nsh, 32);
             if (memcmp(mt->seg[k].dv, (uint8_t[32]){0}, 32) != 0) { /* the DV names its segment */
@@ -613,11 +791,88 @@ static void lie_missing(const char *dir)
         }
     }
     if (!done) {
-        fputs("imdb-forge: no segment row of an older version under an added INT64 column\n", stderr);
+        static const char *const none[] = {"no segment row of an older version under an added INT64 column",
+                                           "no erased row in a segment with a NOT NULL INT64 column",
+                                           "no erased row in a segment with a nullable INT64 column",
+                                           "no erased row in a segment with a NOT NULL TEXT column",
+                                           "no erased row in a segment with a NOT NULL BOOL column",
+                                           "no erased row in a segment with a NOT NULL UUID column"};
+        fprintf(stderr, "imdb-forge: %s\n", none[mode]);
         exit(1);
     }
     imdb_manifest_free(&m);
     close(ofd);
+    free(man);
+    free(head);
+}
+
+/* F5: a segment whose imagedb.chunks names one chunk by another SHA-256 (a hex digit changed: the file's own hash, its
+ * name, right again), its DV, the manifest and LAKE_HEAD re-hashed and the log re-signed from the snapshot's commit:
+ * a load reads the file whole by its name and hashes no chunk, so VERIFY and the auditor alone refuse it */
+static void lie_chunks(const char *dir)
+{
+    char p[1200];
+    snprintf(p, sizeof p, "%s/LAKE_HEAD", dir);
+    size_t hn;
+    uint8_t *head = slurp(p, &hn);
+    char *mpos = strstr((char *)head, "manifest ");
+    unsigned long long S = 0;
+    if (!mpos || sscanf((char *)head, "imagedb-lake 1\nseq %llu", &S) != 1) exit(1);
+    char mname[80];
+    memcpy(mname, mpos + 9, 64);
+    strcpy(mname + 64, ".man");
+    snprintf(p, sizeof p, "%s/objects", dir);
+    int ofd = open(p, O_RDONLY | O_DIRECTORY);
+    snprintf(p, sizeof p, "%s/objects/%s", dir, mname);
+    size_t mn;
+    uint8_t *man = slurp(p, &mn);
+    imdb_manifest m;
+    imdb_err e = {0};
+    if (imdb_manifest_parse(man, mn, &m, &e)) die("manifest", &e);
+    const imdb_manifest_tab *mt = NULL;
+    for (uint32_t ti = 0; ti < m.nt && !mt; ti++)
+        if (m.t[ti].nseg) mt = &m.t[ti];
+    if (!mt) exit(1);
+    char sname[80];
+    imdb_hex(mt->seg[0].seg, 32, sname);
+    strcat(sname, ".seg");
+    snprintf(p, sizeof p, "%s/objects/%s", dir, sname);
+    size_t sn;
+    uint8_t *raw = slurp(p, &sn);
+    pq_footer ft;
+    if (imdb_pq_footer(raw, sn, &ft, &e)) die("segment", &e);
+    uint8_t *d = raw + (ft.chunk_hex[ft.ncols - 1] - raw); /* the last chunk's hash, its first digit */
+    *d = *d == '0' ? '1' : '0';
+    char nseg[80], nman[80];
+    if (obj_rename(ofd, sname, raw, sn, ".seg", nseg)) exit(1);
+    uint8_t nsh[32];
+    imdb_unhex(nseg, 64, nsh, 32);
+    if (memcmp(mt->seg[0].dv, (uint8_t[32]){0}, 32) != 0) { /* the DV names its segment */
+        char dname[80], ndv[80];
+        imdb_hex(mt->seg[0].dv, 32, dname);
+        strcat(dname, ".dv");
+        snprintf(p, sizeof p, "%s/objects/%s", dir, dname);
+        size_t dn;
+        uint8_t *dv = slurp(p, &dn);
+        replace_hash(dv, dn, mt->seg[0].seg, nsh);
+        if (obj_rename(ofd, dname, dv, dn, ".dv", ndv)) exit(1);
+        uint8_t ndh[32];
+        imdb_unhex(ndv, 64, ndh, 32);
+        replace_hash(man, mn, mt->seg[0].dv, ndh);
+        free(dv);
+    }
+    replace_hash(man, mn, mt->seg[0].seg, nsh);
+    if (obj_rename(ofd, mname, man, mn, ".man", nman)) exit(1);
+    man_swap sw;
+    imdb_unhex(mname, 64, sw.old, 32);
+    imdb_unhex(nman, 64, sw.new_, 32);
+    memcpy(mpos + 9, nman, 64);
+    snprintf(p, sizeof p, "%s/LAKE_HEAD", dir);
+    spit(p, head, hn);
+    resign_from(dir, S, swap_manifest, &sw);
+    imdb_manifest_free(&m);
+    close(ofd);
+    free(raw);
     free(man);
     free(head);
 }
@@ -753,9 +1008,24 @@ static void corpus(const char *dir, const char *out)
         size_t on;
         uint8_t *b = slurp(q, &on);
         if (strstr(de->d_name, ".seg") && on > 16) {
-            /* seed = table id byte + segment (the harness parses against that schema) */
+            /* seed = table id byte + segment (the harness parses against that schema): F5, the id its footer's
+             * imagedb.table names (before, the old header's bytes 12-15: in a Parquet file, a chunk's data) */
+            pq_footer ft;
+            imdb_err fe = {0};
+            unsigned long tid = 256;
+            if (imdb_pq_footer(b, on, &ft, &fe)) die("segment", &fe);
+            for (uint32_t k = 0; k < ft.nkv; k++)
+                if (ft.klen[k] == 13 && !memcmp(ft.key[k], "imagedb.table", 13) && ft.vlen[k] < 12) {
+                    char v[16];
+                    snprintf(v, sizeof v, "%.*s", (int)ft.vlen[k], (const char *)ft.val[k]);
+                    tid = strtoul(v, NULL, 10);
+                }
+            if (tid > 255) {
+                fputs("imdb-forge: corpus: a segment without a table id of a byte\n", stderr);
+                exit(1);
+            }
             uint8_t *s = malloc(on + 1);
-            s[0] = (uint8_t)imdb_get_le32(b + 12);
+            s[0] = (uint8_t)tid;
             memcpy(s + 1, b, on);
             snprintf(dst, sizeof dst, "%s/segment/%.16s", out, de->d_name);
             spit(dst, s, on + 1);
@@ -2223,8 +2493,24 @@ int main(int argc, char **argv)
         durable_rewind(argv[2]);
         return 0;
     }
+    if (argc == 3 && strcmp(argv[1], "lie-chunks") == 0) { /* F5: a chunk's SHA-256 lies, its file's name right */
+        lie_chunks(argv[2]);
+        return 0;
+    }
+    if (argc == 3 && (!strcmp(argv[1], "lie-stub-text") || !strcmp(argv[1], "lie-stub-bool") || !strcmp(argv[1], "lie-stub-cell"))) {
+        lie_row(argv[2], argv[1][9] == 't' ? 3 : argv[1][9] == 'b' ? 4 : 5); /* F5 */
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[1], "lie-stub-null") == 0) { /* F5 */
+        lie_row(argv[2], 2);
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[1], "lie-stub") == 0) { /* F5 */
+        lie_row(argv[2], 1);
+        return 0;
+    }
     if (argc == 3 && strcmp(argv[1], "lie-missing") == 0) { /* F1 */
-        lie_missing(argv[2]);
+        lie_row(argv[2], 0);
         return 0;
     }
     if (argc == 3 && strcmp(argv[1], "lie-tombstone") == 0) {
@@ -2263,7 +2549,7 @@ int main(int argc, char **argv)
         corpus(argv[2], argv[3]);
         return 0;
     }
-    fputs("usage: imdb-forge lie-payload SEGMENT | redact-all SEGMENT | index-lie DIR KIND | view-lie DIR KIND | manifest-lie DIR KIND | lie-zonemap DIR | lie-tombstone DIR | lie-missing DIR | durable-rewind DIR | "
+    fputs("usage: imdb-forge lie-payload SEGMENT | redact-all SEGMENT | index-lie DIR KIND | view-lie DIR KIND | manifest-lie DIR KIND | lie-zonemap DIR | lie-chunks DIR | lie-tombstone DIR | lie-missing DIR | lie-stub DIR | lie-stub-null DIR | lie-stub-text DIR | lie-stub-bool DIR | lie-stub-cell DIR | durable-rewind DIR | "
           "rotate-foreign DIR | promote-elsewhere DIR ROOTKEY | writers-resign DIR | alg-flip DIR SEQ | corpus DIR OUT\n", stderr);
     return 2;
 }

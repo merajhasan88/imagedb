@@ -1,4 +1,4 @@
-/* Segment files: byte 0 picks the schema; the rest is the file image. */
+/* Segment files (F5: imagedb's Parquet subset, lake.h): byte 0 picks the schema; the rest is the file image. */
 #include "../src/db_internal.h"
 #include "../src/lake.h"
 #include "fuzz_common.h"
@@ -17,7 +17,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     memcpy(b, data + 1, n);
     imdb_segment *g;
     imdb_err e = {0};
-    if (imdb_segment_parse(&s, h.vers[0].hash, b, n, NULL, &g, &e) == 0) {
+    if (imdb_segment_parse(&h.vers[0], b, n, NULL, &g, &e) == 0) { /* F5: a Parquet segment of that version */
         imdb_err e2 = {0};
         imdb_segimg *gi = imdb_seg_pin(NULL, g, &e2); /* a parse of its own: apart from any table, resident */
         if (gi) (void)imdb_segment_check_commitments(&h, g, gi, &e2);

@@ -7,8 +7,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "../../src/backup.h" /* F5: seg_nulls' backup and restore */
 #include "../../src/fsio.h"
 #include "../../src/lake.h"
+#include "../../src/parquet.h"
+#include "../../src/sql.h" /* F5: the settle test's rows */
 #include "thelp.h"
 
 static uint64_t lookup_cents(imdb_db *db, int64_t id, uint64_t snap)
@@ -378,38 +381,51 @@ static void t_segment_decoder_strict(void)
     OK(imdb_checkpoint(db, E));
     imdb_table *t = imdb_table_by_name(db, "txns");
     imdb_segment *g = t->seg[0];
-    const imdb_segimg *gimg = imdb_seg_pin(t, g, E);
-    CHECK(gimg);
-    size_t n = gimg->len;
+    /* the segment as written (F5: a loaded or published image keeps no copy of its file: seg_settle) */
+    char hname[65], path[600];
+    imdb_hex(g->hash, 32, hname);
+    snprintf(path, sizeof path, "%s/objects/%s.seg", dir, hname);
+    FILE *ff = fopen(path, "rb");
+    CHECK(ff);
+    fseek(ff, 0, SEEK_END);
+    size_t n = (size_t)ftell(ff);
+    fseek(ff, 0, SEEK_SET);
+    uint8_t *file = malloc(n);
+    CHECK(file && fread(file, 1, n, ff) == n);
+    fclose(ff);
     int accepted_mut = 0;
     for (size_t cut = 0; cut < n; cut++) {
         uint8_t *b = imdb_alloc_aligned(1, cut ? cut : 1, E);
-        memcpy(b, gimg->bytes, cut);
+        memcpy(b, file, cut);
         imdb_segment *x;
         imdb_err e2 = {0};
-        CHECK(imdb_segment_parse(&t->s, t->hist.vers[0].hash, b, cut, NULL, &x, &e2) != 0);
+        CHECK(imdb_segment_parse(&t->hist.vers[0], b, cut, NULL, &x, &e2) != 0);
         imdb_free(b);
     }
     for (size_t at = 0; at < n; at++) {
         uint8_t *b = imdb_alloc_aligned(1, n, E);
-        memcpy(b, gimg->bytes, n);
+        memcpy(b, file, n);
         b[at] ^= 0x01;
         imdb_segment *x;
         imdb_err e2 = {0};
-        if (imdb_segment_parse(&t->s, t->hist.vers[0].hash, b, n, NULL, &x, &e2) == 0) {
-            /* A structurally valid mutation always changes the content hash.
-             * If it also survives the commitment check it can only be in the
-             * VID or BEGIN columns, which VERIFY compares with the version store. */
+        if (imdb_segment_parse(&t->hist.vers[0], b, n, NULL, &x, &e2) == 0) {
+            /* A structurally valid mutation always changes the content hash. If it also survives the commitment
+             * check it can only be in the imdb$vid or imdb$begin chunks, which VERIFY compares with the version store,
+             * or in imagedb.chunks' hashes, which a load does not hash (F5: VERIFY and the auditor check them) */
             uint8_t h[32];
             imdb_segimg *xi = imdb_seg_pin(NULL, x, E); /* a parse of its own: apart, resident */
             imdb_sha256(xi->bytes, xi->len, h);
             CHECK(memcmp(h, g->hash, 32) != 0);
             imdb_err e3 = {0};
             if (imdb_segment_check_commitments(&t->hist, x, xi, &e3) == 0) {
-                uint64_t vid_off = imdb_get_le64(gimg->bytes + IMDB_SEG_HEADER + 8);
-                uint64_t beg_off = imdb_get_le64(gimg->bytes + IMDB_SEG_HEADER + 24 + 8);
-                bool in_sys = (at >= vid_off && at < vid_off + 8u * g->nrows) ||
-                              (at >= beg_off && at < beg_off + 8u * g->nrows);
+                pq_footer ft;
+                OK(imdb_pq_footer(file, n, &ft, E));
+                bool in_sys = (at >= ft.off[0] && at < ft.off[0] + ft.size[0]) ||
+                              (at >= ft.off[1] && at < ft.off[1] + ft.size[1]);
+                for (uint32_t ci = 0; ci < ft.ncols; ci++) {
+                    size_t hx = (size_t)(ft.chunk_hex[ci] - file);
+                    in_sys |= at >= hx && at < hx + 64;
+                }
                 CHECK(in_sys);
             }
             accepted_mut++;
@@ -418,6 +434,7 @@ static void t_segment_decoder_strict(void)
             imdb_free(b);
         }
     }
+    free(file);
     CHECK(accepted_mut > 0 && (size_t)accepted_mut < n);
     /* manifest: every truncation rejected */
     for (size_t cut = 0; cut < db->lake_mlen; cut++) {
@@ -1207,6 +1224,535 @@ static void t_pin_verify_rules(void)
     imdb_close(db);
 }
 
+/* F5: an image settles (lake.c seg_settle): a nullable table's, built (once its object is written) or loaded, keeps no
+ * copy of its file, its views its own arrays; a table of NOT NULL fixed-width columns keeps its file as its views */
+static int lsql(imdb_session *s, const char *q)
+{
+    imdb_result r;
+    imdb_err_clear(&g_e);
+    int rc = imdb_exec_one(s, q, strlen(q), NULL, 0, &r, &g_e);
+    if (!rc) imdb_result_free(&r);
+    return rc;
+}
+
+static void t_seg_settle(void)
+{
+    const char *dir = test_tmpdir();
+    OK(imdb_init(dir, false, NULL, E));
+    for (int pass = 0; pass < 2; pass++) { /* built, then loaded by a reopen */
+        imdb_db *db = open_db(dir);
+        CHECK(db);
+        imdb_session s;
+        imdb_session_init(&s, db);
+        if (!pass) {
+            OK(lsql(&s, "CREATE TABLE a (id BIGINT PRIMARY KEY, x TEXT, i INTEGER, f FLOAT64)"));
+            OK(lsql(&s, "CREATE TABLE b (id BIGINT PRIMARY KEY, k BIGINT NOT NULL, t TIMESTAMP NOT NULL)"));
+            for (int r = 0; r < 2000; r += 100) {
+                char q[16384];
+                size_t at = (size_t)snprintf(q, sizeof q, "INSERT INTO a VALUES ");
+                for (int k = r; k < r + 100; k++)
+                    at += (size_t)snprintf(q + at, sizeof q - at, "%s(%d, %s, %s, %s)", k > r ? ", " : "", k,
+                                           k % 3 ? "'a memo'" : "NULL", k % 5 ? "7" : "NULL", k % 7 ? "1.5" : "NULL");
+                OK(lsql(&s, q));
+                at = (size_t)snprintf(q, sizeof q, "INSERT INTO b VALUES ");
+                for (int k = r; k < r + 100; k++)
+                    at += (size_t)snprintf(q + at, sizeof q - at, "%s(%d, %d, TIMESTAMP '2026-11-13 12:00:00')", k > r ? ", " : "", k, k * 3);
+                OK(lsql(&s, q));
+            }
+            OK(lsql(&s, "CHECKPOINT"));
+        }
+        for (int tb = 0; tb < 2; tb++) {
+            imdb_table *t = imdb_table_by_name(db, tb ? "b" : "a");
+            CHECK(t && t->nseg > 0);
+            for (uint32_t k = 0; k < t->nseg; k++) {
+                const imdb_segimg *gi = imdb_seg_pin(t, t->seg[k], E);
+                CHECK(gi);
+                if (!tb) CHECK(gi->viewless && !gi->bytes && !gi->len); /* settled: its file gone */
+                else CHECK(!gi->viewless && gi->bytes && gi->len);      /* its file its views */
+            }
+        }
+        imdb_session_close(&s);
+        imdb_close(db);
+    }
+}
+
+/* F5: a stub (an erased row) keeps its vid, begin and commitment alone: the parse refuses one whose NOT NULL column holds
+ * a value where its placeholder (zero) must stand, the statistics unchanged (the value within them, so this rule alone
+ * refuses it), or whose salt is not zero. The file is an ERASE's own segment, patched where imdb_pq_value_at puts the
+ * row's value (a writer's lie gets past no replay: audit_reject.sh's PB; this is the parse's own rule) */
+static void t_seg_stub_placeholder(void)
+{
+    const char *dir = test_tmpdir();
+    OK(imdb_init(dir, false, NULL, E));
+    imdb_db *db = open_db(dir);
+    CHECK(db);
+    imdb_session s;
+    imdb_session_init(&s, db);
+    OK(lsql(&s, "CREATE TABLE t (id INT64 PRIMARY KEY, u INT64 SUBJECT, memo TEXT)"));
+    OK(lsql(&s, "INSERT INTO t VALUES (1, 42, 'secret-one'), (2, 7, 'two'), (3, 42, 'secret-three')"));
+    OK(lsql(&s, "CHECKPOINT"));
+    OK(lsql(&s, "ERASE SUBJECT 42"));
+    imdb_table *t = imdb_table_by_name(db, "t");
+    CHECK(t && t->nseg == 1);
+    char hname[65], path[1200];
+    imdb_hex(t->seg[0]->hash, 32, hname);
+    snprintf(path, sizeof path, "%s/objects/%s.seg", dir, hname);
+    FILE *ff = fopen(path, "rb");
+    CHECK(ff);
+    fseek(ff, 0, SEEK_END);
+    size_t n = (size_t)ftell(ff);
+    fseek(ff, 0, SEEK_SET);
+    uint8_t *file = malloc(n);
+    CHECK(file && fread(file, 1, n, ff) == n);
+    fclose(ff);
+    const imdb_sver *v = &t->hist.vers[0];
+    pq_footer ft;
+    pq_col sh[PQ_MAX_COLUMNS];
+    pq_rcol r[PQ_MAX_COLUMNS];
+    imdb_seg_shapes(v, sh);
+    uint32_t nc = IMDB_SEG_NSYS + v->s.ncols, stub = UINT32_MAX, stubs = 0;
+    OK(imdb_pq_footer(file, n, &ft, E));
+    OK(imdb_pq_read(file, n, &ft, sh, nc, r, E));
+    for (uint32_t i = 0; i < ft.nrows; i++)
+        if (imdb_get_le32(r[2].c.fixed + 4u * i) & IMDB_SEG_STUB) {
+            stubs++;
+            if (stub == UINT32_MAX) stub = i;
+        }
+    CHECK(stubs == 2 && stub != UINT32_MAX);
+    CHECK(imdb_get_le64(r[IMDB_SEG_NSYS].c.fixed + 8u * stub) == 0); /* id's placeholder; the other stub's keeps the
+                                                                        statistics' minimum 0, the live row's 2 its max */
+    size_t at_id = 0, at_salt = 0;
+    OK(imdb_pq_value_at(file, n, &ft, IMDB_SEG_NSYS, &sh[IMDB_SEG_NSYS], r[IMDB_SEG_NSYS].c.present, stub, &at_id, E));
+    OK(imdb_pq_value_at(file, n, &ft, 3, &sh[3], r[3].c.present, stub, &at_salt, E));
+    imdb_pq_free_read(r, nc);
+    static const char *const why[] = {NULL, "keeps data", "keeps a salt"};
+    for (int k = 0; k < 3; k++) {
+        uint8_t *b = imdb_alloc_aligned(1, n, E);
+        CHECK(b);
+        memcpy(b, file, n);
+        if (k == 1) b[at_id] = 1; /* id 1: within [0, 2] */
+        if (k == 2) b[at_salt] = 1;
+        imdb_segment *x = NULL;
+        imdb_err e2 = {0};
+        int rc = imdb_segment_parse(v, b, n, NULL, &x, &e2);
+        if (!why[k]) {
+            CHECK(rc == 0);
+            if (!rc) imdb_segment_free(x);
+            else imdb_free(b);
+        } else {
+            CHECK(rc == IMDB_ERR_CORRUPT && strstr(e2.msg, why[k]));
+            if (!rc) imdb_segment_free(x);
+            else imdb_free(b);
+        }
+    }
+    free(file);
+    imdb_session_close(&s);
+    imdb_close(db);
+}
+
+/* F5: every placeholder rule of a stub (an erased row keeps its vid, begin and commitment alone), one a case: the
+ * ERASE's segment decoded, one column changed at a stub row, the file written again by imdb_pq_write (its statistics and
+ * chunk list made for the change, so only the rule refuses it) and parsed: a NOT NULL BOOL, TEXT and UUID (a 16-byte
+ * cell) holding a value, and a nullable INT64 and TEXT marked VALID. Unchanged, the decoded columns write the same file */
+static void t_seg_stub_placeholders_typed(void)
+{
+    const char *dir = test_tmpdir();
+    OK(imdb_init(dir, false, NULL, E));
+    imdb_db *db = open_db(dir);
+    CHECK(db);
+    imdb_session s;
+    imdb_session_init(&s, db);
+    OK(lsql(&s, "CREATE TABLE t (id INT64 PRIMARY KEY, u INT64 SUBJECT, b BOOL NOT NULL, x TEXT NOT NULL, g UUID NOT NULL, "
+                "n INT64, m TEXT)"));
+    OK(lsql(&s, "INSERT INTO t VALUES (1, 42, TRUE, 'secret', '0f8c3ad1-1111-4222-8333-444455556666', 5, 'memo'), "
+                "(2, 7, FALSE, 'kept', '1f8c3ad1-1111-4222-8333-444455556666', NULL, NULL), "
+                "(3, 42, TRUE, 'secret2', '2f8c3ad1-1111-4222-8333-444455556666', 6, 'memo2')"));
+    OK(lsql(&s, "CHECKPOINT"));
+    OK(lsql(&s, "ERASE SUBJECT 42"));
+    imdb_table *t = imdb_table_by_name(db, "t");
+    CHECK(t && t->nseg == 1);
+    char hname[65], path[1200];
+    imdb_hex(t->seg[0]->hash, 32, hname);
+    snprintf(path, sizeof path, "%s/objects/%s.seg", dir, hname);
+    FILE *ff = fopen(path, "rb");
+    CHECK(ff);
+    fseek(ff, 0, SEEK_END);
+    size_t n = (size_t)ftell(ff);
+    fseek(ff, 0, SEEK_SET);
+    uint8_t *file = malloc(n);
+    CHECK(file && fread(file, 1, n, ff) == n);
+    fclose(ff);
+    const imdb_sver *v = &t->hist.vers[0];
+    pq_footer ft;
+    pq_col sh[PQ_MAX_COLUMNS];
+    pq_rcol r[PQ_MAX_COLUMNS];
+    imdb_seg_shapes(v, sh);
+    uint32_t nc = IMDB_SEG_NSYS + v->s.ncols;
+    OK(imdb_pq_footer(file, n, &ft, E));
+    OK(imdb_pq_read(file, n, &ft, sh, nc, r, E));
+    uint64_t rows = ft.nrows, stub = UINT64_MAX;
+    for (uint64_t i = 0; i < rows && stub == UINT64_MAX; i++)
+        if (imdb_get_le32(r[2].c.fixed + 4u * i) & IMDB_SEG_STUB) stub = i;
+    CHECK(rows == 3 && stub != UINT64_MAX);
+    /* the footer's pairs after imagedb.chunks (the writer makes that one) */
+    static char kb[PQ_MAX_KV][64], vb[PQ_MAX_KV][256];
+    pq_kv kv[PQ_MAX_KV];
+    uint32_t nkv = ft.nkv - 1;
+    for (uint32_t k = 0; k < nkv; k++) {
+        snprintf(kb[k], sizeof kb[k], "%.*s", (int)ft.klen[k + 1], (const char *)ft.key[k + 1]);
+        snprintf(vb[k], sizeof vb[k], "%.*s", (int)ft.vlen[k + 1], (const char *)ft.val[k + 1]);
+        kv[k].key = kb[k];
+        kv[k].value = vb[k];
+    }
+    enum { CB = IMDB_SEG_NSYS + 2, CX, CG, CN, CM };
+    static const char *const why[] = {NULL, "bad BOOL in column b", "column x keeps text", "column g keeps data",
+                                      "marked VALID in column n", "marked VALID in column m"};
+    for (int k = 0; k < 6; k++) {
+        pq_col cols[PQ_MAX_COLUMNS];
+        for (uint32_t c = 0; c < nc; c++) cols[c] = r[c].c;
+        uint8_t *fx = NULL, *pr = NULL, *dt = NULL;
+        uint64_t *of = NULL;
+        uint32_t tc = k == 2 ? CX : CM; /* the TEXT column a case gives "q" at the stub */
+        if (k == 1) {
+            fx = malloc(rows);
+            memcpy(fx, cols[CB].fixed, rows);
+            fx[stub] = 1;
+            cols[CB].fixed = fx;
+        } else if (k == 3) {
+            fx = malloc(rows * 16);
+            memcpy(fx, cols[CG].fixed, rows * 16);
+            fx[stub * 16] = 1;
+            cols[CG].fixed = fx;
+        } else if (k == 4) {
+            pr = calloc((rows + 63) / 64 * 8, 1);
+            memcpy(pr, cols[CN].present, (rows + 7) / 8);
+            pr[stub >> 3] |= (uint8_t)(1u << (stub & 7));
+            fx = malloc(rows * 8);
+            memcpy(fx, cols[CN].fixed, rows * 8);
+            imdb_le64(fx + 8 * stub, 5);
+            cols[CN].present = pr;
+            cols[CN].fixed = fx;
+        }
+        if (k == 2 || k == 5) {
+            of = malloc((rows + 1) * sizeof *of);
+            dt = malloc(cols[tc].off[rows] + 1);
+            uint64_t at = 0;
+            for (uint64_t i = 0; i < rows; i++) {
+                of[i] = at;
+                uint64_t a0 = cols[tc].off[i], z0 = cols[tc].off[i + 1];
+                memcpy(dt + at, cols[tc].data + a0, z0 - a0);
+                at += z0 - a0;
+                if (i == stub) dt[at++] = 'q';
+            }
+            of[rows] = at;
+            cols[tc].off = of;
+            cols[tc].data = dt;
+            if (k == 5) {
+                pr = calloc((rows + 63) / 64 * 8, 1);
+                memcpy(pr, cols[CM].present, (rows + 7) / 8);
+                pr[stub >> 3] |= (uint8_t)(1u << (stub & 7));
+                cols[CM].present = pr;
+            }
+        }
+        imdb_buf out;
+        imdb_buf_init(&out);
+        OK(imdb_pq_write(cols, nc, rows, kv, nkv, &out, E));
+        uint8_t *b = imdb_alloc_aligned(1, out.len, E);
+        CHECK(b);
+        memcpy(b, out.p, out.len);
+        imdb_segment *x = NULL;
+        imdb_err e2 = {0};
+        int rc = imdb_segment_parse(v, b, out.len, NULL, &x, &e2);
+        if (!why[k]) CHECK(rc == 0 && out.len == n && !memcmp(out.p, file, n)); /* the writer of the reader's columns */
+        else CHECK(rc == IMDB_ERR_CORRUPT && strstr(e2.msg, why[k]));
+        if (!rc) imdb_segment_free(x);
+        else imdb_free(b);
+        imdb_buf_free(&out);
+        free(fx);
+        free(pr);
+        free(of);
+        free(dt);
+    }
+    imdb_pq_free_read(r, nc);
+    free(file);
+    imdb_session_close(&s);
+    imdb_close(db);
+}
+
+/* the answer to q as CSV (a NULL an empty field, TEXT always quoted), malloc'd; NULL on an error */
+static char *lrender(imdb_session *s, const char *q)
+{
+    imdb_result r;
+    imdb_err_clear(&g_e);
+    if (imdb_exec_one(s, q, strlen(q), NULL, 0, &r, &g_e)) return NULL;
+    imdb_buf b;
+    imdb_buf_init(&b);
+    if (r.has_rows) imdb_result_render(&r, true, &b);
+    imdb_result_free(&r);
+    char *out = NULL;
+    if (!imdb_buf_check(&b, &g_e) && (out = malloc(b.len + 1))) {
+        memcpy(out, b.p, b.len);
+        out[b.len] = 0;
+    }
+    imdb_buf_free(&b);
+    return out;
+}
+
+/* each of n queries' answers want[k], from a database opened with every ended version out of memory (IMDB_EVICT
+ * eager, set for the open) and a cache of one byte (each image read again from its file), a replica fed stream
+ * first; the answers read from the files (loads counted) and VERIFY taking the copy: 0 when all hold */
+static int lake_answers(const char *dir, const char *const *q, char *const *want, int n, bool replica, const char *stream)
+{
+    const char *old = getenv("IMDB_EVICT");
+    char keep[32] = "";
+    if (old) snprintf(keep, sizeof keep, "%s", old);
+    setenv("IMDB_EVICT", "eager", 1);
+    imdb_open_opts o = {.sync = 0, .seg_cache_bytes = 1};
+    imdb_db *db = NULL;
+    int bad = imdb_open(dir, &o, &db, &g_e) != 0;
+    if (old) setenv("IMDB_EVICT", keep, 1);
+    else unsetenv("IMDB_EVICT");
+    if (bad) return 1;
+    uint64_t applied = 0;
+    if (replica && apply_file(db, stream, &applied, &g_e)) bad = 1;
+    imdb_session s;
+    imdb_session_init(&s, db);
+    uint64_t loads = db->segcache.loads;
+    for (int k = 0; k < n && !bad; k++) {
+        char *got = lrender(&s, q[k]);
+        if (!got || strcmp(got, want[k])) bad = 1;
+        free(got);
+    }
+    if (db->segcache.loads == loads) bad = 1; /* the answers were read from the files */
+    imdb_verify_report vr;
+    if (!bad && imdb_verify(db, &vr, &g_e)) bad = 1;
+    imdb_session_close(&s);
+    imdb_close(db);
+    return bad;
+}
+
+/* each state AS OF its commit */
+static int nulls_from_lake(const char *dir, const uint64_t at[2], char *const want[2], bool replica, const char *stream)
+{
+    char q0[96], q1[96];
+    snprintf(q0, sizeof q0, "SELECT * FROM t AS OF %llu ORDER BY id", (unsigned long long)at[0]);
+    snprintf(q1, sizeof q1, "SELECT * FROM t AS OF %llu ORDER BY id", (unsigned long long)at[1]);
+    const char *q[2] = {q0, q1};
+    return lake_answers(dir, q, want, 2, replica, stream);
+}
+
+/* a copy's current rows */
+static int nulls_current(const char *dir, char *want)
+{
+    const char *q[1] = {"SELECT * FROM t ORDER BY id"};
+    return lake_answers(dir, q, &want, 1, false, NULL);
+}
+
+/* F5: NULLs kept exactly through Parquet segments (the user's rule: every NULL and row kept): a column NULL in every
+ * row (a, and nb to nbt: one of every kind), alternating NULLs (b), rows NULL in every column (7, and each i % 5 == 3),
+ * runs in the rest, every nullable
+ * kind (INT32, INT64, FLOAT64, TEXT, TIMESTAMP, UUID, INTERVAL, a wide DECIMAL, BOOL, DATE, BYTEA); then a column NULL
+ * everywhere after an UPDATE (x); then every row deleted; a CHECKPOINT after each. Each state's answer before its
+ * CHECKPOINT, in memory, is what AS OF reads from the lake alone give, on the primary reopened and on a replica fed its
+ * log, whose segments are the primary's byte for byte (their names their hashes); VERIFY and the auditor take both */
+static void t_seg_nulls(void)
+{
+    const char *dir = test_tmpdir();
+    OK(imdb_init(dir, false, NULL, E));
+    imdb_db *db = open_db(dir);
+    CHECK(db);
+    imdb_session s;
+    imdb_session_init(&s, db);
+    OK(lsql(&s, "CREATE TABLE t (id BIGINT PRIMARY KEY, a INTEGER, b BIGINT, f FLOAT64, x TEXT, ts TIMESTAMP, u UUID, "
+                "iv INTERVAL, w DECIMAL(30,4), e BOOL, d DATE, bt BYTEA, nb BIGINT, nf FLOAT64, nx TEXT, nts TIMESTAMP, "
+                "nu UUID, niv INTERVAL, nw DECIMAL(30,4), ne BOOL, nd DATE, nbt BYTEA)"));
+    size_t cap = 64 * 1024, at = 0;
+    char *ins = malloc(cap);
+    CHECK(ins);
+    at += (size_t)snprintf(ins + at, cap - at, "INSERT INTO t VALUES ");
+    for (int i = 1; i <= 60; i++) {
+        bool nul = i == 7 || i % 5 == 3;
+        char b[32], f[32], x[32], ts[64], u[64], iv[64], w[48], e[8], d[32], by[24];
+        snprintf(b, sizeof b, (i % 2 == 0 || nul) ? "NULL" : "%d", i * 1000003);
+        snprintf(f, sizeof f, (nul || i % 7 == 1) ? "NULL" : "%d.25", i - 30);
+        snprintf(x, sizeof x, (nul || i % 4 == 0) ? "NULL" : "'text %d'", i);
+        if (nul || i % 6 == 0) snprintf(ts, sizeof ts, "NULL");
+        else snprintf(ts, sizeof ts, "TIMESTAMP '2026-11-%02d 12:%02d:00'", i % 28 + 1, i % 60);
+        snprintf(u, sizeof u, (nul || i % 3 == 0) ? "NULL" : "'%08x-1111-4222-8333-444455556666'", (unsigned)i);
+        if (nul || i % 8 == 0) snprintf(iv, sizeof iv, "NULL");
+        else snprintf(iv, sizeof iv, "INTERVAL '%d days %d hours'", i, i % 24);
+        if (nul || i % 9 == 0) snprintf(w, sizeof w, "NULL");
+        else snprintf(w, sizeof w, "%d18446744073709.5%03d", i, i);
+        snprintf(e, sizeof e, "%s", (nul || i % 10 == 0) ? "NULL" : i % 2 ? "TRUE" : "FALSE");
+        if (nul || i % 11 == 0) snprintf(d, sizeof d, "NULL");
+        else snprintf(d, sizeof d, "DATE '2026-%02d-%02d'", i % 12 + 1, i % 27 + 1);
+        snprintf(by, sizeof by, (nul || i % 12 == 0) ? "NULL" : "'\\x%02x00ff'", (unsigned)i);
+        at += (size_t)snprintf(ins + at, cap - at, "%s(%d, NULL, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s%s)", i > 1 ? ", " : "",
+                               i, b, f, x, ts, u, iv, w, e, d, by, ", NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL");
+    }
+    CHECK(at < cap);
+    OK(lsql(&s, ins));
+    free(ins);
+    char *want[2];
+    uint64_t when[2];
+    want[0] = lrender(&s, "SELECT * FROM t ORDER BY id");
+    CHECK(want[0] && strstr(want[0], "\n7,,,,,,,,,,,,,,,,,,,,,\n") && strstr(want[0], "\n8,,,,,,,,,,,,,,,,,,,,,\n")); /* rows NULL whole */
+    OK(lsql(&s, "CHECKPOINT"));
+    when[0] = db->seq;
+    OK(lsql(&s, "UPDATE t SET x = NULL"));
+    want[1] = lrender(&s, "SELECT * FROM t ORDER BY id");
+    CHECK(want[1] && want[0] && strstr(want[0], "\"text 1\"") && !strstr(want[1], "text")); /* x NULL in every row */
+    OK(lsql(&s, "CHECKPOINT"));
+    when[1] = db->seq;
+    /* a backup now: its seed this CHECKPOINT's lake, no commit after it; restored once the rows are deleted */
+    imdb_session_close(&s);
+    imdb_close(db);
+    char key[760], bak[760], dst[760];
+    snprintf(key, sizeof key, "%s-backup.key", dir);
+    snprintf(bak, sizeof bak, "%s-full.bak", dir);
+    snprintf(dst, sizeof dst, "%s-restored", dir);
+    uint8_t kid[32], bkey[IMDB_BACKUP_KEY_LEN];
+    imdb_backup_info bi;
+    OK(imdb_backup_key_create(key, kid, E));
+    OK(imdb_backup_key_load(key, bkey, E));
+    OK(imdb_backup_full(dir, bak, bkey, &bi, E));
+    CHECK(bi.seed_seq == when[1]); /* the copy begins from the seed's segment files, not a replay */
+    db = open_db(dir);
+    CHECK(db);
+    if (!db) {
+        free(want[0]);
+        free(want[1]);
+        return;
+    }
+    imdb_session_init(&s, db);
+    OK(lsql(&s, "DELETE FROM t")); /* every version ended: AS OF reads them from the lake alone */
+    OK(lsql(&s, "CHECKPOINT"));
+    imdb_session_close(&s);
+    imdb_close(db);
+    if (!want[0] || !want[1]) return;
+    CHECK(nulls_from_lake(dir, when, want, false, NULL) == 0);
+    /* a replica fed the log makes the same segments */
+    char rp[700], sf[760];
+    snprintf(rp, sizeof rp, "%s-replica", dir);
+    snprintf(sf, sizeof sf, "%s-stream", dir);
+    imdb_identity id;
+    OK(imdb_identity_read(dir, &id, NULL, E));
+    OK(imdb_init_replica(rp, &id, E));
+    OK(ship_to_file(dir, 0, sf, E));
+    CHECK(nulls_from_lake(rp, when, want, true, sf) == 0);
+    char op[760], orp[760];
+    snprintf(op, sizeof op, "%s/objects", dir);
+    snprintf(orp, sizeof orp, "%s/objects", rp);
+    int nseg = count_files(op, ".seg");
+    CHECK(nseg >= 2 && count_files(orp, ".seg") == nseg);
+    DIR *dd = opendir(op);
+    struct dirent *de;
+    while (dd && (de = readdir(dd))) {
+        size_t l = strlen(de->d_name);
+        if (l < 4 || strcmp(de->d_name + l - 4, ".seg")) continue;
+        char pa[1100], pb[1100];
+        snprintf(pa, sizeof pa, "%s/%s", op, de->d_name);
+        snprintf(pb, sizeof pb, "%s/%s", orp, de->d_name);
+        size_t na = 0, nb = 0;
+        uint8_t *ba = slurp(pa, &na), *bb = slurp(pb, &nb);
+        CHECK(ba && bb && na == nb && !memcmp(ba, bb, na)); /* the replica's own build, byte for byte the primary's */
+        free(ba);
+        free(bb);
+    }
+    if (dd) closedir(dd);
+    /* the backup restored: a copy whose log begins past its seed (FLOOR), so its rows are the seed's segments' */
+    const char *files[1] = {bak};
+    imdb_backup_info ri;
+    OK(imdb_restore(dst, bkey, files, 1, &ri, E));
+    char fl[800];
+    snprintf(fl, sizeof fl, "%s/FLOOR", dst);
+    CHECK(access(fl, F_OK) == 0);
+    CHECK(nulls_current(dst, want[1]) == 0);
+    const char *bin = getenv("IMDB_AUDIT_BIN");
+    if (bin && *bin) {
+        char cmd[2000];
+        snprintf(cmd, sizeof cmd, "'%s' verify '%s' >/dev/null 2>&1 && '%s' verify '%s' >/dev/null 2>&1 && '%s' verify '%s' >/dev/null 2>&1",
+                 bin, dir, bin, rp, bin, dst);
+        CHECK(system(cmd) == 0);
+    }
+    free(want[0]);
+    free(want[1]);
+}
+
+/* F5: a segment whose every row is a stub (the table's every row erased): its NOT NULL 16-byte cells keep no row (a
+ * column of cells of no bytes), its BOOL, TEXT and INT64 their placeholders; loaded again at a cache of one byte (the
+ * image made from its file), counted, VERIFY'd and audited */
+static void t_seg_all_stubs(void)
+{
+    const char *dir = test_tmpdir();
+    OK(imdb_init(dir, false, NULL, E));
+    imdb_db *db = open_db(dir);
+    CHECK(db);
+    imdb_session s;
+    imdb_session_init(&s, db);
+    OK(lsql(&s, "CREATE TABLE t (id INT64 PRIMARY KEY, u INT64 SUBJECT, g UUID NOT NULL, iv INTERVAL NOT NULL, "
+                "w DECIMAL(30,4) NOT NULL, b BOOL NOT NULL, x TEXT NOT NULL, n INT64)"));
+    OK(lsql(&s, "INSERT INTO t VALUES (1, 42, '0f8c3ad1-1111-4222-8333-444455556666', INTERVAL '1 day', 1.5, TRUE, 'one', 5), "
+                "(2, 42, '1f8c3ad1-1111-4222-8333-444455556666', INTERVAL '2 days', 2.5, FALSE, 'two', NULL)"));
+    OK(lsql(&s, "CHECKPOINT"));
+    OK(lsql(&s, "ERASE SUBJECT 42"));
+    imdb_session_close(&s);
+    imdb_close(db);
+    imdb_open_opts o = {.sync = 0, .seg_cache_bytes = 1};
+    db = NULL;
+    OK(imdb_open(dir, &o, &db, E));
+    if (!db) return;
+    imdb_session_init(&s, db);
+    imdb_table *t = imdb_table_by_name(db, "t");
+    CHECK(t && t->nseg == 1);
+    if (t && t->nseg == 1) {
+        const imdb_segimg *gi = imdb_seg_pin(t, t->seg[0], E);
+        CHECK(gi && t->seg[0]->nrows == 2 && gi->flags[0] && gi->flags[1]); /* both rows stubs */
+    }
+    char *cnt = lrender(&s, "SELECT COUNT(*) AS c FROM t");
+    CHECK(cnt && !strcmp(cnt, "c\n0\n"));
+    free(cnt);
+    imdb_verify_report vr;
+    OK(imdb_verify(db, &vr, E));
+    imdb_session_close(&s);
+    imdb_close(db);
+    const char *bin = getenv("IMDB_AUDIT_BIN");
+    if (bin && *bin) {
+        char cmd[1600];
+        snprintf(cmd, sizeof cmd, "'%s' verify '%s' >/dev/null 2>&1", bin, dir);
+        CHECK(system(cmd) == 0);
+    }
+}
+
+/* F5: a segment file in the format before Parquet (its magic "IMDBSEG1") is refused by name, by both parses */
+static void t_seg_old_format(void)
+{
+    imdb_schema s;
+    memset(&s, 0, sizeof s);
+    s.id = 0;
+    s.subject = -1;
+    strcpy(s.name, "t");
+    s.ncols = 1;
+    strcpy(s.cols[0].name, "id");
+    s.cols[0].type = IMDB_T_INT64;
+    s.cols[0].flags = IMDB_COL_PK;
+    s.npk = 1;
+    s.key[0] = 0;
+    imdb_schema_hist h;
+    memset(&h, 0, sizeof h);
+    OK(imdb_hist_first(&h, &s, E));
+    uint8_t *b = imdb_alloc_aligned(1, 256, E);
+    CHECK(b);
+    memcpy(b, "IMDBSEG1", 8);
+    imdb_segment *g = NULL;
+    imdb_err e2 = {0};
+    CHECK(imdb_segment_parse(&h.vers[0], b, 256, NULL, &g, &e2) == IMDB_ERR_CORRUPT && strstr(e2.msg, "IMDBSEG1"));
+    imdb_err_clear(&e2);
+    CHECK(imdb_segment_parse_h(&h, b, 256, NULL, &g, &e2) == IMDB_ERR_CORRUPT && strstr(e2.msg, "IMDBSEG1"));
+    imdb_free(b);
+    imdb_hist_free(&h);
+}
+
 const test_case lake_tests[] = {
     {"checkpoint_basic", t_checkpoint_basic},
     {"deletion_vectors_time_travel", t_deletion_vectors_time_travel},
@@ -1215,6 +1761,12 @@ const test_case lake_tests[] = {
     {"erase_in_lake", t_erase_in_lake},
     {"lake_tamper", t_lake_tamper},
     {"segment_decoder_strict", t_segment_decoder_strict},
+    {"seg_settle", t_seg_settle},
+    {"seg_old_format", t_seg_old_format},
+    {"seg_stub_placeholder", t_seg_stub_placeholder},
+    {"seg_stub_placeholders_typed", t_seg_stub_placeholders_typed},
+    {"seg_nulls", t_seg_nulls},
+    {"seg_all_stubs", t_seg_all_stubs},
     {"dv_decoder_hostile", t_dv_decoder_hostile},
     {"dv_file_tamper", t_dv_file_tamper},
     {"erase_compact_late_replica", t_erase_compact_late_replica},

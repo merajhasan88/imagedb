@@ -233,4 +233,11 @@ OBJ=494d4442524c4f31010000000100000001${SALT}05000000616c696365
 S5=$(printf '%064d' 0)01000000010000000100000001000000000000000000000000000000000000000100000000000000${CM}000000000000
 { printf '\002'; printf '%08x' $(( ${#S5} / 2 )) | sed 's/\(..\)\(..\)\(..\)\(..\)/\4\3\2\1/' | xxd -r -p
   printf '%s%s' "$S5" "$OBJ" | xxd -r -p; } > "$OUT/role/section"
+# F5: Parquet files for fuzz_parquet, written by the writer itself (the harness's seed mode: a byte picking its set of
+# shapes, then the file), each set at 1, 7, 9 and 40 rows
+mkdir -p "$OUT/parquet"
+if [ -x build-fuzz/fuzz_parquet ]; then
+    IMDB_FUZZ_PARQUET_SEEDS="$OUT/parquet" setarch "$(uname -m)" -R build-fuzz/fuzz_parquet > /dev/null 2>&1 || true
+    mkdir -p "$OUT/apq" && cp "$OUT"/parquet/* "$OUT/apq/" 2>/dev/null || true # fuzz_apq: the same seeds
+fi
 echo "corpus: $(find "$OUT" -type f | wc -l) seeds in $OUT"

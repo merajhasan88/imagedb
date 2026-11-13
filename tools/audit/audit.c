@@ -44,6 +44,7 @@
 #include "acrypto.h"
 #include "afsum.h"
 #include "abind.h"
+#include "apq.h"
 
 #define LOG_VERSION 3 /* the commit header's first byte (design.md §3; the format design's slice 1: 2 refused by name) */
 #define LIVE ((uint64_t)INT64_MAX)
@@ -4859,11 +4860,17 @@ typedef struct seg {
                                                                              its version gk (a dropped one's too) */
     uint32_t gk;
     const struct aver *gv; /* that version, in the history it was parsed against (the walked manifest's) */
+    apq_file *pq;            /* F5: the file as apq.c decoded it (the system columns and each column's values) */
+    uint8_t *own[2 * MAX_COLS + 4]; /* F5: the layout's arrays made from it (widened, keyed, offsets, cells) */
+    int nown;
 } seg;
 
 static void seg_free(seg *g)
 {
     free(g->bytes);
+    for (int k = 0; k < g->nown; k++) free(g->own[k]);
+    if (g->pq) apq_free(g->pq);
+    free(g->pq);
     free(g->row);
     memset(g, 0, sizeof *g);
 }
@@ -5010,104 +5017,208 @@ static int cmp_ukey(const void *a, const void *b)
     return x->n ? memcmp(x->b, y->b, x->n) : 0;
 }
 
-/* Strict, canonical parse under the schema version that built the segment (its header names it by its version hash,
- * among vers, a table's nvers versions); every non-stub row's commitment is recomputed under its own version (by its
- * begin), each column by position; then laid out for cur, the version its caller reads with: a column cur has and the
- * segment lacks reads its missing value (F1), and one the segment holds and cur lacks (dropped since) stays in the own
- * columns, for a row's own encoding (F1 stage 4) */
+/* F5: a segment is imagedb's Parquet subset (src/lake.h): the system columns, then its schema version's columns by
+ * position, each a type's shape (the auditor's own mapping, from the format, not src/'s) */
+static void seg_shapes_a(const struct aver *v, apq_shape *sh)
+{
+    static const char *const sys[5] = {"imdb$vid", "imdb$begin", "imdb$flags", "imdb$salt", "imdb$commit"};
+    memset(sh, 0, sizeof *sh * (5u + (unsigned)v->s.ncols));
+    for (int k = 0; k < 5; k++) {
+        sh[k].name = sys[k];
+        sh[k].id = 2147483000 + k;
+        sh[k].phys = k < 2 ? APQ_INT64 : k == 2 ? APQ_INT32 : APQ_FIXED;
+        sh[k].tlen = k == 3 ? 16 : k == 4 ? 32 : 0;
+    }
+    for (int c = 0; c < v->s.ncols; c++) {
+        const col *cc = &v->s.c[c];
+        apq_shape *p = &sh[5 + c];
+        p->name = cc->name;
+        p->id = (int32_t)v->pos[c] + 1;
+        p->opt = (cc->flags & F_NULLABLE) != 0;
+        p->stats = !seg_text(cc);
+        switch (cc->type) {
+        case T_INT64:
+            p->logical = APQ_L_INT;
+            p->bits = cc->prec == 16 || cc->prec == 32 ? cc->prec : 64;
+            p->phys = p->bits == 64 ? APQ_INT64 : APQ_INT32;
+            break;
+        case T_DECIMAL:
+            p->logical = APQ_L_DECIMAL;
+            p->scale = cc->scale;
+            p->prec = cc->prec;
+            p->phys = dwide(cc) ? APQ_FIXED : APQ_INT64;
+            p->tlen = dwide(cc) ? 16 : 0;
+            break;
+        case T_TEXT: p->phys = APQ_BYTES, p->logical = APQ_L_STRING; break;
+        case T_BYTEA: p->phys = APQ_BYTES; break;
+        case T_BOOL: p->phys = APQ_BOOLEAN; break;
+        case T_TIMESTAMP:
+        case T_TIMESTAMPTZ: p->phys = APQ_INT64, p->logical = APQ_L_TIMESTAMP, p->utc = cc->type == T_TIMESTAMPTZ; break;
+        case T_DATE: p->phys = APQ_INT32, p->logical = APQ_L_DATE; break;
+        case T_TIME: p->phys = APQ_INT64, p->logical = APQ_L_TIME; break;
+        case T_UUID: p->phys = APQ_FIXED, p->tlen = 16, p->logical = APQ_L_UUID; break;
+        case T_FLOAT64: p->phys = APQ_DOUBLE; break;
+        case T_INTERVAL: p->phys = APQ_FIXED, p->tlen = 16; break;
+        default: p->phys = APQ_INT64; break; /* T_ENUM: its ordinal */
+        }
+    }
+}
+
+static uint8_t *seg_own(seg *g, size_t n)
+{
+    uint8_t *p = xcalloc(n ? n : 1, 1);
+    g->own[g->nown++] = p;
+    return p;
+}
+
+/* Strict, canonical parse under the schema version that built the segment (its footer names it by its version hash,
+ * among vers, a table's nvers versions; F5: read by apq.c, the file written again the same); every non-stub row's
+ * commitment is recomputed under its own version (by its begin), each column by position; then laid out for cur, the
+ * version its caller reads with: a column cur has and the segment lacks reads its missing value (F1), and one the
+ * segment holds and cur lacks (dropped since) stays in the own columns, for a row's own encoding (F1 stage 4) */
 static int parse_segment(const struct aver *vers, uint32_t nvers, const val *missing, const struct aver *cur, uint8_t *b,
                          size_t len, seg *g)
 {
     memset(g, 0, sizeof *g);
+    if (len >= 8 && memcmp(b, "IMDBSEG1", 8) == 0)
+        return fail("segment: the format before Parquet (IMDBSEG1, before F5) is not read");
+    const char *why = "no schema version in its footer";
+    uint32_t sl = 0;
+    const uint8_t *sx = apq_peek(b, len, "imagedb.schema", &sl, &why);
+    if (!sx) return fail("segment: %s", why);
     uint32_t gk = nvers;
     for (uint32_t k = nvers; k-- > 0;) { /* the last first: most segments are the current version's */
-        if (memcmp(vers[k].hash, b + 16, 32) == 0) {
+        char hx[65];
+        hex(vers[k].hash, 32, hx);
+        if (sl == 64 && memcmp(hx, sx, 64) == 0) {
             gk = k;
             break;
         }
     }
     if (gk == nvers) return fail("segment: schema hash mismatch");
     const schema *s = &vers[gk].s;
-    if (len < 64 || memcmp(b, "IMDBSEG1", 8) != 0) return fail("segment: bad magic");
-    uint32_t n = le32(b + 48), ncols = le32(b + 52), nsec = le32(b + 56);
-    if (le32(b + 8) == 2) return fail("segment: version 2, before schema versions by position, is not read");
-    if (le32(b + 8) != 3 || le32(b + 12) != s->id || le32(b + 60) != 0 || ncols != (uint32_t)s->ncols)
-        return fail("segment: bad header");
-    if (n > (1u << 22)) return fail("segment: too many rows");
-    uint32_t want_kind[MAX_SECTIONS], want_col[MAX_SECTIONS];
-    uint64_t want_len[MAX_SECTIONS];
-    uint32_t k = 0;
-    uint32_t sys[5] = {S_VID, S_BEGIN, S_FLAGS, S_SALT, S_COMMIT};
-    uint64_t syslen[5] = {8ull * n, 8ull * n, n, 16ull * n, 32ull * n};
-    for (int i = 0; i < 5; i++) want_kind[k] = sys[i], want_col[k] = 0, want_len[k++] = syslen[i];
-    for (int c = 0; c < s->ncols; c++) {
-        uint8_t t = s->c[c].type;
-        if (seg_int(&s->c[c])) want_kind[k] = S_I64, want_col[k] = (uint32_t)c, want_len[k++] = 8ull * n;
-        else if (t == T_BOOL) want_kind[k] = S_U8, want_col[k] = (uint32_t)c, want_len[k++] = n;
-        else {
-            want_kind[k] = S_TOFF, want_col[k] = (uint32_t)c, want_len[k++] = 4ull * (n + 1);
-            want_kind[k] = S_TDATA, want_col[k] = (uint32_t)c, want_len[k++] = UINT64_MAX;
+    uint32_t nc = 5u + (uint32_t)s->ncols;
+    apq_shape sh[APQ_MAX_COLS];
+    seg_shapes_a(&vers[gk], sh);
+    g->pq = xcalloc(1, sizeof *g->pq);
+    if (apq_read(b, len, sh, nc, g->pq, &why)) {
+        free(g->pq);
+        g->pq = NULL;
+        return fail("segment: %s", why);
+    }
+    /* its pairs after imagedb.chunks: exactly the format, the INTERVAL columns' field ids (when any), the version's
+     * hash, the table */
+    char ivl[MAX_COLS * 6 + 1] = "", hx[65], tid[12];
+    size_t at = 0;
+    for (int c = 0; c < s->ncols; c++)
+        if (s->c[c].type == T_INTERVAL)
+            at += (size_t)snprintf(ivl + at, sizeof ivl - at, "%s%u", at ? "," : "", (unsigned)vers[gk].pos[c] + 1u);
+    hex(vers[gk].hash, 32, hx);
+    snprintf(tid, sizeof tid, "%u", (unsigned)s->id);
+    const char *wk[4] = {"imagedb.format", "imagedb.interval", "imagedb.schema", "imagedb.table"}, *wv[4] = {"1", ivl, hx, tid};
+    uint32_t want = 0;
+    bool same = true;
+    for (int k = 0; k < 4; k++) {
+        if (k == 1 && !at) continue;
+        want++;
+        if (want >= g->pq->nkv) {
+            same = false;
+            break;
         }
-        if (s->c[c].flags & F_NULLABLE) want_kind[k] = S_VALID, want_col[k] = (uint32_t)c, want_len[k++] = (n + 7ull) / 8;
+        same &= g->pq->klen[want] == strlen(wk[k]) && !memcmp(g->pq->key[want], wk[k], strlen(wk[k])) &&
+                g->pq->vlen[want] == strlen(wv[k]) && !memcmp(g->pq->val[want], wv[k], strlen(wv[k]));
     }
-    want_kind[k] = S_ZONE, want_col[k] = 0, want_len[k++] = 24ull * ncols;
-    if (nsec != k) return fail("segment: wrong section count");
-    size_t pos = 64 + 24u * (size_t)nsec;
-    if (pos > len) return fail("segment: truncated directory");
-    const uint8_t *sec[MAX_SECTIONS];
-    uint64_t slen[MAX_SECTIONS];
-    for (uint32_t i = 0; i < nsec; i++) {
-        const uint8_t *d = b + 64 + 24u * i;
-        uint64_t off = le64(d + 8), l = le64(d + 16);
-        size_t expect = (pos + 7) & ~(size_t)7;
-        if (le32(d) != want_kind[i] || le32(d + 4) != want_col[i] || (want_len[i] != UINT64_MAX && l != want_len[i]) ||
-            off != expect || expect > len || l > len - off)
-            return fail("segment: section %u not canonical", i);
-        if (!all_zero(b + pos, expect - pos)) return fail("segment: non-zero padding");
-        sec[i] = b + off;
-        slen[i] = l;
-        pos = (size_t)(off + l);
+    if (!same || g->pq->nkv != want + 1) {
+        apq_free(g->pq);
+        free(g->pq);
+        g->pq = NULL;
+        return fail("segment: its footer's pairs are not its schema version's and table's");
     }
-    if (pos != len) return fail("segment: trailing bytes");
+    uint64_t n64 = g->pq->nrows;
+    if (n64 > (1u << 22)) {
+        apq_free(g->pq);
+        free(g->pq);
+        g->pq = NULL;
+        return fail("segment: too many rows");
+    }
+    uint32_t n = (uint32_t)n64;
     g->bytes = b;
     g->len = len;
     g->n = n;
     g->row = xcalloc(n, sizeof *g->row);
     int rc = 0;
+    const apq_col *pc = g->pq->col;
     for (uint32_t i = 0; i < n && !rc; i++) {
         segrow *r = &g->row[i];
-        r->vid = le64(sec[0] + 8u * i);
-        r->begin = le64(sec[1] + 8u * i);
-        uint8_t fl = sec[2][i];
-        r->salt = sec[3] + 16u * i;
-        r->commit = sec[4] + 32u * i;
+        r->vid = le64(pc[0].fixed + 8u * i);
+        r->begin = le64(pc[1].fixed + 8u * i);
+        uint32_t fl = le32(pc[2].fixed + 4u * i);
+        r->salt = pc[3].fixed + 16u * i;
+        r->commit = pc[4].fixed + 32u * i;
         r->end = LIVE;
         if (fl > 3 || (i && r->vid <= g->row[i - 1].vid) || r->begin == 0 || r->begin >= LIVE)
             rc = fail("segment: bad system columns");
-        r->flags = fl;
+        r->flags = (uint8_t)fl;
         r->stub = (fl & 1) != 0;
         r->purged = (fl & 2) != 0;
         if (!rc && fl && !all_zero(r->salt, 16)) rc = fail("segment: erased or purged row keeps a salt");
     }
-    k = 5;
+    /* each column in the layout the checks below read: 8 bytes a row for the integers (an INTEGER, a SMALLINT, a DATE
+     * widened; a FLOAT64 its key), a byte a row for a BOOL, u32 offsets and bytes for a byte string and a 16-byte cell
+     * (a wide DECIMAL's big-endian bytes as i then hi), a NULLABLE column's validity bits */
     for (int c = 0; c < s->ncols && !rc; c++) {
-        g->colp[c] = sec[k++];
-        if (seg_text(&s->c[c])) { /* F3d: offsets and data for each byte string; F3e: a wide DECIMAL's 16-byte cells */
-            g->tdata[c] = sec[k];
-            uint64_t dl = slen[k++];
-            if (le32(g->colp[c]) != 0 || le32(g->colp[c] + 4u * n) != dl) rc = fail("segment: bad TEXT offsets");
-            for (uint32_t i = 0; i < n && !rc; i++) {
-                uint32_t a = le32(g->colp[c] + 4u * i), z = le32(g->colp[c] + 4u * (i + 1));
-                if (z < a || z > dl || z - a > MAX_TEXT) rc = fail("segment: bad TEXT offsets");
-                else if (fix16(&s->c[c]) && z - a != 0 && z - a != 16) rc = fail("segment: a 16-byte cell of %u bytes", z - a);
+        const col *cc = &s->c[c];
+        const apq_col *q = &pc[5 + c];
+        const apq_shape *p = &sh[5 + c];
+        if (cc->flags & F_NULLABLE) g->valid[c] = q->pres;
+        if (seg_int(cc)) {
+            if (p->phys == APQ_INT64) {
+                g->colp[c] = q->fixed;
+                continue;
             }
-        }
-        if (s->c[c].flags & F_NULLABLE) {
-            g->valid[c] = sec[k++];
-            if (n % 8 && g->valid[c][n / 8] >> (n % 8)) rc = fail("segment: VALID padding is not zero");
+            uint8_t *w = seg_own(g, 8u * (size_t)n);
+            for (uint32_t i = 0; i < n; i++) {
+                uint64_t x;
+                if (p->phys == APQ_INT32) {
+                    x = (uint64_t)(int64_t)(int32_t)le32(q->fixed + 4u * i);
+                } else { /* a FLOAT64: a non-negative double's bits, a negative one's with the 63 low bits flipped */
+                    x = le64(q->fixed + 8u * i);
+                    if ((int64_t)x < 0) x ^= 0x7fffffffffffffffull;
+                }
+                for (int k = 0; k < 8; k++) w[8u * i + (unsigned)k] = (uint8_t)(x >> (8 * k));
+            }
+            g->colp[c] = w;
+        } else if (cc->type == T_BOOL) {
+            g->colp[c] = q->fixed;
+        } else if (p->phys == APQ_BYTES) {
+            uint8_t *o = seg_own(g, 4u * ((size_t)n + 1));
+            for (uint32_t i = 0; i <= n; i++)
+                for (int k = 0; k < 4; k++) o[4u * i + (unsigned)k] = (uint8_t)(q->off[i] >> (8 * k));
+            g->colp[c] = o;
+            g->tdata[c] = q->data;
+        } else { /* a 16-byte cell: a kept value's, none for a row that keeps none (whose placeholder is zeros) */
+            uint8_t *o = seg_own(g, 4u * ((size_t)n + 1)), *d = seg_own(g, 16u * (size_t)n);
+            uint32_t z = 0;
+            for (uint32_t i = 0; i < n && !rc; i++) {
+                for (int k = 0; k < 4; k++) o[4u * i + (unsigned)k] = (uint8_t)(z >> (8 * k));
+                uint8_t fl = g->row[i].flags;
+                bool here = !(cc->flags & F_NULLABLE) || (q->pres[i / 8] >> (i % 8) & 1);
+                const uint8_t *x = q->fixed + 16u * i;
+                if (!here || (fl && !(fl == 2 && c == s->subject))) {
+                    if (!all_zero(x, 16)) rc = fail("segment: erased or purged row keeps data");
+                    continue;
+                }
+                if (dwide(cc))
+                    for (int k = 0; k < 16; k++) d[z + (unsigned)k] = x[15 - k];
+                else
+                    memcpy(d + z, x, 16);
+                z += 16;
+            }
+            for (int k = 0; k < 4; k++) o[4u * n + (unsigned)k] = (uint8_t)(z >> (8 * k));
+            g->colp[c] = o;
+            g->tdata[c] = d;
         }
     }
-    const uint8_t *zone = sec[k];
     uint8_t *rowbuf = NULL;
     size_t rowcap = 0;
     for (uint32_t i = 0; i < n && !rc; i++) {
@@ -5164,24 +5275,6 @@ static int parse_segment(const struct aver *vers, uint32_t nvers, const val *mis
         if (memcmp(cm, g->row[i].commit, 32) != 0) rc = fail("segment: row %u does not match its commitment", i);
     }
     free(rowbuf);
-    for (int c = 0; c < s->ncols && !rc; c++) {
-        bool has = false, has_null = false;
-        int64_t mn = 0, mx = 0;
-        for (uint32_t i = 0; i < n; i++) has_null |= !g->row[i].flags && !has_value(g, c, i);
-        if (!seg_text(&s->c[c])) /* F3d: a byte string has no zone map; F3e: nor a wide DECIMAL */
-            for (uint32_t i = 0; i < n; i++) {
-                if (g->row[i].flags || !has_value(g, c, i)) continue;
-                val v;
-                seg_value(s, g, i, c, &v);
-                if (!has || v.i < mn) mn = v.i;
-                if (!has || v.i > mx) mx = v.i;
-                has = true;
-            }
-        const uint8_t *z = zone + 24u * (size_t)c;
-        if (z[0] != has || z[1] != has_null || !all_zero(z + 2, 6) || (int64_t)le64(z + 8) != mn ||
-            (int64_t)le64(z + 16) != mx)
-            rc = fail("segment: zone map does not match the data (column %s)", s->c[c].name);
-    }
     if (!rc) { /* F1: laid out for cur by position (the own columns kept: a row's own encoding reads them) */
         memcpy(g->ocolp, g->colp, sizeof g->colp);
         memcpy(g->otdata, g->tdata, sizeof g->tdata);
@@ -5206,7 +5299,12 @@ static int parse_segment(const struct aver *vers, uint32_t nvers, const val *mis
     if (rc) {
         free(g->row);
         g->row = NULL;
-        g->bytes = NULL;
+        g->bytes = NULL; /* the caller's on a refusal */
+        for (int k = 0; k < g->nown; k++) free(g->own[k]);
+        g->nown = 0;
+        apq_free(g->pq);
+        free(g->pq);
+        g->pq = NULL;
     }
     return rc;
 }
@@ -5503,8 +5601,9 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
     rd r = {b, len, 0, false};
     const uint8_t *mg = rd_bytes(&r, 8);
     uint32_t mver = mg && memcmp(mg, "IMDBMAN1", 8) == 0 ? rd_u32(&r) : 0;
+    if (mver == 18) return fail("manifest version 18: written before Parquet segments (manifest 19, F5), which this auditor does not read");
     if (mver == 17) return fail("manifest version 17: written before roles (manifest 18), which this auditor does not read");
-    if (mver != 18) return fail("manifest: bad header (version 18 only: roles, L)");
+    if (mver != 19) return fail("manifest: bad header (version 19 only: Parquet segments, F5)");
     uint32_t nsec = rd_u32(&r); /* every section, in order: 1 tables, 2 views, 3 sequences (F2a-2), 4 ENUM types (F3g), 5 roles
                                  * and 6 grants (L), 7-11 reserved and empty */
     const uint8_t *id = rd_bytes(&r, 16);

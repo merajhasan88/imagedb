@@ -113,6 +113,7 @@ TESTS(iv)    /* F3f: INTERVAL */
 TESTS(enum) /* F3g: ENUM types */
 TESTS(role) /* L: roles and grants */
 TESTS(e3) /* E3: SERIALIZABLE */
+TESTS(pq) /* F5: the canonical Parquet subset's codec */
 TESTS(tz) /* P2: time zones */
 TESTS(tzsql) /* P2: time zones through the engine */
 

@@ -55,13 +55,67 @@ must_fail "manifest seq differs from LAKE_HEAD" "$AUD" verify "$C"
 must_fail "LAKE_HEAD does not name" "$BIN" verify "$C"
 echo "   rejected by the auditor and the engine"
 
-echo "== D: re-hashed segment whose zone map lies (content hashes all consistent)"
+echo "== D: re-hashed segment whose statistics lie (its max past its values; content hashes all consistent; F5: the zone
+   map's case before, zone maps made at the load now)"
 D=$WORK/d; make_db "$D"
 "$FORGE" lie-zonemap "$D"
-must_fail "zone map does not match" "$AUD" count "$D" t
-must_fail "zone map does not match" "$AUD" verify "$D"
+must_fail "not the file its content gives" "$AUD" count "$D" t
+must_fail "not the file its content gives" "$AUD" verify "$D"
 must_fail "LAKE_HEAD does not name" "$BIN" verify "$D"
 echo "   rejected by the auditor (structural check) and the engine"
+
+echo "== PA: a segment whose imagedb.chunks names a chunk by another SHA-256, its file's name right, the lake re-hashed
+   and the log re-signed by the writer (F5)"
+PA=$WORK/pa; make_db "$PA"
+"$FORGE" lie-chunks "$PA"
+"$BIN" sql "$PA" --nosync -c "SELECT COUNT(*) FROM t;" >/dev/null || fail "a load hashes no chunk: the open must take it"
+must_fail "a chunk is not the one its footer names" "$BIN" verify "$PA"
+must_fail "not the file its content gives" "$AUD" verify "$PA"
+echo "   a load reads the file whole by its name; VERIFY and the auditor check each chunk's hash"
+
+echo "== PB: an erased row (a stub) holding a value where a NOT NULL column's placeholder must stand, its statistics and
+   chunk list made again, the lake re-hashed and the log re-signed by the writer (F5: erased data kept in a stub)"
+PB=$WORK/pb; make_db "$PB"
+"$BIN" sql "$PB" --nosync -c "ERASE SUBJECT 42;" -c "INSERT INTO t VALUES (9, 7, 'later');" -c "CHECKPOINT;" >/dev/null
+"$BIN" verify "$PB" >/dev/null && "$AUD" verify "$PB" >/dev/null || fail "the honest directory must verify"
+"$FORGE" lie-stub "$PB"
+must_fail "physical divergence" "$BIN" verify "$PB"
+must_fail "erased or purged row keeps data" "$AUD" verify "$PB"
+echo "   the engine's replay rebuilds the ERASE's segment and refuses a lake that differs (its parse's own rule for a"
+echo "   stub's placeholders: t_lake's seg_stub_placeholder); the auditor refuses the stub's value"
+
+echo "== PC: the same with a stub's nullable column marked VALID, its value zero (the file decoded and written again:
+   its levels, statistics and chunk list made for it), the lake re-hashed and the log re-signed by the writer (F5)"
+PC=$WORK/pc; "$BIN" init "$PC" >/dev/null
+"$BIN" sql "$PC" --nosync -c "CREATE TABLE t (id INT64 PRIMARY KEY, u INT64 SUBJECT, n INT64, memo TEXT);
+   INSERT INTO t VALUES (1, 42, 5, 'secret-one'), (2, 7, NULL, 'two');
+   INSERT INTO t VALUES (3, 42, 6, 'secret-three');
+   CHECKPOINT;" >/dev/null
+"$BIN" sql "$PC" --nosync -c "ERASE SUBJECT 42;" -c "INSERT INTO t VALUES (9, 7, 1, 'later');" -c "CHECKPOINT;" >/dev/null
+"$BIN" verify "$PC" >/dev/null && "$AUD" verify "$PC" >/dev/null || fail "the honest directory must verify"
+"$FORGE" lie-stub-null "$PC"
+must_fail "physical divergence" "$BIN" verify "$PC"
+must_fail "erased or purged row has a VALID bit" "$AUD" verify "$PC"
+echo "   the auditor refuses a stub marked VALID (the parse's own rule: t_lake's seg_stub_placeholders_typed)"
+
+echo "== PD, PE, PF: a stub holding a value in a NOT NULL TEXT, BOOL and UUID (a 16-byte cell), each its own lake, the
+   file decoded and written again, re-hashed and re-signed by the writer (F5: the auditor has no replay to fall back on)"
+for v in text bool cell; do
+  P=$WORK/p-$v; "$BIN" init "$P" >/dev/null
+  "$BIN" sql "$P" --nosync -c "CREATE TABLE t (id INT64 PRIMARY KEY, u INT64 SUBJECT, b BOOL NOT NULL, x TEXT NOT NULL,
+       g UUID NOT NULL, n INT64, memo TEXT);
+     INSERT INTO t VALUES (1, 42, TRUE, 'secret-one', '0f8c3ad1-1111-4222-8333-444455556666', 5, 'memo'),
+       (2, 7, FALSE, 'two', '1f8c3ad1-1111-4222-8333-444455556666', NULL, NULL);
+     INSERT INTO t VALUES (3, 42, TRUE, 'secret-three', '2f8c3ad1-1111-4222-8333-444455556666', 6, 'm3');
+     CHECKPOINT;" >/dev/null
+  "$BIN" sql "$P" --nosync -c "ERASE SUBJECT 42;" \
+    -c "INSERT INTO t VALUES (9, 7, FALSE, 'later', '3f8c3ad1-1111-4222-8333-444455556666', 1, 'l');" -c "CHECKPOINT;" >/dev/null
+  "$BIN" verify "$P" >/dev/null && "$AUD" verify "$P" >/dev/null || fail "the honest directory must verify ($v)"
+  "$FORGE" lie-stub-$v "$P"
+  must_fail "physical divergence" "$BIN" verify "$P"
+  must_fail "erased or purged row keeps data" "$AUD" verify "$P"
+done
+echo "   the auditor refuses each stub's value by its placeholder rule"
 
 echo "== E: symlink planted in objects/ is refused, not followed"
 E=$WORK/e; make_db "$E"
@@ -347,7 +401,8 @@ echo "   FF a key of two columns, FG of one: the engine's replay and the auditor
    table's key since F4; it had checked only the unique indexes)"
 
 echo "== FH: a segment built after ADD COLUMN whose row from before it reads another value than its missing one there
-   (no commitment covers that value), its zone map made again, the lake re-hashed and the log re-signed by the writer"
+   (no commitment covers that value), its statistics and chunk list made again (F5), the lake re-hashed and the log
+   re-signed by the writer"
 PFH=$WORK/fh; "$BIN" init "$PFH" >/dev/null # rows still in memory at the ALTER: the CHECKPOINT after it builds them
 "$BIN" sql "$PFH" --nosync -c "CREATE TABLE t (id INT64 PRIMARY KEY, u INT64 SUBJECT, memo TEXT);" \
   -c "INSERT INTO t VALUES (1, 42, 'one'), (2, 7, 'two');" >/dev/null

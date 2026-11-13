@@ -48,13 +48,14 @@ LIB     = $(BUILD)/libimagedb.a
 BIN     = $(BUILD)/imagedb
 
 TSRC    = $(wildcard tests/unit/*.c)
-TOBJ    = $(TSRC:tests/unit/%.c=$(BUILD)/tobj/%.o) $(BUILD)/tobj/acrypto.o $(BUILD)/tobj/afsum.o $(BUILD)/tobj/abind.o
+TOBJ    = $(TSRC:tests/unit/%.c=$(BUILD)/tobj/%.o) $(BUILD)/tobj/acrypto.o $(BUILD)/tobj/afsum.o $(BUILD)/tobj/abind.o \
+          $(BUILD)/tobj/apq.o
 TBIN    = $(BUILD)/test_unit
 
-.PHONY: all lint test unit san tsan ct fuzz fuzz-run bench whole index-sum mem-split join-cost workload clean integration faults soak oracle install uninstall
+.PHONY: all lint test unit san tsan ct fuzz fuzz-run bench whole index-sum mem-split join-cost workload clean integration faults soak oracle install uninstall parquet-check
 
 AUDIT   = $(BUILD)/imagedb-audit
-ASRC    = tools/audit/audit.c tools/audit/acrypto.c tools/audit/afsum.c tools/audit/abind.c
+ASRC    = tools/audit/audit.c tools/audit/acrypto.c tools/audit/afsum.c tools/audit/abind.c tools/audit/apq.c
 
 all: $(BIN) $(AUDIT)
 
@@ -78,7 +79,7 @@ uninstall:
 	-rmdir $(DESTDIR)$(PREFIX)/share/doc/imagedb
 
 # The independent verifier shares no code with src/ (see tools/audit/acrypto.h).
-$(AUDIT): $(ASRC) tools/audit/acrypto.h tools/audit/afsum.h tools/audit/abind.h | $(BUILD)/obj
+$(AUDIT): $(ASRC) tools/audit/acrypto.h tools/audit/afsum.h tools/audit/abind.h tools/audit/apq.h | $(BUILD)/obj
 	$(CC) $(CFLAGS) $(ASRC) -o $@ $(LDFLAGS)
 
 # Test-only: builds hostile inputs and fuzz seeds (may use engine code).
@@ -113,6 +114,10 @@ $(BUILD)/tobj/acrypto.o: tools/audit/acrypto.c tools/audit/acrypto.h | $(BUILD)/
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/tobj/afsum.o: tools/audit/afsum.c tools/audit/afsum.h | $(BUILD)/tobj
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# F5: the auditor's Parquet reader, which t_pq gives the files the engine's refuses (a chunk past the file)
+$(BUILD)/tobj/apq.o: tools/audit/apq.c tools/audit/apq.h | $(BUILD)/tobj
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/tobj/abind.o: tools/audit/abind.c tools/audit/abind.h | $(BUILD)/tobj
@@ -210,6 +215,11 @@ build-fuzz/asm/%.o: asm/%.asm asm/common.inc
 	mkdir -p build-fuzz/asm
 	$(NASM) -f elf64 -I asm/ $< -o $@
 
+# F5: the auditor's Parquet reader against the engine's on the same bytes (fuzz_apq): both, in one binary, each its own code
+build-fuzz/fuzz_apq: fuzz/fuzz_apq.c fuzz/fuzz_common.h tools/audit/apq.c tools/audit/apq.h tools/audit/acrypto.c $(SRC) $(HDR) $(FUZZ_ASM)
+	@mkdir -p build-fuzz
+	clang $(FUZZ_FLAGS) fuzz/fuzz_apq.c tools/audit/apq.c tools/audit/acrypto.c $(SRC) $(FUZZ_ASM) -o $@ -pthread
+
 # P2 S7b: the auditor's view binder alone (it shares nothing with src/)
 build-fuzz/fuzz_abind: fuzz/fuzz_abind.c tools/audit/abind.c tools/audit/abind.h
 	@mkdir -p build-fuzz
@@ -222,7 +232,7 @@ build-fuzz/%: fuzz/%.c fuzz/fuzz_common.h $(SRC) $(HDR) $(FUZZ_ASM)
 FUZZ_SECONDS ?= 60
 fuzz-run: fuzz $(BIN) $(FORGE)
 	bash fuzz/make_corpus.sh $(BIN) build-fuzz/corpus
-	@for t in frame stream segment manifest sql codec ed25519 tseg backup expr csv abind role; do \
+	@for t in frame stream segment manifest sql codec ed25519 tseg backup expr csv abind role parquet apq; do \
 	  mkdir -p build-fuzz/work/$$t; \
 	  if ! $(SANRUN) build-fuzz/fuzz_$$t -max_total_time=$(FUZZ_SECONDS) -print_final_stats=1 -rss_limit_mb=2048 \
 	       -artifact_prefix=build-fuzz/crash-$$t- build-fuzz/work/$$t build-fuzz/corpus/$$t \
@@ -283,6 +293,23 @@ whole: $(WHOLE) $(PROBE) $(DEVSTALL)
 whole-ext: $(WHOLE_EXT) $(PROBE) $(DEVSTALL)
 	sh bench/whole.sh $(WHOLE_EXT)
 
+# F5 (docs/f5-design.md): imagedb's Parquet files read by DuckDB's library, the one reader from outside on this machine
+# (the user, 2026-11-13: "DuckDB is fine"); opt-in, outside the matrix, test-only: imagedb links nothing of it. Its
+# scratch in tmpfs (the user's choice for test scratch: give rm -rf /dev/shm/imdb-* at the session's end).
+PQCHECK = $(BUILD)/pqcheck
+$(PQCHECK): tests/parquet_check/pqcheck.c $(LIB) $(HDR)
+	$(CC) $(CFLAGS) -Wno-missing-prototypes -isystem $(DUCKDB_DIR) tests/parquet_check/pqcheck.c $(LIB) -o $@ $(LDFLAGS) \
+	  -L $(DUCKDB_DIR) -lduckdb -Wl,-rpath,$(DUCKDB_DIR)
+# its second part (pqengine): DuckDB reads the segments the engine itself wrote (every type at its edges, NULLs, an
+# ALTER, an ERASE's stubs) against imagedb's own SELECT; a fresh directory beneath the scratch each run
+PQENGINE = $(BUILD)/pqengine
+$(PQENGINE): tests/parquet_check/pqengine.c $(LIB) $(HDR)
+	$(CC) $(CFLAGS) -Wno-missing-prototypes -isystem $(DUCKDB_DIR) tests/parquet_check/pqengine.c $(LIB) -o $@ $(LDFLAGS) \
+	  -L $(DUCKDB_DIR) -lduckdb -Wl,-rpath,$(DUCKDB_DIR)
+parquet-check: $(PQCHECK) $(PQENGINE)
+	mkdir -p /dev/shm/imdb-pqcheck && $(PQCHECK) /dev/shm/imdb-pqcheck
+	$(PQENGINE) /dev/shm/imdb-pqcheck
+
 # The SQL oracle (tests/oracle, P0): imagedb against SQLite in process and, through tests/oracle/run.sh, PostgreSQL,
 # MySQL, MariaDB and SQL Server in private containers, every answer compared. Test-only: it links their clients (the
 # user's yes, 2026-11-01); the engine links none of them.
@@ -332,7 +359,7 @@ TSAN_FLAGS = -std=c11 -D_GNU_SOURCE -g -O1 -ffp-contract=off -fsanitize=thread -
 tsan:
 	mkdir -p build-tsan
 	clang $(TSAN_FLAGS) $(filter-out src/main.c,$(wildcard src/*.c)) $(wildcard src/vendor/monocypher/*.c) \
-	  $(TSRC) tools/audit/acrypto.c tools/audit/afsum.c tools/audit/abind.c -o build-tsan/test_unit -lcrypto
+	  $(TSRC) tools/audit/acrypto.c tools/audit/afsum.c tools/audit/abind.c tools/audit/apq.c -o build-tsan/test_unit -lcrypto
 	clang $(TSAN_FLAGS) tests/unit/t_pool.c tests/tsan/pool_main.c src/pool.c $(KERNEL_SRC) \
 	  src/util.c src/fsio.c -o build-tsan/pool_test
 	$(SANRUN) build-tsan/pool_test

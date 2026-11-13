@@ -888,7 +888,9 @@ SELECT CAST('42' AS INT64), 'a' || CAST(7 AS TEXT), LENGTH('héllo');   -- no FR
   design.md §5 ("Functions, CASE, CAST, IN, LIKE").
 
 The
-lake format is imagedb's own; Parquet, other platforms and the desktop client
+lake's segments are Parquet files in a canonical subset of Parquet: any Parquet reader reads them (DuckDB's is
+checked: `make parquet-check`, which links its library, test-only, outside the matrix). The Iceberg tables over
+them, other platforms and the desktop client
 are deferred (deferred.md).
 
 Ordered indexes:

@@ -4,24 +4,27 @@
  * canonical encoding, so the same logical content always produces the same
  * bytes on the primary, on every replica, and in any re-encoding.
  *
- * Segment ("IMDBSEG1", version 3: F1 stage 4), little-endian:
- *   header (64 B): magic[8] u32 version (3) u32 table version_hash[32] (imdb_sver_hash: the schema version that built
- *                  it, its encoding and positions) u32 nrows
- *                  u32 ncols u32 nsections u32 reserved
- *   directory: nsections x { u32 kind, u32 col, u64 offset, u64 length }
- *   sections in canonical order, each 8-byte aligned, zero padding:
- *     VID u64[n] | BEGIN u64[n] | FLAGS u8[n] | SALT [16]u8[n] | COMMIT [32]u8[n] |
- *     per column: I64 i64[n] (INT64, DECIMAL, TIMESTAMP, FLOAT64 keys)  or  U8 u8[n]  or
- *       TEXT_OFF u32[n+1] + TEXT_DATA, then for a NULLABLE column VALID u8[ceil(n/8)]
- *       (bit i: row i has a value; padding zero) |
- *     ZONEMAP ncols x { u8 has, u8 has_null, pad[6], i64 min, i64 max } over the flag-0 rows,
- *       min/max over their values (NULLs excluded)
+ * Segment (F5: imagedb's canonical Parquet subset, src/parquet.h, docs/f5-design.md): a Parquet file of one row group
+ *   of at least one row, its rows in vid order, a chunk a column: imdb$vid INT64, imdb$begin INT64, imdb$flags INT32,
+ *   imdb$salt FIXED_LEN_BYTE_ARRAY(16), imdb$commit FIXED_LEN_BYTE_ARRAY(32), each REQUIRED (field ids 2147483000 to
+ *   2147483004, below Iceberg's reserved range; a '$' in each name, which no imagedb identifier holds), then the live
+ *   columns of the schema version that built it in its compact order (field id: the column's position + 1), OPTIONAL
+ *   when NULLABLE: BIGINT INT64 INT(64), INTEGER INT32 INT(32), SMALLINT INT32 INT(16), a DECIMAL to 18 digits INT64
+ *   DECIMAL and past them FIXED_LEN_BYTE_ARRAY(16) big-endian DECIMAL, TEXT BYTE_ARRAY STRING, BYTEA BYTE_ARRAY, BOOL
+ *   BOOLEAN, TIMESTAMP INT64 TIMESTAMP(MICROS) local and TIMESTAMPTZ UTC, DATE INT32 DATE, TIME INT64 TIME(MICROS)
+ *   local, UUID FIXED_LEN_BYTE_ARRAY(16) UUID, FLOAT64 DOUBLE (IEEE; the image holds its key), INTERVAL
+ *   FIXED_LEN_BYTE_ARRAY(16) (months LE32, days LE32, microseconds LE64; no annotation), ENUM INT64 (its ordinal).
+ *   The footer's key-value pairs: imagedb.chunks (the writer's), imagedb.format "1", imagedb.interval (the INTERVAL
+ *   columns' field ids, decimal, comma-separated; only when any), imagedb.schema (the version's imdb_sver_hash, 64
+ *   lowercase hex), imagedb.table (the table's id, decimal): exactly these. Statistics wherever a zone map exists (not
+ *   seg_bytes), bounding every value, a placeholder too; the zone maps are computed at the load. A file in the format
+ *   before (magic "IMDBSEG1") is refused by name.
  *   Row flags: 0 a version with its data; 1 (stub) erased: vid, begin, commitment only;
  *   2 (purged) dropped by COMPACT ... PURGE: vid, begin, commitment and the SUBJECT value
  *   (so ERASE SUBJECT still finds purged history, whose payloads remain in the log);
- *   3 purged and erased: vid, begin, commitment only. Every column a row does not keep is
- *   zero (TEXT: empty) with its VALID bit clear, a NULL is zero data with its VALID bit clear,
- *   salt is zero for every flagged row, zone maps cover flag-0 rows only.
+ *   3 purged and erased: vid, begin, commitment only. A row that keeps no value in a column is NULL where the column is
+ *   OPTIONAL and the type's zero where it is REQUIRED (TEXT and BYTEA empty, FLOAT64 +0.0, a 16-byte cell zeros); a
+ *   flagged row's salt is zero; zone maps cover flag-0 rows only.
  *   Every version of a table is in exactly one segment of the manifest.
  *
  * Deletion vector ("IMDBDV01"): seg_hash[32] u32 count u32 0 | count x { u32 row, u32 0, u64 end }
@@ -65,22 +68,17 @@ enum {
 
 #include "db.h"
 
-enum {
-    SEG_VID = 1, SEG_BEGIN = 2, SEG_FLAGS = 3, SEG_SALT = 4, SEG_COMMIT = 5,
-    SEG_I64 = 16, SEG_U8 = 17, SEG_TEXT_OFF = 18, SEG_TEXT_DATA = 19, SEG_VALID = 20,
-    SEG_ZONEMAP = 32,
-};
-
-#define IMDB_SEG_HEADER 64u
-#define IMDB_SEG_VERSION 3u /* F1 stage 4: the header names its schema version by imdb_sver_hash (2: by the schema alone) */
-#define IMDB_MANIFEST_VERSION 18u /* L: roles and grants (sections 5 and 6 filled); 17 before them (F3g: ENUM types, the
+#define IMDB_SEG_NSYS 5u            /* F5: a segment's system columns, before the schema version's */
+#define IMDB_SEG_SYS_FIELD 2147483000 /* F5: the first one's field id */
+#define IMDB_MANIFEST_VERSION 19u /* F5: segments in imagedb's Parquet subset; 18 before them (L: roles and grants,
+                                   sections 5 and 6 filled); 17 before those (F3g: ENUM types, the
                                    enums section, ENUM columns); 16 before those (F3f: INTERVAL columns,
                                    16-byte cells and DEFAULTs); 15 before those (F3e: DECIMAL columns to 38
                                    digits, a wide one's 16-byte cells); 14 before those (F3d: UUID and
                                    BYTEA columns and op 23's kind 10 (gen_random_uuid) in version 1's
                                    DEFAULTs (13 before them: F2b-2, version 1's FOREIGN KEYs; 12: F2c, a CREATE's generated
                                    columns; 11: F2b-1, version 1's CHECKs; 10: F2a-2, the sequences section; 9: F2a, a
-                                   CREATE's DEFAULTs; 8; 7: segment format 2); 2 to 16 refused by name (old_manifest) */
+                                   CREATE's DEFAULTs; 8; 7: segment format 2); 2 to 18 refused by name (old_manifest) */
 #define IMDB_SEG_STUB 1u   /* erased: vid, begin and commitment only */
 #define IMDB_SEG_PURGED 2u /* purged by COMPACT ... PURGE: vid, begin, commitment and the SUBJECT value */
 
@@ -123,6 +121,16 @@ typedef struct imdb_segimg {
      * the image after it lays it out under the cache's lock before any worker reads col[]. */
     imdb_segcol ocol[IMDB_MAX_COLS];
     uint32_t gver, laid;
+    /* F5: the arrays the load made (a pass from the file's form to the image's, an OPTIONAL column spread to n slots,
+     * the flags narrowed); every other view points into bytes. Each holds row values: wiped and freed with the image,
+     * and charged to the cache with it. At most the flags, the four other system columns' (a settled image's) and three a
+     * column (values or offsets, bytes, validity) */
+    struct {
+        void *p;
+        size_t n;
+    } own[IMDB_SEG_NSYS + 3 * IMDB_MAX_COLS];
+    bool viewless; /* F5: no view points into bytes (seg_settle): a built image drops them once its object is written */
+    uint32_t nown;
 } imdb_segimg;
 
 /* A segment's DESCRIPTOR: what stays resident whatever the retention (a few hundred bytes); its image is img_ (NULL:
@@ -226,13 +234,18 @@ int imdb_schema_hash(const imdb_schema *s, uint8_t out[32], imdb_err *e);
  * encoding and each column's position (u16; pos NULL: version 1's, column c at position c). Equal hashes mean equal
  * layouts: a DROP COLUMN then an ADD COLUMN of the same column gives the old encoding at another position */
 int imdb_sver_hash(const imdb_schema *s, const uint16_t *pos, uint8_t out[32], imdb_err *e);
-/* F1: the same, by the version of h whose hash the header names: its image laid out for h's last version */
+/* F1: the same, by the version of h whose hash the footer names (imagedb.schema): its image laid out for h's last
+ * version */
 int imdb_segment_parse_h(const imdb_schema_hist *h, uint8_t *bytes, size_t len, const uint8_t known[32], imdb_segment **out,
                          imdb_err *e);
-/* vhash: the version hash the header must carry (imdb_sver_hash of the version s is) */
-int imdb_segment_parse(const imdb_schema *s, const uint8_t vhash[32], uint8_t *bytes, size_t len, const uint8_t known[32],
-                       imdb_segment **out, imdb_err *e);
+/* a segment of version v (its schema, hash and positions: the footer must name it, its columns be v's). bytes 8-byte
+ * aligned, the caller's on a refusal and the image's on success (its views point into them) */
+int imdb_segment_parse(const imdb_sver *v, uint8_t *bytes, size_t len, const uint8_t known[32], imdb_segment **out,
+                       imdb_err *e);
 void imdb_segment_free(imdb_segment *g);
+/* F5, for tools that build hostile files (forge.c): a segment's Parquet shapes under version v */
+struct pq_col;
+void imdb_seg_shapes(const imdb_sver *v, struct pq_col *sh);
 /* Recomputes every non-stub row's commitment from the columns. */
 int imdb_segment_check_commitments(const imdb_schema_hist *h, const imdb_segment *g, const imdb_segimg *gi, imdb_err *e);
 /* Column c of row `row` (non-stub; a TEXT value points into the segment). */
