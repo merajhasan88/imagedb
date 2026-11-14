@@ -45,6 +45,7 @@
 #include "afsum.h"
 #include "abind.h"
 #include "apq.h"
+#include "aice.h"
 
 #define LOG_VERSION 3 /* the commit header's first byte (design.md §3; the format design's slice 1: 2 refused by name) */
 #define LIVE ((uint64_t)INT64_MAX)
@@ -6650,6 +6651,636 @@ static bool same_history(const mtable *mt, const table *t)
     return true;
 }
 
+
+/* ---- F5c: the Iceberg layer, read by the auditor's own readers (aice.c) ---------------------------------------- */
+
+typedef struct icheck {
+    uint32_t tables, snaps, files, vectors;
+} icheck;
+
+/* the files a table's metadata names: its directory holds exactly these */
+typedef struct inames {
+    char (*n)[128];
+    uint32_t nn, cap;
+} inames;
+
+static void in_add(inames *x, const char *path)
+{
+    const char *b = strrchr(path, '/');
+    b = b ? b + 1 : path;
+    for (uint32_t k = 0; k < x->nn; k++)
+        if (!strcmp(x->n[k], b)) return;
+    if (x->nn == x->cap) {
+        x->cap = x->cap ? x->cap * 2 : 32;
+        x->n = xrealloc(x->n, x->cap, sizeof *x->n);
+    }
+    snprintf(x->n[x->nn++], sizeof x->n[0], "%s", b);
+}
+
+/* the rows of a segment not visible at S by the auditor's own model: flagged (a stub, purged), or ended at or before S
+ * (the generation's deletion vector): ascending, malloc'd; and its last vid (its rows' vids ascend) */
+static int dead_at(int ofd, const mtable *t, uint32_t k, uint64_t S, uint64_t **pos, size_t *n, uint64_t *maxvid)
+{
+    *pos = NULL;
+    *n = 0;
+    uint8_t *sb;
+    size_t sl;
+    if (obj_read(ofd, t->seg[k], ".seg", &sb, &sl)) return -1;
+    seg g;
+    if (parse_segment(t->vers, t->nvers, t->missing, &t->vers[t->nvers - 1], sb, sl, &g)) {
+        free(sb);
+        return -1;
+    }
+    int rc = 0;
+    if (!all_zero(t->dv[k], 32)) {
+        uint8_t *dvb;
+        size_t dl;
+        if (!(rc = obj_read(ofd, t->dv[k], ".dv", &dvb, &dl))) {
+            rc = parse_dv(dvb, dl, t->seg[k], &g, S);
+            free(dvb);
+        }
+    }
+    uint64_t *p = xcalloc(g.n ? g.n : 1, sizeof *p);
+    size_t c = 0;
+    for (uint32_t i = 0; !rc && i < g.n; i++)
+        if (g.row[i].flags || g.row[i].end <= S) p[c++] = i;
+    if (maxvid) *maxvid = g.n ? g.row[g.n - 1].vid : 0;
+    seg_free(&g);
+    if (rc) {
+        free(p);
+        return -1;
+    }
+    *pos = p;
+    *n = c;
+    return 0;
+}
+
+/* a snapshot's dead rows by segment, each parsed once (dead_at) */
+typedef struct dcache {
+    uint64_t **pos;
+    size_t *n;
+    uint64_t *maxvid;
+    bool *have;
+    uint32_t nseg;
+} dcache;
+
+static int dead_get(int ofd, const mtable *t, uint32_t k, uint64_t S, dcache *dc, const uint64_t **pos, size_t *n,
+                    uint64_t *maxvid)
+{
+    if (!dc->have[k]) {
+        if (dead_at(ofd, t, k, S, &dc->pos[k], &dc->n[k], &dc->maxvid[k])) return -1;
+        dc->have[k] = true;
+    }
+    *pos = dc->pos[k];
+    *n = dc->n[k];
+    if (maxvid) *maxvid = dc->maxvid[k];
+    return 0;
+}
+
+static void dcache_free(dcache *dc)
+{
+    for (uint32_t k = 0; k < dc->nseg; k++) free(dc->pos[k]);
+    free(dc->pos);
+    free(dc->n);
+    free(dc->maxvid);
+    free(dc->have);
+}
+
+/* a file the layer names by its absolute path: a file of this table's metadata directory, read */
+static uint8_t *ice_read(int mfd, const char *mloc, const char *path, size_t *len, inames *nm)
+{
+    size_t ml = strlen(mloc);
+    if (strncmp(path, mloc, ml) || path[ml] != '/' || strchr(path + ml + 1, '/') || strlen(path + ml + 1) >= 128) {
+        fail("iceberg: %s is not a file of its table's metadata directory", path);
+        return NULL;
+    }
+    in_add(nm, path);
+    uint8_t *b = NULL;
+    if (read_file(mfd, path + ml + 1, &b, len, 1ull << 30)) return NULL;
+    return b;
+}
+
+static bool ice_path(const uint8_t *p, size_t l, char *out, size_t cap)
+{
+    if (!p || l >= cap) return false;
+    memcpy(out, p, l);
+    out[l] = 0;
+    return strlen(out) == l;
+}
+
+/* one snapshot of table t at S (its generation's entry t, the older's older or NULL), under head H: its manifest list,
+ * its data manifest (each of the generation's segments in order, ADDED or EXISTING as the older holds it, its rows, an
+ * EXISTING one's sequence numbers and first row the older's) and its vectors (each exactly the rows its data file holds
+ * that are not visible at S); its first-row-id above every vid its files hold. ofr: the older's files' first rows (out,
+ * for the head's EXISTING ones); *rows: the rows its data files hold */
+static int ice_snap(int ofd, int mfd, const char *loc, const char *mloc, const mtable *t, const mtable *older, uint64_t S,
+                    uint64_t S0, uint64_t H, const char *list, uint64_t first_row, uint64_t *ofr, const uint64_t *ofr_old,
+                    uint64_t *rows, inames *nm, icheck *ic)
+{
+    dcache dc = {xcalloc(t->nseg ? t->nseg : 1, sizeof(uint64_t *)), xcalloc(t->nseg ? t->nseg : 1, sizeof(size_t)),
+                 xcalloc(t->nseg ? t->nseg : 1, sizeof(uint64_t)), xcalloc(t->nseg ? t->nseg : 1, 1), t->nseg};
+    size_t ll;
+    uint8_t *lb = ice_read(mfd, mloc, list, &ll, nm);
+    if (!lb) {
+        dcache_free(&dc); /* a list that cannot be read: nothing kept (the flip test's leak reports) */
+        return -1;
+    }
+    aocf lo;
+    const char *why;
+    int rc = aocf_read(lb, ll, &lo, &why) ? fail("iceberg: %s: %s", list, why) : 0;
+    char want[4500];
+    snprintf(want, sizeof want, "%s/snap-%llu-h%llu.avro", mloc, (unsigned long long)S, (unsigned long long)H);
+    if (!rc && strcmp(list, want)) rc = fail("iceberg: table %s: snapshot %llu's manifest list is not its own", t->s.name, (unsigned long long)S);
+    arr r = {lo.records, lo.rlen, 0, false};
+    uint32_t ndata = 0, ndel = 0;
+    uint64_t maxvid = 0;
+    bool anyvid = false;
+    *rows = 0;
+    for (uint64_t q = 0; !rc && q < lo.nrec; q++) { /* each manifest the list names, a manifest_file record */
+        size_t pl;
+        const uint8_t *pp = ar_bytes(&r, &pl);
+        int64_t mlen = ar_long(&r), spec = ar_long(&r), content = ar_long(&r), seq = ar_long(&r), minseq = ar_long(&r),
+                added_sid = ar_long(&r), nadd = ar_long(&r), nexist = ar_long(&r), ndelf = ar_long(&r), radd = ar_long(&r),
+                rexist = ar_long(&r), rdel = ar_long(&r), lfrid = -1;
+        if (ar_long(&r)) lfrid = ar_long(&r); /* first_row_id */
+        char mp[4400];
+        if (r.bad || !ice_path(pp, pl, mp, sizeof mp)) {
+            rc = fail("iceberg: %s: a manifest list record that does not read", list);
+            break;
+        }
+        if (spec || seq != (int64_t)S || added_sid != (int64_t)S || (content != 0 && content != 1) || (content == 0 ? ndata++ : ndel++)) {
+            rc = fail("iceberg: %s: its manifests are not one data manifest and at most one of vectors at the snapshot", list);
+            break;
+        }
+        size_t mn;
+        uint8_t *mb = ice_read(mfd, mloc, mp, &mn, nm);
+        if (!mb) {
+            rc = -1;
+            break;
+        }
+        aocf mo;
+        if (aocf_read(mb, mn, &mo, &why)) rc = fail("iceberg: %s: %s", mp, why);
+        if (!rc && (uint64_t)mlen != mn) rc = fail("iceberg: %s: its manifest_length is not its size", list);
+        arr er = {mo.records, mo.rlen, 0, false};
+        uint32_t covered = 0, cadd = 0, cexist = 0;
+        uint64_t crows_add = 0, crows_exist = 0, crows_del = 0, next_frid = first_row;
+        uint8_t *seen = content == 1 ? xcalloc(t->nseg ? t->nseg : 1, 1) : NULL;
+        for (uint64_t x = 0; !rc && x < mo.nrec; x++) { /* each entry, a manifest_entry record */
+            int64_t status = ar_long(&er);
+            int64_t sid = -1, dseq = -1, fseq = -1, frid = -1, off = -1, clen = -1;
+            if (ar_long(&er)) sid = ar_long(&er);
+            if (ar_long(&er)) dseq = ar_long(&er);
+            if (ar_long(&er)) fseq = ar_long(&er);
+            int64_t fcontent = ar_long(&er);
+            size_t fl, ffl, rl = 0;
+            const uint8_t *fp = ar_bytes(&er, &fl), *ff = ar_bytes(&er, &ffl), *rp = NULL;
+            int64_t count = ar_long(&er), size = ar_long(&er);
+            if (ar_long(&er)) frid = ar_long(&er);
+            if (ar_long(&er)) rp = ar_bytes(&er, &rl);
+            if (ar_long(&er)) off = ar_long(&er);
+            if (ar_long(&er)) clen = ar_long(&er);
+            if (er.bad || !fp || !ff || fcontent != content || count < 0 || size < 0) {
+                rc = fail("iceberg: %s: an entry that does not read", mp);
+                break;
+            }
+            if (content == 0) { /* a data file: the generation's segment k, in order */
+                char sp[4400], hx[65];
+                uint32_t k = (uint32_t)x;
+                if (k >= t->nseg) {
+                    rc = fail("iceberg: %s: more data files than the generation's segments", mp);
+                    break;
+                }
+                hex(t->seg[k], 32, hx);
+                snprintf(sp, sizeof sp, "%s/objects/%s.seg", loc, hx);
+                int64_t ok_frid = -1; /* an EXISTING one's: the older snapshot's for it */
+                for (uint32_t o2 = 0; older && o2 < older->nseg && ok_frid < 0; o2++)
+                    if (!memcmp(older->seg[o2], t->seg[k], 32)) ok_frid = (int64_t)ofr_old[o2];
+                bool existing = ok_frid >= 0;
+                struct stat st;
+                char sn[80];
+                snprintf(sn, sizeof sn, "%s.seg", hx);
+                if (fl != strlen(sp) || memcmp(fp, sp, fl) || ffl != 7 || memcmp(ff, "PARQUET", 7) || (uint64_t)count != t->nrows[k] ||
+                    fstatat(ofd, sn, &st, AT_SYMLINK_NOFOLLOW) != 0 || (uint64_t)size != (uint64_t)st.st_size || rp || off >= 0 ||
+                    clen >= 0)
+                    rc = fail("iceberg: %s: data file %u is not the generation's segment, its rows or its size", mp, k);
+                else if (status != (existing ? 0 : 1))
+                    rc = fail("iceberg: table %s: snapshot %llu: data file %u is not %s as the older snapshot %s", t->s.name,
+                              (unsigned long long)S, k, existing ? "EXISTING" : "ADDED", existing ? "holds it" : "lacks it");
+                else if (existing ? sid != (int64_t)S0 || dseq != (int64_t)S0 || fseq != (int64_t)S0 || frid != ok_frid
+                                  : sid >= 0 || dseq >= 0 || fseq >= 0 || frid >= 0)
+                    rc = fail("iceberg: table %s: snapshot %llu: data file %u's sequence numbers or first row are not %s", t->s.name,
+                              (unsigned long long)S, k, existing ? "the older snapshot's" : "inherited");
+                if (rc) break;
+                ofr[k] = existing ? (uint64_t)ok_frid : next_frid; /* its first row, ADDED ones' by the order inherited */
+                if (!existing) next_frid += t->nrows[k];
+                existing ? (cexist++, crows_exist += (uint64_t)count) : (cadd++, crows_add += (uint64_t)count);
+                *rows += (uint64_t)count;
+                covered++;
+                ic->files++;
+            } else { /* a deletion vector: the rows of its data file not visible at S */
+                uint32_t k = t->nseg;
+                for (uint32_t q2 = 0; rp && q2 < t->nseg && k == t->nseg; q2++) {
+                    char sp[4400], hx[65];
+                    hex(t->seg[q2], 32, hx);
+                    snprintf(sp, sizeof sp, "%s/objects/%s.seg", loc, hx);
+                    if (rl == strlen(sp) && !memcmp(rp, sp, rl)) k = q2;
+                }
+                char pp2[4400];
+                if (k == t->nseg || seen[k]++ || ffl != 6 || memcmp(ff, "PUFFIN", 6) || status != 1 || sid >= 0 || dseq >= 0 ||
+                    fseq >= 0 || frid >= 0 || !ice_path(fp, fl, pp2, sizeof pp2)) {
+                    rc = fail("iceberg: %s: a vector of no data file, a second one, or not an ADDED Puffin blob", mp);
+                    break;
+                }
+                size_t pn;
+                uint8_t *pb = ice_read(mfd, mloc, pp2, &pn, nm);
+                aj foot;
+                uint64_t *got = NULL;
+                const uint64_t *wantc = NULL;
+                size_t gn = 0, wn = 0;
+                if (!pb) rc = -1;
+                else if ((uint64_t)size != pn) rc = fail("iceberg: %s: its file_size_in_bytes is not its size", mp);
+                else if (apuf_read(pb, pn, &foot, &why)) rc = fail("iceberg: %s: %s", pp2, why);
+                else {
+                    const aj *bl = aj_get(&foot, "blobs");
+                    const aj *b0 = bl && bl->kind == AJ_ARR && bl->n == 1 ? &bl->v[0] : NULL;
+                    const aj *bo = aj_get(b0, "offset"), *bn = aj_get(b0, "length"), *bt = aj_get(b0, "type");
+                    const aj *bp = aj_get(b0, "properties"), *bref = aj_get(bp, "referenced-data-file"), *bcard = aj_get(bp, "cardinality");
+                    char cardw[24];
+                    snprintf(cardw, sizeof cardw, "%lld", (long long)count);
+                    if (!bo || !bn || !bt || bo->kind != AJ_INT || bn->kind != AJ_INT || bt->kind != AJ_STR ||
+                        strcmp(bt->s, "deletion-vector-v1") || bo->i != off || bn->i != clen || off < 4 || clen < 12 || pn < 4 ||
+                        (uint64_t)off > pn - 4 || (uint64_t)clen > pn - 4 - (uint64_t)off || !bref || bref->kind != AJ_STR ||
+                        strlen(bref->s) != rl || memcmp(bref->s, rp, rl) || !bcard || bcard->kind != AJ_STR || strcmp(bcard->s, cardw))
+                        rc = fail("iceberg: %s: its blob is not the entry's", pp2);
+                    else if (adv_read(pb + off, (size_t)clen, &got, &gn, &why))
+                        rc = fail("iceberg: %s: %s", pp2, why);
+                    else if (dead_get(ofd, t, k, S, &dc, &wantc, &wn, NULL))
+                        rc = -1;
+                    else if (gn != wn || (gn && memcmp(got, wantc, gn * sizeof *got)) || (uint64_t)count != gn)
+                        rc = fail("iceberg: table %s: snapshot %llu's vector of segment %u is not the rows it holds that are "
+                                  "not visible at the snapshot", t->s.name, (unsigned long long)S, k);
+                    aj_free(&foot);
+                }
+                free(got);
+                free(pb);
+                cadd++;
+                crows_del += (uint64_t)count;
+                ic->vectors++;
+            }
+        }
+        if (!rc && content == 0 && covered != t->nseg) rc = fail("iceberg: %s: not every segment of the generation", mp);
+        if (!rc && content == 0 &&
+            (nadd != cadd || nexist != cexist || ndelf || radd != (int64_t)crows_add || rexist != (int64_t)crows_exist || rdel ||
+             minseq != (cexist ? (int64_t)S0 : (int64_t)S) || lfrid != (int64_t)first_row))
+            rc = fail("iceberg: %s: its data manifest's counts, sequence numbers or first row are not its entries'", list);
+        if (!rc && content == 1 &&
+            (nadd != cadd || nexist || ndelf || radd != (int64_t)crows_del || rexist || rdel || minseq != (int64_t)S || lfrid >= 0))
+            rc = fail("iceberg: %s: its delete manifest's counts or sequence numbers are not its entries'", list);
+        for (uint32_t k = 0; !rc && content == 1 && k < t->nseg; k++) { /* a segment with rows not visible and no vector */
+            const uint64_t *wantc = NULL;
+            size_t wn = 0;
+            if (!seen[k] && !(rc = dead_get(ofd, t, k, S, &dc, &wantc, &wn, NULL)) && wn)
+                rc = fail("iceberg: table %s: snapshot %llu: segment %u holds rows not visible and no vector", t->s.name,
+                          (unsigned long long)S, k);
+        }
+        free(seen);
+        free(mb);
+    }
+    for (uint32_t k = 0; !rc && k < t->nseg; k++) { /* its vids below its first row; no vector manifest: none dead */
+        const uint64_t *wantc = NULL;
+        uint64_t mv = 0;
+        size_t wn = 0;
+        if (!(rc = dead_get(ofd, t, k, S, &dc, &wantc, &wn, &mv))) {
+            if (t->nrows[k] && (!anyvid || mv > maxvid)) maxvid = mv, anyvid = true;
+            if (!ndel && wn)
+                rc = fail("iceberg: table %s: snapshot %llu: rows not visible and no vectors", t->s.name, (unsigned long long)S);
+        }
+    }
+    if (!rc && anyvid && maxvid >= first_row)
+        rc = fail("iceberg: table %s: snapshot %llu's first-row-id is not above every vid its files hold", t->s.name,
+                  (unsigned long long)S);
+    if (!rc && ndata != 1) rc = fail("iceberg: %s: no data manifest", list);
+    dcache_free(&dc);
+    free(lb);
+    ic->snaps++;
+    return rc;
+}
+
+/* a column's Iceberg type (the auditor's own map: imagedb's types to Iceberg's), or NULL: left out (ENUM, INTERVAL) */
+static const char *ice_type_a(const col *c, char *buf, size_t cap)
+{
+    switch (c->type) {
+    case T_INT64: return c->prec == 16 || c->prec == 32 ? "int" : "long";
+    case T_DECIMAL: snprintf(buf, cap, "decimal(%u,%u)", (unsigned)c->prec, (unsigned)c->scale); return buf;
+    case T_TEXT: return "string";
+    case T_BYTEA: return "binary";
+    case T_BOOL: return "boolean";
+    case T_FLOAT64: return "double";
+    case T_DATE: return "date";
+    case T_TIME: return "time";
+    case T_TIMESTAMP: return "timestamp";
+    case T_TIMESTAMPTZ: return "timestamptz";
+    case T_UUID: return "uuid";
+    default: return NULL;
+    }
+}
+
+/* days since 1970-01-01 as a civil date (the auditor's own: H. Hinnant's algorithm) */
+static void a_civil(int64_t z, int64_t *y, unsigned *m, unsigned *d)
+{
+    z += 719468;
+    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    unsigned doe = (unsigned)(z - era * 146097);
+    unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100), mp = (5 * doy + 2) / 153;
+    *d = doy - (153 * mp + 2) / 5 + 1;
+    *m = mp < 10 ? mp + 3 : mp - 9;
+    *y = (int64_t)yoe + era * 400 + (*m <= 2);
+}
+
+/* a string-typed initial-default's text by Iceberg's single-value serialization (spec Appendix D), the auditor's own:
+ * a DECIMAL's digits to its scale, a DATE yyyy-mm-dd, a TIME hh:mm:ss.ffffff, a TIMESTAMP both with a T between, a
+ * TIMESTAMPTZ then +00:00, a UUID's 8-4-4-4-12 lower-case hex, a BYTEA's lower-case hex (Appendix D's example) */
+static bool ice_default_ok(const col *c, const val *v, const char *got)
+{
+    char b[4200];
+    size_t n = 0;
+    int64_t days = 0, tod = 0;
+    switch (c->type) {
+    case T_DECIMAL: {
+        uint64_t a = v->i < 0 ? (uint64_t)0 - (uint64_t)v->i : (uint64_t)v->i;
+        char dg[32];
+        int nd = snprintf(dg, sizeof dg, "%llu", (unsigned long long)a);
+        if (v->i < 0) b[n++] = '-';
+        if (nd <= c->scale) { /* 0.00ddd */
+            b[n++] = '0';
+            b[n++] = '.';
+            for (int k = nd; k < c->scale; k++) b[n++] = '0';
+            memcpy(b + n, dg, (size_t)nd), n += (size_t)nd;
+        } else {
+            memcpy(b + n, dg, (size_t)(nd - c->scale)), n += (size_t)(nd - c->scale);
+            if (c->scale) b[n++] = '.', memcpy(b + n, dg + nd - c->scale, c->scale), n += c->scale;
+        }
+        b[n] = 0;
+        return !strcmp(b, got);
+    }
+    case T_UUID:
+        if (v->len != 16) return false;
+        for (int k = 0; k < 16; k++) {
+            if (k == 4 || k == 6 || k == 8 || k == 10) b[n++] = '-';
+            n += (size_t)snprintf(b + n, 3, "%02x", v->s[k]);
+        }
+        b[n] = 0;
+        return !strcmp(b, got);
+    case T_BYTEA:
+        if (v->len > 2000) return strlen(got) == 2 * (size_t)v->len; /* long: its length alone */
+        for (uint32_t k = 0; k < v->len; k++) n += (size_t)snprintf(b + n, 3, "%02x", v->s[k]);
+        b[n] = 0;
+        return !strcmp(b, got);
+    case T_DATE: days = v->i; break;
+    case T_TIME: tod = v->i; break;
+    case T_TIMESTAMP:
+    case T_TIMESTAMPTZ:
+        days = v->i / 86400000000ll, tod = v->i % 86400000000ll;
+        if (tod < 0) tod += 86400000000ll, days--;
+        break;
+    default: return false;
+    }
+    if (c->type != T_TIME) {
+        int64_t y;
+        unsigned m, d;
+        a_civil(days, &y, &m, &d);
+        n += (size_t)snprintf(b + n, 32, "%04lld-%02u-%02u", (long long)y, m, d);
+        if (c->type != T_DATE) b[n++] = 'T';
+    }
+    if (c->type != T_DATE)
+        n += (size_t)snprintf(b + n, 32, "%02lld:%02lld:%02lld.%06lld", (long long)(tod / 3600000000ll), (long long)(tod / 60000000ll % 60),
+                              (long long)(tod / 1000000 % 60), (long long)(tod % 1000000));
+    if (c->type == T_TIMESTAMPTZ) n += (size_t)snprintf(b + n, 8, "+00:00");
+    b[n] = 0;
+    return !strcmp(b, got);
+}
+
+/* the table's schema versions 0..cur as Iceberg schemas: each field by position + 1, its name, its type, required when
+ * NOT NULL at its version and every version before (an optional field never required again), an ALTER's added column's
+ * missing value its initial-default (its kind; an integer's, a boolean's and a string's exactly) */
+static int ice_schemas(const mtable *t, const aj *sc, uint32_t cur)
+{
+    if (!sc || sc->kind != AJ_ARR || sc->n != (size_t)cur + 1) return fail("iceberg: table %s: its schemas are not versions 0 to %u", t->s.name, cur);
+    for (uint32_t vi = 0; vi <= cur; vi++) {
+        const aj *s = &sc->v[vi], *f = aj_get(s, "fields"), *sid = aj_get(s, "schema-id");
+        if (!sid || sid->kind != AJ_INT || sid->i != (int64_t)vi || !f || f->kind != AJ_ARR)
+            return fail("iceberg: table %s: schema %u is not its version", t->s.name, vi);
+        const struct aver *v = &t->vers[vi];
+        size_t fi = 0;
+        for (int c = 0; c < v->s.ncols; c++) {
+            char tb[40];
+            const char *ty = ice_type_a(&v->s.c[c], tb, sizeof tb);
+            if (!ty) continue;
+            int p = v->pos[c];
+            bool req = !(v->s.c[c].flags & F_NULLABLE);
+            for (uint32_t vj = 0; req && vj < vi; vj++)
+                if (p < t->vers[vj].npos && t->vers[vj].at[p] >= 0 && (t->vers[vj].s.c[t->vers[vj].at[p]].flags & F_NULLABLE)) req = false;
+            const aj *fo = fi < f->n ? &f->v[fi] : NULL, *fid = aj_get(fo, "id"), *fn = aj_get(fo, "name"), *fr = aj_get(fo, "required"),
+                     *ft = aj_get(fo, "type"), *fd = aj_get(fo, "initial-default");
+            if (!fid || fid->kind != AJ_INT || fid->i != (int64_t)p + 1 || !fn || fn->kind != AJ_STR || strcmp(fn->s, v->s.c[c].name))
+                return fail("iceberg: table %s: schema %u's fields are not its version's columns", t->s.name, vi);
+            if (!ft || ft->kind != AJ_STR || strcmp(ft->s, ty))
+                return fail("iceberg: table %s: schema %u: field %s is not of its column's type", t->s.name, vi, v->s.c[c].name);
+            if (!fr || fr->kind != AJ_BOOL || fr->i != (int64_t)req)
+                return fail("iceberg: table %s: schema %u: field %s's required is not its column's", t->s.name, vi, v->s.c[c].name);
+            bool added = p >= t->vers[0].npos, has = added && !t->missing[p].null;
+            const val *mv = &t->missing[p];
+            if (!has != !fd)
+                return fail("iceberg: table %s: schema %u: field %s's initial-default %s", t->s.name, vi, v->s.c[c].name,
+                            has ? "is missing" : "is not an added column's");
+            if (has) {
+                int ty2 = v->s.c[c].type;
+                bool ok = ty2 == T_INT64   ? fd->kind == AJ_INT && fd->i == mv->i
+                          : ty2 == T_BOOL  ? fd->kind == AJ_BOOL && fd->i == (mv->i != 0)
+                          : ty2 == T_TEXT  ? fd->kind == AJ_STR && strlen(fd->s) == mv->len && !memcmp(fd->s, mv->s, mv->len)
+                          : ty2 == T_FLOAT64 ? fd->kind == AJ_NUM
+                          : ty2 == T_DECIMAL && mv->wide ? fd->kind == AJ_STR /* past 18 digits: its kind alone */
+                                             : fd->kind == AJ_STR && ice_default_ok(&v->s.c[c], mv, fd->s);
+                if (!ok) return fail("iceberg: table %s: schema %u: field %s's initial-default is not its missing value", t->s.name, vi, v->s.c[c].name);
+            }
+            fi++;
+        }
+        if (fi != f->n) return fail("iceberg: table %s: schema %u holds more fields than its version", t->s.name, vi);
+    }
+    return 0;
+}
+
+/* the older generation's objects of table entry t, each on disk (a seed brings the head generation's alone) */
+static bool older_on_disk(int ofd, const mtable *t)
+{
+    for (uint32_t k = 0; k < t->nseg; k++) {
+        char hx[65], nm[80];
+        struct stat st;
+        hex(t->seg[k], 32, hx);
+        snprintf(nm, sizeof nm, "%s.seg", hx);
+        if (fstatat(ofd, nm, &st, AT_SYMLINK_NOFOLLOW) != 0) return false;
+        if (all_zero(t->dv[k], 32)) continue;
+        hex(t->dv[k], 32, hx);
+        snprintf(nm, sizeof nm, "%s.dv", hx);
+        if (fstatat(ofd, nm, &st, AT_SYMLINK_NOFOLLOW) != 0) return false;
+    }
+    return true;
+}
+
+static uint32_t ver_at_a(const mtable *t, uint64_t S)
+{
+    uint32_t v = 0;
+    for (uint32_t k = 0; k < t->nvers; k++)
+        if (t->vers[k].since <= S) v = k;
+    return v;
+}
+
+/* F5c: the Iceberg layer, when its sidecar names this lake's head and this directory's location: no table's layer where
+ * the head gives none; each live table's metadata at the head, its schemas, and its snapshots: the head's generation and,
+ * where this copy can give it (its commit above the boundary and past the log's floor, its objects on disk), the one
+ * the head retains; each checked by ice_snap against the auditor's own parse of the lake; its directory exactly the
+ * files they name. A layer absent, or of another head or location, is reported, not checked */
+static int check_iceberg(int dirfd, const char *dir, const manifest *m, const state *S)
+{
+    int icefd = openat(dirfd, "iceberg", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (icefd < 0) return 0;
+    char loc[4096];
+    if (!realpath(dir, loc)) {
+        close(icefd);
+        return fail("iceberg: cannot resolve %s", dir);
+    }
+    uint8_t *sb = NULL;
+    size_t sl = 0;
+    char want[4300];
+    char mhx[65]; /* the head by its commit and LAKE_HEAD's manifest hash: another history's head at the same commit is stale */
+    hex(S->lake_manifest, 32, mhx);
+    int wl = snprintf(want, sizeof want, "imagedb-iceberg 1\nhead %llu %s\nlocation %s\n", (unsigned long long)m->seq, mhx, loc);
+    if (read_file(icefd, "LAYER", &sb, &sl, 8192) || wl < 0 || (size_t)wl != sl || memcmp(sb, want, sl)) {
+        printf("iceberg: a layer of another head or location (stale): not checked\n");
+        free(sb);
+        close(icefd);
+        return 0;
+    }
+    free(sb);
+    int ofd = openat(dirfd, "objects", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    manifest pm;
+    memset(&pm, 0, sizeof pm);
+    bool havepm = false;
+    int rc = ofd < 0 ? fail("objects/: cannot open") : 0;
+    if (!rc && !all_zero(m->prev_manifest, 32)) {
+        uint8_t *pb = NULL;
+        size_t pl;
+        if (obj_read(ofd, m->prev_manifest, ".man", &pb, &pl) || parse_manifest(pb, pl, &pm)) rc = -1;
+        else havepm = true;
+        free(pb);
+    }
+    bool pm_ok = havepm && pm.seq > S->boundary_at_lake && pm.seq >= S->floor; /* the engine's rule: durable state alone */
+    DIR *dd = rc ? NULL : fdopendir(dup(icefd)); /* no table's layer where the head gives none */
+    for (struct dirent *de; dd && !rc && (de = readdir(dd));) {
+        char *end = NULL;
+        unsigned long id = strtoul(de->d_name, &end, 10);
+        if (de->d_name[0] < '0' || de->d_name[0] > '9' || !end || *end) continue;
+        bool live = false;
+        for (uint32_t q = 0; q < m->nt && !live; q++) live = m->t[q].s.id == id && !m->t[q].dropped_at && m->t[q].nseg;
+        if (!live) rc = fail("iceberg: table %lu's layer stands where the head gives none", id);
+    }
+    if (dd) closedir(dd);
+    icheck ic = {0};
+    for (uint32_t ti = 0; !rc && ti < m->nt; ti++) {
+        const mtable *t = &m->t[ti];
+        if (t->dropped_at || !t->nseg) continue;
+        const mtable *older = NULL;
+        for (uint32_t q = 0; pm_ok && q < pm.nt && !older; q++)
+            if (pm.t[q].s.id == t->s.id && !pm.t[q].dropped_at && pm.t[q].nseg) older = &pm.t[q];
+        if (older && !older_on_disk(ofd, older)) older = NULL;
+        char tdir[64], mloc[4400], name[96];
+        snprintf(tdir, sizeof tdir, "%u/metadata", (unsigned)t->s.id);
+        snprintf(mloc, sizeof mloc, "%s/iceberg/%s", loc, tdir);
+        int mfd = openat(icefd, tdir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (mfd < 0) {
+            rc = fail("iceberg: table %s has no layer", t->s.name);
+            break;
+        }
+        inames nm = {0};
+        uint8_t *hb = NULL, *jb = NULL;
+        size_t hl = 0, jl = 0;
+        snprintf(name, sizeof name, "%llu", (unsigned long long)m->seq);
+        in_add(&nm, "version-hint.text");
+        if (read_file(mfd, "version-hint.text", &hb, &hl, 64) || hl != strlen(name) || memcmp(hb, name, hl))
+            rc = fail("iceberg: table %s: its version hint is not the head", t->s.name);
+        snprintf(name, sizeof name, "v%llu.metadata.json", (unsigned long long)m->seq);
+        in_add(&nm, name);
+        aj md;
+        memset(&md, 0, sizeof md);
+        const char *why;
+        if (!rc && read_file(mfd, name, &jb, &jl, 1u << 26)) rc = -1;
+        if (!rc && aj_parse((const char *)jb, jl, &md, &why)) rc = fail("iceberg: table %s: %s", t->s.name, why);
+        uint32_t hver = ver_at_a(t, m->seq);
+        if (!rc) {
+            const aj *fv = aj_get(&md, "format-version"), *cs = aj_get(&md, "current-snapshot-id"), *lc = aj_get(&md, "location");
+            const aj *sn = aj_get(&md, "snapshots"), *lsn = aj_get(&md, "last-sequence-number"), *csi = aj_get(&md, "current-schema-id");
+            const aj *nri = aj_get(&md, "next-row-id"), *refs = aj_get(&md, "refs"), *mref = aj_get(refs, "main"),
+                     *mrs = aj_get(mref, "snapshot-id"), *pr = aj_get(&md, "properties"), *ptn = aj_get(pr, "imagedb.table");
+            char tl[4400];
+            snprintf(tl, sizeof tl, "%s/iceberg/%u", loc, (unsigned)t->s.id);
+            uint32_t want_n = older ? 2 : 1;
+            if (!fv || fv->kind != AJ_INT || fv->i != 3 || !cs || cs->kind != AJ_INT || cs->i != (int64_t)m->seq || !lc ||
+                lc->kind != AJ_STR || strcmp(lc->s, tl) || !sn || sn->kind != AJ_ARR || sn->n != want_n || !lsn ||
+                lsn->kind != AJ_INT || lsn->i != (int64_t)m->seq || !csi || csi->kind != AJ_INT || csi->i != (int64_t)hver ||
+                !mrs || mrs->kind != AJ_INT || mrs->i != (int64_t)m->seq || !ptn || ptn->kind != AJ_STR || strcmp(ptn->s, t->s.name) ||
+                !nri || nri->kind != AJ_INT)
+                rc = fail("iceberg: table %s: its metadata is not format 3 at the head with its snapshots (%u)", t->s.name, want_n);
+            if (!rc) rc = ice_schemas(t, aj_get(&md, "schemas"), hver);
+            uint64_t *ofr_old = xcalloc(older ? older->nseg : 1, sizeof *ofr_old), *ofr = xcalloc(t->nseg, sizeof *ofr);
+            int64_t prev_ms = INT64_MIN, frow = 0, rows = 0;
+            for (size_t k = 0; !rc && k < sn->n; k++) {
+                bool is_head = k + 1 == sn->n;
+                const mtable *gt = is_head ? t : older;
+                uint64_t Sk = is_head ? m->seq : pm.seq, rk = 0;
+                const aj *so = &sn->v[k], *id = aj_get(so, "snapshot-id"), *sq = aj_get(so, "sequence-number"),
+                         *ls = aj_get(so, "manifest-list"), *ts = aj_get(so, "timestamp-ms"), *fr = aj_get(so, "first-row-id"),
+                         *par = aj_get(so, "parent-snapshot-id"), *ssid = aj_get(so, "schema-id");
+                if (!id || id->kind != AJ_INT || id->i != (int64_t)Sk || !sq || sq->kind != AJ_INT || sq->i != (int64_t)Sk || !ls ||
+                    ls->kind != AJ_STR || !ts || ts->kind != AJ_INT || ts->i < prev_ms || !fr || fr->kind != AJ_INT ||
+                    (k ? !par || par->kind != AJ_INT || par->i != (int64_t)pm.seq : par != NULL) || !ssid || ssid->kind != AJ_INT ||
+                    ssid->i != (int64_t)ver_at_a(t, Sk) || (k && fr->i != frow + rows) || (!k && fr->i != (int64_t)t->versions)) {
+                    rc = fail("iceberg: table %s: snapshot %zu is not the generation's", t->s.name, k);
+                    break;
+                }
+                prev_ms = ts->i;
+                rc = ice_snap(ofd, mfd, loc, mloc, gt, is_head ? older : NULL, Sk, older ? pm.seq : 0, m->seq, ls->s, (uint64_t)fr->i,
+                              is_head ? ofr : ofr_old, ofr_old, &rk, &nm, &ic);
+                frow = fr->i;
+                rows = (int64_t)rk;
+            }
+            if (!rc && nri->i != frow + rows) rc = fail("iceberg: table %s: its next-row-id is not past its snapshots' rows", t->s.name);
+            free(ofr_old);
+            free(ofr);
+        }
+        DIR *md2 = rc ? NULL : fdopendir(dup(mfd)); /* its directory: exactly the files the metadata names */
+        for (struct dirent *de; md2 && !rc && (de = readdir(md2));) {
+            if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+            bool named = false;
+            for (uint32_t k = 0; k < nm.nn && !named; k++) named = !strcmp(nm.n[k], de->d_name);
+            if (!named) rc = fail("iceberg: table %s: metadata/%s is no file of its layer", t->s.name, de->d_name);
+        }
+        if (md2) closedir(md2);
+        free(nm.n);
+        aj_free(&md);
+        free(hb);
+        free(jb);
+        close(mfd);
+        ic.tables++;
+    }
+    if (!rc) printf("iceberg ok: %u tables, %u snapshots, %u data files, %u vectors against the lake's rows\n", ic.tables, ic.snaps,
+                    ic.files, ic.vectors);
+    if (havepm) manifest_free(&pm);
+    if (ofd >= 0) close(ofd);
+    close(icefd);
+    return rc;
+}
+
 static int cmd_verify(const char *dir, const char *anchor)
 {
     int dirfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
@@ -6789,6 +7420,7 @@ static int cmd_verify(const char *dir, const char *anchor)
         if (!rc)
             printf("lake ok: snapshot at commit %llu, %u tables, %llu rows re-derived from segment files\n",
                    (unsigned long long)m.seq, m.nt, (unsigned long long)rows);
+        if (!rc) rc = check_iceberg(dirfd, dir, &m, &S); /* F5c */
         manifest_free(&m);
     }
     if (!rc && S.note[0]) printf("note: %s\n", S.note);

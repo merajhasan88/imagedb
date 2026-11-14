@@ -408,7 +408,8 @@ int imdb_create_file_excl(int dirfd, const char *name, const void *p, size_t n, 
     return rc;
 }
 
-int imdb_write_file_atomic(int dirfd, const char *name, const void *p, size_t n, int mode, imdb_err *e)
+/* write-temp, fsync, rename, without the directory's sync: the caller syncs the directory once for several (F5c's layer) */
+int imdb_write_file_renamed(int dirfd, const char *name, const void *p, size_t n, int mode, imdb_err *e)
 {
     char tmp[128];
     int len = snprintf(tmp, sizeof tmp, "%s.tmp", name);
@@ -425,7 +426,13 @@ int imdb_write_file_atomic(int dirfd, const char *name, const void *p, size_t n,
         imdb_io_unlinkat(dirfd, tmp, 0);
         return rc;
     }
-    return imdb_sync_dir(dirfd, e);
+    return IMDB_OK;
+}
+
+int imdb_write_file_atomic(int dirfd, const char *name, const void *p, size_t n, int mode, imdb_err *e)
+{
+    int rc = imdb_write_file_renamed(dirfd, name, p, n, mode, e);
+    return rc ? rc : imdb_sync_dir(dirfd, e);
 }
 
 int imdb_open_dir_at(int dirfd, const char *name, imdb_err *e)
@@ -448,4 +455,15 @@ int imdb_open_parent(const char *path, const char **base, imdb_err *e)
     if (fd < 0) return imdb_fail(e, IMDB_ERR_IO, "the directory of %s: %s", path, strerror(errno));
     *base = slash ? slash + 1 : path;
     return fd;
+}
+
+/* F5c: a path made absolute, its symlinks resolved (the Iceberg layer names files by their location): out of cap bytes,
+ * at least 4096 (PATH_MAX); NULL and errno on a failure. Not a fault point: only an open with the layer on calls it */
+char *imdb_io_realpath(const char *path, char *out, size_t cap)
+{
+    if (cap < 4096) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    return realpath(path, out);
 }

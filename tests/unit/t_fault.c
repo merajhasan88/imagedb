@@ -1293,6 +1293,49 @@ static int run_alter(const char *run)
  * taking their values, a mark-only commit, CHECKPOINTs (manifest 10's section), INSERT ... SELECT's values a row, a
  * setval, OVERRIDING USER VALUE; every recovered state the acknowledged one (VERIFY's and the auditor's sequence rules:
  * the marks only advance, within the bounds, from the last setval; the owner; the manifest's states) */
+/* F5c: publications with the Iceberg layer on (iceberg.h): a CHECKPOINT (the first layer), a delete (a vector), a table
+ * made after it (its directory made under a current sidecar), a second CHECKPOINT (two snapshots, EXISTING files), an
+ * update and a third, the table dropped (its layer removed whole at the next) and a fourth. The layer is derived and its
+ * failure a warning: every crash state holds it absent, stale or current, and the check's writable open (the layer on)
+ * writes a stale one again, then VERIFY and the auditor take a current one (a current one wrong is refused) */
+static int run_iceberg(const char *run)
+{
+    imdb_open_opts o = {.sync = 1, .iceberg = true};
+    imdb_db *db = NULL;
+    imdb_err e = {0};
+    if (imdb_open(dir_in(run, "p"), &o, &db, &e)) return 0;
+    imdb_session s;
+    imdb_session_init(&s, db);
+    static const char *const q[] = {
+        "INSERT INTO txns VALUES (10, 7, 1.00, 'row')",
+        "CHECKPOINT",
+        "DELETE FROM txns WHERE id = 2",
+        "CREATE TABLE b (id INT64 PRIMARY KEY, v TEXT)",
+        "INSERT INTO b VALUES (1, 'b1'), (2, 'b2')",
+        "CHECKPOINT",
+        "UPDATE b SET v = 'b2, again' WHERE id = 2",
+        "INSERT INTO txns VALUES (11, 42, 2.00, 'row')",
+        "CHECKPOINT",
+        "DROP TABLE b",
+        "INSERT INTO txns VALUES (12, 9, 3.00, 'row')",
+        "CHECKPOINT",
+    };
+    int v = 0;
+    for (size_t i = 0; i < sizeof q / sizeof *q; i++) {
+        imdb_result r;
+        imdb_err_clear(&e);
+        if (imdb_exec_one(&s, q[i], strlen(q[i]), NULL, 0, &r, &e)) {
+            v = after_error(db);
+            break;
+        }
+        imdb_result_free(&r);
+        ack(db);
+    }
+    imdb_session_close(&s);
+    imdb_close(db);
+    return v;
+}
+
 static int run_seq(const char *run)
 {
     imdb_open_opts o = {.sync = 1};
@@ -2311,7 +2354,7 @@ static const char *check_run(const fscen *s, const char *run, const frun *r)
     }
     char anc[700];
     snprintf(anc, sizeof anc, "%s/anchor", run);
-    imdb_open_opts o = {.sync = 1, .anchor = s->anchored ? anc : NULL};
+    imdb_open_opts o = {.sync = 1, .anchor = s->anchored ? anc : NULL, .iceberg = strcmp(s->name, "iceberg") == 0};
     imdb_db *db = NULL;
     imdb_err e = {0};
     int orc = imdb_open(dir, &o, &db, &e);
@@ -2362,6 +2405,8 @@ static const char *check_run(const fscen *s, const char *run, const frun *r)
         snprintf(g_why, sizeof g_why, "VERIFY fails: %s", e.msg);
         why = g_why;
     }
+    if (!why && strcmp(s->name, "iceberg") == 0 && db->lake_seq && !vr.iceberg) /* F5c: written again by the open, then checked */
+        why = "the Iceberg layer is not current after a writable open with it on";
     if (!why && s->erased && count_subject(db, 42, db->seq) == 0 && tree_contains(run, s->erased)) {
         snprintf(g_why, sizeof g_why, "subject 42 is erased but a file still holds \"%s\"", s->erased);
         why = g_why;
@@ -2481,7 +2526,9 @@ static const char *fault_tmpdir(char *buf, size_t cap)
     struct stat st;
     if (!root && stat("/dev/shm", &st) == 0 && S_ISDIR(st.st_mode) && access("/dev/shm", W_OK) == 0) root = "/dev/shm";
     if (!root) return test_tmpdir();
-    snprintf(buf, cap, "%s/imdb-fault-%d-%d", root, (int)getpid(), n++);
+    /* fixed widths (pid_max 4194304: seven digits): a scenario's path, and so a count that follows its length (F5c's
+     * layer records its directory's real path; backup_catalogue's lines name theirs), the same whatever the pid */
+    snprintf(buf, cap, "%s/imdb-fault-%07d-%03d", root, (int)getpid(), n++);
     nftw(buf, rm_one, 16, FTW_DEPTH | FTW_PHYS);
     rmdir(buf);
     return mkdir(buf, 0700) == 0 ? buf : test_tmpdir();
@@ -2980,6 +3027,7 @@ static const fscen kScen[] = {
     {"alter", setup_txns, run_alter, false, NULL, NULL, false, false, false}, /* P2 F1 */
     {"seq", setup_txns, run_seq, false, NULL, NULL, false, false, false},     /* F2a-2 */
     {"erase_role", setup_erase_role, run_erase_role, false, NULL, erase_role_base_ok, false, false, false}, /* L stage 2 */
+    {"iceberg", setup_txns, run_iceberg, false, NULL, NULL, false, false, false}, /* F5c */
 };
 
 static void t_fault_commits(void) { fault_scenario(&kScen[0]); }
@@ -3018,6 +3066,7 @@ static void t_fault_backup_catalogue(void) { fault_scenario(&kScen[32]); }
 static void t_fault_alter(void) { fault_scenario(&kScen[33]); }
 static void t_fault_seq(void) { fault_scenario(&kScen[34]); }
 static void t_fault_erase_role(void) { fault_scenario(&kScen[35]); }
+static void t_fault_iceberg(void) { fault_scenario(&kScen[36]); }
 
 const test_case fault_tests[] = {
     {"fault_commits", t_fault_commits},     {"fault_nosync", t_fault_nosync}, {"fault_checkpoint", t_fault_checkpoint},
@@ -3051,5 +3100,6 @@ const test_case fault_tests[] = {
     {"fault_alter", t_fault_alter},
     {"fault_seq", t_fault_seq},
     {"fault_erase_role", t_fault_erase_role}, /* L stage 2 */
+    {"fault_iceberg", t_fault_iceberg},       /* F5c */
 };
 const size_t fault_ntests = sizeof fault_tests / sizeof *fault_tests;

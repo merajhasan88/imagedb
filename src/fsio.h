@@ -39,6 +39,7 @@ int imdb_io_mkdir(const char *path, int mode);
 int imdb_io_mkdirat(int dirfd, const char *name, int mode);
 int imdb_io_fstat(int fd, struct stat *st);
 int imdb_io_fstatat(int dirfd, const char *name, struct stat *st, int flags);
+char *imdb_io_realpath(const char *path, char *out, size_t cap); /* F5c: the layer's location (cap at least 4096) */
 int imdb_io_flock(int fd, int op);
 DIR *imdb_io_fdopendir(int fd);
 /* NULL at the end, or on an error with errno set (errno is cleared first). */
@@ -105,6 +106,8 @@ int imdb_read_file_at(int dirfd, const char *name, uint8_t **out, size_t *len, s
 int imdb_read_file_aligned_at(int dirfd, const char *name, uint8_t **out, size_t *len, size_t max, imdb_err *e);
 /* Atomically replaces dirfd/name with the given bytes. */
 int imdb_write_file_atomic(int dirfd, const char *name, const void *p, size_t n, int mode, imdb_err *e);
+/* the same without the directory's sync: the caller syncs the directory once for several files (F5c's layer) */
+int imdb_write_file_renamed(int dirfd, const char *name, const void *p, size_t n, int mode, imdb_err *e);
 /* Creates dirfd/name exclusively; fails if it exists. */
 int imdb_create_file_excl(int dirfd, const char *name, const void *p, size_t n, int mode, imdb_err *e);
 int imdb_sync_dir(int dirfd, imdb_err *e);

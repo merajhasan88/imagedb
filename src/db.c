@@ -14,6 +14,7 @@
 #include "cpu.h"
 #include "db_internal.h"
 #include "fsio.h"
+#include "iceberg.h"
 #include "lake.h"
 #include "oidx.h"
 #include "logdir.h"
@@ -6037,6 +6038,8 @@ int imdb_close(imdb_db *db)
     if (db->anchor_lockfd >= 0) close(db->anchor_lockfd); /* the lease goes last */
     if (db->dirfd >= 0) close(db->dirfd);
     imdb_free(db->path);
+    imdb_free(db->location);
+    imdb_free(db->ice_seen);
     if (db->events_fd >= 0) close(db->events_fd); /* P1 M2 */
     if (db->events_dirfd >= 0) close(db->events_dirfd);
     pthread_mutex_destroy(&db->events_lock);
@@ -6194,6 +6197,18 @@ int imdb_open(const char *path, const imdb_open_opts *o, imdb_db **out, imdb_err
         rc = e->code;
         goto fail;
     }
+    if (o && o->iceberg && !ro) { /* F5c: the layer names files by the directory's absolute path: resolved once, here */
+        char loc[4096];
+        if (imdb_io_realpath(path, loc, sizeof loc)) {
+            db->location = imdb_strndup(loc, strlen(loc), e);
+            if (!db->location) {
+                rc = e->code;
+                goto fail;
+            }
+        } else {
+            imdb_warn(db, "the Iceberg layer is off: the directory's path could not be resolved (%s)", strerror(errno));
+        }
+    }
     db->dirfd = imdb_io_open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (db->dirfd < 0) {
         rc = imdb_fail(e, IMDB_ERR_IO, "open %s: %s", path, strerror(errno));
@@ -6331,6 +6346,12 @@ int imdb_open(const char *path, const imdb_open_opts *o, imdb_db **out, imdb_err
         } else {
             imdb_stats_tick(db, true);
         }
+    }
+    if (db->location) { /* F5c: a stale layer (a write failed or cut short, the directory moved, the layer just turned on),
+                         * written again; a warning, never the open's failure */
+        imdb_err ie = {0};
+        if (imdb_iceberg_refresh(db, &ie)) imdb_warn(db, "the Iceberg layer could not be written (%s); written again at the "
+                                                         "next publication or open", ie.msg);
     }
     *out = db;
     return IMDB_OK;

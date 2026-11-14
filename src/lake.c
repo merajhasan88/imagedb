@@ -1,5 +1,6 @@
 /* Lake: segments, deletion vectors, manifests; CHECKPOINT / COMPACT / ERASE. */
 #include "lake.h"
+#include "iceberg.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -3020,6 +3021,14 @@ static int lake_persist(imdb_db *db, const uint8_t *keep, size_t keeplen, imdb_e
     }
     imdb_buf_free(&dv);
     close(ofd);
+    if (!rc && db->location) { /* F5c: the Iceberg layer for the new head (unless current: an open completing a publication
+                                * that finished writes none), derived: a failure is a warning, never the
+                                * publish's (the next publish writes it again) */
+        imdb_err ie = {0};
+        if (imdb_iceberg_refresh(db, &ie))
+            imdb_warn(db, "lake published at commit %llu, but its Iceberg layer could not be written (%s); written again at "
+                      "the next publication or open", (unsigned long long)db->lake_seq, ie.msg);
+    }
     return rc;
 }
 

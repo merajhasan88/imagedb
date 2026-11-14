@@ -114,6 +114,7 @@ TESTS(enum) /* F3g: ENUM types */
 TESTS(role) /* L: roles and grants */
 TESTS(e3) /* E3: SERIALIZABLE */
 TESTS(pq) /* F5: the canonical Parquet subset's codec */
+TESTS(ice) /* F5c: the Iceberg v3 layer per copy */
 TESTS(tz) /* P2: time zones */
 TESTS(tzsql) /* P2: time zones through the engine */
 

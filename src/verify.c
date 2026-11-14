@@ -31,6 +31,7 @@
 #include "db_internal.h"
 #include "fsio.h"
 #include "lake.h"
+#include "iceberg.h"
 #include "parquet.h"
 #include "logdir.h"
 #include "pool.h"
@@ -2501,10 +2502,32 @@ static int verify_body(imdb_db *db, imdb_verify_report *rep, imdb_err *e)
 }
 
 /* one operation (stage 3c-1): the segment cache trims when the outermost ends */
+/* F5c: the Iceberg layer, when one stands for the lake's head and this copy's location (its sidecar says so): the files
+ * must be the ones the lake gives, byte for byte; an absent or stale layer is a note, never a failure (an outside
+ * reader's view, per copy: a read-only open cannot write it again) */
+static int verify_iceberg(imdb_db *db, imdb_verify_report *rep, imdb_err *e)
+{
+    rep->iceberg = rep->iceberg_stale = false; /* verify_body zeroed the report too */
+    char loc[4096];
+    const char *l = db->location ? db->location : imdb_io_realpath(db->path, loc, sizeof loc);
+    if (!l || !db->lake_seq) return IMDB_OK;
+    imdb_err ie = {0};
+    int rc = imdb_iceberg_verify(db, l, &ie);
+    if (rc == IMDB_ERR_NOTFOUND) return IMDB_OK;
+    if (rc == IMDB_ERR_STATE) { /* a layer of another head (written by a handle with the layer on) or of another location */
+        rep->iceberg_stale = true;
+        return IMDB_OK;
+    }
+    if (rc) return imdb_fail(e, rc == IMDB_ERR_NOMEM ? rc : IMDB_ERR_VERIFY, "%s", ie.msg);
+    rep->iceberg = true;
+    return IMDB_OK;
+}
+
 int imdb_verify(imdb_db *db, imdb_verify_report *rep, imdb_err *e)
 {
     imdb_op_enter(db);
     int rc = verify_body(db, rep, e);
+    if (!rc) rc = verify_iceberg(db, rep, e);
     imdb_op_leave(db);
     return rc;
 }

@@ -411,6 +411,11 @@ typedef struct imdb_stats {
 
 typedef struct imdb_db {
     char *path;
+    char *location;           /* F5c: the directory's absolute path (resolved at the open), the Iceberg layer's; NULL: off */
+    struct imdb_ice_seen *ice_seen; /* F5c: each segment of the kept generations and its flagged rows, as the last layer
+                                       found them (iceberg.c: by hash, sorted), so a layer reads no segment twice */
+    uint32_t nice_seen;
+    uint64_t ice_reads;       /* F5c: the vectors, images and segments its layers read (the tests' measure: imdb_iceberg_reads) */
     int dirfd, logfd, lockfd;
     int durfd;                /* DURABLE (writable opens): the watermark, rewritten per append */
     int anchorfd;             /* the external anchor (writable opens with an anchor), else -1 */
@@ -599,6 +604,8 @@ typedef struct imdb_open_opts {
     uint64_t txn_bytes;       /* row bytes written (IMDB_MAX_TXN_BYTES) */
     uint32_t txn_ops;         /* row operations (IMDB_MAX_OPS_PER_COMMIT) */
     uint32_t txn_locks;       /* rows selected FOR UPDATE (IMDB_MAX_TXN_LOCKS) */
+    bool iceberg;             /* F5c: write the Iceberg v3 layer per copy after every publish (iceberg.h; the CLI's --iceberg;
+                                 off at the API so that the fault tables do not move) */
 } imdb_open_opts;
 
 /* ---- lifecycle ---------------------------------------------------------- */
@@ -1159,6 +1166,8 @@ typedef struct imdb_verify_report {
     uint8_t head[32];
     uint8_t digest[32];
     char note[256];
+    bool iceberg;             /* F5c: an Iceberg layer stood for the head and this location, and was the one the lake gives */
+    bool iceberg_stale;       /* F5c: one stood for another head or location: not checked, reported */
 } imdb_verify_report;
 /* Independent re-verification of the on-disk log against the open state:
  * framing, chain, MACs, commitments, per-commit digests, erasure

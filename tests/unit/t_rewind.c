@@ -643,6 +643,74 @@ static void t_rewind_hashes(void)
     fork_free(&x);
 }
 
+/* F5c: an old writer with the Iceberg layer on publishes at commit N; promoted, its replica publishes another state at
+ * the same N; the old writer rewound onto it (--demote) and following it publishes N again, the layer off. Its layer
+ * then names N and another manifest: stale (VERIFY reports it, the auditor leaves it unchecked), where a sidecar naming
+ * the head by its commit alone read as current and was refused; then a writable open with the layer writes it again */
+static void t_rewind_iceberg(void)
+{
+    const char *base = test_tmpdir();
+    char p[620], r[620], save[700], lp[700];
+    snprintf(p, sizeof p, "%s/p", base);
+    snprintf(r, sizeof r, "%s/r", base);
+    snprintf(save, sizeof save, "%s/p-past-fork.frames", base);
+    snprintf(lp, sizeof lp, "%s/iceberg/LAYER", p);
+    uint8_t seed[32];
+    memset(seed, 0x37, sizeof seed);
+    imdb_signer root;
+    imdb_signer_init(&root, seed);
+    OK(imdb_init_primary(p, root.pk, E));
+    OK(imdb_init(r, true, p, E));
+    imdb_db *db = open_with(p, 1);
+    CHECK(db);
+    OK(make_table(db, E));
+    for (int64_t i = 1; i <= 3; i++) OK(ins1(db, i, 7, i * 10, "shared"));
+    OK(imdb_checkpoint(db, E));
+    imdb_close(db);
+    OK(replicate(p, r));
+    imdb_open_opts io = {.sync = 1, .iceberg = true};
+    db = NULL;
+    OK(imdb_open(p, &io, &db, E)); /* the old writer, the layer on: N its CHECKPOINT past the fork */
+    for (int64_t i = 4; i <= 6; i++) OK(ins1(db, i, 7, i * 10, "old-writer-only")); /* room for the promotion's commit */
+    OK(imdb_checkpoint(db, E));
+    uint64_t N = db->lake_seq;
+    imdb_close(db);
+    size_t l0 = 0;
+    uint8_t *s0 = slurp(lp, &l0);
+    CHECK(s0 && l0 > 0);
+    free(s0);
+    imdb_promote_opts po = {.old_writer_stopped = true};
+    imdb_promote_result pr;
+    OK(imdb_promote(r, seed, &po, &pr, E));
+    CHECK(pr.committed);
+    db = open_with(r, 1);
+    CHECK(db);
+    while (db->seq + 1 < N) OK(ins1(db, 100 + (int64_t)db->seq, 8, 1, "pad")); /* its CHECKPOINT commit N: other rows */
+    if (db->seq + 1 != N) fprintf(stderr, "    the promoted one at %llu, N %llu\n", (unsigned long long)db->seq, (unsigned long long)N);
+    CHECK(db->seq + 1 == N);
+    OK(imdb_checkpoint(db, E)); /* the promoted one publishes at N too: another manifest */
+    if (db->lake_seq != N) fprintf(stderr, "    published at %llu (seq %llu), N %llu\n", (unsigned long long)db->lake_seq, (unsigned long long)db->seq, (unsigned long long)N);
+    CHECK(db->lake_seq == N);
+    imdb_close(db);
+    imdb_rewind_report rep;
+    OK(rewind_onto(p, r, UINT64_MAX, save, true, DAMAGE_NONE, &rep));
+    CHECK(rep.applied && rep.demoted);
+    OK(replicate(r, p)); /* the old writer follows: it publishes N again, the layer off */
+    db = open_with(p, 1);
+    CHECK(db && db->lake_seq == N);
+    imdb_verify_report vr;
+    OK(imdb_verify(db, &vr, E));
+    CHECK(vr.iceberg_stale && !vr.iceberg); /* the layer names N and another manifest */
+    imdb_close(db);
+    CHECK(audit_ok(p));
+    db = NULL;
+    OK(imdb_open(p, &io, &db, E)); /* a writable open with the layer: written again, current */
+    OK(imdb_verify(db, &vr, E));
+    CHECK(vr.iceberg && !vr.iceberg_stale);
+    imdb_close(db);
+    CHECK(audit_ok(p));
+}
+
 const test_case rewind_tests[] = {
     {"rewind_demote", t_rewind_demote},
     {"rewind_fork_publishes", t_rewind_fork_publishes},
@@ -652,5 +720,6 @@ const test_case rewind_tests[] = {
     {"rewind_refusals", t_rewind_refusals},
     {"rewind_cut", t_rewind_cut},
     {"rewind_hashes", t_rewind_hashes},
+    {"rewind_iceberg", t_rewind_iceberg},
 };
 const size_t rewind_ntests = sizeof rewind_tests / sizeof *rewind_tests;

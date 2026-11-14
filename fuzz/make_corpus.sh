@@ -240,4 +240,27 @@ if [ -x build-fuzz/fuzz_parquet ]; then
     IMDB_FUZZ_PARQUET_SEEDS="$OUT/parquet" setarch "$(uname -m)" -R build-fuzz/fuzz_parquet > /dev/null 2>&1 || true
     mkdir -p "$OUT/apq" && cp "$OUT"/parquet/* "$OUT/apq/" 2>/dev/null || true # fuzz_apq: the same seeds
 fi
+# F5c: fuzz_aice's readers (fuzz/fuzz_aice.c: the first byte picks one): a layer's files as the CLI writes them (its
+# table metadata JSON, its manifest lists and manifests, its Puffin files and a vector's blob), and two round-trip seeds
+mkdir -p "$OUT/aice"
+I=$WORK/ice
+"$BIN" init "$I" >/dev/null
+"$BIN" sql "$I" --nosync --iceberg -c "CREATE TABLE t (id INT64 PRIMARY KEY, x TEXT, b BYTEA); INSERT INTO t VALUES (1, 'a', '\x00ff'), (2, 'b', NULL), (3, 'c', '\x01'); CHECKPOINT; DELETE FROM t WHERE id = 2; ALTER TABLE t ADD COLUMN d DATE DEFAULT DATE '2026-11-14'; INSERT INTO t (id, x) VALUES (4, 'd'); CHECKPOINT;" >/dev/null
+k=0
+for f in "$I"/iceberg/*/metadata/*; do
+    case "$f" in
+    *.json) sel='\000' ;;
+    *.avro) sel='\001' ;;
+    *.puffin) sel='\002' ;;
+    *) continue ;;
+    esac
+    k=$((k + 1))
+    { printf "$sel"; cat "$f"; } > "$OUT/aice/seed$k"
+    if [ "$sel" = '\002' ]; then # its blob: at offset 4, the footer's length
+        len=$(grep -ao '"length":[0-9]*' "$f" | head -1 | cut -d: -f2)
+        [ -n "$len" ] && { printf '\003'; tail -c +5 "$f" | head -c "$len"; } > "$OUT/aice/blob$k"
+    fi
+done
+printf '\004\001\000\000\002\000\000\377\377\377' > "$OUT/aice/round-dv"
+printf '\005caf\303\251 "quoted" \\ \001' > "$OUT/aice/round-json"
 echo "corpus: $(find "$OUT" -type f | wc -l) seeds in $OUT"

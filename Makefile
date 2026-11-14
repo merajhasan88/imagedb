@@ -49,13 +49,13 @@ BIN     = $(BUILD)/imagedb
 
 TSRC    = $(wildcard tests/unit/*.c)
 TOBJ    = $(TSRC:tests/unit/%.c=$(BUILD)/tobj/%.o) $(BUILD)/tobj/acrypto.o $(BUILD)/tobj/afsum.o $(BUILD)/tobj/abind.o \
-          $(BUILD)/tobj/apq.o
+          $(BUILD)/tobj/apq.o $(BUILD)/tobj/aice.o
 TBIN    = $(BUILD)/test_unit
 
-.PHONY: all lint test unit san tsan ct fuzz fuzz-run bench whole index-sum mem-split join-cost workload clean integration faults soak oracle install uninstall parquet-check
+.PHONY: all lint test unit san tsan ct fuzz fuzz-run bench whole index-sum mem-split join-cost workload clean integration faults soak oracle install uninstall parquet-check iceberg-check
 
 AUDIT   = $(BUILD)/imagedb-audit
-ASRC    = tools/audit/audit.c tools/audit/acrypto.c tools/audit/afsum.c tools/audit/abind.c tools/audit/apq.c
+ASRC    = tools/audit/audit.c tools/audit/acrypto.c tools/audit/afsum.c tools/audit/abind.c tools/audit/apq.c tools/audit/aice.c
 
 all: $(BIN) $(AUDIT)
 
@@ -79,7 +79,7 @@ uninstall:
 	-rmdir $(DESTDIR)$(PREFIX)/share/doc/imagedb
 
 # The independent verifier shares no code with src/ (see tools/audit/acrypto.h).
-$(AUDIT): $(ASRC) tools/audit/acrypto.h tools/audit/afsum.h tools/audit/abind.h tools/audit/apq.h | $(BUILD)/obj
+$(AUDIT): $(ASRC) tools/audit/acrypto.h tools/audit/afsum.h tools/audit/abind.h tools/audit/apq.h tools/audit/aice.h | $(BUILD)/obj
 	$(CC) $(CFLAGS) $(ASRC) -o $@ $(LDFLAGS)
 
 # Test-only: builds hostile inputs and fuzz seeds (may use engine code).
@@ -118,6 +118,10 @@ $(BUILD)/tobj/afsum.o: tools/audit/afsum.c tools/audit/afsum.h | $(BUILD)/tobj
 
 # F5: the auditor's Parquet reader, which t_pq gives the files the engine's refuses (a chunk past the file)
 $(BUILD)/tobj/apq.o: tools/audit/apq.c tools/audit/apq.h | $(BUILD)/tobj
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# F5c: the auditor's Iceberg readers, which t_ice reads the engine's layer with
+$(BUILD)/tobj/aice.o: tools/audit/aice.c tools/audit/aice.h | $(BUILD)/tobj
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/tobj/abind.o: tools/audit/abind.c tools/audit/abind.h | $(BUILD)/tobj
@@ -220,6 +224,11 @@ build-fuzz/fuzz_apq: fuzz/fuzz_apq.c fuzz/fuzz_common.h tools/audit/apq.c tools/
 	@mkdir -p build-fuzz
 	clang $(FUZZ_FLAGS) fuzz/fuzz_apq.c tools/audit/apq.c tools/audit/acrypto.c $(SRC) $(FUZZ_ASM) -o $@ -pthread
 
+# F5c: the auditor's readers of the Iceberg layer (fuzz_aice), against the engine's writers (icecodec.c) for round trips
+build-fuzz/fuzz_aice: fuzz/fuzz_aice.c fuzz/fuzz_common.h tools/audit/aice.c tools/audit/aice.h $(SRC) $(HDR) $(FUZZ_ASM)
+	@mkdir -p build-fuzz
+	clang $(FUZZ_FLAGS) fuzz/fuzz_aice.c tools/audit/aice.c $(SRC) $(FUZZ_ASM) -o $@ -pthread
+
 # P2 S7b: the auditor's view binder alone (it shares nothing with src/)
 build-fuzz/fuzz_abind: fuzz/fuzz_abind.c tools/audit/abind.c tools/audit/abind.h
 	@mkdir -p build-fuzz
@@ -232,7 +241,7 @@ build-fuzz/%: fuzz/%.c fuzz/fuzz_common.h $(SRC) $(HDR) $(FUZZ_ASM)
 FUZZ_SECONDS ?= 60
 fuzz-run: fuzz $(BIN) $(FORGE)
 	bash fuzz/make_corpus.sh $(BIN) build-fuzz/corpus
-	@for t in frame stream segment manifest sql codec ed25519 tseg backup expr csv abind role parquet apq; do \
+	@for t in frame stream segment manifest sql codec ed25519 tseg backup expr csv abind role parquet apq aice; do \
 	  mkdir -p build-fuzz/work/$$t; \
 	  if ! $(SANRUN) build-fuzz/fuzz_$$t -max_total_time=$(FUZZ_SECONDS) -print_final_stats=1 -rss_limit_mb=2048 \
 	       -artifact_prefix=build-fuzz/crash-$$t- build-fuzz/work/$$t build-fuzz/corpus/$$t \
@@ -310,6 +319,16 @@ parquet-check: $(PQCHECK) $(PQENGINE)
 	mkdir -p /dev/shm/imdb-pqcheck && $(PQCHECK) /dev/shm/imdb-pqcheck
 	$(PQENGINE) /dev/shm/imdb-pqcheck
 
+# F5c (docs/f5c-design.md section 8): the Iceberg v3 layer read by DuckDB's iceberg and avro extensions (the user's yes,
+# 2026-11-14: INSTALL avro; INSTALL iceberg), every snapshot of every publication against imagedb's own answer AS OF it;
+# opt-in, outside the matrix, test-only (it links the auditor's JSON reader, aice.c, to read the metadata)
+ICECHECK = $(BUILD)/icecheck
+$(ICECHECK): tests/iceberg_check/icecheck.c tools/audit/aice.c tools/audit/aice.h $(LIB) $(HDR)
+	$(CC) $(CFLAGS) -Wno-missing-prototypes -isystem $(DUCKDB_DIR) tests/iceberg_check/icecheck.c tools/audit/aice.c $(LIB) -o $@ \
+	  $(LDFLAGS) -L $(DUCKDB_DIR) -lduckdb -Wl,-rpath,$(DUCKDB_DIR)
+iceberg-check: $(ICECHECK)
+	mkdir -p /dev/shm/imdb-icecheck && $(ICECHECK) /dev/shm/imdb-icecheck
+
 # The SQL oracle (tests/oracle, P0): imagedb against SQLite in process and, through tests/oracle/run.sh, PostgreSQL,
 # MySQL, MariaDB and SQL Server in private containers, every answer compared. Test-only: it links their clients (the
 # user's yes, 2026-11-01); the engine links none of them.
@@ -359,7 +378,7 @@ TSAN_FLAGS = -std=c11 -D_GNU_SOURCE -g -O1 -ffp-contract=off -fsanitize=thread -
 tsan:
 	mkdir -p build-tsan
 	clang $(TSAN_FLAGS) $(filter-out src/main.c,$(wildcard src/*.c)) $(wildcard src/vendor/monocypher/*.c) \
-	  $(TSRC) tools/audit/acrypto.c tools/audit/afsum.c tools/audit/abind.c tools/audit/apq.c -o build-tsan/test_unit -lcrypto
+	  $(TSRC) tools/audit/acrypto.c tools/audit/afsum.c tools/audit/abind.c tools/audit/apq.c tools/audit/aice.c -o build-tsan/test_unit -lcrypto
 	clang $(TSAN_FLAGS) tests/unit/t_pool.c tests/tsan/pool_main.c src/pool.c $(KERNEL_SRC) \
 	  src/util.c src/fsio.c -o build-tsan/pool_test
 	$(SANRUN) build-tsan/pool_test

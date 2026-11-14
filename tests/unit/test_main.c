@@ -138,6 +138,7 @@ int main(int argc, char **argv)
         {"role", role_tests, &role_ntests},    /* L: roles and grants */
         {"e3", e3_tests, &e3_ntests},          /* E3: SERIALIZABLE */
         {"pq", pq_tests, &pq_ntests},          /* F5: the canonical Parquet subset's codec */
+        {"ice", ice_tests, &ice_ntests},       /* F5c: the Iceberg v3 layer per copy */
         {"tz", tz_tests, &tz_ntests}, /* P2: time zones */
         {"tzsql", tzsql_tests, &tzsql_ntests}, /* P2: time zones through the engine */
     };

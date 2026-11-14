@@ -38,7 +38,7 @@ static int usage(void)
           "  imagedb sql <dir> [-c SQL]... [-f FILE] [--csv] [--cross-check] [--nosync] [--lake-sync]\n"
           "                    [--anchor FILE [--accept-rollback]] [--read-only] [--durable-ack] [--mem-limit BYTES]\n"
           "                    [--mem-window SECONDS|none] [--seg-cache BYTES|all] [--stats FILE] [--events FILE]\n"
-          "                    [--zoneinfo DIR]\n"
+          "                    [--zoneinfo DIR] [--iceberg]\n"
           "                                             run SQL (interactive when no -c/-f and stdin is a tty);\n"
           "                                             --durable-ack: the watermark synced as each commit returns,\n"
           "                                             so a damaged last frame past it is known unacknowledged;\n"
@@ -47,7 +47,7 @@ static int usage(void)
           "                                             replica's acknowledgements on stdin; --follow --acks: a\n"
           "                                             keep-alive when idle for MS, 1000; --hashes: only each\n"
           "                                             commit's hash after N, for rewind)\n"
-          "  imagedb apply <replica-dir> [--durable-ack] [--mem-limit BYTES] [--mem-window SECONDS|none]\n"
+          "  imagedb apply <replica-dir> [--durable-ack] [--iceberg] [--mem-limit BYTES] [--mem-window SECONDS|none]\n"
           "                    [--seg-cache BYTES|all] [--stats FILE] [--events FILE]\n"
           "                                             apply a commit stream from stdin\n"
           "  imagedb follow <replica-dir> [--mem-limit BYTES] [--mem-window SECONDS|none] [--seg-cache BYTES|all]\n"
@@ -113,6 +113,7 @@ static void print_err(const char *what, const imdb_err *e)
 static uint64_t g_mem_limit; /* --mem-limit (db.h: the memory budget), for the command's open */
 static uint64_t g_mem_window; /* --mem-window (db.h: the memory window, stage 3b; 0: the default) */
 static uint64_t g_seg_cache; /* --seg-cache (db.h: the segment cache, stage 3c-1; 0: the default) */
+static bool g_iceberg;       /* --iceberg (F5c: the Iceberg v3 layer per copy after every publish, iceberg.h) */
 static const char *g_stats_path; /* --stats FILE (P1 M1: the stats export), for the command's open */
 static const char *g_events_path; /* --events FILE (P1 M2: the event log), for the command's open */
 static const char *g_zoneinfo; /* --zoneinfo DIR (P2: the zones SET TIME ZONE, AT TIME ZONE and literals name), for the open */
@@ -195,7 +196,7 @@ static imdb_db *open_anchored(const char *dir, bool ro, int sync, const char *an
     imdb_open_opts o = {.sync = sync, .read_only = ro, .anchor = anchor, .accept_rollback = accept_rollback,
                         .durable_ack = durable_ack, .mem_limit = g_mem_limit, .mem_window_us = g_mem_window,
                         .seg_cache_bytes = g_seg_cache, .stats_path = g_stats_path, .events_path = g_events_path,
-                        .zoneinfo = g_zoneinfo,
+                        .zoneinfo = g_zoneinfo, .iceberg = g_iceberg,
                         .progress = open_progress};
     imdb_db *db;
     imdb_err e = {0};
@@ -624,6 +625,7 @@ static int cmd_sql(int argc, char **argv)
         else if (strcmp(argv[i], "--cross-check") == 0) cross = true;
         else if (strcmp(argv[i], "--nosync") == 0) sync = 0;
         else if (strcmp(argv[i], "--lake-sync") == 0) lake_sync = true;
+        else if (strcmp(argv[i], "--iceberg") == 0) g_iceberg = true;
         else if (strcmp(argv[i], "--anchor") == 0 && i + 1 < argc) anchor = argv[++i];
         else if (strcmp(argv[i], "--stats") == 0 && i + 1 < argc) g_stats_path = argv[++i];
         else if (strcmp(argv[i], "--events") == 0 && i + 1 < argc) g_events_path = argv[++i];
@@ -831,6 +833,7 @@ static int cmd_follow(int argc, char **argv)
         }
         else if (strcmp(argv[dd], "--mem-window") == 0 && parse_window(argv[dd + 1], &g_mem_window)) dd += 2;
         else if (strcmp(argv[dd], "--seg-cache") == 0 && parse_seg_cache(argv[dd + 1], &g_seg_cache)) dd += 2;
+        else if (strcmp(argv[dd], "--iceberg") == 0) { g_iceberg = true; dd += 1; }
         else if (strcmp(argv[dd], "--silent-after") == 0 && parse_ms(argv[dd + 1], 86400000, &silent)) dd += 2;
         else if (strcmp(argv[dd], "--mem-limit") != 0 && strcmp(argv[dd], "--mem-window") != 0 && strcmp(argv[dd], "--stats") != 0 &&
                  strcmp(argv[dd], "--events") != 0 && strcmp(argv[dd], "--silent-after") != 0 &&
@@ -1706,6 +1709,7 @@ int main(int argc, char **argv)
         bool durable_ack = false;
         for (int i = 3; i < argc; i++) {
             if (strcmp(argv[i], "--durable-ack") == 0) durable_ack = true;
+            else if (strcmp(argv[i], "--iceberg") == 0) g_iceberg = true;
             else if (strcmp(argv[i], "--mem-limit") == 0 && i + 1 < argc && parse_size(argv[i + 1], &g_mem_limit)) i++;
             else if (strcmp(argv[i], "--stats") == 0 && i + 1 < argc) g_stats_path = argv[++i];
             else if (strcmp(argv[i], "--events") == 0 && i + 1 < argc) g_events_path = argv[++i];
@@ -1743,6 +1747,8 @@ int main(int argc, char **argv)
                    (unsigned long long)vr.payload_rows_checked, (unsigned long long)vr.versions,
                    (unsigned long long)vr.live, (unsigned long long)vr.stubs, (unsigned long long)vr.segments_checked,
                    (unsigned long long)vr.lake_rows_checked, hex);
+            if (vr.iceberg) printf("  iceberg layer      the one the lake gives, file by file\n");
+            if (vr.iceberg_stale) printf("  iceberg layer      stale (another head or location): written again by a publish with --iceberg\n");
             if (vr.note[0]) printf("  note               %s\n", vr.note);
         }
         imdb_close(db);
