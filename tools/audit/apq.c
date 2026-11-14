@@ -266,7 +266,7 @@ static int read_foot(const uint8_t *f, size_t len, foot *ft, const char **why)
     *why = "not a Parquet file of the subset";
     if (len < 12 || memcmp(f, "PAR1", 4) || memcmp(f + len - 4, "PAR1", 4)) return -1;
     uint32_t ml = get32(f + len - 8);
-    if (ml > len - 12) return -1;
+    if (ml > len - 12 || ml > (1u << 20)) return -1; /* F5b: a footer of 1 MiB at most, as the engine's PQ_MAX_FOOTER */
     ft->meta = len - 8 - ml;
     cr r = {f + ft->meta, ml, 0, {0}, 0};
     *why = "a footer that does not decode";

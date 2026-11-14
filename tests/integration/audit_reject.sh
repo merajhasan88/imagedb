@@ -68,10 +68,27 @@ echo "== PA: a segment whose imagedb.chunks names a chunk by another SHA-256, it
    and the log re-signed by the writer (F5)"
 PA=$WORK/pa; make_db "$PA"
 "$FORGE" lie-chunks "$PA"
-"$BIN" sql "$PA" --nosync -c "SELECT COUNT(*) FROM t;" >/dev/null || fail "a load hashes no chunk: the open must take it"
+must_fail "a chunk is not the one its footer names" "$BIN" sql "$PA" --nosync -c "SELECT COUNT(*) FROM t;"
 must_fail "a chunk is not the one its footer names" "$BIN" verify "$PA"
 must_fail "not the file its content gives" "$AUD" verify "$PA"
-echo "   a load reads the file whole by its name; VERIFY and the auditor check each chunk's hash"
+echo "   F5b: every load authenticates each chunk against its entry, so the snapshot is not used and the replay's"
+echo "   rebuild differs from the forged manifest (the open and VERIFY name the chunk); the auditor's rewrite differs"
+
+echo "== PG: an honest segment named by its whole file's SHA-256 (F5a's rule), not its tail's, the lake re-hashed and the
+   log re-signed by the writer (F5b)"
+PG=$WORK/pg; make_db "$PG"
+"$FORGE" lie-name "$PG"
+must_fail "does not hash to its name" "$BIN" verify "$PG"
+must_fail "does not hash to its name" "$AUD" verify "$PG"
+echo "   its content is the writer's and every other name is consistent: only the name rule refuses it, the engine's"
+echo "   authentication and the auditor's own tail hash"
+
+echo "== PH: a segment whose imagedb.format is F5a's \"1\", named by its tail, the lake re-hashed and the log re-signed (F5b)"
+PH=$WORK/ph; make_db "$PH"
+"$FORGE" lie-format1 "$PH"
+must_fail "format 1" "$BIN" verify "$PH"
+must_fail "format 1" "$AUD" verify "$PH"
+echo "   refused by name by the engine's parse (the snapshot not used, the replay's rebuild another file) and the auditor"
 
 echo "== PB: an erased row (a stub) holding a value where a NOT NULL column's placeholder must stand, its statistics and
    chunk list made again, the lake re-hashed and the log re-signed by the writer (F5: erased data kept in a stub)"

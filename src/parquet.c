@@ -537,6 +537,14 @@ static void footer_encode(imdb_buf *out, const pq_col *cols, uint32_t ncols, uin
 
 /* ---- the subset's rules: the writer's input and the reader's result alike (one rule for both sides) --------------- */
 
+/* Iceberg's TypeUtil.decimalRequiredBytes for 19 to 38 digits: the least b with 10^P <= 2^(8b - 1) (t_pq checks the
+ * table against a 128-bit computation of that rule) */
+unsigned imdb_pq_dec_bytes(int32_t precision)
+{
+    static const uint8_t kBytes[39 - 19] = {9, 9, 9, 10, 10, 11, 11, 11, 12, 12, 13, 13, 13, 14, 14, 15, 15, 16, 16, 16};
+    return precision >= 19 && precision <= 38 ? kBytes[precision - 19] : 0;
+}
+
 /* a column's shape: a type of the subset with its annotations' fields, and nothing else set */
 static bool shape_ok(const pq_col *c)
 {
@@ -550,8 +558,9 @@ static bool shape_ok(const pq_col *c)
     case PQ_BYTE_ARRAY:
         if (c->type_length) return false;
         break;
-    case PQ_FLBA:
-        if (c->type_length != 16 && c->type_length != 32) return false;
+    case PQ_FLBA: /* 16 or 32 bytes, or a DECIMAL's width (its rule below) */
+        if (c->type_length != 16 && c->type_length != 32 && (c->logical != PQL_DECIMAL || c->type_length < 9 || c->type_length > 16))
+            return false;
         break;
     default: return false;
     }
@@ -562,10 +571,11 @@ static bool shape_ok(const pq_col *c)
     switch (c->logical) {
     case PQL_NONE: return true;
     case PQL_STRING: return c->phys == PQ_BYTE_ARRAY;
-    case PQL_DECIMAL: /* imagedb's two forms: to 18 digits an INT64, past them 16 bytes */
-        if (c->scale < 0 || c->scale > c->precision) return false;
-        return (c->phys == PQ_INT64 && c->precision >= 1 && c->precision <= 18) ||
-               (c->phys == PQ_FLBA && c->type_length == 16 && c->precision >= 19 && c->precision <= 38);
+    case PQL_DECIMAL: /* Iceberg's mapping (F5b): one physical type and width a precision */
+        if (c->scale < 0 || c->scale > c->precision || c->precision < 1 || c->precision > 38) return false;
+        if (c->precision <= 9) return c->phys == PQ_INT32;
+        if (c->precision <= 18) return c->phys == PQ_INT64;
+        return c->phys == PQ_FLBA && (unsigned)c->type_length == imdb_pq_dec_bytes(c->precision);
     case PQL_DATE: return c->phys == PQ_INT32;
     case PQL_TIME:
     case PQL_TIMESTAMP: return c->phys == PQ_INT64;
@@ -702,40 +712,28 @@ int imdb_pq_writer_column(pq_writer *w, const pq_col *c, imdb_err *e)
     return IMDB_OK;
 }
 
-/* The chunks' hashes (imagedb.chunks) and the file's prefix, its bytes before the footer, hashed at once as
- * imdb_par_for's items, each into its own slot, the prefix first (the longest; items are claimed in order): the file's
- * SHA-256, its object's name, then needs only its footer, so a build spends about one pass of hashing in time, as
- * before the chunks' hashes (2026-11-13: the two passes in turn were half of a CHECKPOINT). Below PQ_PAR_HASH bytes the
+/* The chunks' hashes (imagedb.chunks; F5b: the name is the tail's, so a chunk's hash is the only pass over its bytes),
+ * imdb_par_for's items, each into its own slot (a write's and an authentication's alike). Below PQ_PAR_HASH bytes the
  * items run inline: waking the pool costs more. */
 enum { PQ_PAR_HASH = 1 << 20 };
 
 typedef struct {
     const uint8_t *p;
     const uint64_t *off, *size;
-    size_t prefix;
-    bool name; /* item 0 the prefix, item i + 1 chunk i; else item i chunk i */
-    imdb_sha256_ctx ctx;
     uint8_t (*h)[32];
 } hash_job;
 
 static void hash_item(void *arg, size_t i)
 {
     hash_job *j = arg;
-    if (j->name && !i) {
-        imdb_sha256_init(&j->ctx);
-        imdb_sha256_update(&j->ctx, j->p, j->prefix);
-        return;
-    }
-    if (j->name) i--;
     imdb_sha256(j->p + j->off[i], j->size[i], j->h[i]);
 }
 
 static void hash_run(hash_job *j, uint32_t nchunks, uint64_t bytes)
 {
-    size_t n = (size_t)nchunks + j->name;
-    if (bytes >= PQ_PAR_HASH) imdb_par_for(n, hash_item, j);
+    if (bytes >= PQ_PAR_HASH) imdb_par_for(nchunks, hash_item, j);
     else
-        for (size_t i = 0; i < n; i++) hash_item(j, i);
+        for (size_t i = 0; i < nchunks; i++) hash_item(j, i);
 }
 
 int imdb_pq_writer_end(pq_writer *w, const pq_kv *kv, uint32_t nkv, imdb_err *e)
@@ -748,15 +746,14 @@ int imdb_pq_writer_end(pq_writer *w, const pq_kv *kv, uint32_t nkv, imdb_err *e)
             return imdb_fail(e, IMDB_ERR_STATE, "parquet: key-value pairs not sorted after imagedb.chunks");
     int rc = imdb_buf_check(out, e); /* a reservation or a put refused: no whole file to hash */
     if (rc) return rc;
-    /* the chunks' hashes, and the name's prefix beside them */
+    /* the chunks' hashes */
     uint8_t h[PQ_MAX_COLUMNS][32];
-    hash_job j = {.p = out->p, .off = w->off, .size = w->size, .prefix = out->len, .name = true, .h = h};
+    hash_job j = {.p = out->p, .off = w->off, .size = w->size, .h = h};
     hash_run(&j, w->ncols, out->len);
     /* the chunks' ranges and hashes, for imagedb.chunks */
-    size_t cap = (size_t)w->ncols * (2 * 20 + 64 + 3) + 1, at = 0;
+    size_t cap = (size_t)w->ncols * (2 * 20 + 64 + 3) + 1, at = 0, meta = out->len;
     char *chunks = imdb_alloc_array(cap, 1, e);
     if (!chunks) {
-        imdb_wipe(&j.ctx, sizeof j.ctx);
         imdb_wipe(h, sizeof h);
         return e->code;
     }
@@ -770,7 +767,6 @@ int imdb_pq_writer_end(pq_writer *w, const pq_kv *kv, uint32_t nkv, imdb_err *e)
         imdb_wipe(hx, sizeof hx);
     }
     if (!rc) {
-        size_t meta = out->len;
         const uint8_t *key[PQ_MAX_KV + 1], *val[PQ_MAX_KV + 1];
         uint32_t klen[PQ_MAX_KV + 1], vlen[PQ_MAX_KV + 1];
         key[0] = (const uint8_t *)"imagedb.chunks";
@@ -785,7 +781,7 @@ int imdb_pq_writer_end(pq_writer *w, const pq_kv *kv, uint32_t nkv, imdb_err *e)
         }
         footer_encode(out, w->shape, w->ncols, w->nrows, w->off, w->size, w->st, key, klen, val, vlen, nkv + 1);
         uint64_t mlen = out->len - meta;
-        if (mlen > UINT32_MAX) rc = imdb_fail(e, IMDB_ERR_LIMIT, "parquet: footer too large");
+        if (mlen > PQ_MAX_FOOTER) rc = imdb_fail(e, IMDB_ERR_LIMIT, "parquet: footer too large");
         else {
             imdb_buf_put_u32(out, (uint32_t)mlen);
             imdb_buf_put(out, "PAR1", 4);
@@ -794,22 +790,18 @@ int imdb_pq_writer_end(pq_writer *w, const pq_kv *kv, uint32_t nkv, imdb_err *e)
     imdb_wipe(chunks, cap); /* unsalted hashes of columns: an oracle for guesses once rows are erased (f5-design) */
     imdb_free(chunks);
     if (!rc) rc = imdb_buf_check(out, e);
-    if (!rc) { /* the name: the prefix's state, then the footer's bytes */
-        imdb_sha256_update(&j.ctx, out->p + j.prefix, out->len - j.prefix);
-        imdb_sha256_final(&j.ctx, w->hash);
-    }
-    imdb_wipe(&j.ctx, sizeof j.ctx);
+    if (!rc) imdb_sha256(out->p + meta, out->len - meta, w->hash); /* the name: the tail's hash (F5b) */
     imdb_wipe(h, sizeof h);
 #ifdef IMDB_STORE_CHECKS
     if (!rc && w->bound && out->len > w->bound) { /* the bound is an upper bound, or its allocation doubles */
         fprintf(stderr, "imagedb: parquet: a file of %zu bytes past its bound of %llu\n", out->len, (unsigned long long)w->bound);
         abort();
     }
-    if (!rc) { /* the name made in two parts is the file's hash */
-        uint8_t again[32];
-        imdb_sha256(out->p, out->len, again);
-        if (memcmp(again, w->hash, 32)) {
-            fprintf(stderr, "imagedb: parquet: a file's hash made in parts is not its hash\n");
+    if (!rc) { /* every file written authenticates against its name: the writer's tail and frame are the check's */
+        pq_footer ft;
+        imdb_err ea = {0};
+        if (imdb_pq_authenticate(out->p, out->len, w->hash, &ft, &ea)) { /* it allocates nothing: no fault reaches it */
+            fprintf(stderr, "imagedb: parquet: a file written does not authenticate against its name: %s\n", ea.msg);
             abort();
         }
     }
@@ -956,16 +948,34 @@ static int tr_skip(tr *r, uint8_t type)
     }
 }
 
+/* F5b: the footer's length from a len-byte file's last eight bytes (the length, the closing magic), bounded */
+static int tail_len(const uint8_t last8[8], uint64_t len, uint32_t *ml, imdb_err *e)
+{
+    if (len < 12 || memcmp(last8 + 4, "PAR1", 4)) return imdb_fail(e, IMDB_ERR_CORRUPT, "parquet: not a Parquet file");
+    *ml = imdb_get_le32(last8);
+    if (*ml > len - 12 || *ml > PQ_MAX_FOOTER)
+        return imdb_fail(e, IMDB_ERR_CORRUPT, "parquet: the footer's length is out of bounds");
+    return IMDB_OK;
+}
+
+static int footer_walk(const uint8_t *mb, uint32_t ml, uint64_t len, pq_footer *ft, imdb_err *e);
+
 int imdb_pq_footer(const uint8_t *f, size_t len, pq_footer *ft, imdb_err *e)
 {
     memset(ft, 0, sizeof *ft);
-    if (len < 12 || memcmp(f, "PAR1", 4) || memcmp(f + len - 4, "PAR1", 4))
-        return imdb_fail(e, IMDB_ERR_CORRUPT, "parquet: not a Parquet file");
-    uint32_t ml = imdb_get_le32(f + len - 8);
-    if (ml > len - 12) return imdb_fail(e, IMDB_ERR_CORRUPT, "parquet: the footer's length is out of bounds");
+    uint32_t ml;
+    if (len < 12 || memcmp(f, "PAR1", 4)) return imdb_fail(e, IMDB_ERR_CORRUPT, "parquet: not a Parquet file");
+    int rc = tail_len(f + len - 8, len, &ml, e);
+    return rc ? rc : footer_walk(f + len - 8 - ml, ml, len, ft, e);
+}
+
+/* the footer's ml bytes at mb, a len-byte file's (its pointers into m: the in-memory file's, or the streamed check's tail) */
+static int footer_walk(const uint8_t *mb, uint32_t ml, uint64_t len, pq_footer *ft, imdb_err *e)
+{
+    memset(ft, 0, sizeof *ft);
     ft->meta_at = len - 8 - ml;
     ft->meta_len = ml;
-    tr r = {f + ft->meta_at, ml, 0, {0}, 0};
+    tr r = {mb, ml, 0, {0}, 0};
     bool rows = false, rg = false;
     uint64_t nschema = 0;
     int16_t id;
@@ -1279,7 +1289,7 @@ int imdb_pq_read(const uint8_t *f, size_t len, const pq_footer *ft, const pq_col
     return rc;
 }
 
-int imdb_pq_chunks_verify(const uint8_t *f, const pq_footer *ft, imdb_err *e)
+static int chunks_check(const uint8_t *f, const pq_footer *ft, int code, imdb_err *e)
 {
     uint8_t h[PQ_MAX_COLUMNS][32];
     uint64_t bytes = 0;
@@ -1296,10 +1306,133 @@ int imdb_pq_chunks_verify(const uint8_t *f, const pq_footer *ft, imdb_err *e)
     for (uint32_t ci = 0; ci < ft->ncols && !rc; ci++) { /* in column order, whatever order the items ran in */
         char hx[65];
         hex(h[ci], 32, hx);
-        if (memcmp(hx, ft->chunk_hex[ci], 64)) rc = imdb_fail(e, IMDB_ERR_CORRUPT, "parquet: a chunk is not the one its footer names");
+        if (memcmp(hx, ft->chunk_hex[ci], 64)) rc = imdb_fail(e, code, "parquet: a chunk is not the one its footer names");
         imdb_wipe(hx, sizeof hx);
     }
     imdb_wipe(h, sizeof h);
+    return rc;
+}
+
+int imdb_pq_chunks_verify(const uint8_t *f, const pq_footer *ft, imdb_err *e)
+{
+    return chunks_check(f, ft, IMDB_ERR_CORRUPT, e);
+}
+
+/* ---- F5b: a file's name and its authentication ---------------------------------------------------------------- */
+
+int imdb_pq_name(const uint8_t *f, size_t len, uint8_t out[32], imdb_err *e)
+{
+    uint32_t ml;
+    if (len < 12) return imdb_fail(e, IMDB_ERR_CORRUPT, "parquet: not a Parquet file");
+    int rc = tail_len(f + len - 8, len, &ml, e);
+    if (!rc) imdb_sha256(f + len - 8 - ml, (size_t)ml + 8, out);
+    return rc;
+}
+
+/* the frame over the walked footer, both checks' one rule: the chunks in column order, each at or past its
+ * predecessor's end (the opening magic's first) and inside the file, the last ending at the footer; gap refuses a byte
+ * not zero in [from, to) */
+typedef int (*gap_fn)(void *ctx, uint64_t from, uint64_t to, imdb_err *e);
+
+static int frame_check(const pq_footer *ft, gap_fn gap, void *ctx, imdb_err *e)
+{
+    uint64_t prev = 4;
+    for (uint32_t ci = 0; ci < ft->ncols; ci++) {
+        if (ft->off[ci] < prev || ft->off[ci] > ft->meta_at || ft->size[ci] > ft->meta_at - ft->off[ci])
+            return imdb_fail(e, IMDB_ERR_CORRUPT, "parquet: a chunk out of place");
+        int rc = gap(ctx, prev, ft->off[ci], e);
+        if (rc) return rc;
+        prev = ft->off[ci] + ft->size[ci];
+    }
+    if (prev != ft->meta_at) return imdb_fail(e, IMDB_ERR_CORRUPT, "parquet: bytes between the chunks and the footer");
+    return IMDB_OK;
+}
+
+static int gap_mem(void *ctx, uint64_t from, uint64_t to, imdb_err *e)
+{
+    const uint8_t *f = ctx;
+    for (uint64_t i = from; i < to; i++)
+        if (f[i]) return imdb_fail(e, IMDB_ERR_CORRUPT, "parquet: a byte between the chunks not zero");
+    return IMDB_OK;
+}
+
+int imdb_pq_authenticate(const uint8_t *f, size_t len, const uint8_t name[32], pq_footer *ft, imdb_err *e)
+{
+    uint8_t h[32];
+    memset(ft, 0, sizeof *ft);
+    int rc = imdb_pq_name(f, len, h, e); /* the tail, before anything is parsed */
+    if (rc) return rc;
+    if (memcmp(h, name, 32)) return imdb_fail(e, IMDB_ERR_VERIFY, "parquet: a file whose tail does not hash to its name");
+    if ((rc = imdb_pq_footer(f, len, ft, e)) || (rc = frame_check(ft, gap_mem, (void *)(uintptr_t)f, e))) return rc;
+    return chunks_check(f, ft, IMDB_ERR_VERIFY, e);
+}
+
+typedef struct {
+    pq_read_fn rd;
+    void *ctx;
+    uint8_t *buf;
+    size_t bufsz;
+} stream_gap;
+
+static int gap_stream(void *ctx, uint64_t from, uint64_t to, imdb_err *e)
+{
+    stream_gap *s = ctx;
+    while (from < to) {
+        size_t k = to - from < s->bufsz ? (size_t)(to - from) : s->bufsz;
+        int rc = s->rd(s->ctx, from, s->buf, k, e);
+        if (rc) return rc;
+        for (size_t i = 0; i < k; i++)
+            if (s->buf[i]) return imdb_fail(e, IMDB_ERR_CORRUPT, "parquet: a byte between the chunks not zero");
+        from += k;
+    }
+    return IMDB_OK;
+}
+
+/* imdb_pq_authenticate's rule and order over pieces (the tail, the opening magic, the footer, the frame, each chunk in
+ * column order), so one file gets one verdict either way (t_pq compares them) */
+int imdb_pq_authenticate_stream(pq_read_fn rd, void *ctx, uint64_t len, const uint8_t name[32], uint8_t *buf,
+                                size_t bufsz, imdb_err *e)
+{
+    if (bufsz < 4096) return imdb_fail(e, IMDB_ERR_INVALID, "parquet: a piece buffer under 4096 bytes");
+    if (len < 12) return imdb_fail(e, IMDB_ERR_CORRUPT, "parquet: not a Parquet file");
+    uint8_t last[8], h[32];
+    uint32_t ml;
+    int rc = rd(ctx, len - 8, last, 8, e);
+    if (rc || (rc = tail_len(last, len, &ml, e))) return rc;
+    size_t tl = (size_t)ml + 8;
+    uint8_t *tail = imdb_alloc(tl, e);
+    if (!tail) return e->code;
+    pq_footer ft;
+    memset(&ft, 0, sizeof ft);
+    if (!(rc = rd(ctx, len - tl, tail, tl, e))) {
+        imdb_sha256(tail, tl, h);
+        if (memcmp(h, name, 32)) rc = imdb_fail(e, IMDB_ERR_VERIFY, "parquet: a file whose tail does not hash to its name");
+    }
+    if (!rc && !(rc = rd(ctx, 0, buf, 4, e)) && memcmp(buf, "PAR1", 4))
+        rc = imdb_fail(e, IMDB_ERR_CORRUPT, "parquet: not a Parquet file");
+    if (!rc) rc = footer_walk(tail, ml, len, &ft, e);
+    stream_gap sg = {rd, ctx, buf, bufsz};
+    if (!rc) rc = frame_check(&ft, gap_stream, &sg, e);
+    for (uint32_t ci = 0; !rc && ci < ft.ncols; ci++) {
+        imdb_sha256_ctx c;
+        imdb_sha256_init(&c);
+        for (uint64_t at = ft.off[ci], end = at + ft.size[ci]; !rc && at < end;) {
+            size_t k = end - at < bufsz ? (size_t)(end - at) : bufsz;
+            if (!(rc = rd(ctx, at, buf, k, e))) imdb_sha256_update(&c, buf, k);
+            at += k;
+        }
+        if (!rc) {
+            char hx[65];
+            imdb_sha256_final(&c, h);
+            hex(h, 32, hx);
+            if (memcmp(hx, ft.chunk_hex[ci], 64)) rc = imdb_fail(e, IMDB_ERR_VERIFY, "parquet: a chunk is not the one its footer names");
+            imdb_wipe(hx, sizeof hx);
+        }
+        imdb_wipe(&c, sizeof c);
+    }
+    imdb_wipe(h, sizeof h);
+    imdb_wipe(tail, tl); /* the footer's statistics and its chunks' unsalted hashes (f5-design.md section 2) */
+    imdb_free(tail);
     return rc;
 }
 

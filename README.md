@@ -892,8 +892,13 @@ lake's segments are files in a canonical subset of Parquet, which DuckDB reads (
 links its library, test-only, outside the matrix); no other Parquet reader is tested yet. A segment holds every
 version of its rows, not a table's current state: ended versions, erased rows as stubs (zero or NULL where their
 values were) and imagedb's system columns (imdb$vid, imdb$begin, imdb$flags, imdb$salt, imdb$commit) beside the
-table's columns. The Iceberg tables that will show each table's current rows, other platforms and the desktop
-client are deferred (deferred.md).
+table's columns. A segment's file name is the SHA-256 of its tail (its footer, the footer's length and the closing
+`PAR1`), which lists each column chunk's SHA-256: `tail -c $((N + 8)) FILE | sha256sum`, N the little-endian u32
+before the closing magic, gives its name, and every load checks the tail, the frame and each chunk. A DECIMAL is
+stored as Iceberg maps it (INT32 to 9 digits, INT64 to 18, past them the fewest bytes that hold its precision), and
+imdb$vid and imdb$begin carry Iceberg v3's row-lineage field ids. The Iceberg tables that will show each table's
+current rows (DuckDB's iceberg extension is not yet tested), other platforms and the desktop client are deferred
+(deferred.md).
 
 Ordered indexes:
 

@@ -32,7 +32,7 @@ static uint64_t next(void)
     return rng;
 }
 
-enum { NC = 23 };
+enum { NC = 26 }; /* F5b: 23 to 25 a DECIMAL of each of Iceberg's other forms */
 typedef struct data {
     uint64_t n;
     uint8_t *fixed[NC];
@@ -46,7 +46,8 @@ static const char *const names[NC] = {"imdb$vid", "imdb$begin", "imdb$flags", "i
                                       "k",        "i",          "s",          "d",         "w",
                                       "t",        "b",          "ts",         "tz",        "dt",
                                       "tm",       "u",          "bya",        "f",         "iv",
-                                      "en",       "rt",         "zn"};
+                                      "en",       "rt",         "zn",         "d9",        "d19",
+                                      "d30"};
 
 /* each column's type as DuckDB reads it */
 static const char *const dtype[NC] = {"BIGINT",  "BIGINT",  "INTEGER",   "BLOB",
@@ -54,13 +55,14 @@ static const char *const dtype[NC] = {"BIGINT",  "BIGINT",  "INTEGER",   "BLOB",
                                       "DECIMAL(10,2)", "DECIMAL(38,6)", "VARCHAR", "BOOLEAN",
                                       "TIMESTAMP", "TIMESTAMP WITH TIME ZONE", "DATE", "TIME",
                                       "UUID",    "BLOB",    "DOUBLE",    "BLOB",
-                                      "BIGINT",  "VARCHAR", "BIGINT"};
+                                      "BIGINT",  "VARCHAR", "BIGINT",    "DECIMAL(9,2)",
+                                      "DECIMAL(19,0)", "DECIMAL(30,4)"};
 
 static void col_shape(int c, pq_col *p)
 {
     memset(p, 0, sizeof *p);
     p->name = names[c];
-    p->field_id = c < 5 ? 2147483000 + c : c + 1;
+    p->field_id = c == 0 ? 2147483540 : c == 1 ? 2147483539 : c < 5 ? 2147483000 + c : c + 1; /* F5b: the lake's */
     switch (c) {
     case 0: case 1: p->phys = PQ_INT64; break;
     case 2: p->phys = PQ_INT32; break;
@@ -84,6 +86,10 @@ static void col_shape(int c, pq_col *p)
     case 20: p->phys = PQ_INT64; p->stats = true; p->optional = true; break;
     case 21: p->phys = PQ_BYTE_ARRAY; p->logical = PQL_STRING; break;
     case 22: p->phys = PQ_INT64; p->logical = PQL_INT; p->int_bits = 64; p->stats = true; p->optional = true; break;
+    /* F5b: Iceberg's DECIMAL widths: an INT32 to 9 digits (its statistics), FIXED of the least bytes past 18 */
+    case 23: p->phys = PQ_INT32; p->logical = PQL_DECIMAL; p->scale = 2; p->precision = 9; p->stats = true; p->optional = true; break;
+    case 24: p->phys = PQ_FLBA; p->type_length = 9; p->logical = PQL_DECIMAL; p->precision = 19; break;
+    case 25: p->phys = PQ_FLBA; p->type_length = 13; p->logical = PQL_DECIMAL; p->scale = 4; p->precision = 30; p->optional = true; break;
     }
 }
 
@@ -167,6 +173,15 @@ static void build(data *d, uint64_t n)
                 continue;
             }
             case 20: x = (int64_t)(next() % 5); break;
+            case 23: x = (int64_t)(next() % 1999999999ull) - 999999999; break;
+            case 24: case 25: { /* F5b: big-endian in the column's width, its sign the dropped bytes' */
+                unsigned __int128 lim = c == 24 ? (unsigned __int128)10000000000000000000ull
+                                                : (unsigned __int128)10000000000000000000ull * 100000000000ull;
+                unsigned __int128 m = ((unsigned __int128)next() << 64 | next()) % lim;
+                __int128 sv = (next() & 1) ? -(__int128)m : (__int128)m;
+                for (unsigned k = 0; k < w; k++) v[k] = (uint8_t)((unsigned __int128)sv >> (8 * (w - 1 - k)));
+                continue;
+            }
             case 22: x = 0; break;
             }
             if (w == 4) {
@@ -201,10 +216,11 @@ static double fixed_d(const data *d, int c, uint64_t i)
     return f;
 }
 
-static void dec128_text(const uint8_t *be, int scale, char *out)
+/* a big-endian two's complement DECIMAL of w bytes (F5b: 9 to 16), sign-extended, as text with its scale */
+static void dec_be_text(const uint8_t *be, unsigned w, int scale, char *out)
 {
     unsigned __int128 u = 0;
-    for (int k = 0; k < 16; k++) u = u << 8 | be[k];
+    for (unsigned k = 0; k < 16; k++) u = u << 8 | (k < 16 - w ? ((be[0] & 0x80) ? 0xff : 0) : be[k - (16 - w)]);
     bool neg = (be[0] & 0x80) != 0;
     if (neg) u = ~u + 1;
     char digits[64];
@@ -261,9 +277,10 @@ static void literal(const data *d, int c, uint64_t i, char *out, size_t cap)
     col_shape(c, &p);
     int64_t x = c == 18 ? 0 : fixed_i(d, c, i, width(&p));
     switch (c) {
-    case 8: {
+    case 8:
+    case 23: {
         uint64_t a = x < 0 ? (uint64_t)0 - (uint64_t)x : (uint64_t)x;
-        snprintf(out, cap, "CAST('%s%" PRIu64 ".%02" PRIu64 "' AS DECIMAL(10,2))", x < 0 ? "-" : "", a / 100, a % 100);
+        snprintf(out, cap, "CAST('%s%" PRIu64 ".%02" PRIu64 "' AS %s)", x < 0 ? "-" : "", a / 100, a % 100, dtype[c]);
         break;
     }
     case 11: snprintf(out, cap, "%s", x ? "true" : "false"); break;
@@ -311,6 +328,9 @@ static void check_file(duckdb_connection con, const char *path, const data *d)
         {"INT64", "NULL", "OPTIONAL", "NULL", "NULL"},
         {"BYTE_ARRAY", "NULL", "REQUIRED", "UTF8", "StringType()"},
         {"INT64", "NULL", "OPTIONAL", "INT_64", "IntType(bitWidth=\x40, isSigned=1)"},
+        {"INT32", "NULL", "OPTIONAL", "DECIMAL", "DecimalType(scale=2, precision=9)"},
+        {"FIXED_LEN_BYTE_ARRAY", "9", "REQUIRED", "DECIMAL", "DecimalType(scale=0, precision=19)"},
+        {"FIXED_LEN_BYTE_ARRAY", "13", "OPTIONAL", "DECIMAL", "DecimalType(scale=4, precision=30)"},
     };
     snprintf(sql, sizeof sql,
              "SELECT name, field_id, type, type_length, repetition_type, converted_type, logical_type "
@@ -349,7 +369,8 @@ static void check_file(duckdb_connection con, const char *path, const data *d)
                                          "\"imdb$commit\"", "k", "i", "s", "CAST(d * 100 AS BIGINT)", "CAST(w AS VARCHAR)",
                                          "t", "CAST(b AS INTEGER)", "epoch_us(ts)", "epoch_us(tz)", "dt - DATE '1970-01-01'",
                                          "CAST(round(EXTRACT(EPOCH FROM tm) * 1000000) AS BIGINT)", "CAST(u AS VARCHAR)",
-                                         "bya", "f", "iv", "en", "rt", "zn"};
+                                         "bya", "f", "iv", "en", "rt", "zn", "CAST(d9 * 100 AS BIGINT)",
+                                         "CAST(d19 AS VARCHAR)", "CAST(d30 AS VARCHAR)"};
     for (int c = 0; c < NC; c++) {
         snprintf(sql, sizeof sql, "SELECT %s FROM read_parquet('%s') ORDER BY \"imdb$vid\"", expr[c], path);
         if (query(con, sql, &r)) continue;
@@ -374,10 +395,10 @@ static void check_file(duckdb_connection con, const char *path, const data *d)
                 size_t wl = p.phys == PQ_FLBA ? w : (size_t)(d->off[c][i + 1] - d->off[c][i]);
                 if (b.size != wl || memcmp(b.data, want, wl)) FAIL("%s: column %s row %" PRIu64 " bytes\n", path, names[c], i);
                 duckdb_free(b.data);
-            } else if (c == 9 || c == 16) {
+            } else if (c == 9 || c == 16 || c == 24 || c == 25) {
                 char *got = duckdb_value_varchar(&r, 0, i), want[80];
                 const uint8_t *v = d->fixed[c] + i * w;
-                if (c == 9) dec128_text(v, 6, want);
+                if (c == 9 || c == 24 || c == 25) dec_be_text(v, w, c == 9 ? 6 : c == 24 ? 0 : 4, want);
                 else
                     snprintf(want, sizeof want, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
                              v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15]);

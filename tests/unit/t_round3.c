@@ -746,7 +746,8 @@ static void fixture_check(const char *tgz, uint8_t alg, const char *meta_head, b
     free(m);
 }
 
-/* The format's fixtures (make_fixtures.sh, 2026-11-12's first pair: META 5, log version 3, manifest version 16 with F1's
+/* The format's fixtures (make_fixtures.sh, 2026-11-14's first pair: META 5, log version 3, manifest version 20 (F5b: segments
+ * in imagedb's Parquet subset named by their tail, Iceberg's field ids and DECIMAL widths) with F1's
  * schema history, F2a's CREATE DEFAULTs (op 23), F2a-2's sequences (ops 24-27), F2b-1's CHECKs (op 28, op 22 kinds 11 and 12)
  * F2c's generated columns (op 23 kind 9), F2b-2's FOREIGN KEYs (op 29, op 22 kinds 13 and 14), F3d's UUID and BYTEA (a drawn
  * key, op 23 kind 10), F3e's DECIMALs to 38 digits and F3f's INTERVALs (each field at its ends, the equal-span trio, a DEFAULT,
@@ -756,12 +757,12 @@ static void fixture_check(const char *tgz, uint8_t alg, const char *meta_head, b
  * digest algorithm: they pin the format, so a change to it fails here first */
 static void t_round3_alg1_fixture(void)
 {
-    fixture_check("tests/fixtures/alg1-20261113a.tar.gz", IMDB_DIGEST_ALG_LTHASH16, "imagedb-meta 5\n", true, 134);
+    fixture_check("tests/fixtures/alg1-20261114a.tar.gz", IMDB_DIGEST_ALG_LTHASH16, "imagedb-meta 5\n", true, 134);
 }
 
 static void t_round3_alg2_fixture(void)
 {
-    fixture_check("tests/fixtures/alg2-20261113a.tar.gz", IMDB_DIGEST_ALG_LTHASH16_TREE, "imagedb-meta 5\n", true, 134);
+    fixture_check("tests/fixtures/alg2-20261114a.tar.gz", IMDB_DIGEST_ALG_LTHASH16_TREE, "imagedb-meta 5\n", true, 134);
 }
 
 /* The fixtures of the formats before the current one (alg1-20261026: META 2; alg2-20261026 and
@@ -802,7 +803,8 @@ static void t_round3_old_fixtures(void)
      * alg2-20261109d: before generated columns, F2c), 12 (alg1-20261109e, alg2-20261109e: before FOREIGN KEYs, F2b-2), 13 (alg1-20261109f, alg2-20261109f: before UUID and BYTEA, F3d)
      * 14 (alg1-20261109g, alg2-20261109g: before DECIMALs of 38 digits, F3e) and 15 (alg1-20261110a, alg2-20261110a: before
      * INTERVAL, F3f), 16 (alg1-20261112a, alg2-20261112a: before ENUM types, F3g), 17 (alg1-20261112b, alg2-20261112b:
-     * before roles, L) and 18 (alg1-20261112c, alg2-20261112c: before Parquet segments, F5):
+     * before roles, L), 18 (alg1-20261112c, alg2-20261112c: before Parquet segments, F5) and 19 (alg1-20261113a,
+     * alg2-20261113a: before segments named by their tail, Iceberg's field ids and DECIMAL widths, F5b):
      * META reads, and the open refuses the lake (or the log) by name, never replaying past it to a rebuilt manifest of
      * another version */
     static const char *const tgz4[] = {"tests/fixtures/alg1-20261029.tar.gz", "tests/fixtures/alg2-20261029.tar.gz",
@@ -819,7 +821,8 @@ static void t_round3_old_fixtures(void)
                                        "tests/fixtures/alg1-20261110a.tar.gz", "tests/fixtures/alg2-20261110a.tar.gz",
                                        "tests/fixtures/alg1-20261112a.tar.gz", "tests/fixtures/alg2-20261112a.tar.gz",
                                        "tests/fixtures/alg1-20261112b.tar.gz", "tests/fixtures/alg2-20261112b.tar.gz",
-                                       "tests/fixtures/alg1-20261112c.tar.gz", "tests/fixtures/alg2-20261112c.tar.gz"};
+                                       "tests/fixtures/alg1-20261112c.tar.gz", "tests/fixtures/alg2-20261112c.tar.gz",
+                                       "tests/fixtures/alg1-20261113a.tar.gz", "tests/fixtures/alg2-20261113a.tar.gz"};
     static const char *const why4[] = {"before DROP TABLE", "before DROP TABLE", "before views", "before views",
                                        "before the format design", "before the format design",
                                        "before schema versions by position", "before schema versions by position",
@@ -828,7 +831,8 @@ static void t_round3_old_fixtures(void)
                                        "before generated columns", "before generated columns", "before FOREIGN KEYs", "before FOREIGN KEYs", "before UUID and BYTEA", "before UUID and BYTEA",
                                        "before DECIMALs of 38 digits", "before DECIMALs of 38 digits", "before INTERVAL", "before INTERVAL",
                                        "before ENUM types", "before ENUM types", "before roles", "before roles",
-                                       "before Parquet segments", "before Parquet segments"};
+                                       "before Parquet segments", "before Parquet segments",
+                                       "before segments named by their tail", "before segments named by their tail"};
     for (size_t i = 0; i < sizeof tgz4 / sizeof *tgz4; i++) {
         struct stat st;
         if (stat(tgz4[i], &st) != 0) {

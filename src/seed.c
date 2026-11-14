@@ -17,6 +17,7 @@
 #include "limits.h"
 #include "log.h"
 #include "logdir.h"
+#include "parquet.h"
 #include "sha256.h"
 #include "writer.h"
 
@@ -336,14 +337,34 @@ int imdb_seed_send(const char *path, int dirfd, int logfd, const imdb_sink *out,
 
 /* ---- the replica's side ------------------------------------------------------------------------------- */
 
-/* one object of n bytes into objects/, kept only if they hash to h: streamed to a temporary file in chunks */
+/* a temporary file's bytes for imdb_pq_authenticate_stream: exactly n at off, or an I/O error */
+typedef struct {
+    int fd;
+    const char *name;
+} tmp_rd;
+
+static int tmp_read(void *ctx, uint64_t off, uint8_t *b, size_t n, imdb_err *e)
+{
+    const tmp_rd *r = ctx;
+    for (size_t got = 0; got < n;) {
+        ssize_t k = imdb_io_pread(r->fd, b + got, n - got, (off_t)(off + got));
+        if (k < 0 && errno == EINTR) continue;
+        if (k <= 0) return imdb_fail(e, IMDB_ERR_IO, "seed: objects/%s: a short read", r->name);
+        got += (size_t)k;
+    }
+    return IMDB_OK;
+}
+
+/* one object of n bytes into objects/, kept only if it is the object its name names: streamed to a temporary file in
+ * chunks, hashed as it arrives (a segment, F5b: named by its tail, which comes last, so authenticated from that file
+ * once written, in bounded memory: parquet.h imdb_pq_authenticate_stream) */
 static int take_object(int ofd, imdb_stream *s, uint8_t kind, const uint8_t h[32], uint64_t n, uint8_t *buf, imdb_err *e)
 {
     char name[80], tmp[90];
     obj_file(kind, h, name);
     snprintf(tmp, sizeof tmp, "%s.tmp", name);
     (void)imdb_io_unlinkat(ofd, tmp, 0);
-    int fd = imdb_io_openat(ofd, tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    int fd = imdb_io_openat(ofd, tmp, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd < 0) return imdb_fail(e, IMDB_ERR_IO, "seed: objects/%s: %s", tmp, strerror(errno));
     imdb_sha256_ctx c;
     imdb_sha256_init(&c);
@@ -351,15 +372,24 @@ static int take_object(int ofd, imdb_stream *s, uint8_t kind, const uint8_t h[32
     for (uint64_t left = n; !rc && left;) {
         size_t k = left < CHUNK ? (size_t)left : CHUNK;
         if (!(rc = imdb_stream_need(s, buf, k, e))) {
-            imdb_sha256_update(&c, buf, k);
+            if (kind != OBJ_SEG) imdb_sha256_update(&c, buf, k);
             rc = imdb_write_all(fd, buf, k, e);
         }
         left -= k;
     }
     uint8_t got[32];
     imdb_sha256_final(&c, got);
-    if (!rc && memcmp(got, h, 32) != 0)
+    if (!rc && kind == OBJ_SEG) {
+        tmp_rd r = {fd, tmp};
+        imdb_err ea = {0};
+        int ra = imdb_pq_authenticate_stream(tmp_read, &r, n, h, buf, CHUNK, &ea);
+        if (ra == IMDB_ERR_VERIFY || ra == IMDB_ERR_CORRUPT)
+            rc = imdb_fail(e, IMDB_ERR_AUTH, "seed: object %s is not the bytes its name says: %s", name, ea.msg);
+        else if (ra)
+            rc = imdb_fail(e, ra, "%s", ea.msg); /* an I/O error or an allocation's, as it was */
+    } else if (!rc && memcmp(got, h, 32) != 0) {
         rc = imdb_fail(e, IMDB_ERR_AUTH, "seed: object %s is not the bytes its name says", name);
+    }
     if (!rc && imdb_io_fsync(fd) != 0) rc = imdb_fail(e, IMDB_ERR_IO, "seed: objects/%s: fsync: %s", tmp, strerror(errno));
     close(fd);
     if (!rc && imdb_io_renameat(ofd, tmp, ofd, name) != 0)

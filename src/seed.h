@@ -14,7 +14,9 @@
  * The replica takes it only empty (init-replica, nothing applied). It checks the head as an open checks
  * FLOOR (the key changes from META's keys, S's header under the key at S) before it trusts the manifest
  * hash S's publish op names, then takes each object only if the manifest names it, once, and its bytes
- * hash to its name (streamed to a temporary file: nothing is allocated from a length the stream claims).
+ * are that object's (streamed to a temporary file, hashed as they come; a segment, F5b, authenticated by its tail, frame
+ * and chunks from that file in bounded memory: nothing is allocated from a length the stream claims, a segment's tail
+ * at most PQ_MAX_FOOTER + 8 bytes).
  * It writes the objects, then FLOOR (head and manifest), then LAKE_HEAD, and leaves its handle stale: the
  * next open loads the snapshot at its floor, and ship goes on after S. A seed cut short leaves only
  * objects, or FLOOR without LAKE_HEAD; a writable open of a replica with no LAKE_HEAD and an empty log

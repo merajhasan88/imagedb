@@ -13,6 +13,10 @@
  *                                          the manifest and LAKE_HEAD so all names match
  *   imdb-forge lie-chunks <dir>            F5: a segment's imagedb.chunks names a chunk by another SHA-256, re-hash
  *                                          the lake and re-sign the log from the snapshot's commit
+ *   imdb-forge lie-name <dir>              F5b: a segment, its content honest, named by its whole file's SHA-256
+ *                                          (F5a's rule) instead of its tail's; the lake re-hashed and the log re-signed
+ *   imdb-forge lie-format1 <dir>           F5b: a segment's imagedb.format "1" (F5a's), named by its tail; the
+ *                                          lake re-hashed and the log re-signed
  *   imdb-forge lie-tombstone <dir>         move a purged tombstone to another subject, re-hash the
  *                                          lake and re-sign the log from the snapshot's commit
  *                                          (a malicious or buggy writer: everything consistent)
@@ -243,10 +247,17 @@ static void redact_ver_one(void *ctx, const uint8_t *f, size_t fl)
     imdb_commit_free(&c);
 }
 
+static bool g_whole_name; /* F5b: lie-name: a segment named by its whole file, F5a's rule */
+
 static int obj_rename(int ofd, const char *old, const uint8_t *b, size_t n, const char *ext, char *newname)
 {
     uint8_t h[32];
-    imdb_sha256(b, n, h);
+    imdb_err ne = {0};
+    if (!strcmp(ext, ".seg") && !g_whole_name) { /* F5b: a segment is named by its tail */
+        if (imdb_pq_name(b, n, h, &ne)) die("segment", &ne);
+    } else {
+        imdb_sha256(b, n, h);
+    }
     imdb_hex(h, 32, newname);
     strcat(newname, ext);
     if (unlinkat(ofd, old, 0) != 0) return -1;
@@ -809,7 +820,9 @@ static void lie_row(const char *dir, int mode) /* 0 F1 missing; F5 stubs: 1 NOT 
 /* F5: a segment whose imagedb.chunks names one chunk by another SHA-256 (a hex digit changed: the file's own hash, its
  * name, right again), its DV, the manifest and LAKE_HEAD re-hashed and the log re-signed from the snapshot's commit:
  * a load reads the file whole by its name and hashes no chunk, so VERIFY and the auditor alone refuse it */
-static void lie_chunks(const char *dir)
+/* mode 0 (lie-chunks): the last chunk's hash in imagedb.chunks changed; 1 (lie-name, F5b): the content kept, the
+ * segment named by its whole file's hash; 2 (lie-format1, F5b): its imagedb.format "1", named by its tail */
+static void lie_chunks(const char *dir, int mode)
 {
     char p[1200];
     snprintf(p, sizeof p, "%s/LAKE_HEAD", dir);
@@ -842,9 +855,17 @@ static void lie_chunks(const char *dir)
     pq_footer ft;
     if (imdb_pq_footer(raw, sn, &ft, &e)) die("segment", &e);
     uint8_t *d = raw + (ft.chunk_hex[ft.ncols - 1] - raw); /* the last chunk's hash, its first digit */
-    *d = *d == '0' ? '1' : '0';
+    if (mode == 0) *d = *d == '0' ? '1' : '0';
+    if (mode == 2) {
+        uint32_t fl;
+        const uint8_t *fv = imdb_pq_kv(&ft, "imagedb.format", &fl);
+        if (!fv || fl != 1) exit(1);
+        raw[fv - raw] = '1';
+    }
     char nseg[80], nman[80];
+    g_whole_name = mode == 1;
     if (obj_rename(ofd, sname, raw, sn, ".seg", nseg)) exit(1);
+    g_whole_name = false;
     uint8_t nsh[32];
     imdb_unhex(nseg, 64, nsh, 32);
     if (memcmp(mt->seg[0].dv, (uint8_t[32]){0}, 32) != 0) { /* the DV names its segment */
@@ -2494,7 +2515,15 @@ int main(int argc, char **argv)
         return 0;
     }
     if (argc == 3 && strcmp(argv[1], "lie-chunks") == 0) { /* F5: a chunk's SHA-256 lies, its file's name right */
-        lie_chunks(argv[2]);
+        lie_chunks(argv[2], 0);
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[1], "lie-name") == 0) { /* F5b: an honest segment under its whole file's hash */
+        lie_chunks(argv[2], 1);
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[1], "lie-format1") == 0) { /* F5b: a segment of F5a's format marker */
+        lie_chunks(argv[2], 2);
         return 0;
     }
     if (argc == 3 && (!strcmp(argv[1], "lie-stub-text") || !strcmp(argv[1], "lie-stub-bool") || !strcmp(argv[1], "lie-stub-cell"))) {

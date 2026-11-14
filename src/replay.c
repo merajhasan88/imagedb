@@ -1058,7 +1058,16 @@ int imdb_replay(imdb_db *db, bool ro, imdb_err *e)
                          (unsigned long long)first, why.msg[0] ? why.msg : "none is published");
     for (size_t si = start; si < db->nsegs; si++) {
         int rc = replay_segment(db, si, ro, e);
-        if (rc) return rc;
+        if (rc) {
+            if (why.code) { /* the snapshot's own failure, often the cause (F5b: a segment not its name's): both said */
+                static const char lead[] = "; snapshot not used: ";
+                size_t l = strnlen(e->msg, sizeof e->msg);
+                for (const char *x = lead; *x && l + 1 < sizeof e->msg; x++) e->msg[l++] = *x;
+                for (const char *x = why.msg; *x && l + 1 < sizeof e->msg; x++) e->msg[l++] = *x;
+                if (l < sizeof e->msg) e->msg[l] = 0;
+            }
+            return rc;
+        }
     }
     if (db->have_dur) { /* the log must still hold every commit the writer acknowledged, and that very commit */
         if (imdb_tail_check(&db->dur, true, db->seq, IMDB_SCAN_END, "the log ends at a frame boundary", e))

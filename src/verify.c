@@ -1638,13 +1638,8 @@ static void lake_item(void *ctx, size_t i)
     }
     memcpy(al, sb, sl);
     imdb_free(sb);
-    /* F5: each chunk against its SHA-256 in imagedb.chunks (a load reads the whole file by its name and hashes no chunk;
-     * a partial read will trust them): before the parse, which a settled image leaves no file to hash */
-    pq_footer cf;
-    if (!imdb_pq_footer(al, sl, &cf, e) && (it->rc = imdb_pq_chunks_verify(al, &cf, e))) {
-        imdb_free(al);
-        return;
-    }
+    /* F5b: imdb_lake_read_object authenticated it (its tail against its name, its frame, each chunk against
+     * imagedb.chunks), as every load does */
     if ((it->rc = imdb_segment_parse_h(&vt->hist, al, sl, mt->seg[it->k].seg, &it->g, e))) { /* read by its name */
         imdb_free(al);
         return;
@@ -2277,8 +2272,7 @@ static int verify_seed(imdb_db *db, vctx *x, imdb_err *e)
             sb = NULL;
             /* F1: by the current manifest's history, which holds every version its segments name (F's history and
              * any ALTER since; the positions are F's own): the model at F has F's alone */
-            pq_footer cf; /* F5: each chunk against its SHA-256 (above) */
-            if (!rc && !imdb_pq_footer(al, sl, &cf, e) && (rc = imdb_pq_chunks_verify(al, &cf, e))) imdb_free(al);
+            /* F5b: authenticated by imdb_lake_read_object (above) */
             if (!rc && (rc = imdb_segment_parse_h(&m.t[ti].hist, al, sl, m.t[ti].seg[k].seg, &g, e))) imdb_free(al);
             imdb_segimg *gi = rc ? NULL : imdb_seg_pin(NULL, g, e); /* its own parse: apart from any table, resident */
             /* the ends its deletion vector records at or before F: a seed's floor is its snapshot, whose lake still

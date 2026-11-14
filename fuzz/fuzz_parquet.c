@@ -1,24 +1,27 @@
 /* F5: the canonical Parquet subset's reader (src/parquet.c) on any bytes. The first byte picks a set of shapes (the
- * caller's: every type the lake writes; two byte arrays and an INT64; a BOOLEAN, a DATE and a UUID beside an INT64);
+ * caller's: every type the lake writes; two byte arrays and an INT64; a BOOLEAN, a DATE and a UUID beside an INT64; F5b:
+ * a DECIMAL of each form, an INT32, a FIXED of 9 and of 13 bytes, beside an INT64);
  * the rest is the file, read from a buffer of its exact size. Each input is refused (IMDB_ERR_CORRUPT, or an allocation
  * refused), or what the reader took is the writer's file for what it read but for the chunks' hashes (imagedb.chunks,
- * which a load does not hash): a disagreement aborts. IMDB_FUZZ_PARQUET_SEEDS=DIR writes seeds there and exits
+ * which the read does not hash): a disagreement aborts. F5b: the file named by its tail, its authentication in memory and
+ * streamed in pieces give one verdict (code and message), and one accepted is a footer the reader takes whose every
+ * chunk hashes to its entry. IMDB_FUZZ_PARQUET_SEEDS=DIR writes seeds there and exits
  * (fuzz/make_corpus.sh: the writer's own files, each set at a few row counts). */
 #include <stdio.h>
 
 #include "../src/parquet.h"
 #include "fuzz_common.h"
 
-enum { MAXC = 23, NSETS = 3 };
+enum { MAXC = 26, NSETS = 4 };
 
 static void shape23(int c, pq_col *p)
 {
     static const char *const nm[MAXC] = {"imdb$vid", "imdb$begin", "imdb$flags", "imdb$salt", "imdb$commit", "k", "i",
                                          "s", "d", "w", "t", "b", "ts", "tz", "dt", "tm", "u", "by", "f", "iv", "en",
-                                         "rt", "zn"};
+                                         "rt", "zn", "d9", "d19", "d30"};
     memset(p, 0, sizeof *p);
     p->name = nm[c];
-    p->field_id = c < 5 ? 2147483000 + c : c + 1;
+    p->field_id = c == 0 ? 2147483540 : c == 1 ? 2147483539 : c < 5 ? 2147483000 + c : c + 1; /* F5b: the lake's */
     switch (c) {
     case 0: case 1: p->phys = PQ_INT64; break;
     case 2: p->phys = PQ_INT32; break;
@@ -42,14 +45,18 @@ static void shape23(int c, pq_col *p)
     case 20: p->phys = PQ_INT64; p->stats = true; p->optional = true; break;
     case 21: p->phys = PQ_BYTE_ARRAY; p->logical = PQL_STRING; break;
     case 22: p->phys = PQ_INT64; p->logical = PQL_INT; p->int_bits = 64; p->stats = true; p->optional = true; break;
+    /* F5b: a DECIMAL by Iceberg's widths: an INT32 to 9 digits, a FIXED of the least bytes past 18 */
+    case 23: p->phys = PQ_INT32; p->logical = PQL_DECIMAL; p->scale = 2; p->precision = 9; p->stats = true; p->optional = true; break;
+    case 24: p->phys = PQ_FLBA; p->type_length = 9; p->logical = PQL_DECIMAL; p->precision = 19; break;
+    case 25: p->phys = PQ_FLBA; p->type_length = 13; p->logical = PQL_DECIMAL; p->scale = 4; p->precision = 30; p->optional = true; break;
     }
 }
 
 /* set k's shapes; returns its column count */
 static uint32_t shapes(int k, pq_col *sh)
 {
-    static const int pick[NSETS][MAXC] = {{0}, {0, 10, 21}, {0, 11, 14, 16}};
-    static const uint32_t nc[NSETS] = {MAXC, 3, 4};
+    static const int pick[NSETS][MAXC] = {{0}, {0, 10, 21}, {0, 11, 14, 16}, {0, 23, 24, 25}};
+    static const uint32_t nc[NSETS] = {23, 3, 4, 4};
     for (uint32_t c = 0; c < nc[k]; c++) shape23(k == 0 ? (int)c : pick[k][c], &sh[c]);
     if (k == 2) sh[2].optional = false; /* a REQUIRED DATE */
     return nc[k];
@@ -100,6 +107,48 @@ static bool same_but_hashes(const uint8_t *f, size_t len, const pq_footer *ft, c
     return same;
 }
 
+/* F5b: the streamed check's pieces, from the input */
+typedef struct {
+    const uint8_t *p;
+    uint64_t len;
+} mrd;
+
+static int mrd_read(void *ctx, uint64_t off, uint8_t *buf, size_t n, imdb_err *e)
+{
+    const mrd *m = ctx;
+    if (off > m->len || n > m->len - off) return imdb_fail(e, IMDB_ERR_IO, "fuzz: a read past the end");
+    memcpy(buf, m->p + off, n);
+    return IMDB_OK;
+}
+
+/* F5b: the file against its own name (its tail's hash, when it has a tail) and against a name one bit off: in memory
+ * and streamed one verdict; an accepted one's footer the reader's and its chunks their entries' */
+static void authenticate_both(const uint8_t *f, size_t len)
+{
+    uint8_t name[32], piece[4096];
+    imdb_err e = {0};
+    if (imdb_pq_name(f, len, name, &e)) {
+        if (e.code != IMDB_ERR_CORRUPT) abort();
+        memset(name, 0, sizeof name);
+    }
+    for (int round = 0; round < 2; round++) {
+        if (round) name[31] ^= 1;
+        pq_footer ft;
+        imdb_err a = {0}, b = {0};
+        int ra = imdb_pq_authenticate(f, len, name, &ft, &a);
+        mrd m = {f, len};
+        int rb = imdb_pq_authenticate_stream(mrd_read, &m, len, name, piece, sizeof piece, &b);
+        if (rb == IMDB_ERR_NOMEM) continue;            /* the streamed check alone allocates (its tail): no verdict */
+        if (ra != rb || strcmp(a.msg, b.msg)) abort(); /* two verdicts for one file */
+        if (ra && ra != IMDB_ERR_CORRUPT && ra != IMDB_ERR_VERIFY && ra != IMDB_ERR_NOMEM) abort();
+        if (!ra) {
+            pq_footer f2;
+            imdb_err c = {0};
+            if (round || imdb_pq_footer(f, len, &f2, &c) || imdb_pq_chunks_verify(f, &f2, &c)) abort();
+        }
+    }
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     if (size < 1) return 0;
@@ -107,6 +156,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     size_t len = size - 1;
     uint8_t *f = malloc(len ? len : 1); /* exactly the file: a read past it is the sanitizer's */
     memcpy(f, data + 1, len);
+    authenticate_both(f, len);
     pq_col sh[PQ_MAX_COLUMNS];
     uint32_t nc = shapes(k, sh);
     pq_footer ft;

@@ -1,29 +1,33 @@
 /*
  * The lake: immutable columnar segments, deletion vectors and manifests,
- * all content-addressed (file name = SHA-256 of the bytes) and written in one
+ * all content-addressed (file name = SHA-256 of the bytes; a segment's of its tail, F5b) and written in one
  * canonical encoding, so the same logical content always produces the same
  * bytes on the primary, on every replica, and in any re-encoding.
  *
  * Segment (F5: imagedb's canonical Parquet subset, src/parquet.h, docs/f5-design.md): a Parquet file of one row group
  *   of at least one row, its rows in vid order, a chunk a column: imdb$vid INT64, imdb$begin INT64, imdb$flags INT32,
- *   imdb$salt FIXED_LEN_BYTE_ARRAY(16), imdb$commit FIXED_LEN_BYTE_ARRAY(32), each REQUIRED (field ids 2147483000 to
- *   2147483004, below Iceberg's reserved range; a '$' in each name, which no imagedb identifier holds), then the live
+ *   imdb$salt FIXED_LEN_BYTE_ARRAY(16), imdb$commit FIXED_LEN_BYTE_ARRAY(32), each REQUIRED (F5b: field ids 2147483540
+ *   and 2147483539, Iceberg v3's _row_id and _last_updated_sequence_number, then 2147483002 to 2147483004, below
+ *   Iceberg's reserved range; a '$' in each name, which no imagedb identifier holds), then the live
  *   columns of the schema version that built it in its compact order (field id: the column's position + 1), OPTIONAL
- *   when NULLABLE: BIGINT INT64 INT(64), INTEGER INT32 INT(32), SMALLINT INT32 INT(16), a DECIMAL to 18 digits INT64
- *   DECIMAL and past them FIXED_LEN_BYTE_ARRAY(16) big-endian DECIMAL, TEXT BYTE_ARRAY STRING, BYTEA BYTE_ARRAY, BOOL
+ *   when NULLABLE: BIGINT INT64 INT(64), INTEGER INT32 INT(32), SMALLINT INT32 INT(16), a DECIMAL by Iceberg's mapping
+ *   (F5b): to 9 digits INT32, to 18 INT64, past them FIXED_LEN_BYTE_ARRAY of imdb_pq_dec_bytes (9 to 16) big-endian,
+ *   each DECIMAL, TEXT BYTE_ARRAY STRING, BYTEA BYTE_ARRAY, BOOL
  *   BOOLEAN, TIMESTAMP INT64 TIMESTAMP(MICROS) local and TIMESTAMPTZ UTC, DATE INT32 DATE, TIME INT64 TIME(MICROS)
  *   local, UUID FIXED_LEN_BYTE_ARRAY(16) UUID, FLOAT64 DOUBLE (IEEE; the image holds its key), INTERVAL
  *   FIXED_LEN_BYTE_ARRAY(16) (months LE32, days LE32, microseconds LE64; no annotation), ENUM INT64 (its ordinal).
- *   The footer's key-value pairs: imagedb.chunks (the writer's), imagedb.format "1", imagedb.interval (the INTERVAL
+ *   The footer's key-value pairs: imagedb.chunks (the writer's), imagedb.format "2" (F5b; "1" refused by name),
+ *   imagedb.interval (the INTERVAL
  *   columns' field ids, decimal, comma-separated; only when any), imagedb.schema (the version's imdb_sver_hash, 64
  *   lowercase hex), imagedb.table (the table's id, decimal): exactly these. Statistics wherever a zone map exists (not
  *   seg_bytes), bounding every value, a placeholder too; the zone maps are computed at the load. A file in the format
- *   before (magic "IMDBSEG1") is refused by name.
+ *   before (magic "IMDBSEG1") is refused by name. Its name (F5b) is the SHA-256 of its tail (the footer, its length,
+ *   the closing magic); a file read is authenticated by that, its frame and each chunk's hash (parquet.h).
  *   Row flags: 0 a version with its data; 1 (stub) erased: vid, begin, commitment only;
  *   2 (purged) dropped by COMPACT ... PURGE: vid, begin, commitment and the SUBJECT value
  *   (so ERASE SUBJECT still finds purged history, whose payloads remain in the log);
  *   3 purged and erased: vid, begin, commitment only. A row that keeps no value in a column is NULL where the column is
- *   OPTIONAL and the type's zero where it is REQUIRED (TEXT and BYTEA empty, FLOAT64 +0.0, a 16-byte cell zeros); a
+ *   OPTIONAL and the type's zero where it is REQUIRED (TEXT and BYTEA empty, FLOAT64 +0.0, a fixed-length value zeros); a
  *   flagged row's salt is zero; zone maps cover flag-0 rows only.
  *   Every version of a table is in exactly one segment of the manifest.
  *
@@ -69,8 +73,11 @@ enum {
 #include "db.h"
 
 #define IMDB_SEG_NSYS 5u            /* F5: a segment's system columns, before the schema version's */
-#define IMDB_SEG_SYS_FIELD 2147483000 /* F5: the first one's field id */
-#define IMDB_MANIFEST_VERSION 19u /* F5: segments in imagedb's Parquet subset; 18 before them (L: roles and grants,
+#define IMDB_SEG_FIELD_VID 2147483540   /* F5b: imdb$vid, Iceberg v3's _row_id */
+#define IMDB_SEG_FIELD_BEGIN 2147483539 /* F5b: imdb$begin, Iceberg v3's _last_updated_sequence_number */
+#define IMDB_SEG_SYS_FIELD 2147483000   /* F5: the other three's, this + their index (2 to 4) */
+#define IMDB_MANIFEST_VERSION 20u /* F5b: segments named by their tail, Iceberg's field ids and DECIMAL widths; 19
+                                   before them (F5: segments in imagedb's Parquet subset); 18 before those (L: roles and grants,
                                    sections 5 and 6 filled); 17 before those (F3g: ENUM types, the
                                    enums section, ENUM columns); 16 before those (F3f: INTERVAL columns,
                                    16-byte cells and DEFAULTs); 15 before those (F3e: DECIMAL columns to 38

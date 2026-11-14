@@ -1,6 +1,7 @@
 /* F5: `make parquet-check`'s second part (the advisor 16:2x): DuckDB reads the segments the engine itself wrote, so the
  * engine's mapping (lake.c seg_shapes and seg_kv, which its build and parse share) meets a reader from outside. A table
- * of every type, at their edges (DECIMAL(1,0), (18,18), (19,0), (38,6); INTEGER and SMALLINT at their ends; a NOT NULL
+ * of every type, at their edges (DECIMAL(1,0), (18,18), (19,0), (38,6); F5b, Iceberg's widths: (9,9) an INT32 at its
+ * end, (19,0) 9 bytes, (30,4) 13 bytes and (38,6) 16, each at its precision's ends; INTEGER and SMALLINT at their ends; a NOT NULL
  * INTEGER; a SUBJECT; an ENUM), NULLs in every nullable column, 300 rows and a CHECKPOINT, an ALTER adding a column and
  * 100 more rows, an ERASE SUBJECT (segments rewritten with stubs), a CHECKPOINT. Then each segment's file in objects/:
  * DuckDB's types against the schema version that built it; each data row's values against imagedb's own SELECT of that
@@ -162,7 +163,8 @@ int main(int argc, char **argv)
     run("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')");
     run("CREATE TABLE t (id BIGINT PRIMARY KEY, sub BIGINT SUBJECT, n INTEGER NOT NULL, i INTEGER, s SMALLINT, b BIGINT, "
         "d DECIMAL(10,2), d1 DECIMAL(1,0), d18 DECIMAL(18,18), w DECIMAL(38,6), w19 DECIMAL(19,0), x TEXT, v VARCHAR(5), "
-        "bya BYTEA, bo BOOLEAN, ts TIMESTAMP, tz TIMESTAMPTZ, dt DATE, tm TIME, u UUID, f FLOAT64, iv INTERVAL, e mood)");
+        "bya BYTEA, bo BOOLEAN, ts TIMESTAMP, tz TIMESTAMPTZ, dt DATE, tm TIME, u UUID, f FLOAT64, iv INTERVAL, e mood, "
+        "w30 DECIMAL(30,4), d9 DECIMAL(9,9))");
     for (int r = 1; r <= 400; r++) {
         if (r == 301) {
             run("CHECKPOINT");
@@ -178,16 +180,19 @@ int main(int argc, char **argv)
         snprintf(x, sizeof x, "'text %d with ''quote'''", r);
         snprintf(ts, sizeof ts, "'%04d-0%d-1%d 12:34:56.%06d'", 1900 + r, r % 9 + 1, r % 10, r * 1009 % 1000000);
         snprintf(q, sizeof q,
-                 "INSERT INTO t (id, sub, n, i, s, b, d, d1, d18, w, w19, x, v, bya, bo, ts, tz, dt, tm, u, f, iv, e%s) "
+                 "INSERT INTO t (id, sub, n, i, s, b, d, d1, d18, w, w19, x, v, bya, bo, ts, tz, dt, tm, u, f, iv, e, w30, d9%s) "
                  "VALUES (%d, %d, %d, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TIMESTAMP %s, TIMESTAMPTZ %s, "
                  "DATE '%04d-12-31', TIME '23:59:%02d.999999', '%08x-1111-4222-8333-444455556666', %s, INTERVAL '%d mons %d "
-                 "days %d microseconds', %s%s%s)",
+                 "days %d microseconds', %s, %s, %s%s%s)",
                  r > 300 ? ", z" : "", r, r % 10, r % 2 ? 2147483647 : -2147483647 - 1, NV(1, r % 2 ? "2147483647" : "-2147483648"),
                  NV(2, r % 2 ? "32767" : "-32768"), NV(3, "9223372036854775807"), NV(4, d), NV(5, r % 2 ? "9" : "-9"),
                  NV(6, "0.999999999999999999"), NV(0, w), NV(1, r % 2 ? "9999999999999999999" : "-9999999999999999999"),
                  NV(2, x), NV(3, "'abcde'"), NV(4, "'\\x00ff10'"), NV(5, r % 2 ? "TRUE" : "FALSE"), ts, ts,
                  1 + r % 9999, r % 60, r * 2654435761u, NV(6, r % 5 ? "-1.25e300" : "0"), r % 1000 - 500, r % 61 - 30,
-                 r * 1000003, NV(0, r % 3 ? "'happy'" : "'sad'"), r > 300 ? ", " : "", r > 300 ? (r % 4 ? "77" : "NULL") : "");
+                 r * 1000003, NV(0, r % 3 ? "'happy'" : "'sad'"),
+                 NV(2, r % 2 ? "99999999999999999999999999.9999" : r % 5 ? "-99999999999999999999999999.9999" : "-0.0001"),
+                 NV(3, r % 2 ? "0.999999999" : r % 5 ? "-0.999999999" : "0.000000001"), r > 300 ? ", " : "",
+                 r > 300 ? (r % 4 ? "77" : "NULL") : "");
         run(q);
     }
     run("ERASE SUBJECT 7");
@@ -232,6 +237,46 @@ int main(int argc, char **argv)
             duckdb_free(nm);
             duckdb_free(ty);
         }
+        duckdb_destroy_result(&dr);
+        /* F5b, as DuckDB's parquet_schema reads the file: imdb$vid and imdb$begin under Iceberg v3's row-lineage field ids,
+         * each DECIMAL in Iceberg's physical type and width (the least bytes with 10^P <= 2^(8b - 1), computed here) */
+        snprintf(sql, sizeof sql, "SELECT name, CAST(field_id AS VARCHAR), type, CAST(type_length AS VARCHAR) FROM parquet_schema('%s')", path);
+        if (duckdb_query(con, sql, &dr) == DuckDBError) {
+            FAIL("%s: %s\n", path, duckdb_result_error(&dr));
+            duckdb_destroy_result(&dr);
+            continue;
+        }
+        unsigned ndec = 0, wdec = 0, nlin = 0;
+        for (uint16_t c = 0; c < sv->ncols; c++) wdec += sv->cols[c].type == IMDB_T_DECIMAL;
+        for (idx_t row = 0; row < duckdb_row_count(&dr); row++) {
+            char *nm = duckdb_value_varchar(&dr, 0, row), *fid = duckdb_value_varchar(&dr, 1, row),
+                 *ty = duckdb_value_varchar(&dr, 2, row), *tl = duckdb_value_varchar(&dr, 3, row);
+            if (!strcmp(nm, "imdb$vid") || !strcmp(nm, "imdb$begin")) {
+                nlin++;
+                if (strcmp(fid, nm[5] == 'v' ? "2147483540" : "2147483539")) FAIL("%s: %s's field id %s\n", path, nm, fid);
+            }
+            for (uint16_t c = 0; c < sv->ncols; c++) {
+                const imdb_column *cc = &sv->cols[c];
+                if (cc->type != IMDB_T_DECIMAL || strcmp(nm, cc->name)) continue;
+                char wl[8] = "NULL";
+                if (cc->precision > 18) {
+                    unsigned __int128 ten = 1;
+                    for (unsigned i = 0; i < cc->precision; i++) ten *= 10u;
+                    unsigned b = 1;
+                    while (ten > (unsigned __int128)1 << (8 * b - 1)) b++;
+                    snprintf(wl, sizeof wl, "%u", b);
+                }
+                const char *wt = cc->precision <= 9 ? "INT32" : cc->precision <= 18 ? "INT64" : "FIXED_LEN_BYTE_ARRAY";
+                if (strcmp(ty, wt) || strcmp(tl ? tl : "NULL", wl))
+                    FAIL("%s: DECIMAL(%u,%u) %s is %s of %s, want %s of %s\n", path, cc->precision, cc->scale, nm, ty, tl ? tl : "NULL", wt, wl);
+                ndec++;
+            }
+            duckdb_free(nm);
+            duckdb_free(fid);
+            duckdb_free(ty);
+            if (tl) duckdb_free(tl);
+        }
+        if (ndec != wdec || nlin != 2) FAIL("%s: %u DECIMAL columns of %u and %u lineage columns seen\n", path, ndec, wdec, nlin);
         duckdb_destroy_result(&dr);
         /* the rows in vid order: the flags, then each column comparable */
         size_t at_sql = (size_t)snprintf(sql, sizeof sql, "SELECT \"imdb$flags\"");

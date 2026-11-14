@@ -18,6 +18,7 @@
 #include "../../src/lake.h"
 #include "../../src/log.h"
 #include "../../src/logdir.h"
+#include "../../src/parquet.h"
 #include "../../src/repl.h"
 #include "../../src/sign.h"
 #include "../../src/writer.h"
@@ -1922,7 +1923,9 @@ static void put_crc_at(uint8_t *b, size_t from, size_t to) /* CRC32C of b[from, 
 /* (e) hostile seeds, each refused into the same empty replica, and each time it is empty again after a reopen (the
  * leftovers removed): a stream cut short, a damaged head, a forged floor header, an object whose bytes are not its
  * name, one the manifest does not name, too few objects; a replica that holds a commit refuses a seed; then the true
- * seed is taken by the replica the refusals left */
+ * seed is taken by the replica the refusals left. F5b: a segment is named by its tail and authenticated from its
+ * temporary file once written, so a byte flipped in one of its chunks, in the zeros before a chunk and in its tail is
+ * each refused by its own rule, and neither the segment nor its temporary file is left in objects/ */
 static void t_retain_seed_refused(void)
 {
     const char *dir = test_tmpdir();
@@ -1962,11 +1965,32 @@ static void t_retain_seed_refused(void)
         at += 41 + (size_t)len;
     }
     CHECK(segat);
+    /* F5b: the segment's own frame, from its bytes in the stream: a chunk's middle, the first zeros before a chunk */
+    size_t segn = (size_t)imdb_get_le64(seed + segat + 33), inchunk = 0, ingap = 0;
+    pq_footer sft;
+    OK(imdb_pq_footer(seed + segat + 41, segn, &sft, E));
+    inchunk = (size_t)(sft.off[0] + sft.size[0] / 2);
+    for (uint32_t c = 0, prev = 4; c < sft.ncols && !ingap; prev = (uint32_t)(sft.off[c] + sft.size[c]), c++)
+        if (sft.off[c] > prev) ingap = prev;
+    CHECK(ingap);
+    char segname[80], segtmp[90], segp[900], tmpp[900];
+    imdb_hex(seed + segat + 1, 32, segname);
+    strcat(segname, ".seg");
+    snprintf(segtmp, sizeof segtmp, "%s.tmp", segname);
+    snprintf(segp, sizeof segp, "%s/objects/%s", r, segname);
+    snprintf(tmpp, sizeof tmpp, "%s/objects/%s", r, segtmp);
     static const struct {
         int what;
-        const char *why;
-    } cases[] = {{0, "truncated"},          {1, "its FLOOR is damaged"},  {2, "not signed by its writer key"},
-                 {3, "not the bytes its name says"}, {4, "does not name"}, {5, "where the manifest names"}};
+        const char *why, *why2;
+    } cases[] = {{0, "truncated", ""},
+                 {1, "its FLOOR is damaged", ""},
+                 {2, "not signed by its writer key", ""},
+                 {3, "not the bytes its name says", ""},
+                 {4, "does not name", ""},
+                 {5, "where the manifest names", ""},
+                 {6, "not the bytes its name says", "a chunk is not the one its footer names"},
+                 {7, "not the bytes its name says", "a byte between the chunks not zero"},
+                 {8, "not the bytes its name says", "does not hash to its name"}};
     for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) {
         memcpy(b, seed, n);
         size_t m = n;
@@ -1979,6 +2003,9 @@ static void t_retain_seed_refused(void)
         case 4: b[segat + 1] ^= 1; break;             /* a segment's name */
         case 5: imdb_le32(b + 20, imdb_get_le32(b + 20) - 1); /* one object fewer */
                 put_crc_at(b, 0, 24); break;
+        case 6: b[segat + 41 + inchunk] ^= 1; break;  /* F5b: inside a chunk, the tail kept */
+        case 7: b[segat + 41 + ingap] ^= 1; break;    /* F5b: in the zeros before a chunk */
+        case 8: b[segat + 41 + segn - 12] ^= 1; break; /* F5b: in its tail (the footer) */
         }
         spit(bad, b, m);
         imdb_db *rdb = ropen(r, false);
@@ -1986,7 +2013,11 @@ static void t_retain_seed_refused(void)
         if (!rdb) return;
         uint64_t applied = 0;
         imdb_err_clear(E);
-        CHECK(apply_file(rdb, bad, &applied, E) != IMDB_OK && strstr(g_e.msg, cases[k].why) && !rdb->seeded);
+        int arc = apply_file(rdb, bad, &applied, E);
+        if (arc == IMDB_OK || !strstr(g_e.msg, cases[k].why) || !strstr(g_e.msg, cases[k].why2) || rdb->seeded)
+            fprintf(stderr, "    case %d: %d %s\n", cases[k].what, arc, g_e.msg);
+        CHECK(arc != IMDB_OK && strstr(g_e.msg, cases[k].why) && strstr(g_e.msg, cases[k].why2) && !rdb->seeded);
+        if (cases[k].what >= 6) CHECK(arc == IMDB_ERR_AUTH && access(segp, F_OK) != 0 && access(tmpp, F_OK) != 0);
         imdb_close(rdb);
         rdb = ropen(r, false); /* the reopen removes what the refused seed left */
         bool fl = true;

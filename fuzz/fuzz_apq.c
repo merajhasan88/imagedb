@@ -1,5 +1,5 @@
 /* F5: the auditor's Parquet reader (tools/audit/apq.c, its own code) against the engine's (src/parquet.c) on the same
- * bytes, with fuzz_parquet's three sets of shapes and its seeds (a byte picking the set, then the file). The engine
+ * bytes, with fuzz_parquet's four sets of shapes and its seeds (a byte picking the set, then the file). The engine
  * accepting (its footer, its read and every chunk's SHA-256) means the auditor accepts; the auditor accepting means the
  * engine does, but for the engine's DOUBLE rule (imagedb's FLOAT64, which the auditor's own value check applies after
  * the read). An allocation refused gives no verdict. A disagreement aborts. */
@@ -9,16 +9,16 @@
 #include "../tools/audit/apq.h"
 #include "fuzz_common.h"
 
-enum { MAXC = 23, NSETS = 3 };
+enum { MAXC = 26, NSETS = 4 };
 
 static void shape23(int c, pq_col *p)
 {
     static const char *const nm[MAXC] = {"imdb$vid", "imdb$begin", "imdb$flags", "imdb$salt", "imdb$commit", "k", "i",
                                          "s", "d", "w", "t", "b", "ts", "tz", "dt", "tm", "u", "by", "f", "iv", "en",
-                                         "rt", "zn"};
+                                         "rt", "zn", "d9", "d19", "d30"};
     memset(p, 0, sizeof *p);
     p->name = nm[c];
-    p->field_id = c < 5 ? 2147483000 + c : c + 1;
+    p->field_id = c == 0 ? 2147483540 : c == 1 ? 2147483539 : c < 5 ? 2147483000 + c : c + 1; /* F5b: the lake's */
     switch (c) {
     case 0: case 1: p->phys = PQ_INT64; break;
     case 2: p->phys = PQ_INT32; break;
@@ -42,13 +42,17 @@ static void shape23(int c, pq_col *p)
     case 20: p->phys = PQ_INT64; p->stats = true; p->optional = true; break;
     case 21: p->phys = PQ_BYTE_ARRAY; p->logical = PQL_STRING; break;
     case 22: p->phys = PQ_INT64; p->logical = PQL_INT; p->int_bits = 64; p->stats = true; p->optional = true; break;
+    /* F5b: a DECIMAL by Iceberg's widths (fuzz_parquet's set 3) */
+    case 23: p->phys = PQ_INT32; p->logical = PQL_DECIMAL; p->scale = 2; p->precision = 9; p->stats = true; p->optional = true; break;
+    case 24: p->phys = PQ_FLBA; p->type_length = 9; p->logical = PQL_DECIMAL; p->precision = 19; break;
+    case 25: p->phys = PQ_FLBA; p->type_length = 13; p->logical = PQL_DECIMAL; p->scale = 4; p->precision = 30; p->optional = true; break;
     }
 }
 
 static uint32_t shapes(int k, pq_col *sh)
 {
-    static const int pick[NSETS][MAXC] = {{0}, {0, 10, 21}, {0, 11, 14, 16}};
-    static const uint32_t nc[NSETS] = {MAXC, 3, 4};
+    static const int pick[NSETS][MAXC] = {{0}, {0, 10, 21}, {0, 11, 14, 16}, {0, 23, 24, 25}};
+    static const uint32_t nc[NSETS] = {23, 3, 4, 4};
     for (uint32_t c = 0; c < nc[k]; c++) shape23(k == 0 ? (int)c : pick[k][c], &sh[c]);
     if (k == 2) sh[2].optional = false; /* a REQUIRED DATE */
     return nc[k];

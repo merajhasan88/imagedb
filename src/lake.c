@@ -68,7 +68,7 @@ static void seg_shapes(const imdb_sver *v, pq_col *sh)
     memset(sh, 0, sizeof *sh * (IMDB_SEG_NSYS + v->s.ncols));
     for (uint32_t k = 0; k < IMDB_SEG_NSYS; k++) {
         sh[k].name = kSysName[k];
-        sh[k].field_id = IMDB_SEG_SYS_FIELD + (int32_t)k;
+        sh[k].field_id = k == 0 ? IMDB_SEG_FIELD_VID : k == 1 ? IMDB_SEG_FIELD_BEGIN : IMDB_SEG_SYS_FIELD + (int32_t)k;
     }
     sh[0].phys = sh[1].phys = PQ_INT64;
     sh[2].phys = PQ_INT32;
@@ -88,15 +88,15 @@ static void seg_shapes(const imdb_sver *v, pq_col *sh)
             p->int_bits = col->precision ? (uint8_t)col->precision : 64;
             p->phys = p->int_bits == 64 ? PQ_INT64 : PQ_INT32;
             break;
-        case IMDB_T_DECIMAL:
+        case IMDB_T_DECIMAL: /* F5b: Iceberg's mapping (the image keeps an 8-byte value or a 16-byte cell either way) */
             p->logical = PQL_DECIMAL;
             p->scale = col->scale;
             p->precision = col->precision;
             if (dec_wide(col)) {
                 p->phys = PQ_FLBA;
-                p->type_length = 16;
+                p->type_length = (int32_t)imdb_pq_dec_bytes(col->precision);
             } else {
-                p->phys = PQ_INT64;
+                p->phys = col->precision <= 9 ? PQ_INT32 : PQ_INT64;
             }
             break;
         case IMDB_T_TEXT:
@@ -146,7 +146,7 @@ static void seg_kv(const imdb_sver *v, seg_kvs *k)
     static const char hx[] = "0123456789abcdef";
     size_t at = 0;
     k->n = 0;
-    k->kv[k->n++] = (pq_kv){"imagedb.format", "1"};
+    k->kv[k->n++] = (pq_kv){"imagedb.format", "2"}; /* F5b: 1 F5a's (seg_old_format refuses it by name) */
     for (uint16_t c = 0; c < v->s.ncols; c++)
         if (v->s.cols[c].type == IMDB_T_INTERVAL)
             at += (size_t)snprintf(k->interval + at, sizeof k->interval - at, "%s%u", at ? "," : "", (unsigned)v->pos[c] + 1u);
@@ -417,11 +417,22 @@ static void seg_drop_bytes(imdb_segment *g, imdb_segimg *gi)
     gi->len = 0;
 }
 
-/* the format before F5's (a header "IMDBSEG1" and sections): refused by name, as every format before the freeze */
+/* the formats before (a header "IMDBSEG1" and sections, before F5; F5a's Parquet, imagedb.format "1", before F5b's name,
+ * field ids and DECIMAL widths): refused by name, as every format before the freeze */
 static int seg_old_format(const uint8_t *b, size_t len, imdb_err *e)
 {
     if (len >= 8 && memcmp(b, kSegMagic, 8) == 0)
         return imdb_fail(e, IMDB_ERR_CORRUPT, "segment: the format before Parquet (IMDBSEG1, before F5) is not read");
+    return IMDB_OK;
+}
+
+static int seg_old_pq(const pq_footer *ft, imdb_err *e)
+{
+    uint32_t n;
+    const uint8_t *f = imdb_pq_kv(ft, "imagedb.format", &n);
+    if (f && n == 1 && f[0] == '1')
+        return imdb_fail(e, IMDB_ERR_CORRUPT, "segment: format 1 (F5a's, before F5b's names, field ids and DECIMAL widths) is "
+                         "not read");
     return IMDB_OK;
 }
 
@@ -492,25 +503,28 @@ static int seg_take(imdb_segimg *gi, const imdb_schema *s, uint32_t c, pq_rcol *
         return IMDB_OK;
     }
     /* a 16-byte cell (UUID, INTERVAL, a wide DECIMAL): the image keeps a kept row's cell and none for the rest, whose
-     * placeholder is sixteen zeros (an OPTIONAL column's NULL slots are zero by the read) */
+     * placeholder is zeros, its width's (an OPTIONAL column's NULL slots are zero by the read) */
     uint32_t kept = 0;
     for (uint32_t i = 0; i < n; i++) kept += seg_keeps(gi->flags[i], s, c) && !(sc->valid && !valid_bit(sc->valid, i));
     uint32_t *o = seg_own(gi, (size_t)n + 1, sizeof *o, e);
     uint8_t *d = o ? seg_own(gi, (size_t)kept * 16, 1, e) : NULL;
     if (!d) return e->code;
     uint32_t at = 0;
+    unsigned tl = (unsigned)rr->c.type_length; /* 16, or a wide DECIMAL's imdb_pq_dec_bytes (F5b) */
     for (uint32_t i = 0; i < n; i++) {
         o[i] = at;
-        const uint8_t *x = rr->c.fixed + 16u * i;
+        const uint8_t *x = rr->c.fixed + (size_t)tl * i;
         if (!seg_keeps(gi->flags[i], s, c) || (sc->valid && !valid_bit(sc->valid, i))) {
-            if (!all_zero(x, 16))
+            if (!all_zero(x, tl))
                 return imdb_fail(e, IMDB_ERR_CORRUPT, "segment: a row without a value in column %s keeps data", col->name);
             continue;
         }
-        if (dec_wide(col))
-            for (int k = 0; k < 16; k++) d[at + k] = x[15 - k];
-        else
+        if (dec_wide(col)) { /* big-endian, tl bytes, sign-extended to the image's little-endian cell */
+            uint8_t sign = x[0] & 0x80 ? 0xff : 0;
+            for (unsigned k = 0; k < 16; k++) d[at + k] = k < tl ? x[tl - 1 - k] : sign;
+        } else {
             memcpy(d + at, x, 16);
+        }
         at += 16;
     }
     o[n] = at;
@@ -665,7 +679,7 @@ static int seg_parse(const imdb_sver *v, uint8_t *b, size_t len, const pq_footer
     g->vid_last = gi->vid[n - 1];
     memcpy(gi->ocol, gi->col, sizeof gi->col); /* F1: the file's own layout, under the version that built it */
     if (known) memcpy(g->hash, known, 32); /* checked by the caller against its name */
-    else imdb_sha256(b, len, g->hash);
+    else (void)imdb_pq_name(b, len, g->hash, e); /* F5b: named by its tail (bounded by the footer read: cannot fail) */
     *out = g;
     return IMDB_OK;
 }
@@ -676,7 +690,7 @@ int imdb_segment_parse(const imdb_sver *v, uint8_t *b, size_t len, const uint8_t
     *out = NULL;
     pq_footer ft;
     int rc = seg_old_format(b, len, e);
-    if (rc || (rc = imdb_pq_footer(b, len, &ft, e))) return rc;
+    if (rc || (rc = imdb_pq_footer(b, len, &ft, e)) || (rc = seg_old_pq(&ft, e))) return rc;
     return seg_parse(v, b, len, &ft, known, out, e);
 }
 
@@ -686,7 +700,7 @@ int imdb_segment_parse_h(const imdb_schema_hist *h, uint8_t *b, size_t len, cons
     *out = NULL;
     pq_footer ft;
     int rc = seg_old_format(b, len, e);
-    if (rc || (rc = imdb_pq_footer(b, len, &ft, e))) return rc;
+    if (rc || (rc = imdb_pq_footer(b, len, &ft, e)) || (rc = seg_old_pq(&ft, e))) return rc;
     uint32_t sl;
     const uint8_t *sx = imdb_pq_kv(&ft, "imagedb.schema", &sl);
     uint8_t want[32];
@@ -1138,7 +1152,8 @@ static int seg_build(const imdb_table *t, uint32_t gver, const seg_src *src, uin
         uint8_t *pres = pc.optional ? tmp_alloc(&tm, (size_t)n / 8 + 1, 1, e) : NULL;
         uint64_t *off = NULL;
         uint8_t *data = NULL, *fx = NULL;
-        unsigned w = pc.phys == PQ_BOOLEAN ? 1 : pc.phys == PQ_INT32 ? 4 : pc.phys == PQ_FLBA ? 16 : 8;
+        unsigned w = pc.phys == PQ_BOOLEAN ? 1 : pc.phys == PQ_INT32 ? 4 : pc.phys == PQ_FLBA ? (unsigned)pc.type_length : 8;
+        bool wide_lost = false; /* a value past its file width: every write's range check rules it out */
         if (pc.phys == PQ_BYTE_ARRAY) {
             off = tmp_alloc(&tm, (size_t)n + 1, sizeof *off, e);
             data = off ? tmp_alloc(&tm, text_len[c], 1, e) : NULL;
@@ -1167,7 +1182,10 @@ static int seg_build(const imdb_table *t, uint32_t gver, const seg_src *src, uin
                 at += v.len;
                 break;
             case PQ_BOOLEAN: x[0] = (uint8_t)v.i; break;
-            case PQ_INT32: imdb_le32(x, (uint32_t)v.i); break; /* INTEGER, SMALLINT and DATE: their range checked at the write */
+            case PQ_INT32: /* INTEGER, SMALLINT, DATE and a DECIMAL to 9 digits (F5b): their range checked at the write */
+                wide_lost |= v.i < INT32_MIN || v.i > INT32_MAX;
+                imdb_le32(x, (uint32_t)v.i);
+                break;
             case PQ_DOUBLE: { /* FLOAT64: the key back to its IEEE double */
                 double d = imdb_f64_value(v.i);
                 uint64_t u;
@@ -1183,9 +1201,14 @@ static int seg_build(const imdb_table *t, uint32_t gver, const seg_src *src, uin
                     imdb_le32(x, (uint32_t)v.iv.mon);
                     imdb_le32(x + 4, (uint32_t)v.iv.day);
                     imdb_le64(x + 8, (uint64_t)v.i);
-                } else { /* F3e: a wide DECIMAL, its 128 bits big-endian (Parquet's DECIMAL) */
-                    unsigned __int128 d = (unsigned __int128)imdb_dec_value(&v);
-                    for (int k = 0; k < 16; k++) x[k] = (uint8_t)(d >> (8 * (15 - k)));
+                } else { /* F3e: a wide DECIMAL big-endian (Parquet's DECIMAL); F5b: its low w bytes, the rest its sign */
+                    __int128 sd = imdb_dec_value(&v);
+                    unsigned __int128 d = (unsigned __int128)sd;
+                    if (w < 16) {
+                        __int128 lim = (__int128)1 << (8 * w - 1);
+                        wide_lost |= sd < -lim || sd >= lim;
+                    }
+                    for (unsigned k = 0; k < w; k++) x[k] = (uint8_t)(d >> (8 * (w - 1 - k)));
                 }
                 break;
             }
@@ -1193,6 +1216,10 @@ static int seg_build(const imdb_table *t, uint32_t gver, const seg_src *src, uin
         if (off) off[n] = at;
         if (lost) {
             rc = imdb_fail(e, IMDB_ERR_STATE, "segment build: a NULL in a column without NULLs");
+            break;
+        }
+        if (wide_lost) {
+            rc = imdb_fail(e, IMDB_ERR_STATE, "segment build: a value past its column's width");
             break;
         }
         pc.present = pres;
@@ -1204,7 +1231,7 @@ static int seg_build(const imdb_table *t, uint32_t gver, const seg_src *src, uin
     }
     tmp_free(&tm); /* a refusal's column */
     imdb_free(fl);
-    uint8_t fh[32]; /* the file's hash, the writer's (made beside its chunks' hashes) */
+    uint8_t fh[32]; /* the file's name, the writer's: its tail's hash (F5b) */
     if (!rc) rc = imdb_pq_writer_end(pw, kv.kv, kv.n, e);
     if (!rc) memcpy(fh, pw->hash, 32);
     if (pw) imdb_wipe(pw, sizeof *pw); /* its statistics: row values */
@@ -1446,6 +1473,9 @@ static int old_manifest(uint32_t ver, imdb_err *e)
     if (ver == 5)
         return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 5: this lake was written by an imagedb before views' "
                          "format (manifest 6, P2 S7), which this version does not read");
+    if (ver == 19) /* F5b: its segments named by their whole file, two field ids and DECIMAL widths before Iceberg's */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 19: this lake was written by an imagedb before segments "
+                         "named by their tail (manifest 20, F5b, 2026-11-14), which this version does not read");
     if (ver == 18) /* F5: its segments in the format before Parquet */
         return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 18: this lake was written by an imagedb before Parquet "
                          "segments (manifest 19, 2026-11-13), which this version does not read");
@@ -3390,6 +3420,16 @@ static int read_obj(int ofd, const uint8_t h[32], const char *ext, uint8_t **out
     int rc = !strcmp(ext, ".seg") ? imdb_read_file_aligned_at(ofd, name, out, len, IMDB_MAX_OBJECT, e)
                                  : imdb_read_file_at(ofd, name, out, len, IMDB_MAX_OBJECT, e);
     if (rc) return rc;
+    if (!strcmp(ext, ".seg")) { /* F5b: its tail hashed before its footer is parsed, its frame, each chunk on the pool */
+        pq_footer ft;
+        imdb_err ea = {0};
+        if ((rc = imdb_pq_authenticate(*out, *len, h, &ft, &ea))) {
+            imdb_free(*out);
+            *out = NULL;
+            return imdb_fail(e, rc, "lake: segment %s: %s", name, ea.msg);
+        }
+        return IMDB_OK;
+    }
     uint8_t got[32];
     imdb_sha256(*out, *len, got);
     if (memcmp(got, h, 32) != 0) {

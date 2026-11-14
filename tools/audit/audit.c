@@ -5017,15 +5017,28 @@ static int cmp_ukey(const void *a, const void *b)
     return x->n ? memcmp(x->b, y->b, x->n) : 0;
 }
 
+/* F5b: a wide DECIMAL's FIXED width by Iceberg's rule, "the minimum number of bytes that can store P": the least b with
+ * 10^P <= 2^(8b - 1), by its own arithmetic (no table copied from src/) */
+static int32_t dec_bytes_a(int prec)
+{
+    unsigned __int128 p10 = 1;
+    for (int i = 0; i < prec; i++) p10 *= 10u; /* 10^38 < 2^127 */
+    for (int32_t b = 1; b <= 16; b++)
+        if (p10 <= (unsigned __int128)1 << (8 * b - 1)) return b;
+    return 0;
+}
+
 /* F5: a segment is imagedb's Parquet subset (src/lake.h): the system columns, then its schema version's columns by
- * position, each a type's shape (the auditor's own mapping, from the format, not src/'s) */
+ * position, each a type's shape (the auditor's own mapping, from the format, not src/'s). F5b: imdb$vid and imdb$begin
+ * under Iceberg v3's row-lineage field ids (_row_id, _last_updated_sequence_number); a DECIMAL by Iceberg's mapping */
 static void seg_shapes_a(const struct aver *v, apq_shape *sh)
 {
     static const char *const sys[5] = {"imdb$vid", "imdb$begin", "imdb$flags", "imdb$salt", "imdb$commit"};
+    static const int32_t sid[5] = {2147483540, 2147483539, 2147483002, 2147483003, 2147483004};
     memset(sh, 0, sizeof *sh * (5u + (unsigned)v->s.ncols));
     for (int k = 0; k < 5; k++) {
         sh[k].name = sys[k];
-        sh[k].id = 2147483000 + k;
+        sh[k].id = sid[k];
         sh[k].phys = k < 2 ? APQ_INT64 : k == 2 ? APQ_INT32 : APQ_FIXED;
         sh[k].tlen = k == 3 ? 16 : k == 4 ? 32 : 0;
     }
@@ -5046,8 +5059,8 @@ static void seg_shapes_a(const struct aver *v, apq_shape *sh)
             p->logical = APQ_L_DECIMAL;
             p->scale = cc->scale;
             p->prec = cc->prec;
-            p->phys = dwide(cc) ? APQ_FIXED : APQ_INT64;
-            p->tlen = dwide(cc) ? 16 : 0;
+            p->phys = dwide(cc) ? APQ_FIXED : cc->prec <= 9 ? APQ_INT32 : APQ_INT64; /* F5b: Iceberg's int32 to 9 digits */
+            p->tlen = dwide(cc) ? dec_bytes_a(cc->prec) : 0;
             break;
         case T_TEXT: p->phys = APQ_BYTES, p->logical = APQ_L_STRING; break;
         case T_BYTEA: p->phys = APQ_BYTES; break;
@@ -5115,9 +5128,16 @@ static int parse_segment(const struct aver *vers, uint32_t nvers, const val *mis
             at += (size_t)snprintf(ivl + at, sizeof ivl - at, "%s%u", at ? "," : "", (unsigned)vers[gk].pos[c] + 1u);
     hex(vers[gk].hash, 32, hx);
     snprintf(tid, sizeof tid, "%u", (unsigned)s->id);
-    const char *wk[4] = {"imagedb.format", "imagedb.interval", "imagedb.schema", "imagedb.table"}, *wv[4] = {"1", ivl, hx, tid};
+    const char *wk[4] = {"imagedb.format", "imagedb.interval", "imagedb.schema", "imagedb.table"}, *wv[4] = {"2", ivl, hx, tid};
     uint32_t want = 0;
     bool same = true;
+    if (g->pq->nkv > 1 && g->pq->klen[1] == 14 && !memcmp(g->pq->key[1], "imagedb.format", 14) && g->pq->vlen[1] == 1 &&
+        g->pq->val[1][0] == '1') { /* F5b: F5a's format, refused by name */
+        apq_free(g->pq);
+        free(g->pq);
+        g->pq = NULL;
+        return fail("segment: format 1 (F5a's, before F5b's names, field ids and DECIMAL widths), which this auditor does not read");
+    }
     for (int k = 0; k < 4; k++) {
         if (k == 1 && !at) continue;
         want++;
@@ -5196,22 +5216,25 @@ static int parse_segment(const struct aver *vers, uint32_t nvers, const val *mis
                 for (int k = 0; k < 4; k++) o[4u * i + (unsigned)k] = (uint8_t)(q->off[i] >> (8 * k));
             g->colp[c] = o;
             g->tdata[c] = q->data;
-        } else { /* a 16-byte cell: a kept value's, none for a row that keeps none (whose placeholder is zeros) */
+        } else { /* a 16-byte cell: a kept value's, none for a row that keeps none (whose placeholder is zeros); F5b: a
+                  * wide DECIMAL's file value its tlen bytes, sign-extended to the cell */
             uint8_t *o = seg_own(g, 4u * ((size_t)n + 1)), *d = seg_own(g, 16u * (size_t)n);
-            uint32_t z = 0;
+            uint32_t z = 0, tl = (uint32_t)p->tlen;
             for (uint32_t i = 0; i < n && !rc; i++) {
                 for (int k = 0; k < 4; k++) o[4u * i + (unsigned)k] = (uint8_t)(z >> (8 * k));
                 uint8_t fl = g->row[i].flags;
                 bool here = !(cc->flags & F_NULLABLE) || (q->pres[i / 8] >> (i % 8) & 1);
-                const uint8_t *x = q->fixed + 16u * i;
+                const uint8_t *x = q->fixed + (size_t)tl * i;
                 if (!here || (fl && !(fl == 2 && c == s->subject))) {
-                    if (!all_zero(x, 16)) rc = fail("segment: erased or purged row keeps data");
+                    if (!all_zero(x, tl)) rc = fail("segment: erased or purged row keeps data");
                     continue;
                 }
-                if (dwide(cc))
-                    for (int k = 0; k < 16; k++) d[z + (unsigned)k] = x[15 - k];
-                else
+                if (dwide(cc)) {
+                    uint8_t sgn = (x[0] & 0x80) ? 0xff : 0;
+                    for (uint32_t k = 0; k < 16; k++) d[z + k] = k < tl ? x[tl - 1 - k] : sgn;
+                } else {
                     memcpy(d + z, x, 16);
+                }
                 z += 16;
             }
             for (int k = 0; k < 4; k++) o[4u * n + (unsigned)k] = (uint8_t)(z >> (8 * k));
@@ -5419,7 +5442,20 @@ static int obj_read(int ofd, const uint8_t h[32], const char *ext, uint8_t **out
     }
     if (read_file(ofd, name, out, len, MAX_OBJECT)) return -1;
     uint8_t got[32];
-    a_sha256(*out, *len, got);
+    if (!strcmp(ext, ".seg")) {
+        /* F5b: a segment is named by its tail, the footer, its length and PAR1 (the footer's length bounded first, 1
+         * MiB at most); apq_read then writes the whole file again from what it decodes, so every other byte, each
+         * chunk's SHA-256 in imagedb.chunks among them, is the writer's */
+        uint32_t ml = *len >= 12 ? le32(*out + *len - 8) : 0;
+        if (*len < 12 || memcmp(*out + *len - 4, "PAR1", 4) || ml > *len - 12 || ml > (1u << 20)) {
+            free(*out);
+            *out = NULL;
+            return fail("segment %s: no tail of the subset's frame", name);
+        }
+        a_sha256(*out + *len - 8 - ml, (size_t)ml + 8, got);
+    } else {
+        a_sha256(*out, *len, got);
+    }
     if (memcmp(got, h, 32) != 0) {
         free(*out);
         *out = NULL;
@@ -5601,9 +5637,10 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
     rd r = {b, len, 0, false};
     const uint8_t *mg = rd_bytes(&r, 8);
     uint32_t mver = mg && memcmp(mg, "IMDBMAN1", 8) == 0 ? rd_u32(&r) : 0;
+    if (mver == 19) return fail("manifest version 19: written before segments named by their tail (manifest 20, F5b), which this auditor does not read");
     if (mver == 18) return fail("manifest version 18: written before Parquet segments (manifest 19, F5), which this auditor does not read");
     if (mver == 17) return fail("manifest version 17: written before roles (manifest 18), which this auditor does not read");
-    if (mver != 19) return fail("manifest: bad header (version 19 only: Parquet segments, F5)");
+    if (mver != 20) return fail("manifest: bad header (version 20 only: segments named by their tail, F5b)");
     uint32_t nsec = rd_u32(&r); /* every section, in order: 1 tables, 2 views, 3 sequences (F2a-2), 4 ENUM types (F3g), 5 roles
                                  * and 6 grants (L), 7-11 reserved and empty */
     const uint8_t *id = rd_bytes(&r, 16);

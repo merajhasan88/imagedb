@@ -1006,8 +1006,8 @@ static void t_pq_writer_stream(void)
 }
 
 /* the writer's hashes past PQ_PAR_HASH (1 MiB) run on the pool (parquet.c hash_run): the name it hands its caller is
- * the file's SHA-256, its chunk list every chunk's, and imdb_pq_chunks_verify (the pool's too) refuses a byte flipped
- * in each chunk; under IMDB_THREADS=1 the same items run inline */
+ * its tail's SHA-256 (F5b), its chunk list every chunk's, and imdb_pq_chunks_verify and imdb_pq_authenticate (the
+ * pool's too) refuse a byte flipped in each chunk; under IMDB_THREADS=1 the same items run inline */
 static void t_pq_writer_large(void)
 {
     tset s;
@@ -1025,18 +1025,21 @@ static void t_pq_writer_large(void)
     OK(imdb_pq_writer_end(w, tkv, 2, E));
     CHECK(b.len > (1u << 20)); /* the pool's branch */
     uint8_t h[32];
-    imdb_sha256(b.p, b.len, h);
+    OK(imdb_pq_name(b.p, b.len, h, E)); /* F5b: the name is the tail's hash */
     CHECK(!memcmp(h, w->hash, 32));
     pq_footer ft;
     OK(imdb_pq_footer(b.p, b.len, &ft, E));
     OK(imdb_pq_chunks_verify(b.p, &ft, E));
+    OK(imdb_pq_authenticate(b.p, b.len, w->hash, &ft, E));
     uint32_t flipped = 0;
     for (uint32_t c = 0; c < ft.ncols; c++) {
         if (!ft.size[c]) continue;
         size_t at = ft.off[c] + ft.size[c] / 2;
         b.p[at] ^= 1;
-        imdb_err e2 = {0};
+        imdb_err e2 = {0}, e3 = {0};
+        pq_footer af;
         CHECK(imdb_pq_chunks_verify(b.p, &ft, &e2) == IMDB_ERR_CORRUPT);
+        CHECK(imdb_pq_authenticate(b.p, b.len, w->hash, &af, &e3) == IMDB_ERR_VERIFY);
         b.p[at] ^= 1;
         flipped++;
     }
@@ -1120,6 +1123,225 @@ static void t_pq_value_at_bound(void)
     free(txt);
 }
 
+/* ---- F5b: DECIMAL widths, a file's name and its authentication ---- */
+
+/* the width table against Iceberg's rule computed here in 128 bits (the least b with 10^P <= 2^(8b - 1)) and against
+ * Iceberg's TypeUtil numbers; each precision's one form (an INT32 to 9 digits, an INT64 to 18, past them a FIXED of
+ * that width), every other physical type or width refused (the subset's one rule: the writer's, so the reader's) */
+static void t_pq_dec_widths(void)
+{
+    for (int32_t p = -1; p <= 40; p++) {
+        unsigned want = 0;
+        if (p >= 19 && p <= 38) {
+            unsigned __int128 ten = 1;
+            for (int32_t i = 0; i < p; i++) ten *= 10u;
+            for (unsigned b = 1; b <= 16 && !want; b++)
+                if (ten <= (unsigned __int128)1 << (8 * b - 1)) want = b;
+        }
+        CHECK(imdb_pq_dec_bytes(p) == want);
+    }
+    static const int32_t edge[][2] = {{19, 9},  {21, 9},  {22, 10}, {23, 10}, {24, 11}, {26, 11}, {27, 12}, {28, 12},
+                                      {29, 13}, {31, 13}, {32, 14}, {33, 14}, {34, 15}, {35, 15}, {36, 16}, {38, 16}};
+    for (size_t k = 0; k < sizeof edge / sizeof edge[0]; k++) CHECK(imdb_pq_dec_bytes(edge[k][0]) == (unsigned)edge[k][1]);
+    enum { N = 3 };
+    int64_t v[N] = {1, 2, 3};
+    uint8_t z[N * 17];
+    memset(z, 0, sizeof z);
+    for (int32_t p = 1; p <= 38; p++)
+        for (int form = 0; form < 11; form++) { /* INT32, INT64, a FIXED of 8 to 16 bytes */
+            pq_col c[2] = {{.name = "v", .field_id = 1, .phys = PQ_INT64, .fixed = (const uint8_t *)v},
+                           {.name = "d", .field_id = 2, .logical = PQL_DECIMAL, .precision = p, .scale = p / 2, .fixed = z}};
+            if (form == 0) c[1].phys = PQ_INT32;
+            else if (form == 1) c[1].phys = PQ_INT64;
+            else c[1].phys = PQ_FLBA, c[1].type_length = 8 + (form - 2);
+            c[1].stats = c[1].phys != PQ_FLBA;
+            bool one = form == 0   ? p <= 9
+                       : form == 1 ? p >= 10 && p <= 18
+                                   : p >= 19 && c[1].type_length == (int32_t)imdb_pq_dec_bytes(p);
+            int rc = write_rc(c, 2, N);
+            if ((rc == 0) != one) fprintf(stderr, "    DECIMAL(%d) form %d: %d\n", (int)p, form, rc);
+            CHECK((rc == 0) == one);
+        }
+    /* a FIXED of 9 to 15 bytes is a DECIMAL's alone */
+    pq_col c[2] = {{.name = "v", .field_id = 1, .phys = PQ_INT64, .fixed = (const uint8_t *)v},
+                   {.name = "f", .field_id = 2, .phys = PQ_FLBA, .type_length = 13, .fixed = z}};
+    CHECK(write_rc(c, 2, N) == IMDB_ERR_STATE);
+}
+
+/* a memory file read in pieces for imdb_pq_authenticate_stream; a read covering fail_at fails (0: none) */
+typedef struct {
+    const uint8_t *p;
+    uint64_t len, fail_at;
+    unsigned reads;
+} mrd;
+
+static int mrd_read(void *ctx, uint64_t off, uint8_t *buf, size_t n, imdb_err *e)
+{
+    mrd *m = ctx;
+    m->reads++;
+    if (off > m->len || n > m->len - off) return imdb_fail(e, IMDB_ERR_IO, "test: a read past the end");
+    if (m->fail_at && off <= m->fail_at && m->fail_at - off < n) return imdb_fail(e, IMDB_ERR_IO, "test: a failed read");
+    memcpy(buf, m->p + off, n);
+    return IMDB_OK;
+}
+
+/* both checks' verdict on f against name: its code and message (msg, 160 bytes), or 1 when the two differ */
+static int auth_both(const uint8_t *f, size_t len, const uint8_t name[32], uint8_t *buf, char *msg)
+{
+    pq_footer ft;
+    imdb_err a = {0}, b = {0};
+    int ra = imdb_pq_authenticate(f, len, name, &ft, &a);
+    mrd m = {f, len, 0, 0};
+    int rb = imdb_pq_authenticate_stream(mrd_read, &m, len, name, buf, 4096, &b);
+    if (ra != rb || strcmp(a.msg, b.msg)) {
+        fprintf(stderr, "    in memory %d (%s), streamed %d (%s)\n", ra, a.msg, rb, b.msg);
+        return 1;
+    }
+    snprintf(msg, 160, "%s", a.msg);
+    return ra;
+}
+
+/* F5b: a file's name is its tail's SHA-256 (the footer, its length, PAR1), not its whole file's; it authenticates in
+ * memory and streamed in pieces alike; every byte flipped is refused by both with one verdict and by its own rule (the
+ * tail by the name, before any footer parse: never a parse error; a chunk by its hash; the opening magic and the zeros
+ * between chunks by the frame), every truncation by both; a footer's length past PQ_MAX_FOOTER refused from the last
+ * eight bytes alone; a failed read anywhere is the reader's error */
+static void t_pq_authenticate(void)
+{
+    tset s;
+    tset_make(&s, 90, 31, false);
+    imdb_buf b;
+    imdb_buf_init(&b);
+    OK(imdb_pq_write(s.col, TNC, s.n, tkv, 2, &b, E));
+    uint8_t name[32], whole[32];
+    uint32_t ml = imdb_get_le32(b.p + b.len - 8);
+    imdb_sha256(b.p + b.len - 8 - ml, (size_t)ml + 8, name); /* the tail's hash, by hand */
+    uint8_t got[32];
+    OK(imdb_pq_name(b.p, b.len, got, E));
+    CHECK(!memcmp(got, name, 32));
+    imdb_sha256(b.p, b.len, whole);
+    CHECK(memcmp(whole, name, 32) != 0);
+    uint8_t *buf = malloc(4096);
+    char msg[160];
+    CHECK(b.len > 3 * 4096); /* read in pieces */
+    CHECK(auth_both(b.p, b.len, name, buf, msg) == 0);
+    CHECK(auth_both(b.p, b.len, whole, buf, msg) == IMDB_ERR_VERIFY && strstr(msg, "does not hash to its name"));
+    pq_footer ft;
+    OK(imdb_pq_footer(b.p, b.len, &ft, E));
+    unsigned by[3] = {0, 0, 0};
+    for (size_t at = 0; at < b.len; at++) {
+        b.p[at] ^= 0x10;
+        int rc = auth_both(b.p, b.len, name, buf, msg);
+        b.p[at] ^= 0x10;
+        bool tail = at >= ft.meta_at, chunk = false;
+        for (uint32_t c = 0; c < ft.ncols; c++) chunk |= at >= ft.off[c] && at < ft.off[c] + ft.size[c];
+        int want = tail || chunk ? IMDB_ERR_VERIFY : IMDB_ERR_CORRUPT;
+        const char *why = tail    ? "does not hash to its name"
+                          : chunk ? "a chunk is not the one its footer names"
+                          : at < 4 ? "not a Parquet file"
+                                   : "a byte between the chunks not zero";
+        /* the footer's length and the closing magic place the tail: a flip there may leave no tail of the frame */
+        if (at >= b.len - 8 && rc == IMDB_ERR_CORRUPT && (strstr(msg, "out of bounds") || strstr(msg, "not a Parquet file")))
+            want = rc, why = msg;
+        if (rc != want || !strstr(msg, why)) {
+            fprintf(stderr, "    a byte flipped at %zu of %zu: %d (%s)\n", at, b.len, rc, msg);
+            CHECK(0);
+            break;
+        }
+        by[tail ? 0 : chunk ? 1 : 2]++;
+    }
+    CHECK(by[0] && by[1] && by[2] > 4); /* the gaps too */
+    for (size_t cut = 0; cut < b.len; cut++) {
+        int rc = auth_both(b.p, cut, name, buf, msg);
+        if (rc == 0 || rc == 1) {
+            fprintf(stderr, "    cut at %zu: %d\n", cut, rc);
+            CHECK(0);
+            break;
+        }
+    }
+    /* zeros inserted before the tail keep the tail and so the name: the frame's last rule (the last chunk ends at the
+     * footer) refuses them, so no two files authenticate under one name */
+    for (size_t extra = 1; extra <= 64; extra *= 4) {
+        size_t tl = (size_t)ml + 8, gl = b.len + extra;
+        uint8_t *g = malloc(gl);
+        memcpy(g, b.p, b.len - tl);
+        memset(g + b.len - tl, 0, extra);
+        memcpy(g + b.len - tl + extra, b.p + b.len - tl, tl);
+        CHECK(auth_both(g, gl, name, buf, msg) == IMDB_ERR_CORRUPT && strstr(msg, "bytes between the chunks and the footer"));
+        free(g);
+    }
+    /* the order rule: chunk 1's range from chunk 0's start through its own end (an overlap that leaves no byte outside a
+     * hash or a zero gap), its hash made for that range and the footer written for it, the file named by its own tail:
+     * only the order refuses it */
+    {
+        pq_col sh2[TNC], cols[TNC];
+        pq_rcol rr[TNC];
+        pq_footer f2;
+        tshapes_of(&s, sh2);
+        OK(imdb_pq_footer(b.p, b.len, &f2, E));
+        OK(imdb_pq_read(b.p, b.len, &f2, sh2, TNC, rr, E));
+        for (int c = 0; c < TNC; c++) cols[c] = rr[c].c;
+        uint64_t off[PQ_MAX_COLUMNS], size[PQ_MAX_COLUMNS];
+        memcpy(off, f2.off, sizeof off);
+        memcpy(size, f2.size, sizeof size);
+        size[1] = off[1] + size[1] - off[0];
+        off[1] = off[0];
+        char list[PQ_MAX_COLUMNS * 112];
+        size_t at = 0;
+        for (int c = 0; c < TNC; c++) {
+            uint8_t hh[32];
+            char hx[65];
+            imdb_sha256(b.p + off[c], size[c], hh);
+            imdb_hex(hh, 32, hx);
+            at += (size_t)snprintf(list + at, sizeof list - at, "%llu,%llu,%s;", (unsigned long long)off[c],
+                                   (unsigned long long)size[c], hx);
+        }
+        const uint8_t *val[PQ_MAX_KV + 1];
+        uint32_t vlen[PQ_MAX_KV + 1];
+        memcpy(val, f2.val, sizeof val);
+        memcpy(vlen, f2.vlen, sizeof vlen);
+        val[0] = (const uint8_t *)list;
+        vlen[0] = (uint32_t)at;
+        imdb_buf g;
+        imdb_buf_init(&g);
+        imdb_buf_put(&g, b.p, f2.meta_at);
+        size_t meta = g.len;
+        imdb_pq_footer_encode(&g, cols, TNC, s.n, off, size, f2.key, f2.klen, val, vlen, f2.nkv);
+        imdb_buf_put_u32(&g, (uint32_t)(g.len - meta));
+        imdb_buf_put(&g, "PAR1", 4);
+        uint8_t gname[32];
+        OK(imdb_buf_check(&g, E));
+        OK(imdb_pq_name(g.p, g.len, gname, E));
+        CHECK(auth_both(g.p, g.len, gname, buf, msg) == IMDB_ERR_CORRUPT && strstr(msg, "a chunk out of place"));
+        imdb_pq_free_read(rr, TNC);
+        imdb_buf_free(&g);
+    }
+    /* the tail's bound, from the last eight bytes alone */
+    size_t bl = PQ_MAX_FOOTER + 64;
+    uint8_t *big = calloc(bl, 1);
+    memcpy(big, "PAR1", 4);
+    imdb_le32(big + bl - 8, PQ_MAX_FOOTER + 1);
+    memcpy(big + bl - 4, "PAR1", 4);
+    pq_footer bf;
+    imdb_err e2 = {0}, e3 = {0};
+    CHECK(imdb_pq_authenticate(big, bl, name, &bf, &e2) == IMDB_ERR_CORRUPT && strstr(e2.msg, "out of bounds"));
+    mrd m = {big, bl, 0, 0};
+    CHECK(imdb_pq_authenticate_stream(mrd_read, &m, bl, name, buf, 4096, &e3) == IMDB_ERR_CORRUPT && m.reads == 1);
+    free(big);
+    /* a failed read: the reader's error, wherever it falls (every byte is read: the tail, the magic, gaps, chunks) */
+    for (uint64_t fa = 1; fa < b.len; fa += 1 + b.len / 13) {
+        mrd mf = {b.p, b.len, fa, 0};
+        imdb_err e4 = {0};
+        CHECK(imdb_pq_authenticate_stream(mrd_read, &mf, b.len, name, buf, 4096, &e4) == IMDB_ERR_IO && strstr(e4.msg, "a failed read"));
+    }
+    imdb_err e5 = {0};
+    mrd m2 = {b.p, b.len, 0, 0};
+    CHECK(imdb_pq_authenticate_stream(mrd_read, &m2, b.len, name, buf, 4095, &e5) == IMDB_ERR_INVALID);
+    free(buf);
+    imdb_buf_free(&b);
+    tset_free(&s);
+}
+
 const test_case pq_tests[] = {
     {"pq_levels_exhaustive", t_pq_levels_exhaustive},
     {"pq_levels_refused", t_pq_levels_refused},
@@ -1134,5 +1356,7 @@ const test_case pq_tests[] = {
     {"pq_read_crafted", t_pq_read_crafted},
     {"pq_read_past_end", t_pq_read_past_end},
     {"pq_value_at_bound", t_pq_value_at_bound},
+    {"pq_dec_widths", t_pq_dec_widths},
+    {"pq_authenticate", t_pq_authenticate},
 };
 const size_t pq_ntests = sizeof pq_tests / sizeof *pq_tests;
