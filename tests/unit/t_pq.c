@@ -1047,6 +1047,79 @@ static void t_pq_writer_large(void)
     tset_free(&s);
 }
 
+/* imdb_pq_value_at's bound: a file whose last chunk (an INT64) claims bytes past the file's end in its footer's size
+ * and imagedb.chunks (each number within the footer's bound, so imdb_pq_footer takes it): value_at refuses a row there,
+ * even row 0, whose value lies inside the file, since its page header would be read from a range the file lacks */
+static void t_pq_value_at_bound(void)
+{
+    enum { N = 200 };
+    int64_t *v = calloc(N, 8);
+    char *txt = malloc(N * 8);
+    uint64_t off[N + 1];
+    off[0] = 0;
+    for (int i = 0; i < N; i++) {
+        v[i] = i * 7;
+        memcpy(txt + off[i], "abcdefgh", (size_t)(i % 8));
+        off[i + 1] = off[i] + (uint64_t)(i % 8);
+    }
+    pq_col c[2] = {
+        {.name = "t", .field_id = 1, .phys = PQ_BYTE_ARRAY, .logical = PQL_STRING, .off = off, .data = (const uint8_t *)txt},
+        {.name = "v", .field_id = 2, .phys = PQ_INT64, .fixed = (const uint8_t *)v},
+    };
+    pq_col sh[2];
+    memcpy(sh, c, sizeof sh);
+    for (int k = 0; k < 2; k++) {
+        sh[k].fixed = sh[k].data = NULL;
+        sh[k].off = NULL;
+    }
+    imdb_buf b, g;
+    imdb_buf_init(&b);
+    imdb_buf_init(&g);
+    OK(imdb_pq_write(c, 2, N, tkv, 2, &b, E));
+    pq_footer ft;
+    pq_rcol r[2];
+    OK(imdb_pq_footer(b.p, b.len, &ft, E));
+    OK(imdb_pq_read(b.p, b.len, &ft, sh, 2, r, E));
+    size_t at0 = 0;
+    OK(imdb_pq_value_at(b.p, b.len, &ft, 1, &sh[1], NULL, 0, &at0, E)); /* the honest file: row 0's value */
+    CHECK(imdb_get_le64(b.p + at0) == 0);
+    uint64_t claim = (b.len - ft.meta_at) + 64; /* past the file's end */
+    CHECK(ft.size[1] + claim <= ft.meta_at);   /* within the footer's bound */
+    imdb_buf_put(&g, b.p, ft.meta_at);        /* the chunks as they were */
+    uint64_t size[2] = {ft.size[0], ft.size[1] + claim};
+    char list[300];
+    size_t at = 0;
+    for (int ci = 0; ci < 2; ci++)
+        at += (size_t)snprintf(list + at, sizeof list - at, "%llu,%llu,%064d;", (unsigned long long)ft.off[ci],
+                               (unsigned long long)size[ci], 0);
+    const uint8_t *val[PQ_MAX_KV + 1];
+    uint32_t vlen[PQ_MAX_KV + 1];
+    memcpy(val, ft.val, sizeof val);
+    memcpy(vlen, ft.vlen, sizeof vlen);
+    val[0] = (const uint8_t *)list;
+    vlen[0] = (uint32_t)at;
+    pq_col cols[2] = {r[0].c, r[1].c};
+    size_t meta = g.len;
+    imdb_pq_footer_encode(&g, cols, 2, N, ft.off, size, ft.key, ft.klen, val, vlen, ft.nkv);
+    imdb_buf_put_u32(&g, (uint32_t)(g.len - meta));
+    imdb_buf_put(&g, "PAR1", 4);
+    imdb_pq_free_read(r, 2);
+    OK(imdb_buf_check(&g, E));
+    uint8_t *exact = malloc(g.len);
+    memcpy(exact, g.p, g.len);
+    pq_footer gf;
+    imdb_err e = {0};
+    CHECK(imdb_pq_footer(exact, g.len, &gf, &e) == 0 && gf.off[1] + gf.size[1] > g.len); /* the footer takes it */
+    size_t at1 = 0;
+    imdb_err e2 = {0};
+    CHECK(imdb_pq_value_at(exact, g.len, &gf, 1, &sh[1], NULL, 0, &at1, &e2) == IMDB_ERR_STATE); /* refused: the bound */
+    free(exact);
+    imdb_buf_free(&b);
+    imdb_buf_free(&g);
+    free(v);
+    free(txt);
+}
+
 const test_case pq_tests[] = {
     {"pq_levels_exhaustive", t_pq_levels_exhaustive},
     {"pq_levels_refused", t_pq_levels_refused},
@@ -1060,5 +1133,6 @@ const test_case pq_tests[] = {
     {"pq_read_flips_pages", t_pq_read_flips_pages},
     {"pq_read_crafted", t_pq_read_crafted},
     {"pq_read_past_end", t_pq_read_past_end},
+    {"pq_value_at_bound", t_pq_value_at_bound},
 };
 const size_t pq_ntests = sizeof pq_tests / sizeof *pq_tests;

@@ -262,6 +262,7 @@ static void t_erase_in_lake(void)
     uint64_t s_before = db->seq;
     CHECK(count_subject(db, 42, db->seq) == 16);
     CHECK(tree_contains(p, "SECRET-LAKE-42") && tree_contains_n(p, pat, 8));
+    CHECK(tree_contains_n(path_join(p, "objects"), pat, 8)); /* F5: in a segment, as Parquet holds an INT64, not the log alone */
     OK(ship_to_file(p, 0, s, E));
     imdb_db *rep = open_db(r);
     CHECK(rep);
@@ -1724,6 +1725,80 @@ static void t_seg_all_stubs(void)
     }
 }
 
+/* F5a's follow-up: an erased row's values, each as its segment holds it (Parquet's encoding, not the row codec's: an
+ * INTEGER and a DATE in 4 bytes, a wide DECIMAL big-endian in 16, a FLOAT64 as its IEEE bits, an INTERVAL's three
+ * fields, a UUID, a TIMESTAMP, BYTEA and TEXT bytes), found under objects/ before the ERASE (so the search reads the
+ * segment, not only the log) and in no file of the directory after it */
+static void t_seg_erase_needles(void)
+{
+    const char *dir = test_tmpdir();
+    OK(imdb_init(dir, false, NULL, E));
+    imdb_db *db = open_db(dir);
+    CHECK(db);
+    if (!db) return;
+    imdb_session s;
+    imdb_session_init(&s, db);
+    OK(lsql(&s, "CREATE TABLE t (id BIGINT PRIMARY KEY, u BIGINT SUBJECT, i INTEGER, w DECIMAL(30,4), f FLOAT64, d DATE, "
+                "ts TIMESTAMP, g UUID, iv INTERVAL, bt BYTEA, x TEXT)"));
+    OK(lsql(&s, "INSERT INTO t VALUES (1, 42, 1589749221, 98765432109876543210.1234, 12345.6789012345, DATE '2187-03-14', "
+                "TIMESTAMP '2187-03-14 15:09:26.535897', '5ec2e75e-c2e7-45ec-a5e5-c2e75ec2e75e', "
+                "INTERVAL '102 years 10 mons 4321 days 00:00:00.005678', '\\x5ec2e75ec2e7aabbccdd5ec2', 'SECRET-NEEDLE-5EC2E7'), "
+                "(2, 7, 11, 1.5, 2.5, DATE '2026-11-13', TIMESTAMP '2026-11-13 12:00:00', "
+                "'00000000-1111-4222-8333-444455556666', INTERVAL '1 day', '\\x0102', 'plain')"));
+    OK(lsql(&s, "CHECKPOINT"));
+    struct {
+        const char *what;
+        uint8_t b[24];
+        size_t n;
+    } nd[9];
+    memset(nd, 0, sizeof nd);
+    int k = 0;
+    nd[k].what = "INTEGER (4 bytes)", imdb_le32(nd[k].b, 1589749221u), nd[k++].n = 4;
+    __int128 wv = 0;
+    OK(imdb_parse_decimal128("98765432109876543210.1234", 25, 30, 4, &wv, E));
+    unsigned __int128 wu = (unsigned __int128)wv;
+    for (int j = 15; j >= 0; j--, wu >>= 8) nd[k].b[j] = (uint8_t)(wu & 0xff);
+    nd[k].what = "DECIMAL(30,4) (16 bytes big-endian)", nd[k++].n = 16;
+    double fv = 12345.6789012345;
+    uint64_t fu;
+    memcpy(&fu, &fv, 8);
+    nd[k].what = "FLOAT64 (IEEE)", imdb_le64(nd[k].b, fu), nd[k++].n = 8;
+    int64_t dv = 0, tv = 0;
+    OK(imdb_parse_date("2187-03-14", 10, &dv, E));
+    nd[k].what = "DATE (4 bytes)", imdb_le32(nd[k].b, (uint32_t)dv), nd[k++].n = 4;
+    OK(imdb_parse_timestamp("2187-03-14 15:09:26.535897", 26, &tv, E));
+    nd[k].what = "TIMESTAMP", imdb_le64(nd[k].b, (uint64_t)tv), nd[k++].n = 8;
+    OK(imdb_parse_uuid("5ec2e75e-c2e7-45ec-a5e5-c2e75ec2e75e", 36, nd[k].b, E));
+    nd[k].what = "UUID", nd[k++].n = 16;
+    int32_t im = 0, id_ = 0;
+    int64_t ius = 0;
+    const char *ivt = "102 years 10 mons 4321 days 00:00:00.005678";
+    OK(imdb_parse_interval(ivt, strlen(ivt), &im, &id_, &ius, E));
+    imdb_le32(nd[k].b, (uint32_t)im), imdb_le32(nd[k].b + 4, (uint32_t)id_), imdb_le64(nd[k].b + 8, (uint64_t)ius);
+    nd[k].what = "INTERVAL (months, days, microseconds)", nd[k++].n = 16;
+    static const uint8_t bt[12] = {0x5e, 0xc2, 0xe7, 0x5e, 0xc2, 0xe7, 0xaa, 0xbb, 0xcc, 0xdd, 0x5e, 0xc2};
+    memcpy(nd[k].b, bt, 12), nd[k].what = "BYTEA", nd[k++].n = 12;
+    memcpy(nd[k].b, "SECRET-NEEDLE-5EC2E7", 20), nd[k].what = "TEXT", nd[k++].n = 20;
+    char objs[800];
+    snprintf(objs, sizeof objs, "%s/objects", dir);
+    for (int j = 0; j < k; j++)
+        if (!tree_contains_n(objs, nd[j].b, nd[j].n)) {
+            fprintf(stderr, "    the segment does not hold the %s needle\n", nd[j].what);
+            CHECK(0);
+        }
+    OK(lsql(&s, "ERASE SUBJECT 42"));
+    for (int j = 0; j < k; j++)
+        if (tree_contains_n(dir, nd[j].b, nd[j].n)) {
+            fprintf(stderr, "    the %s needle survives the ERASE\n", nd[j].what);
+            CHECK(0);
+        }
+    char *left = lrender(&s, "SELECT id FROM t ORDER BY id");
+    CHECK(left && !strcmp(left, "id\n2\n"));
+    free(left);
+    imdb_session_close(&s);
+    imdb_close(db);
+}
+
 /* F5: a segment file in the format before Parquet (its magic "IMDBSEG1") is refused by name, by both parses */
 static void t_seg_old_format(void)
 {
@@ -1767,6 +1842,7 @@ const test_case lake_tests[] = {
     {"seg_stub_placeholders_typed", t_seg_stub_placeholders_typed},
     {"seg_nulls", t_seg_nulls},
     {"seg_all_stubs", t_seg_all_stubs},
+    {"seg_erase_needles", t_seg_erase_needles},
     {"dv_decoder_hostile", t_dv_decoder_hostile},
     {"dv_file_tamper", t_dv_file_tamper},
     {"erase_compact_late_replica", t_erase_compact_late_replica},

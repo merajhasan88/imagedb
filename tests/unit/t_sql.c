@@ -433,6 +433,7 @@ static void t_erase_where(void)
     uint8_t pat[8];
     imdb_le64(pat, 8877665544332211ull);
     CHECK(tree_contains(p, "pii-XYZ") && tree_contains_n(p, pat, 8));
+    CHECK(tree_contains_n(path_join(p, "objects"), pat, 8)); /* F5: in a segment (and its statistics), not the log alone */
     RUN("ERASE FROM t WHERE memo = 'pii-XYZ'");
     CHECK(q("SELECT COUNT(*) FROM t", &res) == 0 && cell_i(&res, 0, 0) == 19);
     imdb_result_free(&res);

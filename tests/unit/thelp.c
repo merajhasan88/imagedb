@@ -150,8 +150,12 @@ uint8_t *slurp(const char *p, size_t *n)
 void spit(const char *p, const uint8_t *b, size_t n)
 {
     FILE *f = fopen(p, "wb");
-    fwrite(b, 1, n, f);
-    fclose(f);
+    if (!f) { /* a full disk or a missing directory: the test fails here, by name, not in fwrite (UBSan, 11-13) */
+        test_fail(__FILE__, __LINE__, "spit: the file cannot be opened for writing");
+        return;
+    }
+    if (n && fwrite(b, 1, n, f) != n) test_fail(__FILE__, __LINE__, "spit: the file was not written whole");
+    if (fclose(f) != 0) test_fail(__FILE__, __LINE__, "spit: the file was not written whole");
 }
 
 bool mem_contains(const uint8_t *h, size_t hn, const char *needle)
