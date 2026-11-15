@@ -395,6 +395,8 @@ int apuf_read(const uint8_t *f, size_t len, aj *footer, const char **why)
 }
 
 /* the CRC-32 the blob carries (ISO-HDLC), the auditor's own */
+static uint32_t crc32_iso(const uint8_t *p, size_t n);
+uint32_t aice_crc32(const uint8_t *p, size_t n) { return crc32_iso(p, n); }
 static uint32_t crc32_iso(const uint8_t *p, size_t n)
 {
     uint32_t c = 0xffffffffu;

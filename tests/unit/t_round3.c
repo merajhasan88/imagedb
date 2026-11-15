@@ -757,12 +757,12 @@ static void fixture_check(const char *tgz, uint8_t alg, const char *meta_head, b
  * digest algorithm: they pin the format, so a change to it fails here first */
 static void t_round3_alg1_fixture(void)
 {
-    fixture_check("tests/fixtures/alg1-20261114a.tar.gz", IMDB_DIGEST_ALG_LTHASH16, "imagedb-meta 5\n", true, 134);
+    fixture_check("tests/fixtures/alg1-20261114b.tar.gz", IMDB_DIGEST_ALG_LTHASH16, "imagedb-meta 5\n", true, 134);
 }
 
 static void t_round3_alg2_fixture(void)
 {
-    fixture_check("tests/fixtures/alg2-20261114a.tar.gz", IMDB_DIGEST_ALG_LTHASH16_TREE, "imagedb-meta 5\n", true, 134);
+    fixture_check("tests/fixtures/alg2-20261114b.tar.gz", IMDB_DIGEST_ALG_LTHASH16_TREE, "imagedb-meta 5\n", true, 134);
 }
 
 /* The fixtures of the formats before the current one (alg1-20261026: META 2; alg2-20261026 and
@@ -804,7 +804,8 @@ static void t_round3_old_fixtures(void)
      * 14 (alg1-20261109g, alg2-20261109g: before DECIMALs of 38 digits, F3e) and 15 (alg1-20261110a, alg2-20261110a: before
      * INTERVAL, F3f), 16 (alg1-20261112a, alg2-20261112a: before ENUM types, F3g), 17 (alg1-20261112b, alg2-20261112b:
      * before roles, L), 18 (alg1-20261112c, alg2-20261112c: before Parquet segments, F5) and 19 (alg1-20261113a,
-     * alg2-20261113a: before segments named by their tail, Iceberg's field ids and DECIMAL widths, F5b):
+     * alg2-20261113a: before segments named by their tail, Iceberg's field ids and DECIMAL widths, F5b) and 20 (alg1-20261114a,
+     * alg2-20261114a: before each table's last change, F5c stage 2):
      * META reads, and the open refuses the lake (or the log) by name, never replaying past it to a rebuilt manifest of
      * another version */
     static const char *const tgz4[] = {"tests/fixtures/alg1-20261029.tar.gz", "tests/fixtures/alg2-20261029.tar.gz",
@@ -822,7 +823,8 @@ static void t_round3_old_fixtures(void)
                                        "tests/fixtures/alg1-20261112a.tar.gz", "tests/fixtures/alg2-20261112a.tar.gz",
                                        "tests/fixtures/alg1-20261112b.tar.gz", "tests/fixtures/alg2-20261112b.tar.gz",
                                        "tests/fixtures/alg1-20261112c.tar.gz", "tests/fixtures/alg2-20261112c.tar.gz",
-                                       "tests/fixtures/alg1-20261113a.tar.gz", "tests/fixtures/alg2-20261113a.tar.gz"};
+                                       "tests/fixtures/alg1-20261113a.tar.gz", "tests/fixtures/alg2-20261113a.tar.gz",
+                                       "tests/fixtures/alg1-20261114a.tar.gz", "tests/fixtures/alg2-20261114a.tar.gz"};
     static const char *const why4[] = {"before DROP TABLE", "before DROP TABLE", "before views", "before views",
                                        "before the format design", "before the format design",
                                        "before schema versions by position", "before schema versions by position",
@@ -832,7 +834,8 @@ static void t_round3_old_fixtures(void)
                                        "before DECIMALs of 38 digits", "before DECIMALs of 38 digits", "before INTERVAL", "before INTERVAL",
                                        "before ENUM types", "before ENUM types", "before roles", "before roles",
                                        "before Parquet segments", "before Parquet segments",
-                                       "before segments named by their tail", "before segments named by their tail"};
+                                       "before segments named by their tail", "before segments named by their tail",
+                                       "before each table's last change was recorded", "before each table's last change was recorded"};
     for (size_t i = 0; i < sizeof tgz4 / sizeof *tgz4; i++) {
         struct stat st;
         if (stat(tgz4[i], &st) != 0) {

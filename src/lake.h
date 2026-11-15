@@ -76,7 +76,9 @@ enum {
 #define IMDB_SEG_FIELD_VID 2147483540   /* F5b: imdb$vid, Iceberg v3's _row_id */
 #define IMDB_SEG_FIELD_BEGIN 2147483539 /* F5b: imdb$begin, Iceberg v3's _last_updated_sequence_number */
 #define IMDB_SEG_SYS_FIELD 2147483000   /* F5: the other three's, this + their index (2 to 4) */
-#define IMDB_MANIFEST_VERSION 20u /* F5b: segments named by their tail, Iceberg's field ids and DECIMAL widths; 19
+#define IMDB_MANIFEST_VERSION 21u /* F5c stage 2: each table's entry ends with the publication that last changed what
+                                   its Iceberg layer reads, and that publication's last included commit's time; 20 before it
+                                   (F5b: segments named by their tail, Iceberg's field ids and DECIMAL widths); 19
                                    before them (F5: segments in imagedb's Parquet subset); 18 before those (L: roles and grants,
                                    sections 5 and 6 filled); 17 before those (F3g: ENUM types, the
                                    enums section, ENUM columns); 16 before those (F3f: INTERVAL columns,
@@ -290,6 +292,12 @@ typedef struct imdb_manifest_tab {
      * after the CREATE, at or before the snapshot and before a drop, and the last version to be s. A consumer may
      * take it whole (and zero it): imdb_manifest_free frees what is left */
     imdb_schema_hist hist;
+    /* F5c stage 2 (manifest 21): after the history, u64 changed (the publication that last changed what the layer reads:
+     * the schema, the vid count, the segments, the drop and the history, lkey's spans; an ERASE every table), u64
+     * changed_us (the time of the commit before it: the last that publication includes). lkey: the SHA-256 of those
+     * spans as the entry encodes them (the parse's, the writer's alike), what the next publication compares */
+    uint64_t changed, changed_us;
+    uint8_t lkey[32];
 } imdb_manifest_tab;
 /* P2 S7: a view in a manifest (version 6): a live one's definition, a dropped one's tombstone (def NULL) */
 typedef struct imdb_manifest_view {

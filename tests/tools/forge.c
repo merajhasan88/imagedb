@@ -1271,11 +1271,12 @@ static void manifest_lie(const char *dir, const char *kind)
         imdb_buf_put(&nb, man, mn);
         uint16_t c = m.t[m.nt - 1].s.ncols; /* the last index's column, little endian, before the three u64, F1's u32 and
                                              * F2a's u16 (manifest 9: version 1's DEFAULTs, none) */
-        nb.p[nb.len - 232] = (uint8_t)c; /* then F2b-1's u16 (manifest 11: version 1's CHECKs, none), F2b-2's u16
-                                          * (manifest 13: its FOREIGN KEYs, none), the views section (12 + a count of 0), the
+        nb.p[nb.len - 248] = (uint8_t)c; /* then F2b-1's u16 (manifest 11: version 1's CHECKs, none), F2b-2's u16
+                                          * (manifest 13: its FOREIGN KEYs, none), F5c's two u64 (manifest 21: its last change), the
+                                          * views section (12 + a count of 0), the
                                           * sequences and the types (16 each), the roles (52, L: its object's hash, last id and
                                           * count), the grants and the five reserved ones (16 each) */
-        nb.p[nb.len - 231] = (uint8_t)(c >> 8);
+        nb.p[nb.len - 247] = (uint8_t)(c >> 8);
     } else if (strcmp(kind, "section") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION && mn > 144 + 144) {
         imdb_buf_put(&nb, man, mn); /* the format design's slice 1: the seven reserved sections end it, 16 bytes each */
         nb.p[nb.len - 68] = 1;      /* the replica set's section (7): its u32 count a later format's (sections 3 to 6 are read now: F2a-2,
@@ -1342,6 +1343,18 @@ static void manifest_lie(const char *dir, const char *kind)
             if (memcmp(nb.p + i, pat, sizeof pat) == 0) at = i + sizeof pat - 1;
         if (!at) exit(1);
         nb.p[at] = '3';
+    } else if (strcmp(kind, "changed-time") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION && m.nt) {
+        /* F5c (manifest 21): the first table's last change (u64 its publication, u64 its time, after its history) given a
+         * time one microsecond later: within every bound the parse holds, another than the log's */
+        imdb_buf_put(&nb, man, mn);
+        uint8_t pat[16];
+        imdb_le64(pat, m.t[0].changed);
+        imdb_le64(pat + 8, m.t[0].changed_us);
+        size_t at = 0;
+        for (size_t i = 0; i + sizeof pat <= mn && !at; i++)
+            if (memcmp(nb.p + i, pat, sizeof pat) == 0) at = i + 8;
+        if (!at) exit(1);
+        imdb_le64(nb.p + at, m.t[0].changed_us + 1);
     } else if (strcmp(kind, "check-text") == 0 && imdb_get_le32(man + 8) == IMDB_MANIFEST_VERSION) {
         /* F2b-1: version 1's CHECK z_a_check (manifest 11: u8 9, the name, u32 5, "a > 0") made "a > 1": a CHECK the rows still
          * pass, another than the log's */

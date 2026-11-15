@@ -711,6 +711,94 @@ static void t_rewind_iceberg(void)
     CHECK(audit_ok(p));
 }
 
+
+/* F5c stage 2 (the advisor, 2026-11-14 22:1x): a layer cut short leaves no sidecar, so a writer rewound onto another
+ * history never skips a table that layer half wrote. The old writer's layer is whole at P (a last changed at P0, b at
+ * P); past the fork it changes a and publishes H, its layer failing at b (a directory it cannot remove) after a was
+ * written for H; promoted, the replica changes b alone and publishes H', which retains P; the old writer is rewound and
+ * follows it, then opened with the layer: a, unchanged since P0 on this history, would be left untouched under a sidecar
+ * still naming P, its files H's of the other history. The sidecar removed before the first table is touched, every
+ * table is written again: VERIFY and the auditor take the layer */
+static void t_rewind_iceberg_cut(void)
+{
+    const char *base = test_tmpdir();
+    char p[620], r[620], save[700], sd[760], hint[760];
+    snprintf(p, sizeof p, "%s/p", base);
+    snprintf(r, sizeof r, "%s/r", base);
+    snprintf(save, sizeof save, "%s/p-past-fork.frames", base);
+    uint8_t seed[32];
+    memset(seed, 0x38, sizeof seed);
+    imdb_signer root;
+    imdb_signer_init(&root, seed);
+    OK(imdb_init_primary(p, root.pk, E));
+    OK(imdb_init(r, true, p, E));
+    imdb_open_opts io = {.sync = 1, .iceberg = true};
+    imdb_db *db = NULL;
+    OK(imdb_open(p, &io, &db, E));
+    CHECK(db);
+    if (!db) return;
+    static const char *const q0[] = {"CREATE TABLE a (id BIGINT PRIMARY KEY, v BIGINT)",
+                                     "CREATE TABLE b (id BIGINT PRIMARY KEY, v BIGINT)",
+                                     "INSERT INTO a VALUES (1, 1), (2, 2)",
+                                     "INSERT INTO b VALUES (1, 1)",
+                                     "CHECKPOINT", /* P0: a and b */
+                                     "INSERT INTO b VALUES (2, 2)",
+                                     "CHECKPOINT"}; /* P: b alone; the layer whole at P */
+    OK(exec_all(db, q0, sizeof q0 / sizeof *q0, NULL));
+    const imdb_table *ta = imdb_table_by_name(db, "a"), *tb = imdb_table_by_name(db, "b");
+    CHECK(ta && tb);
+    if (!ta || !tb) {
+        imdb_close(db);
+        return;
+    }
+    unsigned aid = (unsigned)ta->s.id, bid = (unsigned)tb->s.id;
+    imdb_close(db);
+    OK(replicate(p, r));
+    db = NULL;
+    OK(imdb_open(p, &io, &db, E)); /* the old writer, the layer on */
+    CHECK(db);
+    if (!db) return;
+    snprintf(sd, sizeof sd, "%s/iceberg/%u/metadata/stray.d", p, bid);
+    CHECK(mkdir(sd, 0700) == 0);
+    static const char *const q1[] = {"INSERT INTO a VALUES (3, 3)", "CHECKPOINT"}; /* H: a changed; its layer cut at b */
+    OK(exec_all(db, q1, sizeof q1 / sizeof *q1, NULL));
+    uint64_t H = db->lake_seq;
+    imdb_close(db);
+    snprintf(hint, sizeof hint, "%s/iceberg/%u/metadata/version-hint.text", p, aid);
+    size_t hl = 0;
+    uint8_t *hb = slurp(hint, &hl);
+    char want[32];
+    int wl = snprintf(want, sizeof want, "%llu", (unsigned long long)(2 * H)); /* a written for H, an older beside it */
+    CHECK(hb && wl > 0 && hl == (size_t)wl && !memcmp(hb, want, hl));
+    free(hb);
+    imdb_promote_opts po = {.old_writer_stopped = true};
+    imdb_promote_result pr;
+    OK(imdb_promote(r, seed, &po, &pr, E));
+    CHECK(pr.committed);
+    db = open_with(r, 1);
+    CHECK(db);
+    if (!db) return;
+    static const char *const q2[] = {"INSERT INTO b VALUES (3, 3)", "CHECKPOINT"}; /* H': b alone; it retains P */
+    OK(exec_all(db, q2, sizeof q2 / sizeof *q2, NULL));
+    imdb_close(db);
+    imdb_rewind_report rep;
+    OK(rewind_onto(p, r, UINT64_MAX, save, true, DAMAGE_NONE, &rep));
+    CHECK(rep.applied && rep.demoted);
+    OK(replicate(r, p)); /* the old writer follows: it publishes H', the layer off */
+    CHECK(rmdir(sd) == 0);
+    db = NULL;
+    OK(imdb_open(p, &io, &db, E)); /* a writable open with the layer: no sidecar, so every table written again */
+    CHECK(db);
+    if (!db) return;
+    imdb_verify_report vr;
+    imdb_err_clear(E);
+    int vrc = imdb_verify(db, &vr, E);
+    if (vrc || !vr.iceberg || vr.iceberg_stale) fprintf(stderr, "    VERIFY %d, layer %d, stale %d (%s)\n", vrc, vr.iceberg, vr.iceberg_stale, E->msg);
+    CHECK(!vrc && vr.iceberg && !vr.iceberg_stale);
+    imdb_close(db);
+    CHECK(audit_ok(p));
+}
+
 const test_case rewind_tests[] = {
     {"rewind_demote", t_rewind_demote},
     {"rewind_fork_publishes", t_rewind_fork_publishes},
@@ -721,5 +809,6 @@ const test_case rewind_tests[] = {
     {"rewind_cut", t_rewind_cut},
     {"rewind_hashes", t_rewind_hashes},
     {"rewind_iceberg", t_rewind_iceberg},
+    {"rewind_iceberg_cut", t_rewind_iceberg_cut},
 };
 const size_t rewind_ntests = sizeof rewind_tests / sizeof *rewind_tests;

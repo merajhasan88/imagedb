@@ -56,5 +56,7 @@ const uint8_t *aocf_meta(const aocf *o, const char *key, size_t *len);
 int apuf_read(const uint8_t *f, size_t len, aj *footer, const char **why);
 /* a deletion-vector-v1 blob: its positions (malloc'd, ascending) in *pos, *n of them; 0, or -1 with *why */
 int adv_read(const uint8_t *b, size_t len, uint64_t **pos, size_t *n, const char **why);
+/* the ISO CRC-32 (zlib's), a deletion vector's: what the auditor's own writer of the layer seals one with */
+uint32_t aice_crc32(const uint8_t *p, size_t n);
 
 #endif

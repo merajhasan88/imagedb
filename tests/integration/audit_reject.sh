@@ -555,6 +555,15 @@ must_fail "differs from the log" "$AUD" verify "$PFX"
 echo "   FV a signed INSERT of a row a CHECK refuses, FW a signed ADD CHECK a live row fails: the replay and the auditor
    refuse each; FX a manifest's version 1 CHECK of another text: VERIFY and the auditor refuse it"
 
+echo "== PI: a manifest whose table's last change (manifest 21, F5c) is given another time, re-pointed and re-signed"
+PIX=$WORK/pi; make_db "$PIX"
+"$BIN" verify "$PIX" >/dev/null && "$AUD" verify "$PIX" >/dev/null || fail "the honest directory must verify"
+"$FORGE" manifest-lie "$PIX" changed-time
+must_fail "another time than the log's" "$BIN" verify "$PIX"
+must_fail "another time than the log's" "$AUD" verify "$PIX"
+echo "   PI a table's last change a microsecond later than the commit before its publication: VERIFY and the auditor
+   refuse it by the one-step rule (lake.h, manifest 21)"
+
 echo "== FY, FZ: generated columns broken (F2c): a signed row whose generated value its expression does not give, a manifest's text"
 PFY=$WORK/fy; "$BIN" init "$PFY" >/dev/null
 "$BIN" sql "$PFY" --nosync -c "CREATE TABLE z (id INT64 PRIMARY KEY, a INT64, w INT64 GENERATED ALWAYS AS (a * 2) STORED);" \

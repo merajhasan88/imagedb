@@ -13,6 +13,7 @@
 #include "../../src/backup.h"
 
 #include "../../src/db_internal.h"
+#include "../../src/fsio.h"
 #include "../../src/iceberg.h"
 #include "../../src/icecodec.h"
 #include "../../src/lake.h"
@@ -179,6 +180,16 @@ static uint8_t *read_at(const char *dir, const char *name, size_t *n)
     return slurp(p, n);
 }
 
+/* the name of a table's current metadata file, by its version hint (v<K>.metadata.json): "" when there is none */
+static void cur_meta(const char *mdir, char *out, size_t cap)
+{
+    size_t hl = 0;
+    uint8_t *hb = read_at(mdir, "version-hint.text", &hl);
+    if (hb && hl > 0 && hl < 24) snprintf(out, cap, "v%.*s.metadata.json", (int)hl, (const char *)hb);
+    else if (cap) out[0] = 0;
+    free(hb);
+}
+
 /* a snapshot's visible rows by the layer: each data file's records less its deletion vector's (the auditor's readers) */
 static int64_t layer_rows(const char *mdir, const char *list_path)
 {
@@ -308,7 +319,8 @@ static void t_ice_layer(void)
     uint64_t S2 = db->seq;
     char mdir[800], name[64];
     snprintf(mdir, sizeof mdir, "%s/iceberg/%u/metadata", dir, (unsigned)imdb_table_by_name(db, "t")->s.id);
-    snprintf(name, sizeof name, "v%llu.metadata.json", (unsigned long long)S2);
+    cur_meta(mdir, name, sizeof name); /* t changed at S2: v(2 S2), with its older snapshot S1 */
+    CHECK(name[0] && strtoull(name + 1, NULL, 10) == 2 * S2);
     size_t ml = 0;
     uint8_t *mb = read_at(mdir, name, &ml);
     CHECK(mb);
@@ -365,7 +377,7 @@ static void t_ice_layer(void)
     free(vb);
     /* a byte flipped in the head's data manifest: VERIFY names it */
     char mname[96];
-    snprintf(mname, sizeof mname, "m-%llu-h%llu-data.avro", (unsigned long long)S2, (unsigned long long)S2);
+    snprintf(mname, sizeof mname, "m-%llu-%llu-data.avro", (unsigned long long)S2, (unsigned long long)S1); /* the head's, its older S1 */
     size_t fl = 0;
     uint8_t *fb = read_at(mdir, mname, &fl);
     CHECK(fb && fl > 40);
@@ -386,18 +398,23 @@ static void t_ice_layer(void)
     OK(run(&s, "ERASE SUBJECT 42"));
     uint64_t S3 = db->lake_seq;
     CHECK(S3 > S2);
-    DIR *d = opendir(mdir);
+    DIR *d = opendir(mdir); /* the table alone at S3 (an ERASE changes every table): its files named by S3 alone */
     struct dirent *de;
-    char tag[32];
-    snprintf(tag, sizeof tag, "h%llu", (unsigned long long)S3);
+    char want[4][64];
+    snprintf(want[0], sizeof want[0], "snap-%llu.avro", (unsigned long long)S3);
+    snprintf(want[1], sizeof want[1], "m-%llu-data.avro", (unsigned long long)S3);
+    snprintf(want[2], sizeof want[2], "m-%llu-dv.avro", (unsigned long long)S3);
+    snprintf(want[3], sizeof want[3], "v%llu.metadata.json", (unsigned long long)(2 * S3 + 1));
     while (d && (de = readdir(d))) {
         if (de->d_name[0] == '.' || !strncmp(de->d_name, "dv-", 3) || !strcmp(de->d_name, "version-hint.text")) continue;
-        bool ok = strstr(de->d_name, tag) || !strncmp(de->d_name, "v", 1);
+        bool ok = false;
+        for (int k = 0; k < 4 && !ok; k++) ok = !strcmp(de->d_name, want[k]);
         if (!ok) fprintf(stderr, "    %s stays after the ERASE\n", de->d_name);
         CHECK(ok);
     }
     if (d) closedir(d);
-    snprintf(name, sizeof name, "v%llu.metadata.json", (unsigned long long)S3);
+    cur_meta(mdir, name, sizeof name);
+    CHECK(!strcmp(name, want[3]));
     mb = read_at(mdir, name, &ml);
     CHECK(mb && aj_parse((const char *)mb, ml, &m, &why) == 0);
     snaps = mb ? aj_get(&m, "snapshots") : NULL;
@@ -406,8 +423,8 @@ static void t_ice_layer(void)
         const aj *ls = aj_get(&snaps->v[0], "manifest-list");
         CHECK(ls && ls->kind == AJ_STR && layer_rows(mdir, ls->s) == count_as_of(&s, S3));
     }
-    snprintf(name, sizeof name, "v%llu.metadata.json", (unsigned long long)S2);
-    CHECK(!read_at(mdir, name, &ml)); /* the metadata of the head before */
+    snprintf(name, sizeof name, "v%llu.metadata.json", (unsigned long long)(2 * S2)); /* the head before's, with its older */
+    CHECK(!read_at(mdir, name, &ml));
     if (mb) aj_free(&m);
     free(mb);
     OK(imdb_verify(db, &vr, E));
@@ -453,7 +470,7 @@ static int ice_nsnaps(imdb_db *db, const char *dir, const char *name)
     if (!t) return -1;
     char mdir[800], f[64];
     snprintf(mdir, sizeof mdir, "%s/iceberg/%u/metadata", dir, (unsigned)t->s.id);
-    snprintf(f, sizeof f, "v%llu.metadata.json", (unsigned long long)db->lake_seq);
+    cur_meta(mdir, f, sizeof f); /* by its version hint */
     size_t ml = 0;
     uint8_t *mb = read_at(mdir, f, &ml);
     aj m;
@@ -869,7 +886,10 @@ static void t_ice_cut(void)
     const char *files[1] = {bk};
     OK(imdb_restore(rs, key, files, 1, &bi, E));
     rdb = ice_open(rs);
-    CHECK(rdb && ice_nsnaps(rdb, rs, "a") == 1 && ice_verified(rdb));
+    int rn0 = rdb ? ice_nsnaps(rdb, rs, "a") : -1;
+    bool rv0 = rdb && ice_verified(rdb);
+    if (rn0 < 1 || !rv0) fprintf(stderr, "    restored: %d snapshots, verify %d (%s)\n", rn0, rv0, g_e.msg);
+    CHECK(rdb && rn0 >= 1 && rv0); /* the head, and its older where that generation's objects are on disk (shared here) */
     if (rdb) imdb_close(rdb);
     CHECK(audit_says(rs, NULL) <= 0);
 }
@@ -907,7 +927,10 @@ static void t_ice_restore(void)
     imdb_db *rdb = ice_open(rs);
     CHECK(rdb);
     if (!rdb) return;
-    CHECK(ice_nsnaps(rdb, rs, "a") == 1 && ice_verified(rdb));
+    int rn1 = ice_nsnaps(rdb, rs, "a");
+    bool rv1 = ice_verified(rdb);
+    if (rn1 < 1 || !rv1) fprintf(stderr, "    restored: %d snapshots, verify %d (%s)\n", rn1, rv1, g_e.msg);
+    CHECK(rn1 >= 1 && rv1); /* the head, and its older where that generation's objects are on disk (shared here) */
     for (int round = 0; round < 2; round++) { /* the primary's publications, applied in the copy's opening handle */
         db = ice_open(dir);
         CHECK(db);
@@ -998,6 +1021,300 @@ static void t_ice_values(void)
     imdb_buf_free(&b);
 }
 
+/* table name's last change and its time in the head manifest (manifest 21): 0 when it cannot be read */
+static uint64_t head_changed(imdb_db *db, const char *name, uint64_t *us)
+{
+    const imdb_table *t = imdb_table_by_name(db, name);
+    imdb_manifest m;
+    imdb_err e2 = {0};
+    if (!t || !db->lake_mbytes || imdb_manifest_parse(db->lake_mbytes, db->lake_mlen, &m, &e2)) return 0;
+    uint64_t c = t->s.id < m.nt ? m.t[t->s.id].changed : 0;
+    if (us) *us = t->s.id < m.nt ? m.t[t->s.id].changed_us : 0;
+    imdb_manifest_free(&m);
+    return c;
+}
+
+/* the publication's own: changed at it, the time of the commit before it */
+static bool changed_here(imdb_db *db, const char *name)
+{
+    uint64_t us = 0, c = head_changed(db, name, &us);
+    imdb_err e2 = {0};
+    const imdb_commit_info *ci = imdb_ci_at(db, db->lake_seq - 1, &e2);
+    if (c != db->lake_seq || !ci || us != ci->time_us)
+        fprintf(stderr, "    %s: changed %llu at %llu, the head %llu\n", name, (unsigned long long)c, (unsigned long long)us,
+                (unsigned long long)db->lake_seq);
+    return c == db->lake_seq && ci && us == ci->time_us;
+}
+
+/* F5c stage 2 (manifest 21): each kind of change alone, its table's last change moved exactly when the layer reads what it
+ * changed (a write, an ALTER with no row, a COMPACT; an ERASE every table), carried over otherwise (another table's write,
+ * an index, an expiry's horizon), each publication taken by VERIFY's and the auditor's one-step rule */
+static void t_ice_changed(void)
+{
+    const char *dir = test_tmpdir();
+    OK(imdb_init(dir, false, NULL, E));
+    imdb_db *db = ice_open(dir);
+    CHECK(db);
+    if (!db) return;
+    imdb_session s;
+    imdb_session_init(&s, db);
+    OK(run(&s, "CREATE TABLE a (id BIGINT PRIMARY KEY, u BIGINT SUBJECT, v BIGINT)"));
+    OK(run(&s, "CREATE TABLE b (id BIGINT PRIMARY KEY, v BIGINT)"));
+    OK(run(&s, "CREATE TABLE c (id BIGINT PRIMARY KEY, v BIGINT) RETENTION 10 SECONDS"));
+    OK(run(&s, "INSERT INTO a VALUES (1, 42, 1), (2, 7, 2)"));
+    OK(run(&s, "INSERT INTO b VALUES (1, 1), (2, 2)"));
+    OK(run(&s, "INSERT INTO c VALUES (1, 1), (2, 2)"));
+    OK(run(&s, "UPDATE c SET v = 3 WHERE id = 1"));
+    OK(run(&s, "CHECKPOINT"));
+    uint64_t p1 = db->lake_seq;
+    CHECK(changed_here(db, "a") && changed_here(db, "b") && changed_here(db, "c"));
+    CHECK(ice_verified(db) && audit_says(dir, NULL) <= 0);
+    OK(run(&s, "INSERT INTO a VALUES (3, 7, 3)")); /* another table's write: b and c carried */
+    OK(run(&s, "CHECKPOINT"));
+    CHECK(changed_here(db, "a") && head_changed(db, "b", NULL) == p1 && head_changed(db, "c", NULL) == p1);
+    CHECK(ice_verified(db) && audit_says(dir, NULL) <= 0);
+    OK(run(&s, "CREATE INDEX b_v ON b (v)")); /* an index: not what the layer reads */
+    OK(run(&s, "INSERT INTO a VALUES (4, 7, 4)"));
+    OK(run(&s, "CHECKPOINT"));
+    CHECK(changed_here(db, "a") && head_changed(db, "b", NULL) == p1);
+    CHECK(ice_verified(db) && audit_says(dir, NULL) <= 0);
+    OK(run(&s, "ALTER TABLE b ADD COLUMN w BIGINT DEFAULT 5")); /* an ALTER with no row: b's history */
+    OK(run(&s, "INSERT INTO a VALUES (5, 7, 5)"));
+    OK(run(&s, "CHECKPOINT"));
+    CHECK(changed_here(db, "b") && head_changed(db, "c", NULL) == p1);
+    uint64_t pb = db->lake_seq;
+    CHECK(ice_verified(db) && audit_says(dir, NULL) <= 0);
+    imdb_clock_offset(15 * 1000000ll); /* c's expiry: its horizon moves, its segments and history do not */
+    OK(run(&s, "SELECT COUNT(*) FROM c"));
+    OK(run(&s, "INSERT INTO a VALUES (6, 7, 6)"));
+    OK(run(&s, "CHECKPOINT"));
+    CHECK(changed_here(db, "a") && head_changed(db, "b", NULL) == pb && head_changed(db, "c", NULL) == p1);
+    CHECK(ice_verified(db) && audit_says(dir, NULL) <= 0);
+    OK(run(&s, "COMPACT b")); /* its segments rewritten */
+    CHECK(changed_here(db, "b") && head_changed(db, "c", NULL) == p1);
+    CHECK(ice_verified(db) && audit_says(dir, NULL) <= 0);
+    OK(run(&s, "ERASE SUBJECT 42")); /* an ERASE: every table */
+    CHECK(changed_here(db, "a") && changed_here(db, "b") && changed_here(db, "c"));
+    CHECK(ice_verified(db) && audit_says(dir, NULL) <= 0);
+    OK(run(&s, "INSERT INTO b (id, v) VALUES (9, 9)"));
+    OK(run(&s, "CHECKPOINT")); /* after it, by comparison again */
+    uint64_t pe = db->lake_seq;
+    CHECK(changed_here(db, "b") && head_changed(db, "a", NULL) < pe && head_changed(db, "c", NULL) < pe);
+    CHECK(ice_verified(db) && audit_says(dir, NULL) <= 0);
+    imdb_session_close(&s);
+    imdb_close(db);
+    db = ice_open(dir); /* the next publication of another handle: compares with the same head */
+    CHECK(db);
+    if (!db) return;
+    imdb_session_init(&s, db);
+    OK(run(&s, "INSERT INTO c VALUES (7, 7)"));
+    OK(run(&s, "CHECKPOINT"));
+    CHECK(changed_here(db, "c") && head_changed(db, "b", NULL) == pe);
+    CHECK(ice_verified(db) && audit_says(dir, NULL) <= 0);
+    /* a RENAME TABLE alone (the advisor, 2026-11-15): the name is in the schema's span (the layer's imagedb.table
+     * property), so b2 changed at the next publication though another table's write made it; then written alone, then
+     * left untouched under its new name, each taken by VERIFY and the auditor */
+    OK(run(&s, "ALTER TABLE b RENAME TO b2"));
+    OK(run(&s, "INSERT INTO c VALUES (8, 8)"));
+    OK(run(&s, "CHECKPOINT"));
+    uint64_t pr = db->lake_seq;
+    CHECK(changed_here(db, "b2"));
+    CHECK(ice_verified(db) && audit_says(dir, NULL) <= 0);
+    char q[64];
+    for (int k = 0; k < 2; k++) {
+        snprintf(q, sizeof q, "INSERT INTO c VALUES (%d, 9)", 10 + k);
+        OK(run(&s, q));
+        OK(run(&s, "CHECKPOINT"));
+        CHECK(head_changed(db, "b2", NULL) == pr && ice_nsnaps(db, dir, "b2") == 1);
+        CHECK(ice_verified(db) && audit_says(dir, NULL) <= 0);
+    }
+    imdb_session_close(&s);
+    imdb_close(db);
+}
+
+/* the bytes of every file under a table's layer (names and contents), to tell it was not touched */
+static char *table_state(const char *dir, const imdb_table *t, size_t *len)
+{
+    char mdir[800];
+    snprintf(mdir, sizeof mdir, "%s/iceberg/%u/metadata", dir, (unsigned)t->s.id);
+    return dir_state(mdir, len);
+}
+
+/* F5c stage 2: a publication touches only the tables that changed (f5c-design 9.1): on 20 tables, a CHECKPOINT that
+ * changes one writes that table's layer (twice: at its change, then alone at the next publication) and leaves every
+ * other table's files as they were, its syncs a few whatever the tables; VERIFY and the auditor take each */
+static void t_ice_untouched(void)
+{
+    const char *dir = test_tmpdir();
+    OK(imdb_init(dir, false, NULL, E));
+    imdb_open_opts o = {.sync = 1, .iceberg = true};
+    imdb_db *db = NULL;
+    OK(imdb_open(dir, &o, &db, E));
+    CHECK(db);
+    if (!db) return;
+    imdb_session s;
+    imdb_session_init(&s, db);
+    char q[160];
+    for (int k = 0; k < 20; k++) {
+        snprintf(q, sizeof q, "CREATE TABLE t%d (id BIGINT PRIMARY KEY, v BIGINT)", k);
+        OK(run(&s, q));
+        snprintf(q, sizeof q, "INSERT INTO t%d VALUES (1, 1), (2, 2)", k);
+        OK(run(&s, q));
+    }
+    OK(run(&s, "CHECKPOINT"));
+    OK(run(&s, "INSERT INTO t0 VALUES (3, 3)"));
+    OK(run(&s, "CHECKPOINT")); /* t0 with two snapshots, the rest alone (unchanged since the first) */
+    OK(run(&s, "INSERT INTO t1 VALUES (3, 3)"));
+    OK(run(&s, "CHECKPOINT")); /* t1 changes; t0 goes alone */
+    CHECK(ice_nsnaps(db, dir, "t0") == 1 && ice_nsnaps(db, dir, "t1") == 2 && ice_nsnaps(db, dir, "t7") == 1);
+    size_t l7 = 0, l9 = 0;
+    char *s7 = table_state(dir, imdb_table_by_name(db, "t7"), &l7), *s9 = table_state(dir, imdb_table_by_name(db, "t9"), &l9);
+    imdb_hist h0, h1;
+    OK(run(&s, "INSERT INTO t2 VALUES (3, 3)"));
+    imdb_io_sync_stats(&h0);
+    OK(run(&s, "CHECKPOINT")); /* t2 changes, t1 goes alone; 17 tables untouched */
+    imdb_io_sync_stats(&h1);
+    uint64_t syncs = h1.n - h0.n;
+    size_t m7 = 0, m9 = 0;
+    char *n7 = table_state(dir, imdb_table_by_name(db, "t7"), &m7), *n9 = table_state(dir, imdb_table_by_name(db, "t9"), &m9);
+    CHECK(s7 && n7 && l7 == m7 && !memcmp(s7, n7, l7) && s9 && n9 && l9 == m9 && !memcmp(s9, n9, l9));
+    if (syncs > 40) fprintf(stderr, "    a publication touching two tables of 20: %llu syncs\n", (unsigned long long)syncs);
+    CHECK(syncs <= 40); /* the lake's own and two tables' layers, never 20 tables' */
+    free(s7), free(n7), free(s9), free(n9);
+    CHECK(ice_nsnaps(db, dir, "t1") == 1 && ice_nsnaps(db, dir, "t2") == 2);
+    CHECK(ice_verified(db) && audit_says(dir, NULL) <= 0);
+    imdb_session_close(&s);
+    imdb_close(db);
+    db = ice_open(dir); /* another handle: the same layer, nothing written at its open */
+    CHECK(db && ice_verified(db));
+    if (db) imdb_close(db);
+}
+
+
+/* the inodes of a table's Puffin files, by name (a file written again is renamed into place: another inode) */
+static int puffins(const char *dir, const imdb_table *t, char names[][96], ino_t *ino, int cap)
+{
+    char mdir[800];
+    snprintf(mdir, sizeof mdir, "%s/iceberg/%u/metadata", dir, (unsigned)t->s.id);
+    DIR *d = opendir(mdir);
+    struct dirent *de;
+    int n = 0;
+    while (d && n < cap && (de = readdir(d))) {
+        size_t l = strlen(de->d_name);
+        if (l < 7 || l >= 96 || strcmp(de->d_name + l - 7, ".puffin")) continue;
+        char fp[900];
+        snprintf(fp, sizeof fp, "%s/%s", mdir, de->d_name);
+        struct stat st;
+        if (stat(fp, &st) != 0) continue;
+        memcpy(names[n], de->d_name, l + 1);
+        ino[n++] = st.st_ino;
+    }
+    if (d) closedir(d);
+    return n;
+}
+
+/* a table left untouched keeps what the last layer found for its vectors (the advisor, 2026-11-14 22:1x): t, six segments
+ * each with a dead row, is left alone by two publications that change u alone; then one of its rows changes: the next
+ * layer reads that segment's new vector alone and writes no other Puffin file again, as when t changed at every one */
+static void t_ice_idle(void)
+{
+    const char *dir = test_tmpdir();
+    OK(imdb_init(dir, false, NULL, E));
+    imdb_db *db = ice_open(dir);
+    CHECK(db);
+    if (!db) return;
+    keep_in_memory(db); /* every image kept, no window: the counts the layer's alone, whatever the mode */
+    imdb_session s;
+    imdb_session_init(&s, db);
+    OK(run(&s, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)"));
+    OK(run(&s, "CREATE TABLE u (id BIGINT PRIMARY KEY, v BIGINT)"));
+    char q[128];
+    for (int k = 0; k < 6; k++) { /* six segments, each with a dead row */
+        snprintf(q, sizeof q, "INSERT INTO t VALUES (%d, 1), (%d, 2), (%d, 3)", 10 * k, 10 * k + 1, 10 * k + 2);
+        OK(run(&s, q));
+        OK(run(&s, "CHECKPOINT"));
+        snprintf(q, sizeof q, "DELETE FROM t WHERE id = %d", 10 * k);
+        OK(run(&s, q));
+    }
+    OK(run(&s, "INSERT INTO u VALUES (1, 1)"));
+    OK(run(&s, "CHECKPOINT"));
+    for (int k = 2; k <= 4; k++) { /* u alone: t written alone once, then left untouched twice */
+        snprintf(q, sizeof q, "INSERT INTO u VALUES (%d, 1)", k);
+        OK(run(&s, q));
+        OK(run(&s, "CHECKPOINT"));
+    }
+    const imdb_table *t = imdb_table_by_name(db, "t");
+    CHECK(t);
+    if (!t) {
+        imdb_session_close(&s);
+        imdb_close(db);
+        return;
+    }
+    char n0[16][96], n1[16][96];
+    ino_t i0[16], i1[16];
+    int c0 = puffins(dir, t, n0, i0, 16);
+    CHECK(c0 == 6);
+    uint64_t r0 = imdb_iceberg_reads(db);
+    OK(run(&s, "UPDATE t SET v = 9 WHERE id = 31"));
+    OK(run(&s, "CHECKPOINT")); /* one vector changed: it alone read */
+    uint64_t reads = imdb_iceberg_reads(db) - r0;
+    int c1 = puffins(dir, t, n1, i1, 16), kept = 0, again = 0;
+    for (int a = 0; a < c0; a++)
+        for (int b = 0; b < c1; b++)
+            if (!strcmp(n0[a], n1[b])) i0[a] == i1[b] ? kept++ : again++;
+    if (reads != 1 || again || kept != 6) fprintf(stderr, "    reads %llu, Puffin files kept %d, written again %d\n", (unsigned long long)reads, kept, again);
+    CHECK(reads == 1 && again == 0 && kept == 6 && c1 == 7); /* the six the older snapshot reads, the changed one new */
+    CHECK(audit_says(dir, NULL) <= 0 && ice_verified(db));
+    imdb_session_close(&s);
+    imdb_close(db);
+}
+
+
+/* the older snapshot never below the table's horizon at the head (f5c-design 9.4): a COMPACT's PURGE BEFORE at the
+ * retained generation's commit keeps both (imagedb answers AS OF there), one past it leaves the head alone (imagedb
+ * refuses AS OF there, and that generation's files still hold the versions purged); VERIFY and the auditor take each */
+static void t_ice_horizon(void)
+{
+    const char *dir = test_tmpdir();
+    OK(imdb_init(dir, false, NULL, E));
+    imdb_db *db = ice_open(dir);
+    CHECK(db);
+    if (!db) return;
+    imdb_session s;
+    imdb_session_init(&s, db);
+    OK(run(&s, "CREATE TABLE a (id BIGINT PRIMARY KEY, v BIGINT)"));
+    OK(run(&s, "CREATE TABLE b (id BIGINT PRIMARY KEY, v BIGINT)"));
+    OK(run(&s, "INSERT INTO a VALUES (1, 1), (2, 2)"));
+    OK(run(&s, "INSERT INTO b VALUES (1, 1), (2, 2)"));
+    OK(run(&s, "CHECKPOINT"));
+    OK(run(&s, "UPDATE a SET v = 10 WHERE id = 1"));
+    OK(run(&s, "UPDATE b SET v = 10 WHERE id = 1"));
+    OK(run(&s, "CHECKPOINT"));
+    uint64_t P = db->lake_seq; /* what the COMPACT's publication retains */
+    char q[160];
+    snprintf(q, sizeof q, "COMPACT a PURGE BEFORE %llu", (unsigned long long)P);
+    OK(run(&s, q)); /* the horizon at P itself: AS OF P answered, so both snapshots */
+    CHECK(ice_nsnaps(db, dir, "a") == 2 && ice_nsnaps(db, dir, "b") == 1);
+    snprintf(q, sizeof q, "SELECT v FROM a AS OF %llu WHERE id = 1", (unsigned long long)P);
+    OK(run(&s, q));
+    CHECK(ice_verified(db) && audit_says(dir, NULL) <= 0);
+    OK(run(&s, "UPDATE a SET v = 20 WHERE id = 2"));
+    OK(run(&s, "CHECKPOINT"));
+    uint64_t P2 = db->lake_seq;
+    CHECK(ice_nsnaps(db, dir, "a") == 2);
+    OK(run(&s, "UPDATE b SET v = 20 WHERE id = 2")); /* a commit past P2, so the horizon can pass it */
+    snprintf(q, sizeof q, "COMPACT a PURGE BEFORE %llu", (unsigned long long)db->seq);
+    OK(run(&s, q)); /* past P2: the head alone */
+    int n = ice_nsnaps(db, dir, "a");
+    if (n != 1) fprintf(stderr, "    a: %d snapshots past its horizon\n", n);
+    CHECK(n == 1);
+    snprintf(q, sizeof q, "SELECT v FROM a AS OF %llu WHERE id = 1", (unsigned long long)P2);
+    CHECK(run(&s, q) == IMDB_ERR_HISTORY);
+    CHECK(ice_verified(db) && audit_says(dir, NULL) <= 0);
+    imdb_session_close(&s);
+    imdb_close(db);
+}
+
 const test_case ice_tests[] = {
     {"ice_roaring", t_ice_roaring},
     {"ice_json", t_ice_json},
@@ -1010,5 +1327,9 @@ const test_case ice_tests[] = {
     {"ice_cut", t_ice_cut},
     {"ice_restore", t_ice_restore},
     {"ice_values", t_ice_values},
+    {"ice_changed", t_ice_changed},
+    {"ice_untouched", t_ice_untouched},
+    {"ice_idle", t_ice_idle},
+    {"ice_horizon", t_ice_horizon},
 };
 const size_t ice_ntests = sizeof ice_tests / sizeof *ice_tests;

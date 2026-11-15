@@ -2163,6 +2163,8 @@ typedef struct state {
     uint8_t lake_prev[32];
     uint8_t last_manifest[32];     /* the manifest recorded by the latest publishing commit so far */
     uint8_t lake_prev_manifest[32]; /* what the snapshot's prev_manifest must be */
+    uint64_t lake_prev_time;  /* F5c: the time of the commit before the lake's (its tables' changed_us where they changed) */
+    bool lake_prev_time_known; /* that commit read (or FLOOR's) */
     bool dur_present, dur_synced, dur_strict; /* DURABLE: the writer's durable watermark */
     keys K;                  /* the writer keys so far */
     int anc_n;               /* --anchor: its intact records (checked once the log's keys are known) */
@@ -4759,6 +4761,8 @@ static int replay(state *S, int dirfd, uint64_t *commits)
                 memcpy(S->lake_prev, c.prev, 32);
                 for (uint32_t i = 0; i < c.nops; i++)
                     if (c.ops[i].manifest && memcmp(c.ops[i].manifest, S->lake_manifest, 32) == 0) S->lake_recorded = true;
+                S->lake_prev_time = last_time; /* F5c: the commit before the lake's (FLOOR's when it is the first read) */
+                S->lake_prev_time_known = true;
             }
             for (uint32_t i = 0; !rc && i < c.nops; i++) { /* history horizon as of the lake snapshot */
                 const op *o = &c.ops[i];
@@ -5365,6 +5369,8 @@ typedef struct mtable {
     uint64_t retention; /* SET_RETENTION's microseconds, or all ones */
     uint64_t created_at, dropped_at; /* version 5: the commits that created and dropped it (0: live) */
     uint32_t nvers;      /* F1: its schema versions, from the manifest's history (version 1 alone: s) */
+    uint64_t changed, changed_us; /* F5c (manifest 21): the publication that last changed what the layer reads, its time */
+    uint8_t lkey[32];             /* F5c: the SHA-256 of those spans (parse_manifest), what the next manifest is compared by */
     struct aver *vers;
     val missing[MAX_COLS]; /* by position: what a row of an older version reads for a column added after it */
     uint8_t *missing_text[MAX_COLS];
@@ -5638,10 +5644,11 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
     rd r = {b, len, 0, false};
     const uint8_t *mg = rd_bytes(&r, 8);
     uint32_t mver = mg && memcmp(mg, "IMDBMAN1", 8) == 0 ? rd_u32(&r) : 0;
+    if (mver == 20) return fail("manifest version 20: written before each table's last change was recorded (manifest 21, F5c), which this auditor does not read");
     if (mver == 19) return fail("manifest version 19: written before segments named by their tail (manifest 20, F5b), which this auditor does not read");
     if (mver == 18) return fail("manifest version 18: written before Parquet segments (manifest 19, F5), which this auditor does not read");
     if (mver == 17) return fail("manifest version 17: written before roles (manifest 18), which this auditor does not read");
-    if (mver != 20) return fail("manifest: bad header (version 20 only: segments named by their tail, F5b)");
+    if (mver != 21) return fail("manifest: bad header (version 21 only: each table's last change, F5c)");
     uint32_t nsec = rd_u32(&r); /* every section, in order: 1 tables, 2 views, 3 sequences (F2a-2), 4 ENUM types (F3g), 5 roles
                                  * and 6 grants (L), 7-11 reserved and empty */
     const uint8_t *id = rd_bytes(&r, 16);
@@ -5661,15 +5668,22 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
     m->nt = nt;
     for (uint32_t i = 0; i < nt; i++) {
         mtable *t = &m->t[i];
+        size_t sp[5][2]; /* F5c: what the layer reads, as the entry encodes it: the schema, the vid count, the segments, the
+                          * drop, the history (its own spans; the engine's lkey_of) */
+        sp[0][0] = r.o;
         uint32_t sl = rd_u32(&r);
         const uint8_t *sb = rd_bytes(&r, sl);
         if (!sb) return fail("manifest: truncated");
+        sp[0][1] = r.o;
         rd sr = {sb, sl, 0, false};
         if (decode_schema(&sr, &t->s) || rd_left(&sr) || t->s.id != i) return fail("manifest: bad schema");
         t->horizon = rd_u64(&r);
         t->live = rd_u64(&r);
+        sp[1][0] = r.o;
         t->versions = rd_u64(&r);
+        sp[1][1] = r.o;
         const uint8_t *lh = rd_bytes(&r, 2048);
+        sp[2][0] = r.o;
         t->nseg = rd_u32(&r);
         if (r.bad || t->nseg > 65536 || t->nseg > rd_left(&r) / 68 || t->live > t->versions) return fail("manifest: malformed");
         memcpy(t->lthash, lh, 2048);
@@ -5683,6 +5697,7 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
             memcpy(t->seg[k], sg, 32);
             memcpy(t->dv[k], dv, 32);
         }
+        sp[2][1] = r.o;
         /* indexes, sorted by name; their names unique across tables (checked below) */
         t->nidx = rd_u32(&r);
         if (r.bad || t->nidx > MAX_INDEXES) return fail("manifest: bad index count");
@@ -5701,12 +5716,15 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
         if (r.bad || (t->retention != UINT64_MAX && (t->retention < RETAIN_MIN_US || t->retention > RETAIN_MAX_US)))
             return fail("manifest: bad retention");
         t->created_at = rd_u64(&r);
+        sp[3][0] = r.o;
         t->dropped_at = rd_u64(&r);
+        sp[3][1] = r.o;
         if (r.bad || !t->created_at || t->created_at > m->seq ||
             (t->dropped_at && (t->dropped_at <= t->created_at || t->dropped_at > m->seq || t->live)))
             return fail("manifest: bad creation or drop commits");
         /* F1: its schema history: version 1's schema, then each ALTER at its commit, by alter_next alone (the catalog's
          * rules are the log's), after the CREATE, at or before the snapshot, before a drop, ending at its schema */
+        sp[4][0] = r.o;
         uint32_t na = rd_u32(&r);
         if (r.bad || na >= 256) return fail("manifest: bad schema history");
         t->vers = xcalloc(na + 1, sizeof *t->vers);
@@ -5779,6 +5797,15 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
             checks_free(o.ck, o.nck); /* F2b-1: an ADD CHECK's, the version holds its own copy */
             free(o.fk); /* F2b-2: an ADD FOREIGN KEY's too */
         }
+        sp[4][1] = r.o;
+        a_sha256_ctx kc;
+        a_sha256_init(&kc);
+        for (int k = 0; k < 5; k++) a_sha256_update(&kc, r.p + sp[k][0], sp[k][1] - sp[k][0]);
+        a_sha256_final(&kc, t->lkey);
+        t->changed = rd_u64(&r); /* F5c: at or after its last ALTER and its drop, at or before the snapshot */
+        t->changed_us = rd_u64(&r);
+        if (r.bad || t->changed < last || t->changed > m->seq || (t->dropped_at && t->changed < t->dropped_at))
+            return fail("manifest: table %s's last change is not after its history and at or before its commit", t->s.name);
         const schema *ls = &t->vers[t->nvers - 1].s;
         if (ls->rawlen != t->s.rawlen || memcmp(ls->raw, t->s.raw, t->s.rawlen) != 0)
             return fail("manifest: the schema history of table %s does not end at its schema", t->s.name);
@@ -6652,6 +6679,40 @@ static bool same_history(const mtable *mt, const table *t)
 }
 
 
+/* F5c (manifest 21): each table's last change by the one-step rule against the generation the head retains: a table
+ * whose entry differs from that generation's in what the layer reads (lkey), a table new since, and every table where
+ * none is retained (an ERASE's head, the first) changed at the head's commit, at the time of the commit before it (where
+ * this log holds that commit); the others carry the retained generation's commit and time */
+static int check_changed(int dirfd, const manifest *m, const state *S)
+{
+    manifest pm;
+    memset(&pm, 0, sizeof pm);
+    bool have = false;
+    int rc = 0;
+    if (!all_zero(m->prev_manifest, 32)) {
+        int ofd = openat(dirfd, "objects", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        uint8_t *pb = NULL;
+        size_t pl = 0;
+        if (ofd < 0) rc = fail("objects/: cannot open");
+        else if (obj_read(ofd, m->prev_manifest, ".man", &pb, &pl) || parse_manifest(pb, pl, &pm)) rc = -1;
+        else have = true;
+        free(pb);
+        if (ofd >= 0) close(ofd);
+    }
+    for (uint32_t i = 0; !rc && i < m->nt; i++) {
+        const mtable *t = &m->t[i];
+        bool carried = have && i < pm.nt && !memcmp(pm.t[i].lkey, t->lkey, 32);
+        uint64_t want = carried ? pm.t[i].changed : m->seq;
+        if (t->changed != want)
+            rc = fail("table %s: the manifest says its layer last changed at commit %llu, the lake gives %llu", t->s.name,
+                      (unsigned long long)t->changed, (unsigned long long)want);
+        else if (carried ? t->changed_us != pm.t[i].changed_us : S->lake_prev_time_known && t->changed_us != S->lake_prev_time)
+            rc = fail("table %s: the manifest gives its last change another time than the log's", t->s.name);
+    }
+    if (have) manifest_free(&pm);
+    return rc;
+}
+
 /* ---- F5c: the Iceberg layer, read by the auditor's own readers (aice.c) ---------------------------------------- */
 
 typedef struct icheck {
@@ -6768,13 +6829,13 @@ static bool ice_path(const uint8_t *p, size_t l, char *out, size_t cap)
     return strlen(out) == l;
 }
 
-/* one snapshot of table t at S (its generation's entry t, the older's older or NULL), under head H: its manifest list,
+/* one snapshot of table t labelled S, read at its generation's commit at (its entry t; the head's older or NULL): its manifest list,
  * its data manifest (each of the generation's segments in order, ADDED or EXISTING as the older holds it, its rows, an
  * EXISTING one's sequence numbers and first row the older's) and its vectors (each exactly the rows its data file holds
  * that are not visible at S); its first-row-id above every vid its files hold. ofr: the older's files' first rows (out,
  * for the head's EXISTING ones); *rows: the rows its data files hold */
 static int ice_snap(int ofd, int mfd, const char *loc, const char *mloc, const mtable *t, const mtable *older, uint64_t S,
-                    uint64_t S0, uint64_t H, const char *list, uint64_t first_row, uint64_t *ofr, const uint64_t *ofr_old,
+                    uint64_t S0, uint64_t at, const char *list, uint64_t first_row, uint64_t *ofr, const uint64_t *ofr_old,
                     uint64_t *rows, inames *nm, icheck *ic)
 {
     dcache dc = {xcalloc(t->nseg ? t->nseg : 1, sizeof(uint64_t *)), xcalloc(t->nseg ? t->nseg : 1, sizeof(size_t)),
@@ -6789,7 +6850,8 @@ static int ice_snap(int ofd, int mfd, const char *loc, const char *mloc, const m
     const char *why;
     int rc = aocf_read(lb, ll, &lo, &why) ? fail("iceberg: %s: %s", list, why) : 0;
     char want[4500];
-    snprintf(want, sizeof want, "%s/snap-%llu-h%llu.avro", mloc, (unsigned long long)S, (unsigned long long)H);
+    if (older) snprintf(want, sizeof want, "%s/snap-%llu-%llu.avro", mloc, (unsigned long long)S, (unsigned long long)S0);
+    else snprintf(want, sizeof want, "%s/snap-%llu.avro", mloc, (unsigned long long)S); /* F5c 9.1: names carry the labels */
     if (!rc && strcmp(list, want)) rc = fail("iceberg: table %s: snapshot %llu's manifest list is not its own", t->s.name, (unsigned long long)S);
     arr r = {lo.records, lo.rlen, 0, false};
     uint32_t ndata = 0, ndel = 0;
@@ -6914,7 +6976,7 @@ static int ice_snap(int ofd, int mfd, const char *loc, const char *mloc, const m
                         rc = fail("iceberg: %s: its blob is not the entry's", pp2);
                     else if (adv_read(pb + off, (size_t)clen, &got, &gn, &why))
                         rc = fail("iceberg: %s: %s", pp2, why);
-                    else if (dead_get(ofd, t, k, S, &dc, &wantc, &wn, NULL))
+                    else if (dead_get(ofd, t, k, at, &dc, &wantc, &wn, NULL))
                         rc = -1;
                     else if (gn != wn || (gn && memcmp(got, wantc, gn * sizeof *got)) || (uint64_t)count != gn)
                         rc = fail("iceberg: table %s: snapshot %llu's vector of segment %u is not the rows it holds that are "
@@ -6939,7 +7001,7 @@ static int ice_snap(int ofd, int mfd, const char *loc, const char *mloc, const m
         for (uint32_t k = 0; !rc && content == 1 && k < t->nseg; k++) { /* a segment with rows not visible and no vector */
             const uint64_t *wantc = NULL;
             size_t wn = 0;
-            if (!seen[k] && !(rc = dead_get(ofd, t, k, S, &dc, &wantc, &wn, NULL)) && wn)
+            if (!seen[k] && !(rc = dead_get(ofd, t, k, at, &dc, &wantc, &wn, NULL)) && wn)
                 rc = fail("iceberg: table %s: snapshot %llu: segment %u holds rows not visible and no vector", t->s.name,
                           (unsigned long long)S, k);
         }
@@ -6950,7 +7012,7 @@ static int ice_snap(int ofd, int mfd, const char *loc, const char *mloc, const m
         const uint64_t *wantc = NULL;
         uint64_t mv = 0;
         size_t wn = 0;
-        if (!(rc = dead_get(ofd, t, k, S, &dc, &wantc, &wn, &mv))) {
+        if (!(rc = dead_get(ofd, t, k, at, &dc, &wantc, &wn, &mv))) {
             if (t->nrows[k] && (!anyvid || mv > maxvid)) maxvid = mv, anyvid = true;
             if (!ndel && wn)
                 rc = fail("iceberg: table %s: snapshot %llu: rows not visible and no vectors", t->s.name, (unsigned long long)S);
@@ -7111,6 +7173,783 @@ static int ice_schemas(const mtable *t, const aj *sc, uint32_t cur)
     return 0;
 }
 
+static uint32_t ver_at_a(const mtable *t, uint64_t S);
+
+/* ---- F5c step C: each file of a table's layer made again by the auditor's own writers (nothing shared with the
+ * engine's iceberg.c and icecodec.c: the layer's form written out from f5c-design.md 8 and 9.1 and Iceberg's spec) and
+ * compared with the file byte for byte, so every byte is checked, not only what the checks above model ---- */
+
+typedef struct ibf {
+    uint8_t *p;
+    size_t n, cap;
+} ibf;
+
+static void ib_put(ibf *b, const void *p, size_t n)
+{
+    if (b->n + n > b->cap) {
+        size_t c = b->cap ? b->cap : 256;
+        while (c < b->n + n) c *= 2;
+        b->p = xrealloc(b->p, c, 1);
+        b->cap = c;
+    }
+    if (n) memcpy(b->p + b->n, p, n);
+    b->n += n;
+}
+static void ib_u8(ibf *b, uint8_t v) { ib_put(b, &v, 1); }
+static void ib_str(ibf *b, const char *s) { ib_put(b, s, strlen(s)); }
+static void ib_le32(ibf *b, uint32_t v)
+{
+    uint8_t t[4] = {(uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16), (uint8_t)(v >> 24)};
+    ib_put(b, t, 4);
+}
+static void ib_le64(ibf *b, uint64_t v)
+{
+    ib_le32(b, (uint32_t)v);
+    ib_le32(b, (uint32_t)(v >> 32));
+}
+static void ib_le16(ibf *b, uint16_t v)
+{
+    uint8_t t[2] = {(uint8_t)v, (uint8_t)(v >> 8)};
+    ib_put(b, t, 2);
+}
+static void ib_be32(ibf *b, uint32_t v)
+{
+    uint8_t t[4] = {(uint8_t)(v >> 24), (uint8_t)(v >> 16), (uint8_t)(v >> 8), (uint8_t)v};
+    ib_put(b, t, 4);
+}
+static void ib_u64d(ibf *b, uint64_t v)
+{
+    char t[24];
+    snprintf(t, sizeof t, "%llu", (unsigned long long)v);
+    ib_str(b, t);
+}
+static void ib_i64d(ibf *b, int64_t v)
+{
+    char t[24];
+    snprintf(t, sizeof t, "%lld", (long long)v);
+    ib_str(b, t);
+}
+
+/* JSON as the layer writes it: no space, a comma between members, a string's quote and backslash escaped, every other
+ * byte below 0x20 as \u00xx in lower case, the rest as it is */
+typedef struct jw {
+    ibf *b;
+    int depth;
+    bool more[24];
+    bool key;
+} jw;
+static void jw_sep(jw *w)
+{
+    if (w->key) {
+        w->key = false;
+        return;
+    }
+    if (w->depth && w->more[w->depth]) ib_u8(w->b, ',');
+    if (w->depth) w->more[w->depth] = true;
+}
+static void jw_open(jw *w, char c)
+{
+    jw_sep(w);
+    ib_u8(w->b, (uint8_t)c);
+    if (w->depth + 1 < 24) w->depth++;
+    w->more[w->depth] = false;
+}
+static void jw_close(jw *w, char c)
+{
+    ib_u8(w->b, (uint8_t)c);
+    if (w->depth) w->depth--;
+}
+static void jw_q(ibf *b, const uint8_t *s, size_t n)
+{
+    static const char hx[] = "0123456789abcdef";
+    ib_u8(b, '"');
+    for (size_t i = 0; i < n; i++) {
+        if (s[i] == '"' || s[i] == '\\') {
+            ib_u8(b, '\\');
+            ib_u8(b, s[i]);
+        } else if (s[i] < 0x20) {
+            uint8_t u[6] = {'\\', 'u', '0', '0', (uint8_t)hx[s[i] >> 4], (uint8_t)hx[s[i] & 15]};
+            ib_put(b, u, 6);
+        } else {
+            ib_u8(b, s[i]);
+        }
+    }
+    ib_u8(b, '"');
+}
+static void jw_key(jw *w, const char *k)
+{
+    jw_sep(w);
+    jw_q(w->b, (const uint8_t *)k, strlen(k));
+    ib_u8(w->b, ':');
+    w->key = true;
+}
+static void jw_str(jw *w, const uint8_t *s, size_t n)
+{
+    jw_sep(w);
+    jw_q(w->b, s, n);
+}
+static void jw_cstr(jw *w, const char *s) { jw_str(w, (const uint8_t *)s, strlen(s)); }
+static void jw_i64(jw *w, int64_t v)
+{
+    jw_sep(w);
+    ib_i64d(w->b, v);
+}
+static void jw_raw(jw *w, const char *s)
+{
+    jw_sep(w);
+    ib_str(w->b, s);
+}
+
+/* Avro: a long's zigzag varint; bytes and strings by their length; an object container file of one block, codec null,
+ * its metadata map avro.schema, avro.codec, then the pairs */
+static void av_long(ibf *b, int64_t v)
+{
+    uint64_t z = ((uint64_t)v << 1) ^ (uint64_t)(v >> 63);
+    while (z >= 0x80) {
+        ib_u8(b, (uint8_t)(z | 0x80));
+        z >>= 7;
+    }
+    ib_u8(b, (uint8_t)z);
+}
+static void av_str(ibf *b, const char *s)
+{
+    av_long(b, (int64_t)strlen(s));
+    ib_str(b, s);
+}
+static void av_file(ibf *out, const char *sch, const char *const *pairs, uint32_t npairs, const uint8_t sync[16], uint64_t nrec,
+                    const ibf *rec)
+{
+    ib_put(out, "Obj\x01", 4);
+    av_long(out, (int64_t)npairs + 2);
+    av_str(out, "avro.schema");
+    av_str(out, sch);
+    av_str(out, "avro.codec");
+    av_str(out, "null");
+    for (uint32_t k = 0; k < npairs; k++) {
+        av_str(out, pairs[2 * k]);
+        av_str(out, pairs[2 * k + 1]);
+    }
+    av_long(out, 0);
+    ib_put(out, sync, 16);
+    av_long(out, (int64_t)nrec);
+    av_long(out, (int64_t)rec->n);
+    ib_put(out, rec->p, rec->n);
+    ib_put(out, sync, 16);
+}
+
+/* Iceberg v3's manifest entry and manifest file schemas as the layer writes them (format constants, the auditor's copy) */
+static const char aEntrySchema[] =
+    "{\"type\":\"record\",\"name\":\"manifest_entry\",\"fields\":["
+    "{\"name\":\"status\",\"type\":\"int\",\"field-id\":0},"
+    "{\"name\":\"snapshot_id\",\"type\":[\"null\",\"long\"],\"default\":null,\"field-id\":1},"
+    "{\"name\":\"sequence_number\",\"type\":[\"null\",\"long\"],\"default\":null,\"field-id\":3},"
+    "{\"name\":\"file_sequence_number\",\"type\":[\"null\",\"long\"],\"default\":null,\"field-id\":4},"
+    "{\"name\":\"data_file\",\"type\":{\"type\":\"record\",\"name\":\"r2\",\"fields\":["
+    "{\"name\":\"content\",\"type\":\"int\",\"field-id\":134},"
+    "{\"name\":\"file_path\",\"type\":\"string\",\"field-id\":100},"
+    "{\"name\":\"file_format\",\"type\":\"string\",\"field-id\":101},"
+    "{\"name\":\"partition\",\"type\":{\"type\":\"record\",\"name\":\"r102\",\"fields\":[]},\"field-id\":102},"
+    "{\"name\":\"record_count\",\"type\":\"long\",\"field-id\":103},"
+    "{\"name\":\"file_size_in_bytes\",\"type\":\"long\",\"field-id\":104},"
+    "{\"name\":\"first_row_id\",\"type\":[\"null\",\"long\"],\"default\":null,\"field-id\":142},"
+    "{\"name\":\"referenced_data_file\",\"type\":[\"null\",\"string\"],\"default\":null,\"field-id\":143},"
+    "{\"name\":\"content_offset\",\"type\":[\"null\",\"long\"],\"default\":null,\"field-id\":144},"
+    "{\"name\":\"content_size_in_bytes\",\"type\":[\"null\",\"long\"],\"default\":null,\"field-id\":145}"
+    "]},\"field-id\":2}]}";
+static const char aListSchema[] =
+    "{\"type\":\"record\",\"name\":\"manifest_file\",\"fields\":["
+    "{\"name\":\"manifest_path\",\"type\":\"string\",\"field-id\":500},"
+    "{\"name\":\"manifest_length\",\"type\":\"long\",\"field-id\":501},"
+    "{\"name\":\"partition_spec_id\",\"type\":\"int\",\"field-id\":502},"
+    "{\"name\":\"content\",\"type\":\"int\",\"field-id\":517},"
+    "{\"name\":\"sequence_number\",\"type\":\"long\",\"field-id\":515},"
+    "{\"name\":\"min_sequence_number\",\"type\":\"long\",\"field-id\":516},"
+    "{\"name\":\"added_snapshot_id\",\"type\":\"long\",\"field-id\":503},"
+    "{\"name\":\"added_files_count\",\"type\":\"int\",\"field-id\":504},"
+    "{\"name\":\"existing_files_count\",\"type\":\"int\",\"field-id\":505},"
+    "{\"name\":\"deleted_files_count\",\"type\":\"int\",\"field-id\":506},"
+    "{\"name\":\"added_rows_count\",\"type\":\"long\",\"field-id\":512},"
+    "{\"name\":\"existing_rows_count\",\"type\":\"long\",\"field-id\":513},"
+    "{\"name\":\"deleted_rows_count\",\"type\":\"long\",\"field-id\":514},"
+    "{\"name\":\"first_row_id\",\"type\":[\"null\",\"long\"],\"default\":null,\"field-id\":520}"
+    "]}";
+
+/* a 64-bit roaring bitmap of ascending positions, portable format, no run containers (cookie 12346): a 32-bit bitmap
+ * per high half, each container an array to 4,096 values, else a bitset */
+static void ar_roaring(ibf *b, const uint64_t *pos, size_t n)
+{
+    uint64_t nk = 0;
+    for (size_t i = 0; i < n; i++) nk += !i || (pos[i] >> 32) != (pos[i - 1] >> 32);
+    ib_le64(b, nk);
+    for (size_t i = 0; i < n;) {
+        size_t k = i;
+        while (k < n && (pos[k] >> 32) == (pos[i] >> 32)) k++;
+        ib_le32(b, (uint32_t)(pos[i] >> 32));
+        size_t nc = 0;
+        for (size_t q = i; q < k; q++) nc += q == i || ((uint32_t)pos[q] >> 16) != ((uint32_t)pos[q - 1] >> 16);
+        ib_le32(b, 12346);
+        ib_le32(b, (uint32_t)nc);
+        for (size_t q = i; q < k;) { /* each container's key and its cardinality less one */
+            size_t r = q;
+            while (r < k && ((uint32_t)pos[r] >> 16) == ((uint32_t)pos[q] >> 16)) r++;
+            ib_le16(b, (uint16_t)((uint32_t)pos[q] >> 16));
+            ib_le16(b, (uint16_t)(r - q - 1));
+            q = r;
+        }
+        uint32_t off = 8 + 8 * (uint32_t)nc;
+        for (size_t q = i; q < k;) {
+            size_t r = q;
+            while (r < k && ((uint32_t)pos[r] >> 16) == ((uint32_t)pos[q] >> 16)) r++;
+            ib_le32(b, off);
+            off += r - q <= 4096 ? 2 * (uint32_t)(r - q) : 8192;
+            q = r;
+        }
+        for (size_t q = i; q < k;) {
+            size_t r = q;
+            while (r < k && ((uint32_t)pos[r] >> 16) == ((uint32_t)pos[q] >> 16)) r++;
+            if (r - q <= 4096) {
+                for (size_t s = q; s < r; s++) ib_le16(b, (uint16_t)pos[s]);
+            } else {
+                uint8_t bits[8192];
+                memset(bits, 0, sizeof bits);
+                for (size_t s = q; s < r; s++) bits[((uint32_t)pos[s] & 0xffff) >> 3] |= (uint8_t)(1u << (pos[s] & 7));
+                ib_put(b, bits, sizeof bits);
+            }
+            q = r;
+        }
+        i = k;
+    }
+}
+
+/* a table's layer, the auditor's own: each file's name and bytes */
+typedef struct ifiles {
+    char (*name)[96];
+    ibf *body;
+    uint32_t n, cap;
+} ifiles;
+static ibf *if_add(ifiles *x, const char *name)
+{
+    for (uint32_t k = 0; k < x->n; k++)
+        if (!strcmp(x->name[k], name)) {
+            x->body[k].n = 0;
+            return &x->body[k];
+        }
+    if (x->n == x->cap) {
+        x->cap = x->cap ? 2 * x->cap : 16;
+        x->name = xrealloc(x->name, x->cap, sizeof *x->name);
+        x->body = xrealloc(x->body, x->cap, sizeof *x->body);
+    }
+    snprintf(x->name[x->n], sizeof x->name[0], "%s", name);
+    memset(&x->body[x->n], 0, sizeof x->body[0]);
+    return &x->body[x->n++];
+}
+static void if_free(ifiles *x)
+{
+    for (uint32_t k = 0; k < x->n; k++) free(x->body[k].p);
+    free(x->name);
+    free(x->body);
+}
+
+static void sync_a(uint32_t tid, uint64_t S, uint64_t P, const char *kind, uint8_t out[16])
+{
+    a_sha256_ctx c;
+    uint8_t b[20], h[32];
+    a_sha256_init(&c);
+    a_sha256_update(&c, "imagedb.iceberg.sync", 20);
+    for (int k = 0; k < 4; k++) b[k] = (uint8_t)(tid >> (8 * k));
+    for (int k = 0; k < 8; k++) b[4 + k] = (uint8_t)(S >> (8 * k)), b[12 + k] = (uint8_t)(P >> (8 * k));
+    a_sha256_update(&c, b, sizeof b);
+    a_sha256_update(&c, kind, strlen(kind));
+    a_sha256_final(&c, h);
+    memcpy(out, h, 16);
+}
+
+/* a 128-bit integer's digits to its scale (a DECIMAL's text: a leading zero below one) */
+static void dec_text(__int128 v, int scale, char *out, size_t cap)
+{
+    char dg[48];
+    int nd = 0;
+    unsigned __int128 a = v < 0 ? (unsigned __int128)0 - (unsigned __int128)v : (unsigned __int128)v;
+    do {
+        dg[nd++] = (char)('0' + (int)(a % 10));
+        a /= 10;
+    } while (a);
+    size_t n = 0;
+    if (v < 0) out[n++] = '-';
+    if (nd <= scale) {
+        out[n++] = '0';
+        out[n++] = '.';
+        for (int k = nd; k < scale; k++) out[n++] = '0';
+        for (int k = nd - 1; k >= 0; k--) out[n++] = dg[k];
+    } else {
+        for (int k = nd - 1; k >= scale; k--) out[n++] = dg[k];
+        if (scale) {
+            out[n++] = '.';
+            for (int k = scale - 1; k >= 0; k--) out[n++] = dg[k];
+        }
+    }
+    out[n < cap ? n : cap - 1] = 0;
+}
+
+/* an initial-default in Iceberg's single-value JSON (Appendix D), the auditor's own text of each type */
+static void jw_value(jw *w, const col *c, const val *v)
+{
+    char b[4200];
+    switch (c->type) {
+    case T_INT64: jw_i64(w, v->i); return;
+    case T_BOOL: jw_raw(w, v->i ? "true" : "false"); return;
+    case T_TEXT: jw_str(w, v->s, v->len); return;
+    case T_FLOAT64: { /* the shortest of 15, 16 and 17 digits that reads back, a fraction or an exponent always */
+        double d = float_value(v->i);
+        for (int prec = 15; prec <= 17; prec++) {
+            snprintf(b, sizeof b, "%.*g", prec, d);
+            if (prec == 17 || strtod(b, NULL) == d) break;
+        }
+        if (!strchr(b, '.') && !strchr(b, 'e') && !strchr(b, 'E')) strcat(b, ".0");
+        jw_raw(w, b);
+        return;
+    }
+    case T_DECIMAL: dec_text(v->wide ? (__int128)(((unsigned __int128)(uint64_t)v->hi << 64) | (uint64_t)v->i) : (__int128)v->i, c->scale, b, sizeof b); break;
+    case T_UUID: {
+        size_t n = 0;
+        for (int k = 0; k < 16 && v->len == 16; k++) {
+            if (k == 4 || k == 6 || k == 8 || k == 10) b[n++] = '-';
+            n += (size_t)snprintf(b + n, 3, "%02x", v->s[k]);
+        }
+        b[n] = 0;
+        break;
+    }
+    case T_BYTEA: {
+        size_t n = 0;
+        for (uint32_t k = 0; k < v->len && n + 3 < sizeof b; k++) n += (size_t)snprintf(b + n, 3, "%02x", v->s[k]);
+        b[n] = 0;
+        break;
+    }
+    default: { /* DATE, TIME, TIMESTAMP, TIMESTAMPTZ */
+        int64_t days = 0, tod = 0;
+        if (c->type == T_DATE) days = v->i;
+        else if (c->type == T_TIME) tod = v->i;
+        else {
+            days = v->i / 86400000000ll, tod = v->i % 86400000000ll;
+            if (tod < 0) tod += 86400000000ll, days--;
+        }
+        size_t n = 0;
+        if (c->type != T_TIME) {
+            int64_t y;
+            unsigned mo, d;
+            a_civil(days, &y, &mo, &d);
+            n += (size_t)snprintf(b + n, 32, "%04lld-%02u-%02u", (long long)y, mo, d);
+            if (c->type != T_DATE) b[n++] = 'T';
+        }
+        if (c->type != T_DATE)
+            n += (size_t)snprintf(b + n, 40, "%02lld:%02lld:%02lld.%06lld", (long long)(tod / 3600000000ll),
+                                  (long long)(tod / 60000000ll % 60), (long long)(tod / 1000000 % 60), (long long)(tod % 1000000));
+        if (c->type == T_TIMESTAMPTZ) n += (size_t)snprintf(b + n, 8, "+00:00");
+        b[n] = 0;
+        break;
+    }
+    }
+    jw_cstr(w, b);
+}
+
+/* schema version vi of table t (its manifest's history) as the layer's schema object */
+static void jw_schema(jw *w, const mtable *t, uint32_t vi)
+{
+    const struct aver *v = &t->vers[vi];
+    jw_open(w, '{');
+    jw_key(w, "type");
+    jw_cstr(w, "struct");
+    jw_key(w, "schema-id");
+    jw_i64(w, vi);
+    jw_key(w, "fields");
+    jw_open(w, '[');
+    for (int c = 0; c < v->s.ncols; c++) {
+        char tb[40];
+        const char *ty = ice_type_a(&v->s.c[c], tb, sizeof tb);
+        if (!ty) continue;
+        int p = v->pos[c];
+        bool req = !(v->s.c[c].flags & F_NULLABLE);
+        for (uint32_t vj = 0; req && vj < vi; vj++)
+            if (p < t->vers[vj].npos && t->vers[vj].at[p] >= 0 && (t->vers[vj].s.c[t->vers[vj].at[p]].flags & F_NULLABLE)) req = false;
+        jw_open(w, '{');
+        jw_key(w, "id");
+        jw_i64(w, p + 1);
+        jw_key(w, "name");
+        jw_cstr(w, v->s.c[c].name);
+        jw_key(w, "required");
+        jw_raw(w, req ? "true" : "false");
+        jw_key(w, "type");
+        jw_cstr(w, ty);
+        if (p >= t->vers[0].npos && !t->missing[p].null) {
+            jw_key(w, "initial-default");
+            jw_value(w, &v->s.c[c], &t->missing[p]);
+        }
+        jw_close(w, '}');
+    }
+    jw_close(w, ']');
+    jw_close(w, '}');
+}
+
+/* one snapshot as the layer writes it: its Puffin files, manifests and list into fs; *frow and *rows its first row and
+ * its files' rows; ofr: each file's first row (in: the older's, for an EXISTING one's search; out: this one's) */
+typedef struct asnap {
+    const mtable *t; /* its generation's entry */
+    uint64_t S, at;  /* its label and its read point */
+    int64_t ms;
+    uint32_t ver;
+    uint64_t first_row, added_rows, existing_rows, *frow_of; /* frow_of: each of its files' first row */
+} asnap;
+static int regen_snap(int ofd, const char *loc, const char *mloc, const mtable *head_t, asnap *sn, const asnap *older,
+                      ifiles *fs)
+{
+    const mtable *t = sn->t;
+    ibf data = {0}, dels = {0};
+    uint32_t nadded = 0, nexist = 0, ndel = 0;
+    uint64_t delrows = 0, next = sn->first_row;
+    sn->frow_of = xcalloc(t->nseg ? t->nseg : 1, sizeof *sn->frow_of);
+    dcache dc = {xcalloc(t->nseg ? t->nseg : 1, sizeof(uint64_t *)), xcalloc(t->nseg ? t->nseg : 1, sizeof(size_t)),
+                 xcalloc(t->nseg ? t->nseg : 1, sizeof(uint64_t)), xcalloc(t->nseg ? t->nseg : 1, 1), t->nseg};
+    int rc = 0;
+    for (uint32_t k = 0; !rc && k < t->nseg; k++) {
+        char hx[65], path[4400], sn2[80];
+        hex(t->seg[k], 32, hx);
+        snprintf(path, sizeof path, "%s/objects/%s.seg", loc, hx);
+        snprintf(sn2, sizeof sn2, "%s.seg", hx);
+        struct stat st;
+        if (fstatat(ofd, sn2, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+            rc = fail("iceberg: objects/%s: %s", sn2, strerror(errno));
+            break;
+        }
+        int64_t ofrid = -1; /* EXISTING: the older's file of this segment, its first row */
+        for (uint32_t q = 0; older && q < older->t->nseg && ofrid < 0; q++)
+            if (!memcmp(older->t->seg[q], t->seg[k], 32)) ofrid = (int64_t)older->frow_of[q];
+        bool existing = ofrid >= 0;
+        sn->frow_of[k] = existing ? (uint64_t)ofrid : next;
+        if (existing) nexist++, sn->existing_rows += t->nrows[k];
+        else next += t->nrows[k], nadded++, sn->added_rows += t->nrows[k];
+        av_long(&data, existing ? 0 : 1); /* status */
+        for (int q = 0; q < 3; q++) { /* snapshot_id, sequence_number, file_sequence_number: the older's where EXISTING */
+            av_long(&data, existing);
+            if (existing) av_long(&data, (int64_t)older->S);
+        }
+        av_long(&data, 0);
+        av_str(&data, path);
+        av_str(&data, "PARQUET");
+        av_long(&data, t->nrows[k]);
+        av_long(&data, (int64_t)st.st_size);
+        av_long(&data, existing);
+        if (existing) av_long(&data, ofrid);
+        av_long(&data, 0), av_long(&data, 0), av_long(&data, 0);
+        const uint64_t *pos;
+        size_t np = 0;
+        if ((rc = dead_get(ofd, t, k, sn->at, &dc, &pos, &np, NULL))) break;
+        if (!np) continue;
+        ibf blob = {0}, rb = {0}, foot = {0}, puf = {0};
+        static const uint8_t magic[4] = {0xd1, 0xd3, 0x39, 0x64};
+        ib_put(&rb, magic, 4);
+        ar_roaring(&rb, pos, np);
+        ib_be32(&blob, (uint32_t)rb.n);
+        ib_put(&blob, rb.p, rb.n);
+        ib_be32(&blob, aice_crc32(rb.p, rb.n));
+        jw w = {&foot, 0, {0}, false};
+        char card[24];
+        snprintf(card, sizeof card, "%zu", np);
+        jw_open(&w, '{');
+        jw_key(&w, "blobs");
+        jw_open(&w, '[');
+        jw_open(&w, '{');
+        jw_key(&w, "type");
+        jw_cstr(&w, "deletion-vector-v1");
+        jw_key(&w, "fields");
+        jw_open(&w, '[');
+        jw_i64(&w, 2147483645);
+        jw_close(&w, ']');
+        jw_key(&w, "snapshot-id");
+        jw_i64(&w, -1);
+        jw_key(&w, "sequence-number");
+        jw_i64(&w, -1);
+        jw_key(&w, "offset");
+        jw_i64(&w, 4);
+        jw_key(&w, "length");
+        jw_i64(&w, (int64_t)blob.n);
+        jw_key(&w, "properties");
+        jw_open(&w, '{');
+        jw_key(&w, "referenced-data-file");
+        jw_cstr(&w, path);
+        jw_key(&w, "cardinality");
+        jw_cstr(&w, card);
+        jw_close(&w, '}');
+        jw_close(&w, '}');
+        jw_close(&w, ']');
+        jw_key(&w, "properties");
+        jw_open(&w, '{');
+        jw_key(&w, "created-by");
+        jw_cstr(&w, "imagedb");
+        jw_close(&w, '}');
+        jw_close(&w, '}');
+        ib_str(&puf, "PFA1");
+        ib_put(&puf, blob.p, blob.n);
+        ib_str(&puf, "PFA1");
+        ib_put(&puf, foot.p, foot.n);
+        ib_le32(&puf, (uint32_t)foot.n);
+        ib_le32(&puf, 0);
+        ib_str(&puf, "PFA1");
+        a_sha256_ctx pc; /* its name: the SHA-256 of its segment's and its deletion vector's names */
+        uint8_t ph[32];
+        char px[65], pname[96], ppath[4600];
+        a_sha256_init(&pc);
+        a_sha256_update(&pc, t->seg[k], 32);
+        a_sha256_update(&pc, t->dv[k], 32);
+        a_sha256_final(&pc, ph);
+        hex(ph, 32, px);
+        snprintf(pname, sizeof pname, "dv-%s.puffin", px);
+        ibf *pb = if_add(fs, pname);
+        ib_put(pb, puf.p, puf.n);
+        snprintf(ppath, sizeof ppath, "%s/%s", mloc, pname);
+        av_long(&dels, 1); /* ADDED, its numbers inherited */
+        av_long(&dels, 0), av_long(&dels, 0), av_long(&dels, 0);
+        av_long(&dels, 1);
+        av_str(&dels, ppath);
+        av_str(&dels, "PUFFIN");
+        av_long(&dels, (int64_t)np);
+        av_long(&dels, (int64_t)puf.n);
+        av_long(&dels, 0);
+        av_long(&dels, 1), av_str(&dels, path);
+        av_long(&dels, 1), av_long(&dels, 4);
+        av_long(&dels, 1), av_long(&dels, (int64_t)blob.n);
+        ndel++, delrows += np;
+        free(blob.p), free(rb.p), free(foot.p), free(puf.p);
+    }
+    dcache_free(&dc);
+    uint64_t p = older ? older->S : 0;
+    char mdata[96], mdel[96], lname[96], sid[16], seqs[24], frs[24], par[24], path[4600];
+    if (older) snprintf(mdata, sizeof mdata, "m-%llu-%llu-data.avro", (unsigned long long)sn->S, (unsigned long long)p);
+    else snprintf(mdata, sizeof mdata, "m-%llu-data.avro", (unsigned long long)sn->S);
+    snprintf(mdel, sizeof mdel, "m-%llu-dv.avro", (unsigned long long)sn->S);
+    if (older) snprintf(lname, sizeof lname, "snap-%llu-%llu.avro", (unsigned long long)sn->S, (unsigned long long)p);
+    else snprintf(lname, sizeof lname, "snap-%llu.avro", (unsigned long long)sn->S);
+    snprintf(sid, sizeof sid, "%u", (unsigned)sn->ver);
+    snprintf(seqs, sizeof seqs, "%llu", (unsigned long long)sn->S);
+    snprintf(frs, sizeof frs, "%llu", (unsigned long long)sn->first_row);
+    snprintf(par, sizeof par, "%llu", (unsigned long long)p);
+    ibf scj = {0};
+    jw sw = {&scj, 0, {0}, false};
+    jw_schema(&sw, head_t, sn->ver);
+    ib_u8(&scj, 0);
+    uint64_t mdlen = 0, mvlen = 0;
+    if (!rc) {
+        const char *md[] = {"schema", (const char *)scj.p, "schema-id", sid, "partition-spec", "[]", "partition-spec-id", "0",
+                            "format-version", "3", "content", "data"};
+        uint8_t sy[16];
+        sync_a(head_t->s.id, sn->S, p, "data", sy);
+        ibf *fb = if_add(fs, mdata);
+        av_file(fb, aEntrySchema, md, 6, sy, t->nseg, &data);
+        mdlen = fb->n;
+        if (ndel) {
+            md[11] = "deletes";
+            sync_a(head_t->s.id, sn->S, 0, "deletes", sy);
+            fb = if_add(fs, mdel);
+            av_file(fb, aEntrySchema, md, 6, sy, ndel, &dels);
+            mvlen = fb->n;
+        }
+        ibf r = {0};
+        snprintf(path, sizeof path, "%s/%s", mloc, mdata);
+        av_str(&r, path);
+        av_long(&r, (int64_t)mdlen), av_long(&r, 0), av_long(&r, 0), av_long(&r, (int64_t)sn->S);
+        av_long(&r, (int64_t)(nexist && older ? older->S : sn->S)), av_long(&r, (int64_t)sn->S);
+        av_long(&r, nadded), av_long(&r, nexist), av_long(&r, 0);
+        av_long(&r, (int64_t)sn->added_rows), av_long(&r, (int64_t)sn->existing_rows), av_long(&r, 0);
+        av_long(&r, 1), av_long(&r, (int64_t)sn->first_row);
+        if (ndel) {
+            snprintf(path, sizeof path, "%s/%s", mloc, mdel);
+            av_str(&r, path);
+            av_long(&r, (int64_t)mvlen), av_long(&r, 0), av_long(&r, 1), av_long(&r, (int64_t)sn->S);
+            av_long(&r, (int64_t)sn->S), av_long(&r, (int64_t)sn->S);
+            av_long(&r, ndel), av_long(&r, 0), av_long(&r, 0);
+            av_long(&r, (int64_t)delrows), av_long(&r, 0), av_long(&r, 0);
+            av_long(&r, 0);
+        }
+        const char *lm[10];
+        uint32_t nl = 0;
+        lm[2 * nl] = "snapshot-id", lm[2 * nl++ + 1] = seqs;
+        if (older) lm[2 * nl] = "parent-snapshot-id", lm[2 * nl++ + 1] = par;
+        lm[2 * nl] = "sequence-number", lm[2 * nl++ + 1] = seqs;
+        lm[2 * nl] = "first-row-id", lm[2 * nl++ + 1] = frs;
+        lm[2 * nl] = "format-version", lm[2 * nl++ + 1] = "3";
+        sync_a(head_t->s.id, sn->S, p, "list", sy);
+        av_file(if_add(fs, lname), aListSchema, lm, nl, sy, ndel ? 2 : 1, &r);
+        free(r.p);
+    }
+    free(scj.p);
+    free(data.p);
+    free(dels.p);
+    return rc;
+}
+
+/* table t's layer made again (its state as check_iceberg found it: older the generation pm's entry or NULL) and compared
+ * with metadata/ file by file, the directory holding exactly those */
+static int regen_table(int ofd, int mfd, const char *loc, const char *mloc, const uint8_t db_id[16], const mtable *t,
+                       uint64_t H, const mtable *older, uint64_t P)
+{
+    ifiles fs = {0};
+    asnap sn[2];
+    memset(sn, 0, sizeof sn);
+    uint32_t ns = 0;
+    int rc = 0;
+    if (older) sn[ns++] = (asnap){older, older->changed, P, (int64_t)(older->changed_us / 1000), ver_at_a(t, P), older->versions, 0, 0, NULL};
+    sn[ns++] = (asnap){t, t->changed, H, (int64_t)(t->changed_us / 1000), ver_at_a(t, H), t->versions, 0, 0, NULL};
+    for (uint32_t k = 0; !rc && k < ns; k++) {
+        if (k) { /* a head with an older: above every vid and past the older's rows */
+            uint64_t past = sn[0].first_row + sn[0].added_rows + sn[0].existing_rows;
+            if (past > sn[k].first_row) sn[k].first_row = past;
+        }
+        rc = regen_snap(ofd, loc, mloc, t, &sn[k], k ? &sn[0] : NULL, &fs);
+    }
+    const asnap *hd = &sn[ns - 1];
+    uint64_t K = 2 * hd->S + (ns == 1);
+    if (!rc) { /* the table metadata, then its version hint */
+        a_sha256_ctx c;
+        uint8_t u[32], tb[4];
+        a_sha256_init(&c);
+        a_sha256_update(&c, "imagedb.iceberg.table", 21);
+        a_sha256_update(&c, db_id, 16);
+        for (int k = 0; k < 4; k++) tb[k] = (uint8_t)(t->s.id >> (8 * k));
+        a_sha256_update(&c, tb, 4);
+        a_sha256_final(&c, u);
+        u[6] = (uint8_t)((u[6] & 0x0f) | 0x80);
+        u[8] = (uint8_t)((u[8] & 0x3f) | 0x80);
+        char uuid[40], tl[4400], nm[96];
+        snprintf(uuid, sizeof uuid, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x", u[0], u[1], u[2], u[3],
+                 u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
+        snprintf(tl, sizeof tl, "%s/iceberg/%u", loc, (unsigned)t->s.id);
+        int64_t lastcol = 0;
+        for (uint32_t vi = 0; vi <= hd->ver; vi++)
+            for (int k = 0; k < t->vers[vi].s.ncols; k++)
+                if ((int64_t)t->vers[vi].pos[k] + 1 > lastcol) lastcol = (int64_t)t->vers[vi].pos[k] + 1;
+        snprintf(nm, sizeof nm, "v%llu.metadata.json", (unsigned long long)K);
+        ibf *mb = if_add(&fs, nm);
+        jw w = {mb, 0, {0}, false};
+        jw_open(&w, '{');
+        jw_key(&w, "format-version");
+        jw_i64(&w, 3);
+        jw_key(&w, "table-uuid");
+        jw_cstr(&w, uuid);
+        jw_key(&w, "location");
+        jw_cstr(&w, tl);
+        jw_key(&w, "last-sequence-number");
+        jw_i64(&w, (int64_t)hd->S);
+        jw_key(&w, "last-updated-ms");
+        jw_i64(&w, hd->ms);
+        jw_key(&w, "last-column-id");
+        jw_i64(&w, lastcol);
+        jw_key(&w, "current-schema-id");
+        jw_i64(&w, hd->ver);
+        jw_key(&w, "schemas");
+        jw_open(&w, '[');
+        for (uint32_t vi = 0; vi <= hd->ver; vi++) jw_schema(&w, t, vi);
+        jw_close(&w, ']');
+        jw_key(&w, "default-spec-id");
+        jw_i64(&w, 0);
+        jw_key(&w, "partition-specs");
+        jw_raw(&w, "[{\"spec-id\":0,\"fields\":[]}]");
+        jw_key(&w, "last-partition-id");
+        jw_i64(&w, 999);
+        jw_key(&w, "default-sort-order-id");
+        jw_i64(&w, 0);
+        jw_key(&w, "sort-orders");
+        jw_raw(&w, "[{\"order-id\":0,\"fields\":[]}]");
+        jw_key(&w, "properties");
+        jw_open(&w, '{');
+        jw_key(&w, "imagedb.table");
+        jw_cstr(&w, t->s.name);
+        jw_close(&w, '}');
+        jw_key(&w, "current-snapshot-id");
+        jw_i64(&w, (int64_t)hd->S);
+        jw_key(&w, "refs");
+        jw_open(&w, '{');
+        jw_key(&w, "main");
+        jw_open(&w, '{');
+        jw_key(&w, "snapshot-id");
+        jw_i64(&w, (int64_t)hd->S);
+        jw_key(&w, "type");
+        jw_cstr(&w, "branch");
+        jw_close(&w, '}');
+        jw_close(&w, '}');
+        jw_key(&w, "snapshots");
+        jw_open(&w, '[');
+        for (uint32_t k = 0; k < ns; k++) {
+            char lp[4600];
+            if (k) snprintf(lp, sizeof lp, "%s/snap-%llu-%llu.avro", mloc, (unsigned long long)sn[k].S, (unsigned long long)sn[0].S);
+            else snprintf(lp, sizeof lp, "%s/snap-%llu.avro", mloc, (unsigned long long)sn[k].S);
+            jw_open(&w, '{');
+            jw_key(&w, "snapshot-id");
+            jw_i64(&w, (int64_t)sn[k].S);
+            if (k) {
+                jw_key(&w, "parent-snapshot-id");
+                jw_i64(&w, (int64_t)sn[k - 1].S);
+            }
+            jw_key(&w, "sequence-number");
+            jw_i64(&w, (int64_t)sn[k].S);
+            jw_key(&w, "timestamp-ms");
+            jw_i64(&w, sn[k].ms);
+            jw_key(&w, "manifest-list");
+            jw_cstr(&w, lp);
+            jw_key(&w, "summary");
+            jw_open(&w, '{');
+            jw_key(&w, "operation");
+            jw_cstr(&w, k ? "overwrite" : "append");
+            jw_close(&w, '}');
+            jw_key(&w, "schema-id");
+            jw_i64(&w, sn[k].ver);
+            jw_key(&w, "first-row-id");
+            jw_i64(&w, (int64_t)sn[k].first_row);
+            jw_key(&w, "added-rows");
+            jw_i64(&w, (int64_t)sn[k].added_rows);
+            jw_close(&w, '}');
+        }
+        jw_close(&w, ']');
+        jw_key(&w, "snapshot-log");
+        jw_open(&w, '[');
+        for (uint32_t k = 0; k < ns; k++) {
+            jw_open(&w, '{');
+            jw_key(&w, "timestamp-ms");
+            jw_i64(&w, sn[k].ms);
+            jw_key(&w, "snapshot-id");
+            jw_i64(&w, (int64_t)sn[k].S);
+            jw_close(&w, '}');
+        }
+        jw_close(&w, ']');
+        jw_key(&w, "metadata-log");
+        jw_open(&w, '[');
+        jw_close(&w, ']');
+        jw_key(&w, "next-row-id");
+        jw_i64(&w, (int64_t)(hd->first_row + hd->added_rows + hd->existing_rows));
+        jw_close(&w, '}');
+        ibf *hb = if_add(&fs, "version-hint.text");
+        ib_u64d(hb, K);
+    }
+    for (uint32_t k = 0; !rc && k < fs.n; k++) { /* each file, byte for byte */
+        uint8_t *fb = NULL;
+        size_t fl = 0;
+        if (read_file(mfd, fs.name[k], &fb, &fl, 1ull << 30)) rc = -1;
+        else if (fl != fs.body[k].n || memcmp(fb, fs.body[k].p, fl))
+            rc = fail("iceberg: table %s: metadata/%s is not the file the lake gives (made again by the auditor's own writers)",
+                      t->s.name, fs.name[k]);
+        free(fb);
+    }
+    DIR *d = rc ? NULL : fdopendir(dup(mfd)); /* and nothing else */
+    for (struct dirent *de; d && !rc && (de = readdir(d));) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        bool named = false;
+        for (uint32_t k = 0; k < fs.n && !named; k++) named = !strcmp(fs.name[k], de->d_name);
+        if (!named) rc = fail("iceberg: table %s: metadata/%s is no file of its layer", t->s.name, de->d_name);
+    }
+    if (d) closedir(d);
+    for (uint32_t k = 0; k < ns; k++) free(sn[k].frow_of);
+    if_free(&fs);
+    return rc;
+}
+
 /* the older generation's objects of table entry t, each on disk (a seed brings the head generation's alone) */
 static bool older_on_disk(int ofd, const mtable *t)
 {
@@ -7155,7 +7994,7 @@ static int check_iceberg(int dirfd, const char *dir, const manifest *m, const st
     char want[4300];
     char mhx[65]; /* the head by its commit and LAKE_HEAD's manifest hash: another history's head at the same commit is stale */
     hex(S->lake_manifest, 32, mhx);
-    int wl = snprintf(want, sizeof want, "imagedb-iceberg 1\nhead %llu %s\nlocation %s\n", (unsigned long long)m->seq, mhx, loc);
+    int wl = snprintf(want, sizeof want, "imagedb-iceberg 2\nhead %llu %s\nlocation %s\n", (unsigned long long)m->seq, mhx, loc);
     if (read_file(icefd, "LAYER", &sb, &sl, 8192) || wl < 0 || (size_t)wl != sl || memcmp(sb, want, sl)) {
         printf("iceberg: a layer of another head or location (stale): not checked\n");
         free(sb);
@@ -7175,7 +8014,7 @@ static int check_iceberg(int dirfd, const char *dir, const manifest *m, const st
         else havepm = true;
         free(pb);
     }
-    bool pm_ok = havepm && pm.seq > S->boundary_at_lake && pm.seq >= S->floor; /* the engine's rule: durable state alone */
+    bool pm_ok = havepm && pm.seq > S->boundary_at_lake; /* the engine's rule (f5c-design 9.1): its time travels in its manifest */
     DIR *dd = rc ? NULL : fdopendir(dup(icefd)); /* no table's layer where the head gives none */
     for (struct dirent *de; dd && !rc && (de = readdir(dd));) {
         char *end = NULL;
@@ -7191,8 +8030,10 @@ static int check_iceberg(int dirfd, const char *dir, const manifest *m, const st
         const mtable *t = &m->t[ti];
         if (t->dropped_at || !t->nseg) continue;
         const mtable *older = NULL;
-        for (uint32_t q = 0; pm_ok && q < pm.nt && !older; q++)
-            if (pm.t[q].s.id == t->s.id && !pm.t[q].dropped_at && pm.t[q].nseg) older = &pm.t[q];
+        for (uint32_t q = 0; pm_ok && q < pm.nt && !older; q++) /* a table changed at the head: its last change in pm lower */
+            if (pm.t[q].s.id == t->s.id && !pm.t[q].dropped_at && pm.t[q].nseg && pm.t[q].changed < t->changed &&
+                pm.seq >= t->horizon) /* never below the table's horizon at the head: no AS OF answers there */
+                older = &pm.t[q];
         if (older && !older_on_disk(ofd, older)) older = NULL;
         char tdir[64], mloc[4400], name[96];
         snprintf(tdir, sizeof tdir, "%u/metadata", (unsigned)t->s.id);
@@ -7205,11 +8046,12 @@ static int check_iceberg(int dirfd, const char *dir, const manifest *m, const st
         inames nm = {0};
         uint8_t *hb = NULL, *jb = NULL;
         size_t hl = 0, jl = 0;
-        snprintf(name, sizeof name, "%llu", (unsigned long long)m->seq);
+        uint64_t K = 2 * t->changed + (older ? 0 : 1); /* its metadata's number, as the engine's (f5c-design 9.1) */
+        snprintf(name, sizeof name, "%llu", (unsigned long long)K);
         in_add(&nm, "version-hint.text");
         if (read_file(mfd, "version-hint.text", &hb, &hl, 64) || hl != strlen(name) || memcmp(hb, name, hl))
-            rc = fail("iceberg: table %s: its version hint is not the head", t->s.name);
-        snprintf(name, sizeof name, "v%llu.metadata.json", (unsigned long long)m->seq);
+            rc = fail("iceberg: table %s: its version hint is not its state's", t->s.name);
+        snprintf(name, sizeof name, "v%llu.metadata.json", (unsigned long long)K);
         in_add(&nm, name);
         aj md;
         memset(&md, 0, sizeof md);
@@ -7225,10 +8067,10 @@ static int check_iceberg(int dirfd, const char *dir, const manifest *m, const st
             char tl[4400];
             snprintf(tl, sizeof tl, "%s/iceberg/%u", loc, (unsigned)t->s.id);
             uint32_t want_n = older ? 2 : 1;
-            if (!fv || fv->kind != AJ_INT || fv->i != 3 || !cs || cs->kind != AJ_INT || cs->i != (int64_t)m->seq || !lc ||
+            if (!fv || fv->kind != AJ_INT || fv->i != 3 || !cs || cs->kind != AJ_INT || cs->i != (int64_t)t->changed || !lc ||
                 lc->kind != AJ_STR || strcmp(lc->s, tl) || !sn || sn->kind != AJ_ARR || sn->n != want_n || !lsn ||
-                lsn->kind != AJ_INT || lsn->i != (int64_t)m->seq || !csi || csi->kind != AJ_INT || csi->i != (int64_t)hver ||
-                !mrs || mrs->kind != AJ_INT || mrs->i != (int64_t)m->seq || !ptn || ptn->kind != AJ_STR || strcmp(ptn->s, t->s.name) ||
+                lsn->kind != AJ_INT || lsn->i != (int64_t)t->changed || !csi || csi->kind != AJ_INT || csi->i != (int64_t)hver ||
+                !mrs || mrs->kind != AJ_INT || mrs->i != (int64_t)t->changed || !ptn || ptn->kind != AJ_STR || strcmp(ptn->s, t->s.name) ||
                 !nri || nri->kind != AJ_INT)
                 rc = fail("iceberg: table %s: its metadata is not format 3 at the head with its snapshots (%u)", t->s.name, want_n);
             if (!rc) rc = ice_schemas(t, aj_get(&md, "schemas"), hver);
@@ -7237,19 +8079,21 @@ static int check_iceberg(int dirfd, const char *dir, const manifest *m, const st
             for (size_t k = 0; !rc && k < sn->n; k++) {
                 bool is_head = k + 1 == sn->n;
                 const mtable *gt = is_head ? t : older;
-                uint64_t Sk = is_head ? m->seq : pm.seq, rk = 0;
+                uint64_t Sk = gt->changed, at = is_head ? m->seq : pm.seq, rk = 0; /* its label, its read point */
+                int64_t frw = k ? (frow + rows > (int64_t)t->versions ? frow + rows : (int64_t)t->versions) : (int64_t)gt->versions;
                 const aj *so = &sn->v[k], *id = aj_get(so, "snapshot-id"), *sq = aj_get(so, "sequence-number"),
                          *ls = aj_get(so, "manifest-list"), *ts = aj_get(so, "timestamp-ms"), *fr = aj_get(so, "first-row-id"),
                          *par = aj_get(so, "parent-snapshot-id"), *ssid = aj_get(so, "schema-id");
                 if (!id || id->kind != AJ_INT || id->i != (int64_t)Sk || !sq || sq->kind != AJ_INT || sq->i != (int64_t)Sk || !ls ||
-                    ls->kind != AJ_STR || !ts || ts->kind != AJ_INT || ts->i < prev_ms || !fr || fr->kind != AJ_INT ||
-                    (k ? !par || par->kind != AJ_INT || par->i != (int64_t)pm.seq : par != NULL) || !ssid || ssid->kind != AJ_INT ||
-                    ssid->i != (int64_t)ver_at_a(t, Sk) || (k && fr->i != frow + rows) || (!k && fr->i != (int64_t)t->versions)) {
+                    ls->kind != AJ_STR || !ts || ts->kind != AJ_INT || ts->i != (int64_t)(gt->changed_us / 1000) || ts->i < prev_ms ||
+                    !fr || fr->kind != AJ_INT ||
+                    (k ? !par || par->kind != AJ_INT || par->i != (int64_t)older->changed : par != NULL) || !ssid || ssid->kind != AJ_INT ||
+                    ssid->i != (int64_t)ver_at_a(t, at) || fr->i != frw) {
                     rc = fail("iceberg: table %s: snapshot %zu is not the generation's", t->s.name, k);
                     break;
                 }
                 prev_ms = ts->i;
-                rc = ice_snap(ofd, mfd, loc, mloc, gt, is_head ? older : NULL, Sk, older ? pm.seq : 0, m->seq, ls->s, (uint64_t)fr->i,
+                rc = ice_snap(ofd, mfd, loc, mloc, gt, is_head ? older : NULL, Sk, older ? older->changed : 0, at, ls->s, (uint64_t)fr->i,
                               is_head ? ofr : ofr_old, ofr_old, &rk, &nm, &ic);
                 frow = fr->i;
                 rows = (int64_t)rk;
@@ -7258,6 +8102,7 @@ static int check_iceberg(int dirfd, const char *dir, const manifest *m, const st
             free(ofr_old);
             free(ofr);
         }
+        if (!rc) rc = regen_table(ofd, mfd, loc, mloc, m->db_id, t, m->seq, older, older ? pm.seq : 0); /* step C: every byte */
         DIR *md2 = rc ? NULL : fdopendir(dup(mfd)); /* its directory: exactly the files the metadata names */
         for (struct dirent *de; md2 && !rc && (de = readdir(md2));) {
             if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
@@ -7349,6 +8194,7 @@ static int cmd_verify(const char *dir, const char *anchor)
         if (!rc && m.boundary != S.boundary_at_lake)
             rc = fail("manifest's retirement boundary differs from the log's at its commit");
         if (!rc) rc = check_objects(dirfd, &m, &S);
+        if (!rc) rc = check_changed(dirfd, &m, &S); /* F5c (manifest 21) */
         if (!rc && m.nt > S.nt) rc = fail("manifest names tables the log does not have");
         if (!rc && m.nen != S.nen_lake) rc = fail("the manifest's ENUM types differ from the log's at its commit"); /* F3g */
         for (uint32_t ei = 0; !rc && ei < m.nen; ei++)

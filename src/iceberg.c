@@ -327,9 +327,10 @@ typedef struct ifile {
 } ifile;
 
 typedef struct isnap {
-    uint64_t S;          /* the generation's commit: the snapshot's id and sequence number */
-    uint32_t ver;        /* the table's schema version at S */
-    int64_t ms;          /* S's commit time, milliseconds */
+    uint64_t S;          /* its label: its id and sequence number, the table's last change in its generation (manifest 21) */
+    uint64_t at;         /* its read point: its generation's commit (the label may lie below a horizon or the boundary) */
+    uint32_t ver;        /* the table's schema version at its read point */
+    int64_t ms;          /* its time, milliseconds: the label's changed_us (the last commit its publication includes) */
     const imdb_manifest_tab *mt;
     ifile *f;            /* its data files, the manifest's segments in order */
     uint64_t first_row;  /* the snapshot's first-row-id, its data manifest's first_row_id */
@@ -566,7 +567,7 @@ static int put_puffin(const char *name, const char *path, const uint64_t *pos, s
 
 /* one snapshot's Puffin files (one a data file holding a row not live at S), its manifests and its manifest list; a
  * vector the last layer found (cx) is neither read nor written again while its Puffin file is there */
-static int write_snap(imdb_db *db, imdb_table *t, isnap *sn, const isnap *older, uint64_t H, const char *loc,
+static int write_snap(imdb_db *db, imdb_table *t, isnap *sn, const isnap *older, bool head, const char *loc,
                       const char *mloc, int mfd, int ofd, icache *cx, iout *o, imdb_err *e)
 {
     char hx[65], path[ICE_FPATH];
@@ -575,7 +576,7 @@ static int write_snap(imdb_db *db, imdb_table *t, isnap *sn, const isnap *older,
     imdb_buf_init(&dels);
     int rc = IMDB_OK;
     uint64_t next_added = sn->first_row; /* an ADDED file's inherited first_row_id */
-    bool head = sn->S == H, lied = false;
+    bool lied = false;
     uint32_t nput = sn->mt->nseg;
     if (g_lie == ICE_LIE_FILE_OUT && head && nput > 1) nput--; /* tests: the head's data manifest leaves its last file out */
     for (uint32_t k = 0; !rc && k < nput; k++) {
@@ -615,7 +616,7 @@ static int write_snap(imdb_db *db, imdb_table *t, isnap *sn, const isnap *older,
         } else {
             uint64_t *pos;
             size_t np;
-            if ((rc = dead_rows(db, t, f->ms, ofd, sn->S, &pos, &np, e))) break;
+            if ((rc = dead_rows(db, t, f->ms, ofd, sn->at, &pos, &np, e))) break; /* at its read point */
             if (head && !lied && g_lie == ICE_LIE_DV_MISSING && np >= 2) { /* tests: a vector without its first dead row */
                 memmove(pos, pos + 1, (np - 1) * sizeof *pos);
                 np--;
@@ -661,9 +662,14 @@ static int write_snap(imdb_db *db, imdb_table *t, isnap *sn, const isnap *older,
     snprintf(seqs, sizeof seqs, "%llu", (unsigned long long)sn->S);
     snprintf(frs, sizeof frs, "%llu", (unsigned long long)sn->first_row);
     snprintf(par, sizeof par, "%llu", older ? (unsigned long long)older->S : 0ull);
-    snprintf(mdata, sizeof mdata, "m-%llu-h%llu-data.avro", (unsigned long long)sn->S, (unsigned long long)H);
-    snprintf(mdel, sizeof mdel, "m-%llu-h%llu-dv.avro", (unsigned long long)sn->S, (unsigned long long)H);
-    snprintf(lname, sizeof lname, "snap-%llu-h%llu.avro", (unsigned long long)sn->S, (unsigned long long)H);
+    /* names carry only what fixes their content (f5c-design 9.1): a lone snapshot c its own, a head c with an older p
+     * both in its data manifest's (EXISTING entries are p's) and its list's; a delete manifest c alone (ADDED entries) */
+    uint64_t p = older ? older->S : 0;
+    if (older) snprintf(mdata, sizeof mdata, "m-%llu-%llu-data.avro", (unsigned long long)sn->S, (unsigned long long)p);
+    else snprintf(mdata, sizeof mdata, "m-%llu-data.avro", (unsigned long long)sn->S);
+    snprintf(mdel, sizeof mdel, "m-%llu-dv.avro", (unsigned long long)sn->S);
+    if (older) snprintf(lname, sizeof lname, "snap-%llu-%llu.avro", (unsigned long long)sn->S, (unsigned long long)p);
+    else snprintf(lname, sizeof lname, "snap-%llu.avro", (unsigned long long)sn->S);
     uint64_t mdlen = 0, mvlen = 0;
     imdb_buf fb;
     imdb_buf_init(&fb);
@@ -673,14 +679,14 @@ static int write_snap(imdb_db *db, imdb_table *t, isnap *sn, const isnap *older,
         const char *md[] = {"schema", (const char *)schema.p, "schema-id", sid, "partition-spec", "[]",
                             "partition-spec-id", "0", "format-version", "3", "content", "data"};
         uint8_t sync[16];
-        sync_of(t->s.id, sn->S, H, "data", sync);
+        sync_of(t->s.id, sn->S, p, "data", sync);
         imdb_av_file(&fb, kEntrySchema, md, 6, sync, nput, data.p, data.len);
         mdlen = fb.len + (g_lie == ICE_LIE_MLEN && head); /* tests: a manifest_length another */
         rc = out_file(o, mfd, mdata, &fb, false, e);
         if (!rc && sn->ndel) {
             md[11] = "deletes";
             fb.len = 0;
-            sync_of(t->s.id, sn->S, H, "deletes", sync);
+            sync_of(t->s.id, sn->S, 0, "deletes", sync); /* the snapshot's alone, as its name */
             imdb_av_file(&fb, kEntrySchema, md, 6, sync, sn->ndel, dels.p, dels.len);
             mvlen = fb.len;
             rc = out_file(o, mfd, mdel, &fb, false, e);
@@ -706,7 +712,7 @@ static int write_snap(imdb_db *db, imdb_table *t, isnap *sn, const isnap *older,
         lm[2 * nl] = "format-version", lm[2 * nl++ + 1] = "3";
         uint8_t sync[16];
         fb.len = 0;
-        sync_of(t->s.id, sn->S, H, "list", sync);
+        sync_of(t->s.id, sn->S, p, "list", sync);
         rc = imdb_buf_check(&r, e);
         if (!rc) {
             imdb_av_file(&fb, kListSchema, lm, nl, sync, sn->ndel ? 2 : 1, r.p, r.len);
@@ -755,20 +761,43 @@ typedef struct hidx { /* a segment hash and its file's index: the older snapshot
 } hidx;
 static int hidx_cmp(const void *a, const void *b) { return memcmp(((const hidx *)a)->h, ((const hidx *)b)->h, 32); }
 
-/* table t's layer at head H (m its manifest, hms its commit's time) and, where pm_ok, the older kept generation (pm its
- * manifest, pms its commit's time) */
-static int write_table(imdb_db *db, imdb_table *t, const imdb_manifest *m, const imdb_manifest *pm, bool pm_ok, int64_t hms,
-                       int64_t pms, const char *loc, int icefd, int ofd, icache *cx, iout *o, imdb_err *e)
+/* table t's layer (f5c-design 9.1): its head snapshot, labelled by its last change in the head generation m (manifest 21)
+ * and read at m's commit; and, where pm_ok and the table changed at m (its label in pm, the generation m retains, lower),
+ * the older snapshot, labelled by its last change in pm and read at pm's commit. skip_ok: the sidecar names pm and this
+ * location (the layer was whole at pm): a table whose state is pm's (unchanged at m, and alone at pm) is not touched */
+static int write_table(imdb_db *db, imdb_table *t, const imdb_manifest *m, const imdb_manifest *pm, bool pm_ok, bool skip_ok,
+                       const char *loc, int icefd, int ofd, icache *cx, iout *o, imdb_err *e)
 {
-    const imdb_manifest_tab *mt = man_tab(m, t->s.id), *pt = pm && pm_ok ? man_tab(pm, t->s.id) : NULL;
+    const imdb_manifest_tab *mt = man_tab(m, t->s.id), *pt = pm ? man_tab(pm, t->s.id) : NULL;
     if (!mt || mt->dropped_at || !mt->nseg) return IMDB_OK;
     if (pt && (pt->dropped_at || !pt->nseg)) pt = NULL;
+    char tname[24], tloc[ICE_PATH], mloc[ICE_MPATH], name[96];
+    snprintf(tname, sizeof tname, "%u", (unsigned)t->s.id);
+    if (!o->verify && skip_ok && pt && pt->changed == mt->changed && pt->changed != pm->seq) {
+        /* unchanged at m and alone at pm: its files are the ones pm's layer wrote (each synced before that sidecar), so
+         * none is read or written; its version hint still there, else written again (a hand that removed it) */
+        char hp[64];
+        snprintf(hp, sizeof hp, "%s/metadata/version-hint.text", tname);
+        struct stat st;
+        if (imdb_io_fstatat(icefd, hp, &st, AT_SYMLINK_NOFOLLOW) == 0) {
+            /* what the last layer found for its vectors carried forward (the advisor, 22:1x): a table idle for several
+             * publications, then written, reads and writes only what changed */
+            int crc = IMDB_OK;
+            for (uint32_t k = 0; k < mt->nseg && !crc; k++) {
+                const imdb_ice_seen *hit = seen_find(cx, &mt->seg[k]);
+                if (hit) crc = seen_add(cx, &mt->seg[k], hit->ndead, hit->psize, hit->blen, e);
+            }
+            return crc;
+        }
+    }
+    if (pt && !(pm_ok && pt->changed < mt->changed)) pt = NULL; /* no older snapshot: none kept, or unchanged since */
+    /* nor below the table's horizon at the head (a COMPACT's PURGE BEFORE past pm's commit): imagedb answers no AS OF
+     * there (imdb_check_history), and pm's files still hold the versions purged, so the layer offers none either */
+    if (pt && pm->seq < mt->horizon) pt = NULL;
     bool present = true;
     int rc = pt ? older_present(pt, ofd, &present, e) : IMDB_OK;
     if (rc) return rc;
     if (!present) pt = NULL;
-    char tname[24], tloc[ICE_PATH], mloc[ICE_MPATH], name[96];
-    snprintf(tname, sizeof tname, "%u", (unsigned)t->s.id);
     snprintf(tloc, sizeof tloc, "%s/iceberg/%s", loc, tname);
     snprintf(mloc, sizeof mloc, "%s/metadata", tloc);
     int tfd = -1, mfd = -1;
@@ -788,10 +817,11 @@ static int write_table(imdb_db *db, imdb_table *t, const imdb_manifest *m, const
     for (int k = 0; k < 2 && !rc; k++) {
         if (!gens[k]) continue;
         isnap *s = &sn[ns++];
-        s->S = mans[k]->seq;
-        s->ver = ver_at(t, s->S);
+        s->S = gens[k]->changed;
+        s->at = mans[k]->seq;
+        s->ver = ver_at(t, s->at);
         s->mt = gens[k];
-        s->ms = k ? hms : pms;
+        s->ms = (int64_t)(gens[k]->changed_us / 1000);
         s->f = imdb_alloc_array(gens[k]->nseg, sizeof *s->f, e);
         if (!s->f) rc = e->code;
         if (!rc && ns == 2) {
@@ -832,10 +862,11 @@ static int write_table(imdb_db *db, imdb_table *t, const imdb_manifest *m, const
                 }
             }
         }
-        /* the row-id ranges: the first snapshot's from the head's vid count, above every vid either holds; each next
-         * after the last one's rows (the simple valid approach: its data manifest's added and existing rows) */
-        s->first_row = ns == 1 ? mt->versions : sn[0].first_row + sn[0].added_rows + sn[0].existing_rows;
-        if (!rc) rc = write_snap(db, t, s, ns == 2 ? &sn[0] : NULL, m->seq, loc, mloc, mfd, ofd, cx, o, e);
+        /* the row-id ranges, each fixed by what its names carry: a lone or older snapshot's its own generation's vid count
+         * (above every vid it holds); a head's with an older the greater of its own vid count and past the older's rows */
+        uint64_t past = ns == 2 ? sn[0].first_row + sn[0].added_rows + sn[0].existing_rows : 0;
+        s->first_row = ns == 1 ? gens[k]->versions : (gens[k]->versions > past ? gens[k]->versions : past);
+        if (!rc) rc = write_snap(db, t, s, ns == 2 ? &sn[0] : NULL, k == 1, loc, mloc, mfd, ofd, cx, o, e);
     }
     imdb_free(oidx);
     imdb_buf meta;
@@ -911,7 +942,8 @@ static int write_table(imdb_db *db, imdb_table *t, const imdb_manifest *m, const
         ij_arr(&j);
         for (uint32_t k = 0; k < ns; k++) {
             char lpath[ICE_FPATH];
-            snprintf(lpath, sizeof lpath, "%s/snap-%llu-h%llu.avro", mloc, (unsigned long long)sn[k].S, (unsigned long long)m->seq);
+            if (k) snprintf(lpath, sizeof lpath, "%s/snap-%llu-%llu.avro", mloc, (unsigned long long)sn[k].S, (unsigned long long)sn[0].S);
+            else snprintf(lpath, sizeof lpath, "%s/snap-%llu.avro", mloc, (unsigned long long)sn[k].S);
             ij_obj(&j);
             ij_key(&j, "snapshot-id");
             ij_i64(&j, (int64_t)sn[k].S);
@@ -956,12 +988,15 @@ static int write_table(imdb_db *db, imdb_table *t, const imdb_manifest *m, const
         ij_key(&j, "next-row-id");
         ij_i64(&j, (int64_t)(head->first_row + head->added_rows + head->existing_rows));
         ij_end_obj(&j);
-        snprintf(name, sizeof name, "v%llu.metadata.json", (unsigned long long)m->seq);
+        /* its name K: 2c + 1 alone, 2c with an older (numeric and growing: the next publication makes such a table alone,
+         * K + 1, and its next change is 2c' > 2c + 1), the version hint K */
+        uint64_t K = 2 * head->S + (ns == 1);
+        snprintf(name, sizeof name, "v%llu.metadata.json", (unsigned long long)K);
         rc = out_file(o, mfd, name, &meta, false, e);
         if (!rc) {
             imdb_buf h;
             imdb_buf_init(&h);
-            imdb_buf_printf(&h, "%llu", (unsigned long long)m->seq);
+            imdb_buf_printf(&h, "%llu", (unsigned long long)K);
             rc = out_file(o, mfd, "version-hint.text", &h, false, e);
             imdb_buf_free(&h);
         }
@@ -1041,7 +1076,7 @@ static void sidecar(imdb_buf *b, uint64_t H, const uint8_t mh[32], const char *l
 {
     char hx[65];
     hex32(mh, hx);
-    imdb_buf_printf(b, "imagedb-iceberg 1\nhead %llu %s\nlocation %s\n", (unsigned long long)H, hx, loc);
+    imdb_buf_printf(b, "imagedb-iceberg 2\nhead %llu %s\nlocation %s\n", (unsigned long long)H, hx, loc); /* 2: stage 2's form */
 }
 
 static int layer(imdb_db *db, const char *location, bool verify, imdb_err *e)
@@ -1057,25 +1092,26 @@ static int layer(imdb_db *db, const char *location, bool verify, imdb_err *e)
     if (!rc && db->lake_prev) {
         if (!(rc = imdb_manifest_parse(db->lake_prev, db->lake_prevlen, &pm, e))) have_pm = true;
     }
-    /* the snapshots' times: the head's commit is always this copy's; the older generation is offered by durable state alone,
-     * never by what a handle's commit index holds: its commit above the head's boundary and at or past this copy's log floor
-     * (a seed's commit or a RETIRE's), so every handle and the auditor make the same layer; its time the log's, or FLOOR's for
-     * the floor's own commit (a seed's generation, its objects the seed's) */
-    int64_t hms = 0, pms = 0;
-    bool pm_ok = have_pm && pm.seq > m.boundary && pm.seq >= db->log_floor;
-    if (!rc && db->log_floor && m.seq == db->log_floor) {
-        hms = (int64_t)(db->floor_time / 1000);
-    } else if (!rc) {
-        const imdb_commit_info *ci = imdb_ci_at(db, m.seq, e);
-        if (!ci) rc = e->code;
-        else hms = (int64_t)(ci->time_us / 1000);
-    }
-    if (!rc && pm_ok && db->log_floor && pm.seq == db->log_floor) {
-        pms = (int64_t)(db->floor_time / 1000);
-    } else if (!rc && pm_ok) {
-        const imdb_commit_info *ci = imdb_ci_at(db, pm.seq, e);
-        if (!ci) rc = e->code;
-        else pms = (int64_t)(ci->time_us / 1000);
+    /* the older snapshot is offered where the generation the head retains lies above the head's boundary (its time travels
+     * in its manifest, so a seed's or a RETIRE's log floor no longer matters; its objects on disk, write_table); a table
+     * is left untouched only where the sidecar names that generation and this location: the layer was whole at it
+     * (f5c-design 9.1, the advisor's rule: a version hint alone never licenses a skip) */
+    bool pm_ok = have_pm && pm.seq > m.boundary, skip_ok = false;
+    if (!rc && !verify && have_pm && !g_lie) {
+        imdb_err e2 = {0};
+        int sfd = imdb_open_dir_at(db->dirfd, "iceberg", &e2);
+        if (sfd >= 0) {
+            uint8_t *sb = NULL;
+            size_t sn = 0;
+            imdb_buf want;
+            imdb_buf_init(&want);
+            sidecar(&want, pm.seq, m.prev_manifest, location);
+            skip_ok = !imdb_read_file_at(sfd, "LAYER", &sb, &sn, 4096, &e2) && !want.err && sn == want.len &&
+                      !memcmp(sb, want.p, sn);
+            imdb_free(sb);
+            imdb_buf_free(&want);
+            close(sfd);
+        }
     }
     int icefd = -1, ofd = -1;
     if (!rc) {
@@ -1086,6 +1122,14 @@ static int layer(imdb_db *db, const char *location, bool verify, imdb_err *e)
         }
     }
     if (!rc && (ofd = imdb_open_dir_at(db->dirfd, "objects", e)) < 0) rc = e->code;
+    if (!rc && !verify) { /* the sidecar removed, durably, before any table is touched: a sidecar naming the retained generation
+                          * then means untouched since it (a write cut short, a writer rewound onto another history: the
+                          * advisor, 22:1x), so the skip (write_table) never stands on a table half written */
+        if (imdb_io_unlinkat(icefd, "LAYER", 0) != 0 && errno != ENOENT)
+            rc = imdb_fail(e, IMDB_ERR_IO, "iceberg/LAYER cannot be removed: %s", strerror(errno));
+        else if (imdb_sync_dir(icefd, e))
+            rc = e->code;
+    }
     /* the vectors the last layer found; none under VERIFY (it makes every file again) or a test's lie (which forgets
      * them, so the next layer makes its files again) */
     icache cache = {.old = db->ice_seen, .nold = db->nice_seen}, *cx = verify || g_lie ? NULL : &cache;
@@ -1098,7 +1142,7 @@ static int layer(imdb_db *db, const char *location, bool verify, imdb_err *e)
         imdb_table *t = db->t[ti];
         if (!t) continue;
         iout o = {.verify = verify, .dirsync_later = true}; /* its directory synced once, at its end */
-        rc = write_table(db, t, &m, have_pm ? &pm : NULL, pm_ok, hms, pms, location, icefd, ofd, cx, &o, e);
+        rc = write_table(db, t, &m, have_pm ? &pm : NULL, pm_ok, skip_ok, location, icefd, ofd, cx, &o, e);
         imdb_free(o.names);
     }
     if (!rc) { /* a table the head gives no layer (dropped, or no segment): none stands for it */

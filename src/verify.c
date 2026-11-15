@@ -1898,6 +1898,38 @@ static int verify_lake(imdb_db *db, const vctx *x, imdb_verify_report *rep, imdb
             rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: the manifest's indexes of table %s differ from the log's",
                            x->t[ti].s.name);
     }
+    if (!rc) { /* F5c (manifest 21): each table's last change by the one-step rule against the generation the head retains:
+                * a table whose entry differs in what the layer reads (lkey), a new one, and every table where none is
+                * retained (an ERASE's head, the first) at the head's commit and the time of the commit before it; the
+                * others the retained generation's (the auditor's check_changed) */
+        imdb_manifest rpm;
+        memset(&rpm, 0, sizeof rpm);
+        bool have = false, tknown = false;
+        uint64_t tprev = 0;
+        if (db->lake_prev) {
+            if ((rc = imdb_manifest_parse(db->lake_prev, db->lake_prevlen, &rpm, e))) have = false;
+            else have = true;
+        }
+        if (!rc && db->log_floor && m.seq - 1 == db->log_floor) {
+            tprev = db->floor_time, tknown = true;
+        } else if (!rc && m.seq > 1) {
+            imdb_err ec = {0};
+            const imdb_commit_info *ci = imdb_ci_at(db, m.seq - 1, &ec);
+            if (ci) tprev = ci->time_us, tknown = true; /* below this copy's log: its time not checked here */
+        }
+        for (uint32_t ti = 0; ti < m.nt && !rc; ti++) {
+            const imdb_manifest_tab *mt = &m.t[ti];
+            bool carried = have && ti < rpm.nt && !memcmp(rpm.t[ti].lkey, mt->lkey, 32);
+            uint64_t cwant = carried ? rpm.t[ti].changed : m.seq;
+            if (mt->changed != cwant)
+                rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: the manifest says table %s's layer last changed at commit %llu, the "
+                               "lake gives %llu", x->t[ti].s.name, (unsigned long long)mt->changed, (unsigned long long)cwant);
+            else if (carried ? mt->changed_us != rpm.t[ti].changed_us : tknown && mt->changed_us != tprev)
+                rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: the manifest gives table %s's last change another time than the log's",
+                               x->t[ti].s.name);
+        }
+        if (have) imdb_manifest_free(&rpm);
+    }
     if (!rc && m.nv != at->nv) /* P2 S7: the manifest's views, the log's at its commit */
         rc = imdb_fail(e, IMDB_ERR_VERIFY, "lake: the manifest's views differ from the log at commit %llu",
                        (unsigned long long)m.seq);

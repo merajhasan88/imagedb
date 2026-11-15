@@ -511,7 +511,7 @@ Command-line options (`imagedb` with no arguments prints the commands):
 | `--cross-check` | sql | `SET cross_check = on` for the session | off |
 | `--nosync` | sql | commits are not fdatasynced until a clean close | synced |
 | `--lake-sync` | sql | a CHECKPOINT after every change (priced) | off |
-| `--iceberg` | sql, apply, follow | F5c: write the Iceberg v3 layer per copy (`iceberg/<table id>/metadata/`) after every publish, so Iceberg readers (DuckDB's iceberg extension is the tested one) see each table's current rows and the generation kept beside them; derived, never shipped, a failure only a warning; about 8 syncs a live table a publication (Supported scope) | off |
+| `--iceberg` | sql, apply, follow | F5c: write the Iceberg v3 layer per copy (`iceberg/<table id>/metadata/`) after every publish, so Iceberg readers (DuckDB's iceberg extension is the tested one) see each table's current rows and the generation kept beside them; derived, never shipped, a failure only a warning; a publication writes only the changed tables' layers (Supported scope) | off |
 | `--durable-ack` | sql, apply | DURABLE fsynced before each commit returns | off |
 | `--read-only` | sql | opens without writing anything (a replica's reads) | writable |
 | `--anchor FILE` | sql, verify, promote | an external anchor: a log rolled back behind it is refused | none |
@@ -899,18 +899,23 @@ before the closing magic, gives its name, and every load checks the tail, the fr
 stored as Iceberg maps it (INT32 to 9 digits, INT64 to 18, past them the fewest bytes that hold its precision), and
 imdb$vid and imdb$begin carry Iceberg v3's row-lineage field ids. With `--iceberg` (off by default), each copy
 writes an Iceberg v3 table per live table under `iceberg/<table id>/metadata/` after every publication: its metadata
-(`v<H>.metadata.json`, `version-hint.text`), a snapshot of the lake's head and, where the copy holds it, one of the
-generation kept beside it (manifest lists and manifests in Avro), and a deletion vector per segment holding rows
-not visible at a snapshot (Puffin files); the data files are the segments themselves, so a reader sees each table's
-rows at that snapshot without a copy. Tested with DuckDB's iceberg extension (`make iceberg-check`, test-only,
-outside the matrix): every snapshot of a table of every type, with updates, deletes, columns added with DEFAULTs,
-an ERASE, a rename, a drop and a COMPACT, read by DuckDB equal to imagedb's own answer `AS OF` it; no other Iceberg
-reader is tested. VERIFY and the auditor check a current layer against the lake; `iceberg/LAYER` names the head
-and location it was written for, and a stale one is reported, not checked. INTERVAL and ENUM columns are left out
-of the Iceberg schema. Its cost today: a publication rewrites every live table's metadata, about 8 syncs a table
-(measured on this machine's SSD: a CHECKPOINT touching one of 200 tables made 1,612 syncs in 2.4 s, against 7 in 79 ms
-with the layer off), so it suits a database of few tables; an outside reader holds no pin, so a publication may remove
-the files of the snapshot it is reading. Other platforms and the desktop client are deferred (deferred.md).
+(`v<K>.metadata.json`, `version-hint.text`), a snapshot of the table at the lake's head and, where the table changed
+there and the copy holds that generation above the table's horizon, one of the generation kept beside it (manifest
+lists and manifests in Avro), and a deletion vector per segment holding rows not visible at a snapshot (Puffin
+files); the data files are the segments themselves, so a reader sees each table's rows at that snapshot without a
+copy. A snapshot's id is the publication that last changed its table, and names that table state: its rows are the
+same in every metadata file holding it (an ERASE changes every table and keeps no generation, so no id outlives
+one), while its parent and
+first-row-id are the file's own (a row's id is its stored imdb$vid, never derived). Tested with DuckDB's iceberg
+extension (`make iceberg-check`, test-only, outside the matrix): every snapshot of a table of every type, with updates,
+deletes, columns added with DEFAULTs, an ERASE, a rename, a drop, a COMPACT and a PURGE BEFORE, and of a table left
+unchanged, read by its id, and the current one by its directory, each equal to imagedb's own answer `AS OF` its
+read point, each id read again giving the same rows; no other Iceberg reader is tested. VERIFY and the auditor check a
+current layer against the lake; `iceberg/LAYER` names the head and location it was written for, and a stale one is
+reported, not checked. INTERVAL and ENUM columns are left out of the Iceberg schema. A publication writes only the
+layers of the tables it changed (measured on this machine's SSD: a CHECKPOINT touching one of 200 tables made 20 syncs
+in 27 to 82 ms, against 7 in 9 to 24 ms with the layer off); an outside reader holds no pin, so a publication may
+remove the files of the snapshot it is reading. Other platforms and the desktop client are deferred (deferred.md).
 
 Ordered indexes:
 

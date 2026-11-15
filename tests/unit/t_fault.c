@@ -42,6 +42,7 @@
 #include "../../src/logdir.h"
 #include "../../src/repl.h"
 #include "../../src/rewind.h"
+#include "../../src/sha256.h"
 #include "../../src/sql.h"
 #include "../../src/writer.h"
 #include "thelp.h"
@@ -569,7 +570,7 @@ static const imdb_io_hooks g_hooks = {hook_before, hook_after, NULL};
 
 /* ---- the acknowledgement record ------------------------------------------------------ */
 
-enum { R_ACK = 1, R_CLOSED, R_COUNTS, R_NOTE };
+enum { R_ACK = 1, R_CLOSED, R_COUNTS, R_NOTE, R_LAYER };
 
 typedef struct frec {
     uint8_t kind;
@@ -615,6 +616,81 @@ static void ack_closed(void)
     frec r;
     memset(&r, 0, sizeof r);
     r.kind = R_CLOSED;
+    rec_send(&r);
+}
+
+/* F5c (the advisor, 2026-11-15): a sidecar naming a completed layer means every table's files are as that layer left
+ * them. A layer begins by removing the sidecar, durably: without that sync a power cut can bring an older sidecar back
+ * over tables a later layer had begun to rewrite (what a rewound writer's skip would then trust; rewind_iceberg_cut). The
+ * scenario records each completed layer, its sidecar's hash and its tables' files' (layer_rec), and a crash state whose
+ * sidecar is one of them must hold that layer's tables exactly (check_layer), before any open writes the layer again */
+static int name_cmp(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+
+static int sorted_names(const char *d, char **names, int cap)
+{
+    DIR *dd = opendir(d);
+    int n = 0;
+    for (struct dirent *de; dd && (de = readdir(dd));)
+        if (strcmp(de->d_name, ".") && strcmp(de->d_name, "..") && n < cap) names[n++] = strdup(de->d_name);
+    if (dd) closedir(dd);
+    qsort(names, (size_t)n, sizeof *names, name_cmp);
+    return n;
+}
+
+static void hash_file(imdb_sha256_ctx *c, const char *p)
+{
+    int fd = open(p, O_RDONLY | O_CLOEXEC);
+    uint8_t b[8192];
+    for (ssize_t n; fd >= 0 && (n = read(fd, b, sizeof b)) > 0;) imdb_sha256_update(c, b, (size_t)n);
+    if (fd >= 0) close(fd);
+    imdb_sha256_update(c, "\0", 1);
+}
+
+/* the sidecar's hash and its tables' (each table directory by name, each file under it by name and bytes); false: no
+ * sidecar */
+static bool layer_hashes(const char *dir, uint8_t side[32], uint8_t tabs[32])
+{
+    char p[1200];
+    snprintf(p, sizeof p, "%s/iceberg/LAYER", dir);
+    struct stat st;
+    if (stat(p, &st) != 0) return false;
+    imdb_sha256_ctx c;
+    imdb_sha256_init(&c);
+    hash_file(&c, p);
+    imdb_sha256_final(&c, side);
+    imdb_sha256_init(&c);
+    char *tn[256];
+    snprintf(p, sizeof p, "%s/iceberg", dir);
+    int nt = sorted_names(p, tn, 256);
+    for (int k = 0; k < nt; k++) {
+        if (strcmp(tn[k], "LAYER")) {
+            imdb_sha256_update(&c, tn[k], strlen(tn[k]) + 1);
+            char *fn[512], md[1400];
+            snprintf(md, sizeof md, "%s/iceberg/%s/metadata", dir, tn[k]);
+            int nf = sorted_names(md, fn, 512);
+            for (int q = 0; q < nf; q++) {
+                char fp[1700];
+                snprintf(fp, sizeof fp, "%s/%s", md, fn[q]);
+                imdb_sha256_update(&c, fn[q], strlen(fn[q]) + 1);
+                hash_file(&c, fp);
+                free(fn[q]);
+            }
+            imdb_sha256_update(&c, "/", 1);
+        }
+        free(tn[k]);
+    }
+    imdb_sha256_final(&c, tabs);
+    return true;
+}
+
+static void layer_rec(const char *dir)
+{
+    frec r;
+    memset(&r, 0, sizeof r);
+    uint8_t tabs[32];
+    if (!layer_hashes(dir, r.head, tabs)) return; /* no layer completed (its sidecar removed at its start) */
+    r.kind = R_LAYER;
+    memcpy(r.counts, tabs, 32);
     rec_send(&r);
 }
 
@@ -1304,6 +1380,7 @@ static int run_iceberg(const char *run)
     imdb_db *db = NULL;
     imdb_err e = {0};
     if (imdb_open(dir_in(run, "p"), &o, &db, &e)) return 0;
+    layer_rec(dir_in(run, "p")); /* the open's own layer, when it wrote one */
     imdb_session s;
     imdb_session_init(&s, db);
     static const char *const q[] = {
@@ -1330,6 +1407,7 @@ static int run_iceberg(const char *run)
         }
         imdb_result_free(&r);
         ack(db);
+        if (strcmp(q[i], "CHECKPOINT") == 0) layer_rec(dir_in(run, "p")); /* each completed layer, for check_layer */
     }
     imdb_session_close(&s);
     imdb_close(db);
@@ -2320,6 +2398,17 @@ static const char *check_rewind(const char *run); /* the rewind scenario's, with
 static const char *check_erase_role(const char *run); /* L stage 2: the erase_role scenario's, with its setup below */
 static const char *check_backup_catalogue(const char *run, bool done); /* with its setup below */
 
+static const char *check_layer(const char *dir, const frun *r)
+{
+    uint8_t side[32], tabs[32];
+    if (!layer_hashes(dir, side, tabs)) return NULL;
+    for (size_t i = 0; i < r->nrecs; i++)
+        if (r->recs[i].kind == R_LAYER && !memcmp(r->recs[i].head, side, 32))
+            return memcmp(r->recs[i].counts, tabs, 32) ? "a sidecar names a completed layer, but a table's files are not that layer's"
+                                                       : NULL;
+    return NULL; /* a sidecar no record names: written, the process then cut before it could say so */
+}
+
 static const char *check_run(const fscen *s, const char *run, const frun *r)
 {
     if (!WIFEXITED(r->status)) {
@@ -2351,6 +2440,10 @@ static const char *check_run(const fscen *s, const char *run, const frun *r)
     if (s->strict) {
         const char *sw = strict_check(dir, r);
         if (sw) return sw;
+    }
+    if (strcmp(s->name, "iceberg") == 0) { /* the crash state itself, before the open below writes the layer again */
+        const char *lw = check_layer(dir, r);
+        if (lw) return lw;
     }
     char anc[700];
     snprintf(anc, sizeof anc, "%s/anchor", run);

@@ -1466,6 +1466,17 @@ static bool man_obj_live(const void *arg, uint8_t okind, uint32_t oid)
     return okind == IMDB_OBJ_VIEW && oid < m->nv && m->v[oid].id == oid && !m->v[oid].dropped_at;
 }
 
+/* F5c stage 2: the SHA-256 of what a table's Iceberg layer reads in its manifest entry (lake.h, imdb_manifest_tab's
+ * lkey): the spans of its schema, its vid count, its segments, its drop and its history, as the entry encodes them, so
+ * the writer's and the parse's are one rule */
+static void lkey_of(const uint8_t *p, const size_t sp[5][2], uint8_t out[32])
+{
+    imdb_sha256_ctx c;
+    imdb_sha256_init(&c);
+    for (int k = 0; k < 5; k++) imdb_sha256_update(&c, p + sp[k][0], sp[k][1] - sp[k][0]);
+    imdb_sha256_final(&c, out);
+}
+
 static int old_manifest(uint32_t ver, imdb_err *e)
 {
     if (ver < 5)
@@ -1474,6 +1485,9 @@ static int old_manifest(uint32_t ver, imdb_err *e)
     if (ver == 5)
         return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 5: this lake was written by an imagedb before views' "
                          "format (manifest 6, P2 S7), which this version does not read");
+    if (ver == 20) /* F5c stage 2: no table entry says when it last changed */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 20: this lake was written by an imagedb before each "
+                         "table's last change was recorded (manifest 21, F5c, 2026-11-14), which this version does not read");
     if (ver == 19) /* F5b: its segments named by their whole file, two field ids and DECIMAL widths before Iceberg's */
         return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version 19: this lake was written by an imagedb before segments "
                          "named by their tail (manifest 20, F5b, 2026-11-14), which this version does not read");
@@ -1609,17 +1623,23 @@ int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err
     m->nt = nt;
     for (uint32_t i = 0; i < nt; i++) {
         imdb_manifest_tab *t = &m->t[i];
+        size_t sp[5][2]; /* F5c stage 2: lkey's spans (lkey_of) */
+        sp[0][0] = r.off;
         uint32_t sl = imdb_rd_u32(&r);
         const uint8_t *sb = imdb_rd_bytes(&r, sl);
         if (!sb) goto bad;
+        sp[0][1] = r.off;
         imdb_rd sr;
         imdb_rd_init(&sr, sb, sl);
         imdb_err e2 = {0};
         if (imdb_schema_decode(&sr, &t->s, &e2) || imdb_rd_left(&sr) || t->s.id != i) goto bad;
         t->horizon = imdb_rd_u64(&r);
         t->live = imdb_rd_u64(&r);
+        sp[1][0] = r.off;
         t->versions = imdb_rd_u64(&r);
+        sp[1][1] = r.off;
         imdb_rd_copy(&r, (uint8_t *)t->digest.v, IMDB_LTHASH_BYTES);
+        sp[2][0] = r.off;
         t->nseg = imdb_rd_u32(&r);
         if (r.err || t->nseg > IMDB_MAX_SEGMENTS || t->nseg > imdb_rd_left(&r) / 68 || t->live > t->versions) goto bad;
         t->seg = imdb_alloc_array(t->nseg ? t->nseg : 1, sizeof *t->seg, e);
@@ -1632,6 +1652,7 @@ int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err
             imdb_rd_copy(&r, t->seg[k].dv, 32);
             t->seg[k].nrows = imdb_rd_u32(&r);
         }
+        sp[2][1] = r.off;
         t->nidx = imdb_rd_u32(&r);
         if (r.err || t->nidx > IMDB_MAX_INDEXES) goto bad;
         for (uint32_t k = 0; k < t->nidx; k++) {
@@ -1647,12 +1668,15 @@ int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err
         t->retention_us = imdb_rd_u64(&r);
         if (r.err || !imdb_retention_ok(t->retention_us)) goto bad;
         t->created_at = imdb_rd_u64(&r);
+        sp[3][0] = r.off;
         t->dropped_at = imdb_rd_u64(&r);
+        sp[3][1] = r.off;
         /* created by its commit, before any drop, which leaves it nothing live; both at or before this snapshot */
         if (r.err || !t->created_at || t->created_at > m->seq || (t->dropped_at && (t->dropped_at <= t->created_at ||
                                                                             t->dropped_at > m->seq || t->live)))
             goto bad;
         /* F1: its schema history (lake.h): version 1, then each ALTER on the version before it, ending at s */
+        sp[4][0] = r.off;
         uint32_t na = imdb_rd_u32(&r);
         if (r.err || na >= IMDB_MAX_SCHEMA_VERSIONS) goto bad;
         imdb_schema s0 = t->s;
@@ -1730,6 +1754,12 @@ int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err
             if (!ok) goto bad;
             last = at;
         }
+        sp[4][1] = r.off;
+        if (r.err) goto bad;
+        lkey_of(r.p, (const size_t(*)[2])sp, t->lkey);
+        t->changed = imdb_rd_u64(&r); /* F5c stage 2: changed at or after its last ALTER and its drop, at or before its commit */
+        t->changed_us = imdb_rd_u64(&r);
+        if (r.err || t->changed < last || t->changed > m->seq || (t->dropped_at && t->changed < t->dropped_at)) goto bad;
         if (!schema_same(&t->s, &t->hist.vers[t->hist.nvers - 1].s)) goto bad; /* the history ends at its schema */
     }
     if (r.err || r.off != send || man_section(&r, IMDB_MAN_VIEWS, &send)) goto bad;
@@ -2330,6 +2360,19 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
     }
     if (p->nrw) qsort(p->rw, p->nrw, sizeof *p->rw, cmp_rw);
     /* manifest */
+    /* F5c stage 2: the head before, whose tables' lkeys this one's are compared with (every copy's: publications are
+     * logged ops; a seed carries its manifest); none at the first publication, and an ERASE marks every table changed
+     * (a copy of a redacted log holds stubs before it, so its entries before the ERASE are not the primary's) */
+    imdb_manifest old;
+    memset(&old, 0, sizeof old);
+    bool have_old = false;
+    if (kind != IMDB_OP_ERASE && db->lake_mbytes) {
+        if ((rc = imdb_manifest_parse(db->lake_mbytes, db->lake_mlen, &old, e))) {
+            plan_free(p);
+            return rc;
+        }
+        have_old = true;
+    }
     imdb_buf *mb = &p->manifest;
     imdb_buf_put(mb, kManMagic, 8);
     imdb_buf_put_u32(mb, IMDB_MANIFEST_VERSION); /* lake.h: 6's tables and views, then the format design's sections */
@@ -2350,21 +2393,28 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
     for (uint32_t ti = 0; ti < db->nt; ti++) {
         imdb_table *t = db->t[ti];
         plan_tab *pt = &p->tab[ti];
+        size_t sp[5][2]; /* F5c stage 2: lkey's spans (lkey_of), as the parse records them */
         sch.len = 0;
         imdb_schema_encode(&t->s, &sch);
         if ((rc = imdb_buf_check(&sch, e))) break; /* an empty schema would be signed into the log */
+        sp[0][0] = mb->len;
         imdb_buf_put_u32(mb, (uint32_t)sch.len);
         imdb_buf_put(mb, sch.p, sch.len);
+        sp[0][1] = mb->len;
         imdb_buf_put_u64(mb, pt->horizon);
         imdb_buf_put_u64(mb, t->live);
+        sp[1][0] = mb->len;
         imdb_buf_put_u64(mb, t->nver);
+        sp[1][1] = mb->len;
         imdb_buf_put(mb, post[ti].v, IMDB_LTHASH_BYTES);
+        sp[2][0] = mb->len;
         imdb_buf_put_u32(mb, pt->nseg);
         for (uint32_t k = 0; k < pt->nseg; k++) {
             imdb_buf_put(mb, pt->seg[k]->hash, 32);
             imdb_buf_put(mb, pt->dvh[k], 32);
             imdb_buf_put_u32(mb, pt->seg[k]->nrows);
         }
+        sp[2][1] = mb->len;
         imdb_buf_put_u32(mb, t->nidx);
         for (uint32_t k = 0; k < t->nidx; k++) {
             const imdb_index_def *d = &t->idx[k].d;
@@ -2377,10 +2427,13 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
         }
         imdb_buf_put_u64(mb, t->retention_us);
         imdb_buf_put_u64(mb, t->created_at);
+        sp[3][0] = mb->len;
         imdb_buf_put_u64(mb, t->dropped_at);
+        sp[3][1] = mb->len;
         /* F1: its schema history (lake.h), each ALTER written again from the version it made */
         const imdb_schema_hist *h = &t->hist;
         uint32_t na = h->nvers ? h->nvers - 1 : 0;
+        sp[4][0] = mb->len;
         imdb_buf_put_u32(mb, na);
         if (na) {
             sch.len = 0;
@@ -2449,6 +2502,15 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
             if (imdb_alter_put(mb, &o)) rc = imdb_fail(e, IMDB_ERR_STATE, "lake: table %s's ALTER cannot be written", t->s.name);
         }
         if (rc) break;
+        sp[4][1] = mb->len;
+        uint64_t changed = seq, changed_us = db->last_time; /* the time of the commit before: this one's last */
+        if (have_old && !mb->err && ti < old.nt) {
+            uint8_t lk[32];
+            lkey_of(mb->p, (const size_t(*)[2])sp, lk);
+            if (!memcmp(old.t[ti].lkey, lk, 32)) changed = old.t[ti].changed, changed_us = old.t[ti].changed_us;
+        }
+        imdb_buf_put_u64(mb, changed);
+        imdb_buf_put_u64(mb, changed_us);
     }
     man_close(mb, sec);
     sec = man_open(mb, IMDB_MAN_VIEWS);
@@ -2502,6 +2564,7 @@ static int plan_build(imdb_db *db, uint8_t kind, uint32_t ctable, uint64_t purge
         man_close(mb, sec);
     }
     imdb_buf_free(&sch);
+    if (have_old) imdb_manifest_free(&old);
     if (rc || (rc = imdb_buf_check(mb, e))) {
         plan_free(p);
         return rc;

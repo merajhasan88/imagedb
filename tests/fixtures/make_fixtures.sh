@@ -1,8 +1,9 @@
 #!/bin/sh
-# Makes the format's fixtures (2026-11-14, its first pair: META 5, log version 3, manifest version 20 and segments in imagedb's
+# Makes the format's fixtures (2026-11-14, its second pair: META 5, log version 3, manifest version 21 (F5c stage 2: each
+# table's entry ends with its last change, the publication and its time) and segments in imagedb's
 # Parquet subset named by their tail, with Iceberg v3's row-lineage field ids and DECIMAL widths (F5b; F5: lake.h; before it, segment format 3, F1 stage 4:
-# a segment names its schema version by its hash with positions), ops 16, 19, 20, 21, 22's kinds and 23 to 37; alg1-20261114a.tar.gz
-# and alg2-20261114a.tar.gz beside this script): a primary and its replica under digest algorithm ALG, by
+# a segment names its schema version by its hash with positions), ops 16, 19, 20, 21, 22's kinds and 23 to 37; alg1-20261114b.tar.gz
+# and alg2-20261114b.tar.gz beside this script): a primary and its replica under digest algorithm ALG, by
 # make_alg2.sh's steps, which reach every reader of the format: a log of several segments (each manifest
 # publish ends one), CHECKPOINTs (manifests, segments, the lanes), a two-column index and a unique one,
 # an UPDATE and a DELETE, ERASE SUBJECT (redacted log payloads, rewritten segments), commits after it, and
@@ -51,10 +52,11 @@
 # alg2-20261109g, manifest version 14: before DECIMALs of 38 digits; alg1-20261110a and alg2-20261110a, manifest version
 # 15: before INTERVAL; alg1-20261112a and alg2-20261112a, manifest version 16: before ENUM types; alg1-20261112b and
 # alg2-20261112b, manifest version 17: before roles; alg1-20261112c and alg2-20261112c, manifest version 18: before Parquet
-# segments; alg1-20261113a and alg2-20261113a, manifest version 19: before segments named by their tail) stay as
+# segments; alg1-20261113a and alg2-20261113a, manifest version 19: before segments named by their tail; alg1-20261114a and
+# alg2-20261114a, manifest version 20: before each table's last change) stay as
 # directories this format refuses.
 #   sh tests/fixtures/make_fixtures.sh BIN AUDIT ALG OUTDIR   (OUTDIR must not exist)
-#   tar -czf tests/fixtures/algALG-20261114a.tar.gz -C OUTDIR primary replica
+#   tar -czf tests/fixtures/algALG-20261114b.tar.gz -C OUTDIR primary replica
 set -eu
 BIN=$1
 AUD=$2
