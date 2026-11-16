@@ -240,6 +240,11 @@ if [ -x build-fuzz/fuzz_parquet ]; then
     IMDB_FUZZ_PARQUET_SEEDS="$OUT/parquet" setarch "$(uname -m)" -R build-fuzz/fuzz_parquet > /dev/null 2>&1 || true
     mkdir -p "$OUT/apq" && cp "$OUT"/parquet/* "$OUT/apq/" 2>/dev/null || true # fuzz_apq: the same seeds
 fi
+# N1a: fuzz_wire's seeds, written by the codec itself (the harness's seed mode: a byte picking the decoder, then its bytes)
+mkdir -p "$OUT/wire"
+if [ -x build-fuzz/fuzz_wire ]; then
+    IMDB_FUZZ_WIRE_SEEDS="$OUT/wire" setarch "$(uname -m)" -R build-fuzz/fuzz_wire > /dev/null 2>&1 || true
+fi
 # F5c: fuzz_aice's readers (fuzz/fuzz_aice.c: the first byte picks one): a layer's files as the CLI writes them (its
 # table metadata JSON, its manifest lists and manifests, its Puffin files and a vector's blob), and two round-trip seeds
 mkdir -p "$OUT/aice"

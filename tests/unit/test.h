@@ -118,5 +118,6 @@ TESTS(pq) /* F5: the canonical Parquet subset's codec */
 TESTS(ice) /* F5c: the Iceberg v3 layer per copy */
 TESTS(tz) /* P2: time zones */
 TESTS(tzsql) /* P2: time zones through the engine */
+TESTS(wire)  /* N1a: IMDBWIR1, the server's own protocol (server/wire.c) */
 
 #endif
