@@ -898,7 +898,12 @@ static int replay_segment(imdb_db *db, size_t si, bool ro, imdb_err *e)
                 break;
             }
             if (!f->decoded) {
-                rc = imdb_fail(e, f->err.code ? f->err.code : IMDB_ERR_CORRUPT, "%s", f->err.msg);
+                uint64_t fs = 0;
+                if (f->err.code == IMDB_ERR_UNSUPPORTED && !imdb_frame_authentic(f->p, f->len, db->writer_pk, &fs))
+                    rc = imdb_fail(e, IMDB_ERR_AUTH, "commit %llu: signature invalid (under the writer key of epoch %u); its "
+                                   "header is one this version refuses", (unsigned long long)fs, imdb_writer_epoch_at(db, fs));
+                else
+                    rc = imdb_fail(e, f->err.code ? f->err.code : IMDB_ERR_CORRUPT, "%s", f->err.msg);
                 break;
             }
             if (frames == 0 && f->c.seq != first)
@@ -1207,9 +1212,11 @@ static int redact_segment(imdb_db *db, size_t si, imdb_err *e)
     }
     if (!rc && off != len) rc = imdb_fail(e, IMDB_ERR_CORRUPT, "redaction: trailing bytes in segment");
     if (!rc) rc = imdb_buf_check(&out, e);
-    /* a tagged segment is written whole again: its frames as one group, no fill (design.md §3) */
+    /* the segment written whole again: its frames as one group, no fill (design.md §3); one holding frames is tagged (format
+     * 1: a segment not tagged is a new one's zeros, with no frame to redact) */
     const imdb_buf *w = &out;
-    if (!rc && any && seg.tagged) {
+    if (!rc && any && !seg.tagged) rc = imdb_fail(e, IMDB_ERR_STATE, "redaction: a segment not tagged holds frames");
+    if (!rc && any) {
         imdb_tseg_build(first, out.p, out.len, &whole);
         rc = imdb_buf_check(&whole, e);
         w = &whole;
@@ -1222,13 +1229,12 @@ static int redact_segment(imdb_db *db, size_t si, imdb_err *e)
         rc = imdb_write_file_atomic(db->logdirfd, name, w->p, w->len, 0600, e);
         if (!rc && is_last && !db->read_only && !db->log_rotate) {
             if (db->logfd >= 0) close(db->logfd);
-            db->logfd = imdb_io_openat(db->logdirfd, name, seg.tagged ? O_RDWR | O_CLOEXEC | O_NOFOLLOW
-                                                                    : O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW);
+            db->logfd = imdb_io_openat(db->logdirfd, name, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
             if (db->logfd < 0) rc = imdb_fail(e, IMDB_ERR_IO, "reopen log segment: %s", strerror(errno));
         }
         if (!rc && is_last) {
             db->log_size = out.len;
-            if (seg.tagged) { /* the next group after the rewritten frames; the fill is extended as needed */
+            { /* the next group after the rewritten frames; the fill is extended as needed */
                 db->log_phys = w->len / IMDB_TSEG_SECTOR;
                 db->log_fill = w->len;
                 db->log_group = false;
@@ -1519,8 +1525,19 @@ int imdb_ship_to(const char *path, uint64_t after_seq, const imdb_sink *out, con
             bool resume = segs[si] == cur_first && (uint64_t)st.st_ino == cur_ino;
             uint64_t from = resume ? cur_off : 0, prev = resume ? cur_prev : segs[si] - 1;
             uint8_t hd[IMDB_TSEG_SECTOR];
-            bool tagged = resume ? cur_tagged
-                                 : imdb_io_pread(fd, hd, sizeof hd, 0) >= 4 && imdb_tseg_is_tagged(hd, sizeof hd);
+            ssize_t hn = resume ? 0 : imdb_io_pread(fd, hd, sizeof hd, 0);
+            bool tagged = resume ? cur_tagged : hn >= 4 && imdb_tseg_is_tagged(hd, sizeof hd);
+            if (!resume && hn > 0 && imdb_tseg_later(hd, (size_t)hn, segs[si], e)) { /* format 1: a later imagedb's */
+                close(fd);
+                rc = e->code;
+                break;
+            }
+            if (!resume && !tagged && hn >= 4 && imdb_get_le32(hd) == IMDB_FRAME_MAGIC) { /* format 1: tagged alone */
+                close(fd);
+                rc = imdb_fail(e, IMDB_ERR_UNSUPPORTED, "ship: log segment %llu: an untagged segment, written by an imagedb "
+                               "before the tagged log (2026-10-27), which format 1 does not read", (unsigned long long)segs[si]);
+                break;
+            }
             if (tagged) {
                 /* frame by frame from where the last poll stopped, a window of sectors at a time; its
                  * size says nothing, the fill being there already (design.md §3, live readers) */

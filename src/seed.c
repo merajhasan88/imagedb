@@ -418,6 +418,9 @@ int imdb_seed_take(imdb_db *db, imdb_stream *s, const uint8_t p[IMDB_SEED_PREFIX
                          "holds commit %llu", (unsigned long long)db->seq);
     uint64_t S = imdb_get_le64(p + 8);
     uint32_t hl = imdb_get_le32(p + 16), nobj = imdb_get_le32(p + 20);
+    if (imdb_later_magic(p, 8, "IMDBSED1")) /* format 1: a later imagedb's, by name, before anything is written */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "seed: %.8s, written by a later imagedb, which format 1 does not "
+                         "read", (const char *)p);
     if (memcmp(p, "IMDBSED1", 8) != 0 || imdb_kern()->crc32c(0, p, 24) != imdb_get_le32(p + 24) || !S || hl < 64 ||
         hl > IMDB_SEED_HEAD_MAX || !nobj || nobj > IMDB_SEED_OBJECTS_MAX)
         return imdb_fail(e, IMDB_ERR_CORRUPT, "seed: a malformed prefix");

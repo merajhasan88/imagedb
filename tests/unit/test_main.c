@@ -75,6 +75,7 @@ int main(int argc, char **argv)
         {"kernels", kernels_tests, &kernels_ntests},
         {"codec", codec_tests, &codec_ntests},
         {"tseg", tseg_tests, &tseg_ntests},
+        {"format1", format1_tests, &format1_ntests},
         {"engine", engine_tests, &engine_ntests},
         {"lake", lake_tests, &lake_ntests},
         {"sql", sql_tests, &sql_ntests},
@@ -149,7 +150,6 @@ int main(int argc, char **argv)
             if (argc > 1 && !strstr(tc->name, argv[1]) && strcmp(argv[1], groups[g].name) != 0) continue;
             g_rng = 0x9E3779B97F4A7C15ull ^ (uint64_t)(i + 1) * 0xBF58476D1CE4E5B9ull;
             g_test_failed = 0;
-            imdb_log_set_tagged(true); /* a test of the untagged format turns it off for itself only */
             imdb_sql_set_window_reference(false); /* P2 S12: the sliding frames, but where a test asks for the reference */
             imdb_seg_load_hook(NULL, NULL);        /* P2 S14: no load held, but where a test holds them */
             imdb_clock_offset(0);      /* a test that moves the clock (expiry) moves it for itself only */

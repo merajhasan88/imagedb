@@ -233,6 +233,14 @@ void imdb_hist_add_atomic(imdb_hist *h, uint64_t us); /* any thread (relaxed: co
 /* the q-th permille value's bucket bound, never above the largest seen; 0 when empty (copies taken by relaxed loads) */
 uint64_t imdb_hist_quantile(const imdb_hist *h, unsigned permille);
 
+/* Format 1's rule for a later version (docs/format-1.md): a structure naming itself and a version past format 1's is
+ * refused by name (UNSUPPORTED), never taken for damage, so that no repair (recover's cut, a torn tail's drop, a
+ * rewrite of DURABLE or LAKE_HEAD) ever runs over a later imagedb's file. imdb_later_magic: b begins with magic's
+ * stem (all but its trailing digits) and as many digits, as a number greater than magic's. imdb_later_text: b begins
+ * with prefix ("imagedb-meta ", say) and a decimal number greater than cur ended by a newline (*ver: that number). */
+bool imdb_later_magic(const uint8_t *b, size_t n, const char *magic);
+bool imdb_later_text(const uint8_t *b, size_t n, const char *prefix, unsigned long cur, unsigned long *ver);
+
 /* Constant-time comparison for MACs. */
 bool imdb_ct_eq(const void *a, const void *b, size_t n);
 

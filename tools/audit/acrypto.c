@@ -1,6 +1,7 @@
 /* Verification-only crypto for imagedb-audit (see acrypto.h). */
 #include "acrypto.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 /* ---- SHA-256 (FIPS 180-4) ------------------------------------------------ */
@@ -620,25 +621,12 @@ void a_chacha20_block(const uint8_t key[32], uint32_t counter, const uint8_t non
 
 void a_lthash_element(uint8_t alg, const uint8_t commit[32], uint16_t lanes[1024])
 {
-    if (alg == 2) { /* ChaCha20 under the commitment itself as the key, nonce "IMDBLT20" || 0^4, blocks 0..31 */
-        uint8_t blk[64];
-        static const uint8_t nonce[12] = {'I', 'M', 'D', 'B', 'L', 'T', '2', '0', 0, 0, 0, 0};
-        for (uint32_t b = 0; b < 32; b++) {
-            a_chacha20_block(commit, b, nonce, blk);
-            for (int k = 0; k < 32; k++) lanes[32 * b + (uint32_t)k] = (uint16_t)(blk[2 * k] | blk[2 * k + 1] << 8);
-        }
-        return;
-    }
-    uint8_t seed[44];
-    memcpy(seed, "IMDBLT16", 8);
-    memcpy(seed + 8, commit, 32);
-    for (uint32_t i = 0; i < 64; i++) {
-        uint8_t out[32];
-        seed[40] = (uint8_t)(i >> 24);
-        seed[41] = (uint8_t)(i >> 16);
-        seed[42] = (uint8_t)(i >> 8);
-        seed[43] = (uint8_t)i;
-        a_sha256(seed, sizeof seed, out);
-        for (int k = 0; k < 16; k++) lanes[16 * i + (uint32_t)k] = (uint16_t)(out[2 * k] | out[2 * k + 1] << 8);
+    if (alg != 2) abort(); /* META's reader refuses any other: format 1 keeps digest_alg 2 alone */
+    /* ChaCha20 under the commitment itself as the key, nonce "IMDBLT20" || 0^4, blocks 0..31 */
+    uint8_t blk[64];
+    static const uint8_t nonce[12] = {'I', 'M', 'D', 'B', 'L', 'T', '2', '0', 0, 0, 0, 0};
+    for (uint32_t b = 0; b < 32; b++) {
+        a_chacha20_block(commit, b, nonce, blk);
+        for (int k = 0; k < 32; k++) lanes[32 * b + (uint32_t)k] = (uint16_t)(blk[2 * k] | blk[2 * k + 1] << 8);
     }
 }

@@ -431,6 +431,11 @@ static int seg_old_pq(const pq_footer *ft, imdb_err *e)
 {
     uint32_t n;
     const uint8_t *f = imdb_pq_kv(ft, "imagedb.format", &n);
+    uint32_t v = 0, i = 0;
+    while (f && i < n && i < 9 && f[i] >= '0' && f[i] <= '9') v = v * 10 + (uint32_t)(f[i++] - '0');
+    if (f && n && i == n && f[0] != '0' && v > 2) /* format 1 writes "2": a later imagedb's, by name */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "segment: imagedb.format %u, written by a later imagedb, which format "
+                         "1 (imagedb.format 2) does not read", v);
     if (f && n == 1 && f[0] == '1')
         return imdb_fail(e, IMDB_ERR_CORRUPT, "segment: format 1 (F5a's, before F5b's names, field ids and DECIMAL widths) is "
                          "not read");
@@ -1335,6 +1340,9 @@ int imdb_dv_parse(const uint8_t *b, size_t len, uint8_t seg_hash[32], imdb_dv_en
     imdb_rd r;
     imdb_rd_init(&r, b, len);
     const uint8_t *m = imdb_rd_bytes(&r, 8);
+    if (m && imdb_later_magic(m, 8, "IMDBDV01")) /* format 1: a later imagedb's, by name */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "dv: %.8s, written by a later imagedb, which format 1 does not read",
+                         (const char *)m);
     if (!m || memcmp(m, kDvMagic, 8) != 0) return imdb_fail(e, IMDB_ERR_CORRUPT, "dv: bad magic");
     imdb_rd_copy(&r, seg_hash, 32);
     uint32_t cnt = imdb_rd_u32(&r);
@@ -1600,10 +1608,16 @@ int imdb_manifest_parse(const uint8_t *b, size_t len, imdb_manifest *m, imdb_err
     imdb_rd r;
     imdb_rd_init(&r, b, len);
     const uint8_t *mg = imdb_rd_bytes(&r, 8);
+    if (mg && imdb_later_magic(mg, 8, "IMDBMAN1")) /* format 1: a later imagedb's, by name */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest: %.8s, written by a later imagedb, which format 1 does not "
+                         "read", (const char *)mg);
     if (!mg || memcmp(mg, kManMagic, 8) != 0) return imdb_fail(e, IMDB_ERR_CORRUPT, "manifest: bad magic");
     uint32_t ver = imdb_rd_u32(&r); /* 9 (F2a; 8 F1 stage 4's, 7 before): 6's tables and views, then the format design's
                                      * sections, all present (no reader for 2-8) */
     if (ver >= 2 && ver <= IMDB_MANIFEST_VERSION - 1) return old_manifest(ver, e);
+    if (ver > IMDB_MANIFEST_VERSION)
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version %u: written by a later imagedb, which format 1 "
+                         "(manifest %u) does not read", ver, IMDB_MANIFEST_VERSION);
     if (ver != IMDB_MANIFEST_VERSION) return imdb_fail(e, IMDB_ERR_CORRUPT, "manifest: unsupported version");
     uint32_t nsec = imdb_rd_u32(&r); /* manifest 7: the sections after the header, every one (lake.h) */
     imdb_rd_copy(&r, m->db_id, 16);
@@ -3821,6 +3835,12 @@ int imdb_lake_head(int dirfd, bool *present, uint64_t *seq, uint8_t mh[32], imdb
     uint8_t *b;
     size_t n;
     if (imdb_read_file_at(dirfd, "LAKE_HEAD", &b, &n, 256, e)) return e->code;
+    unsigned long later = 0;
+    if (imdb_later_text(b, n, "imagedb-lake ", 1, &later)) { /* format 1 reads imagedb-lake 1 */
+        imdb_free(b);
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "LAKE_HEAD: imagedb-lake %lu: written by a later imagedb, which "
+                         "format 1 does not open", later);
+    }
     static const char a[] = "imagedb-lake 1\nseq ";
     static const char m[] = "\nmanifest ";
     const char *s = (const char *)b;
@@ -3901,7 +3921,15 @@ static int snapshot_commit(imdb_db *db, uint64_t seq, imdb_commit_rec *c, uint8_
     }
     if (last == SIZE_MAX || off != *len || seg.tail != IMDB_SCAN_END || imdb_frame_seq(*buf + last) != seq)
         return imdb_fail(e, IMDB_ERR_STATE, "commit %llu is not the last frame of its segment", (unsigned long long)seq);
-    if (imdb_frame_decode_body(*buf + last + IMDB_FRAME_HDR, lastlen - IMDB_FRAME_HDR, c, e)) return e->code;
+    if (imdb_frame_decode_body(*buf + last + IMDB_FRAME_HDR, lastlen - IMDB_FRAME_HDR, c, e)) {
+        uint64_t fs = 0; /* a header refused by name is a writer's, or its signature is what fails */
+        if (e->code == IMDB_ERR_UNSUPPORTED && !imdb_frame_authentic(*buf + last, lastlen, imdb_writer_key_at(db, seq), &fs)) {
+            imdb_err_clear(e); /* the decode's verdict replaced: imdb_fail keeps a first error */
+            return imdb_fail(e, IMDB_ERR_AUTH, "commit %llu: signature invalid (under the writer key of epoch %u)",
+                             (unsigned long long)seq, imdb_writer_epoch_at(db, seq));
+        }
+        return e->code;
+    }
     return snapshot_checked(db, seq, c, e);
 }
 
@@ -4072,7 +4100,12 @@ int imdb_lake_format_check(imdb_db *db, imdb_err *e)
     uint64_t S;
     uint8_t mh[32];
     imdb_err e2 = {0};
-    if (read_head(db, &present, &S, mh, &e2) || !present) return IMDB_OK;
+    int hr = read_head(db, &present, &S, mh, &e2);
+    if (hr == IMDB_ERR_UNSUPPORTED) { /* format 1: a later imagedb's LAKE_HEAD, never replayed over */
+        *e = e2;
+        return hr;
+    }
+    if (hr || !present) return IMDB_OK;
     int ofd = open_objects(db, &e2);
     if (ofd < 0) return IMDB_OK;
     uint8_t *mb = NULL;
@@ -4083,7 +4116,13 @@ int imdb_lake_format_check(imdb_db *db, imdb_err *e)
         imdb_rd_init(&r, mb, ml);
         const uint8_t *mg = imdb_rd_bytes(&r, 8);
         uint32_t ver = imdb_rd_u32(&r);
-        if (mg && !r.err && memcmp(mg, kManMagic, 8) == 0 && ver >= 2 && ver <= IMDB_MANIFEST_VERSION - 1)
+        if (mg && imdb_later_magic(mg, 8, "IMDBMAN1"))
+            rc = imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest: %.8s, written by a later imagedb, which format 1 does not "
+                           "read", (const char *)mg);
+        else if (mg && !r.err && memcmp(mg, kManMagic, 8) == 0 && ver > IMDB_MANIFEST_VERSION)
+            rc = imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest version %u: written by a later imagedb, which format 1 "
+                           "(manifest %u) does not read", ver, IMDB_MANIFEST_VERSION);
+        else if (mg && !r.err && memcmp(mg, kManMagic, 8) == 0 && ver >= 2 && ver <= IMDB_MANIFEST_VERSION - 1)
             rc = old_manifest(ver, e); /* 7: before F1 stage 4; 6: before slice 1 */
     }
     imdb_free(mb);

@@ -237,7 +237,7 @@ static void t_index_codec(void)
 {
     char nm[IMDB_MAX_IDENT + 1] = "t_v";
     imdb_op op = {.code = IMDB_OP_CREATE_INDEX, .table = 3, .iflags = IMDB_INDEX_UNIQUE, .incols = 2, .icols = {2, 0}, .iname = nm};
-    imdb_commit_rec c = {.seq = 7, .alg = IMDB_DIGEST_ALG_LTHASH16, .ops = &op, .nops = 1};
+    imdb_commit_rec c = {.seq = 7, .alg = IMDB_DIGEST_ALG_LTHASH16_TREE, .ops = &op, .nops = 1};
     imdb_buf b;
     imdb_buf_init(&b);
     imdb_commit_encode_header(&c, &b);
@@ -273,7 +273,7 @@ static void t_index_codec(void)
             bo.incols = en[i];
             bo.icols[0] = 2;
             bo.icols[1] = i == 3 ? 2 : 0;
-            imdb_commit_rec cb = {.seq = 7, .alg = IMDB_DIGEST_ALG_LTHASH16, .ops = &bo, .nops = 1};
+            imdb_commit_rec cb = {.seq = 7, .alg = IMDB_DIGEST_ALG_LTHASH16_TREE, .ops = &bo, .nops = 1};
             imdb_buf eb;
             imdb_buf_init(&eb);
             imdb_commit_encode_header(&cb, &eb);
@@ -309,7 +309,7 @@ static void t_index_codec(void)
     imdb_buf_free(&b);
     /* with a second op the encoder refuses it */
     imdb_op two[2] = {{.code = IMDB_OP_CHECKPOINT}, op};
-    imdb_commit_rec c2 = {.seq = 7, .alg = IMDB_DIGEST_ALG_LTHASH16, .ops = two, .nops = 2};
+    imdb_commit_rec c2 = {.seq = 7, .alg = IMDB_DIGEST_ALG_LTHASH16_TREE, .ops = two, .nops = 2};
     imdb_buf_init(&b);
     imdb_commit_encode_header(&c2, &b);
     CHECK(b.err != 0);

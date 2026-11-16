@@ -888,8 +888,8 @@ static void t_ice_cut(void)
     rdb = ice_open(rs);
     int rn0 = rdb ? ice_nsnaps(rdb, rs, "a") : -1;
     bool rv0 = rdb && ice_verified(rdb);
-    if (rn0 < 1 || !rv0) fprintf(stderr, "    restored: %d snapshots, verify %d (%s)\n", rn0, rv0, g_e.msg);
-    CHECK(rdb && rn0 >= 1 && rv0); /* the head, and its older where that generation's objects are on disk (shared here) */
+    if (rn0 != 2 || !rv0) fprintf(stderr, "    restored: %d snapshots, verify %d (%s)\n", rn0, rv0, g_e.msg);
+    CHECK(rdb && rn0 == 2 && rv0); /* the head, and its older: that generation's objects are on disk (shared here) */
     if (rdb) imdb_close(rdb);
     CHECK(audit_says(rs, NULL) <= 0);
 }
@@ -929,8 +929,8 @@ static void t_ice_restore(void)
     if (!rdb) return;
     int rn1 = ice_nsnaps(rdb, rs, "a");
     bool rv1 = ice_verified(rdb);
-    if (rn1 < 1 || !rv1) fprintf(stderr, "    restored: %d snapshots, verify %d (%s)\n", rn1, rv1, g_e.msg);
-    CHECK(rn1 >= 1 && rv1); /* the head, and its older where that generation's objects are on disk (shared here) */
+    if (rn1 != 2 || !rv1) fprintf(stderr, "    restored: %d snapshots, verify %d (%s)\n", rn1, rv1, g_e.msg);
+    CHECK(rn1 == 2 && rv1); /* the head, and its older: that generation's objects are on disk (shared here) */
     for (int round = 0; round < 2; round++) { /* the primary's publications, applied in the copy's opening handle */
         db = ice_open(dir);
         CHECK(db);

@@ -10,15 +10,14 @@
 
 _Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "imagedb v0.1 targets little-endian hosts");
 
-static const uint8_t kSeedTag[8] = {'I', 'M', 'D', 'B', 'L', 'T', '1', '6'};
-static const uint8_t kDigestTag[8] = {'I', 'M', 'D', 'B', 'L', 'T', 'D', '1'};
 static const uint8_t kLeafTag2[8] = {'I', 'M', 'D', 'B', 'L', 'T', 'L', '2'};
 static const uint8_t kRootTag2[8] = {'I', 'M', 'D', 'B', 'L', 'T', 'R', '2'};
 
-/* every caller passes its database's algorithm, which META's reader checked: anything else is a bug */
+/* every caller passes its database's algorithm, which META's reader checked: anything else is a bug (format 1: digest_alg 2
+ * alone, the user's decision of 2026-11-15; 1 refused by name where a file names it) */
 static void alg_check(uint8_t alg)
 {
-    if (alg != IMDB_DIGEST_ALG_LTHASH16 && alg != IMDB_DIGEST_ALG_LTHASH16_TREE) {
+    if (alg != IMDB_DIGEST_ALG_LTHASH16_TREE) {
         fputs("imagedb: lthash: no digest algorithm\n", stderr);
         abort();
     }
@@ -36,17 +35,9 @@ bool imdb_lthash_is_zero(const imdb_lthash *h)
 void imdb_lthash_element(uint8_t alg, const uint8_t commit[IMDB_HASH_LEN], imdb_lthash *out)
 {
     alg_check(alg);
-    if (alg == IMDB_DIGEST_ALG_LTHASH16_TREE) {
-        /* the commitment is the key: it is already a SHA-256 of the salted row, and the nonce
-         * carries the domain tag (design.md §4; the first definition hashed it once more) */
-        imdb_kern()->lthash_expand2(commit, (uint8_t *)out->v);
-        return;
-    }
-    uint8_t seed[40];
-    memcpy(seed, kSeedTag, 8);
-    memcpy(seed + 8, commit, IMDB_HASH_LEN);
-    /* lanes are little-endian u16 over the MGF1 output bytes */
-    imdb_kern()->lthash_expand(seed, (uint8_t *)out->v);
+    /* the commitment is the key: it is already a SHA-256 of the salted row, and the nonce
+     * carries the domain tag (design.md §4; the first definition hashed it once more) */
+    imdb_kern()->lthash_expand2(commit, (uint8_t *)out->v);
 }
 
 void imdb_lthash_add(imdb_lthash *acc, const imdb_lthash *x) { imdb_kern()->lthash_add(acc->v, x->v); }
@@ -103,13 +94,5 @@ static void tree_digest(const imdb_lthash *h, uint8_t out[IMDB_HASH_LEN])
 void imdb_lthash_digest(uint8_t alg, const imdb_lthash *h, uint8_t out[IMDB_HASH_LEN])
 {
     alg_check(alg);
-    if (alg == IMDB_DIGEST_ALG_LTHASH16_TREE) {
-        tree_digest(h, out);
-        return;
-    }
-    imdb_sha256_ctx c;
-    imdb_sha256_init(&c);
-    imdb_sha256_update(&c, kDigestTag, sizeof kDigestTag);
-    imdb_sha256_update(&c, h->v, IMDB_LTHASH_BYTES);
-    imdb_sha256_final(&c, out);
+    tree_digest(h, out);
 }

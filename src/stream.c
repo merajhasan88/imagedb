@@ -122,6 +122,9 @@ int imdb_stream_seed(imdb_stream *s, uint8_t p[28], bool *have, imdb_err *e)
         if (s->read(s->ctx, s->back, IMDB_FRAME_HDR, &got, e)) return e->code;
         s->nback = got;
     }
+    if (s->nback == IMDB_FRAME_HDR && imdb_later_magic(s->back, 8, "IMDBSED1")) /* format 1: a later imagedb's seed */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "seed: %.8s, written by a later imagedb, which format 1 does not "
+                         "read", (const char *)s->back);
     if (s->nback != IMDB_FRAME_HDR || memcmp(s->back, "IMDBSED1", 8) != 0) return IMDB_OK;
     memcpy(p, s->back, IMDB_FRAME_HDR);
     s->nback = 0;

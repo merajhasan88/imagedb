@@ -1,9 +1,9 @@
 #!/bin/sh
-# Makes the format's fixtures (2026-11-14, its second pair: META 5, log version 3, manifest version 21 (F5c stage 2: each
-# table's entry ends with its last change, the publication and its time) and segments in imagedb's
-# Parquet subset named by their tail, with Iceberg v3's row-lineage field ids and DECIMAL widths (F5b; F5: lake.h; before it, segment format 3, F1 stage 4:
-# a segment names its schema version by its hash with positions), ops 16, 19, 20, 21, 22's kinds and 23 to 37; alg1-20261114b.tar.gz
-# and alg2-20261114b.tar.gz beside this script): a primary and its replica under digest algorithm ALG, by
+# Makes the main set of format 1's fixtures (make_format1.sh runs it, then adds what its census found missing:
+# tests/fixtures/format1-20261115.tar.gz's main/; docs/format-1.md §5): META 5, log version 3, manifest version 21 and
+# segments in imagedb's Parquet subset named by their tail (F5, F5b), ops 16, 19, 20, 21, 22's kinds and 23 to 37, a
+# primary and its replica, digest_alg 2 (format 1's one). It made the 20261114b pair (alg2-20261114b.tar.gz) until
+# 2026-11-15, when gone_t's drop took a century's retention: it no longer makes that pair byte for byte. By
 # make_alg2.sh's steps, which reach every reader of the format: a log of several segments (each manifest
 # publish ends one), CHECKPOINTs (manifests, segments, the lanes), a two-column index and a unique one,
 # an UPDATE and a DELETE, ERASE SUBJECT (redacted log payloads, rewritten segments), commits after it, and
@@ -37,7 +37,7 @@
 # a password changed, a rename, a REVOKE and an ALTER of attributes: manifest 18, each name and verifier a payload
 # entry under its commitment, the earlier ones in the history; then (stage 2) ERASE ROLE of a dropped role whole and of
 # a role's earlier verifier, the replica fed the redacted log). The live
-# tables are RETENTION FOREVER and the dropped one is kept a century, the longest but FOREVER: a fixture is frozen
+# tables are RETENTION FOREVER and the dropped ones are kept a century, the longest but FOREVER: a fixture is frozen
 # data, so its history
 # never expires under the tests that open it (the 24-hour default is tested by the unit tests). Every
 # statement runs cross-checked; the engine and the auditor verify both directories, and the replica's
@@ -55,17 +55,16 @@
 # segments; alg1-20261113a and alg2-20261113a, manifest version 19: before segments named by their tail; alg1-20261114a and
 # alg2-20261114a, manifest version 20: before each table's last change) stay as
 # directories this format refuses.
-#   sh tests/fixtures/make_fixtures.sh BIN AUDIT ALG OUTDIR   (OUTDIR must not exist)
-#   tar -czf tests/fixtures/algALG-20261114b.tar.gz -C OUTDIR primary replica
+#   sh tests/fixtures/make_fixtures.sh BIN AUDIT OUTDIR   (OUTDIR must not exist; digest_alg 2, format 1's one)
+#   (alone, its pair: OUTDIR/primary and OUTDIR/replica; format 1's fixtures: make_format1.sh)
 set -eu
 BIN=$1
 AUD=$2
-ALG=$3
-OUT=$4
+OUT=$3
 P=$OUT/primary
 R=$OUT/replica
 mkdir "$OUT"
-"$BIN" init "$P" --digest-alg "$ALG" > /dev/null
+"$BIN" init "$P" > /dev/null
 "$BIN" init-replica "$R" "$P" > /dev/null
 sql() { "$BIN" sql "$P" --cross-check -c "$1" > /dev/null; }
 ship() { "$BIN" ship "$P" --after "$("$BIN" info "$R" | awk '/^commit/ {print $2}')" | "$BIN" apply "$R" > /dev/null; }
@@ -152,7 +151,7 @@ sql "GRANT SELECT ON moodsv TO reader"               # a view's
 sql "GRANT staff TO reader"                          # a membership
 sql "CREATE TABLE gone_t (id INT64 PRIMARY KEY)"
 sql "GRANT SELECT ON gone_t TO staff"
-sql "DROP TABLE gone_t"                              # its grant ends with it (no op)
+sql "DROP TABLE gone_t RETENTION 36500 DAYS"       # its grant ends with it (no op); kept a century, as gone
 sql "CHECKPOINT"
 ship
 sql "ALTER TABLE pair ADD w TEXT DEFAULT 'w0'"          # F1: op 22; pair's rows so far are in a segment of version 1

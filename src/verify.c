@@ -1311,6 +1311,10 @@ static int ordered_frame(vctx *x, vbatch *b, size_t i, uint64_t seg_first, bool 
     vframe *f = &b->f[i];
     if (!log_start && f->first_of_seg != x->ended)
         return imdb_fail(e, IMDB_ERR_VERIFY, "verify: log segments do not end exactly at the commits that publish manifests");
+    uint64_t fs = 0;
+    if (!f->decoded && f->err.code == IMDB_ERR_UNSUPPORTED && !imdb_frame_authentic(f->p, f->len, x->key, &fs))
+        return imdb_fail(e, IMDB_ERR_AUTH, "verify: commit %llu: signature invalid; its header is one this version "
+                         "refuses", (unsigned long long)fs);
     if (!f->decoded) return imdb_fail(e, f->err.code ? f->err.code : IMDB_ERR_VERIFY, "%s", f->err.msg);
     const imdb_commit_rec *c = &f->c;
     if (f->first_of_seg && c->seq != seg_first)

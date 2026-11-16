@@ -308,6 +308,14 @@ int imdb_rewind_begin(const char *path, imdb_rewind **out, imdb_rewind_report *r
     if (!rc && (rw->dirfd = imdb_io_open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)) < 0)
         rc = imdb_fail(e, IMDB_ERR_IO, "open %s: %s", path, strerror(errno));
     if (!rc) {
+        imdb_identity mid; /* format 1: a later imagedb's copy refused by name before LOCK is made */
+        bool mrep = false;
+        imdb_err em = {0};
+        if (faccessat(rw->dirfd, "LOCK", F_OK, AT_SYMLINK_NOFOLLOW) != 0 &&
+            imdb_meta_read_at(rw->dirfd, &mid, &mrep, &em) == IMDB_ERR_UNSUPPORTED)
+            rc = imdb_fail(e, em.code, "%s", em.msg);
+    }
+    if (!rc) {
         rw->lockfd = imdb_io_openat(rw->dirfd, "LOCK", O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
         if (rw->lockfd < 0 || imdb_io_flock(rw->lockfd, LOCK_EX | LOCK_NB) != 0)
             rc = imdb_fail(e, IMDB_ERR_STATE, "%s is in use by another process (a writer or a follower): stop it first",
@@ -319,7 +327,9 @@ int imdb_rewind_begin(const char *path, imdb_rewind **out, imdb_rewind_report *r
     if (!rc) rc = pins_free(rw->dirfd, e);
     if (!rc) {
         imdb_err ed = {0};
-        if (imdb_durable_read(rw->dirfd, &rw->w, &rw->have_w, &ed)) rw->have_w = false; /* a torn one: synced from 1 */
+        int dr = imdb_durable_read(rw->dirfd, &rw->w, &rw->have_w, &ed);
+        if (dr == IMDB_ERR_UNSUPPORTED) rc = imdb_fail(e, dr, "%s", ed.msg); /* format 1: a later imagedb's */
+        else if (dr) rw->have_w = false; /* a torn one: synced from 1 */
     }
     if (!rc && (rw->logfd = imdb_open_dir_at(rw->dirfd, IMDB_LOG_DIR, e)) < 0) rc = e->code;
     if (!rc) rc = imdb_logdir_list(rw->logfd, &rw->segs, &rw->nsegs, e);
@@ -499,17 +509,14 @@ static int cut_log(imdb_rewind *rw, uint64_t f, imdb_err *e)
     char name[IMDB_LOGSEG_NAME + 1];
     imdb_logseg_name(sf, name);
     if (!rc && off < s.len) { /* frames past f in it */
-        if (s.tagged) { /* written whole again: its frames to f as one group (as a redaction writes one) */
+        if (!s.tagged) { /* format 1: a segment not tagged is a new one's zeros, with no frame to cut */
+            rc = imdb_fail(e, IMDB_ERR_STATE, "rewind: log segment %s is not tagged and holds frames", name);
+        } else { /* written whole again: its frames to f as one group (as a redaction writes one) */
             imdb_buf whole;
             imdb_buf_init(&whole);
             imdb_tseg_build(sf, s.buf, off, &whole);
             if (!(rc = imdb_buf_check(&whole, e))) rc = imdb_write_file_atomic(rw->logfd, name, whole.p, whole.len, 0600, e);
             imdb_buf_wipe_free(&whole);
-        } else {
-            int fd = imdb_io_openat(rw->logfd, name, O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
-            if (fd < 0 || imdb_io_ftruncate(fd, (off_t)off) != 0 || imdb_io_fsync(fd) != 0)
-                rc = imdb_fail(e, IMDB_ERR_IO, "cannot cut log segment %s: %s", name, strerror(errno));
-            if (fd >= 0) close(fd);
         }
         if (!rc && imdb_io_fsync(rw->logfd) != 0) rc = imdb_fail(e, IMDB_ERR_IO, "fsync(log/) failed: %s", strerror(errno));
     }

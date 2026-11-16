@@ -112,7 +112,10 @@ static int prologue_decode(const uint8_t p[IMDB_BACKUP_PROLOGUE], imdb_backup_in
     if (imdb_get_le32(p + 8) != 2)
         return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "backup: format version %u (this build reads 2)", imdb_get_le32(p + 8));
     uint32_t kind = imdb_get_le32(p + 12);
-    if ((kind != 1 && kind != 2) || (p[32] != IMDB_DIGEST_ALG_LTHASH16 && p[32] != IMDB_DIGEST_ALG_LTHASH16_TREE) ||
+    if (p[32] == 1) /* digest_alg 1 (dropped before the freeze): a database of it is refused by name, its backups too */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "backup: of a digest_alg 1 database, made by an imagedb before format 1 "
+                         "(2026-11-15), which keeps digest_alg 2 alone; this version does not read it");
+    if ((kind != 1 && kind != 2) || p[32] != IMDB_DIGEST_ALG_LTHASH16_TREE ||
         p[33] > 1 || !all_zero(p + 34, 6) || (!p[33] && !all_zero(p + 72, IMDB_PUBKEY_LEN)) ||
         imdb_get_le32(p + 192) != IMDB_BACKUP_CHUNK || imdb_get_le32(p + 196) != 0)
         return imdb_fail(e, IMDB_ERR_CORRUPT, "backup: a malformed prologue");

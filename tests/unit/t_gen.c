@@ -946,7 +946,7 @@ static void t_gen_codec(void)
     imdb_op ops[3] = {{.code = IMDB_OP_CREATE_TABLE, .table = 0, .schema = &s},
                       {.code = IMDB_OP_SET_RETENTION, .table = 0, .retention_us = IMDB_RETAIN_DEFAULT_US},
                       {.code = IMDB_OP_COLUMN_DEFAULTS, .table = 0, .defs = cd, .ndefs = 2}};
-    imdb_commit_rec c = {.seq = 1, .alg = IMDB_DIGEST_ALG_LTHASH16, .ops = ops, .nops = 3};
+    imdb_commit_rec c = {.seq = 1, .alg = IMDB_DIGEST_ALG_LTHASH16_TREE, .ops = ops, .nops = 3};
     imdb_buf b, b2;
     imdb_buf_init(&b);
     imdb_buf_init(&b2);

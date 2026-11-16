@@ -579,12 +579,12 @@ typedef struct man_swap {
     uint8_t old[32], new_[32];
 } man_swap;
 
-/* alg-flip: the commit names the other digest algorithm, everything else as it was (its state digest
- * is still its database's algorithm's), re-signed by the writer: only the algorithm rule refuses it */
+/* alg-flip: the commit names digest_alg 1 (dropped before the freeze: format 1 keeps 2 alone), everything else as it
+ * was (its state digest still its database's algorithm's), re-signed by the writer: only the algorithm rule refuses it */
 static void flip_alg(imdb_commit_rec *c, void *ctx)
 {
     (void)ctx;
-    c->alg = c->alg == IMDB_DIGEST_ALG_LTHASH16 ? IMDB_DIGEST_ALG_LTHASH16_TREE : IMDB_DIGEST_ALG_LTHASH16;
+    c->alg = 1;
 }
 
 static void swap_manifest(imdb_commit_rec *c, void *ctx)

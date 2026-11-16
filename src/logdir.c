@@ -172,14 +172,34 @@ int imdb_logseg_read(int logfd, uint64_t first, uint8_t **buf, size_t *len, imdb
     return imdb_read_file_at(logfd, name, buf, len, IMDB_MAX_OBJECT, e);
 }
 
+int imdb_logseg_untagged_check(const uint8_t *b, size_t n, uint64_t first, imdb_err *e)
+{
+    if (n >= 4 && imdb_get_le32(b) == IMDB_FRAME_MAGIC) /* an untagged segment begins with its first frame */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "log segment %llu: an untagged segment, written by an imagedb before "
+                         "the tagged log (2026-10-27), which format 1 does not read", (unsigned long long)first);
+    for (size_t i = 0; i < n; i++)
+        if (b[i])
+            return imdb_fail(e, IMDB_ERR_CORRUPT, "log segment %llu: neither a tagged segment nor a new one's zeros",
+                             (unsigned long long)first);
+    return IMDB_OK;
+}
+
 int imdb_logseg_load(int logfd, uint64_t first, imdb_logseg *s, imdb_err *e)
 {
     memset(s, 0, sizeof *s);
     s->first = first;
     s->tail = IMDB_SCAN_END;
     if (imdb_logseg_read(logfd, first, &s->buf, &s->size, e)) return e->code;
+    if (imdb_tseg_later(s->buf, s->size, first, e)) { /* format 1: a later imagedb's, by name */
+        imdb_logseg_free(s);
+        return e->code;
+    }
     s->len = s->size;
-    if (!imdb_tseg_is_tagged(s->buf, s->size)) return IMDB_OK;
+    if (!imdb_tseg_is_tagged(s->buf, s->size)) { /* blank, or refused */
+        int rc = imdb_logseg_untagged_check(s->buf, s->size, first, e);
+        if (rc) imdb_logseg_free(s);
+        return rc;
+    }
     s->tagged = true;
     imdb_err et = {0};
     s->tail = imdb_tseg_scan(s->buf, s->size, first, &s->len, &s->end, &et);
@@ -258,6 +278,7 @@ int imdb_logseg_first_time(int logfd, uint64_t first, uint64_t *time_us, imdb_er
         if ((rc = pread_upto(fd, b.p, n, 0, &got, e))) goto out;
         b.len = got;
         bool more = true;
+        if ((rc = imdb_tseg_later(b.p, b.len, first, e))) goto out; /* format 1: a later imagedb's, by name */
         if (imdb_tseg_is_tagged(b.p, b.len)) {
             /* the first group begins at sector 1, its first frame at its first byte */
             imdb_tseg_pos pos = {.sector = 1, .byte = 0, .tag = 0, .next = first};
@@ -273,14 +294,10 @@ int imdb_logseg_first_time(int logfd, uint64_t first, uint64_t *time_us, imdb_er
                 goto out;
             }
             more = more || whole <= IMDB_TSEG_SECTOR;
-        } else {
-            imdb_err e2 = {0};
-            imdb_scan_status s = imdb_frame_scan(b.p, b.len, 0, &flen, &e2);
-            if (s == IMDB_SCAN_FRAME) {
-                f = b.p;
-                break;
-            }
-            more = s == IMDB_SCAN_TORN; /* a frame longer than the read, or a prefix not read whole yet */
+        } else { /* format 1: a new segment's zeros hold no first frame; the untagged format is refused by name */
+            if (!(rc = imdb_logseg_untagged_check(b.p, b.len, first, e)))
+                rc = imdb_fail(e, IMDB_ERR_CORRUPT, "log segment %s: no whole first frame", name);
+            goto out;
         }
         if (!more || n == size) {
             rc = imdb_fail(e, IMDB_ERR_CORRUPT, "log segment %s: no whole first frame", name);
@@ -324,6 +341,10 @@ int imdb_durable_read(int dirfd, imdb_durable *w, bool *present, imdb_err *e)
         imdb_err e2 = {0};
         if (n > 0 && imdb_durable_decode(b, (size_t)n, w, &e2) == IMDB_OK) {
             *present = true;
+            break;
+        }
+        if (e2.code == IMDB_ERR_UNSUPPORTED) { /* a later imagedb's: not a torn read, nothing to read again */
+            rc = imdb_fail(e, e2.code, "%s", e2.msg);
             break;
         }
         if (attempt == 4) {

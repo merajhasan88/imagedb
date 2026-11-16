@@ -59,6 +59,10 @@ typedef struct imdb_logseg {
     imdb_tseg_end end;
     char tail_msg[256];
 } imdb_logseg;
+/* Format 1 (the user's decision of 2026-11-15) has tagged segments alone: one whose bytes are not tagged is a new
+ * segment whose header never landed (nothing, or zeros only: imdb_logseg_blank, which its place decides), else the
+ * untagged format of before the tagged log (2026-10-27), refused by name (UNSUPPORTED), else damage (CORRUPT). */
+int imdb_logseg_untagged_check(const uint8_t *b, size_t n, uint64_t first, imdb_err *e);
 int imdb_logseg_load(int logfd, uint64_t first, imdb_logseg *s, imdb_err *e);
 void imdb_logseg_free(imdb_logseg *s); /* wipes: an erased payload may be in it until redaction */
 /* The time of the segment's first commit, from its first frame alone (expiry: db.c): the frame read

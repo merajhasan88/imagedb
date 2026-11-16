@@ -764,11 +764,10 @@ static void t_copy_dump(void)
     OK(imdb_dump(rep, 1000, outb_write, &d2, E));
     CHECK(d2.n == d1.n && !memcmp(d1.p, d2.p, d1.n));
     imdb_close(rep);
-    uint8_t other = db->meta.digest_alg == IMDB_DIGEST_ALG_LTHASH16 ? IMDB_DIGEST_ALG_LTHASH16_TREE : IMDB_DIGEST_ALG_LTHASH16;
     imdb_close(db);
-    OK(imdb_init_primary_alg(q, NULL, other, E));
+    OK(imdb_init_primary(q, NULL, E));
     imdb_db *dst = open_at(q);
-    CHECK(dst && dst->meta.digest_alg == other);
+    CHECK(dst);
     CHECK(restore_text(d1.p, d1.n) == 0);
     OK(imdb_dump(dst, 1000, outb_write, &d3, E));
     const char *a1 = strchr(d1.p, '\n'), *a3 = d3.p ? strchr(d3.p, '\n') : NULL;
@@ -842,10 +841,9 @@ static void t_copy_dump_ckey(void)
     OK(imdb_dump(db, 0, outb_write, &d1, E));
     CHECK(d1.p && strstr(d1.p, "CREATE TABLE pair (v INT64, b TEXT, a INT64, PRIMARY KEY (a, b)) RETENTION FOREVER;\n"));
     CHECK(d1.p && strstr(d1.p, " (BATCH 10000);\n1,y,2\n2,x,2\n3,\"\",-1\n,z,0\n\\.\n")); /* as the scan walks them, NULL empty */
-    uint8_t other = db->meta.digest_alg == IMDB_DIGEST_ALG_LTHASH16 ? IMDB_DIGEST_ALG_LTHASH16_TREE : IMDB_DIGEST_ALG_LTHASH16;
     imdb_session_close(&g_s);
     imdb_close(db);
-    OK(imdb_init_primary_alg(q, NULL, other, E));
+    OK(imdb_init_primary(q, NULL, E));
     imdb_db *dst = open_at(q);
     CHECK(dst);
     if (!dst) return;
@@ -915,12 +913,12 @@ static void t_copy_defaults(void)
 }
 
 /* the format's fixtures (tests/fixtures: tables kept FOREVER, a dropped one kept a century), each opened read-only:
- * the primary's dump is its replica's at the same commit and names no dropped table; restored into an empty database
- * of the other digest algorithm, it dumps again the same past its first line, VERIFY passing */
+ * the primary's dump is its replica's at the same commit and names no dropped table; restored into an empty database,
+ * it dumps again the same past its first line, VERIFY passing (the other digest algorithm until format 1 kept one) */
 static void t_copy_dump_fixtures(void)
 {
-    static const char *const tgz[] = {"tests/fixtures/alg1-20261114b.tar.gz", "tests/fixtures/alg2-20261114b.tar.gz"};
-    for (int f = 0; f < 2; f++) {
+    static const char *const tgz[] = {"tests/fixtures/alg2-20261114b.tar.gz"};
+    for (int f = 0; f < 1; f++) {
         char dir[600], cmd[1600], p[700], r[700], q[700];
         snprintf(dir, sizeof dir, "%s", test_tmpdir());
         snprintf(cmd, sizeof cmd, "tar -xzf '%s' -C '%s'", tgz[f], dir);
@@ -941,13 +939,12 @@ static void t_copy_dump_fixtures(void)
         for (uint32_t i = 0; i < db->nviews; i++) vlive += !db->views[i].dropped_at;
         for (const char *at = d1.p; (at = strstr(at, "\nCREATE VIEW ")) != NULL; at++) vmade++;
         CHECK(vlive > 1 && vlive < db->nviews && vmade == vlive);
-        uint8_t other = db->meta.digest_alg == IMDB_DIGEST_ALG_LTHASH16 ? IMDB_DIGEST_ALG_LTHASH16_TREE : IMDB_DIGEST_ALG_LTHASH16;
         imdb_close(db);
         OK(imdb_open(r, &o, &rdb, E));
         OK(imdb_dump(rdb, 0, outb_write, &d2, E));
         imdb_close(rdb);
         CHECK(d1.n == d2.n && !memcmp(d1.p, d2.p, d1.n));
-        OK(imdb_init_primary_alg(q, NULL, other, E));
+        OK(imdb_init_primary(q, NULL, E));
         memset(&g_io, 0, sizeof g_io);
         imdb_db *dst = open_at(q);
         CHECK(dst);

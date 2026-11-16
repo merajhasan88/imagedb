@@ -290,7 +290,8 @@ static void t_review_erase_gc_failure(void)
 
 static void t_review_corrupt_complete_tail(void)
 {
-    imdb_log_set_tagged(false); /* the untagged format's tail, byte by byte (the tagged one: t_tseg) */
+    /* the tail staged on the frames, written back as a tagged group (format 1's one log format; the sectors' own
+     * states: t_tseg) */
     imdb_session a, b;
     imdb_db *db = sessions(&a, &b);
     CHECK(db);
@@ -301,15 +302,19 @@ static void t_review_corrupt_complete_tail(void)
     imdb_session_close(&b);
     imdb_close(db);
     size_t n;
-    uint8_t *bytes = slurp(lp, &n);
-    CHECK(bytes && n > 0);
+    uint64_t first = 0;
+    bool tg = false;
+    uint8_t *bytes = seg_frames(lp, &n, &first, &tg);
+    CHECK(bytes && n > 0 && tg);
+    if (!bytes) return;
     bytes[n - 1] ^= 1; /* corruption in a full, previously committed final frame */
-    spit(lp, bytes, n);
+    seg_put_frames(lp, first, true, bytes, n);
     free(bytes);
+    long size = file_size(lp);
     imdb_open_opts o = {.sync = 0};
     int rc = imdb_open(dir, &o, &db, E);
     imdb_close(db);
-    CHECK(rc == IMDB_ERR_CORRUPT && file_size(lp) == (long)n);
+    CHECK(rc == IMDB_ERR_CORRUPT && file_size(lp) == size);
 }
 
 static void t_review_partial_redaction_quarantine(void)
@@ -525,7 +530,7 @@ static void t_review_durable_tracks_commits(void)
 
 static void t_review_durable_acked_loss(void)
 {
-    imdb_log_set_tagged(false); /* the untagged format's tail, byte by byte (the tagged one: t_tseg) */
+    /* the tail staged on the frames, written back as a tagged group (format 1's one log format) */
     const char *dir = test_tmpdir();
     uint8_t head4[32];
     long before_last;
@@ -535,17 +540,21 @@ static void t_review_durable_acked_loss(void)
     char lp[700];
     snprintf(lp, sizeof lp, "%s", seg_path(dir, -1));
     size_t n;
-    uint8_t *orig = slurp(lp, &n);
-    CHECK(orig);
+    uint64_t first = 0;
+    bool tg = false;
+    uint8_t *orig = seg_frames(lp, &n, &first, &tg);
+    CHECK(orig && tg && (long)n > before_last);
+    if (!orig) return;
     /* commit 5 vanished at a frame boundary: no torn bytes, yet it was acknowledged */
-    spit(lp, orig, (size_t)before_last);
+    seg_put_frames(lp, first, true, orig, (size_t)before_last);
+    long size = file_size(lp);
     imdb_open_opts o = {.sync = 0};
     imdb_err_clear(E);
     CHECK(imdb_open(dir, &o, &db, E) == IMDB_ERR_CORRUPT && strstr(E->msg, "acknowledged as durable"));
     imdb_open_opts ro = {.sync = 0, .read_only = true};
     imdb_err_clear(E);
     CHECK(imdb_open(dir, &ro, &db, E) == IMDB_ERR_CORRUPT);
-    CHECK(file_size(lp) == before_last);
+    CHECK(file_size(lp) == size);
     /* recover: nothing to cut and nothing to save, only the watermark comes down */
     imdb_recover_report rr;
     OK(imdb_recover_tail(dir, false, NULL, &rr, E));
@@ -589,47 +598,62 @@ static void t_review_durable_foreign(void)
 
 static void t_review_durable_absent(void)
 {
-    imdb_log_set_tagged(false); /* the untagged format's tail, byte by byte (the tagged one: t_tseg) */
+    /* the tail staged on the frames, written back as tagged groups (format 1's one log format): a crash loses whole
+     * sectors, so the unfinished append is a final group short of its last sector, on a sixth commit of several */
     const char *dir = test_tmpdir();
-    uint8_t head4[32];
+    uint8_t head4[32], head5[32];
     long before_last;
     imdb_db *db = five_commits(dir, head4, &before_last);
     CHECK(db);
-    long full;
+    if (!db) return;
+    memcpy(head5, db->head, 32);
+    long before6 = (long)db->log_size;
+    char big[1600];
+    memset(big, 'x', sizeof big - 1);
+    big[sizeof big - 1] = 0;
+    OK(ins1(db, 6, 42, 6, big)); /* commit 6: a frame of several sectors */
     imdb_close(db);
     char lp[700], dp[700];
     snprintf(lp, sizeof lp, "%s", seg_path(dir, -1));
     snprintf(dp, sizeof dp, "%s/DURABLE", dir);
     size_t n;
-    uint8_t *orig = slurp(lp, &n);
-    CHECK(orig);
-    full = (long)n;
+    uint64_t first = 0;
+    bool tg = false;
+    uint8_t *orig = seg_frames(lp, &n, &first, &tg);
+    CHECK(orig && tg && (long)n > before6);
+    if (!orig) return;
+    long full = (long)n;
     /* without a watermark a damaged complete final frame cannot be told from damage */
     CHECK(unlink(dp) == 0);
     uint8_t *c = malloc(n);
     memcpy(c, orig, n);
     c[n - 1] ^= 1;
-    spit(lp, c, n);
+    seg_put_frames(lp, first, true, c, n);
+    long size = file_size(lp);
     imdb_open_opts o = {.sync = 0};
     imdb_err_clear(E);
     CHECK(imdb_open(dir, &o, &db, E) == IMDB_ERR_CORRUPT && strstr(E->msg, "no DURABLE watermark"));
-    CHECK(file_size(lp) == full);
-    /* an incomplete one is an unfinished append either way */
-    spit(lp, orig, (size_t)(full - 3));
+    CHECK(file_size(lp) == size);
+    /* an incomplete one, its group short of its last sector, is an unfinished append either way */
+    size_t f6 = (size_t)(full - before6), keep = (f6 + IMDB_TSEG_PAYLOAD - 1) / IMDB_TSEG_PAYLOAD - 1;
+    CHECK(keep >= 1);
+    seg_put_frames(lp, first, true, orig, (size_t)before6);
+    seg_append(lp, orig + before6, keep * IMDB_TSEG_PAYLOAD);
     db = open_db(dir);
-    CHECK(db && db->seq == 4 && file_size(lp) == before_last && db->warning[0]);
+    if (!db) fprintf(stderr, "    the torn sixth commit: %s\n", g_e.msg);
+    CHECK(db && db->seq == 5 && seg_frames_len(lp) == before6 && db->warning[0]);
     imdb_close(db);
     imdb_durable w;
     bool present;
     OK(read_dur(dir, &w, &present)); /* the writable open published a new one */
-    CHECK(present && w.seq == 4 && w.synced && !memcmp(w.head, head4, 32));
+    CHECK(present && w.seq == 5 && w.synced && !memcmp(w.head, head5, 32));
     free(orig);
     free(c);
 }
 
 static void t_review_ship_bound(void)
 {
-    imdb_log_set_tagged(false); /* the untagged format's tail, byte by byte (the tagged one: t_tseg) */
+    /* the tail staged on the frames, written back as a tagged group (format 1's one log format) */
     char p[600], r[600], s[600];
     paths(p, r, s);
     uint8_t head4[32];
@@ -650,10 +674,13 @@ static void t_review_ship_bound(void)
     char lp[700];
     snprintf(lp, sizeof lp, "%s", seg_path(p, -1));
     size_t n;
-    uint8_t *b = slurp(lp, &n);
-    CHECK(b);
+    uint64_t first = 0;
+    bool tg = false;
+    uint8_t *b = seg_frames(lp, &n, &first, &tg);
+    CHECK(b && tg);
+    if (!b) return;
     b[n - 1] ^= 1;
-    spit(lp, b, n);
+    seg_put_frames(lp, first, true, b, n);
     OK(ship_to_file(p, 0, s, E)); /* commit 5's damage is past the watermark: held back */
     CHECK(count_frames(s) == 4);
     durable_set(p, 5, head5, true);

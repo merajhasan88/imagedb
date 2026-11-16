@@ -89,35 +89,6 @@ static void t_crc32c(void)
     CHECK(imdb_kern()->crc32c(imdb_kern()->crc32c(0, buf, 333), buf + 333, 667) == whole);
 }
 
-/* Independent MGF1-SHA256 via OpenSSL. */
-static void ossl_mgf1(const uint8_t seed[40], uint8_t out[2048])
-{
-    for (uint32_t i = 0; i < 64; i++) {
-        uint8_t m[44];
-        memcpy(m, seed, 40);
-        m[40] = (uint8_t)(i >> 24); m[41] = (uint8_t)(i >> 16); m[42] = (uint8_t)(i >> 8); m[43] = (uint8_t)i;
-        ossl_sha256(m, 44, out + 32 * i);
-    }
-}
-
-static void t_lthash_expand(void)
-{
-    for (int it = 0; it < 200; it++) {
-        uint8_t seed[40], a[2048], b[2048], c[2048];
-        test_rand_bytes(seed, sizeof seed);
-        imdb_lthash_expand_ref(seed, a);
-        ossl_mgf1(seed, b);
-        CHECK(memcmp(a, b, sizeof a) == 0);
-        if (imdb_cpu_get()->avx2) {
-            imdb_lthash_expand_avx2(seed, c);
-            CHECK(memcmp(a, c, sizeof a) == 0);
-        }
-        uint8_t d[2048];
-        imdb_kern()->lthash_expand(seed, d);
-        CHECK(memcmp(a, d, sizeof a) == 0);
-    }
-}
-
 /* OpenSSL's ChaCha20 keystream: its 16-byte IV is the block counter (LE32) then the RFC 8439 nonce */
 static void ossl_chacha20(const uint8_t key[32], const uint8_t nonce[12], uint8_t *out, size_t n)
 {
@@ -184,7 +155,7 @@ static void t_lthash_algebra(void)
     enum { N = 64 };
     uint8_t commits[N][32];
     for (int i = 0; i < N; i++) test_rand_bytes(commits[i], 32);
-    for (uint8_t alg = IMDB_DIGEST_ALG_LTHASH16; alg <= IMDB_DIGEST_ALG_LTHASH16_TREE; alg++) {
+    for (uint8_t alg = IMDB_DIGEST_ALG_LTHASH16_TREE; alg <= IMDB_DIGEST_ALG_LTHASH16_TREE; alg++) {
         imdb_lthash fwd, rev, tmp;
         imdb_lthash_zero(&fwd);
         imdb_lthash_zero(&rev);
@@ -214,20 +185,15 @@ static void t_lthash_algebra(void)
     CHECK(memcmp(&r1, &x, sizeof r1) == 0);
 }
 
-/* Both algorithms' elements and digests against their definitions (lthash.h), computed here with
- * OpenSSL alone: alg 1's MGF1 and flat digest, alg 2's ChaCha20 keyed by the commitment and its
- * tree (and not alg 2's first definition, which hashed the key once more) */
+/* digest_alg 2's element and digest against their definitions (lthash.h), computed here with OpenSSL alone:
+ * ChaCha20 keyed by the commitment and its tree (and not its first definition, which hashed the key once more) */
 static void t_lthash_definitions(void)
 {
     for (int it = 0; it < 60; it++) {
         uint8_t commit[32], m[40], key[32], want[2048];
         test_rand_bytes(commit, sizeof commit);
         imdb_lthash got;
-        memcpy(m, "IMDBLT16", 8);
         memcpy(m + 8, commit, 32);
-        ossl_mgf1(m, want);
-        imdb_lthash_element(IMDB_DIGEST_ALG_LTHASH16, commit, &got);
-        CHECK(memcmp(got.v, want, sizeof want) == 0);
         ossl_chacha20(commit, (const uint8_t *)"IMDBLT20\0\0\0\0", want, sizeof want);
         imdb_lthash_element(IMDB_DIGEST_ALG_LTHASH16_TREE, commit, &got);
         CHECK(memcmp(got.v, want, sizeof want) == 0);
@@ -235,15 +201,10 @@ static void t_lthash_definitions(void)
         ossl_sha256(m, sizeof m, key);
         ossl_chacha20(key, (const uint8_t *)"IMDBLT20\0\0\0\0", want, sizeof want);
         CHECK(memcmp(got.v, want, sizeof want) != 0);
-        /* the digests of a random state */
+        /* the digest of a random state */
         imdb_lthash st;
         test_rand_bytes(&st, sizeof st);
-        uint8_t flat[8 + 2048], d1[32], d2[32], root[8 + 256], leaf[268], dw[32];
-        memcpy(flat, "IMDBLTD1", 8);
-        memcpy(flat + 8, st.v, 2048);
-        ossl_sha256(flat, sizeof flat, dw);
-        imdb_lthash_digest(IMDB_DIGEST_ALG_LTHASH16, &st, d1);
-        CHECK(memcmp(d1, dw, 32) == 0);
+        uint8_t d2[32], root[8 + 256], leaf[268], dw[32];
         memcpy(root, "IMDBLTR2", 8);
         for (int i = 0; i < 8; i++) {
             memcpy(leaf, "IMDBLTL2", 8);
@@ -253,7 +214,7 @@ static void t_lthash_definitions(void)
         }
         ossl_sha256(root, sizeof root, dw);
         imdb_lthash_digest(IMDB_DIGEST_ALG_LTHASH16_TREE, &st, d2);
-        CHECK(memcmp(d2, dw, 32) == 0 && memcmp(d1, d2, 32) != 0);
+        CHECK(memcmp(d2, dw, 32) == 0);
     }
 }
 
@@ -428,7 +389,6 @@ const test_case crypto_tests[] = {
     {"sha256_vs_openssl", t_sha256_vs_openssl},
     {"hmac_vs_openssl", t_hmac_vs_openssl},
     {"crc32c", t_crc32c},
-    {"lthash_expand", t_lthash_expand},
     {"lthash_expand2", t_lthash_expand2},
     {"lthash_definitions", t_lthash_definitions},
     {"sha256_x8", t_sha256_x8},

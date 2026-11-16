@@ -713,28 +713,22 @@ static void lt_bytes(const lt *a, uint8_t out[2 * LANES])
         out[2 * i + 1] = (uint8_t)(a->v[i] >> 8);
     }
 }
-/* the state's digest by the database's algorithm: 1, SHA256("IMDBLTD1" || lanes); 2, the root
+/* the state's digest by the database's algorithm (format 1: 2 alone): the root
  * SHA256("IMDBLTR2" || leaf_0 .. leaf_7) of leaf_i = SHA256("IMDBLTL2" || u32 i LE || lane bytes
  * 256 i .. 256 i + 255), each through a_sha256, which pads */
 static void lt_digest(uint8_t alg, const lt *a, uint8_t out[32])
 {
-    uint8_t b[8 + 2 * LANES];
-    if (alg == 2) {
-        uint8_t lanes[2 * LANES], leaf[8 + 4 + 256], root[8 + 8 * 32];
-        lt_bytes(a, lanes);
-        memcpy(root, "IMDBLTR2", 8);
-        for (uint32_t i = 0; i < 8; i++) {
-            memcpy(leaf, "IMDBLTL2", 8);
-            put32(leaf + 8, i);
-            memcpy(leaf + 12, lanes + 256 * i, 256);
-            a_sha256(leaf, sizeof leaf, root + 8 + 32 * i);
-        }
-        a_sha256(root, sizeof root, out);
-        return;
+    if (alg != 2) abort(); /* META's reader refuses any other */
+    uint8_t lanes[2 * LANES], leaf[8 + 4 + 256], root[8 + 8 * 32];
+    lt_bytes(a, lanes);
+    memcpy(root, "IMDBLTR2", 8);
+    for (uint32_t i = 0; i < 8; i++) {
+        memcpy(leaf, "IMDBLTL2", 8);
+        put32(leaf + 8, i);
+        memcpy(leaf + 12, lanes + 256 * i, 256);
+        a_sha256(leaf, sizeof leaf, root + 8 + 32 * i);
     }
-    memcpy(b, "IMDBLTD1", 8);
-    lt_bytes(a, b + 8);
-    a_sha256(b, sizeof b, out);
+    a_sha256(root, sizeof root, out);
 }
 
 /* ---- META ----------------------------------------------------------------------------- */
@@ -747,6 +741,28 @@ typedef struct meta {
     uint8_t alg; /* every commit's header names it */
 } meta;
 
+/* Format 1's rule for a later version (docs/format-1.md), the auditor's own: a structure naming a version past format
+ * 1's is refused by name, never as damage. later_magic: b begins with magic's stem and as many digits, a greater
+ * number. later_text: the version after prefix, ended by a newline, when greater than cur; 0 otherwise. */
+static bool later_magic(const uint8_t *b, size_t n, const char *magic)
+{
+    size_t m = strlen(magic), s = m;
+    while (s && magic[s - 1] >= '0' && magic[s - 1] <= '9') s--;
+    if (s == m || n < m || memcmp(b, magic, s) != 0) return false;
+    for (size_t i = s; i < m; i++) /* as many digits, compared as a number: the first that differs decides */
+        if (b[i] < '0' || b[i] > '9') return false;
+    return memcmp(b + s, magic + s, m - s) > 0;
+}
+
+static unsigned long later_text(const uint8_t *b, size_t n, const char *prefix, unsigned long cur)
+{
+    size_t p = strlen(prefix), i = p;
+    if (n <= p || memcmp(b, prefix, p) != 0 || b[p] == '0') return 0;
+    unsigned long v = 0;
+    while (i < n && i - p < 9 && b[i] >= '0' && b[i] <= '9') v = v * 10 + (unsigned long)(b[i++] - '0');
+    return i > p && i < n && b[i] == '\n' && v > cur ? v : 0;
+}
+
 static int read_meta(int dirfd, meta *m)
 {
     uint8_t *b;
@@ -757,7 +773,10 @@ static int read_meta(int dirfd, meta *m)
     size_t off = sizeof a5 - 1;
     int rc = 0;
     memset(m, 0, sizeof *m);
-    if (n < off + 33 || memcmp(s, a5, off) != 0 || !unhex(s + off, 32, m->db_id, 16) || s[off + 32] != '\n') {
+    unsigned long later = later_text(b, n, "imagedb-meta ", 5);
+    if (later) {
+        rc = fail("META: imagedb-meta %lu, made by a later imagedb, which format 1 (META 5) does not read", later);
+    } else if (n < off + 33 || memcmp(s, a5, off) != 0 || !unhex(s + off, 32, m->db_id, 16) || s[off + 32] != '\n') {
         rc = fail("META malformed (expected imagedb-meta 5)");
     } else {
         off += 33;
@@ -776,8 +795,10 @@ static int read_meta(int dirfd, meta *m)
         if (!rc && root) off += 70;
         m->has_root = root;
         if (!rc) {
-            if (n - off != 9 || memcmp(s + off, "digest ", 7) != 0 || s[off + 8] != '\n' || (s[off + 7] != '1' && s[off + 7] != '2'))
-                rc = fail("META: malformed digest algorithm (1 or 2)");
+            if (n - off == 9 && memcmp(s + off, "digest 1\n", 9) == 0)
+                rc = fail("META: digest algorithm 1: made by an imagedb before format 1 (2026-11-15), which keeps digest_alg 2 alone");
+            else if (n - off != 9 || memcmp(s + off, "digest 2\n", 9) != 0)
+                rc = fail("META: malformed digest algorithm (2)");
             else m->alg = (uint8_t)(s[off + 7] - '0'), off += 9;
         }
         if (!rc && off != n) rc = fail("META: trailing bytes");
@@ -1695,6 +1716,9 @@ static int decode_body(const uint8_t *b, size_t n, const meta *m, keys *ks, comm
     rd hr = {h, hlen, 0, false};
     uint8_t hver = rd_u8(&hr), halg = rd_u8(&hr);
     if (hver == 2) return fail("header: log version 2, from before the format design's version 3 (2026-11-07): not read");
+    if (hver > LOG_VERSION) /* after the signature: a later imagedb's commit, by name */
+        return fail("header: log version %u, written by a later imagedb, which format 1 (log version %u) does not read",
+                    hver, LOG_VERSION);
     if (hver != LOG_VERSION) return fail("header: unsupported version");
     if (halg != m->alg) /* never mixed in one log: every digest is computed by META's algorithm */
         return fail("commit %llu: digest algorithm %u, but this database's is %u", (unsigned long long)dseq, halg, m->alg);
@@ -1935,6 +1959,9 @@ static int decode_body(const uint8_t *b, size_t n, const meta *m, keys *ks, comm
                 return fail("header: RETIRE must be the only op, the commit after its boundary before it");
             break;
         default:
+            if (o->code > 37) /* format 1's ops are 1 to 37: past them a later imagedb's, by name */
+                return fail("header: op %u, written by a later imagedb, which format 1 (ops 1 to 37) does not read",
+                            o->code);
             return fail("header: unknown op %u", o->code);
         }
         if (hr.bad) return fail("header: truncated op");
@@ -4360,6 +4387,21 @@ static int apply_op(state *S, const op *o, uint64_t seq)
 
 /* ---- tagged log segments, read by design.md §3 ("Tagged, preallocated segments") -------- */
 
+/* format 1 (the user's decision of 2026-11-15) has tagged segments alone: one not tagged is the last segment's zeros
+ * (a new segment whose header never landed: no frame), else the untagged format of before the tagged log, refused
+ * by name, else damage */
+static int untagged_seg(const uint8_t *b, size_t n, bool last, const char *name)
+{
+    if (later_magic(b, n, "ILT1"))
+        return fail("log segment %s: a tagged segment of a later format (%.4s), written by a later imagedb, which "
+                    "format 1 (ILT1) does not read", name, (const char *)b);
+    if (n >= 4 && le32(b) == 0x32474C49u) /* an untagged segment begins with its first frame */
+        return fail("log segment %s: an untagged segment, written by an imagedb before the tagged log (2026-10-27), "
+                    "which format 1 does not read", name);
+    if (last && all_zero(b, n)) return 0;
+    return fail("log corrupt: segment %s: neither tagged nor the last segment's zeros", name);
+}
+
 enum { TS_SEC = 512, TS_PAY = 504 };
 #define TS_TOP (1ull << 63)
 enum { TAIL_END = 0, TAIL_TORN = 1, TAIL_DAMAGED = 2 };
@@ -4414,6 +4456,9 @@ static int untag(const uint8_t *b, size_t n, uint64_t first, const char *name, u
     *out = NULL;
     *len = 0;
     if (n < TS_SEC || n % TS_SEC) return fail("log corrupt: segment %s: a tagged segment's size is not a multiple of 512", name);
+    if (le32(b + 4) > 1 && a_crc32c(b, 16) == le32(b + 16)) /* its header whole, at a later version */
+        return fail("log segment %s: tagged segment version %u, written by a later imagedb, which format 1 (version 1) "
+                    "does not read", name, le32(b + 4));
     if (le32(b + 4) != 1 || le64(b + 8) != first || a_crc32c(b, 16) != le32(b + 16) || !all_zero(b + 20, TS_SEC - 20))
         return fail("log corrupt: segment %s: a malformed tagged header", name);
     uint8_t *o = xcalloc(n, 1);
@@ -4586,6 +4631,11 @@ static int load_durable(int dirfd, state *S)
         size_t n;
         if (read_file(dirfd, "DURABLE", &b, &n, 64)) return -1;
         uint32_t fl = n == 60 ? le32(b + 48) : 0;
+        if (later_magic(b, n, "IMDBDUR1")) {
+            int r = fail("DURABLE: %.8s, written by a later imagedb, which format 1 does not read", (const char *)b);
+            free(b);
+            return r;
+        }
         bool ok = n == 60 && memcmp(b, "IMDBDUR1", 8) == 0 && a_crc32c(b, 56) == le32(b + 56) &&
                   (fl == 0 || fl == 1 || fl == 3) && le32(b + 52) == 0;
         if (ok) {
@@ -4625,7 +4675,6 @@ static int replay(state *S, int dirfd, uint64_t *commits)
     }
     uint64_t last_time = S->floor_time;
     int rc = 0;
-    bool seen_tagged = false; /* the format only moves forward (design.md §3) */
     for (size_t si = 0; !rc && si < nsegs; si++) {
         if (si + 1 < nsegs && segs[si + 1] - 1 <= S->floor) continue; /* below the floor, not yet cut */
         bool lastseg = si + 1 == nsegs, ended = false;
@@ -4646,10 +4695,8 @@ static int replay(state *S, int dirfd, uint64_t *commits)
             }
             log = fr;
             n = fl;
-            seen_tagged = true;
-        } else if (seen_tagged && !(lastseg && all_zero(log, n))) { /* a new segment whose header never landed */
+        } else if ((rc = untagged_seg(log, n, lastseg, name))) { /* format 1: the last segment's zeros alone */
             free(log);
-            rc = fail("log corrupt: segment %s is untagged, after a tagged one", name);
             break;
         }
         bool tail_left = tail != TAIL_END;
@@ -5493,7 +5540,9 @@ static int load_head(int dirfd, uint64_t *seq, uint8_t mh[32], bool *present)
     size_t i = sizeof a - 1;
     uint64_t v = 0;
     int rc = 0;
-    if (n < i || memcmp(s, a, i) != 0) rc = fail("LAKE_HEAD malformed");
+    unsigned long later = later_text(b, n, "imagedb-lake ", 1);
+    if (later) rc = fail("LAKE_HEAD: imagedb-lake %lu, written by a later imagedb, which format 1 does not read", later);
+    else if (n < i || memcmp(s, a, i) != 0) rc = fail("LAKE_HEAD malformed");
     size_t d0 = i;
     while (!rc && i < n && s[i] >= '0' && s[i] <= '9' && i - d0 < 19) v = v * 10 + (uint64_t)(s[i++] - '0');
     if (!rc && (i == d0 || (s[d0] == '0' && i - d0 > 1) || n - i != 1 + 9 + 64 + 1 || memcmp(s + i, "\nmanifest ", 10) != 0 ||
@@ -5644,6 +5693,9 @@ static int parse_manifest(const uint8_t *b, size_t len, manifest *m)
     rd r = {b, len, 0, false};
     const uint8_t *mg = rd_bytes(&r, 8);
     uint32_t mver = mg && memcmp(mg, "IMDBMAN1", 8) == 0 ? rd_u32(&r) : 0;
+    if (mg && later_magic(mg, 8, "IMDBMAN1"))
+        return fail("manifest: %.8s, written by a later imagedb, which format 1 does not read", (const char *)mg);
+    if (mver > 21) return fail("manifest version %u: written by a later imagedb, which format 1 (manifest 21) does not read", mver);
     if (mver == 20) return fail("manifest version 20: written before each table's last change was recorded (manifest 21, F5c), which this auditor does not read");
     if (mver == 19) return fail("manifest version 19: written before segments named by their tail (manifest 20, F5b), which this auditor does not read");
     if (mver == 18) return fail("manifest version 18: written before Parquet segments (manifest 19, F5), which this auditor does not read");
@@ -6358,7 +6410,9 @@ static int floor_load(int dirfd, state *S, flr *f)
     size_t n;
     if (read_file(dirfd, "FLOOR", &b, &n, MAX_OBJECT)) return -1;
     int rc = 0;
-    if (n < 64 || a_crc32c(b, n - 4) != le32(b + n - 4) || memcmp(b, "IMDBFLR1", 8) != 0 || memcmp(b + 8, S->m.db_id, 16) != 0)
+    if (later_magic(b, n, "IMDBFLR1"))
+        rc = fail("FLOOR: %.8s, written by a later imagedb, which format 1 does not read", (const char *)b);
+    else if (n < 64 || a_crc32c(b, n - 4) != le32(b + n - 4) || memcmp(b, "IMDBFLR1", 8) != 0 || memcmp(b + 8, S->m.db_id, 16) != 0)
         rc = fail("FLOOR: damaged or another database's");
     rd r = {b, n - 4, 24, false};
     uint64_t F = rc ? 0 : rd_u64(&r);
@@ -8646,7 +8700,9 @@ static int load_writers(int dirfd, const meta *m, uint64_t S, keys *k)
     if (fd >= 0) close(fd);
     if (read_file(dirfd, "WRITERS", &b, &n, 4096u * 4096u)) return -1;
     int rc = 0;
-    if (n < 32 || a_crc32c(b, n - 4) != le32(b + n - 4) || memcmp(b, "IMDBWRS1", 8) != 0 || memcmp(b + 8, m->db_id, 16) != 0)
+    if (later_magic(b, n, "IMDBWRS1"))
+        rc = fail("WRITERS: %.8s, written by a later imagedb, which format 1 does not read", (const char *)b);
+    else if (n < 32 || a_crc32c(b, n - 4) != le32(b + n - 4) || memcmp(b, "IMDBWRS1", 8) != 0 || memcmp(b + 8, m->db_id, 16) != 0)
         rc = fail("WRITERS: damaged or another database's");
     rd r = {b, n - 4, 28, false};
     uint32_t cnt = rc ? 0 : le32(b + 24);
@@ -8713,7 +8769,6 @@ static int tail_load(int dirfd, const meta *mt, const manifest *m, const uint8_t
     } else if (nsegs == 0 || segs[si] > T->S) {
         rc = fail("no log segment holds the snapshot commit %llu", (unsigned long long)T->S);
     }
-    bool seen_tagged = false;
     for (; !rc && si < nsegs; si++) {
         char name[32];
         snprintf(name, sizeof name, "%020llu.ilg", (unsigned long long)segs[si]);
@@ -8732,10 +8787,8 @@ static int tail_load(int dirfd, const meta *mt, const manifest *m, const uint8_t
             }
             log = fr;
             n = fl;
-            seen_tagged = true;
-        } else if (seen_tagged && !(si + 1 == nsegs && all_zero(log, n))) { /* as in the replay */
+        } else if ((rc = untagged_seg(log, n, si + 1 == nsegs, name))) { /* as in the replay */
             free(log);
-            rc = fail("log corrupt: segment %s is untagged, after a tagged one", name);
             break;
         }
         T->bufs = xrealloc(T->bufs, T->nbufs + 1, sizeof *T->bufs);
@@ -9271,7 +9324,7 @@ static int cmd_vectors(void)
         int n = snprintf(s, sizeof s, "imagedb vector %d", i + 1);
         a_sha256(s, (size_t)n, c[i]);
     }
-    for (uint8_t alg = 1; alg <= 2; alg++) {
+    for (uint8_t alg = 2; alg <= 2; alg++) { /* format 1's one algorithm */
         char nm[48];
         lt el, acc;
         uint8_t lanes[2 * LANES];

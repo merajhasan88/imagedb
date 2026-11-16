@@ -58,7 +58,7 @@ static bool cat_make(cat_fx *x)
 }
 
 /* --expires is sealed in the prologue (its hash is every chunk's additional data): read back, and a changed byte fails
- * the file; a version 1 prologue is refused by name */
+ * the file; a version 1 prologue is refused by name, and one of a digest_alg 1 database (format 1 keeps 2 alone) */
 static void t_catalogue_expiry(void)
 {
     cat_fx x;
@@ -82,6 +82,12 @@ static void t_catalogue_expiry(void)
     spit(bad, f, n);
     imdb_err_clear(E);
     SOFT(imdb_backup_check(bad, x.key, &a, E) == IMDB_ERR_UNSUPPORTED && strstr(g_e.msg, "format version 1"));
+    f[8] = 2; /* version 2 again, its database's digest algorithm 1 (dropped before the freeze): refused by name too */
+    f[32] = 1;
+    unlink(bad);
+    spit(bad, f, n);
+    imdb_err_clear(E);
+    SOFT(imdb_backup_check(bad, x.key, &a, E) == IMDB_ERR_UNSUPPORTED && strstr(g_e.msg, "digest_alg 1"));
     free(f);
 }
 

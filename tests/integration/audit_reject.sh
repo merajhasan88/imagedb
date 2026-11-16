@@ -724,23 +724,22 @@ echo "   KA a signed row whose ordinal is its type's label count, KB and KC a si
    whose DEFAULT is past the labels: the replay and the auditor refuse each; KF a manifest whose type holds a label the
    log never made: VERIFY and the auditor refuse it"
 
-echo "== Z: a commit naming the other digest algorithm, re-signed by the writer (both ways round); META naming an unknown one"
-for a in 1 2; do # explicit algorithms: under IMDB_DIGEST_ALG=2 make_db's would all be alg 2
-  PZ=$WORK/z$a
-  "$BIN" init "$PZ" --digest-alg "$a" >/dev/null
-  "$BIN" sql "$PZ" --nosync -c "CREATE TABLE t (id INT64 PRIMARY KEY, u INT64 SUBJECT, memo TEXT);
-     INSERT INTO t VALUES (1, 42, 'one'); CHECKPOINT; INSERT INTO t VALUES (2, 7, 'tail');" >/dev/null
-  # the commit after the checkpoint: the snapshot open's checks stay as they were, the tail replays it
-  "$FORGE" alg-flip "$PZ" "$("$BIN" info "$PZ" | awk '/^commit/ {print $2}')"
-  must_fail "digest algorithm $((3 - a)), but this database's is $a" "$BIN" verify "$PZ"
-  must_fail "digest algorithm $((3 - a)), but this database's is $a" "$AUD" verify "$PZ"
-done
+echo "== Z: a commit naming digest_alg 1 (dropped before the freeze: format 1 keeps 2 alone), re-signed by the writer;"
+echo "   META naming an unknown one"
+PZ=$WORK/z2
+"$BIN" init "$PZ" >/dev/null
+"$BIN" sql "$PZ" --nosync -c "CREATE TABLE t (id INT64 PRIMARY KEY, u INT64 SUBJECT, memo TEXT);
+   INSERT INTO t VALUES (1, 42, 'one'); CHECKPOINT; INSERT INTO t VALUES (2, 7, 'tail');" >/dev/null
+# the commit after the checkpoint: the snapshot open's checks stay as they were, the tail replays it
+"$FORGE" alg-flip "$PZ" "$("$BIN" info "$PZ" | awk '/^commit/ {print $2}')"
+must_fail "digest algorithm 1" "$BIN" verify "$PZ"
+must_fail "digest algorithm 1, but this database's is 2" "$AUD" verify "$PZ"
 PM=$WORK/zm; "$BIN" init "$PM" >/dev/null
-sed -i 's/^digest [12]$/digest 3/' "$PM/META"
+sed -i 's/^digest 2$/digest 3/' "$PM/META"
 must_fail "digest algorithm 3 is not one this version knows" "$BIN" verify "$PM"
 must_fail "malformed digest algorithm" "$AUD" verify "$PM"
-echo "   Z the algorithm byte of a signed commit flipped, either way, and META's unknown 3: the auditor refuses each,
-   the engine at its open's replay (VERIFY's own check: t_round3 digest_alg_mismatch, under an open handle)"
+echo "   Z the algorithm byte of a signed commit made digest_alg 1, and META's unknown 3: the auditor refuses each,
+   the engine at its open's replay, by name (VERIFY's own check: t_round3 digest_alg_mismatch, under an open handle)"
 
 echo "== VA-VE: view ops the log's rules forbid, each signed by the writer, alone in its commit (P2 S7, S7b)"
 make_vdb() {

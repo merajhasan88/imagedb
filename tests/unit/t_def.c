@@ -500,7 +500,7 @@ static void t_def_codec(void)
     imdb_op ops[3] = {{.code = IMDB_OP_CREATE_TABLE, .table = 0, .schema = &s},
                       {.code = IMDB_OP_SET_RETENTION, .table = 0, .retention_us = IMDB_RETAIN_DEFAULT_US},
                       {.code = IMDB_OP_COLUMN_DEFAULTS, .table = 0, .defs = cd, .ndefs = 3}};
-    imdb_commit_rec c = {.seq = 1, .alg = IMDB_DIGEST_ALG_LTHASH16, .ops = ops, .nops = 3};
+    imdb_commit_rec c = {.seq = 1, .alg = IMDB_DIGEST_ALG_LTHASH16_TREE, .ops = ops, .nops = 3};
     imdb_buf b, b2;
     imdb_buf_init(&b);
     imdb_buf_init(&b2);
@@ -563,7 +563,7 @@ static void t_def_codec(void)
         {{ops[0], ops[1], {.code = IMDB_OP_COLUMN_DEFAULTS, .table = 1, .defs = cd, .ndefs = 1}}, 3},
     };
     for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
-        imdb_commit_rec cc = {.seq = 1, .alg = IMDB_DIGEST_ALG_LTHASH16, .ops = cases[i].ops, .nops = cases[i].n};
+        imdb_commit_rec cc = {.seq = 1, .alg = IMDB_DIGEST_ALG_LTHASH16_TREE, .ops = cases[i].ops, .nops = cases[i].n};
         imdb_buf eb;
         imdb_buf_init(&eb);
         imdb_commit_encode_header(&cc, &eb);

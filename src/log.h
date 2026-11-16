@@ -8,7 +8,7 @@
  *   descriptor: u8 kind(2) | u32 header_len | u64 seq | commit_hash[32] | sig[64]
  *
  * header  (chained; never rewritten):
- *         u8 version(2) | u8 digest_alg (1 or 2, below: META's) | u64 seq | u64 time_us | prev[32] |
+ *         u8 version(2) | u8 digest_alg (2, below: META's) | u64 seq | u64 time_us | prev[32] |
  *         u32 n_ops | ops... | state_digest[32]
  * commit_hash = SHA256("IMDBCHN2" || header)               -- hash(prev || transaction)
  * sig         = Ed25519(writer key, "IMDBSIG2" || u64 seq || u32 header_len || commit_hash)
@@ -73,8 +73,12 @@
 #define IMDB_SIGMSG_LEN  52u
 #define IMDB_HEADER_MIN  86u          /* header with no ops */
 #define IMDB_LOG_VERSION 3 /* P2 (the format design, slice 1): 2 is refused by name, no reader kept before the freeze */
-#define IMDB_DIGEST_ALG_LTHASH16 1      /* LtHash16 elements by MGF1-SHA256; the state digest SHA-256 over the lanes */
-#define IMDB_DIGEST_ALG_LTHASH16_TREE 2 /* elements by ChaCha20 keyed by the commitment; the digest a tree of eight leaves */
+/* The on-disk format (docs/format-1.md): format 1 is META 5, log version 3 (tagged segments version 1, ops 1 to
+ * IMDB_OP_FORMAT1_LAST), manifest version 21, segments of imagedb.format "2", digest_alg 2; a later one is refused by
+ * name. db.c asserts the versions it covers: a change to one is a format step (docs/format-1.md §4). */
+#define IMDB_FORMAT 1u
+#define IMDB_DIGEST_ALG_LTHASH16_TREE 2 /* elements by ChaCha20 keyed by the commitment; the digest a tree of eight leaves: format
+                                         * 1's one algorithm (1, LtHash16 by MGF1-SHA256, dropped before the freeze, 2026-11-15) */
 
 enum {
     IMDB_OP_CREATE_TABLE = 1,
@@ -161,6 +165,7 @@ enum {
     IMDB_OP_GRANT = 36,           /* L: u32 n | n records (imdb_grant_rec), strictly increasing, each exactly what it
                                      adds; alone */
     IMDB_OP_REVOKE = 37,          /* L: the same, each exactly what it removes; alone */
+    IMDB_OP_FORMAT1_LAST = 37,    /* format 1's last op: one past it a later imagedb's, refused by name (docs/format-1.md) */
 };
 
 /* op 22's kinds (F1) */
@@ -527,6 +532,10 @@ void imdb_commit_encode_header(const imdb_commit_rec *c, imdb_buf *b);
 void imdb_commit_hash(const uint8_t *header, size_t len, uint8_t out[32]);
 /* The 52 signed bytes: "IMDBSIG2" || u64 seq || u32 header_len || commit_hash. */
 void imdb_commit_sigmsg(uint64_t seq, uint32_t hlen, const uint8_t hash[32], uint8_t out[IMDB_SIGMSG_LEN]);
+/* Format 1: a frame whose header a decode refused by name (UNSUPPORTED: a later imagedb's, or an earlier format) is
+ * refused so only when it is a writer's: a plain commit's descriptor (kind 2), its header hashing to the descriptor's
+ * hash, the signature over them valid under pk. Otherwise its signature is what fails (*seq: the descriptor's). */
+bool imdb_frame_authentic(const uint8_t *frame, size_t len, const uint8_t pk[IMDB_PUBKEY_LEN], uint64_t *seq);
 bool imdb_commit_sig_valid(const uint8_t writer_pk[IMDB_PUBKEY_LEN], uint64_t seq, uint32_t hlen,
                            const uint8_t hash[32], const uint8_t sig[IMDB_SIG_LEN]);
 /* The root-signed bytes of a promotion: "IMDBPRO1" || db_id || u32 epoch || u64 seq || prev || new_pk. */
@@ -620,6 +629,10 @@ imdb_scan_status imdb_frame_scan(const uint8_t *buf, size_t len, size_t off, siz
 void imdb_tseg_header(uint64_t first, uint8_t out[IMDB_TSEG_SECTOR]);
 /* A segment whose bytes begin "ILT1" is tagged; any other is untagged (frames back to back). */
 bool imdb_tseg_is_tagged(const uint8_t *b, size_t n);
+/* Format 1: a tagged segment of a later format (its magic ILTk past ILT1, or ILT1's header whole at a later version)
+ * is refused by name (UNSUPPORTED), before any other check: never scanned as damage, whose repairs (recover's cut, the
+ * open's drop of a torn tail) would cut a later imagedb's frames. IMDB_OK: not a later one. */
+int imdb_tseg_later(const uint8_t *b, size_t n, uint64_t first, imdb_err *e);
 
 /* A write group as the writer lays it out (every frame appended since the log's last fdatasync). */
 typedef struct imdb_tgroup {

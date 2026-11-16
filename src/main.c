@@ -28,10 +28,8 @@
 static int usage(void)
 {
     fputs("usage:\n"
-          "  imagedb init <dir> [--root KEY] [--digest-alg N]\n"
-          "                                             create a primary database (KEY: a root key that may\n"
-          "                                             certify a promotion; imagedb root-key makes one; N: the\n"
-          "                                             state digest's algorithm, 1 or 2, default IMDB_DIGEST_ALG or 2)\n"
+          "  imagedb init <dir> [--root KEY]            create a primary database (KEY: a root key that may\n"
+          "                                             certify a promotion; imagedb root-key makes one)\n"
           "  imagedb init-replica <dir> <primary-dir>   create a replica (copies the db id and writer public key)\n"
           "  imagedb init-replica <dir> --identity FILE create a replica from a primary's identity file\n"
           "  imagedb identity <dir>                     print the db id and writer public key (no secrets)\n"
@@ -955,7 +953,7 @@ static int cmd_follow(int argc, char **argv)
 }
 
 /* P2 D1.1: a restored copy's ERASE_DEBT (backup.c's write_debt): 0 none, 1 read (*n erasures, the last *last), -1 not
- * one (a damaged file is said, never trusted) */
+ * one (a damaged file is said, never trusted), -2 a later imagedb's (format 1 reads version 1) */
 static int debt_read(int dirfd, size_t *n, uint64_t *last)
 {
     *n = 0;
@@ -968,6 +966,7 @@ static int debt_read(int dirfd, size_t *n, uint64_t *last)
     if (k <= 0 || (size_t)k == sizeof b - 1) return -1;
     b[k] = 0;
     char *crc = strstr(b, "crc32c ");
+    if (imdb_later_text((const uint8_t *)b, (size_t)k, "imagedb-erase-debt ", 1, NULL)) return -2; /* a later imagedb's */
     if (strncmp(b, "imagedb-erase-debt 1\n", 21) != 0 || !crc || crc[strlen(crc) - 1] != '\n') return -1;
     unsigned want = 0;
     if (sscanf(crc, "crc32c %8x\n", &want) != 1 || imdb_kern()->crc32c(0, b, (size_t)(crc - b)) != want) return -1;
@@ -1112,14 +1111,16 @@ static void print_info(imdb_db *db)
     size_t nd;
     uint64_t ld;
     int dr = debt_read(db->dirfd, &nd, &ld);
-    if (dr < 0) printf("erasures   ERASE_DEBT is damaged: this copy may hold what erasures removed\n");
+    if (dr == -2) printf("erasures   ERASE_DEBT was written by a later imagedb, which format 1 does not read\n");
+    else if (dr < 0) printf("erasures   ERASE_DEBT is damaged: this copy may hold what erasures removed\n");
     else if (dr && db->seq < ld)
         printf("erasures   it holds what %zu erasures removed, through commit %llu (restored with --accept-erased)\n", nd,
                (unsigned long long)ld);
     else if (dr) printf("erasures   its ERASE_DEBT is paid: it has applied them since (remove the file)\n");
-    printf("algorithm  digest_alg %u (%s)\n", (unsigned)db->meta.digest_alg,
-           db->meta.digest_alg == IMDB_DIGEST_ALG_LTHASH16_TREE ? "LtHash16 by ChaCha20, the digest a tree of SHA-256"
-                                                             : "LtHash16 by MGF1-SHA256, the digest SHA-256");
+    printf("format     %u (META 5, log version %u, manifest %u: README, Format stability)\n", IMDB_FORMAT,
+           (unsigned)IMDB_LOG_VERSION,
+           (unsigned)IMDB_MANIFEST_VERSION);
+    printf("algorithm  digest_alg %u (LtHash16 by ChaCha20, the digest a tree of SHA-256)\n", (unsigned)db->meta.digest_alg);
     imdb_hex(db->writer_pk, IMDB_PUBKEY_LEN, hex);
     printf("writer     epoch %u, key %s%s\n", imdb_current_epoch(db), hex, db->meta.has_root ? " (a root key may promote)" : "");
     if (db->lake_seq) {
@@ -1138,8 +1139,8 @@ static void print_info(imdb_db *db)
                (unsigned long long)t->live, (unsigned long long)t->nver, t->nseg, hex, dropped);
     }
     const imdb_kernels *k = imdb_kern();
-    printf("kernels    crc32c=%s lthash=%s expand=%s expand2=%s sha256x8=%s utf8=%s filter=%s sum=%s\n", k->crc32c_name,
-           k->lthash_name, k->expand_name, k->expand2_name, k->sha8_name, k->utf8_name, k->filter_name, k->sum_name);
+    printf("kernels    crc32c=%s lthash=%s expand2=%s sha256x8=%s utf8=%s filter=%s sum=%s\n", k->crc32c_name,
+           k->lthash_name, k->expand2_name, k->sha8_name, k->utf8_name, k->filter_name, k->sum_name);
 }
 
 static uint64_t wall_us(void) /* the export's age: its time_us against this clock */
@@ -1226,7 +1227,7 @@ static int cmd_health(int argc, char **argv)
     imdb_err e = {0};
     if (imdb_health_dir(argv[2], &e)) {
         printf("unhealthy: %s\n", e.msg);
-        return 3;
+        return e.code == IMDB_ERR_UNSUPPORTED ? 1 : 3; /* another format's: unreadable by this version, not damaged */
     }
     { /* P2 D1.1: a restored copy holding what erasures removed */
         int hd = open(argv[2], O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -1239,8 +1240,10 @@ static int cmd_health(int argc, char **argv)
         if (dr && hd >= 0 && (imdb_durable_read(hd, &w, &hw, &ed) || !hw)) w.seq = 0;
         if (hd >= 0) close(hd);
         if (dr < 0 || (dr && w.seq < ld)) {
-            printf("owes erasures: %s\n", dr < 0 ? "its ERASE_DEBT is damaged" : "it was restored past erasures it does not apply "
-                                                                       "(ERASE_DEBT)");
+            printf("owes erasures: %s\n", dr == -2  ? "its ERASE_DEBT was written by a later imagedb"
+                                           : dr < 0 ? "its ERASE_DEBT is damaged"
+                                                    : "it was restored past erasures it does not apply "
+                                                      "(ERASE_DEBT)");
             return 1;
         }
     }
@@ -1366,23 +1369,17 @@ int main(int argc, char **argv)
         return 0;
     }
     if (strcmp(cmd, "init") == 0 && argc >= 3 && argc % 2 == 1) {
-        uint8_t root[IMDB_PUBKEY_LEN], alg = 0;
-        const char *rk = NULL, *ak = NULL;
+        uint8_t root[IMDB_PUBKEY_LEN];
+        const char *rk = NULL;
         for (int i = 3; i + 1 < argc; i += 2) {
             if (strcmp(argv[i], "--root") == 0 && !rk) rk = argv[i + 1];
-            else if (strcmp(argv[i], "--digest-alg") == 0 && !ak) ak = argv[i + 1];
             else return usage();
         }
         if (rk && (strlen(rk) != 2 * IMDB_PUBKEY_LEN || !imdb_unhex(rk, 2 * IMDB_PUBKEY_LEN, root, IMDB_PUBKEY_LEN))) {
             fprintf(stderr, "imagedb: init: the root key is 64 hex digits (imagedb root-key FILE prints it)\n");
             return 2;
         }
-        if (ak && strcmp(ak, "1") != 0 && strcmp(ak, "2") != 0) {
-            fprintf(stderr, "imagedb: init: --digest-alg is 1 or 2\n");
-            return 2;
-        }
-        if ((!ak && imdb_default_digest_alg(&alg, &e)) ||
-            imdb_init_primary_alg(argv[2], rk ? root : NULL, ak ? (uint8_t)(ak[0] - '0') : alg, &e)) {
+        if (imdb_init_primary(argv[2], rk ? root : NULL, &e)) {
             print_err("init", &e);
             return 1;
         }

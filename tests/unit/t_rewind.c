@@ -310,9 +310,8 @@ static const char *file_is_tail(fork_fx *x, const char *file, const char *copy_a
     return back ? NULL : "FILE applied at the fork does not give back the commits it took off";
 }
 
-static void rewind_old_primary(ckpt where, bool tagged)
+static void rewind_old_primary(ckpt where)
 {
-    imdb_log_set_tagged(tagged);
     fork_fx x;
     CHECK(make_fork(&x, where, false));
     char save[700], keep[700], atf[700];
@@ -342,10 +341,9 @@ static void rewind_old_primary(ckpt where, bool tagged)
     fork_free(&x);
 }
 
-static void t_rewind_demote(void) { rewind_old_primary(CKPT_BELOW, true); }
-static void t_rewind_fork_publishes(void) { rewind_old_primary(CKPT_AT, true); }
-static void t_rewind_lake_past(void) { rewind_old_primary(CKPT_PAST, true); }
-static void t_rewind_untagged(void) { rewind_old_primary(CKPT_BELOW, false); }
+static void t_rewind_demote(void) { rewind_old_primary(CKPT_BELOW); }
+static void t_rewind_fork_publishes(void) { rewind_old_primary(CKPT_AT); }
+static void t_rewind_lake_past(void) { rewind_old_primary(CKPT_PAST); }
 
 /* q, a replica that applied p's commits the promoted r never had: rewound without --demote (refused with it) */
 static void t_rewind_replica(void)
@@ -803,7 +801,6 @@ const test_case rewind_tests[] = {
     {"rewind_demote", t_rewind_demote},
     {"rewind_fork_publishes", t_rewind_fork_publishes},
     {"rewind_lake_past", t_rewind_lake_past},
-    {"rewind_untagged", t_rewind_untagged},
     {"rewind_replica", t_rewind_replica},
     {"rewind_refusals", t_rewind_refusals},
     {"rewind_cut", t_rewind_cut},

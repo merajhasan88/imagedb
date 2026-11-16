@@ -12,13 +12,8 @@ static void t_dispatch_report(void)
     const imdb_kernels *k = imdb_kern();
     const imdb_cpu *c = imdb_cpu_get();
     printf("    cpu: sse42=%d avx2=%d bmi2=%d forced_scalar=%d\n", c->sse42, c->avx2, c->bmi2, c->forced_scalar);
-    uint8_t alg = 0; /* the suite's: the matrix's alg 1 pass shows here that it ran under alg 1 */
-    imdb_err ea = {0};
-    CHECK(imdb_default_digest_alg(&alg, &ea) == 0);
-    const char *env = getenv("IMDB_DIGEST_ALG");
-    printf("    new databases: digest_alg %u (IMDB_DIGEST_ALG %s)\n", (unsigned)alg, env ? env : "unset");
-    printf("    kernels: crc32c=%s lthash=%s expand=%s expand2=%s sha256x8=%s utf8=%s filter=%s sum=%s\n", k->crc32c_name,
-           k->lthash_name, k->expand_name, k->expand2_name, k->sha8_name, k->utf8_name, k->filter_name, k->sum_name);
+    printf("    kernels: crc32c=%s lthash=%s expand2=%s sha256x8=%s utf8=%s filter=%s sum=%s\n", k->crc32c_name,
+           k->lthash_name, k->expand2_name, k->sha8_name, k->utf8_name, k->filter_name, k->sum_name);
     if (c->forced_scalar)
         CHECK(k->crc32c == imdb_crc32c_ref && k->filter_range_i64 == imdb_filter_range_i64_ref &&
               k->lthash_expand2 == imdb_lthash_expand2_ref && k->sha256_x8 == imdb_sha256_x8_ref);

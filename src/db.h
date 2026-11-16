@@ -612,13 +612,8 @@ typedef struct imdb_open_opts {
 /* Primary: fresh db id and writer key (signing.key). Replica: copies the
  * identity from a local primary directory. */
 int imdb_init(const char *path, bool replica, const char *from_primary, imdb_err *e);
-/* A primary whose promotions root (NULL: none) may certify, under the default digest algorithm
- * (imdb_default_digest_alg), or alg. */
+/* A primary whose promotions root (NULL: none) may certify, of digest_alg 2 (format 1's one algorithm). */
 int imdb_init_primary(const char *path, const uint8_t *root, imdb_err *e);
-int imdb_init_primary_alg(const char *path, const uint8_t *root, uint8_t alg, imdb_err *e);
-/* A new primary's digest algorithm: IMDB_DIGEST_ALG from the environment (1 or 2) when set, else
- * digest_alg 2. A replica takes its primary's, never this. */
-int imdb_default_digest_alg(uint8_t *alg, imdb_err *e);
 /* Replica of a remote primary, from its identity (see imagedb identity). */
 int imdb_init_replica(const char *path, const imdb_identity *id, imdb_err *e);
 int imdb_read_identity(const char *dir, uint8_t db_id[16], uint8_t writer[IMDB_PUBKEY_LEN], imdb_err *e);
@@ -1188,9 +1183,6 @@ int imdb_recompute_digest(imdb_db *db, imdb_table *t, uint64_t snap, imdb_lthash
 
 /* Internal hooks shared with lake.c */
 int imdb_log_append(imdb_db *db, const uint8_t *frame, size_t len, imdb_err *e);
-/* Tests only: segments made from now on untagged (false), as before 2026-10-27, so that the old
- * format's paths, which an old database's last segment still takes, stay tested. */
-void imdb_log_set_tagged(bool on);
 /* Tests only: the engine's clock (commit times, expiry) moved by us from the wall clock's; reset to 0
  * before every test. */
 void imdb_clock_offset(int64_t us);

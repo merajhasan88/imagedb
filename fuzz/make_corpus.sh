@@ -8,7 +8,7 @@ OUT=${2:-build-fuzz/corpus}
 WORK=$(mktemp -d "${IMDB_TEST_TMP:-/tmp}/imdb-corpus.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 D=$WORK/db
-"$BIN" init "$D" --digest-alg 1 >/dev/null
+"$BIN" init "$D" >/dev/null
 # fw, fu and fe must stay the fourth, fifth and sixth tables made (ids 3, 4 and 5), fmood the first type (id 1):
 # fuzz_common.h's fourth to sixth schemas are theirs, so their segment seeds parse whole (a seed's first byte is its
 # table id; another id meets another schema)
@@ -73,10 +73,10 @@ COMPACT txns PURGE BEFORE 3;
 mkdir -p "$OUT"/{frame,stream,segment,manifest,sql,codec,ed25519}
 "${FORGE:-$(dirname "$BIN")/imdb-forge}" corpus "$D" "$OUT"   # frames, stream seeds, objects, rows
 cp "$D/DURABLE" "$OUT/frame/durable"                            # the watermark record (fuzz_frame decodes it too)
-# the same database under digest_alg 2, so the frame, stream and manifest harnesses see both
-# algorithms' header bytes and lanes (prefixed: forge names its seeds by a counter)
+# the same database again (once digest_alg 1's and 2's; format 1 keeps 2 alone), its seeds prefixed: forge names its
+# seeds by a counter
 D2=$WORK/db2; O2=$WORK/db2-out
-"$BIN" init "$D2" --digest-alg 2 >/dev/null
+"$BIN" init "$D2" >/dev/null
 "$BIN" sql "$D2" --nosync -c "$SQL" >/dev/null
 mkdir -p "$O2"/{frame,stream,segment,manifest,sql,codec,ed25519}
 "${FORGE:-$(dirname "$BIN")/imdb-forge}" corpus "$D2" "$O2"

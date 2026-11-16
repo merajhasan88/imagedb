@@ -467,7 +467,7 @@ static void t_seq_codec(void)
         {{drop, adv}, 2, false},  {{set, ret}, 2, false},     {{set, set}, 2, false},  {{cs, drop}, 2, false},
     };
     for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
-        imdb_commit_rec c = {.seq = 1, .alg = IMDB_DIGEST_ALG_LTHASH16, .ops = cases[i].ops, .nops = cases[i].n};
+        imdb_commit_rec c = {.seq = 1, .alg = IMDB_DIGEST_ALG_LTHASH16_TREE, .ops = cases[i].ops, .nops = cases[i].n};
         imdb_buf b;
         imdb_buf_init(&b);
         imdb_commit_encode_header(&c, &b);
@@ -486,8 +486,8 @@ static void t_seq_codec(void)
         imdb_buf_free(&b);
     }
     /* the decoder alike: SEQ_ADVANCE before CREATE, built by hand from two encodings */
-    imdb_commit_rec c1 = {.seq = 1, .alg = IMDB_DIGEST_ALG_LTHASH16, .ops = &cs, .nops = 1};
-    imdb_commit_rec c2 = {.seq = 1, .alg = IMDB_DIGEST_ALG_LTHASH16, .ops = &adv, .nops = 1};
+    imdb_commit_rec c1 = {.seq = 1, .alg = IMDB_DIGEST_ALG_LTHASH16_TREE, .ops = &cs, .nops = 1};
+    imdb_commit_rec c2 = {.seq = 1, .alg = IMDB_DIGEST_ALG_LTHASH16_TREE, .ops = &adv, .nops = 1};
     imdb_buf b1, b2, h;
     imdb_buf_init(&b1);
     imdb_buf_init(&b2);

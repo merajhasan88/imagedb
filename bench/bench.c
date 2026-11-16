@@ -92,46 +92,31 @@ static void kernels(void)
     dt = now() - t0;
     printf("  utf8 ascii run  C       %7.2f GB/s   %-14s %7.2f GB/s\n", aref, k->utf8_name, (double)N * 8 * reps / dt / 1e9);
 
-    uint8_t seed[40] = {1}, o[2048];
     int er = 3000;
-    t0 = now();
-    for (int r = 0; r < er; r++) {
-        seed[9] = (uint8_t)r;
-        imdb_lthash_expand_ref(seed, o);
-    }
-    dt = now() - t0;
-    double eref = dt / er * 1e6;
-    t0 = now();
-    for (int r = 0; r < er * 5; r++) {
-        seed[9] = (uint8_t)r;
-        k->lthash_expand(seed, o);
-    }
-    dt = now() - t0;
-    printf("  digest element  C       %7.1f us/row  %-14s %7.1f us/row (64 x SHA-256)\n", eref, k->expand_name, dt / (er * 5) * 1e6);
-    /* digest_alg 2's element (the key's SHA-256, then 32 ChaCha20 blocks) and both state digests,
-     * through lthash.c as the engine calls them */
+    /* digest_alg 2's element (32 ChaCha20 blocks under the commitment) and its state digest (the tree), through
+     * lthash.c as the engine calls them (format 1's one algorithm: 1's, MGF1-SHA256, dropped before the freeze) */
     uint8_t cm[32] = {2}, d[32];
     imdb_lthash el, st;
     memset(&st, 0x5a, sizeof st);
-    double per[4];
-    for (int al = 0; al < 2; al++) {
+    double per[2];
+    {
         t0 = now();
         for (int r = 0; r < er * 5; r++) {
             cm[9] = (uint8_t)r;
-            imdb_lthash_element(al ? IMDB_DIGEST_ALG_LTHASH16_TREE : IMDB_DIGEST_ALG_LTHASH16, cm, &el);
+            imdb_lthash_element(IMDB_DIGEST_ALG_LTHASH16_TREE, cm, &el);
             g_sink += el.v[r & 1023];
         }
-        per[al] = (now() - t0) / (er * 5) * 1e6;
+        per[0] = (now() - t0) / (er * 5) * 1e6;
         t0 = now();
         for (int r = 0; r < er * 5; r++) {
             st.v[r & 1023] ^= (uint16_t)r;
-            imdb_lthash_digest(al ? IMDB_DIGEST_ALG_LTHASH16_TREE : IMDB_DIGEST_ALG_LTHASH16, &st, d);
+            imdb_lthash_digest(IMDB_DIGEST_ALG_LTHASH16_TREE, &st, d);
             g_sink += d[0];
         }
-        per[2 + al] = (now() - t0) / (er * 5) * 1e6;
+        per[1] = (now() - t0) / (er * 5) * 1e6;
     }
-    printf("  element         alg 1   %7.1f us/row  alg 2 (%s) %7.1f us/row\n", per[0], k->expand2_name, per[1]);
-    printf("  state digest    alg 1   %7.1f us      alg 2 (%s) %7.1f us (the tree)\n", per[2], k->sha8_name, per[3]);
+    printf("  element         alg 2 (%s) %7.1f us/row\n", k->expand2_name, per[0]);
+    printf("  state digest    alg 2 (%s) %7.1f us (the tree)\n", k->sha8_name, per[1]);
     free(buf);
     free(bits);
 

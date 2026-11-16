@@ -1,7 +1,10 @@
 /* Tagged log segments (design.md §3, "Tagged, preallocated segments"): the scan's rules one by
  * one on segments laid out as the writer lays them, every crash state of a group written by
  * several appends, and the writer's fill through the engine. */
+#include <fcntl.h>
 #include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
 #include "../../src/cpu.h"
 #include "../../src/log.h"
@@ -639,8 +642,9 @@ static int audit_verdict(const char *dir)
 static void t_tseg_blank_last(void)
 {
     static uint8_t z[IMDB_TSEG_SECTOR + 4096];
-    for (int zeros = 0; zeros < 2; zeros++) {
-        char *dir = path_join(test_tmpdir(), zeros ? "zeros" : "empty");
+    static const size_t sizes[3] = {0, sizeof z, 100}; /* nothing, zeros, and zeros short of a sector */
+    for (int zeros = 0; zeros < 3; zeros++) {
+        char *dir = path_join(test_tmpdir(), zeros == 2 ? "short" : zeros ? "zeros" : "empty");
         OK(imdb_init(dir, false, NULL, E));
         imdb_db *db = open_db(dir);
         CHECK(db);
@@ -653,7 +657,7 @@ static void t_tseg_blank_last(void)
         char name[IMDB_LOGSEG_NAME + 1], p[800];
         imdb_logseg_name(next, name);
         snprintf(p, sizeof p, "%s/log/%s", dir, name);
-        spit(p, z, zeros ? sizeof z : 0);
+        spit(p, z, sizes[zeros]);
         imdb_open_opts ro = {.sync = 0, .read_only = true};
         OK(imdb_open(dir, &ro, &db, E));
         imdb_verify_report vr;
@@ -681,6 +685,122 @@ static void t_tseg_blank_last(void)
     }
 }
 
+
+/* the auditor's output on dir holds needle (-1: no auditor in this build) */
+static int audit_output_has(const char *dir, const char *needle)
+{
+    const char *bin = getenv("IMDB_AUDIT_BIN");
+    if (!bin || !*bin) return -1;
+    char out[800], cmd[1700];
+    snprintf(out, sizeof out, "%s.audit.txt", dir);
+    snprintf(cmd, sizeof cmd, "'%s' verify '%s' > '%s' 2>&1", bin, dir, out);
+    int st = system(cmd);
+    size_t n = 0;
+    uint8_t *b = slurp(out, &n);
+    bool has = b && mem_contains(b, n, needle);
+    free(b);
+    unlink(out);
+    return st != 0 && has;
+}
+
+/* Format 1 (the user's decision of 2026-11-15) has tagged segments alone. A segment in the untagged format of before the
+ * tagged log (its frames back to back) is refused by name at every entry (a writable, a read-only and a full-replay open,
+ * the first frame's time, ship, the auditor), the directory left as it was; a segment neither tagged nor zeros is damage
+ * (CORRUPT), as is a new segment's zeros anywhere but last */
+static void t_tseg_untagged_refused(void)
+{
+    char *dir = path_join(test_tmpdir(), "db");
+    OK(imdb_init(dir, false, NULL, E));
+    imdb_db *db = open_db(dir);
+    CHECK(db);
+    if (!db) return;
+    OK(make_table(db, E));
+    OK(ins1(db, 1, 7, 100, "row"));
+    OK(ins1(db, 2, 7, 200, "row"));
+    imdb_close(db);
+    char p[800], copy[800], stream[800], logdir[800], why[300] = "", cmd[1800];
+    snprintf(p, sizeof p, "%s", seg_path(dir, -1));
+    snprintf(copy, sizeof copy, "%s/copy", test_tmpdir());
+    snprintf(stream, sizeof stream, "%s/stream", test_tmpdir());
+    snprintf(logdir, sizeof logdir, "%s/log", dir);
+    size_t n = 0;
+    uint64_t first = 0;
+    bool tg = false;
+    uint8_t *fr = seg_frames(p, &n, &first, &tg);
+    CHECK(fr && tg && n > 0);
+    if (!fr) return;
+    for (int kind = 0; kind < 2; kind++) {
+        const char *needle = kind ? "neither a tagged segment nor a new one's zeros" : "an untagged segment";
+        int code = kind ? IMDB_ERR_CORRUPT : IMDB_ERR_UNSUPPORTED;
+        if (kind) { /* damage: bytes neither tagged, nor a frame's, nor zeros */
+            uint8_t *g = malloc(n);
+            CHECK(g != NULL);
+            if (!g) break;
+            memset(g, 0x5a, n);
+            spit(p, g, n);
+            free(g);
+        } else {
+            seg_put_frames(p, first, false, fr, n); /* the untagged format: its frames back to back */
+        }
+        snprintf(cmd, sizeof cmd, "rm -rf '%s' && cp -a '%s' '%s'", copy, dir, copy);
+        CHECK(system(cmd) == 0);
+        for (int how = 0; how < 3; how++) {
+            imdb_open_opts o = {.sync = 0, .read_only = how == 1, .full_replay = how == 2};
+            imdb_db *x = NULL;
+            imdb_err_clear(E);
+            int rc = imdb_open(dir, &o, &x, E);
+            if (rc != code || !strstr(g_e.msg, needle)) fprintf(stderr, "    open %d (%d): %d %s\n", how, kind, rc, g_e.msg);
+            CHECK(rc == code && !x && strstr(g_e.msg, needle));
+            if (x) imdb_close(x);
+        }
+        int lfd = open(logdir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        CHECK(lfd >= 0);
+        uint64_t t = 0;
+        imdb_err_clear(E);
+        CHECK(lfd >= 0 && imdb_logseg_first_time(lfd, first, &t, E) == code && strstr(g_e.msg, needle));
+        if (lfd >= 0) close(lfd);
+        if (!kind) { /* ship reads the files itself */
+            imdb_err_clear(E);
+            CHECK(ship_to_file(dir, 0, stream, E) == IMDB_ERR_UNSUPPORTED && strstr(g_e.msg, needle));
+        }
+        CHECK(audit_output_has(dir, kind ? "neither tagged nor the last segment's zeros" : "an untagged segment") != 0);
+        CHECK(dirs_identical(dir, copy, why, sizeof why)); /* nothing written by any of them */
+        if (why[0]) fprintf(stderr, "    %s\n", why);
+    }
+    free(fr);
+}
+
+/* A new segment's zeros anywhere but last: damage, refused by every open and the auditor */
+static void t_tseg_blank_not_last(void)
+{
+    char *dir = path_join(test_tmpdir(), "db");
+    OK(imdb_init(dir, false, NULL, E));
+    imdb_db *db = open_db(dir);
+    CHECK(db);
+    if (!db) return;
+    OK(make_table(db, E));
+    OK(ins1(db, 1, 7, 100, "row"));
+    OK(imdb_checkpoint(db, E));
+    uint64_t next = db->seq + 1;
+    imdb_close(db);
+    static uint8_t z[IMDB_TSEG_SECTOR];
+    for (int k = 0; k < 2; k++) { /* two of them: the first is not last */
+        char name[IMDB_LOGSEG_NAME + 1], p[800];
+        imdb_logseg_name(next + (uint64_t)k, name);
+        snprintf(p, sizeof p, "%s/log/%s", dir, name);
+        spit(p, z, k ? 0 : sizeof z);
+    }
+    for (int how = 0; how < 3; how++) {
+        imdb_open_opts o = {.sync = 0, .read_only = how == 1, .full_replay = how == 2};
+        imdb_db *x = NULL;
+        imdb_err_clear(E);
+        int rc = imdb_open(dir, &o, &x, E);
+        CHECK(rc == IMDB_ERR_CORRUPT && !x);
+        if (x) imdb_close(x);
+    }
+    CHECK(audit_verdict(dir) != 0);
+}
+
 const test_case tseg_tests[] = {
     {"tseg_groups", t_tseg_groups},
     {"tseg_layout", t_tseg_layout},
@@ -698,5 +818,7 @@ const test_case tseg_tests[] = {
     {"tseg_fill", t_tseg_fill},
     {"tseg_end_after_reopen", t_tseg_end_after_reopen},
     {"tseg_blank_last", t_tseg_blank_last},
+    {"tseg_untagged_refused", t_tseg_untagged_refused},
+    {"tseg_blank_not_last", t_tseg_blank_not_last},
 };
 const size_t tseg_ntests = sizeof tseg_tests / sizeof *tseg_tests;

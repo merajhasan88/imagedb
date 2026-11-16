@@ -165,6 +165,9 @@ static int entry_load(imdb_db *db, imdb_rd *r, uint32_t i, uint64_t *last, bool 
 /* Each entry proven from META's keys, in order; the schedule grows as they verify. */
 static int writers_load(imdb_db *db, const uint8_t *p, size_t n, imdb_err *e)
 {
+    if (imdb_later_magic(p, n, "IMDBWRS1")) /* format 1: a later imagedb's, by name, before its CRC's place is read */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "WRITERS: %.8s, written by a later imagedb, which format 1 does not "
+                         "read", (const char *)p);
     if (n < 32 || imdb_kern()->crc32c(0, p, n - 4) != imdb_get_le32(p + n - 4))
         return imdb_fail(e, IMDB_ERR_CORRUPT, "WRITERS: damaged");
     imdb_rd r;
@@ -293,6 +296,11 @@ int imdb_floor_read(imdb_db *db, imdb_err *e)
     if (rc) return rc;
     imdb_rd r;
     imdb_floor_hd h;
+    if (imdb_later_magic(p, n, "IMDBFLR1")) { /* format 1: a later imagedb's, by name */
+        rc = imdb_fail(e, IMDB_ERR_UNSUPPORTED, "FLOOR: %.8s, written by a later imagedb, which format 1 does not "
+                       "read", (const char *)p);
+        goto out;
+    }
     if (n < 64 || imdb_kern()->crc32c(0, p, n - 4) != imdb_get_le32(p + n - 4)) {
         rc = imdb_fail(e, IMDB_ERR_CORRUPT, "FLOOR: damaged");
         goto out;
@@ -373,6 +381,8 @@ int imdb_writers_init(imdb_db *db, imdb_err *e)
     if (rc == IMDB_ERR_NOTFOUND) return IMDB_OK;
     if (!rc) rc = writers_load(db, p, n, &ew);
     imdb_free(p);
+    if (rc == IMDB_ERR_UNSUPPORTED) /* format 1: a later imagedb's, never replayed over and republished */
+        return imdb_fail(e, rc, "%s", ew.msg);
     if (rc) { /* proves nothing: a snapshot then fails to authenticate and the whole log is replayed */
         imdb_writers_reset(db);
         imdb_warn(db, "WRITERS ignored (%s)", ew.msg);
@@ -567,7 +577,11 @@ static int ledger_check(int fd, const char *path, const uint8_t db_id[16], uint3
     size_t n = 0;
     int rc = b ? imdb_read_all(fd, b, LEDGER_MAX + 1, &n, e) : e->code;
     if (!rc && n > LEDGER_MAX) rc = imdb_fail(e, IMDB_ERR_LIMIT, "ledger %s is too large", path);
-    if (!rc && n && (n < sizeof LEDGER_HEAD - 1 || memcmp(b, LEDGER_HEAD, sizeof LEDGER_HEAD - 1) != 0))
+    unsigned long lv = 0;
+    if (!rc && n && imdb_later_text(b, n, "imagedb-root-ledger ", 1, &lv)) /* format 1: a later imagedb's, by name */
+        rc = imdb_fail(e, IMDB_ERR_UNSUPPORTED, "ledger %s: imagedb-root-ledger %lu, written by a later imagedb, which "
+                       "format 1 does not read", path, lv);
+    else if (!rc && n && (n < sizeof LEDGER_HEAD - 1 || memcmp(b, LEDGER_HEAD, sizeof LEDGER_HEAD - 1) != 0))
         rc = imdb_fail(e, IMDB_ERR_CORRUPT, "ledger %s is not an imagedb root ledger", path);
     for (size_t at = n ? sizeof LEDGER_HEAD - 1 : 0; !rc && at < n;) {
         const char *l = (const char *)b + at;

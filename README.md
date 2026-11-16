@@ -13,8 +13,8 @@ docs/review-2026-10-27.md integrates the review of 2026-10-26; deferred.md track
 future work, and design.md explains the design. These documents are kept by the
 author, not in this repository (below).
 
-**The on-disk format is not frozen yet:** a later version may not open a database
-made by this one (deferred.md D8, item 6). Do not keep data you need in it.
+**The on-disk format is format 1** (2026-11-15; below, Format stability): later versions read a database
+made by this one, and this one refuses a later format's by name, writing nothing into it.
 
 ## Consistency contract
 
@@ -219,6 +219,20 @@ network file systems), a CPU without AVX2 (its code path runs only under
   hash chain up to the signed snapshot commit. VERIFY and the auditor check
   the whole log.
 
+## Format stability
+
+The on-disk format is frozen as **format 1** (2026-11-15; `imagedb info` prints it): META 5, the log's version 3
+in tagged segments, manifests of version 21, segments in imagedb's Parquet subset (imagedb.format "2"), the state
+digest's algorithm 2. A later imagedb reads a format-1 database and, until a logged format step, writes format 1
+into it byte for byte, so that every copy re-derives each publication exactly; a format step also raises META's
+version and comes with an upgrade of format-1 copies.
+
+This version refuses a later format's files by name ("written by a later imagedb"), never as damage, and writes
+nothing into such a directory but a reader's lease in pins/: no repair (recover's cut, a watermark rewritten, a
+lake made again) runs over them. A log frame stamped with a later version is called a later imagedb's only under
+a valid signature; otherwise its signature is what fails. The formats before format 1 (digest_alg 1, untagged log
+segments, earlier logs, manifests and segments) are refused by name too.
+
 ## Replication and auditing
 
 ```sh
@@ -237,11 +251,10 @@ superaccumulator). The two agree bit for bit, out-of-range results included.
   reader authenticates each frame's signed descriptor before decoding it.
   Replay and VERIFY check signatures in batches of 64 (about 4.8x fewer cycles
   per signature; a failed batch is rechecked one by one, so rejections are exact).
-- The state digest's algorithm is chosen when a database is made: `imagedb init
-  --digest-alg 2` (the default since 2026-10-26: elements by ChaCha20, the
-  digest a tree of SHA-256, see design.md §4) or `--digest-alg 1` (MGF1-SHA256,
-  as every earlier directory has). META and every commit name it, a replica
-  takes its primary's, and a commit naming the other is refused everywhere.
+- The state digest's algorithm is digest_alg 2 (elements by ChaCha20, the digest a tree of SHA-256, see
+  design.md §4), the one format 1 keeps: digest_alg 1 (MGF1-SHA256, the default until 2026-10-26) was dropped
+  before the freeze, and a META, commit, identity or backup naming it is refused by name. META and every commit
+  name the algorithm, a replica takes its primary's, and a commit naming another is refused everywhere.
   `imagedb info` prints it.
 - `ship` sends nothing past the primary's durable watermark. With normal sync,
   those frames have passed fdatasync. Under `--nosync` the watermark does not
@@ -473,7 +486,8 @@ checks the
 directory without opening it (META, DURABLE, no replica incident recorded) and
 the export: exit 0 healthy, 1 a statement running past N seconds (60), a
 following replica that has not heard its primary for MS (10000: stale) or an
-unreadable export, 2 the handle failed (reopen it), 3 the directory damaged or
+unreadable export or a directory of a format this version does not read (a later imagedb's, or one before
+format 1), 2 the handle failed (reopen it), 3 the directory damaged or
 a replica incident recorded. An idle copy writes no export until its next
 statement: an old export with nothing running is idle, not hung.
 
@@ -524,7 +538,6 @@ Command-line options (`imagedb` with no arguments prints the commands):
 | `--events FILE` | sql, apply, follow | the event log (Monitoring) | none |
 | `--zoneinfo DIR` | sql | the IANA zone files SET TIME ZONE, AT TIME ZONE and TIMESTAMPTZ literals name (Time zones) | `/usr/share/zoneinfo` |
 | `--root KEY` | init | a root key that may certify a promotion | none |
-| `--digest-alg N` | init | the state digest's algorithm, 1 or 2 | `IMDB_DIGEST_ALG`, else 2 |
 | `--identity FILE` | init-replica | a replica from a primary's identity file | |
 | `--after N` | ship | the commits after N | 0 |
 | `--batch N` | dump | each table's `COPY ... FROM STDIN (BATCH N)`: rows a restore commits at once | 10000 |
@@ -591,7 +604,6 @@ Environment variables:
 | Variable | What it does |
 |---|---|
 | `IMDB_THREADS=N` | the worker pool's size (default: the CPUs the process may use); 1 runs every parallel loop inline |
-| `IMDB_DIGEST_ALG=1\|2` | the digest algorithm of the databases `init` creates (default 2); never read when a database opens |
 | `IMDB_NO_SIMD=1` | the C reference kernels and the reference Ed25519, whatever the CPU |
 | `IMDB_EVICT=eager` | a test mode: every publish evicts what it can (reads below the floor go to the lake) |
 | `IMDB_SEGCACHE=tiny` | a test mode: no segment image is kept between operations |

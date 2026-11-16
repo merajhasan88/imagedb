@@ -499,55 +499,53 @@ static void t_round3_meta_digest_alg(void)
     OK(imdb_init_primary(p, NULL, E));
     imdb_identity id, b;
     bool rep = true;
-    uint8_t def = 0;
     OK(imdb_identity_read(p, &id, &rep, E));
-    OK(imdb_default_digest_alg(&def, E));
-    CHECK(id.digest_alg == def && !rep && !id.has_root);
-    /* identity 3: written and read back, with a root key and without, either algorithm */
-    for (int r = 0; r < 2; r++)
-        for (uint8_t alg = IMDB_DIGEST_ALG_LTHASH16; alg <= IMDB_DIGEST_ALG_LTHASH16_TREE; alg++) {
-            imdb_identity a = id;
-            a.has_root = r;
-            memset(a.root, r ? 0x5a : 0, sizeof a.root);
-            a.digest_alg = alg;
-            int n = imdb_identity_format(&a, buf, sizeof buf);
-            CHECK(n > 0);
-            OK(imdb_identity_parse(buf, (size_t)n, &b, E));
-            CHECK(b.digest_alg == alg && b.has_root == a.has_root && memcmp(b.db_id, a.db_id, 16) == 0 &&
-                  memcmp(b.writer, a.writer, 32) == 0 && memcmp(b.root, a.root, 32) == 0);
-        }
+    CHECK(id.digest_alg == IMDB_DIGEST_ALG_LTHASH16_TREE && !rep && !id.has_root); /* format 1's one algorithm */
+    /* identity 3: written and read back, with a root key and without */
+    for (int r = 0; r < 2; r++) {
+        imdb_identity a = id;
+        a.has_root = r;
+        memset(a.root, r ? 0x5a : 0, sizeof a.root);
+        int n = imdb_identity_format(&a, buf, sizeof buf);
+        CHECK(n > 0);
+        OK(imdb_identity_parse(buf, (size_t)n, &b, E));
+        CHECK(b.digest_alg == IMDB_DIGEST_ALG_LTHASH16_TREE && b.has_root == a.has_root && memcmp(b.db_id, a.db_id, 16) == 0 &&
+              memcmp(b.writer, a.writer, 32) == 0 && memcmp(b.root, a.root, 32) == 0);
+    }
     imdb_hex(id.db_id, 16, hx);
     imdb_hex(id.writer, 32, wx);
     memset(rx, 'a', 64);
     rx[64] = 0;
-    /* identity 1 and 2 predate the algorithm: alg 1 */
+    /* identity 1 and 2 predate the algorithm and mean digest_alg 1, dropped before the freeze: refused by name */
     snprintf(buf, sizeof buf, "imagedb-identity 1\ndb_id %s\nwriter %s\n", hx, wx);
-    OK(imdb_identity_parse(buf, strlen(buf), &b, E));
-    CHECK(b.digest_alg == IMDB_DIGEST_ALG_LTHASH16 && !b.has_root);
+    imdb_err_clear(E);
+    CHECK(imdb_identity_parse(buf, strlen(buf), &b, E) == IMDB_ERR_UNSUPPORTED && strstr(g_e.msg, "digest algorithm 1"));
     snprintf(buf, sizeof buf, "imagedb-identity 2\ndb_id %s\nwriter %s\nroot %s\n", hx, wx, rx);
-    OK(imdb_identity_parse(buf, strlen(buf), &b, E));
-    CHECK(b.digest_alg == IMDB_DIGEST_ALG_LTHASH16 && b.has_root);
+    imdb_err_clear(E);
+    CHECK(imdb_identity_parse(buf, strlen(buf), &b, E) == IMDB_ERR_UNSUPPORTED && strstr(g_e.msg, "digest algorithm 1"));
     static const struct {
         const char *tail;
         int rc;
-    } bad[] = {{"digest 3\n", IMDB_ERR_UNSUPPORTED}, {"digest x\n", IMDB_ERR_INVALID}, {"digest 1", IMDB_ERR_INVALID},
-               {"digest 1\n\n", IMDB_ERR_INVALID}, {"digest  1\n", IMDB_ERR_INVALID}, {"digest 12\n", IMDB_ERR_INVALID},
-               {"", IMDB_ERR_INVALID}, {"root zz\ndigest 1\n", IMDB_ERR_INVALID}};
+    } bad[] = {{"digest 3\n", IMDB_ERR_UNSUPPORTED}, {"digest 1\n", IMDB_ERR_UNSUPPORTED}, {"digest x\n", IMDB_ERR_INVALID},
+               {"digest 2", IMDB_ERR_INVALID}, {"digest 2\n\n", IMDB_ERR_INVALID}, {"digest  2\n", IMDB_ERR_INVALID},
+               {"digest 12\n", IMDB_ERR_INVALID}, {"", IMDB_ERR_INVALID}, {"root zz\ndigest 2\n", IMDB_ERR_INVALID}};
     for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
         snprintf(buf, sizeof buf, "imagedb-identity 3\ndb_id %s\nwriter %s\n%s", hx, wx, bad[i].tail);
         imdb_err_clear(E);
         CHECK(imdb_identity_parse(buf, strlen(buf), &b, E) == bad[i].rc);
     }
-    /* META 5, with a root key or without, either algorithm; 1 to 4 (earlier formats) refused by name */
+    /* META 5, with a root key or without; digest 1 refused by name; 1 to 4 (earlier formats) refused by name */
     snprintf(buf, sizeof buf, "imagedb-meta 5\ndb_id %s\nrole primary\nwriter %s\ndigest 2\n", hx, wx);
     CHECK(meta_text(dir, 0, buf, &b, &rep) == 0 && b.digest_alg == IMDB_DIGEST_ALG_LTHASH16_TREE && !b.has_root && !rep);
+    snprintf(buf, sizeof buf, "imagedb-meta 5\ndb_id %s\nrole replica\nwriter %s\nroot %s\ndigest 2\n", hx, wx, rx);
+    CHECK(meta_text(dir, 1, buf, &b, &rep) == 0 && b.digest_alg == IMDB_DIGEST_ALG_LTHASH16_TREE && b.has_root && rep);
     snprintf(buf, sizeof buf, "imagedb-meta 5\ndb_id %s\nrole replica\nwriter %s\nroot %s\ndigest 1\n", hx, wx, rx);
-    CHECK(meta_text(dir, 1, buf, &b, &rep) == 0 && b.digest_alg == IMDB_DIGEST_ALG_LTHASH16 && b.has_root && rep);
+    CHECK(meta_text(dir, 9, buf, &b, &rep) == IMDB_ERR_UNSUPPORTED && strstr(g_e.msg, "digest algorithm 1"));
     for (int v = 1; v <= 4; v++) {
         snprintf(buf, sizeof buf, "imagedb-meta %d\ndb_id %s\nrole primary\nwriter %s\ndigest 2\n", v, hx, wx);
         CHECK(meta_text(dir, 1 + v, buf, &b, &rep) == IMDB_ERR_UNSUPPORTED && strstr(g_e.msg, "before the retention format"));
     }
-    static const char *const badm[] = {"digest 3\n", "", "digest 1", "digest 1\nx", "digest 0\n", "root zz\ndigest 1\n"};
+    static const char *const badm[] = {"digest 3\n", "", "digest 2", "digest 2\nx", "digest 0\n", "root zz\ndigest 2\n"};
     static const int badrc[] = {IMDB_ERR_UNSUPPORTED, IMDB_ERR_CORRUPT, IMDB_ERR_CORRUPT,
                                 IMDB_ERR_CORRUPT, IMDB_ERR_UNSUPPORTED, IMDB_ERR_CORRUPT};
     for (size_t i = 0; i < sizeof badm / sizeof *badm; i++) {
@@ -556,9 +554,9 @@ static void t_round3_meta_digest_alg(void)
     }
 }
 
-/* digest_alg 2: every commit of a database names its algorithm. A replica whose META names the
- * other one refuses its primary's stream, either way round; a commit re-signed under the other
- * one is refused by VERIFY (reading the log under an open handle) and by the next open. */
+/* digest_alg 1, dropped before the freeze (format 1 keeps 2 alone): a replica whose META names it is refused at its
+ * open, by name; a commit re-signed under it is refused by VERIFY (reading the log under an open handle) and by the
+ * next open, by name too. */
 static void meta_with_alg(const char *dir, uint8_t alg)
 {
     imdb_identity id;
@@ -576,38 +574,29 @@ static void meta_with_alg(const char *dir, uint8_t alg)
 static void t_round3_digest_alg_mismatch(void)
 {
     const char *dir = test_tmpdir();
-    for (uint8_t alg = IMDB_DIGEST_ALG_LTHASH16; alg <= IMDB_DIGEST_ALG_LTHASH16_TREE && !g_test_failed; alg++) {
-        char p[700], r[700], s[700];
-        snprintf(p, sizeof p, "%s/p%u", dir, alg);
-        snprintf(r, sizeof r, "%s/r%u", dir, alg);
-        snprintf(s, sizeof s, "%s/s%u", dir, alg);
-        OK(imdb_init_primary_alg(p, NULL, alg, E));
-        OK(imdb_init(r, true, p, E));
-        imdb_identity id;
-        bool rep;
-        OK(imdb_identity_read(r, &id, &rep, E));
-        CHECK(id.digest_alg == alg && rep); /* a replica takes its primary's */
-        imdb_db *db = open_db(p);
-        CHECK(db);
-        if (!db) return;
-        OK(make_table(db, E));
-        for (int i = 1; i <= 3; i++) CHECK(ins1(db, i, 7, 100 * i, "m") == 0);
-        imdb_close(db);
-        meta_with_alg(r, alg == IMDB_DIGEST_ALG_LTHASH16 ? IMDB_DIGEST_ALG_LTHASH16_TREE : IMDB_DIGEST_ALG_LTHASH16);
-        OK(ship_to_file(p, 0, s, E));
-        imdb_db *rdb = open_db(r);
-        CHECK(rdb);
-        if (!rdb) return;
-        uint64_t applied = 0;
-        imdb_err_clear(E);
-        CHECK(apply_file(rdb, s, &applied, E) != 0 && applied == 0 && strstr(g_e.msg, "digest algorithm") &&
-              strstr(g_e.msg, "but this database's is"));
-        imdb_close(rdb);
-    }
-    /* commit 2 of p1 (alg 1) re-signed under alg 2: the same length, so overwritten in place */
-    char p[700];
-    snprintf(p, sizeof p, "%s/p1", dir);
+    char p[700], r[700];
+    snprintf(p, sizeof p, "%s/p", dir);
+    snprintf(r, sizeof r, "%s/r", dir);
+    OK(imdb_init_primary(p, NULL, E));
+    OK(imdb_init(r, true, p, E));
+    imdb_identity id;
+    bool rep;
+    OK(imdb_identity_read(r, &id, &rep, E));
+    CHECK(id.digest_alg == IMDB_DIGEST_ALG_LTHASH16_TREE && rep); /* a replica takes its primary's */
     imdb_db *db = open_db(p);
+    CHECK(db);
+    if (!db) return;
+    OK(make_table(db, E));
+    for (int i = 1; i <= 3; i++) CHECK(ins1(db, i, 7, 100 * i, "m") == 0);
+    imdb_close(db);
+    meta_with_alg(r, 1);
+    imdb_db *rdb = NULL;
+    imdb_open_opts ro = {.sync = 1};
+    imdb_err_clear(E);
+    CHECK(imdb_open(r, &ro, &rdb, E) == IMDB_ERR_UNSUPPORTED && strstr(g_e.msg, "digest algorithm 1"));
+    if (rdb) imdb_close(rdb);
+    /* commit 2 re-signed under digest_alg 1: the same length, so overwritten in place */
+    db = open_db(p);
     CHECK(db);
     if (!db) return;
     char *seg = seg_path(p, 0);
@@ -627,7 +616,7 @@ static void t_round3_digest_alg_mismatch(void)
         imdb_commit_rec c;
         OK(imdb_frame_decode_body(log + off + IMDB_FRAME_HDR, fl - IMDB_FRAME_HDR, &c, E));
         if (c.seq == 2) {
-            c.alg = IMDB_DIGEST_ALG_LTHASH16_TREE;
+            c.alg = 1; /* digest_alg 1: dropped before the freeze */
             imdb_buf h, pl, f;
             imdb_buf_init(&h);
             imdb_buf_init(&pl);
@@ -655,12 +644,12 @@ static void t_round3_digest_alg_mismatch(void)
     imdb_verify_report vr;
     memset(&vr, 0, sizeof vr);
     imdb_err_clear(E);
-    CHECK(imdb_verify(db, &vr, E) != 0 && strstr(g_e.msg, "commit 2: digest algorithm 2, but this database's is 1"));
+    CHECK(imdb_verify(db, &vr, E) != 0 && strstr(g_e.msg, "digest algorithm 1"));
     imdb_close(db);
     imdb_db *db2 = NULL;
     imdb_open_opts o = {.sync = 1};
     imdb_err_clear(E);
-    CHECK(imdb_open(p, &o, &db2, E) != 0 && strstr(g_e.msg, "commit 2: digest algorithm 2, but this database's is 1"));
+    CHECK(imdb_open(p, &o, &db2, E) != 0 && strstr(g_e.msg, "digest algorithm 1"));
     if (db2) imdb_close(db2);
 }
 
@@ -700,6 +689,15 @@ static void fixture_check(const char *tgz, uint8_t alg, const char *meta_head, b
     bool rep = true;
     OK(imdb_identity_read(p, &id, &rep, E));
     CHECK(id.digest_alg == alg && !rep && !id.has_root);
+    { /* the clock at the fixture's last commit: its retentions (a table dropped with the 24-hour default) never due */
+        imdb_open_opts ro = {.read_only = true};
+        imdb_db *x = NULL;
+        OK(imdb_open(p, &ro, &x, E));
+        if (x) {
+            imdb_clock_freeze(x->last_time);
+            imdb_close(x);
+        }
+    }
     imdb_db *db = open_db(p);
     CHECK(db && db->meta.digest_alg == alg && db->seq == base);
     if (!db) return;
@@ -755,11 +753,6 @@ static void fixture_check(const char *tgz, uint8_t alg, const char *meta_head, b
  * DEFAULT, a view's CAST, an ADD VALUE and an ADD COLUMN of the type after the first CHECKPOINT)
  * (a DROP COLUMN and a SET DEFAULT since stage 4, a clock's since F2a), segment format 3, ops 16, 19 to 23, tagged segments), one a
  * digest algorithm: they pin the format, so a change to it fails here first */
-static void t_round3_alg1_fixture(void)
-{
-    fixture_check("tests/fixtures/alg1-20261114b.tar.gz", IMDB_DIGEST_ALG_LTHASH16, "imagedb-meta 5\n", true, 134);
-}
-
 static void t_round3_alg2_fixture(void)
 {
     fixture_check("tests/fixtures/alg2-20261114b.tar.gz", IMDB_DIGEST_ALG_LTHASH16_TREE, "imagedb-meta 5\n", true, 134);
@@ -850,20 +843,23 @@ static void t_round3_old_fixtures(void)
         snprintf(p, sizeof p, "%s/primary", d);
         imdb_identity id;
         bool rep;
-        OK(imdb_identity_read(p, &id, &rep, E));
+        bool a1 = strstr(tgz4[i], "/alg1-") != NULL; /* digest_alg 1, dropped before the freeze: refused for it first */
+        imdb_err_clear(E);
+        int irc = imdb_identity_read(p, &id, &rep, E);
+        CHECK(a1 ? irc == IMDB_ERR_UNSUPPORTED && strstr(g_e.msg, "digest algorithm 1") : irc == 0);
         for (int full = 0; full < 2; full++) { /* a full replay too, refused before its CHECKPOINTs rebuild another one */
             imdb_open_opts o = {.sync = 0, .full_replay = full};
             imdb_db *db = NULL;
             imdb_err_clear(E);
             int rc = imdb_open(p, &o, &db, E);
-            CHECK(!db && rc == IMDB_ERR_UNSUPPORTED && strstr(g_e.msg, why4[i]));
+            CHECK(!db && rc == IMDB_ERR_UNSUPPORTED && strstr(g_e.msg, a1 ? "digest algorithm 1" : why4[i]));
             if (db) imdb_close(db);
         }
         CHECK(audit_dir(p) != 0);
     }
 }
 
-/* A promotion rewrites the replica's META as a primary's: version 5, the root line and "digest 1" kept */
+/* A promotion rewrites the replica's META as a primary's: version 5, the root line and "digest 2" kept */
 static void t_round3_meta_promotion(void)
 {
     const char *dir = test_tmpdir();
@@ -875,7 +871,7 @@ static void t_round3_meta_promotion(void)
     memset(seed, 0x6b, sizeof seed);
     imdb_signer root;
     imdb_signer_init(&root, seed);
-    OK(imdb_init_primary_alg(p, root.pk, IMDB_DIGEST_ALG_LTHASH16, E));
+    OK(imdb_init_primary(p, root.pk, E));
     imdb_signer_wipe(&root);
     OK(imdb_init(r, true, p, E));
     imdb_db *db = open_db(p);
@@ -888,7 +884,7 @@ static void t_round3_meta_promotion(void)
     bool rep = false;
     snprintf(f, sizeof f, "%s/META", r);
     OK(imdb_identity_read(r, &id, &rep, E));
-    CHECK(id.digest_alg == IMDB_DIGEST_ALG_LTHASH16 && rep && id.has_root);
+    CHECK(id.digest_alg == IMDB_DIGEST_ALG_LTHASH16_TREE && rep && id.has_root);
     OK(ship_to_file(p, 0, s, E));
     imdb_db *rdb = open_db(r);
     CHECK(rdb);
@@ -902,15 +898,14 @@ static void t_round3_meta_promotion(void)
     size_t n = 0;
     uint8_t *m = slurp(f, &n);
     CHECK(m && n > 15 && memcmp(m, "imagedb-meta 5\n", 15) == 0 && mem_contains(m, n, "role primary\n") &&
-          mem_contains(m, n, "\nroot ") && mem_contains(m, n, "\ndigest 1\n"));
+          mem_contains(m, n, "\nroot ") && mem_contains(m, n, "\ndigest 2\n"));
     free(m);
     OK(imdb_identity_read(r, &id, &rep, E));
-    CHECK(id.digest_alg == IMDB_DIGEST_ALG_LTHASH16 && !rep && id.has_root);
+    CHECK(id.digest_alg == IMDB_DIGEST_ALG_LTHASH16_TREE && !rep && id.has_root);
 }
 
 const test_case round3_tests[] = {
     {"round3_meta_digest_alg", t_round3_meta_digest_alg},
-    {"round3_alg1_fixture", t_round3_alg1_fixture},
     {"round3_alg2_fixture", t_round3_alg2_fixture},
     {"round3_old_fixtures", t_round3_old_fixtures},
     {"round3_meta_promotion", t_round3_meta_promotion},

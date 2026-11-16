@@ -32,10 +32,10 @@ static void t_audit_hashes(void)
         CHECK(memcmp(a, b, 64) == 0);
         CHECK(a_crc32c(buf, n) == imdb_crc32c_ref(0, buf, n));
     }
-    for (int it = 0; it < 40; it++) { /* the element by either algorithm, against the engine's */
+    for (int it = 0; it < 40; it++) { /* the element (digest_alg 2, format 1's one), against the engine's */
         uint8_t commit[32];
         test_rand_bytes(commit, 32);
-        for (uint8_t alg = IMDB_DIGEST_ALG_LTHASH16; alg <= IMDB_DIGEST_ALG_LTHASH16_TREE; alg++) {
+        for (uint8_t alg = IMDB_DIGEST_ALG_LTHASH16_TREE; alg <= IMDB_DIGEST_ALG_LTHASH16_TREE; alg++) {
             uint16_t lanes[1024];
             imdb_lthash ref;
             a_lthash_element(alg, commit, lanes);

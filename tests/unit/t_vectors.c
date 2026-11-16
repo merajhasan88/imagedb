@@ -5,7 +5,8 @@
  * derives every one of them again with its own code (imagedb-audit vectors: its SHA-256, LtHash and ChaCha20, the
  * commit header encoded by hand), compared line by line by vectors_auditor. IMDB_VECTORS_PRINT=1 prints the values.
  *   c_i = SHA256("imagedb vector i"), i = 1..3
- *   per digest algorithm (1: LtHash16 by MGF1-SHA256, the digest SHA-256; 2: by ChaCha20, the digest a tree of eight):
+ *   the digest algorithm (2: LtHash16 by ChaCha20, the digest a tree of eight; format 1's one: 1, by MGF1-SHA256, was
+ *   dropped before the freeze, 2026-11-15, its five vectors with it):
  *     SHA256 of c_1's element (its 2048 lane bytes), the digests of {}, {c_1}, {c_1, c_2, c_3}, and of that set less c_2
  *   the row commitment of table 7, salt 00..0f, row "imagedb"; the genesis hash of db_id 10..1f;
  *   the commit hash of a header (log version 3, seq 5, digest algorithm 2, time 1700000000000000 us, prev the genesis
@@ -21,11 +22,6 @@
 
 /* the published values (2026-11-04; the commit hash and the signed message 2026-11-07: log version 3, the format
  * design's slice 1); a change here is a format change, made on purpose and said in the plan log */
-#define VEC_A1_E1 "50101545a9d5adabc4702c479da75eb9d04fe0c8c278cf141dd2bad7c9f0a934"
-#define VEC_A1_EMPTY "951572071daa9b7e0d1ecf9cf0a4266818efc5d0b6c7f914e83316b0898c1bc4"
-#define VEC_A1_ONE "3fabbaaea1db805f1a9f3e7508ffbe9a9d896104bc615971f63a06c7252a1430"
-#define VEC_A1_THREE "d333649deb6f059232e4ebdd96bf8d2c60d1b7fc3787de61a95f2b1c346dae21"
-#define VEC_A1_LESS "0eb5ae3fb60f965baac08bbf55a057bf9cb9093b7af58eb182b8183c5dca3481"
 #define VEC_A2_E1 "832ba9fadd80bf6538fd01cd8aeab1e3f039de4574aba4a45bd1104f01ef29c6"
 #define VEC_A2_EMPTY "866cd7d3893108b5f18d487839a1354b4991c1820403f626b3ab0d7528062f38"
 #define VEC_A2_ONE "0cb0e165b7a149ca518cc4ae1c6ad2c5f4c0388338eb48faf648e950ab38cecb"
@@ -69,12 +65,9 @@ static void t_vectors_digests(void)
         int n = snprintf(s, sizeof s, "imagedb vector %d", i + 1);
         imdb_sha256((const uint8_t *)s, (size_t)n, c[i]);
     }
-    static const char *const want[2][5] = {
-        {VEC_A1_E1, VEC_A1_EMPTY, VEC_A1_ONE, VEC_A1_THREE, VEC_A1_LESS},
-        {VEC_A2_E1, VEC_A2_EMPTY, VEC_A2_ONE, VEC_A2_THREE, VEC_A2_LESS},
-    };
-    for (uint8_t alg = 1; alg <= 2; alg++) {
-        const char *const *w = want[alg - 1];
+    static const char *const want[5] = {VEC_A2_E1, VEC_A2_EMPTY, VEC_A2_ONE, VEC_A2_THREE, VEC_A2_LESS};
+    for (uint8_t alg = IMDB_DIGEST_ALG_LTHASH16_TREE; alg <= IMDB_DIGEST_ALG_LTHASH16_TREE; alg++) {
+        const char *const *w = want;
         char nm[40];
         imdb_lthash el, acc;
         uint8_t lanes[IMDB_LTHASH_BYTES], d[32];
@@ -145,9 +138,21 @@ static void t_vectors_chain(void)
     imdb_err_clear(E);
     CHECK(imdb_commit_decode_header(b.p, b.len, &d, E) == IMDB_ERR_UNSUPPORTED && strstr(g_e.msg, "log version 2"));
     imdb_commit_free(&d);
-    b.p[0] = 4;
+    b.p[0] = 4; /* format 1: a later log version refused by name, never taken for damage */
+    imdb_err_clear(E);
+    CHECK(imdb_commit_decode_header(b.p, b.len, &d, E) == IMDB_ERR_UNSUPPORTED &&
+          strstr(g_e.msg, "log version 4, written by a later imagedb"));
+    imdb_commit_free(&d);
+    b.p[0] = 1; /* neither format 1's nor one refused by name: damage */
     imdb_err_clear(E);
     CHECK(imdb_commit_decode_header(b.p, b.len, &d, E) == IMDB_ERR_CORRUPT);
+    imdb_commit_free(&d);
+    b.p[0] = 3; /* its first op one past format 1's last (u8 version | u8 alg | u64 seq | u64 time | prev | u32 nops) */
+    CHECK(c.nops >= 1 && b.len > 54);
+    b.p[54] = IMDB_OP_FORMAT1_LAST + 1;
+    imdb_err_clear(E);
+    CHECK(imdb_commit_decode_header(b.p, b.len, &d, E) == IMDB_ERR_UNSUPPORTED &&
+          strstr(g_e.msg, "op 38, written by a later imagedb"));
     imdb_commit_free(&d);
     imdb_buf_free(&b);
 }
@@ -161,8 +166,7 @@ static void t_vectors_auditor(void)
     static const struct {
         const char *name, *want;
     } v[] = {
-        {"alg1.element.c1", VEC_A1_E1}, {"alg1.digest.empty", VEC_A1_EMPTY}, {"alg1.digest.c1", VEC_A1_ONE},
-        {"alg1.digest.c1c2c3", VEC_A1_THREE}, {"alg1.digest.c1c3", VEC_A1_LESS}, {"alg2.element.c1", VEC_A2_E1},
+        {"alg2.element.c1", VEC_A2_E1},
         {"alg2.digest.empty", VEC_A2_EMPTY}, {"alg2.digest.c1", VEC_A2_ONE}, {"alg2.digest.c1c2c3", VEC_A2_THREE},
         {"alg2.digest.c1c3", VEC_A2_LESS}, {"row", VEC_ROW}, {"genesis", VEC_GENESIS}, {"commit", VEC_COMMIT},
         {"sigmsg", VEC_SIGMSG},

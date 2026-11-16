@@ -120,7 +120,9 @@ static void t_rollback_savepoint(void)
 
 static void t_torn_tail_every_offset(void)
 {
-    imdb_log_set_tagged(false); /* the untagged format: an append cut at every byte (t_tseg: the tagged one) */
+    /* the last commit's frame lost at its boundary, zeros past the frames, and damage before them, staged on the frames
+     * and written back as a tagged group (format 1's one log format; a cut inside a frame is no crash state of it: a
+     * crash loses whole sectors, and every state of a group's sectors is t_tseg's crash_states) */
     const char *dir = test_tmpdir();
     OK(imdb_init(dir, false, NULL, E));
     imdb_db *db = open_db(dir);
@@ -137,25 +139,33 @@ static void t_torn_tail_every_offset(void)
     /* a crash during commit 4's append: the writer never published it as durable */
     durable_set(dir, seq_full - 1, head3, true);
     size_t n;
+    uint64_t first = 0;
+    bool tg = false;
     char lp[700];
     snprintf(lp, sizeof lp, "%s", seg_path(dir, -1)); /* no CHECKPOINT: one segment */
     CHECK(log_segments(dir) == 1);
-    uint8_t *orig = slurp(lp, &n);
-    CHECK(orig && (long)n == full);
-    /* every truncation point inside the last frame recovers to the previous commit */
-    for (long cut = before_last; cut < full; cut++) {
-        spit(lp, orig, (size_t)cut);
+    uint8_t *orig = seg_frames(lp, &n, &first, &tg);
+    CHECK(orig && tg && (long)n == full);
+    if (!orig) return;
+    /* the last frame lost at its boundary recovers to the previous commit */
+    {
+        long cut = before_last;
+        seg_put_frames(lp, first, true, orig, (size_t)cut);
         db = open_db(dir);
         CHECK(db);
         CHECK(db->seq == seq_full - 1);
         CHECK(cut == before_last || db->warning[0]);
-        CHECK(file_size(lp) == before_last);
+        CHECK(seg_frames_len(lp) == before_last);
         imdb_close(db);
     }
-    /* zero-filled tail (size extended, data not persisted) is also a torn tail */
-    uint8_t *z = calloc(1, (size_t)full + 100);
-    memcpy(z, orig, (size_t)before_last);
-    spit(lp, z, (size_t)full + 100);
+    /* zeros past the frames (the fill: a group never written) hold no commit */
+    seg_put_frames(lp, first, true, orig, (size_t)before_last);
+    {
+        int fd = open(lp, O_WRONLY | O_APPEND | O_CLOEXEC);
+        uint8_t z[2 * IMDB_TSEG_SECTOR] = {0};
+        CHECK(fd >= 0 && write(fd, z, sizeof z) == (ssize_t)sizeof z);
+        if (fd >= 0) close(fd);
+    }
     db = open_db(dir);
     CHECK(db && db->seq == seq_full - 1);
     imdb_close(db);
@@ -163,17 +173,16 @@ static void t_torn_tail_every_offset(void)
     uint8_t *c = malloc(n);
     memcpy(c, orig, n);
     c[before_last - 40] ^= 0x01; /* inside the third insert's frame */
-    spit(lp, c, n);
+    seg_put_frames(lp, first, true, c, n);
     imdb_open_opts o = {.sync = 0};
     imdb_err_clear(E);
     CHECK(imdb_open(dir, &o, &db, E) == IMDB_ERR_CORRUPT);
     /* restore and confirm full state */
-    spit(lp, orig, n);
+    seg_put_frames(lp, first, true, orig, n);
     db = open_db(dir);
     CHECK(db && db->seq == seq_full);
     imdb_close(db);
     free(orig);
-    free(z);
     free(c);
 }
 
@@ -862,7 +871,7 @@ static uint64_t inode_of(const char *p)
 
 static void t_log_segments(void)
 {
-    imdb_log_set_tagged(false); /* the untagged format, byte by byte (segments of both kinds: t_tseg) */
+    /* format 1's tagged segments: a file's frames edited and written back as a tagged group (the sectors' own states: t_tseg) */
     const char *base = test_tmpdir();
     char p[600], r[600], s[600];
     snprintf(p, sizeof p, "%s/primary", base);
@@ -919,7 +928,7 @@ static void t_log_segments(void)
     char la[700], lb[700], why[300] = "";
     snprintf(la, sizeof la, "%s/log", p);
     snprintf(lb, sizeof lb, "%s/log", r);
-    CHECK(dirs_identical(la, lb, why, sizeof why));
+    CHECK(logs_identical(la, lb, why, sizeof why)); /* the same frames (each copy's groups follow its own syncs) */
     /* ship from the middle of the log streams exactly the later commits */
     OK(ship_to_file(p, 6, s, E));
     size_t sn;
@@ -946,11 +955,15 @@ static void t_log_segments(void)
      * snapshot open does not read segments before the snapshot (by design: VERIFY
      * does), so the full replay and VERIFY are the ones that must refuse it */
     size_t n0, n1b;
-    uint8_t *a = slurp(s0, &n0), *b = slurp(s1, &n1b);
+    uint64_t f0 = 0, f1 = 0;
+    bool t0 = false, t1 = false;
+    uint8_t *a = seg_frames(s0, &n0, &f0, &t0), *b = seg_frames(s1, &n1b, &f1, &t1);
+    CHECK(a && b && t0 && t1);
+    if (!a || !b) return;
     uint8_t *m = malloc(n0 + n1b);
     memcpy(m, a, n0);
     memcpy(m + n0, b, n1b);
-    spit(s0, m, n0 + n1b);
+    seg_put_frames(s0, f0, true, m, n0 + n1b);
     unlink(s1);
     imdb_open_opts o = {.sync = 0, .full_replay = true};
     imdb_err_clear(E);
@@ -962,11 +975,12 @@ static void t_log_segments(void)
     CHECK(imdb_verify(db, &vr, E) == IMDB_ERR_VERIFY && strstr(g_e.msg, "segments do not end exactly"));
     imdb_close(db);
     /* a torn frame anywhere but the last segment is corruption, never truncated */
-    spit(s0, a, n0 - 5);
-    spit(s1, b, n1b);
+    seg_put_frames(s0, f0, true, a, n0 - 5);
+    long sz0 = file_size(s0);
+    seg_put_frames(s1, f1, true, b, n1b);
     imdb_err_clear(E);
-    CHECK(imdb_open(p, &o, &db, E) == IMDB_ERR_CORRUPT && file_size(s0) == (long)(n0 - 5));
-    spit(s0, a, n0);
+    CHECK(imdb_open(p, &o, &db, E) == IMDB_ERR_CORRUPT && file_size(s0) == sz0);
+    seg_put_frames(s0, f0, true, a, n0);
     db = open_db(p);
     CHECK(db);
     OK(imdb_verify(db, &vr, E));
@@ -994,7 +1008,7 @@ static void t_log_segments(void)
     imdb_close(rep);
     snprintf(la, sizeof la, "%s/log", p2);
     snprintf(lb, sizeof lb, "%s/log", r2);
-    CHECK(dirs_identical(la, lb, why, sizeof why));
+    CHECK(logs_identical(la, lb, why, sizeof why));
     CHECK(dirs_identical(path_join(p2, "objects"), path_join(r2, "objects"), why, sizeof why));
 }
 

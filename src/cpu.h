@@ -28,9 +28,6 @@ typedef struct imdb_kernels {
     void (*lthash_add)(uint16_t *acc, const uint16_t *x);   /* 1024 lanes */
     void (*lthash_sub)(uint16_t *acc, const uint16_t *x);
 
-    const char *expand_name;
-    /* MGF1-SHA256 expansion of a 40-byte seed into 2048 bytes */
-    void (*lthash_expand)(const uint8_t seed[40], uint8_t out[2048]);
 
     const char *expand2_name;
     /* digest_alg 2's expansion: 32 ChaCha20 blocks (RFC 8439) under key, nonce imdb_lthash2_nonce,
@@ -61,7 +58,6 @@ const imdb_kernels *imdb_kern(void);
 extern const uint8_t imdb_lthash2_nonce[12];
 
 /* SIMD implementations (sha256x8.c and chacha20x8.c always; asm/ when built with NASM). */
-void imdb_lthash_expand_avx2(const uint8_t seed[40], uint8_t out[2048]);
 void imdb_lthash_expand2_avx2(const uint8_t key[32], uint8_t out[2048]);
 void imdb_sha256_x8_avx2(const uint8_t *const msg[8], size_t nblk, uint8_t out[8][32]);
 uint32_t imdb_crc32c_sse42(uint32_t crc, const void *p, size_t n);
@@ -75,7 +71,6 @@ void imdb_sum_masked_i64_avx2(const int64_t *col, const uint64_t *bits, size_t n
 uint32_t imdb_crc32c_ref(uint32_t crc, const void *p, size_t n);
 void imdb_lthash_add_ref(uint16_t *acc, const uint16_t *x);
 void imdb_lthash_sub_ref(uint16_t *acc, const uint16_t *x);
-void imdb_lthash_expand_ref(const uint8_t seed[40], uint8_t out[2048]);
 void imdb_lthash_expand2_ref(const uint8_t key[32], uint8_t out[2048]);
 void imdb_sha256_x8_ref(const uint8_t *const msg[8], size_t nblk, uint8_t out[8][32]);
 size_t imdb_ascii_prefix_ref(const uint8_t *p, size_t n);

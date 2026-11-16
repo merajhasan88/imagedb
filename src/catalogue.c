@@ -148,7 +148,15 @@ static int cat_parse(const char *path, const uint8_t *b, size_t n, imdb_catalogu
         if (k < 0) {
             rc = cat_bad(e, path, line + 1);
         } else if (line == 0) {
-            if (!(k == 3 && IS(0, CAT_MAGIC) && IS(1, "1") && cat_hex32(f[2], fl[2], c->db_id, 16))) rc = cat_bad(e, path, 1);
+            uint32_t cv = 0;
+            size_t ci = 0;
+            while (k == 3 && ci < fl[1] && ci < 9 && f[1][ci] >= '0' && f[1][ci] <= '9')
+                cv = cv * 10 + (uint32_t)(f[1][ci++] - '0');
+            if (k == 3 && IS(0, CAT_MAGIC) && ci && ci == fl[1] && f[1][0] != '0' && cv > 1) /* a later one's */
+                rc = imdb_fail(e, IMDB_ERR_UNSUPPORTED, "catalogue %s: version %u, written by a later imagedb, which "
+                               "format 1 does not read", path, cv);
+            else if (!(k == 3 && IS(0, CAT_MAGIC) && IS(1, "1") && cat_hex32(f[2], fl[2], c->db_id, 16)))
+                rc = cat_bad(e, path, 1);
             c->has_head = true;
         } else if (k == 8 && IS(0, "backup")) {
             char *name = cat_name(f[1], fl[1], e);

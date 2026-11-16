@@ -451,9 +451,7 @@ expect "CREATE UNIQUE INDEX d2v ON d2 (v);" "$(cat "$WORK/d.sql")"
 nc=$("$BIN" sql "$C" --csv -c "SELECT COUNT(*) FROM c;" | tail -1) # 12, or 10 without script(1) above
 expect "CREATE VIEW dv (k, v) AS SELECT k, v FROM d2 WHERE v > 0;" "$(cat "$WORK/d.sql")"
 expect "-- the end of the dump: 2 tables, 1 views, $((nc + 3)) rows" "$(tail -1 "$WORK/d.sql")"
-alg=$(sed -n '1s/.*digest algorithm \([12]\)).*/\1/p' "$WORK/d.sql")
-other=$((3 - ${alg:-2}))
-"$BIN" init "$WORK/dst" --digest-alg "$other" >/dev/null || fail "init the dump's target"
+"$BIN" init "$WORK/dst" >/dev/null || fail "init the dump's target"
 "$BIN" sql "$WORK/dst" --nosync -f "$WORK/d.sql" >/dev/null || fail "the dump's restore"
 "$BIN" dump "$WORK/dst" --batch 4 > "$WORK/d2.sql" || fail "the restored copy's dump"
 cmp -s <(tail -n +2 "$WORK/d.sql") <(tail -n +2 "$WORK/d2.sql") || fail "the restored copy's dump differs: $(diff "$WORK/d.sql" "$WORK/d2.sql")"
@@ -490,5 +488,50 @@ fi
 "$BIN" init "$WORK/dlive" >/dev/null && "$BIN" sql "$WORK/dlive" --nosync -f "$WORK/dl$k.sql" >/dev/null || fail "restoring a live dump"
 [ "$("$BIN" sql "$WORK/dlive" --csv -c "SELECT COUNT(*) FROM d2;" | tail -1)" = "$rows" ] || fail "the live dump's restore"
 echo "dump: six dumps beside a writer, each the primary's rows at the commit it names"
+
+
+step "format 1: a later imagedb's directory (META 6) refused by name by every subcommand, nothing written into it"
+L="$WORK/later"
+cp -a "$P" "$L"
+sed -i '1s/^imagedb-meta 5$/imagedb-meta 6/' "$L/META"
+[ "$(head -1 "$L/META")" = "imagedb-meta 6" ] || fail "format 1: the stamp"
+cp -a "$L" "$WORK/later.orig"
+LF="$WORK/later-f" # a replica of the primary with its key: follow and apply reach its open
+"$BIN" init-replica "$LF" "$P" >/dev/null && "$BIN" replica-key "$LF" >/dev/null || fail "format 1: a replica to stamp"
+sed -i '1s/^imagedb-meta 5$/imagedb-meta 6/' "$LF/META"
+cp -a "$LF" "$WORK/later-f.orig"
+"$BIN" backup-key "$WORK/later.key" >/dev/null 2>&1 || fail "format 1: a backup key"
+later() { # a name, then its command: refused, in META's words, the directory as it was
+  lname=$1
+  shift
+  if lout=$("$@" 2>&1 < /dev/null); then fail "format 1: $lname took a later imagedb's directory"; fi
+  expect "imagedb-meta 6" "$lout"
+  diff -rq "$L" "$WORK/later.orig" > /dev/null && diff -rq "$LF" "$WORK/later-f.orig" > /dev/null ||
+    fail "format 1: $lname changed a later imagedb's directory"
+}
+later sql "$BIN" sql "$L" -c "SELECT 1"
+later "sql --read-only" "$BIN" sql "$L" --read-only -c "SELECT 1"
+later apply "$BIN" apply "$LF"
+later follow "$BIN" follow "$LF" -- true
+later verify "$BIN" verify "$L"
+later info "$BIN" info "$L"
+later dump "$BIN" dump "$L"
+later identity "$BIN" identity "$L"
+later replica-key "$BIN" replica-key "$L"
+later replica-add "$BIN" replica-add "$L" later1 0000000000000000000000000000000000000000000000000000000000000000
+later rotate-key "$BIN" rotate-key "$L"
+later recover "$BIN" recover "$L" --discard-tail --save "$WORK/later.save"
+later backup "$BIN" backup "$L" --key "$WORK/later.key" --out "$WORK/later.bak"
+later "ship --hashes" "$BIN" ship "$L" --hashes --after 0
+later init-replica "$BIN" init-replica "$WORK/later-rep" "$L"
+[ ! -e "$WORK/later.save" ] && [ ! -e "$WORK/later.bak" ] || fail "format 1: a save file or a backup was made"
+set +e
+"$BIN" health "$L" > "$WORK/later.health" 2>&1
+hrc=$?
+set -e
+[ "$hrc" = 1 ] || fail "format 1: health exits $hrc for a later imagedb's directory (1: unreadable by this version)"
+expect "imagedb-meta 6" "$(cat "$WORK/later.health")"
+diff -rq "$L" "$WORK/later.orig" > /dev/null || fail "format 1: health changed a later imagedb's directory"
+echo "format 1: 15 subcommands refused a later imagedb's directory by name, health 1, nothing written"
 
 printf '\nALL INTEGRATION CHECKS PASSED\n'

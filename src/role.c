@@ -1030,6 +1030,9 @@ int imdb_rcat_fill(imdb_rcat *c, const uint8_t *obj, size_t len, bool strict, im
     imdb_rd_copy(&r, mg, 8);
     uint32_t n = imdb_rd_u32(&r);
     uint32_t prole = 0, pwhat = 0;
+    if (!r.err && imdb_later_magic(mg, 8, "IMDBRLO1")) /* format 1: a later imagedb's, by name */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "manifest: a roles object %.8s, written by a later imagedb, which "
+                         "format 1 does not read", (const char *)mg);
     if (r.err || memcmp(mg, kRolObj, 8) || !n || n > imdb_rd_left(&r) / 25) goto bad;
     for (uint32_t k = 0; k < n; k++) {
         uint32_t id = imdb_rd_u32(&r);

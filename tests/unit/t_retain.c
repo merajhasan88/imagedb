@@ -633,12 +633,11 @@ static void t_retain_expire_rules(void)
     imdb_buf_free(&b);
 }
 
-/* When a segment began, from its first frame alone, in both formats: a small first frame and one larger
+/* When a segment began, from its first frame alone (a tagged segment: format 1's one): a small first frame and one larger
  * than the first read, a missing segment and a damaged first frame refused */
 static void t_retain_seg_time(void)
 {
-    for (int tagged = 1; tagged >= 0; tagged--) {
-        imdb_log_set_tagged(tagged != 0);
+    for (int tagged = 1; tagged >= 1; tagged--) {
         const char *dir = test_tmpdir();
         OK(imdb_init(dir, false, NULL, E));
         imdb_db *db = ropen(dir, false);

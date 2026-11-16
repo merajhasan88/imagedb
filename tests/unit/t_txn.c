@@ -1,10 +1,13 @@
 /* Session transactions (db.h, docs/txn-design.md): several sessions on one
  * database, each reading committed data at its snapshot plus its own writes,
  * with suspended write sets replayed (and re-validated) on the way back in. */
+#include <errno.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <sys/resource.h>
 
+#include "../../src/fsio.h"
 #include "../../src/sql.h"
 #include "thelp.h"
 
@@ -271,12 +274,26 @@ static void t_txn_snapshot_below_horizon(void)
     imdb_close(db);
 }
 
-/* A commit whose log write fails (here: the file size limit, as on a full disk)
- * leaves no partial frame, no change in the store or the digest, and nothing
- * visible to anyone; the database keeps working. */
+/* the next write to g_fail_fd fails once with ENOSPC (as on a full disk); the put-back after it is let through */
+static _Atomic int g_fail_armed;
+static int g_fail_fd = -1;
+static long fail_once_before(imdb_io_call *c, void *ctx)
+{
+    (void)ctx;
+    if (c->op == IMDB_IO_WRITE && c->fd == g_fail_fd && atomic_exchange(&g_fail_armed, 0)) {
+        errno = ENOSPC;
+        return -1;
+    }
+    return 0;
+}
+static const imdb_io_hooks g_fail_once = {fail_once_before, NULL, NULL};
+
+/* A commit whose log write fails (here: its frame's first write, as on a full disk) leaves no partial frame, no
+ * change in the store or the digest, and nothing visible to anyone; the database keeps working. (Until format 1 this
+ * ran on an untagged segment under RLIMIT_FSIZE; a tagged write lands inside the fill, and the limit would fail its
+ * put-back too, so a hook fails the one write.) */
 static void t_txn_failed_commit_untouched(void)
 {
-    imdb_log_set_tagged(false); /* RLIMIT_FSIZE stops an append; a tagged write lands inside the fill (the fault tests fail its writes) */
     imdb_session a, b;
     imdb_db *db = setup(&a, &b);
     CHECK(db);
@@ -289,19 +306,22 @@ static void t_txn_failed_commit_untouched(void)
     imdb_state_digest(db, NULL, d0);
     char seg[700];
     snprintf(seg, sizeof seg, "%s", seg_path(db->path, -1));
-    long size = file_size(seg);
-    CHECK(size > 0);
-    struct rlimit old, lim;
-    CHECK(getrlimit(RLIMIT_FSIZE, &old) == 0);
-    void (*prev)(int) = signal(SIGXFSZ, SIG_IGN);
-    lim = old;
-    lim.rlim_cur = (rlim_t)size + 16; /* the frame is larger: it stops part way */
-    CHECK(setrlimit(RLIMIT_FSIZE, &lim) == 0);
+    size_t n0 = 0, n1 = 0;
+    uint64_t first = 0;
+    bool tg = false;
+    uint8_t *f0 = seg_frames(seg, &n0, &first, &tg);
+    CHECK(f0 && tg);
+    g_fail_fd = db->logfd;
+    atomic_store(&g_fail_armed, 1);
+    imdb_io_set_hooks(&g_fail_once);
     int rc = srun(&a, "COMMIT");
-    setrlimit(RLIMIT_FSIZE, &old);
-    signal(SIGXFSZ, prev);
+    imdb_io_set_hooks(NULL);
+    CHECK(atomic_load(&g_fail_armed) == 0); /* the write was made, and failed */
     CHECK(rc == IMDB_ERR_IO && !a.txn.open && !db->failed);
-    CHECK(file_size(seg) == size); /* no partial frame */
+    uint8_t *f1 = seg_frames(seg, &n1, &first, &tg);
+    CHECK(f0 && f1 && n1 == n0 && !memcmp(f0, f1, n0)); /* no partial frame */
+    free(f0);
+    free(f1);
     imdb_state_digest(db, NULL, d1);
     CHECK(db->seq == seq && memcmp(db->head, head, 32) == 0 && memcmp(d0, d1, 32) == 0);
     CHECK(sval(&b, "SELECT SUM(v) FROM t") == 30 && sval(&b, "SELECT COUNT(*) FROM t") == 2);

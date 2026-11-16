@@ -47,7 +47,7 @@ bool a_ed25519_verify(const uint8_t pk[32], const void *msg, size_t n, const uin
 void a_chacha20_block(const uint8_t key[32], uint32_t counter, const uint8_t nonce[12], uint8_t out[64]);
 
 /* LtHash16-1024 element, 2048 bytes read as 1024 little-endian 16-bit lanes, by the database's
- * digest algorithm: 1, MGF1-SHA256 of "IMDBLT16" || commitment; 2, ChaCha20 under the commitment
+ * digest algorithm (format 1: 2 alone; 1, MGF1-SHA256, dropped before the freeze): ChaCha20 under the commitment
  * itself as the key, nonce "IMDBLT20" then four zero bytes, blocks 0..31. */
 void a_lthash_element(uint8_t alg, const uint8_t commit[32], uint16_t lanes[1024]);
 

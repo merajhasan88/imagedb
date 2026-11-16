@@ -1260,6 +1260,21 @@ void imdb_commit_sigmsg(uint64_t seq, uint32_t hlen, const uint8_t hash[32], uin
     memcpy(out + 20, hash, 32);
 }
 
+bool imdb_frame_authentic(const uint8_t *frame, size_t len, const uint8_t pk[IMDB_PUBKEY_LEN], uint64_t *seq)
+{
+    *seq = 0;
+    if (len < IMDB_FRAME_HDR + IMDB_BODY_DESC) return false;
+    const uint8_t *d = frame + IMDB_FRAME_HDR; /* kind | u32 header_len | u64 seq | commit_hash | sig */
+    size_t blen = len - IMDB_FRAME_HDR;
+    uint32_t hlen = imdb_get_le32(d + 1);
+    *seq = imdb_get_le64(d + 5);
+    if (d[0] != IMDB_BODY_KIND || hlen < IMDB_HEADER_MIN || hlen > IMDB_MAX_HEADER || hlen > blen - IMDB_BODY_DESC)
+        return false;
+    uint8_t h[32];
+    imdb_commit_hash(d + IMDB_BODY_DESC, hlen, h);
+    return memcmp(h, d + 13, 32) == 0 && imdb_commit_sig_valid(pk, *seq, hlen, h, d + 45);
+}
+
 bool imdb_commit_sig_valid(const uint8_t writer_pk[IMDB_PUBKEY_LEN], uint64_t seq, uint32_t hlen,
                            const uint8_t hash[32], const uint8_t sig[IMDB_SIG_LEN])
 {
@@ -1428,11 +1443,17 @@ int imdb_commit_decode_header(const uint8_t *h, size_t hlen, imdb_commit_rec *c,
     if (ver == 2)
         return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "commit: log version 2, from before the format design's version 3 "
                          "(2026-11-07), which this version does not read");
+    if (ver > IMDB_LOG_VERSION) /* format 1: a later imagedb's, by name (the replay first asks the frame's signature) */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "commit: log version %u, written by a later imagedb, which format 1 "
+                         "(log version %u) does not read", ver, IMDB_LOG_VERSION);
     if (ver != IMDB_LOG_VERSION) return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: unsupported log version %u", ver);
-    /* either algorithm decodes; which one a database's commits must name is its META's, which the
+    /* digest_alg 2 alone (format 1); which one a database's commits must name is its META's, which the
      * engine (imdb_apply_commit, VERIFY, the snapshot open) and the auditor compare */
-    if (alg != IMDB_DIGEST_ALG_LTHASH16 && alg != IMDB_DIGEST_ALG_LTHASH16_TREE)
-        return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: unknown digest algorithm %u", alg);
+    if (alg == 1)
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "commit: digest algorithm 1: written by an imagedb before format 1 "
+                         "(2026-11-15), which keeps digest_alg 2 alone; this version does not read it");
+    if (alg != IMDB_DIGEST_ALG_LTHASH16_TREE)
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "commit: digest algorithm %u is not one this version knows", alg);
     c->alg = alg;
     c->seq = imdb_rd_u64(&r);
     c->time_us = imdb_rd_u64(&r);
@@ -1675,6 +1696,9 @@ int imdb_commit_decode_header(const uint8_t *h, size_t hlen, imdb_commit_rec *c,
             o->table = imdb_rd_u32(&r);
             break;
         default:
+            if (o->code > IMDB_OP_FORMAT1_LAST) /* a later imagedb's op, by name (the replay first asks the signature) */
+                return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "commit: op %u, written by a later imagedb, which format 1 "
+                                 "(ops 1 to %u) does not read", o->code, IMDB_OP_FORMAT1_LAST);
             return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: unknown op code %u", o->code);
         }
         if (r.err) return imdb_fail(e, IMDB_ERR_CORRUPT, "commit: truncated op");
@@ -1842,6 +1866,19 @@ void imdb_tseg_header(uint64_t first, uint8_t out[IMDB_TSEG_SECTOR])
 }
 
 bool imdb_tseg_is_tagged(const uint8_t *b, size_t n) { return n >= 4 && memcmp(b, "ILT1", 4) == 0; }
+
+int imdb_tseg_later(const uint8_t *b, size_t n, uint64_t first, imdb_err *e)
+{
+    if (imdb_later_magic(b, n, "ILT1"))
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "log segment %llu: a tagged segment of a later format (%.4s), written "
+                         "by a later imagedb, which format 1 (ILT1) does not read", (unsigned long long)first, (const char *)b);
+    if (n >= 20 && memcmp(b, "ILT1", 4) == 0 && imdb_get_le32(b + 4) > IMDB_TSEG_VERSION &&
+        imdb_kern()->crc32c(0, b, 16) == imdb_get_le32(b + 16)) /* its own header, whole: a later layout, not damage */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "log segment %llu: tagged segment version %u, written by a later "
+                         "imagedb, which format 1 (version %u) does not read", (unsigned long long)first,
+                         imdb_get_le32(b + 4), IMDB_TSEG_VERSION);
+    return IMDB_OK;
+}
 
 void imdb_tgroup_begin(imdb_tgroup *g, uint64_t tag, uint64_t sector)
 {
@@ -2195,6 +2232,9 @@ void imdb_durable_encode(const imdb_durable *w, uint8_t out[IMDB_DURABLE_LEN])
 int imdb_durable_decode(const uint8_t *b, size_t n, imdb_durable *w, imdb_err *e)
 {
     memset(w, 0, sizeof *w);
+    if (imdb_later_magic(b, n, "IMDBDUR1")) /* format 1: a later imagedb's, by name: never read as torn, never rewritten */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "DURABLE: %.8s, written by a later imagedb, which format 1 does not "
+                         "read", (const char *)b);
     if (n != IMDB_DURABLE_LEN || memcmp(b, "IMDBDUR1", 8) != 0 || imdb_kern()->crc32c(0, b, 56) != imdb_get_le32(b + 56))
         return imdb_fail(e, IMDB_ERR_CORRUPT, "DURABLE: malformed");
     uint32_t flags = imdb_get_le32(b + 48), zero = imdb_get_le32(b + 52);
@@ -2247,6 +2287,9 @@ void imdb_anchor_encode(const imdb_anchor *a, uint8_t out[IMDB_ANCHOR_LEN])
 int imdb_anchor_decode(const uint8_t *b, size_t n, imdb_anchor *a, imdb_err *e)
 {
     memset(a, 0, sizeof *a);
+    if (imdb_later_magic(b, n, "IMDBANC1")) /* format 1: a later imagedb's, by name */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "anchor: %.8s, written by a later imagedb, which format 1 does not "
+                         "read", (const char *)b);
     if (n != IMDB_ANCHOR_LEN || memcmp(b, "IMDBANC1", 8) != 0 || imdb_kern()->crc32c(0, b, 140) != imdb_get_le32(b + 140) ||
         imdb_get_le32(b + 136) != 0)
         return imdb_fail(e, IMDB_ERR_CORRUPT, "anchor: malformed");

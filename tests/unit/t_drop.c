@@ -196,7 +196,7 @@ static void t_drop_rules(void)
 
     /* the codec: a round trip */
     imdb_op op = {.code = IMDB_OP_DROP_TABLE, .table = 1};
-    imdb_commit_rec c = {.seq = 9, .alg = IMDB_DIGEST_ALG_LTHASH16, .ops = &op, .nops = 1};
+    imdb_commit_rec c = {.seq = 9, .alg = IMDB_DIGEST_ALG_LTHASH16_TREE, .ops = &op, .nops = 1};
     imdb_buf b;
     imdb_buf_init(&b);
     imdb_commit_encode_header(&c, &b);
@@ -235,7 +235,7 @@ static void t_drop_rules(void)
         bool ok;
     } cases[] = {{ok_pair, 2, true}, {bad1, 2, false}, {bad2, 2, false}, {bad3, 2, false}, {bad4, 3, false}};
     for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
-        imdb_commit_rec cc = {.seq = 9, .alg = IMDB_DIGEST_ALG_LTHASH16, .ops = cases[i].ops, .nops = cases[i].n};
+        imdb_commit_rec cc = {.seq = 9, .alg = IMDB_DIGEST_ALG_LTHASH16_TREE, .ops = cases[i].ops, .nops = cases[i].n};
         imdb_buf eb;
         imdb_buf_init(&eb);
         imdb_commit_encode_header(&cc, &eb);

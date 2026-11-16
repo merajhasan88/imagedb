@@ -122,32 +122,6 @@ void imdb_sha256_x8_ref(const uint8_t *const msg[8], size_t nblk, uint8_t out[8]
     }
 }
 
-/* MGF1-SHA256(seed, 2048): block i = SHA256(seed || BE32(i)), i = 0..63. */
-void imdb_lthash_expand_ref(const uint8_t seed[40], uint8_t out[2048])
-{
-    uint8_t blk[64];
-    memset(blk, 0, sizeof blk);
-    memcpy(blk, seed, 40);
-    blk[44] = 0x80;          /* padding: message is 44 bytes = 352 bits */
-    blk[62] = 0x01;
-    blk[63] = 0x60;
-    for (uint32_t i = 0; i < 64; i++) {
-        blk[40] = (uint8_t)(i >> 24);
-        blk[41] = (uint8_t)(i >> 16);
-        blk[42] = (uint8_t)(i >> 8);
-        blk[43] = (uint8_t)i;
-        uint32_t h[8];
-        memcpy(h, imdb_sha256_iv, sizeof h);
-        imdb_sha256_compress(h, blk);
-        for (int j = 0; j < 8; j++) {
-            out[32 * i + 4 * j] = (uint8_t)(h[j] >> 24);
-            out[32 * i + 4 * j + 1] = (uint8_t)(h[j] >> 16);
-            out[32 * i + 4 * j + 2] = (uint8_t)(h[j] >> 8);
-            out[32 * i + 4 * j + 3] = (uint8_t)h[j];
-        }
-    }
-}
-
 /* Length of the prefix made of bytes 0x01..0x7F (ASCII without NUL). */
 size_t imdb_ascii_prefix_ref(const uint8_t *p, size_t n)
 {
@@ -182,8 +156,6 @@ static void kern_init(void)
     g_kern.lthash_name = "c";
     g_kern.lthash_add = imdb_lthash_add_ref;
     g_kern.lthash_sub = imdb_lthash_sub_ref;
-    g_kern.expand_name = "c-sha256";
-    g_kern.lthash_expand = imdb_lthash_expand_ref;
     g_kern.expand2_name = "c-chacha20";
     g_kern.lthash_expand2 = imdb_lthash_expand2_ref;
     g_kern.sha8_name = "c";
@@ -195,8 +167,6 @@ static void kern_init(void)
     g_kern.sum_name = "c-int128";
     g_kern.sum_masked_i64 = imdb_sum_masked_i64_ref;
     if (g_cpu.avx2) {
-        g_kern.expand_name = "avx2-sha256x8";
-        g_kern.lthash_expand = imdb_lthash_expand_avx2;
         g_kern.expand2_name = "avx2-chacha20x8";
         g_kern.lthash_expand2 = imdb_lthash_expand2_avx2;
         g_kern.sha8_name = "avx2";

@@ -33,16 +33,15 @@
 /* META pins the writer's public key (epoch 0): replicas and auditors verify every commit against
  * the keys that follow from it (log.h, WRITER_KEY), and only the primary holds signing.key. v3
  * adds the root key that may certify a promotion; without one META stays v2. */
-/* Version 4, always: the db id, the role, epoch 0's writer key, the root key if any, and the digest
- * algorithm. Versions 2 and 3 (without it) are digest_alg 1, and become version 4 with "digest 1"
- * at their next rewrite. */
+/* Version 5, always: the db id, the role, epoch 0's writer key, the root key if any, and the digest algorithm, 2
+ * alone in format 1 (the user's decision of 2026-11-15: digest_alg 1 dropped before the freeze). */
 static int write_meta(int dirfd, const imdb_identity *id, bool replica, imdb_err *e)
 {
     char hex[33], whex[65], rhex[65] = "", buf[300];
     imdb_hex(id->db_id, 16, hex);
     imdb_hex(id->writer, IMDB_PUBKEY_LEN, whex);
     if (id->has_root) imdb_hex(id->root, IMDB_PUBKEY_LEN, rhex);
-    if (id->digest_alg != IMDB_DIGEST_ALG_LTHASH16 && id->digest_alg != IMDB_DIGEST_ALG_LTHASH16_TREE)
+    if (id->digest_alg != IMDB_DIGEST_ALG_LTHASH16_TREE)
         return imdb_fail(e, IMDB_ERR_STATE, "META: no digest algorithm to record");
     int n = snprintf(buf, sizeof buf, "imagedb-meta 5\ndb_id %s\nrole %s\nwriter %s\n%s%s%sdigest %u\n", hex,
                      replica ? "replica" : "primary", whex, id->has_root ? "root " : "", rhex, id->has_root ? "\n" : "",
@@ -50,13 +49,16 @@ static int write_meta(int dirfd, const imdb_identity *id, bool replica, imdb_err
     return imdb_write_file_atomic(dirfd, META_NAME, buf, (size_t)n, 0600, e);
 }
 
-/* "digest <1 or 2>\n" at r, the last line of META 5 and identity 3 */
+/* "digest 2\n" at r, the last line of META 5 and identity 3 (1, dropped before the freeze, refused by name) */
 static int meta_alg(const char **r, size_t *left, uint8_t *alg, imdb_err *e)
 {
     if (*left != 9 || memcmp(*r, "digest ", 7) != 0 || (*r)[7] < '0' || (*r)[7] > '9' || (*r)[8] != '\n')
         return imdb_fail(e, IMDB_ERR_CORRUPT, "malformed digest line");
     int a = (*r)[7] - '0';
-    if (a != IMDB_DIGEST_ALG_LTHASH16 && a != IMDB_DIGEST_ALG_LTHASH16_TREE)
+    if (a == 1)
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "digest algorithm 1: made by an imagedb before format 1 (2026-11-15), "
+                         "which keeps digest_alg 2 alone; this version does not read it");
+    if (a != IMDB_DIGEST_ALG_LTHASH16_TREE)
         return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "digest algorithm %d is not one this version knows", a);
     *alg = (uint8_t)a;
     *r += 9;
@@ -89,6 +91,12 @@ static int read_meta(int dirfd, imdb_identity *id, bool *replica, imdb_err *e)
     int rc = IMDB_OK;
     size_t idend = sizeof a5 - 1 + 32;
     bool v5 = n >= sizeof a5 - 1 && memcmp(s, a5, sizeof a5 - 1) == 0;
+    unsigned long later = 0;
+    if (imdb_later_text(p, n, old, 5, &later)) { /* a later imagedb's (format 1 opens META 5): refused by name */
+        imdb_free(p);
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "META: imagedb-meta %lu: made by a later imagedb, which format 1 "
+                         "(META 5) does not open", later);
+    }
     if (!v5 && n > sizeof old && memcmp(s, old, sizeof old - 1) == 0 && s[sizeof old - 1] >= '1' &&
         s[sizeof old - 1] <= '4' && s[sizeof old] == '\n') {
         rc = imdb_fail(e, IMDB_ERR_UNSUPPORTED,
@@ -156,9 +164,9 @@ int imdb_seed_read(int dirfd, const char *name, imdb_signer *sg, bool *has, imdb
 }
 
 /* "imagedb-identity 3\ndb_id <32 hex>\nwriter <64 hex>\n", a "root <64 hex>" line when the database
- * has a root key, then "digest <1 or 2>\n": what a remote replica needs to know about its primary
+ * has a root key, then "digest 2\n": what a remote replica needs to know about its primary
  * (nothing secret), its digest algorithm included. Versions 1 (no root) and 2 (a root) predate the
- * algorithm and mean digest_alg 1. */
+ * algorithm and mean digest_alg 1: refused by name (format 1 keeps 2 alone). */
 int imdb_identity_format(const imdb_identity *id, char *out, size_t cap)
 {
     char hex[33], whex[65], rhex[65] = "";
@@ -177,6 +185,10 @@ int imdb_identity_parse(const char *s, size_t n, imdb_identity *id, imdb_err *e)
     memset(id, 0, sizeof *id);
     bool v2 = n >= sizeof a2 - 1 && memcmp(s, a2, sizeof a2 - 1) == 0;
     bool v3 = n >= sizeof a3 - 1 && memcmp(s, a3, sizeof a3 - 1) == 0;
+    unsigned long later = 0;
+    if (imdb_later_text((const uint8_t *)s, n, "imagedb-identity ", 3, &later))
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "identity version %lu: made by a later imagedb, which format 1 "
+                         "(identity 3) does not read", later);
     size_t idend = sizeof a1 - 1 + 32;
     const char *r = s + idend + 1;
     size_t left = n > idend + 1 ? n - (idend + 1) : 0;
@@ -184,7 +196,9 @@ int imdb_identity_parse(const char *s, size_t n, imdb_identity *id, imdb_err *e)
               imdb_unhex(s + sizeof a1 - 1, 32, id->db_id, 16) && s[idend] == '\n' && meta_key(&r, &left, "writer", id->writer);
     bool root = v2 || (v3 && left >= 5 && memcmp(r, "root ", 5) == 0);
     if (ok && root) ok = id->has_root = meta_key(&r, &left, "root", id->root);
-    id->digest_alg = IMDB_DIGEST_ALG_LTHASH16; /* versions 1 and 2 */
+    if (n >= sizeof a1 - 1 && !v3 && (v2 || memcmp(s, a1, sizeof a1 - 1) == 0)) /* digest_alg 1's, implied */
+        return imdb_fail(e, IMDB_ERR_UNSUPPORTED, "identity version %c: a primary of digest algorithm 1, made by an "
+                         "imagedb before format 1 (2026-11-15); this version does not read it", v2 ? '2' : '1');
     imdb_err ea = {0};
     if (ok && v3 && meta_alg(&r, &left, &id->digest_alg, &ea))
         return imdb_fail(e, ea.code == IMDB_ERR_UNSUPPORTED ? ea.code : IMDB_ERR_INVALID, "identity: %s", ea.msg);
@@ -257,33 +271,11 @@ out:
     return rc;
 }
 
-int imdb_default_digest_alg(uint8_t *alg, imdb_err *e)
-{
-    const char *s = getenv("IMDB_DIGEST_ALG");
-    *alg = IMDB_DIGEST_ALG_LTHASH16_TREE; /* new databases: digest_alg 2 since 2026-10-26 */
-    if (!s || !*s) return IMDB_OK;
-    if (strcmp(s, "2") == 0) return IMDB_OK;
-    if (strcmp(s, "1") == 0) {
-        *alg = IMDB_DIGEST_ALG_LTHASH16;
-        return IMDB_OK;
-    }
-    return imdb_fail(e, IMDB_ERR_INVALID, "IMDB_DIGEST_ALG is 1 or 2");
-}
-
 int imdb_init_primary(const char *path, const uint8_t *root, imdb_err *e)
 {
-    uint8_t alg;
-    if (imdb_default_digest_alg(&alg, e)) return e->code;
-    return imdb_init_primary_alg(path, root, alg, e);
-}
-
-int imdb_init_primary_alg(const char *path, const uint8_t *root, uint8_t alg, imdb_err *e)
-{
-    if (alg != IMDB_DIGEST_ALG_LTHASH16 && alg != IMDB_DIGEST_ALG_LTHASH16_TREE)
-        return imdb_fail(e, IMDB_ERR_INVALID, "the digest algorithm is 1 or 2");
     imdb_identity id;
     memset(&id, 0, sizeof id);
-    id.digest_alg = alg;
+    id.digest_alg = IMDB_DIGEST_ALG_LTHASH16_TREE; /* format 1's one algorithm */
     if (root) {
         id.has_root = true;
         memcpy(id.root, root, IMDB_PUBKEY_LEN);
@@ -2116,6 +2108,9 @@ imdb_op *imdb_tx_push(imdb_db *db, imdb_err *e) { return tx_push(db, e); }
 
 /* Row bytes the pending commit may still take. The bound keeps every admitted commit
  * inside one frame: an UPDATE, the largest op, adds 85 header and 21 payload bytes. */
+_Static_assert(IMDB_FORMAT == 1 && IMDB_LOG_VERSION == 3 && IMDB_TSEG_VERSION == 1 && IMDB_OP_FORMAT1_LAST == 37 &&
+                   IMDB_MANIFEST_VERSION == 21 && IMDB_DIGEST_ALG_LTHASH16_TREE == 2,
+               "format 1's versions (docs/format-1.md): a change to one is a format step, with IMDB_FORMAT's");
 _Static_assert((uint64_t)IMDB_MAX_TXN_BYTES + (uint64_t)IMDB_MAX_OPS_PER_COMMIT * (85 + 21) + (1u << 20) <=
                    IMDB_MAX_FRAME,
                "a transaction at its limits must fit one log frame");
@@ -4824,9 +4819,6 @@ uint64_t imdb_clock_frozen(void) { return g_clock_frozen; }
 
 uint64_t imdb_now_us(void) { return now_us(); }
 
-static bool g_log_tagged = true; /* imdb_log_set_tagged: tests of the untagged format only */
-
-void imdb_log_set_tagged(bool on) { g_log_tagged = on; }
 
 /* n zero bytes at off: a tagged segment's fill. */
 static int log_write_zeros(int fd, uint64_t off, uint64_t n, imdb_err *e)
@@ -4895,10 +4887,10 @@ static int log_new_segment(imdb_db *db, uint64_t seq, imdb_err *e)
         }
     }
     int fd = imdb_io_openat(db->logdirfd, name,
-                            (g_log_tagged ? O_RDWR : O_WRONLY | O_APPEND) | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+                            O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd < 0) return imdb_fail(e, IMDB_ERR_IO, "create log segment: %s", strerror(errno));
     int rc = IMDB_OK;
-    if (g_log_tagged) { /* design.md §3: its header and the first fill, durable before any frame lands there */
+    { /* design.md §3: its header and the first fill, durable before any frame lands there (format 1: tagged alone) */
         uint8_t h[IMDB_TSEG_SECTOR];
         imdb_tseg_header(seq, h);
         rc = imdb_pwrite_all(fd, h, sizeof h, 0, e);
@@ -4919,7 +4911,7 @@ static int log_new_segment(imdb_db *db, uint64_t seq, imdb_err *e)
     db->logfd = fd;
     db->log_size = 0;
     db->log_rotate = false;
-    db->log_tagged = g_log_tagged;
+    db->log_tagged = true;
     db->log_group = false;
     db->log_phys = 1;
     db->log_fill = IMDB_TSEG_SECTOR + IMDB_LOG_FILL_CHUNK;
@@ -5039,7 +5031,10 @@ static int anchor_parse(imdb_db *db, const char *path, const uint8_t *b, ssize_t
     for (size_t off = 0; off < IMDB_ANCHOR_FILE; off += IMDB_ANCHOR_SLOT) {
         imdb_anchor r; /* first which database it names: the most useful refusal */
         imdb_err ed = {0};
-        if (imdb_anchor_decode(b + off, IMDB_ANCHOR_LEN, &r, &ed) == IMDB_OK && memcmp(r.db_id, db->db_id, 16) != 0)
+        int dr = imdb_anchor_decode(b + off, IMDB_ANCHOR_LEN, &r, &ed);
+        if (dr == IMDB_ERR_UNSUPPORTED) /* format 1: a later imagedb's record, by name, never overwritten as torn */
+            return imdb_fail(e, dr, "anchor %s: %s", path, ed.msg);
+        if (dr == IMDB_OK && memcmp(r.db_id, db->db_id, 16) != 0)
             return imdb_fail(e, IMDB_ERR_CORRUPT, "anchor %s belongs to another database", path);
     }
     bool bad = false;
@@ -5246,29 +5241,6 @@ static int durable_after_recovery(imdb_db *db, imdb_err *e)
     return rc;
 }
 
-/* An old database's untagged last segment, continued until a manifest ends it: appended. */
-static int log_put_untagged(imdb_db *db, const uint8_t *frame, size_t len, imdb_err *e)
-{
-    off_t before = (off_t)db->log_size;
-    int rc = imdb_write_all(db->logfd, frame, len, e);
-    bool sync_failed = false;
-    if (!rc && db->sync && imdb_io_fdatasync(db->logfd) != 0) {
-        rc = imdb_fail(e, IMDB_ERR_IO, "fdatasync(log) failed: %s; reopen (the commit may or may not be there)",
-                       strerror(errno));
-        sync_failed = true;
-    }
-    if (rc) {
-        /* never leave a partial frame behind; if that fails, refuse further writes. A failed
-         * fdatasync stops the handle either way: the kernel may have dropped the dirty pages and
-         * reported the error once, so no later sync proves this or any earlier write landed
-         * (fail-stop; the next open decides from the disk, by the watermark rules). */
-        if (imdb_io_ftruncate(db->logfd, before) != 0 || (db->sync && imdb_io_fdatasync(db->logfd) != 0) ||
-            sync_failed)
-            db->failed = true;
-    }
-    return rc;
-}
-
 /* A tagged segment (design.md §3): the frame's sectors overwrite the fill, the first rewritten with
  * the bytes the open group already had in it. A synchronous commit whose frame leaves less than the
  * low-water mark extends the fill before its own fdatasync (one flush for both). Nothing else does:
@@ -5337,7 +5309,9 @@ int imdb_log_append(imdb_db *db, const uint8_t *frame, size_t len, imdb_err *e)
         if (log_new_segment(db, imdb_frame_seq(frame), e)) return e->code;
         db->seg_time[db->nsegs - 1] = imdb_frame_time(frame); /* the segment's first commit: expiry reads it */
     }
-    int rc = db->log_tagged ? log_put_tagged(db, frame, len, e) : log_put_untagged(db, frame, len, e);
+    if (!db->log_tagged) /* format 1: a writable open made the last segment tagged, a new one is made tagged */
+        return imdb_fail(e, IMDB_ERR_STATE, "log: an untagged segment to append to");
+    int rc = log_put_tagged(db, frame, len, e);
     if (rc) return rc;
     db->log_size += len;
     db->stats.log_bytes += len; /* P1 M1 */
@@ -6214,6 +6188,18 @@ int imdb_open(const char *path, const imdb_open_opts *o, imdb_db **out, imdb_err
         rc = imdb_fail(e, IMDB_ERR_IO, "open %s: %s", path, strerror(errno));
         goto fail;
     }
+    /* format 1: a later imagedb's directory refused by name before this open creates anything in it (LOCK, DURABLE:
+     * only when one is missing, so an open of a database it made reads META once, under LOCK, as before) */
+    if (!ro && (faccessat(db->dirfd, "LOCK", F_OK, AT_SYMLINK_NOFOLLOW) != 0 ||
+                faccessat(db->dirfd, IMDB_DURABLE_NAME, F_OK, AT_SYMLINK_NOFOLLOW) != 0)) {
+        imdb_identity mid;
+        bool mrep = false;
+        imdb_err em = {0};
+        if (read_meta(db->dirfd, &mid, &mrep, &em) == IMDB_ERR_UNSUPPORTED) {
+            rc = imdb_fail(e, em.code, "%s", em.msg);
+            goto fail;
+        }
+    }
     if (!ro) {
         db->lockfd = imdb_io_openat(db->dirfd, "LOCK", O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
         if (db->lockfd < 0 || imdb_io_flock(db->lockfd, LOCK_EX | LOCK_NB) != 0) {
@@ -6231,6 +6217,10 @@ int imdb_open(const char *path, const imdb_open_opts *o, imdb_db **out, imdb_err
     }
     imdb_err ed = {0};
     if (imdb_durable_read(db->dirfd, &db->dur, &db->have_dur, &ed)) {
+        if (ed.code == IMDB_ERR_UNSUPPORTED) { /* format 1: a later imagedb's watermark, never republished over */
+            rc = imdb_fail(e, ed.code, "%s", ed.msg);
+            goto fail;
+        }
         db->have_dur = false; /* a damaged final frame then counts as damage, not as a torn append */
         snprintf(db->warning, sizeof db->warning, "%s: ignored", ed.msg);
     }
@@ -6262,14 +6252,17 @@ int imdb_open(const char *path, const imdb_open_opts *o, imdb_db **out, imdb_err
     bool anchor_new;
     if ((rc = anchor_check(db, o, &anchor_new, e))) goto fail; /* before recovery changes anything in the directory */
     if (!ro && db->nsegs && !db->log_rotate) {
-        /* appends continue the last segment (replay left it valid to its end): a tagged one in place,
-         * an untagged one appended; an untagged one with no frame (a crash before its header landed)
-         * is made tagged, as every new segment is */
+        /* appends continue the last segment (replay left it valid to its end) in place; one with no frame (a crash
+         * before its header landed: imdb_logseg_blank, the one segment not tagged that format 1 opens) is made tagged,
+         * as every new segment is */
         char name[IMDB_LOGSEG_NAME + 1];
         imdb_logseg_name(db->segs[db->nsegs - 1], name);
-        bool retag = g_log_tagged && !db->log_tagged && db->log_size == 0;
-        db->logfd = imdb_io_openat(db->logdirfd, name, db->log_tagged || retag ? O_RDWR | O_CLOEXEC | O_NOFOLLOW
-                                                                              : O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW);
+        if (!db->log_tagged && db->log_size != 0) {
+            rc = imdb_fail(e, IMDB_ERR_CORRUPT, "log: the last segment is not tagged and holds frames");
+            goto fail;
+        }
+        bool retag = !db->log_tagged;
+        db->logfd = imdb_io_openat(db->logdirfd, name, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
         if (db->logfd < 0) {
             rc = imdb_fail(e, IMDB_ERR_IO, "open log segment: %s", strerror(errno));
             goto fail;
@@ -6421,6 +6414,15 @@ int imdb_recover_tail(const char *path, bool apply, const char *save_path, imdb_
     bool tagged_before = false;
     int rc = IMDB_OK;
     if (dirfd < 0) return imdb_fail(e, IMDB_ERR_IO, "open %s: %s", path, strerror(errno));
+    if (faccessat(dirfd, "LOCK", F_OK, AT_SYMLINK_NOFOLLOW) != 0) { /* format 1: a later one's, before LOCK is made */
+        imdb_identity mid;
+        bool mrep = false;
+        if (read_meta(dirfd, &mid, &mrep, e) == IMDB_ERR_UNSUPPORTED) {
+            rc = e->code;
+            goto out;
+        }
+        imdb_err_clear(e);
+    }
     lockfd = imdb_io_openat(dirfd, "LOCK", O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (lockfd < 0 || imdb_io_flock(lockfd, LOCK_EX | LOCK_NB) != 0) {
         rc = imdb_fail(e, IMDB_ERR_STATE, "%s is in use by another process", path);
@@ -6483,7 +6485,12 @@ int imdb_recover_tail(const char *path, bool apply, const char *save_path, imdb_
     bool lake_present = false;
     uint8_t lm[32];
     imdb_err el = {0};
-    if (imdb_lake_head(dirfd, &lake_present, &r->lake_seq, lm, &el) == IMDB_OK && lake_present && r->lake_seq > seq)
+    int lh = imdb_lake_head(dirfd, &lake_present, &r->lake_seq, lm, &el);
+    if (lh == IMDB_ERR_UNSUPPORTED) { /* format 1: a later imagedb's lake, never cut beneath */
+        rc = imdb_fail(e, lh, "%s", el.msg);
+        goto out;
+    }
+    if (lh == IMDB_OK && lake_present && r->lake_seq > seq)
         r->lake_ahead = true;
     if (r->damaged) {
         r->segment = segs[nsegs - 1];

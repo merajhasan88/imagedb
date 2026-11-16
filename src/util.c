@@ -509,3 +509,28 @@ uint64_t imdb_hist_quantile(const imdb_hist *h, unsigned permille)
     }
     return max;
 }
+
+bool imdb_later_magic(const uint8_t *b, size_t n, const char *magic)
+{
+    size_t m = strlen(magic), d = 0;
+    while (d < m && magic[m - 1 - d] >= '0' && magic[m - 1 - d] <= '9') d++;
+    if (!d || n < m || memcmp(b, magic, m - d) != 0) return false;
+    unsigned long want = 0, got = 0;
+    for (size_t i = m - d; i < m; i++) {
+        if (b[i] < '0' || b[i] > '9') return false;
+        want = want * 10 + (unsigned long)(magic[i] - '0');
+        got = got * 10 + (unsigned long)(b[i] - '0');
+    }
+    return got > want;
+}
+
+bool imdb_later_text(const uint8_t *b, size_t n, const char *prefix, unsigned long cur, unsigned long *ver)
+{
+    size_t p = strlen(prefix), i = p;
+    if (n <= p || memcmp(b, prefix, p) != 0) return false;
+    unsigned long v = 0;
+    while (i < n && i - p < 9 && b[i] >= '0' && b[i] <= '9') v = v * 10 + (unsigned long)(b[i++] - '0');
+    if (i == p || i >= n || b[i] != '\n' || (b[p] == '0' && i - p > 1)) return false;
+    if (ver) *ver = v;
+    return v > cur;
+}

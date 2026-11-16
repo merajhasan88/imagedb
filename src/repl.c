@@ -15,6 +15,7 @@
 
 #include "cpu.h"
 #include "db.h"
+#include "db_internal.h"
 #include "fsio.h"
 #include "writer.h"
 
@@ -296,6 +297,13 @@ int imdb_replica_add(const char *primary, const char *name, const uint8_t pub[IM
     if (!name_ok(name, strlen(name))) return imdb_fail(e, IMDB_ERR_INVALID, "a replica name is 1 to 32 of a-z, 0-9, _ and -");
     int dirfd = imdb_io_open(primary, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (dirfd < 0) return imdb_fail(e, IMDB_ERR_IO, "open %s: %s", primary, strerror(errno));
+    imdb_identity mid; /* format 1: a later imagedb's directory refused by name before replicas/ is made */
+    bool mrep = false;
+    imdb_err em = {0};
+    if (imdb_meta_read_at(dirfd, &mid, &mrep, &em) == IMDB_ERR_UNSUPPORTED) {
+        close(dirfd);
+        return imdb_fail(e, em.code, "%s", em.msg);
+    }
     /* exclusive against every receipt: none overlaps the change of a binding */
     int rfd = replicas_dir(dirfd, true, e);
     int rc = rfd < 0 ? e->code : IMDB_OK;
