@@ -516,6 +516,13 @@ typedef struct imdb_db {
     int sync;                 /* 1 = fdatasync every commit                */
     uint64_t seq;
     uint8_t head[32];
+    /* N1b: a statement's own commit for the server's DONE: each commit's number and hash but imdb_maintain's (a
+     * size-triggered CHECKPOINT, an expiry, a RETIRE: between statements, never one's own), which sets maintaining */
+    uint64_t stmt_seq;
+    uint8_t stmt_head[32];
+    bool maintaining;
+    uint64_t role_gen;        /* N1b: moves at every install and erasure of a role's entries, privileges or memberships:
+                               * the server makes its logins again when it moves (a password, NOLOGIN, a rename, DROP, ERASE) */
     uint64_t last_time;
     uint64_t tx_time;         /* set: the next commit's time (expiry checked its rule against it) */
     uint32_t last_hlen;       /* commit seq's signed descriptor (header length, signature): an anchor names it */

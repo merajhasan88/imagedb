@@ -134,6 +134,10 @@ typedef struct imdb_result {
     bool has_count;          /* N1b: count is the rows a write wrote (INSERT, UPDATE, DELETE, COPY), its status's number;
                               * otherwise the rows a result holds are nrows */
     uint64_t count;
+    bool has_commit;         /* N1b: the statement made a commit (an autocommit write, COMMIT, DDL; COPY's BATCH: its last):
+                              * commit and its hash, never a CHECKPOINT or an expiry imdb_maintain made after it */
+    uint64_t commit;
+    uint8_t commit_hash[32];
 } imdb_result;
 
 void imdb_session_init(imdb_session *s, imdb_db *db);

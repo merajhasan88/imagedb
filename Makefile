@@ -46,10 +46,12 @@ OBJ     = $(SRC:src/%.c=$(BUILD)/obj/%.o) $(ASMSRC:asm/%.asm=$(BUILD)/obj/%.asm.
 HDR     = $(wildcard src/*.h src/vendor/monocypher/*.h)
 LIB     = $(BUILD)/libimagedb.a
 BIN     = $(BUILD)/imagedb
+SERVER  = $(BUILD)/imagedb-server
 
 TSRC    = $(wildcard tests/unit/*.c)
 TOBJ    = $(TSRC:tests/unit/%.c=$(BUILD)/tobj/%.o) $(BUILD)/tobj/acrypto.o $(BUILD)/tobj/afsum.o $(BUILD)/tobj/abind.o \
-          $(BUILD)/tobj/apq.o $(BUILD)/tobj/aice.o $(BUILD)/tobj/wire.o $(BUILD)/tobj/conv.o
+          $(BUILD)/tobj/apq.o $(BUILD)/tobj/aice.o $(BUILD)/tobj/wire.o $(BUILD)/tobj/conv.o $(BUILD)/tobj/srv.o \
+          $(BUILD)/tobj/client.o
 TBIN    = $(BUILD)/test_unit
 
 .PHONY: all lint test unit san tsan ct fuzz fuzz-run bench whole index-sum mem-split join-cost workload clean integration faults soak oracle install uninstall parquet-check iceberg-check
@@ -57,7 +59,7 @@ TBIN    = $(BUILD)/test_unit
 AUDIT   = $(BUILD)/imagedb-audit
 ASRC    = tools/audit/audit.c tools/audit/acrypto.c tools/audit/afsum.c tools/audit/abind.c tools/audit/apq.c tools/audit/aice.c
 
-all: $(BIN) $(AUDIT)
+all: $(BIN) $(AUDIT) $(SERVER)
 
 # make install (P1 A1): the CLI and the auditor, the static library, the README and the licence; DESTDIR stages
 # it (a package). A sanitizer build (SAN=1) is never installed.
@@ -129,13 +131,23 @@ $(BUILD)/tobj/aice.o: tools/audit/aice.c tools/audit/aice.h | $(BUILD)/tobj
 $(BUILD)/tobj/conv.o: server/conv.c server/conv.h server/wire.h $(HDR) | $(BUILD)/tobj
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# N1b: the server (server/srv.c: the engine thread, connections, authentication) and the C client (client/)
+$(BUILD)/tobj/srv.o: server/srv.c server/srv.h server/conv.h server/wire.h $(HDR) | $(BUILD)/tobj
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/tobj/client.o: client/client.c client/imagedb_client.h server/wire.h $(HDR) | $(BUILD)/tobj
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(SERVER): server/main.c server/srv.h $(BUILD)/tobj/srv.o $(BUILD)/tobj/conv.o $(BUILD)/tobj/wire.o $(LIB)
+	$(CC) $(CFLAGS) server/main.c $(BUILD)/tobj/srv.o $(BUILD)/tobj/conv.o $(BUILD)/tobj/wire.o $(LIB) -o $@ $(LDFLAGS)
+
 $(BUILD)/tobj/wire.o: server/wire.c server/wire.h $(HDR) | $(BUILD)/tobj
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/tobj/abind.o: tools/audit/abind.c tools/audit/abind.h | $(BUILD)/tobj
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(TBIN): $(TOBJ) $(LIB)
+$(TBIN): $(TOBJ) $(LIB) | $(SERVER) # N1b: t_server runs the binary beside the suite's own
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS) -lcrypto
 
 $(BUILD)/obj $(BUILD)/tobj:
@@ -164,11 +176,13 @@ lint:
 	  { echo "tz.h outside tz.c, db.c and sql*.c: nothing a replica, VERIFY or the auditor recomputes reads a zone"; exit 1; }
 	@! grep -nE '(^|[^_a-zA-Z0-9.>"])(localtime|localtime_r|mktime|tzset|timelocal|strftime)\(|getenv\("TZ"\)' src/*.c src/*.h tools/audit/*.c || \
 	  { echo "the host's time zone read: zones are named, never the process's (tz.h)"; exit 1; }
-	@! grep -nE '(^|[^_a-z])realloc[[:space:]]*\(' /dev/null server/*.c server/*.h || { echo "realloc in server/"; exit 1; }
-	@! grep -nE '(^|[^_a-zA-Z0-9.>"])($(ALLOCS)|free)\(' /dev/null $(filter-out server/wire.c,$(wildcard server/*.c)) || \
-	  { echo "raw allocation in server/: imdbw_alloc and imdbw_free (wire.h: counted, never the engine's)"; exit 1; }
-	@! grep -nE '(^|[^_a-zA-Z0-9.>"])imdb_(alloc|alloc_array|realloc_array|alloc_aligned|free)\(' /dev/null server/wire.c || \
-	  { echo "the engine's allocator in the wire codec: its ceiling is process-wide (docs/n1-design.md §2)"; exit 1; }
+	@! grep -nE '(^|[^_a-z])realloc[[:space:]]*\(' /dev/null server/*.c server/*.h client/*.c client/*.h || { echo "realloc in server/ or client/"; exit 1; }
+	@! grep -nE '(^|[^_a-zA-Z0-9.>"])($(ALLOCS)|free)\(' /dev/null $(filter-out server/wire.c,$(wildcard server/*.c)) \
+	  $(wildcard client/*.c) || \
+	  { echo "raw allocation in server/ or client/: imdbw_alloc and imdbw_free (wire.h: counted, never the engine's)"; exit 1; }
+	@! grep -nE '(^|[^_a-zA-Z0-9.>"])imdb_(alloc|alloc_array|realloc_array|alloc_aligned|free)\(' /dev/null server/wire.c \
+	  server/srv.c $(wildcard client/*.c) || \
+	  { echo "the engine's allocator in the wire codec, the server's threads or the client: its ceiling is process-wide (docs/n1-design.md §2)"; exit 1; }
 	@sh tools/check_options.sh # every SET, option and IMDB_ variable src/ reads is in the README's table (P1 A1)
 
 # The fault group (t_fault.c) runs in the first pass only: the second repeats the kernels in their
@@ -396,7 +410,9 @@ TSAN_FLAGS = -std=c11 -D_GNU_SOURCE -g -O1 -ffp-contract=off -fsanitize=thread -
 tsan:
 	mkdir -p build-tsan
 	clang $(TSAN_FLAGS) $(filter-out src/main.c,$(wildcard src/*.c)) $(wildcard src/vendor/monocypher/*.c) \
-	  $(TSRC) tools/audit/acrypto.c tools/audit/afsum.c tools/audit/abind.c tools/audit/apq.c tools/audit/aice.c server/wire.c server/conv.c -o build-tsan/test_unit -lcrypto
+	  $(TSRC) tools/audit/acrypto.c tools/audit/afsum.c tools/audit/abind.c tools/audit/apq.c tools/audit/aice.c server/wire.c server/conv.c server/srv.c client/client.c -o build-tsan/test_unit -lcrypto
+	clang $(TSAN_FLAGS) $(filter-out src/main.c,$(wildcard src/*.c)) $(wildcard src/vendor/monocypher/*.c) \
+	  server/main.c server/srv.c server/conv.c server/wire.c -o build-tsan/imagedb-server # N1b: t_server runs it
 	clang $(TSAN_FLAGS) tests/unit/t_pool.c tests/tsan/pool_main.c src/pool.c $(KERNEL_SRC) \
 	  src/util.c src/fsio.c -o build-tsan/pool_test
 	$(SANRUN) build-tsan/pool_test

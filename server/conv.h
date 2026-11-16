@@ -24,8 +24,8 @@ int imdbw_value_of(const imdb_result *r, uint64_t row, uint16_t col, const imdbw
  * holds at least target bytes or the rows end (*next: the next row to send; a caller sends b and calls again) */
 int imdbw_rows_of(const imdb_result *r, const imdbw_msg *cols, uint64_t *next, size_t target, imdbw_buf *b, imdb_err *e);
 
-/* a result's DONE: its status, its count (a write's rows, or the rows it holds), its read point when it has one; a
- * write's commit is the server's to add (it is not in the result) */
+/* a result's DONE: its status, its count (a write's rows, or the rows it holds), its read point when it has one, its
+ * commit when it made one (imdb_result.commit) */
 void imdbw_done_of(const imdb_result *r, imdbw_msg *d);
 
 /* a wire parameter as the engine's: its type's tag, its value's representation (a FLOAT64 its key, a DECIMAL in the form

@@ -1,0 +1,49 @@
+/* N1b: the C client of imagedb's protocol, IMDBWIR1 (docs/n1-design.md §4, §7), over the server's Unix-domain socket
+ * (TCP with TLS: N1c). A request is sent whole (imdbc_query, _prepare, _execute, _deallocate, _ping); its replies are
+ * read one message at a time (imdbc_next): COLUMNS, ROWS, DONE, ERROR, WARNING, READY, PONG, as strict as the server
+ * reads the client. Requests may pipeline: send several, then read each one's replies in order. imdbc_cancel, from any
+ * thread, wakes a reader blocked in imdbc_next, which sends CANCEL in band. Its blocks are the wire's (imdbw_alloc). */
+#ifndef IMAGEDB_CLIENT_H
+#define IMAGEDB_CLIENT_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "../server/wire.h"
+
+typedef struct imdbc imdbc;
+
+typedef struct imdbc_stmt {
+    const char *sql;
+    size_t len;
+    const imdbw_value *params; /* its $1 to $n */
+    uint16_t nparams;
+} imdbc_stmt;
+
+/* the server's socket, a role's name and password (the caller's bytes: never a file this library reads); IMDB_ERR_AUTH
+ * for a refusal (an unknown name and a wrong password alike), IMDB_ERR_UNSUPPORTED when the server speaks a later
+ * version only */
+int imdbc_connect(const char *socket_path, const char *user, const char *password, size_t pwlen, imdbc **out, imdb_err *e);
+int imdbc_query(imdbc *c, const imdbc_stmt *stmts, uint32_t n, imdb_err *e);
+int imdbc_prepare(imdbc *c, const char *name, const char *sql, size_t len, imdb_err *e);
+/* nsets sets of nvals values, vals in set order */
+int imdbc_execute(imdbc *c, const char *name, const imdbw_value *vals, uint32_t nsets, uint16_t nvals, imdb_err *e);
+int imdbc_deallocate(imdbc *c, const char *name, imdb_err *e);
+int imdbc_ping(imdbc *c, imdb_err *e);
+/* TERMINATE: the server ends the session (an open transaction rolled back) once the requests before it ran */
+int imdbc_terminate(imdbc *c, imdb_err *e);
+/* the statement running for this connection, cancelled: any thread (a flag and a wake-up; the reader sends CANCEL) */
+void imdbc_cancel(imdbc *c);
+/* the next reply, decoded (a ROWS against the last COLUMNS, which stays readable until the next COLUMNS): valid until
+ * the next call; IMDB_ERR_IO when the server closed the connection */
+int imdbc_next(imdbc *c, imdbw_msg *m, imdb_err *e);
+/* the last COLUMNS (the one a ROWS is read against), or NULL */
+const imdbw_msg *imdbc_columns(const imdbc *c);
+int imdbc_fd(const imdbc *c);
+/* a bound on each wait for a reply's bytes (0: none, the default): past it imdbc_next fails with IMDB_ERR_IO, the
+ * connection then unusable (a frame may be part read) */
+void imdbc_set_timeout(imdbc *c, uint32_t ms);
+void imdbc_close(imdbc *c);
+
+#endif

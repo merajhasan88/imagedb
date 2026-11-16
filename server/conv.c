@@ -172,6 +172,10 @@ void imdbw_done_of(const imdb_result *r, imdbw_msg *d)
         memcpy(d->db_id, r->db_id, 16);
         d->own = r->snap_own;
     }
+    if ((d->has_write = r->has_commit)) { /* the statement's own commit (imdb_result.commit: never a maintenance one) */
+        d->write_commit = r->commit;
+        memcpy(d->write_hash, r->commit_hash, 32);
+    }
 }
 
 int imdbw_param_of(const imdbw_value *w, imdb_value *out, imdb_err *e)

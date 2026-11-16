@@ -145,6 +145,7 @@ int main(int argc, char **argv)
         {"wire", wire_tests, &wire_ntests},    /* N1a: IMDBWIR1's codec */
         {"conv", conv_tests, &conv_ntests},    /* N1b: results and parameters to and from the wire */
         {"pbind", pbind_tests, &pbind_ntests},  /* N1b: a parameter as the literal of its value */
+        {"server", server_tests, &server_ntests}, /* N1b: the server on its socket, through the C client */
     };
     int failed = 0, run = 0;
     for (size_t g = 0; g < sizeof groups / sizeof *groups; g++) {

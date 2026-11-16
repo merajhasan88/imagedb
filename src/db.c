@@ -5574,7 +5574,10 @@ static int maintain_body(imdb_db *db, imdb_err *e)
 int imdb_maintain(imdb_db *db, imdb_err *e)
 {
     imdb_op_enter(db);
+    bool was = db->maintaining; /* N1b: its commits are not a statement's (db->stmt_seq) */
+    db->maintaining = true;
     int rc = maintain_body(db, e);
+    db->maintaining = was;
     imdb_op_leave(db);
     return rc;
 }
@@ -5796,6 +5799,7 @@ static int commit_body(imdb_db *db, imdb_err *e)
             db->tx[i].edef = NULL;
         }
         if (code == IMDB_OP_DROP_ENUM) imdb_enum_drop_install(db, db->tx[i].eid, c.seq);
+        if (code >= IMDB_OP_CREATE_ROLE && code <= IMDB_OP_REVOKE) db->role_gen++; /* N1b: the server's logins made again */
         if (code >= IMDB_OP_CREATE_ROLE && code <= IMDB_OP_REVOKE && !imdb_role_install(&db->rc, &db->tx[i], c.seq)) { /* L */
             db->failed = true;
             snprintf(db->warning, sizeof db->warning, "commit %llu changed a role with no room reserved; reopen",
@@ -5808,6 +5812,10 @@ static int commit_body(imdb_db *db, imdb_err *e)
     }
     db->seq = c.seq;
     memcpy(db->head, c.hash, 32);
+    if (!db->maintaining) { /* N1b: a statement's own (the server's DONE reads it) */
+        db->stmt_seq = c.seq;
+        memcpy(db->stmt_head, c.hash, 32);
+    }
     db->last_hlen = c.hlen;
     memcpy(db->last_sig, c.sig, IMDB_SIG_LEN);
     db->last_time = c.time_us;
@@ -5846,6 +5854,7 @@ static int commit_body(imdb_db *db, imdb_err *e)
         /* L stage 2: the role entries erased (wiped; each one's commit noted for the redaction: the writer holds none
          * pending). Its own list meets every rule; a failure stops the handle (the commit is durable: reopen replays) */
         imdb_err e4 = {0};
+        db->role_gen += o->n_rerase != 0; /* N1b: an erased verifier leaves the server's logins too */
         if (o->n_rerase && imdb_role_erase_apply(&db->rc, o->rerase, o->n_rerase, c.seq, erase_role_note, db, &e4))
             db->failed = true;
         imdb_txn_doom_erased(db, o->erase, o->n_erase, c.seq); /* suspended writes built on erased rows */

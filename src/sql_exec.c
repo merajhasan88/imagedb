@@ -11691,6 +11691,7 @@ int imdb_prepare(imdb_session *s, const char *name, const char *sql, size_t len,
 }
 
 static void cwide_check(const imdb_result *r); /* N1b: below, beside imdb_exec_one */
+static void stmt_commit(const imdb_db *db, uint64_t before, imdb_result *r); /* N1b: below, beside imdb_exec_one */
 
 int imdb_execute(imdb_session *s, const char *name, const imdb_value *params, uint32_t nparams, imdb_result *res, imdb_err *e)
 {
@@ -11702,7 +11703,9 @@ int imdb_execute(imdb_session *s, const char *name, const imdb_value *params, ui
     imdb_op_enter(s->db);
     imdb_result_init(res);
     res->byte_cap = workspace_of(s);
+    uint64_t before = s->db->stmt_seq;
     int rc = exec_stmt_body(s, p->st, false, p->sql, p->len, params, nparams, p->name, res, e);
+    if (!rc) stmt_commit(s->db, before, res);
     if (!rc) p->uses++, cwide_check(res); /* runs that ran to their end */
     imdb_op_leave(s->db);
     return rc;
@@ -11734,12 +11737,25 @@ static void cwide_check(const imdb_result *r)
 #endif
 }
 
+/* N1b: the statement's own commit, when it made one (an autocommit write, COMMIT, DDL; COPY's BATCH: its last), for the
+ * server's DONE: db->stmt_seq moves at every commit but imdb_maintain's, so a CHECKPOINT the size triggered after the
+ * statement is never taken for its commit */
+static void stmt_commit(const imdb_db *db, uint64_t before, imdb_result *r)
+{
+    r->has_commit = db->stmt_seq != before;
+    if (!r->has_commit) return;
+    r->commit = db->stmt_seq;
+    memcpy(r->commit_hash, db->stmt_head, 32);
+}
+
 int imdb_exec_one(imdb_session *ss, const char *sql, size_t len, const imdb_value *params, uint32_t nparams,
                   imdb_result *r, imdb_err *e)
 {
     imdb_db *db = ss->db;
     imdb_op_enter(db);
+    uint64_t before = db->stmt_seq;
     int rc = exec_one_body(ss, sql, len, params, nparams, r, e);
+    if (!rc) stmt_commit(db, before, r);
     if (!rc) cwide_check(r);
     imdb_op_leave(db);
     return rc;
