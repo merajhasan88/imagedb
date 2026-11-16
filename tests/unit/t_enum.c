@@ -402,7 +402,9 @@ static void t_enum_sql(void)
     EXPECT("EXECUTE p ('ok')", "id\n2\n4\n");
     EXPECT("EXECUTE p ('nope')", "ERR not a label of type mood");
     OK(run("PREPARE p2 AS SELECT id FROM t WHERE n = $1"));
-    EXPECT("EXECUTE p2 ('ok')", "ERR does not have the type of column n");
+    /* N1b: an undeclared EXECUTE's string, a TEXT, binds into the ENUM column as its literal would: a label */
+    EXPECT("EXECUTE p2 ('ok')", "id\n2\n4\n");
+    EXPECT("EXECUTE p2 ('nope')", "ERR not a label of type mood");
     imdb_value pv = {.type = IMDB_T_ENUM, .i = 2, .eid = eid_of(db, "mood")};
     imdb_result r;
     CHECK(imdb_exec_one(&g_s, XQ("SELECT COUNT(*) AS c FROM t WHERE n = $1"), &pv, 1, &r, &g_e) == 0);

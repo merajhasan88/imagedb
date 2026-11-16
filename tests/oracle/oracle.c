@@ -325,6 +325,8 @@ static long g_prep_compared; /* P2 S9: SELECTs imagedb ran prepared, compared */
 /* P2 S13: writes imagedb ran prepared, compared; of the prepared, those run with their values as API parameters and
  * those with a NULL among them; writes that may fail part way, compared and refused by both */
 static long g_prepw_compared, g_prep_api, g_prep_null, g_prep_runs;
+static long g_prep_retyped; /* N1b: API parameters passed as another type by their value (par_value) */
+static bool g_retype;        /* N1b: this run's column-bound API parameters retyped (a quarter of the runs) */
 static long g_dup_compared, g_dup_refused, g_ufail_compared, g_ufail_refused;
 static bool g_prep_last_api, g_prep_last_null; /* the last prepared run's: API parameters, a NULL among its values */
 
@@ -2115,8 +2117,11 @@ static struct {
     int t;
     char s[100];
     val v; /* P2 S13: the value itself, for an EXECUTE through API parameters (a NULL typed by its column) */
+    int col; /* N1b: printed where a column binds it, 1 its predicate or BETWEEN, 2 VALUES or SET: its parameter may be
+              * retyped by value (a NULL in VALUES and SET alone) */
 } g_par[48];
 static int g_npar;
+static int g_lit_col; /* N1b: put_lit is printing a value a column binds (col_lit sets it: 1 a predicate, 2 a write) */
 
 static void put_lit(sb *b, int d, int t, const val *v)
 {
@@ -2132,6 +2137,7 @@ static void put_lit(sb *b, int d, int t, const val *v)
             g_par[g_npar].s[lit.n] = 0;
             g_par[g_npar].t = t;
             g_par[g_npar].v = *v;
+            g_par[g_npar].col = g_lit_col;
             sb_printf(b, "$%d", ++g_npar);
         }
         free(lit.p);
@@ -2174,6 +2180,16 @@ static void put_lit(sb *b, int d, int t, const val *v)
         }
         break;
     }
+}
+
+/* N1b: a value printed where a column binds it (its predicate, BETWEEN's bounds, INSERT's VALUES, UPDATE's SET): its
+ * parameter, retyped by value, must bind as its literal (docs/n1-design.md §4); a tree's value is never retyped (an INT64
+ * there is integer arithmetic, a DECIMAL not) */
+static void col_lit(sb *b, int d, int t, const val *v, int kind)
+{
+    g_lit_col = kind;
+    put_lit(b, d, t, v);
+    g_lit_col = 0;
 }
 
 static bool g_qual; /* SQL Server's ORDER BY: every column qualified (a bare name is the select list's first, and
@@ -2669,20 +2685,20 @@ static void put_pred(sb *b, int d, const stmt *q, const pred *p)
     case OP_NOTNULL: sb_str(b, " IS NOT NULL"); break;
     case OP_BETWEEN:
         sb_str(b, " BETWEEN ");
-        put_lit(b, d, t, &p->a);
+        col_lit(b, d, t, &p->a, 1);
         sb_str(b, " AND ");
-        put_lit(b, d, t, &p->b);
+        col_lit(b, d, t, &p->b, 1);
         break;
     default:
 #ifdef ORACLE_MUTATE /* the oracle's own check: imagedb is sent <= where the others get <, which it must catch */
         if (d == D_IMDB && p->op == OP_LT) {
             sb_str(b, " <= ");
-            put_lit(b, d, t, &p->a);
+            col_lit(b, d, t, &p->a, 1);
             break;
         }
 #endif
         sb_printf(b, " %s ", OPS[p->op]);
-        put_lit(b, d, t, &p->a);
+        col_lit(b, d, t, &p->a, 1);
     }
 }
 
@@ -3073,7 +3089,7 @@ static void print_stmt_body(sb *b, int d, const stmt *q)
             sb_str(b, r ? ", (" : "(");
             for (int c = 0; c < ncols(q->tab); c++) {
                 if (c) sb_str(b, ", ");
-                put_lit(b, d, cols(q->tab)[c].t, &q->row[r][c]);
+                col_lit(b, d, cols(q->tab)[c].t, &q->row[r][c], 2);
             }
             sb_str(b, ")");
         }
@@ -3098,7 +3114,7 @@ static void print_stmt_body(sb *b, int d, const stmt *q)
             if (i) sb_str(b, ", ");
             sb_printf(b, "%s = ", cols(q->tab)[q->scol[i]].name);
             if (q->sx[i]) put_x(b, d, q, q->sx[i], -1);
-            else put_lit(b, d, cols(q->tab)[q->scol[i]].t, &q->sval[i]);
+            else col_lit(b, d, cols(q->tab)[q->scol[i]].t, &q->sval[i], 2);
         }
         put_where(b, d, q);
         put_ret(b, d, q);
@@ -4363,8 +4379,41 @@ static imdb_value par_value(int i)
     imdb_value x = {.type = t != CT_TS ? IT[t] : g_tz ? IMDB_T_TIMESTAMPTZ : g_dt == 1 ? IMDB_T_DATE : g_dt == 2 ? IMDB_T_TIME
                                                                    : IMDB_T_TIMESTAMP,
                     .scale = t == CT_DEC ? 2 : 0}; /* --tz: an instant; F3b: a DATE's days, a TIME's microseconds */
+    /* N1b: a column-bound parameter of a retyped run passed as another type, its value kept exactly (docs/n1-design.md
+     * §4): a DECIMAL as an INT64 when whole, at scale 1 when its cents end in 0, else at scale 3; an INT64 as a DECIMAL of scale 0; a FLOAT64 as an INT64
+     * when whole, else a DECIMAL of two places (a multiple of 1/4); a NULL, in VALUES and SET alone, as another type's */
+    bool re = g_retype && g_par[i].col && (!v->null || g_par[i].col == 2) && (t == CT_INT || t == CT_DEC || t == CT_FLT || v->null);
     if (v->null) {
         x.null = true;
+        if (re) {
+            x.type = x.type == IMDB_T_TEXT ? IMDB_T_INT64 : IMDB_T_TEXT;
+            x.scale = 0;
+            g_prep_retyped++;
+        }
+        return x;
+    }
+    if (re && t == CT_DEC) {
+        /* whole: an INT64 (scaled up by 2); a tenth: a DECIMAL of scale 1 (scaled up by 1); else of scale 3 (down by 1) */
+        __int128 d = !(v->i % 100) ? (__int128)(v->i / 100) : !(v->i % 10) ? (__int128)(v->i / 10) : (__int128)v->i * 10;
+        if (!(v->i % 100)) x.type = IMDB_T_INT64, x.scale = 0;
+        else x.scale = v->i % 10 ? 3 : 1;
+        if (x.type == IMDB_T_INT64) x.i = (int64_t)d;
+        else imdb_dec_set(&x, d, d < INT64_MIN || d > INT64_MAX);
+        g_prep_retyped++;
+        return x;
+    }
+    if (re && t == CT_INT) {
+        x.type = IMDB_T_DECIMAL;
+        x.scale = 0;
+        imdb_dec_set(&x, v->i, false);
+        g_prep_retyped++;
+        return x;
+    }
+    if (re && t == CT_FLT && v->f < 9.0e15 && v->f > -9.0e15) { /* within an int64 at two places */
+        bool small = v->f < 9007199254740992.0 && v->f > -9007199254740992.0; /* whole: an int64 round trip, no libm */
+        if (small && (double)(int64_t)v->f == v->f) x.type = IMDB_T_INT64, x.i = (int64_t)v->f;
+        else x.type = IMDB_T_DECIMAL, x.scale = 2, imdb_dec_set(&x, (__int128)(int64_t)(v->f * 100), false); /* quarters: exact */
+        g_prep_retyped++;
         return x;
     }
     if (t == CT_FLT) x.i = imdb_f64_key(v->f);
@@ -4385,6 +4434,7 @@ static void exec_prepared(eng *e, sb *text, bool rows, const int *ty, int nty, r
     static const char *const TNT[] = {"INT64", "DECIMAL(18,2)", "FLOAT64", "TEXT", "BOOL", "TIME"};
     long k = g_prep_runs++;
     bool api = k % 2 == 1, decl = !(api && k % 4 == 3);
+    g_retype = api && (k / 4) % 2 == 0; /* N1b: runs 1 and 3 of every 8, declared types and not */
     g_prep_last_api = api;
     g_prep_last_null = false;
     for (int i = 0; i < g_npar; i++) g_prep_last_null |= g_par[i].v.null;
@@ -4425,7 +4475,7 @@ static void exec_prepared(eng *e, sb *text, bool rows, const int *ty, int nty, r
     sb_str(text, "; ");
     sb_str(text, x.p);
     if (api) { /* the report names the values the API passed */
-        sb_str(text, " -- API:");
+        sb_str(text, g_retype ? " -- API, column-bound values retyped by value (N1b):" : " -- API:");
         for (int i = 0; i < g_npar; i++) sb_printf(text, " $%d = %s", i + 1, g_par[i].s);
     }
     free(p.p);
@@ -6000,6 +6050,8 @@ int main(int argc, char **argv)
     printf("oracle: %ld comparisons of P2 S9's prepared SELECTs (imagedb's literals as $n: PREPARE, EXECUTE)\n", g_prep_compared);
     printf("oracle: %ld comparisons of P2 S13's prepared writes; of every prepared statement compared, %ld with its values as "
            "API parameters, %ld with a NULL among them (a typed parameter)\n", g_prepw_compared, g_prep_api, g_prep_null);
+    printf("oracle: %ld API parameters passed as another type by their value, where a column binds them (N1b: as their "
+           "literals)\n", g_prep_retyped);
     printf("oracle: %ld comparisons of P2 S13's writes drawn to fail part way, outside transactions: an INSERT with a key that "
            "may exist, at any row, %ld (%ld refused by both), UPDATE t SET g = ABS(x) %% 5 %ld (%ld refused by both); the "
            "tables' states after each\n",

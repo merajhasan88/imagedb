@@ -508,6 +508,7 @@ static int dec_form(const imdb_column *c, imdb_value *v, imdb_err *e)
 }
 
 static int enum_label(xctx *x, const sql_stmt *st, uint32_t eid, const char *txt, size_t tl, int32_t *k, imdb_err *e);
+static int enum_label_bytes(xctx *x, const sql_stmt *st, uint32_t eid, const char *lab, size_t n, int32_t *k, imdb_err *e);
 static int enum_named(xctx *x, const sql_stmt *st, const char *name, uint16_t *eid, imdb_err *e);
 static int enum_ord(xctx *x, const sql_stmt *st, uint32_t eid, int64_t ord, imdb_err *e);
 
@@ -536,6 +537,82 @@ static bool param_value_ok(const imdb_value *pv)
     return imdb_value_check(&c, pv, &ignored) == IMDB_OK;
 }
 
+/* N1b: a number's text as its literal would spell it (an INT64's digits, a DECIMAL's with its point), for the FLOAT64
+ * literal's own parse: so a parameter's nearest double is the literal's */
+static size_t num_text(const imdb_value *v, char out[IMDB_MAX_NUMERIC + 4])
+{
+    __int128 x = v->type == IMDB_T_INT64 ? (__int128)v->i : imdb_dec_value(v);
+    int s = v->type == IMDB_T_DECIMAL ? v->scale : 0;
+    char dig[48];
+    unsigned __int128 m = x < 0 ? -(unsigned __int128)x : (unsigned __int128)x;
+    int n = 0;
+    do dig[n++] = (char)('0' + (int)(m % 10)), m /= 10;
+    while (m || n <= s);
+    size_t o = 0;
+    if (x < 0) out[o++] = '-';
+    for (int i = n - 1; i >= 0; i--) {
+        out[o++] = dig[i];
+        if (i == s && s) out[o++] = '.';
+    }
+    return o;
+}
+
+/* N1b (docs/n1-design.md §4, N1b's rule): an API parameter of another type than its column's, bound as the literal of its
+ * value would be: a NULL of any type as a literal NULL (NOT NULL, and a predicate, still refuse it); a number into a
+ * numeric column by its value when no digit is lost: an INT64 or a DECIMAL into a DECIMAL (rescaled exactly; its digits
+ * within the literal's bound, the column's precision, or a comparison's 18 or 38), an INT64 or a DECIMAL into a FLOAT64
+ * (through the literal's own parse of its text: the same nearest double); otherwise refused as the literal is, and a
+ * predicate's falls_back then makes it the tree's residual, compared exactly. Nothing else converts: a TEXT is not a
+ * string literal (values are tagged), a FLOAT64 never goes into an INT64 or a DECIMAL, a DECIMAL into an INT64 only at
+ * scale 0 (its literal an integer's: 7 goes in, 7.00 does not).
+ * out: memset by bind_lit, its type and scale the column's; bind_lit's tail checks it as a literal's value */
+static int param_as_literal(const imdb_value *pv, unsigned n, const imdb_column *c, bool compare, imdb_value *out,
+                            imdb_err *e)
+{
+    if (!param_value_ok(pv)) /* a caller's bytes: checked before anything here reads them (a scale indexes a table) */
+        return imdb_fail(e, IMDB_ERR_INVALID, "parameter $%u: not a value of a column type", n);
+    if (pv->null) {
+        out->null = true;
+        return IMDB_OK;
+    }
+    bool from_num = pv->type == IMDB_T_INT64 || pv->type == IMDB_T_DECIMAL;
+    if (c->type == IMDB_T_FLOAT64 && from_num) {
+        char txt[IMDB_MAX_NUMERIC + 4];
+        size_t tl = num_text(pv, txt);
+        return imdb_parse_float64(txt, tl, &out->i, e);
+    }
+    if (c->type == IMDB_T_INT64 && pv->type == IMDB_T_DECIMAL && !pv->scale) { /* its literal an integer's: 7, not 7.00 */
+        __int128 v = imdb_dec_value(pv);
+        if (v < INT64_MIN || v > INT64_MAX) /* as an integer literal past INT64 (a DECIMAL of scale 0) into an INT64 column */
+            return imdb_fail(e, IMDB_ERR_LIMIT, "column %s: a value past INT64's range", c->name);
+        out->i = (int64_t)v;
+        return IMDB_OK;
+    }
+    if (c->type == IMDB_T_DECIMAL && from_num) {
+        __int128 v = pv->type == IMDB_T_INT64 ? (__int128)pv->i : imdb_dec_value(pv);
+        int ps = pv->type == IMDB_T_DECIMAL ? pv->scale : 0;
+        if (ps > c->scale) {
+            __int128 d = imdb_pow10_128(ps - c->scale);
+            if (v % d)
+                return imdb_fail(e, IMDB_ERR_INVALID, "parameter $%u has more than %u fractional digits for column %s (no silent "
+                                                      "rounding)", n, (unsigned)c->scale, c->name);
+            v /= d;
+        }
+        int lim = compare ? (imdb_dec_wide(c->precision) ? IMDB_DEC_MAX_DIGITS : IMDB_DEC_NARROW_DIGITS) : c->precision;
+        __int128 cap = imdb_pow10_128(lim);
+        for (int k = ps; k < c->scale; k++) {
+            if (v >= cap / 10 || v <= -(cap / 10)) /* times 10 would reach the bound (and, near 10^38, pass an i128) */
+                return imdb_fail(e, IMDB_ERR_LIMIT, "column %s: value exceeds DECIMAL(%u,%u)", c->name, c->precision, c->scale);
+            v *= 10;
+        }
+        if (v >= cap || v <= -cap)
+            return imdb_fail(e, IMDB_ERR_LIMIT, "column %s: value exceeds DECIMAL(%u,%u)", c->name, c->precision, c->scale);
+        imdb_dec_set(out, v, imdb_dec_wide(c->precision));
+        return IMDB_OK;
+    }
+    return imdb_fail(e, IMDB_ERR_INVALID, "parameter $%u does not have the type of column %s (give it that type; an "
+                                          "EXECUTE's: PREPARE name (type, ...) declares it)", n, c->name);
+}
 static int bind_lit(xctx *x, const sql_lit *l, const imdb_column *c, bool compare, imdb_value *out, imdb_err *e)
 {
     memset(out, 0, sizeof *out);
@@ -546,12 +623,24 @@ static int bind_lit(xctx *x, const sql_lit *l, const imdb_column *c, bool compar
         if (l->param > x->nparams) return imdb_fail(e, IMDB_ERR_INVALID, "parameter $%u was not supplied", (unsigned)l->param);
         const imdb_value *pv = &x->params[l->param - 1];
         if (pv->type != c->type || (c->type == IMDB_T_DECIMAL && pv->scale != c->scale) ||
-            (c->type == IMDB_T_ENUM && !pv->null && pv->eid != c->eid)) /* F3g: an ENUM of the column's type */
-            return imdb_fail(e, IMDB_ERR_INVALID, "parameter $%u does not have the type of column %s (give it that type; an "
-                                                  "EXECUTE's: PREPARE name (type, ...) declares it)", (unsigned)l->param, c->name);
-        *out = *pv;
-        if (c->type == IMDB_T_DECIMAL && !out->null && dec_form(c, out, e)) return e->code; /* F3e: the column's form */
-        if (c->type == IMDB_T_ENUM && !out->null && enum_ord(x, x->st, c->eid, out->i, e)) return e->code; /* F3g: a label then */
+            (c->type == IMDB_T_ENUM && !pv->null && pv->eid != c->eid)) { /* F3g: an ENUM of the column's type */
+            if (c->type == IMDB_T_ENUM && pv->type == IMDB_T_TEXT && !pv->null) {
+                if (!param_value_ok(pv))
+                    return imdb_fail(e, IMDB_ERR_INVALID, "parameter $%u: not a value of a column type", (unsigned)l->param);
+                /* N1b: a label as TEXT, as its string literal: the wire's one non-NULL ENUM parameter (a driver knows
+                 * the label, never the ordinal or the type's id); an unknown label refused as the literal's */
+                int32_t k;
+                if (enum_label_bytes(x, x->st, c->eid, pv->len ? (const char *)pv->s : "", pv->len, &k, e)) return e->code;
+                out->i = k;
+                out->eid = c->eid;
+            } else if (param_as_literal(pv, (unsigned)l->param, c, compare, out, e)) {
+                return e->code; /* N1b: as its literal */
+            }
+        } else {
+            *out = *pv;
+            if (c->type == IMDB_T_DECIMAL && !out->null && dec_form(c, out, e)) return e->code; /* F3e: the column's form */
+            if (c->type == IMDB_T_ENUM && !out->null && enum_ord(x, x->st, c->eid, out->i, e)) return e->code; /* F3g: a label */
+        }
     } else {
         char num[IMDB_MAX_NUMERIC + 2];
         const char *txt = x->sql + l->off;
@@ -1684,6 +1773,13 @@ static int one_col(const sql_stmt *st, const imdb_table *t, const char *qual, co
     return col;
 }
 
+/* a NULL to compare with: the literal NULL, or (N1b) a parameter holding one: refused before it binds, so a NOT NULL column's
+ * check never answers for it (the same refusal, either way) */
+static bool lit_null(const xctx *x, const sql_lit *l)
+{
+    return l->kind == LIT_NULL || (l->kind == LIT_PARAM && l->param && l->param <= x->nparams && x->params[l->param - 1].null);
+}
+
 /* One predicate on column col of q's table. post: evaluated on a row a LEFT join may have
  * NULL-extended, so IS NULL is a real test even on a NOT NULL column. */
 static int bind_pred(xctx *x, const sql_cmp *c, int col, bool post, qspec *q, imdb_err *e)
@@ -1703,7 +1799,7 @@ static int bind_pred(xctx *x, const sql_cmp *c, int col, bool post, qspec *q, im
         }
         return IMDB_OK;
     }
-    if (c->a.kind == LIT_NULL || (c->op == CMP_BETWEEN && c->b.kind == LIT_NULL))
+    if (lit_null(x, &c->a) || (c->op == CMP_BETWEEN && lit_null(x, &c->b))) /* N1b: a NULL parameter as a literal NULL */
         return imdb_fail(e, IMDB_ERR_INVALID, "a comparison with NULL is never true; use IS NULL or IS NOT NULL");
     if (bind_lit(x, &c->a, cd, true, &b->a, e)) return e->code;
     if (c->op == CMP_BETWEEN && bind_lit(x, &c->b, cd, true, &b->b, e)) return e->code;
@@ -1734,7 +1830,7 @@ static int bind_pred(xctx *x, const sql_cmp *c, int col, bool post, qspec *q, im
     return IMDB_OK;
 }
 
-static bool falls_back(const sql_cmp *c, const imdb_column *cd);
+static bool falls_back(const xctx *x, const sql_cmp *c, const imdb_column *cd);
 
 /* P2 S4b: a WHERE conjunct `inner op outer` (two columns: one of this statement's table, one of the statement around
  * it) on a run for a row, whose value is then known: a plain predicate, so the run takes the primary key, the subject
@@ -1822,7 +1918,7 @@ static int bind_preds(xctx *x, const sql_stmt *st, qspec *q, imdb_err *e)
         if (col < 0) return col;
         uint16_t np = q->np;
         if (bind_pred(x, &st->where[i], col, false, q, e)) {
-            if (!falls_back(&st->where[i], &q->t->s.cols[col])) return e->code;
+            if (!falls_back(x, &st->where[i], &q->t->s.cols[col])) return e->code;
             q->np = np; /* the literal is another numeric kind: a residual (bind_resid) */
             x->fb[i] = true;
             imdb_err_clear(e);
@@ -2210,11 +2306,21 @@ static uint16_t cmp_root(const sql_cmp *c) { return c->lx ? c->lx : c->nl; }
 
 /* col op literal whose literal is a number of another kind than its numeric column's (1.25 for an INT64, 1.005 for a
  * DECIMAL of scale 2, 2.5e0 for either): compared exactly as a tree, as col + 0 op 1.25 is (a residual: no index
- * serves it), where binding the literal to the column's type would refuse it. Nothing is converted. */
-static bool falls_back(const sql_cmp *c, const imdb_column *cd)
+ * serves it), where binding the literal to the column's type would refuse it. Nothing is converted. N1b: a parameter
+ * holding a number (never a NULL: a comparison with NULL is refused, as a literal NULL's is) is such a literal too */
+static bool num_lit(const xctx *x, const sql_lit *l)
 {
-    bool num_a = c->a.kind == LIT_INT || c->a.kind == LIT_DEC || c->a.kind == LIT_FLOAT;
-    bool num_b = c->op != CMP_BETWEEN || c->b.kind == LIT_INT || c->b.kind == LIT_DEC || c->b.kind == LIT_FLOAT;
+    if (l->kind == LIT_INT || l->kind == LIT_DEC || l->kind == LIT_FLOAT) return true;
+    if (l->kind != LIT_PARAM || !l->param || l->param > x->nparams) return false;
+    const imdb_value *pv = &x->params[l->param - 1];
+    return !pv->null && (pv->type == IMDB_T_INT64 || pv->type == IMDB_T_DECIMAL || pv->type == IMDB_T_FLOAT64) &&
+           param_value_ok(pv); /* a value outside its rules is refused where it binds, never sent to the tree */
+}
+
+static bool falls_back(const xctx *x, const sql_cmp *c, const imdb_column *cd)
+{
+    bool num_a = num_lit(x, &c->a);
+    bool num_b = c->op != CMP_BETWEEN || num_lit(x, &c->b);
     return !c->lx && c->nl && c->op != CMP_ISNULL && c->op != CMP_NOTNULL && num_a && num_b &&
            (cd->type == IMDB_T_INT64 || cd->type == IMDB_T_DECIMAL || cd->type == IMDB_T_FLOAT64);
 }
@@ -4796,10 +4902,6 @@ static int enum_ord(xctx *x, const sql_stmt *st, uint32_t eid, int64_t ord, imdb
  * ordinal, or an error naming the type, never the text (a row's value, design.md §5) */
 static int enum_label(xctx *x, const sql_stmt *st, uint32_t eid, const char *txt, size_t tl, int32_t *k, imdb_err *e)
 {
-    if (!x->db)
-        return imdb_fail(e, IMDB_ERR_INVALID, "a CHECK or a generated column reads no ENUM value yet: a later step (deferred.md D27)");
-    const imdb_enumdef *d = imdb_enum_def(x->db, eid);
-    if (!d) return imdb_fail(e, IMDB_ERR_STATE, "an ENUM value of no type");
     char lab[2 * IMDB_MAX_ENUM_LABEL + 2];
     size_t n = 0;
     for (size_t i = 0; i < tl; i++) { /* '' -> ': a label is at most 63 bytes, so a longer text is no label */
@@ -4807,6 +4909,17 @@ static int enum_label(xctx *x, const sql_stmt *st, uint32_t eid, const char *txt
         lab[n++] = txt[i];
         if (txt[i] == '\'') i++;
     }
+    return enum_label_bytes(x, st, eid, lab, n, k, e);
+}
+
+/* F3g, N1b: a label's bytes (a string literal's once its quotes are read, or a TEXT parameter's as given) as a label of
+ * type eid at the statement's read point, as enum_label */
+static int enum_label_bytes(xctx *x, const sql_stmt *st, uint32_t eid, const char *lab, size_t n, int32_t *k, imdb_err *e)
+{
+    if (!x->db)
+        return imdb_fail(e, IMDB_ERR_INVALID, "a CHECK or a generated column reads no ENUM value yet: a later step (deferred.md D27)");
+    const imdb_enumdef *d = imdb_enum_def(x->db, eid);
+    if (!d) return imdb_fail(e, IMDB_ERR_STATE, "an ENUM value of no type");
     uint64_t snap, pend;
     if (snapshot_of(x, st, &snap, &pend, e)) return e->code;
     int ord = n <= IMDB_MAX_ENUM_LABEL ? imdb_enumdef_find(d, lab, n) : -1;
@@ -7297,7 +7410,7 @@ static int exec_join(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, im
             qspec *bq = late ? (side ? &j->post : &j->post0) : &q[side];
             uint16_t np = bq->np;
             rc = bind_pred(x, &st->where[i], col, late, bq, e);
-            if (rc && falls_back(&st->where[i], &t[side]->s.cols[col])) { /* a residual on the joined row */
+            if (rc && falls_back(x, &st->where[i], &t[side]->s.cols[col])) { /* a residual on the joined row */
                 bq->np = np;
                 x->fb[i] = true;
                 imdb_err_clear(e);

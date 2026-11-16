@@ -578,8 +578,14 @@ static void t_dec38_rules(void)
     imdb_dec_set(&pq[0], P64 * 5, true);
     imdb_err_clear(&g_e);
     static const char sel[] = "SELECT COUNT(*) FROM p WHERE k = $1";
-    CHECK(imdb_exec_one(&g_s, sel, sizeof sel - 1, pq, 1, &r, &g_e) != IMDB_OK ||
-          (imdb_result_free(&r), false)); /* a narrow column: 2^64 * 5 is past it, refused */
+    /* a narrow column: 2^64 * 5 is past its 18 digits, so (N1b) the parameter falls back to the tree's exact comparison,
+     * as its literal written out does: no row, never a key built from a cut value (it was refused before N1b) */
+    CHECK_OK(imdb_exec_one(&g_s, sel, sizeof sel - 1, pq, 1, &r, &g_e));
+    bool none = r.nrows == 1 && !r.cells[0].null && r.cells[0].v.i == 0 && !strstr(r.path, "primary key");
+    imdb_result_free(&r);
+    CHECK(none);
+    snprintf(want, sizeof want, "count\n0\n");
+    EXPECT("SELECT COUNT(*) FROM p WHERE k = 92233720368547758080", want);
     CHECK(verify_db(db) == 0);
     done(db);
     CHECK(audit_dir(dir) == 0);

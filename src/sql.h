@@ -152,8 +152,9 @@ uint64_t imdb_sql_fast_group_segments(void);
 void imdb_result_init(imdb_result *r);
 void imdb_result_free(imdb_result *r);
 
-/* Executes one statement (text may contain one trailing ';'). params are
- * bound to $1..$n with exact type matching. */
+/* Executes one statement (text may contain one trailing ';'). params are bound to $1..$n: one of its use's type as
+ * that type's value, one of another as the literal of its value would be (N1b: a NULL as NULL, a number exactly or not at
+ * all; design.md §5, An API parameter as the literal of its value), each checked against its own type's rules first. */
 int imdb_exec_one(imdb_session *s, const char *sql, size_t len, const imdb_value *params, uint32_t nparams,
                   imdb_result *res, imdb_err *e);
 /* P2 S9: a session's prepared statement by name, as PREPARE, EXECUTE and DEALLOCATE make, run and drop one: sql parsed
