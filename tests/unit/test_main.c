@@ -143,6 +143,7 @@ int main(int argc, char **argv)
         {"tz", tz_tests, &tz_ntests}, /* P2: time zones */
         {"tzsql", tzsql_tests, &tzsql_ntests}, /* P2: time zones through the engine */
         {"wire", wire_tests, &wire_ntests},    /* N1a: IMDBWIR1's codec */
+        {"conv", conv_tests, &conv_ntests},    /* N1b: results and parameters to and from the wire */
     };
     int failed = 0, run = 0;
     for (size_t g = 0; g < sizeof groups / sizeof *groups; g++) {

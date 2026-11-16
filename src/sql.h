@@ -108,6 +108,10 @@ typedef struct imdb_result {
     uint8_t ctype[IMDB_MAX_COLS + 4], cscale[IMDB_MAX_COLS + 4]; /* P2 S4: a SELECT's column types as its statement bound
                                                                 * them (0: not known), a nested SELECT's schema */
     uint16_t ceid[IMDB_MAX_COLS + 4];      /* F3g: an ENUM column's type id beside its ctype (0: another type) */
+    bool cwide[IMDB_MAX_COLS + 4];         /* N1b: the column a statement's top-level SUM (an aggregate's or a window's,
+                                            * through set operations): its cells hold 38 digits in an i128 whatever ctype
+                                            * says (ctype stays its column's: a nested SELECT's schema and a view's logged
+                                            * types read it), so the server sends an INT64 one as a DECIMAL */
     imdb_enumdef *clab[IMDB_MAX_COLS + 4]; /* F3g: the result a statement hands out: each ENUM column's labels, copied once
                                             * at its finish (res_labels), so the renderer reads no catalog and a result
                                             * outlives DDL; NULL elsewhere (imdb_result_free frees them) */
@@ -127,6 +131,9 @@ typedef struct imdb_result {
     bool show_identity;      /* the session asked to print it */
     bool has_rows;
     bool copy_out;           /* P2 S10: COPY ... TO STDOUT wrote its rows to the session's stream: status is its count alone */
+    bool has_count;          /* N1b: count is the rows a write wrote (INSERT, UPDATE, DELETE, COPY), its status's number;
+                              * otherwise the rows a result holds are nrows */
+    uint64_t count;
 } imdb_result;
 
 void imdb_session_init(imdb_session *s, imdb_db *db);

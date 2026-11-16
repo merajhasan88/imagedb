@@ -381,6 +381,7 @@ int imdb_value_check(const imdb_column *c, const imdb_value *v, imdb_err *e)
         return IMDB_OK;
     case IMDB_T_TEXT: {
         if (v->len > IMDB_MAX_TEXT) return imdb_fail(e, IMDB_ERR_LIMIT, "column %s: TEXT longer than %u bytes", c->name, IMDB_MAX_TEXT);
+        if (v->len && !v->s) return imdb_fail(e, IMDB_ERR_INVALID, "column %s: a TEXT without its bytes", c->name); /* as a BYTEA */
         size_t bad;
         if (v->len && !imdb_utf8_valid(v->s, v->len, &bad))
             return imdb_fail(e, IMDB_ERR_INVALID, "column %s: invalid UTF-8 at byte %zu", c->name, bad);

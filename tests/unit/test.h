@@ -119,5 +119,6 @@ TESTS(ice) /* F5c: the Iceberg v3 layer per copy */
 TESTS(tz) /* P2: time zones */
 TESTS(tzsql) /* P2: time zones through the engine */
 TESTS(wire)  /* N1a: IMDBWIR1, the server's own protocol (server/wire.c) */
+TESTS(conv)  /* N1b: the engine's results and parameters to and from the wire (server/conv.c) */
 
 #endif

@@ -415,7 +415,127 @@ static void t_prep_ceiling(void)
     done(db);
 }
 
+/* an API parameter's own value is held to its type's rules wherever it binds (N1b, found 2026-11-16: in a tree, a
+ * TEXT of invalid UTF-8 or with a NUL, a UUID of 3 bytes and a NaN were taken and handed back as cells): refused in
+ * every position, each type's good value taken in the same positions (so the refusals are the values'); and ERASE
+ * SUBJECT's parameter an integer or a string as its literal (a DECIMAL 7 or a BOOL erased nothing and reported done) */
+static void t_prep_param_values(void)
+{
+    imdb_db *db = open_fresh();
+    CHECK(db);
+    CHECK(run("CREATE TABLE pv (id INT64 PRIMARY KEY, who INT64 SUBJECT, s TEXT, u UUID)") == 0);
+    CHECK(run("INSERT INTO pv VALUES (1, 7, 'a', '00000000-0000-0000-0000-000000000001'), (2, 8, 'b', "
+              "'00000000-0000-0000-0000-000000000002')") == 0);
+    static const uint8_t uuid16[16] = {1};
+    static char big[IMDB_MAX_TEXT + 2];
+    memset(big, 'x', sizeof big);
+    enum { NB = 15 };
+    imdb_value bad[NB];
+    memset(bad, 0, sizeof bad);
+    const char *what[NB] = {"TEXT ff fe",      "TEXT with a NUL", "TEXT 65,536 bytes", "TEXT without its bytes",
+                            "UUID of 3 bytes", "UUID of 17",      "FLOAT64 NaN",       "FLOAT64 infinity",
+                            "FLOAT64 -0's key", "DECIMAL scale 39", "DECIMAL 10^38",    "BOOL 2",
+                            "TIMESTAMP past 9999", "DATE before 0001", "type 14"};
+    bad[0].type = IMDB_T_TEXT, bad[0].s = (const uint8_t *)"\xff\xfe", bad[0].len = 2;
+    bad[1].type = IMDB_T_TEXT, bad[1].s = (const uint8_t *)"a\0b", bad[1].len = 3;
+    bad[2].type = IMDB_T_TEXT, bad[2].s = (const uint8_t *)big, bad[2].len = IMDB_MAX_TEXT + 1;
+    bad[3].type = IMDB_T_TEXT, bad[3].len = 4;
+    bad[4].type = IMDB_T_UUID, bad[4].s = uuid16, bad[4].len = 3;
+    bad[5].type = IMDB_T_UUID, bad[5].s = (const uint8_t *)big, bad[5].len = 17;
+    bad[6].type = IMDB_T_FLOAT64, bad[6].i = imdb_f64_key(__builtin_nan(""));
+    bad[7].type = IMDB_T_FLOAT64, bad[7].i = imdb_f64_key(__builtin_inf());
+    bad[8].type = IMDB_T_FLOAT64, bad[8].i = -1;
+    bad[9].type = IMDB_T_DECIMAL, bad[9].scale = 39, bad[9].i = 1;
+    bad[10].type = IMDB_T_DECIMAL, imdb_dec_set(&bad[10], imdb_pow10_128(38), true);
+    bad[11].type = IMDB_T_BOOL, bad[11].i = 2;
+    bad[12].type = IMDB_T_TIMESTAMP, bad[12].i = INT64_MAX;
+    bad[13].type = IMDB_T_DATE, bad[13].i = IMDB_DATE_MIN - 1;
+    bad[14].type = 14;
+    imdb_value good[6];
+    memset(good, 0, sizeof good);
+    good[0].type = IMDB_T_TEXT, good[0].s = (const uint8_t *)"a", good[0].len = 1;
+    good[1].type = IMDB_T_UUID, good[1].s = uuid16, good[1].len = 16;
+    good[2].type = IMDB_T_FLOAT64, good[2].i = imdb_f64_key(1.5);
+    good[3].type = IMDB_T_DECIMAL, good[3].scale = 2, good[3].i = 150;
+    good[4].type = IMDB_T_BOOL, good[4].i = 1;
+    good[5].type = IMDB_T_DATE, good[5].i = 0;
+    static const char *const trees[] = {"SELECT $1 FROM pv", "SELECT id FROM pv WHERE ($1 IS NULL) = FALSE",
+                                        "SELECT COUNT(*) FROM pv WHERE CASE WHEN id = 1 THEN $1 ELSE $1 END IS NOT NULL",
+                                        "SELECT $1", "SELECT id FROM pv WHERE id IN (SELECT id FROM pv WHERE $1 IS NOT NULL)"};
+    bool fine = true;
+    for (size_t t = 0; t < sizeof trees / sizeof *trees; t++) {
+        for (int k = 0; k < NB; k++) {
+            imdb_result r;
+            imdb_err_clear(&g_e);
+            int rc = imdb_exec_one(&g_s, trees[t], strlen(trees[t]), &bad[k], 1, &r, &g_e);
+            if (!rc) {
+                imdb_result_free(&r);
+                fprintf(stderr, "    %s taken: %s\n", what[k], trees[t]);
+                fine = false;
+            } else if (rc != IMDB_ERR_INVALID) {
+                fprintf(stderr, "    %s: %s: %d %s\n", what[k], trees[t], rc, g_e.msg);
+                fine = false;
+            }
+        }
+        for (int k = 0; k < 6; k++) {
+            imdb_result r;
+            imdb_err_clear(&g_e);
+            if (imdb_exec_one(&g_s, trees[t], strlen(trees[t]), &good[k], 1, &r, &g_e)) {
+                fprintf(stderr, "    a good value of type %u refused: %s: %s\n", good[k].type, trees[t], g_e.msg);
+                fine = false;
+            } else {
+                imdb_result_free(&r);
+            }
+        }
+    }
+    /* the column positions refused them before: still */
+    static const char *const cols[] = {"SELECT id FROM pv WHERE s = $1", "SELECT id FROM pv WHERE u = $1",
+                                       "INSERT INTO pv (id, who, s) VALUES (9, 9, $1)"};
+    for (size_t t = 0; t < sizeof cols / sizeof *cols; t++)
+        for (int k = 0; k < 6; k++) {
+            imdb_result r;
+            imdb_err_clear(&g_e);
+            if (!imdb_exec_one(&g_s, cols[t], strlen(cols[t]), &bad[k], 1, &r, &g_e)) {
+                imdb_result_free(&r);
+                fprintf(stderr, "    %s taken: %s\n", what[k], cols[t]);
+                fine = false;
+            }
+        }
+    /* ERASE SUBJECT: an integer or a string; each refusal erases nothing */
+    imdb_value subj[5];
+    memset(subj, 0, sizeof subj);
+    subj[0].type = IMDB_T_DECIMAL, subj[0].i = 7;
+    subj[1].type = IMDB_T_BOOL, subj[1].i = 1;
+    subj[2].type = IMDB_T_FLOAT64, subj[2].i = imdb_f64_key(7.0);
+    subj[3].type = IMDB_T_INT64, subj[3].null = true;
+    subj[4].type = IMDB_T_TEXT, subj[4].null = true;
+    uint64_t seq = db->seq;
+    for (int k = 0; k < 5; k++) {
+        imdb_result r;
+        imdb_err_clear(&g_e);
+        int rc = imdb_exec_one(&g_s, "ERASE SUBJECT $1", 16, &subj[k], 1, &r, &g_e);
+        if (rc != IMDB_ERR_INVALID) {
+            if (!rc) imdb_result_free(&r);
+            fprintf(stderr, "    ERASE SUBJECT $1 of type %u%s: %d\n", subj[k].type, subj[k].null ? " NULL" : "", rc);
+            fine = false;
+        }
+    }
+    if (db->seq != seq) fine = false, fprintf(stderr, "    a refused ERASE committed\n");
+    EXPECT("SELECT id FROM pv ORDER BY id", "id\n1\n2\n");
+    imdb_value seven;
+    memset(&seven, 0, sizeof seven);
+    seven.type = IMDB_T_INT64, seven.i = 7;
+    imdb_result r;
+    imdb_err_clear(&g_e);
+    if (imdb_exec_one(&g_s, "ERASE SUBJECT $1", 16, &seven, 1, &r, &g_e)) fine = false, fprintf(stderr, "    ERASE 7: %s\n", g_e.msg);
+    else imdb_result_free(&r);
+    EXPECT("SELECT id FROM pv ORDER BY id", "id\n2\n");
+    SOFT(fine);
+    done(db);
+}
+
 const test_case prep_tests[] = {
+    {"prep_param_values", t_prep_param_values},
     {"prep_forms", t_prep_forms},
     {"prep_writes", t_prep_writes},
     {"prep_rules", t_prep_rules},

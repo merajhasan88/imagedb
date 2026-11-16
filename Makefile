@@ -49,7 +49,7 @@ BIN     = $(BUILD)/imagedb
 
 TSRC    = $(wildcard tests/unit/*.c)
 TOBJ    = $(TSRC:tests/unit/%.c=$(BUILD)/tobj/%.o) $(BUILD)/tobj/acrypto.o $(BUILD)/tobj/afsum.o $(BUILD)/tobj/abind.o \
-          $(BUILD)/tobj/apq.o $(BUILD)/tobj/aice.o $(BUILD)/tobj/wire.o
+          $(BUILD)/tobj/apq.o $(BUILD)/tobj/aice.o $(BUILD)/tobj/wire.o $(BUILD)/tobj/conv.o
 TBIN    = $(BUILD)/test_unit
 
 .PHONY: all lint test unit san tsan ct fuzz fuzz-run bench whole index-sum mem-split join-cost workload clean integration faults soak oracle install uninstall parquet-check iceberg-check
@@ -125,6 +125,10 @@ $(BUILD)/tobj/aice.o: tools/audit/aice.c tools/audit/aice.h | $(BUILD)/tobj
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # N1a: the server's protocol (server/wire.c, outside src/: the engine's library links no network code)
+# N1b: the engine's results and parameters to and from the wire (server/conv.c)
+$(BUILD)/tobj/conv.o: server/conv.c server/conv.h server/wire.h $(HDR) | $(BUILD)/tobj
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(BUILD)/tobj/wire.o: server/wire.c server/wire.h $(HDR) | $(BUILD)/tobj
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -392,7 +396,7 @@ TSAN_FLAGS = -std=c11 -D_GNU_SOURCE -g -O1 -ffp-contract=off -fsanitize=thread -
 tsan:
 	mkdir -p build-tsan
 	clang $(TSAN_FLAGS) $(filter-out src/main.c,$(wildcard src/*.c)) $(wildcard src/vendor/monocypher/*.c) \
-	  $(TSRC) tools/audit/acrypto.c tools/audit/afsum.c tools/audit/abind.c tools/audit/apq.c tools/audit/aice.c server/wire.c -o build-tsan/test_unit -lcrypto
+	  $(TSRC) tools/audit/acrypto.c tools/audit/afsum.c tools/audit/abind.c tools/audit/apq.c tools/audit/aice.c server/wire.c server/conv.c -o build-tsan/test_unit -lcrypto
 	clang $(TSAN_FLAGS) tests/unit/t_pool.c tests/tsan/pool_main.c src/pool.c $(KERNEL_SRC) \
 	  src/util.c src/fsio.c -o build-tsan/pool_test
 	$(SANRUN) build-tsan/pool_test

@@ -126,6 +126,7 @@ typedef struct imdbw_buf {
     uint8_t *p;
     size_t len, cap;
     bool err;     /* an allocation failed, a limit was passed or a field its decoder refuses was given: send nothing */
+    bool nomem;   /* of those, an allocation (out of memory, not a limit or a field: N1b's conversion says which) */
 } imdbw_buf;
 void imdbw_buf_init(imdbw_buf *b);
 void imdbw_buf_free(imdbw_buf *b);

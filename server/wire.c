@@ -73,7 +73,7 @@ void imdbw_buf_free(imdbw_buf *b)
 void imdbw_buf_reset(imdbw_buf *b)
 {
     b->len = 0;
-    b->err = false;
+    b->err = b->nomem = false;
 }
 
 static bool reserve(imdbw_buf *b, size_t n)
@@ -88,7 +88,7 @@ static bool reserve(imdbw_buf *b, size_t n)
     while (cap < b->len + n) cap *= 2;
     uint8_t *p = imdbw_alloc(cap, 1); /* never grown in place (CLAUDE.md): a new block, the bytes copied */
     if (!p) {
-        b->err = true;
+        b->err = b->nomem = true;
         return false;
     }
     if (b->len) memcpy(p, b->p, b->len);

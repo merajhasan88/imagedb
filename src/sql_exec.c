@@ -511,6 +511,31 @@ static int enum_label(xctx *x, const sql_stmt *st, uint32_t eid, const char *txt
 static int enum_named(xctx *x, const sql_stmt *st, const char *name, uint16_t *eid, imdb_err *e);
 static int enum_ord(xctx *x, const sql_stmt *st, uint32_t eid, int64_t ord, imdb_err *e);
 
+/* an API parameter's own value within its type's rules, asked wherever a parameter binds before anything reads it as its
+ * type: a caller's bytes (the wire's decoder checks the same; an embedded caller is not held to it otherwise, and a
+ * parameter in a tree reached no column check): a type the engine has (a NULL may have none), a DECIMAL within 38
+ * digits and places in its own form (a narrow one's high half 0: imdb_value_check's tripwire), the rest by the codec's
+ * own check against a column of the parameter's type (a TEXT strict UTF-8 without NUL, a UUID 16 bytes, a FLOAT64
+ * finite, each range); an ENUM's ordinal is its caller's (enum_ord, at the statement's read point) */
+static bool param_value_ok(const imdb_value *pv)
+{
+    if (pv->null) return pv->type <= IMDB_T_LAST;
+    if (pv->type < IMDB_T_INT64 || pv->type > IMDB_T_LAST) return false;
+    if (pv->type == IMDB_T_DECIMAL) {
+        __int128 lim = imdb_pow10_128(IMDB_DEC_MAX_DIGITS), v;
+        if (pv->scale > IMDB_DEC_MAX_DIGITS || (!pv->wide && pv->hi)) return false;
+        v = imdb_dec_value(pv);
+        return v < lim && v > -lim;
+    }
+    if (pv->type == IMDB_T_ENUM) return true;
+    imdb_column c;
+    memset(&c, 0, sizeof c);
+    c.type = pv->type;
+    c.flags = IMDB_COL_NULLABLE;
+    imdb_err ignored = {0};
+    return imdb_value_check(&c, pv, &ignored) == IMDB_OK;
+}
+
 static int bind_lit(xctx *x, const sql_lit *l, const imdb_column *c, bool compare, imdb_value *out, imdb_err *e)
 {
     memset(out, 0, sizeof *out);
@@ -721,10 +746,7 @@ static int bind_xlit(xctx *x, const sql_lit *l, imdb_xval *v, imdb_err *e)
     if (l->kind == LIT_PARAM) {
         if (l->param > x->nparams) return imdb_fail(e, IMDB_ERR_INVALID, "parameter $%u was not supplied", (unsigned)l->param);
         const imdb_value *pv = &x->params[l->param - 1];
-        if (pv->type < IMDB_T_INT64 || pv->type > IMDB_T_LAST ||
-            (pv->type == IMDB_T_DECIMAL && !pv->null &&
-             (pv->scale > IMDB_DEC_MAX_DIGITS || imdb_dec_value(pv) >= imdb_pow10_128(IMDB_DEC_MAX_DIGITS) ||
-              imdb_dec_value(pv) <= -imdb_pow10_128(IMDB_DEC_MAX_DIGITS))) || /* F3e: to 38 digits, either form */
+        if (pv->type < IMDB_T_INT64 || !param_value_ok(pv) || /* a NULL of no type has none here; the value its type's */
             (pv->type == IMDB_T_ENUM && !pv->null && (!x->db || enum_ord(x, x->st, pv->eid, pv->i, e)))) /* F3g: a label of a type */
             return imdb_fail(e, IMDB_ERR_INVALID, "parameter $%u: not a value of a column type", (unsigned)l->param);
         imdb_x_from_value(pv, v); /* a NULL keeps its type: NULL + 1 is NULL */
@@ -4430,6 +4452,10 @@ static void col_types(const xctx *x, const sql_stmt *st, const sink *k, const im
         r->ctype[i] = ty;
         r->cscale[i] = sc;
         r->ceid[i] = ty == IMDB_T_ENUM ? ei : 0;
+        /* N1b: a SUM, plain or a tree whose root is one (DISTINCT, FILTER), holds 38 digits in an i128; a tree over a SUM
+         * is held to its type (an overflow is an error), a window's SUM is exec_window's */
+        r->cwide[i] = !st->star && (st->items[i].expr ? st->ex[st->items[i].expr].op == EX_AGG && st->ex[st->items[i].expr].agg == AGG_SUM
+                                                     : st->items[i].agg == AGG_SUM);
     }
 }
 
@@ -7505,6 +7531,7 @@ static int setop_fold(xctx *x, uint8_t op, const imdb_result *acc, const imdb_re
         out->ctype[c] = u[c].type;
         out->cscale[c] = u[c].scale;
         out->ceid[c] = u[c].eid;
+        out->cwide[c] = acc->cwide[c] || b->cwide[c]; /* N1b: one arm's SUM makes the column's */
     }
     bool all = op & SQL_SET_ALL;
     uint8_t o = op & (uint8_t)~SQL_SET_ALL;
@@ -7678,6 +7705,7 @@ static int exec_setop(xctx *x, const sql_stmt *st, imdb_result *r, struct xplain
             memcpy(x->probe_r->ctype, acc.ctype, sizeof acc.ctype);
             memcpy(x->probe_r->cscale, acc.cscale, sizeof acc.cscale);
             memcpy(x->probe_r->ceid, acc.ceid, sizeof acc.ceid); /* F3g */
+            memcpy(x->probe_r->cwide, acc.cwide, sizeof acc.cwide); /* N1b */
         }
         imdb_result_free(&acc);
         return IMDB_OK;
@@ -7741,6 +7769,7 @@ static void rec_open(imdb_result *r, const imdb_result *like, uint64_t cap)
         r->ctype[c] = like->ctype[c];
         r->cscale[c] = like->cscale[c];
         r->ceid[c] = like->ceid[c];
+        r->cwide[c] = like->cwide[c]; /* N1b */
     }
 }
 
@@ -8307,7 +8336,10 @@ static int exec_window(xctx *x, const sql_stmt *st, imdb_result *r, struct xplai
             r->ctype[i] = R.ctype[i];
             r->cscale[i] = R.cscale[i];
             r->ceid[i] = R.ceid[i];
+            r->cwide[i] = R.cwide[i];
         }
+        for (uint8_t q = 0; q < nwi; q++) /* N1b: a window's SUM holds its total in an i128, as an aggregate's */
+            if (st->ex[wi[q].node].fn == WF_AGG && st->ex[wi[q].node].agg == AGG_SUM) r->cwide[wi[q].item] = true;
     }
     imdb_hmap seen;
     memset(&seen, 0, sizeof seen);
@@ -8858,7 +8890,10 @@ static int insert_query(xctx *x, const sql_stmt *st, imdb_table *t, const int *m
         }
         if (write_row(x, st, t, vals, u, r, &e2)) rc = imdb_fail(e, e2.code, "row %llu: %s", (unsigned long long)(row + 1), e2.msg);
     }
-    if (!rc) snprintf(r->status, sizeof r->status, "INSERT %llu", (unsigned long long)u->written);
+    if (!rc) {
+        snprintf(r->status, sizeof r->status, "INSERT %llu", (unsigned long long)u->written);
+        r->count = u->written, r->has_count = true; /* N1b: DONE's count */
+    }
     if (!rc && st->returning) rc = res_finish(r, e);
     imdb_result_free(&q);
     return rc;
@@ -8978,6 +9013,7 @@ static int exec_insert(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
         if (write_row(x, st, t, vals, &u, r, &e2)) return imdb_fail(e, e2.code, "row %u: %s", row + 1, e2.msg); /* P2 S8 */
     }
     snprintf(r->status, sizeof r->status, "INSERT %llu", (unsigned long long)u.written);
+    r->count = u.written, r->has_count = true; /* N1b: DONE's count */
     return st->returning ? res_finish(r, e) : IMDB_OK;
 }
 
@@ -9202,7 +9238,10 @@ static int exec_copy_from(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err 
         rc = imdb_fail(e, code, "%s", m);
     }
     imdb_csv_free(&c);
-    if (!rc) snprintf(r->status, sizeof r->status, "COPY %llu", (unsigned long long)done);
+    if (!rc) {
+        snprintf(r->status, sizeof r->status, "COPY %llu", (unsigned long long)done);
+        r->count = done, r->has_count = true; /* N1b: DONE's count */
+    }
     return rc;
 }
 
@@ -9329,6 +9368,7 @@ static int copy_to_table(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *
     if (!rc) rc = out_flush(&o, e);
     if (!rc) {
         snprintf(r->status, sizeof r->status, "COPY %llu", (unsigned long long)k.crows);
+        r->count = k.crows, r->has_count = true; /* N1b: DONE's count */
         r->copy_out = true;
     }
 done:
@@ -9376,6 +9416,7 @@ static int exec_copy_to(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e
     if (!rc) rc = out_flush(&o, e);
     if (!rc) {
         snprintf(r->status, sizeof r->status, "COPY %llu", (unsigned long long)res.nrows);
+        r->count = res.nrows, r->has_count = true; /* N1b: DONE's count */
         r->copy_out = true;
     }
 done:
@@ -9540,6 +9581,7 @@ static int exec_join_write(xctx *x, const sql_stmt *st, bool upd, imdb_result *r
     imdb_free(pr);
     if (!rc) {
         snprintf(r->status, sizeof r->status, "%s %llu", upd ? "UPDATE" : "DELETE", (unsigned long long)n);
+        r->count = n, r->has_count = true; /* N1b: DONE's count */
         snprintf(r->path, sizeof r->path, "%s", q.path); /* how the pairs were found */
     }
     if (!rc && st->returning) rc = res_finish(r, e);
@@ -9606,7 +9648,10 @@ static int exec_update(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, 
         imdb_xarena_reset(&x->arena, m);
     }
     imdb_free(vids);
-    if (!rc) snprintf(r->status, sizeof r->status, "UPDATE %llu", (unsigned long long)n);
+    if (!rc) {
+        snprintf(r->status, sizeof r->status, "UPDATE %llu", (unsigned long long)n);
+        r->count = n, r->has_count = true; /* N1b: DONE's count */
+    }
     if (!rc) snprintf(r->path, sizeof r->path, "%s", x->vpath); /* P1 Q1: how the rows were found */
     if (!rc && st->returning) rc = res_finish(r, e); /* P2 S8 */
     return rc;
@@ -9750,7 +9795,10 @@ static int exec_delete(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, 
         rc = fk_delete(x, t, vids[i], e); /* F2b-2: its FOREIGN KEYs' actions too */
     }
     imdb_free(vids);
-    if (!rc) snprintf(r->status, sizeof r->status, "DELETE %llu", (unsigned long long)n);
+    if (!rc) {
+        snprintf(r->status, sizeof r->status, "DELETE %llu", (unsigned long long)n);
+        r->count = n, r->has_count = true; /* N1b: DONE's count */
+    }
     if (!rc) snprintf(r->path, sizeof r->path, "%s", x->vpath); /* P1 Q1: how the rows were found */
     if (!rc && st->returning) rc = res_finish(r, e); /* P2 S8 */
     return rc;
@@ -11169,6 +11217,12 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
             imdb_column c = {.type = IMDB_T_INT64};
             strcpy(c.name, "subject");
             rc = bind_lit(&x, &st->subject, &c, true, &v, e);
+        } else if (st->subject.kind == LIT_PARAM && params && st->subject.param <= nparams &&
+                   ((params[st->subject.param - 1].type != IMDB_T_INT64 && params[st->subject.param - 1].type != IMDB_T_TEXT) ||
+                    params[st->subject.param - 1].null)) {
+            /* an erasure's subject is an integer or a string, as its literal must be: a parameter of another type (a
+             * DECIMAL 7, a BOOL) or a NULL refused before anything binds, never an erasure of nothing reported done */
+            rc = imdb_fail(e, IMDB_ERR_INVALID, "ERASE SUBJECT takes an integer or a string");
         } else if (st->subject.kind == LIT_STR || st->subject.kind == LIT_PARAM) {
             imdb_column c = {.type = st->subject.kind == LIT_STR ? IMDB_T_TEXT : (uint8_t)(params && st->subject.param <= nparams ? params[st->subject.param - 1].type : IMDB_T_TEXT)};
             strcpy(c.name, "subject");
@@ -11523,6 +11577,8 @@ int imdb_prepare(imdb_session *s, const char *name, const char *sql, size_t len,
     return prep_add(s, name, sql, len, NULL, 0, e);
 }
 
+static void cwide_check(const imdb_result *r); /* N1b: below, beside imdb_exec_one */
+
 int imdb_execute(imdb_session *s, const char *name, const imdb_value *params, uint32_t nparams, imdb_result *res, imdb_err *e)
 {
     prep_entry *p = prep_find(s, name);
@@ -11534,7 +11590,7 @@ int imdb_execute(imdb_session *s, const char *name, const imdb_value *params, ui
     imdb_result_init(res);
     res->byte_cap = workspace_of(s);
     int rc = exec_stmt_body(s, p->st, false, p->sql, p->len, params, nparams, p->name, res, e);
-    if (!rc) p->uses++; /* runs that ran to their end */
+    if (!rc) p->uses++, cwide_check(res); /* runs that ran to their end */
     imdb_op_leave(s->db);
     return rc;
 }
@@ -11549,12 +11605,29 @@ int imdb_deallocate(imdb_session *s, const char *name, imdb_err *e)
 
 /* One operation (stage 3c-1): the segment cache trims when the outermost ends, so a statement's result holds no
  * pointer into a segment's image (res_put copies TEXT). */
+/* N1b: a wide INT64 cell (a SUM's total in an i128) only in a column marked cwide: the server types a column from the
+ * mark, never from its cells, so a wide cell outside one could not be sent; the checked builds stop at every statement
+ * the suite, the fuzz harnesses and the oracle run */
+static void cwide_check(const imdb_result *r)
+{
+#ifdef IMDB_STORE_CHECKS
+    for (uint16_t c = 0; c < r->ncols && c < IMDB_MAX_COLS + 4; c++)
+        for (uint64_t i = 0; i < r->nrows; i++) {
+            const imdb_cell *cl = &r->cells[i * r->ncols + c];
+            if (cl->wide && cl->v.type == IMDB_T_INT64 && !r->cwide[c]) abort();
+        }
+#else
+    (void)r;
+#endif
+}
+
 int imdb_exec_one(imdb_session *ss, const char *sql, size_t len, const imdb_value *params, uint32_t nparams,
                   imdb_result *r, imdb_err *e)
 {
     imdb_db *db = ss->db;
     imdb_op_enter(db);
     int rc = exec_one_body(ss, sql, len, params, nparams, r, e);
+    if (!rc) cwide_check(r);
     imdb_op_leave(db);
     return rc;
 }
