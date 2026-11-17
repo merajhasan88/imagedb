@@ -51,7 +51,7 @@ SERVER  = $(BUILD)/imagedb-server
 TSRC    = $(wildcard tests/unit/*.c)
 TOBJ    = $(TSRC:tests/unit/%.c=$(BUILD)/tobj/%.o) $(BUILD)/tobj/acrypto.o $(BUILD)/tobj/afsum.o $(BUILD)/tobj/abind.o \
           $(BUILD)/tobj/apq.o $(BUILD)/tobj/aice.o $(BUILD)/tobj/wire.o $(BUILD)/tobj/conv.o $(BUILD)/tobj/srv.o \
-          $(BUILD)/tobj/client.o $(BUILD)/tobj/tls.o
+          $(BUILD)/tobj/client.o $(BUILD)/tobj/tls.o $(BUILD)/tobj/spool.o
 TBIN    = $(BUILD)/test_unit
 
 .PHONY: all server lint test unit san tsan ct fuzz fuzz-run bench whole index-sum mem-split join-cost workload clean integration faults soak oracle install uninstall parquet-check iceberg-check
@@ -136,18 +136,22 @@ $(BUILD)/tobj/conv.o: server/conv.c server/conv.h server/wire.h $(HDR) | $(BUILD
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # N1b: the server (server/srv.c: the engine thread, connections, authentication) and the C client (client/)
-$(BUILD)/tobj/srv.o: server/srv.c server/srv.h server/conv.h server/wire.h server/tls.h $(HDR) | $(BUILD)/tobj
+$(BUILD)/tobj/srv.o: server/srv.c server/srv.h server/conv.h server/wire.h server/tls.h server/spool.h $(HDR) | $(BUILD)/tobj
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/tobj/client.o: client/client.c client/imagedb_client.h server/wire.h server/tls.h $(HDR) | $(BUILD)/tobj
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# N1d: COPY's spool files (server/spool.c, the one file of the server making its own file system calls)
+$(BUILD)/tobj/spool.o: server/spool.c server/spool.h server/wire.h $(HDR) | $(BUILD)/tobj
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # N1c: TLS 1.3 (server/tls.c, the one file of the server and the client that includes OpenSSL's headers)
 $(BUILD)/tobj/tls.o: server/tls.c server/tls.h server/wire.h $(HDR) | $(BUILD)/tobj
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(SERVER): server/main.c server/srv.h $(BUILD)/tobj/srv.o $(BUILD)/tobj/conv.o $(BUILD)/tobj/wire.o $(BUILD)/tobj/tls.o $(LIB)
-	$(CC) $(CFLAGS) server/main.c $(BUILD)/tobj/srv.o $(BUILD)/tobj/conv.o $(BUILD)/tobj/wire.o $(BUILD)/tobj/tls.o $(LIB) -o $@ \
+$(SERVER): server/main.c server/srv.h $(BUILD)/tobj/srv.o $(BUILD)/tobj/conv.o $(BUILD)/tobj/wire.o $(BUILD)/tobj/tls.o $(BUILD)/tobj/spool.o $(LIB)
+	$(CC) $(CFLAGS) server/main.c $(BUILD)/tobj/srv.o $(BUILD)/tobj/conv.o $(BUILD)/tobj/wire.o $(BUILD)/tobj/tls.o $(BUILD)/tobj/spool.o $(LIB) -o $@ \
 	  $(LDFLAGS) -lssl -lcrypto
 
 $(BUILD)/tobj/wire.o: server/wire.c server/wire.h $(HDR) | $(BUILD)/tobj
@@ -421,9 +425,9 @@ TSAN_FLAGS = -std=c11 -D_GNU_SOURCE -g -O1 -ffp-contract=off -fsanitize=thread -
 tsan:
 	mkdir -p build-tsan
 	clang $(TSAN_FLAGS) $(filter-out src/main.c,$(wildcard src/*.c)) $(wildcard src/vendor/monocypher/*.c) \
-	  $(TSRC) tools/audit/acrypto.c tools/audit/afsum.c tools/audit/abind.c tools/audit/apq.c tools/audit/aice.c server/wire.c server/conv.c server/srv.c server/tls.c client/client.c -o build-tsan/test_unit -lssl -lcrypto
+	  $(TSRC) tools/audit/acrypto.c tools/audit/afsum.c tools/audit/abind.c tools/audit/apq.c tools/audit/aice.c server/wire.c server/conv.c server/srv.c server/tls.c server/spool.c client/client.c -o build-tsan/test_unit -lssl -lcrypto
 	clang $(TSAN_FLAGS) $(filter-out src/main.c,$(wildcard src/*.c)) $(wildcard src/vendor/monocypher/*.c) \
-	  server/main.c server/srv.c server/conv.c server/wire.c server/tls.c -o build-tsan/imagedb-server -lssl -lcrypto # N1b: t_server runs it
+	  server/main.c server/srv.c server/conv.c server/wire.c server/tls.c server/spool.c -o build-tsan/imagedb-server -lssl -lcrypto # N1b: t_server runs it
 	clang $(TSAN_FLAGS) tests/unit/t_pool.c tests/tsan/pool_main.c src/pool.c $(KERNEL_SRC) \
 	  src/util.c src/fsio.c -o build-tsan/pool_test
 	$(SANRUN) build-tsan/pool_test

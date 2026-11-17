@@ -32,6 +32,17 @@ typedef struct imdbs_opts {
     uint32_t preauth_per_addr; /* TCP connections authenticating at once from one address (0: 8); twice it may wait */
     uint32_t socket_reserve;   /* connections TCP leaves to the socket (0: 16, at most half max_conns); the socket's
                                 * pre-auth pool is its own (preauth_max each), so the network never starves it */
+    /* N1d: COPY through the server (docs/n1-design.md §8d): spooled, so the engine thread never waits on a client's
+     * network. spool_dir (NULL: server_dir's spool/; neither: COPY refused by name) holds the nameless spool files;
+     * copy_spool bounds every spool's bytes held at once (0: 4 GiB): a COPY FROM whose data passes it fails at once
+     * (LIMIT), the rest of its data read and dropped; copy_ring bounds one COPY TO's output held before its client takes
+     * it (0: 256 MiB): past it the engine thread waits for room, at most copy_wait_ms in all for one COPY TO (0: 60,000)
+     * before it fails (LIMIT); copy_idle_ms: a COPY's data arriving at none for this long ends the connection (0: 30,000) */
+    const char *spool_dir;
+    uint64_t copy_spool;
+    uint64_t copy_ring;
+    uint32_t copy_wait_ms;
+    uint32_t copy_idle_ms;
 } imdbs_opts;
 
 typedef struct imdbs imdbs;
@@ -72,10 +83,19 @@ typedef struct imdbs_counts {
                             * sends and waits for it to move (never a clock, never a gauge a late clear makes stale) */
     uint64_t tcp_authing;  /* N1c gauges: TCP connections authenticating now (holding a slot of their address and pool) */
     uint64_t tcp_waiting;  /* and those waiting for one */
+    uint64_t copy_in;      /* N1d: COPY ... FROM STDIN statements run from their spool */
+    uint64_t copy_out;     /* COPY ... TO STDOUT statements that wrote output to their ring */
+    uint64_t copy_limits;  /* COPYs failed by a bound (copy_spool, copy_wait_ms) */
+    uint64_t copy_waits;   /* times the engine thread waited for a COPY TO's ring to have room */
+    uint64_t copy_idle;    /* connections ended for a COPY's data arriving at none past copy_idle_ms */
+    uint64_t spool_held;   /* gauge: every spool's bytes held now */
+    uint64_t ticks;        /* the engine thread's ticks run (timeouts, maintenance): on their clock under any load */
 } imdbs_counts;
 void imdbs_counts_get(imdbs *s, imdbs_counts *c);
 /* N1c: the TCP port listened on (0: none), an ephemeral one's number; cert_days: server.crt's whole days left */
 uint16_t imdbs_tcp_port(const imdbs *s);
 int imdbs_cert_days(const imdbs *s);
+/* N1d, tests: each COPY TO write of a statement but its first waits ms first (0: none): output that comes slowly */
+void imdbs_test_copy_hold(uint32_t ms);
 
 #endif

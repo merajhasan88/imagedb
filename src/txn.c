@@ -526,7 +526,7 @@ bool imdb_txn_expired(const imdb_txn *x, uint64_t now_ns, char *why, size_t n)
         snprintf(why, n, "transaction timeout: it ran past %u ms (SET transaction_timeout)", x->timeout_ms);
         return true;
     }
-    if (x->idle_ms && now_ns - x->last_ns > (uint64_t)x->idle_ms * 1000000u) {
+    if (x->idle_ms && !x->busy && now_ns - x->last_ns > (uint64_t)x->idle_ms * 1000000u) {
         snprintf(why, n, "idle in transaction for more than %u ms (SET idle_in_transaction_timeout)", x->idle_ms);
         return true;
     }

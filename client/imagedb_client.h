@@ -41,6 +41,11 @@ int imdbc_prepare(imdbc *c, const char *name, const char *sql, size_t len, imdb_
 int imdbc_execute(imdbc *c, const char *name, const imdbw_value *vals, uint32_t nsets, uint16_t nvals, imdb_err *e);
 int imdbc_deallocate(imdbc *c, const char *name, imdb_err *e);
 int imdbc_ping(imdbc *c, imdb_err *e);
+/* N1d: after a COPY_IN reply, COPY ... FROM STDIN's data (cut into frames of at most 1 MiB), then its end, or its failure
+ * (the statement refused unrun, the reason in its ERROR); a COPY TO's bytes arrive as COPY_OUT replies (imdbc_next) */
+int imdbc_copy_data(imdbc *c, const void *p, size_t n, imdb_err *e);
+int imdbc_copy_done(imdbc *c, imdb_err *e);
+int imdbc_copy_fail(imdbc *c, const char *reason, imdb_err *e);
 /* TERMINATE: the server ends the session (an open transaction rolled back) once the requests before it ran */
 int imdbc_terminate(imdbc *c, imdb_err *e);
 /* the statement running for this connection, cancelled: any thread (a flag and a wake-up; the reader sends CANCEL) */

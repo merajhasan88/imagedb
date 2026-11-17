@@ -894,6 +894,8 @@ typedef struct imdb_txn {
     uint64_t begin_ns, last_ns; /* R4: its BEGIN and the end of its last statement (CLOCK_MONOTONIC) */
     uint64_t begin_us;          /* F2a: its BEGIN by imdb's clock (imdb_now_us): now() and the other clock values in it */
     uint32_t timeout_ms, idle_ms; /* SET transaction_timeout and idle_in_transaction_timeout at its BEGIN (0: none) */
+    bool busy;                 /* N1d: its session's statement is under way outside the engine (a COPY's data arriving through
+                                * the server): never idle (idle_ms), its age (timeout_ms) still counted */
     uint32_t *seqs;            /* F2a-2: its sequences nextval touched, while it is not active (db->txseq when it is) */
     uint32_t nseqs;
     uint32_t rd[IMDB_MAX_TABLES / 32]; /* E3: SERIALIZABLE, the tables it read (by id; never shrunk: ROLLBACK TO keeps it) */

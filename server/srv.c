@@ -32,9 +32,15 @@
 #include "../src/scram.h"
 #include "../src/sql.h"
 #include "conv.h"
+#include "spool.h"
 #include "tls.h"
 
 #define RQ_CLOSE 0u               /* a request that is no frame: the connection's end, its session closed */
+#define COPY_FRAME (1u << 20)     /* N1d: a COPY_OUT frame's bytes at most */
+/* N1d: a COPY ... FROM STDIN's data, as its connection's thread takes it (docs/n1-design.md §8d) */
+#define CIN_NONE 0u               /* no COPY's data expected */
+#define CIN_OPEN 1u               /* its request paused at the COPY, COPY_IN sent: the data arrives into the spool */
+#define CIN_DISCARD 2u            /* the COPY answered (refused part way): its frames dropped to the client's end */
 #define FLUSH_AT (64u << 10)      /* the engine hands a connection its frames once this many are encoded */
 #define ROWS_TARGET (64u << 10)   /* a ROWS frame cut at a row's end once past this */
 #define QBYTES_MAX (64ull << 20)  /* a connection's queued request bytes before its socket is read again */
@@ -51,10 +57,21 @@ typedef struct logins {
     login e[];
 } logins;
 
+/* N1d: a COPY TO's ring (a spool file of at most copy_ring bytes, wrapping): the engine thread writes at w, the
+ * connection's thread takes from r (both counted from the statement's start, the file at their remainder by size), done
+ * once the statement ended; w - r its bytes held, counted in imdbs.spool_held */
+typedef struct cring {
+    struct cring *next;
+    imdbsp *sp;
+    uint64_t size, w, r;
+    bool done;
+} cring;
+
 typedef struct outbuf { /* whole frames, sent in order */
     struct outbuf *next;
     uint8_t *p;
     size_t len, off;
+    cring *ring;         /* N1d: no frame but a COPY TO's place: its ring's bytes go out here as COPY_OUT frames */
 } outbuf;
 
 typedef struct conn conn;
@@ -95,6 +112,24 @@ struct conn {
     bool rd_wants_write, wr_wants_read; /* TLS: a read that needs the socket writable, a write that needs it readable */
     char addr[48];       /* N1c: a TCP peer's address, for the per-address cap on authenticating connections */
     imdb_session ses;    /* the engine thread's alone (imdb_session_cancel: any thread) */
+    /* N1d: COPY FROM's spool (under imdbs.mu but the file's bytes): its connection's thread owns it while the data
+     * arrives (cin OPEN, no end), writing at in_len; at the client's COPY_DONE it is the engine thread's, read from in_rd
+     * by the statement; one the engine never took is freed by the connection's thread at its end */
+    uint8_t cin;
+    bool cin_end;        /* the client's COPY_DONE or COPY_FAIL arrived */
+    int32_t cin_err;     /* the COPY refused before it runs (an IMDB_ERR_*: the bound, the spool, a CANCEL, COPY_FAIL) */
+    char cin_msg[IMDBW_MESSAGE_MAX + 1];
+    imdbsp *sp_in;
+    uint64_t in_len, in_rd;
+    uint64_t cin_last;   /* the last of its frames (copy_idle_ms) */
+    struct cring *rings; /* N1d: its COPY TO rings (under mu): each freed once drained, or by its thread at its end */
+    /* the engine thread's alone: */
+    bool cin_run;        /* the running statement is a COPY FROM reading its spool */
+    struct cring *ring;  /* the running statement's COPY TO ring (made at its first write) */
+    int32_t out_err;     /* a COPY TO's write refused (the wait's bound: LIMIT; the spool: IO; a spool directory: STATE) */
+    uint64_t out_waited; /* the running statement's waits for room so far (ns): copy_wait_ms bounds their sum */
+    char out_msg[sizeof(((imdb_err *)0)->msg)];
+    imdbw_buf *run_b;    /* the running request's frames not yet handed over (a COPY TO's ring is queued after them) */
 };
 
 struct imdbs {
@@ -124,6 +159,8 @@ struct imdbs {
     pthread_mutex_t lmu;
     logins *lg;          /* NULL: no one may log in (the logins could not be made: fail closed) */
     uint64_t role_gen;   /* db->role_gen the logins were made at (the engine thread's) */
+    int spool_dfd;       /* N1d: the spool directory (-1: none, COPY refused by name) */
+    uint64_t spool_held; /* under mu: every spool's bytes held now (copy_spool bounds it) */
 };
 
 static uint64_t ms_since(uint64_t t0) { return (imdb_mono_ns() - t0) / 1000000u; }
@@ -213,6 +250,7 @@ static void logins_publish(imdbs *s, bool force)
 static bool runnable(const imdbs *s, const rq *r)
 {
     if (r->type == RQ_CLOSE || r->c->gone) return true;
+    if (r->c->cin == CIN_OPEN && !r->c->cin_end && !r->c->cin_err) return false; /* N1d: its COPY's data still arriving */
     uint64_t cap = s->o.conn_cap ? s->o.conn_cap : (32ull << 20);
     return r->c->pending < cap && (s->pending < BUDGET || !r->c->pending);
 }
@@ -380,6 +418,171 @@ static int params_of(imdb_rd *rd, uint32_t n, imdb_value *pv, imdb_err *e)
     return IMDB_OK;
 }
 
+/* ---- N1d: COPY's spools (docs/n1-design.md §8d) ---- */
+/* under mu: a COPY FROM's spool closed, its bytes no longer held (by its owner: §8d's rule in conn's fields) */
+static void cin_drop(imdbs *s, conn *c)
+{
+    if (!c->sp_in) return;
+    imdbsp_close(c->sp_in);
+    c->sp_in = NULL;
+    s->spool_held -= c->in_len;
+}
+
+/* under mu: a COPY TO's ring closed and freed, its unsent bytes no longer held */
+static void ring_free(imdbs *s, conn *c, cring *g)
+{
+    for (cring **pp = &c->rings; *pp; pp = &(*pp)->next)
+        if (*pp == g) {
+            *pp = g->next;
+            break;
+        }
+    s->spool_held -= g->w - g->r;
+    imdbsp_close(g->sp);
+    imdbw_free(g);
+}
+
+/* the session's COPY reader (the engine thread): the spool its connection's thread filled, whole before the statement
+ * ran, so it never waits on the network; -1 for a COPY that is not ours to read (the server sends COPY_IN first) */
+static long copy_rd(void *arg, char *buf, size_t cap)
+{
+    conn *c = arg;
+    if (!c->cin_run) return -1;
+    if (!c->sp_in || c->in_rd >= c->in_len) return 0; /* (no COPY_DATA at all: no spool was made) */
+    size_t n = cap < c->in_len - c->in_rd ? cap : (size_t)(c->in_len - c->in_rd);
+    ssize_t k = imdbsp_read(c->sp_in, c->in_rd, buf, n);
+    if (k <= 0) return -1;
+    c->in_rd += (uint64_t)k;
+    return (long)k;
+}
+
+static void out_fail(conn *c, int32_t code, const char *msg)
+{
+    if (c->out_err) return;
+    c->out_err = code;
+    snprintf(c->out_msg, sizeof c->out_msg, "%s", msg);
+}
+
+static _Atomic uint32_t g_copy_hold_ms; /* tests: copy_wr sleeps this long before each write of a statement but its first */
+void imdbs_test_copy_hold(uint32_t ms) { atomic_store_explicit(&g_copy_hold_ms, ms, memory_order_relaxed); }
+
+/* the session's COPY writer (the engine thread): a COPY TO's output into its ring, never waiting while the ring has
+ * room; when its client reads slower than it fills, waiting for room (others then wait too), at most copy_wait_ms in all
+ * for the statement before it fails with LIMIT; its client gone, the stop or a CANCEL end the wait at once */
+static int copy_wr(void *arg, const char *p, size_t n)
+{
+    conn *c = arg;
+    imdbs *s = c->s;
+    imdb_err e = {0};
+    uint64_t size = s->o.copy_ring ? s->o.copy_ring : (256ull << 20);
+    uint64_t bound = s->o.copy_spool ? s->o.copy_spool : (4ull << 30);
+    uint64_t wait_ns = (uint64_t)(s->o.copy_wait_ms ? s->o.copy_wait_ms : 60000) * 1000000u;
+    bool first = !c->ring;
+    if (!c->ring) { /* its first bytes: the request's replies before it are handed over, then the ring's place */
+        if (s->spool_dfd < 0) {
+            out_fail(c, IMDB_ERR_STATE, "COPY through the server needs a spool directory (--spool-dir, or --server-dir's spool/)");
+            return -1;
+        }
+        cring *g = imdbw_alloc(1, sizeof *g);
+        outbuf *mk = g ? imdbw_alloc(1, sizeof *mk) : NULL;
+        if (!mk || imdbsp_open(s->spool_dfd, &g->sp, &e)) {
+            out_fail(c, mk ? e.code : IMDB_ERR_NOMEM, mk ? e.msg : "out of memory for a COPY's ring");
+            imdbw_free(mk);
+            imdbw_free(g);
+            return -1;
+        }
+        g->size = size;
+        mk->ring = g;
+        flush(s, c, c->run_b);
+        pthread_mutex_lock(&s->mu);
+        g->next = c->rings;
+        c->rings = g;
+        if (c->gone) {
+            imdbw_free(mk); /* no reply reaches it: the ring is freed at its thread's end */
+        } else {
+            if (c->ot) c->ot->next = mk;
+            else c->oh = mk;
+            c->ot = mk;
+        }
+        s->n.copy_out++;
+        pthread_mutex_unlock(&s->mu);
+        c->ring = g;
+    }
+    uint32_t hold = atomic_load_explicit(&g_copy_hold_ms, memory_order_relaxed);
+    if (hold && !first) usleep(hold * 1000u); /* (tests: a statement whose output comes slowly) */
+    cring *g = c->ring;
+    uint64_t *waited = &c->out_waited; /* the statement's, across its writes: copy_wait_ms bounds the sum */
+    while (n) {
+        pthread_mutex_lock(&s->mu);
+        uint64_t room = 0;
+        for (;;) {
+            if (c->gone || s->stopping || atomic_load_explicit(&c->ses.cancel, memory_order_relaxed)) {
+                bool stop = s->stopping;
+                pthread_mutex_unlock(&s->mu);
+                out_fail(c, IMDB_ERR_CANCELLED, stop ? "the server stops: statement cancelled" : "statement cancelled");
+                return -1;
+            }
+            uint64_t mine = g->w - g->r;
+            room = g->size - mine;
+            uint64_t sroom = bound > s->spool_held ? bound - s->spool_held : 0;
+            if (room > sroom) room = sroom;
+            if (room) break;
+            if (!mine) { /* its ring empty and the server's spools full: others' bytes, no pace of its reader's, so no wait */
+                s->n.copy_limits++;
+                pthread_mutex_unlock(&s->mu);
+                out_fail(c, IMDB_ERR_LIMIT, "COPY TO: the server's spools are full (every spool's bytes held at once: "
+                                            "--copy-spool)");
+                return -1;
+            }
+            if (*waited >= wait_ns) {
+                s->n.copy_limits++;
+                pthread_mutex_unlock(&s->mu);
+                char msg[200];
+                snprintf(msg, sizeof msg, "COPY TO: its client read the data too slowly (the server waited %u ms in all for "
+                                          "room: --copy-ring, --copy-wait)", (unsigned)(wait_ns / 1000000u));
+                out_fail(c, IMDB_ERR_LIMIT, msg);
+                return -1;
+            }
+            s->n.copy_waits++;
+            uint64_t t0 = imdb_mono_ns(), step = wait_ns - *waited < 100000000u ? wait_ns - *waited : 100000000u;
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_nsec += (long)step;
+            ts.tv_sec += ts.tv_nsec / 1000000000L;
+            ts.tv_nsec %= 1000000000L;
+            pthread_cond_timedwait(&s->cv, &s->mu, &ts);
+            *waited += imdb_mono_ns() - t0;
+        }
+        uint64_t off = g->w % g->size;
+        size_t k = n;
+        if (k > room) k = (size_t)room;
+        if (k > g->size - off) k = (size_t)(g->size - off);
+        pthread_mutex_unlock(&s->mu);
+        if (imdbsp_write(g->sp, off, p, k, &e)) { /* [w, w + k) is the engine's alone: the reader takes [r, w) */
+            out_fail(c, e.code, e.msg);
+            return -1;
+        }
+        pthread_mutex_lock(&s->mu);
+        g->w += k;
+        s->spool_held += k;
+        pthread_mutex_unlock(&s->mu);
+        wake(c->wake[1]);
+        p += k, n -= k;
+    }
+    return 0;
+}
+
+/* the engine thread, at a statement's end: its COPY TO ring has all its bytes (its connection's thread sends the rest,
+ * then the replies after it) */
+static void ring_end(imdbs *s, conn *c)
+{
+    if (!c->ring) return;
+    pthread_mutex_lock(&s->mu);
+    c->ring->done = true;
+    pthread_mutex_unlock(&s->mu);
+    c->ring = NULL;
+    wake(c->wake[1]);
+}
+
 /* the engine thread: r's statements from r->at on; true when the request ended (its READY sent), false when it pauses
  * at a statement's boundary and runs on later */
 static bool run(imdbs *s, rq *r)
@@ -388,14 +591,19 @@ static bool run(imdbs *s, rq *r)
     if (r->type == RQ_CLOSE) {
         if (c->ses_open) imdb_session_close(&c->ses); /* an open transaction rolled back */
         c->ses_open = false;
+        pthread_mutex_lock(&s->mu);
+        if (c->cin_end) cin_drop(s, c); /* N1d: a spool the engine took (its data ended) but never ran: its client left */
+        pthread_mutex_unlock(&s->mu);
         return true;
     }
     if (!c->ses_open) {
         imdb_session_init(&c->ses, s->db);
+        imdb_session_copy_io(&c->ses, copy_rd, copy_wr, c); /* N1d: COPY through its spools */
         c->ses_open = true;
     }
     imdbw_buf b;
     imdbw_buf_init(&b);
+    c->run_b = &b;
     uint64_t t0 = imdb_mono_ns(), slice = (uint64_t)(s->o.slice_ms ? s->o.slice_ms : 10) * 1000000u;
     imdb_value pv[IMDBW_VALUES_MAX];
     imdb_err e = {0};
@@ -411,9 +619,44 @@ static bool run(imdbs *s, rq *r)
             put_error(&b, (uint32_t)-IMDB_ERR_IO, i, k_failed);
             break;
         }
+        /* N1d: a COPY ... FROM STDIN: COPY_IN, then the request waits here (not runnable) until its data's end or its
+         * refusal; it runs then from its spool, so the engine thread never waits on the network */
+        bool cin = r->type == IMDBW_QUERY && imdb_copy_in_stmt((const char *)m->texts[i].p, m->texts[i].len);
+        int32_t cerr = 0;
+        if (cin && s->spool_dfd >= 0) {
+            pthread_mutex_lock(&s->mu);
+            bool fresh = c->cin == CIN_NONE;
+            if (fresh) {
+                c->cin = CIN_OPEN, c->cin_end = false, c->cin_err = 0, c->cin_msg[0] = 0;
+                c->in_len = c->in_rd = 0, c->cin_last = imdb_mono_ns();
+            } else if (c->cin != CIN_OPEN) {
+                c->cin_err = IMDB_ERR_STATE; /* (never: a new COPY reaches the engine only after the last one's end) */
+                snprintf(c->cin_msg, sizeof c->cin_msg, "a COPY while another's data is still read");
+            }
+            cerr = c->cin_err;
+            pthread_mutex_unlock(&s->mu);
+            if (fresh) {
+                /* its data arriving is a statement under way, as PostgreSQL's COPY is: its transaction never idle
+                 * (idle_in_transaction_timeout), its age still counted (transaction_timeout) */
+                if (c->ses.txn.open) c->ses.txn.busy = true;
+                imdbw_msg ci;
+                memset(&ci, 0, sizeof ci);
+                ci.type = IMDBW_COPY_IN;
+                put_msg(&b, &ci, NULL, i);
+                flush(s, c, &b);
+                imdbw_buf_free(&b);
+                c->run_b = NULL;
+                return false;
+            }
+        }
+        if (cin && c->ses.txn.busy) { /* its upload over: idle from here unless the statement runs (its end stamps it) */
+            c->ses.txn.busy = false;
+            c->ses.txn.last_ns = imdb_mono_ns();
+        }
         pthread_mutex_lock(&s->mu);
         s->n.started++; /* before it runs: a test waiting for it to move knows this statement has begun */
         pthread_mutex_unlock(&s->mu);
+        c->out_err = 0, c->out_waited = 0;
         char wb[sizeof s->db->warning]; /* the handle's warning before: one this statement raised goes to its client */
         memcpy(wb, s->db->warning, sizeof wb);
         imdb_result res;
@@ -426,9 +669,29 @@ static bool run(imdbs *s, rq *r)
             imdb_rd rd;
             imdbw_span_begin(&m->params[i], &rd);
             rc = params_of(&rd, m->params[i].n, pv, &e);
-            if (!rc && imdb_copy_in_stmt((const char *)t->p, t->len))
-                rc = imdb_fail(&e, IMDB_ERR_UNSUPPORTED, "COPY ... FROM STDIN through the server: a later step (N1d)");
+            if (!rc && cin && s->spool_dfd < 0)
+                rc = imdb_fail(&e, IMDB_ERR_STATE, "COPY through the server needs a spool directory (--spool-dir, or "
+                                                   "--server-dir's spool/)");
+            else if (!rc && cerr)
+                rc = imdb_fail(&e, cerr, "%s", c->cin_msg); /* refused before it ran: its data never read */
+            if (!rc && cin) {
+                c->cin_run = true;
+                pthread_mutex_lock(&s->mu);
+                s->n.copy_in++;
+                pthread_mutex_unlock(&s->mu);
+            }
             if (!rc) rc = imdb_exec_one(&c->ses, (const char *)t->p, t->len, m->params[i].n ? pv : NULL, m->params[i].n, &res, &e);
+            if (cin && s->spool_dfd >= 0) { /* its spool freed; a client still sending: the rest dropped to its end */
+                c->cin_run = false;
+                pthread_mutex_lock(&s->mu);
+                if (c->cin_end) {
+                    cin_drop(s, c);
+                    c->cin = CIN_NONE;
+                } else {
+                    c->cin = CIN_DISCARD; /* (its spool was its thread's, closed when it set the refusal) */
+                }
+                pthread_mutex_unlock(&s->mu);
+            }
             rows = true;
             break;
         }
@@ -447,6 +710,11 @@ static bool run(imdbs *s, rq *r)
             break;
         default:
             rc = imdb_fail(&e, IMDB_ERR_STATE, "a request of no kind");
+        }
+        ring_end(s, c); /* N1d: a COPY TO's bytes all in its ring: its DONE (or ERROR) queued after them */
+        if (rc && c->out_err) { /* its writer's refusal in its own words (the engine's says only that writing failed) */
+            imdb_err_clear(&e);
+            rc = imdb_fail(&e, c->out_err, "%s", c->out_msg);
         }
         pthread_mutex_lock(&s->mu);
         s->n.statements++;
@@ -474,6 +742,7 @@ static bool run(imdbs *s, rq *r)
         if (pause) {
             flush(s, c, &b);
             imdbw_buf_free(&b);
+            c->run_b = NULL;
             pthread_mutex_lock(&s->mu);
             s->n.pauses++;
             pthread_mutex_unlock(&s->mu);
@@ -487,6 +756,7 @@ static bool run(imdbs *s, rq *r)
     put_msg(&b, &rd, NULL, 0);
     flush(s, c, &b);
     imdbw_buf_free(&b);
+    c->run_b = NULL;
     return true;
 }
 
@@ -509,20 +779,28 @@ static void *engine_main(void *arg)
     pthread_mutex_lock(&s->mu);
     uint64_t last_tick = imdb_mono_ns();
     while (!s->stopping) {
-        rq *r = pick(s);
-        if (!r || ms_since(last_tick) >= tick_ms) {
-            if (!r) {
-                struct timespec ts;
-                clock_gettime(CLOCK_REALTIME, &ts);
-                ts.tv_nsec += (long)tick_ms * 1000000L;
-                ts.tv_sec += ts.tv_nsec / 1000000000L;
-                ts.tv_nsec %= 1000000000L;
-                if (pthread_cond_timedwait(&s->cv, &s->mu, &ts) != ETIMEDOUT) continue;
-            }
+        /* the tick on its own clock, whatever wakes this thread: a connection's every send broadcasts the condition
+         * (a reader draining a large result or a COPY TO), and a wait that never timed out once starved the tick (the
+         * transaction timeouts, maintenance, a role change's logins: N1d's review, 2026-11-17) */
+        if (ms_since(last_tick) >= tick_ms) {
             pthread_mutex_unlock(&s->mu);
             tick(s);
             pthread_mutex_lock(&s->mu);
+            s->n.ticks++;
             last_tick = imdb_mono_ns();
+            continue;
+        }
+        rq *r = pick(s);
+        if (!r) { /* nothing runnable: wait for work, at most until the next tick is due */
+            uint64_t due = last_tick + (uint64_t)tick_ms * 1000000u, now = imdb_mono_ns();
+            uint64_t left = due > now ? due - now : 0;
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += (time_t)(left / 1000000000u);
+            ts.tv_nsec += (long)(left % 1000000000u);
+            ts.tv_sec += ts.tv_nsec / 1000000000L;
+            ts.tv_nsec %= 1000000000L;
+            pthread_cond_timedwait(&s->cv, &s->mu, &ts);
             continue;
         }
         conn *c = r->c;
@@ -733,6 +1011,7 @@ static void leave(conn *c)
     imdbs *s = c->s;
     pthread_mutex_lock(&s->mu);
     c->gone = true;
+    if (c->cin == CIN_OPEN && !c->cin_end) cin_drop(s, c); /* N1d: its COPY's spool, still this thread's: freed at once */
     if (c->running && c->ses_open) {
         imdb_session_cancel(&c->ses);
         s->n.leave_cancels++;
@@ -763,6 +1042,73 @@ static void conn_put(conn *c, const imdbw_msg *m)
     pthread_mutex_unlock(&s->mu);
 }
 
+/* N1d: a COPY frame from the client (its connection's thread): its data into the spool while it arrives, dropped while
+ * the COPY's refusal reads it to its end; false when no COPY expects it (the stream no longer says whose bytes they are) */
+static bool copy_frame(conn *c, const imdbw_msg *m)
+{
+    imdbs *s = c->s;
+    uint64_t bound = s->o.copy_spool ? s->o.copy_spool : (4ull << 30);
+    pthread_mutex_lock(&s->mu);
+    if (c->cin == CIN_NONE || (c->cin == CIN_OPEN && c->cin_end)) { /* (after its end: data no COPY expects) */
+        pthread_mutex_unlock(&s->mu);
+        return false;
+    }
+    c->cin_last = imdb_mono_ns();
+    if (c->cin == CIN_DISCARD) { /* refused and answered: dropped to the client's end, then no COPY */
+        if (m->type != IMDBW_COPY_DATA) c->cin = CIN_NONE;
+        pthread_mutex_unlock(&s->mu);
+        return true;
+    }
+    if (m->type != IMDBW_COPY_DATA) { /* the client's end: the request runnable again */
+        if (m->type == IMDBW_COPY_FAIL && !c->cin_err) {
+            const imdbw_text *t = m->ntexts ? &m->texts[0] : NULL;
+            int keep = t ? (int)imdbw_utf8_fit(t->p, t->len, IMDBW_MESSAGE_MAX - 64) : 0;
+            snprintf(c->cin_msg, sizeof c->cin_msg, "COPY ... FROM STDIN failed by its client: %.*s", keep,
+                     t ? (const char *)t->p : "");
+            c->cin_err = IMDB_ERR_CANCELLED;
+            cin_drop(s, c);
+        }
+        c->cin_end = true;
+        pthread_cond_broadcast(&s->cv);
+        pthread_mutex_unlock(&s->mu);
+        return true;
+    }
+    if (c->cin_err) { /* refused, its answer not yet sent: dropped */
+        pthread_mutex_unlock(&s->mu);
+        return true;
+    }
+    if (s->spool_held + m->dlen > bound) { /* answered at once, the rest dropped (§8d) */
+        snprintf(c->cin_msg, sizeof c->cin_msg, "COPY ... FROM STDIN: its data passed the server's spool bound (%llu bytes "
+                 "held at once: --copy-spool); the rest is read and dropped", (unsigned long long)bound);
+        c->cin_err = IMDB_ERR_LIMIT;
+        s->n.copy_limits++;
+        cin_drop(s, c);
+        pthread_cond_broadcast(&s->cv);
+        pthread_mutex_unlock(&s->mu);
+        return true;
+    }
+    s->spool_held += m->dlen; /* reserved before the write: the bound holds across connections */
+    imdbsp *sp = c->sp_in;
+    uint64_t off = c->in_len;
+    pthread_mutex_unlock(&s->mu);
+    imdb_err e = {0};
+    int rc = sp ? IMDB_OK : imdbsp_open(s->spool_dfd, &sp, &e); /* this thread's while the data arrives */
+    if (!rc) rc = imdbsp_write(sp, off, m->data, m->dlen, &e);
+    pthread_mutex_lock(&s->mu);
+    if (sp && !c->sp_in) c->sp_in = sp;
+    if (rc) {
+        s->spool_held -= m->dlen;
+        snprintf(c->cin_msg, sizeof c->cin_msg, "%s", e.msg);
+        c->cin_err = e.code;
+        cin_drop(s, c);
+        pthread_cond_broadcast(&s->cv);
+    } else {
+        c->in_len += m->dlen;
+    }
+    pthread_mutex_unlock(&s->mu);
+    return true;
+}
+
 /* a frame from the client: a request queued, CANCEL and PING answered here; false when the connection is to end (a
  * protocol error, after its ERROR) */
 static bool take_frame(conn *c, uint8_t type, uint8_t *body, uint32_t len, bool *terminate)
@@ -777,6 +1123,18 @@ static bool take_frame(conn *c, uint8_t type, uint8_t *body, uint32_t len, bool 
         snprintf(msg, sizeof msg, "a frame refused, the connection closed: %s", e.msg);
         imdbw_text t = {(const uint8_t *)msg, (uint32_t)imdbw_utf8_fit((const uint8_t *)msg, strlen(msg), IMDBW_MESSAGE_MAX)};
         imdbw_msg er = {.type = IMDBW_ERROR, .code = (uint32_t)-e.code, .texts = &t, .ntexts = 1};
+        conn_put(c, &er);
+        return false;
+    }
+    pthread_mutex_lock(&s->mu);
+    bool copying = (c->cin == CIN_OPEN && !c->cin_end) || c->cin == CIN_DISCARD;
+    pthread_mutex_unlock(&s->mu);
+    if (copying && type != IMDBW_COPY_DATA && type != IMDBW_COPY_DONE && type != IMDBW_COPY_FAIL && type != IMDBW_CANCEL &&
+        type != IMDBW_PING) { /* N1d: §4: after COPY_IN, COPY's frames to its end (CANCEL and PING answered here) */
+        imdbw_msg_free(&m);
+        imdbw_free(body);
+        imdbw_text t = {(const uint8_t *)"a request while a COPY's data was expected: the connection closed", 65};
+        imdbw_msg er = {.type = IMDBW_ERROR, .code = (uint32_t)-IMDB_ERR_STATE, .texts = &t, .ntexts = 1};
         conn_put(c, &er);
         return false;
     }
@@ -807,9 +1165,17 @@ static bool take_frame(conn *c, uint8_t type, uint8_t *body, uint32_t len, bool 
     }
     case IMDBW_CANCEL: /* the statement running now, never one queued behind it (§4); no reply of its own */
         pthread_mutex_lock(&s->mu);
-        if (c->running && c->ses_open) {
+        if (c->cin == CIN_OPEN && !c->cin_end && !c->cin_err) { /* N1d: a COPY whose data arrives: refused, never run */
+            snprintf(c->cin_msg, sizeof c->cin_msg, "statement cancelled: the COPY never ran (the rest of its data is "
+                                                    "read and dropped)");
+            c->cin_err = IMDB_ERR_CANCELLED;
+            cin_drop(s, c);
+            s->n.cancels++;
+            pthread_cond_broadcast(&s->cv);
+        } else if (c->running && c->ses_open) {
             imdb_session_cancel(&c->ses);
             s->n.cancels++;
+            pthread_cond_broadcast(&s->cv); /* N1d: a COPY TO waiting for room sees it */
         }
         pthread_mutex_unlock(&s->mu);
         break;
@@ -821,6 +1187,11 @@ static bool take_frame(conn *c, uint8_t type, uint8_t *body, uint32_t len, bool 
     case IMDBW_TERMINATE:
         *terminate = true;
         break;
+    case IMDBW_COPY_DATA:
+    case IMDBW_COPY_DONE:
+    case IMDBW_COPY_FAIL:
+        if (copy_frame(c, &m)) break;
+        /* fall through */
     default: { /* COPY_DATA, COPY_DONE, COPY_FAIL with no COPY running: the stream no longer says whose bytes they are */
         imdbw_msg_free(&m);
         imdbw_free(body);
@@ -850,7 +1221,8 @@ static int pull(conn *c, inframe *in)
     uint32_t qmax = s->o.queue_max ? s->o.queue_max : 64;
     for (;;) {
         pthread_mutex_lock(&s->mu);
-        bool room = c->nq < qmax && c->qbytes < QBYTES_MAX;
+        /* N1d: while a COPY's frames arrive (its data, or its refusal's drop) they are never queued: always read */
+        bool room = (c->nq < qmax && c->qbytes < QBYTES_MAX) || (c->cin == CIN_OPEN && !c->cin_end) || c->cin == CIN_DISCARD;
         pthread_mutex_unlock(&s->mu);
         if (!room && in->hgot == 0) return 0; /* its queue full: read again once the engine takes one */
         ssize_t k;
@@ -894,6 +1266,61 @@ static int pull(conn *c, inframe *in)
     }
 }
 
+/* N1d: a COPY TO's place at the head of the replies (o): up to a frame of its ring's bytes made a COPY_OUT frame put
+ * before it (1); its ring ended and sent whole, the place removed and the ring freed (1); no bytes yet (0); the ring
+ * unreadable (-1: the connection ends, never a stream cut short and then a DONE) */
+static int ring_take(conn *c, outbuf *o)
+{
+    imdbs *s = c->s;
+    cring *g = o->ring;
+    pthread_mutex_lock(&s->mu);
+    uint64_t w = g->w, r = g->r;
+    bool done = g->done;
+    if (w == r && done) { /* its bytes all sent: the replies after it go next */
+        c->oh = o->next;
+        if (!c->oh) c->ot = NULL;
+        ring_free(s, c, g);
+        pthread_mutex_unlock(&s->mu);
+        imdbw_free(o);
+        return 1;
+    }
+    pthread_mutex_unlock(&s->mu);
+    if (w == r) return 0;
+    uint64_t off = r % g->size;
+    size_t k = (size_t)(w - r);
+    if (k > COPY_FRAME) k = COPY_FRAME;
+    if (k > g->size - off) k = (size_t)(g->size - off);
+    uint8_t *tmp = imdbw_alloc(k, 1);
+    outbuf *f = tmp ? imdbw_alloc(1, sizeof *f) : NULL;
+    ssize_t got = f ? imdbsp_read(g->sp, off, tmp, k) : -1; /* [r, w) is this thread's: the engine writes past w */
+    imdbw_buf b;
+    imdbw_buf_init(&b);
+    if (got == (ssize_t)k) {
+        imdbw_msg m;
+        memset(&m, 0, sizeof m);
+        m.type = IMDBW_COPY_OUT;
+        m.data = tmp, m.dlen = (uint32_t)k;
+        imdbw_msg_put(&b, &m, NULL);
+    }
+    imdbw_free(tmp);
+    if (got != (ssize_t)k || b.err) {
+        imdbw_buf_free(&b);
+        imdbw_free(f);
+        return -1;
+    }
+    f->p = b.p, f->len = b.len;
+    pthread_mutex_lock(&s->mu);
+    g->r += k;
+    s->spool_held -= k;
+    f->next = o; /* o is the head: this thread alone takes from it */
+    c->oh = f;
+    c->pending += f->len;
+    s->pending += f->len;
+    pthread_cond_broadcast(&s->cv); /* room for the engine's writer */
+    pthread_mutex_unlock(&s->mu);
+    return 1;
+}
+
 /* sends what is queued: 1 when bytes left, 0 when none could, -1 when the client is gone */
 static int push(conn *c)
 {
@@ -904,6 +1331,12 @@ static int push(conn *c)
         outbuf *o = c->oh; /* this thread alone takes from the head; the engine appends at the tail */
         pthread_mutex_unlock(&s->mu);
         if (!o) return sent;
+        if (o->ring) { /* N1d: a COPY TO's bytes go out here, as frames */
+            int k = ring_take(c, o);
+            if (k < 0) return -1;
+            if (k == 0) return sent;
+            continue;
+        }
         ssize_t k = c_write(c, o->p + o->off, o->len - o->off); /* TLS: retried with these arguments (partial writes on) */
         if (k == IMDBT_WANT_READ || k == IMDBT_WANT_WRITE) {
             c->wr_wants_read = k == IMDBT_WANT_READ;
@@ -996,6 +1429,7 @@ static void *conn_main(void *arg)
     uint64_t stop_at = 0, progress = imdb_mono_ns();
     bool waiting = false; /* replies waited at the last turn too */
     uint64_t send_ns = (uint64_t)(s->o.send_timeout_ms ? s->o.send_timeout_ms : 30000) * 1000000u;
+    uint64_t copy_idle_ns = (uint64_t)(s->o.copy_idle_ms ? s->o.copy_idle_ms : 30000) * 1000000u;
     if (!authed) {
         pthread_mutex_lock(&s->mu);
         c->gone = c->closed = true; /* no session was made */
@@ -1004,15 +1438,35 @@ static void *conn_main(void *arg)
     for (;;) {
         pthread_mutex_lock(&s->mu);
         s->n.wakeups++;
-        bool closed = c->closed, out = c->oh != NULL, stopping = s->stopping;
+        /* out: bytes to send (N1d: a COPY TO's place at the head counts once its ring holds bytes or has ended: a slow
+         * statement's empty ring is no reply waiting, so send_timeout never drops a client for the engine's pace) */
+        const cring *hg = c->oh ? c->oh->ring : NULL;
+        bool closed = c->closed, out = c->oh != NULL && (!hg || hg->w > hg->r || hg->done), stopping = s->stopping;
         /* its client gone and its statement still running: the cancel again (one that landed just before the statement
          * began was cleared by its start), every turn until the session's end runs */
         bool recancel = c->gone && c->running && c->ses_open && !closed;
         if (recancel) imdb_session_cancel(&c->ses);
         uint32_t qmax = s->o.queue_max ? s->o.queue_max : 64;
-        bool room = c->nq < qmax && c->qbytes < QBYTES_MAX;
+        bool copying = (c->cin == CIN_OPEN && !c->cin_end) || c->cin == CIN_DISCARD; /* N1d: a COPY's frames arrive */
+        if (copying && out) c->cin_last = imdb_mono_ns(); /* its client still has replies to read (COPY_IN among them, or a
+                                                       * ring draining): its data cannot be due yet, so the idle clock waits */
+        uint64_t cin_last = c->cin_last;
+        bool room = (c->nq < qmax && c->qbytes < QBYTES_MAX) || copying; /* N1d: a COPY's frames never queued */
         pthread_mutex_unlock(&s->mu);
         uint64_t now = imdb_mono_ns();
+        if (copying && reading && peer && now - cin_last > copy_idle_ns) { /* N1d: its data stopped: the connection ends */
+            pthread_mutex_lock(&s->mu);
+            s->n.copy_idle++;
+            pthread_mutex_unlock(&s->mu);
+            char msg[160];
+            snprintf(msg, sizeof msg, "COPY's data stopped arriving for %u ms: the connection closed (--copy-idle)",
+                     (unsigned)(copy_idle_ns / 1000000u));
+            imdbw_text t = {(const uint8_t *)msg, (uint32_t)strlen(msg)};
+            imdbw_msg er = {.type = IMDBW_ERROR, .code = (uint32_t)-IMDB_ERR_CANCELLED, .texts = &t, .ntexts = 1};
+            conn_put(c, &er);
+            reading = false;
+            leave(c);
+        }
         if (stopping && reading) reading = false;
         if (c->gone && reading) { /* the engine could not queue a reply, or the server stops: no further request */
             reading = false;
@@ -1038,7 +1492,7 @@ static void *conn_main(void *arg)
         bool pend = want_in && c->tls && imdbt_pending(c->tls) > 0;
         struct pollfd pf[2] = {{peer ? c->fd : -1, (short)((want_in ? in_ev : 0) | (want_out ? out_ev : 0)), 0},
                                {c->wake[0], POLLIN, 0}};
-        int wait_ms = stop_at ? 50 : (out && peer) || recancel ? 100 : 1000;
+        int wait_ms = stop_at ? 50 : (out && peer) || recancel || copying ? 100 : 1000;
         if (poll(pf, 2, pend ? 0 : wait_ms) < 0 && errno != EINTR) break;
         if (pf[1].revents) drain(c->wake[0]);
         bool can_in = pend || (want_in && (pf[0].revents & in_ev)), can_out = want_out && (pf[0].revents & out_ev);
@@ -1083,6 +1537,7 @@ static void *conn_main(void *arg)
     imdbw_free(in.body);
     drop_out(c);
     pthread_mutex_lock(&s->mu);
+    if (c->cin == CIN_OPEN && !c->cin_end) cin_drop(s, c); /* N1d: its spool still this thread's: freed at once */
     c->done = true;
     s->n.live--;
     pthread_cond_broadcast(&s->pacv);
@@ -1096,6 +1551,10 @@ static void *conn_main(void *arg)
 /* ---- the acceptor ---- */
 static void conn_free(conn *c)
 {
+    pthread_mutex_lock(&c->s->mu); /* N1d: its spools (the engine is done with it: no request, none running) */
+    cin_drop(c->s, c);
+    while (c->rings) ring_free(c->s, c, c->rings);
+    pthread_mutex_unlock(&c->s->mu);
     for (rq *r = c->rh, *nx; r; r = nx) nx = r->next, rq_free(r); /* a close queued after the engine's stop: every thread joined */
     imdbt_free(c->tls); /* one its thread never took (a limit refused it) */
     if (c->fd >= 0) close(c->fd);
@@ -1296,13 +1755,24 @@ int imdbs_start(imdb_db *db, const imdbs_opts *o, imdbs **out, imdb_err *e)
     if (db->failed) return imdb_fail(e, IMDB_ERR_STATE, "the database handle has failed: reopen it");
     imdbs *s = imdbw_alloc(1, sizeof *s);
     if (!s) return imdb_fail(e, IMDB_ERR_NOMEM, "out of memory");
-    s->db = db, s->o = *o, s->lfd = -1, s->tfd = -1, s->stop[0] = s->stop[1] = -1;
-    s->o.socket_path = s->o.tcp = s->o.server_dir = NULL; /* the caller's strings: used here alone */
+    s->db = db, s->o = *o, s->lfd = -1, s->tfd = -1, s->stop[0] = s->stop[1] = -1, s->spool_dfd = -1;
+    s->o.socket_path = s->o.tcp = s->o.server_dir = s->o.spool_dir = NULL; /* the caller's strings: used here alone */
     pthread_mutex_init(&s->mu, NULL);
     pthread_mutex_init(&s->lmu, NULL);
     pthread_cond_init(&s->cv, NULL);
     pthread_cond_init(&s->pacv, NULL);
-    int rc = listen_unix(s, o->socket_path, e);
+    int rc = IMDB_OK;
+    if (o->spool_dir || o->server_dir) { /* N1d: COPY's spool directory (neither: COPY refused by name) */
+        char path[4096];
+        if (o->spool_dir) {
+            if ((size_t)snprintf(path, sizeof path, "%s", o->spool_dir) >= sizeof path)
+                rc = imdb_fail(e, IMDB_ERR_INVALID, "the spool directory's path is too long");
+        } else if ((size_t)snprintf(path, sizeof path, "%s/spool", o->server_dir) >= sizeof path) {
+            rc = imdb_fail(e, IMDB_ERR_INVALID, "the server directory's path is too long");
+        }
+        if (!rc) rc = imdbsp_dir(path, &s->spool_dfd, e);
+    }
+    if (!rc) rc = listen_unix(s, o->socket_path, e);
     if (!rc && o->tcp) { /* N1c: TLS 1.3 on TCP, its key and certificate from the server directory */
         if (!o->server_dir) rc = imdb_fail(e, IMDB_ERR_INVALID, "--tcp needs the server directory's certificate");
         if (!rc) rc = imdbt_server_ctx(o->server_dir, &s->tls, &s->cert_days, e);
@@ -1382,6 +1852,7 @@ int imdbs_stop(imdbs *s, imdb_err *e)
     pthread_mutex_unlock(&s->mu);
     if (s->lfd >= 0) close(s->lfd);
     if (s->tfd >= 0) close(s->tfd);
+    if (s->spool_dfd >= 0) close(s->spool_dfd);
     imdbt_ctx_free(s->tls);
     if (s->path[0]) unlink(s->path);
     if (s->stop[0] >= 0) close(s->stop[0]);
@@ -1425,6 +1896,7 @@ void imdbs_counts_get(imdbs *s, imdbs_counts *c)
     pthread_mutex_lock(&s->mu);
     *c = s->n;
     c->tcp_authing = c->tcp_waiting = 0;
+    c->spool_held = s->spool_held;
     for (conn *o = s->conns; o; o = o->next) {
         c->tcp_authing += o->tcp && o->preauth && o->authing;
         c->tcp_waiting += o->tcp && o->preauth && !o->authing;

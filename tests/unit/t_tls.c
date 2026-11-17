@@ -419,7 +419,11 @@ static void t_tls_relay(void)
     SOFT(rc == IMDB_ERR_AUTH && !c);
     if (rc != IMDB_ERR_AUTH) fprintf(stderr, "    through the relay: %d %s\n", rc, e.msg);
     imdbc_close(c);
-    imdbs_counts_get(t.s, &c1);
+    for (int w = 0; w < 1000; w++) { /* counted by the connection's thread after its verdict is sent: waited for */
+        imdbs_counts_get(t.s, &c1);
+        if (c1.refusals == c0.refusals + 1) break;
+        usleep(10000);
+    }
     SOFT(c1.refusals == c0.refusals + 1 && c1.logins == c0.logins); /* the server refused the relayed proof */
     atomic_store(&r.stop, true);
     pthread_join(th, NULL);

@@ -58,7 +58,8 @@ export LANG=C.UTF-8
 # the temporary server and the oracle's connect in the gap (N1c's matrices, 2026-11-16: MySQL's socket missing after
 # "four servers up"). So each container's log must say its initialisation is done before the pings count, and the pings
 # must pass twice, a second apart; under load the whole may take minutes (300 s)
-inited() { docker logs "$C-$1" 2>&1 | grep -qF "$2"; }
+# (the log taken whole first: grep -q stopping early would kill docker logs, a false "not ready" under pipefail)
+inited() { local l; l=$(docker logs "$C-$1" 2>&1) || return 1; case "$l" in *"$2"*) return 0 ;; esac; return 1; }
 i=0
 ok=0
 while [ "$ok" -lt 2 ]; do

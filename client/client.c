@@ -26,6 +26,8 @@ struct imdbc {
     uint8_t *cbody;    /* the last COLUMNS' body, kept while ROWS are read against it */
     imdbw_msg cols;
     bool has_cols;
+    uint32_t outstanding; /* requests sent whose READY has not been read: a cancel reaches only one of them (one asked
+                           * between requests would otherwise cancel the next statement: N1d's review) */
 };
 
 /* N1c: the connection's bytes over its socket or its TLS session alike (the socket non-blocking either way): >0 bytes,
@@ -96,7 +98,7 @@ static int send_cancel(imdbc *c, imdb_err *e)
 static int recv_all(imdbc *c, uint8_t *p, size_t n, imdb_err *e)
 {
     while (n) {
-        if (atomic_exchange(&c->cancel, false) && send_cancel(c, e)) return e->code;
+        if (atomic_exchange(&c->cancel, false) && c->outstanding && send_cancel(c, e)) return e->code;
         ssize_t k = c_read(c, p, n);
         if (k > 0) {
             p += k, n -= (size_t)k;
@@ -110,12 +112,20 @@ static int recv_all(imdbc *c, uint8_t *p, size_t n, imdb_err *e)
 
 static int put_msg(imdbc *c, const imdbw_msg *m, imdb_err *e)
 {
+    bool req = m->type == IMDBW_QUERY || m->type == IMDBW_PREPARE || m->type == IMDBW_EXECUTE || m->type == IMDBW_DEALLOCATE;
+    if (req && !c->outstanding) atomic_store(&c->cancel, false); /* one asked while nothing ran: for nothing */
+    /* one asked while this client sends (a COPY's data) goes out before the next frame: the upload is cancelled where it
+     * stands (§4: the COPY refused unrun, the rest of its data dropped), never after the whole upload, when the COPY may
+     * not have begun and a CANCEL reaches nothing (N1d's review) */
+    else if (c->outstanding && atomic_exchange(&c->cancel, false) && send_cancel(c, e)) return e->code;
     imdbw_buf b;
     imdbw_buf_init(&b);
     imdbw_msg_put(&b, m, NULL);
     int rc = b.err ? imdb_fail(e, b.nomem ? IMDB_ERR_NOMEM : IMDB_ERR_INVALID, "a request its encoder refuses")
                    : send_all(c, b.p, b.len, e);
     imdbw_buf_free(&b);
+    if (!rc && req)
+        c->outstanding++; /* each answered to its READY */
     return rc;
 }
 
@@ -369,6 +379,35 @@ int imdbc_deallocate(imdbc *c, const char *name, imdb_err *e)
     return put_msg(c, &m, e);
 }
 
+/* N1d: COPY ... FROM STDIN's data, after its COPY_IN reply: cut into frames of at most 1 MiB */
+int imdbc_copy_data(imdbc *c, const void *p, size_t n, imdb_err *e)
+{
+    const uint8_t *q = p;
+    while (n) {
+        size_t k = n < (1u << 20) ? n : (1u << 20);
+        imdbw_msg m;
+        memset(&m, 0, sizeof m);
+        m.type = IMDBW_COPY_DATA;
+        m.data = q, m.dlen = (uint32_t)k;
+        if (put_msg(c, &m, e)) return e->code;
+        q += k, n -= k;
+    }
+    return IMDB_OK;
+}
+
+int imdbc_copy_done(imdbc *c, imdb_err *e)
+{
+    imdbw_msg m = {.type = IMDBW_COPY_DONE};
+    return put_msg(c, &m, e);
+}
+
+int imdbc_copy_fail(imdbc *c, const char *reason, imdb_err *e)
+{
+    imdbw_text t = {(const uint8_t *)reason, (uint32_t)strlen(reason)};
+    imdbw_msg m = {.type = IMDBW_COPY_FAIL, .texts = &t, .ntexts = 1};
+    return put_msg(c, &m, e);
+}
+
 int imdbc_ping(imdbc *c, imdb_err *e)
 {
     imdbw_msg m = {.type = IMDBW_PING};
@@ -416,6 +455,7 @@ int imdbc_next(imdbc *c, imdbw_msg *m, imdb_err *e)
         *m = got;
         return IMDB_OK;
     }
+    if (type == IMDBW_READY && c->outstanding) c->outstanding--;
     c->last = got, c->body = body;
     *m = got;
     return IMDB_OK;

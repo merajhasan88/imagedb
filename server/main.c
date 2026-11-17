@@ -24,9 +24,37 @@
 static int usage(void)
 {
     fputs("usage: imagedb-server DIR --socket PATH --server-dir SDIR [--max-conns N] [--nosync] [--durable-ack]\n"
-          "                      [--events FILE] [--stats FILE] [--tcp ADDR:PORT]\n"
+          "                      [--events FILE] [--stats FILE] [--tcp ADDR:PORT] [--spool-dir DIR]\n"
+          "                      [--copy-spool BYTES] [--copy-ring BYTES] [--copy-wait MS] [--copy-idle MS]\n"
           "       imagedb-server cert SDIR [--name NAME]... [--renew]\n", stderr);
     return 2;
+}
+
+/* N1d: a size: digits, then K, M or G (binary) or none: within [lo, hi] */
+static bool parse_bytes(const char *s, uint64_t lo, uint64_t hi, uint64_t *out)
+{
+    char *end;
+    errno = 0;
+    unsigned long long v = strtoull(s, &end, 10);
+    if (errno || end == s || *s == '-') return false;
+    unsigned sh = *end == 'K' ? 10 : *end == 'M' ? 20 : *end == 'G' ? 30 : 0;
+    if (sh) end++;
+    if (*end || v > (UINT64_MAX >> sh)) return false;
+    v <<= sh;
+    if (v < lo || v > hi) return false;
+    *out = v;
+    return true;
+}
+
+/* N1d: milliseconds within [lo, hi] */
+static bool parse_ms(const char *s, uint32_t lo, uint32_t hi, uint32_t *out)
+{
+    char *end;
+    errno = 0;
+    unsigned long v = strtoul(s, &end, 10);
+    if (errno || end == s || *end || *s == '-' || v < lo || v > hi) return false;
+    *out = (uint32_t)v;
+    return true;
 }
 
 /* SDIR/secret: read when it is there (exactly 32 bytes), else made exclusively (0600) and its directory synced */
@@ -106,6 +134,15 @@ int main(int argc, char **argv)
             unsigned long v = strtoul(argv[++i], &end, 10);
             if (*end || !v || v > 65536) return usage();
             so.max_conns = (uint32_t)v;
+        } else if (!strcmp(argv[i], "--spool-dir") && i + 1 < argc) so.spool_dir = argv[++i]; /* N1d: COPY's spool */
+        else if (!strcmp(argv[i], "--copy-spool") && i + 1 < argc) {
+            if (!parse_bytes(argv[++i], 1u << 20, 1ull << 40, &so.copy_spool)) return usage();
+        } else if (!strcmp(argv[i], "--copy-ring") && i + 1 < argc) {
+            if (!parse_bytes(argv[++i], 64u << 10, 64ull << 30, &so.copy_ring)) return usage();
+        } else if (!strcmp(argv[i], "--copy-wait") && i + 1 < argc) {
+            if (!parse_ms(argv[++i], 1, 3600000, &so.copy_wait_ms)) return usage();
+        } else if (!strcmp(argv[i], "--copy-idle") && i + 1 < argc) {
+            if (!parse_ms(argv[++i], 100, 3600000, &so.copy_idle_ms)) return usage();
         } else if (!strcmp(argv[i], "--nosync")) sync = 0;
         else if (!strcmp(argv[i], "--durable-ack")) durable_ack = true;
         else if (argv[i][0] == '-' || dir) return usage();
