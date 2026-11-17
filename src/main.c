@@ -23,6 +23,7 @@
 #include "repl.h"
 #include "rewind.h"
 #include "sql.h"
+#include "../cli/run.h" /* N1d-2: the runner build/imagedb-client shares */
 #include "writer.h"
 
 static int usage(void)
@@ -211,164 +212,6 @@ static imdb_db *open_anchored(const char *dir, bool ro, int sync, const char *an
 
 static imdb_db *open_or_die(const char *dir, bool ro, int sync) { return open_anchored(dir, ro, sync, NULL, false, false); }
 
-/* P2 S10: where COPY ... FROM STDIN's data comes from, as psql serves it: a script's text after the statement (the
- * buffer the script's statements are split from, then more of its file), or stdin (-c, the REPL). The engine gets the
- * bytes up to a line \. outside quotes (psql's end of data) or the file's end, and sees the end there; a script's next
- * statement starts on the line after the \. line. The quotes are followed as CSV's: "" inside them toggles twice */
-typedef struct copy_src {
-    FILE *f;
-    char *b;          /* the bytes: the script's buffer, or stdin's own */
-    size_t n, cap;    /* filled, and its size */
-    size_t pos;       /* the first byte the engine has not had */
-    bool eof, err;    /* f ended, or failed */
-    bool tty;         /* f a terminal: a line at a time, nothing read past the line asked for */
-    bool bol, inq;    /* the scan: at a line's start, inside quotes */
-    bool done;        /* the data's end was reached (\. or the file's end) */
-} copy_src;
-
-typedef struct runner {
-    imdb_session *ss;
-    bool csv;
-    int failures;
-    bool timing;
-    bool stop_on_error;
-    copy_src *script;   /* P2 S10: the stream being run (run_stream): COPY's data inline, after the statement */
-    copy_src *in;       /* stdin's, made at the first COPY ... FROM STDIN outside a script (-c, the REPL) */
-    copy_src *active;   /* the running COPY's: the session's reader reads it */
-} runner;
-
-enum { COPY_TOOK_DATA = 1 }; /* run_stmt to the splitter: a COPY took the data after it; resume at script->pos */
-
-/* room to read into: two bytes at least (a terminal's line and its NUL) */
-static bool src_full(const copy_src *s) { return s->cap - s->n < 2; }
-
-/* more bytes after n: a line from a terminal, else what one read gives; 0 at the end (or a failure: err), or when
- * full (the caller makes room first) */
-static size_t src_read(copy_src *s)
-{
-    if (s->eof || src_full(s)) return 0;
-    size_t got = 0;
-    if (s->tty) {
-        if (fgets(s->b + s->n, (int)(s->cap - s->n > INT32_MAX ? INT32_MAX : s->cap - s->n), s->f)) got = strlen(s->b + s->n);
-    } else {
-        got = fread(s->b + s->n, 1, s->cap - s->n, s->f);
-    }
-    if (!got) {
-        s->eof = true;
-        s->err = ferror(s->f) != 0;
-    }
-    s->n += got;
-    return got;
-}
-
-/* the bytes before pos are spent: dropped, wiped (SQL text and data carry row values) */
-static void src_drop(copy_src *s, size_t k)
-{
-    memmove(s->b, s->b + k, s->n - k);
-    imdb_wipe(s->b + s->n - k, k);
-    s->n -= k;
-    s->pos -= k < s->pos ? k : s->pos;
-}
-
-/* at least k bytes from pos, unless the file ends first: how many there are */
-static size_t src_need(copy_src *s, size_t k)
-{
-    while (s->n - s->pos < k && !s->eof) {
-        if (src_full(s)) {
-            if (!s->pos) break; /* the buffer is the lookahead's: never more than a few bytes */
-            src_drop(s, s->pos);
-        }
-        src_read(s);
-    }
-    return s->n - s->pos;
-}
-
-/* the session's reader (imdb_session_copy_io): the running COPY's data, stopped before a \. line */
-static long copy_read(void *arg, char *out, size_t cap)
-{
-    runner *rn = arg;
-    copy_src *s = rn->active;
-    if (!s) return -1;
-    size_t k = 0;
-    while (k < cap && !s->done) {
-        if (!src_need(s, 1)) {
-            if (s->err) return -1;
-            s->done = true; /* the file's end ends the data */
-            break;
-        }
-        char ch = s->b[s->pos];
-        if (s->bol && !s->inq && ch == '\\') { /* "\." alone on its line ends the data */
-            /* three bytes, a fourth only after a CR: never past the marker's own line, which from a terminal (a line a
-             * read) would take the REPL's next statement into this buffer */
-            size_t have = src_need(s, 3), mark = 0;
-            if (have >= 2 && s->b[s->pos + 1] == '.') {
-                if (have == 2) mark = s->eof ? 2 : 0;
-                else if (s->b[s->pos + 2] == '\n') mark = 3;
-                else if (s->b[s->pos + 2] == '\r' && src_need(s, 4) >= 4 && s->b[s->pos + 3] == '\n') mark = 4;
-            }
-            if (mark) {
-                s->pos += mark;
-                s->done = true;
-                break;
-            }
-        }
-        out[k++] = ch;
-        s->pos++;
-        if (ch == '"') s->inq = !s->inq;
-        s->bol = ch == '\n';
-    }
-    return (long)k;
-}
-
-/* the session's writer: COPY ... TO STDOUT's bytes */
-static int copy_write(void *arg, const char *b, size_t n)
-{
-    (void)arg;
-    return fwrite(b, 1, n, stdout) == n ? 0 : -1;
-}
-
-/* the statement's first word is COPY (the cheap test before parsing it as one) */
-static bool starts_copy(const char *s, size_t n)
-{
-    size_t i = 0;
-    for (;;) {
-        while (i < n && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n')) i++;
-        if (i + 1 < n && s[i] == '-' && s[i + 1] == '-') {
-            while (i < n && s[i] != '\n') i++;
-            continue;
-        }
-        break;
-    }
-    return n - i >= 4 && strncasecmp(s + i, "copy", 4) == 0;
-}
-
-/* a script's COPY: its data begins on the line after the statement; what follows on the statement's line may be spaces,
- * tabs and a comment, nothing else */
-static int skip_rest_of_line(copy_src *s)
-{
-    for (;;) {
-        if (!src_need(s, 1)) return s->err ? -1 : 0;
-        char ch = s->b[s->pos];
-        if (ch == ' ' || ch == '\t') {
-            s->pos++;
-            continue;
-        }
-        if (ch == '-' && src_need(s, 2) >= 2 && s->b[s->pos + 1] == '-') {
-            while (src_need(s, 1) && s->b[s->pos] != '\n') s->pos++;
-            continue;
-        }
-        if (ch == '\r' && src_need(s, 2) >= 2 && s->b[s->pos + 1] == '\n') {
-            s->pos += 2;
-            return 0;
-        }
-        if (ch == '\n') {
-            s->pos++;
-            return 0;
-        }
-        return 1;
-    }
-}
-
 static double now_s(void)
 {
     struct timespec ts;
@@ -388,87 +231,32 @@ static void on_cancel(int sig)
     if (ss) imdb_session_cancel(ss);
 }
 
-static int run_stmt(void *arg, const char *sql, size_t len)
+/* N1d-2: build/imagedb sql's backend (cli/run.h): the statement on the embedded session (COPY's data through the session's
+ * reader, cli_copy_read), Ctrl-C cancelling it, its result rendered, the handle's warning after */
+static int sql_stmt(cli_runner *rn, const char *sql, size_t len, bool copy_in)
 {
-    runner *rn = arg;
+    (void)copy_in; /* its data comes through the session's reader */
+    imdb_session *ss = rn->ctx;
     imdb_result r;
     imdb_err e = {0};
     char before[512];
-    snprintf(before, sizeof before, "%s", rn->ss->db->warning);
-    /* P2 S10: COPY ... FROM STDIN: its data from the script after it (on the next line), or from stdin */
-    char *own = NULL;
-    copy_src *src = NULL;
-    if (starts_copy(sql, len) && imdb_copy_in_stmt(sql, len)) {
-        if (!(own = imdb_alloc(len, &e))) {
-            print_err("error", &e);
-            rn->failures++;
-            return e.code;
-        }
-        memcpy(own, sql, len); /* the script's buffer moves under the data's reads */
-        if (rn->script) {
-            src = rn->script;
-            src->pos = (size_t)(sql + len - src->b);
-            int k = skip_rest_of_line(src);
-            if (k) {
-                imdb_wipe(own, len);
-                imdb_free(own);
-                fprintf(stderr, "imagedb: error: %s\n", k < 0 ? "reading the script failed"
-                                                           : "COPY ... FROM STDIN: its data starts on the line after it");
-                rn->failures++;
-                return IMDB_ERR_INVALID;
-            }
-        } else {
-            if (!rn->in) {
-                if (!(rn->in = imdb_alloc(sizeof *rn->in, &e)) ||
-                    (memset(rn->in, 0, sizeof *rn->in), !(rn->in->b = imdb_alloc(IMDB_COPY_BUF, &e)))) {
-                    imdb_free(rn->in);
-                    rn->in = NULL;
-                    imdb_wipe(own, len);
-                    imdb_free(own);
-                    print_err("error", &e);
-                    rn->failures++;
-                    return e.code;
-                }
-                rn->in->f = stdin;
-                rn->in->cap = IMDB_COPY_BUF;
-                rn->in->tty = isatty(0);
-            }
-            src = rn->in;
-            if (src->tty) fprintf(stderr, "Enter the data, then a line \\. (or end the input)\n");
-        }
-        src->done = false;
-        src->bol = true;
-        src->inq = false;
-        rn->active = src;
-        sql = own;
-    }
+    snprintf(before, sizeof before, "%s", ss->db->warning);
     /* Ctrl-C while a statement runs cancels it; at the prompt and between statements it does what it always did */
     struct sigaction sa, old;
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = on_cancel;
     sa.sa_flags = SA_RESTART; /* a COMMIT blocked in flock (a receipt, the anchor) or a read goes on: never an EINTR */
     sigemptyset(&sa.sa_mask);
-    atomic_store_explicit(&g_cancel_ss, rn->ss, memory_order_relaxed);
+    atomic_store_explicit(&g_cancel_ss, ss, memory_order_relaxed);
     sigaction(SIGINT, &sa, &old);
     double t0 = now_s();
-    int rc = imdb_exec_one(rn->ss, sql, len, NULL, 0, &r, &e);
+    int rc = imdb_exec_one(ss, sql, len, NULL, 0, &r, &e);
     double dt = now_s() - t0;
     sigaction(SIGINT, &old, NULL);
     atomic_store_explicit(&g_cancel_ss, NULL, memory_order_relaxed);
-    if (src) { /* a COPY that stopped before its data's end: the rest is skipped to it, so the script goes on after */
-        char sink[4096];
-        while (!src->done && copy_read(rn, sink, sizeof sink) > 0) {}
-        imdb_wipe(sink, sizeof sink);
-        rn->active = NULL;
-        imdb_wipe(own, len);
-        imdb_free(own);
-    }
-    int took = src && rn->script ? COPY_TOOK_DATA : 0; /* the splitter resumes after the data */
     if (rc) {
         print_err("error", &e);
-        rn->failures++;
-        /* a cancel stops what remains of the input too: Ctrl-C asked for the run to stop, not for its next statement */
-        return rn->stop_on_error || rc == IMDB_ERR_CANCELLED ? rc : took;
+        return rc;
     }
     if (r.copy_out) { /* P2 S10: stdout holds COPY TO's data alone; its count goes beside it */
         fflush(stdout);
@@ -483,130 +271,8 @@ static int run_stmt(void *arg, const char *sql, size_t len)
     if (rn->timing) printf("Time: %.3f ms\n", dt * 1000);
     fflush(stdout);
     imdb_result_free(&r);
-    if (strcmp(before, rn->ss->db->warning) != 0 && rn->ss->db->warning[0])
-        fprintf(stderr, "imagedb: warning: %s\n", rn->ss->db->warning);
-    return took;
-}
-
-static int run_text(runner *rn, const char *text, size_t len)
-{
-    imdb_err e = {0};
-    int rc = imdb_split_statements(text, len, run_stmt, rn, &e);
-    if (rc && e.code) print_err("error", &e);
-    return rc;
-}
-
-/* A script read in chunks (-f FILE, -f -, piped input): each complete statement runs as it arrives, so a script of any
- * size runs in the memory of its longest statement (IMDB_MAX_SQL) and a chunk; at the end of the stream the rest runs
- * as imdb_split_statements runs a text (an unterminated literal is the error it is). Before 2026-11-04 the whole input
- * was read first, and only its first 16 MiB: a longer script was cut, silently. */
-static int run_stream(runner *rn, FILE *f)
-{
-    enum { CHUNK = 1 << 20 };
-    imdb_err e = {0};
-    copy_src s; /* the script's buffer, which a COPY in it reads its data from too (P2 S10) */
-    memset(&s, 0, sizeof s);
-    s.f = f;
-    s.cap = CHUNK;
-    s.tty = isatty(fileno(f));
-    if (!(s.b = imdb_alloc(s.cap, &e))) { /* the helpers' throughout: imdb_realloc_array credits the old block */
-        print_err("error", &e);
-        return 1;
-    }
-    copy_src *outer = rn->script;
-    rn->script = &s;
-    int rc = 0;
-    for (;;) {
-        if (s.n) {
-            size_t used = 0;
-            imdb_err es = {0};
-            rc = imdb_split_complete(s.b, s.n, run_stmt, rn, &used, &es);
-            if (rc == COPY_TOOK_DATA) { /* a COPY took the data after it: the text goes on after the data's end */
-                src_drop(&s, s.pos);
-                rc = 0;
-                continue;
-            }
-            if (rc) {
-                if (es.code) print_err("error", &es);
-                break;
-            }
-            if (used) src_drop(&s, used);
-        }
-        if (src_full(&s)) {
-            if (s.cap >= (size_t)IMDB_MAX_SQL + CHUNK) {
-                fprintf(stderr, "imagedb: error: a statement longer than %u bytes (no ';' ends it)\n", IMDB_MAX_SQL);
-                rc = 1;
-                break;
-            }
-            char *nb = imdb_realloc_array(s.b, s.cap, s.cap * 2, 1, &e); /* wipes the old block */
-            if (!nb) {
-                print_err("error", &e);
-                rc = 1;
-                break;
-            }
-            s.b = nb;
-            s.cap *= 2;
-        }
-        if (!src_read(&s)) {
-            if (s.err) {
-                fprintf(stderr, "imagedb: error: reading the script: %s\n", strerror(errno));
-                rc = 1;
-                break;
-            }
-            /* the end: the rest runs as a text does (an unterminated literal is the error it is), a COPY's data and what
-             * follows it included */
-            while (s.n) {
-                s.pos = 0;
-                rc = imdb_split_statements(s.b, s.n, run_stmt, rn, &e);
-                if (rc != COPY_TOOK_DATA) {
-                    if (rc && e.code) print_err("error", &e);
-                    break;
-                }
-                src_drop(&s, s.pos);
-                rc = 0;
-            }
-            break;
-        }
-    }
-    rn->script = outer;
-    imdb_wipe(s.b, s.cap);
-    imdb_free(s.b);
-    return rc;
-}
-
-/* Interactive loop: accumulate lines until a statement-terminating ';'. */
-static int repl(runner *rn)
-{
-    char line[8192];
-    imdb_buf acc;
-    imdb_buf_init(&acc);
-    rn->stop_on_error = false;
-    printf("imagedb %s  (\\q to quit, statements end with ;)\n", "0.1");
-    for (;;) {
-        fputs(acc.len ? "   -> " : "imagedb> ", stdout);
-        fflush(stdout);
-        if (!fgets(line, sizeof line, stdin)) break;
-        if (!acc.len && (strncmp(line, "\\q", 2) == 0 || strncmp(line, "quit", 4) == 0)) break;
-        if (!acc.len && strncmp(line, "\\timing", 7) == 0) {
-            rn->timing = !rn->timing;
-            printf("timing is %s\n", rn->timing ? "on" : "off");
-            continue;
-        }
-        imdb_buf_put_str(&acc, line);
-        /* run once the buffer ends with ';' outside a string literal */
-        bool in_str = false, done = false;
-        for (size_t i = 0; i < acc.len; i++) {
-            if (acc.p[i] == '\'') in_str = !in_str;
-            if (!in_str && acc.p[i] == ';') done = true;
-            if (!in_str && acc.p[i] == '-' && i + 1 < acc.len && acc.p[i + 1] == '-')
-                while (i < acc.len && acc.p[i] != '\n') i++;
-        }
-        if (done && !in_str) {
-            run_text(rn, (const char *)acc.p, acc.len);
-            acc.len = 0;
-        }
-    }
-    imdb_buf_free(&acc);
+    if (strcmp(before, ss->db->warning) != 0 && ss->db->warning[0])
+        fprintf(stderr, "imagedb: warning: %s\n", ss->db->warning);
     return 0;
 }
 
@@ -660,14 +326,14 @@ static int cmd_sql(int argc, char **argv)
     imdb_session ss;
     imdb_session_init(&ss, db);
     ss.cross_check = cross;
-    runner rn = {.ss = &ss, .csv = csv, .stop_on_error = true};
-    imdb_session_copy_io(&ss, copy_read, copy_write, &rn); /* P2 S10: COPY's data through the CLI's streams */
+    cli_runner rn = {.stmt = sql_stmt, .ctx = &ss, .csv = csv, .stop_on_error = true}; /* N1d-2: cli/run.h */
+    imdb_session_copy_io(&ss, cli_copy_read, cli_copy_write, &rn); /* P2 S10: COPY's data through the CLI's streams */
     int rc = 0;
     bool ran = false;
     for (int i = 3; i < argc && !rc; i++) {
         if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
             const char *q = argv[++i];
-            rc = run_text(&rn, q, strlen(q));
+            rc = cli_run_text(&rn, q, strlen(q));
             ran = true;
         } else if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
             FILE *f = strcmp(argv[i + 1], "-") == 0 ? stdin : fopen(argv[i + 1], "rb");
@@ -677,23 +343,19 @@ static int cmd_sql(int argc, char **argv)
                 rc = 1;
                 break;
             }
-            rc = run_stream(&rn, f);
+            rc = cli_run_stream(&rn, f);
             if (f != stdin) fclose(f);
             ran = true;
         }
     }
     if (!ran && !rc) {
         if (isatty(0)) {
-            repl(&rn);
+            cli_repl(&rn);
         } else {
-            rc = run_stream(&rn, stdin);
+            rc = cli_run_stream(&rn, stdin);
         }
     }
-    if (rn.in) { /* P2 S10 */
-        imdb_wipe(rn.in->b, rn.in->cap);
-        imdb_free(rn.in->b);
-        imdb_free(rn.in);
-    }
+    cli_runner_end(&rn); /* P2 S10 */
     if (ss.txn.open) fprintf(stderr, "imagedb: open transaction rolled back at exit\n");
     imdb_session_close(&ss);
     if (imdb_close(db) != IMDB_OK) {
@@ -1818,7 +1480,7 @@ int main(int argc, char **argv)
         imdb_db *db = open_or_die(argv[2], true, 0); /* read-only: a live primary's or a replica's, never the writer's */
         if (!db) return 1;
         imdb_err de = {0};
-        int rc = imdb_dump_ex(db, batch, flags, copy_write, NULL, &de);
+        int rc = imdb_dump_ex(db, batch, flags, cli_copy_write, NULL, &de);
         if (!rc && fflush(stdout) != 0) rc = imdb_fail(&de, IMDB_ERR_IO, "dump: writing stdout failed");
         imdb_close(db);
         if (rc) {

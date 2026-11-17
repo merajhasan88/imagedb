@@ -5,10 +5,12 @@
  * decoded is the engine's cell, compared here field by field (not through conv.c). */
 #include <string.h>
 
+#include "../../cli/netres.h"
 #include "../../server/conv.h"
 #include "../../src/codec.h"
 #include "../../src/db.h"
 #include "../../src/log.h"
+#include "../../src/tz.h"
 #include "test.h"
 
 static imdb_session g_s;
@@ -327,6 +329,237 @@ static void t_conv_results(void)
     CHECK(imdbw_live_blocks() == live);
 }
 
+/* N1d-2: r through the wire (COLUMNS, ROWS cut at target, DONE: encoded, then decoded as a client decodes them) and
+ * rebuilt by the shell's builder (cli/netres.c) into out, TIMESTAMPTZ offsets from zone */
+static bool rebuild(const imdb_result *r, size_t target, const imdb_tz *zone, imdb_result *out)
+{
+    imdb_result_init(out);
+    bool ok = true;
+    imdbw_msg cols, dcols, d, dd;
+    imdbw_buf cb, b;
+    imdbw_buf_init(&cb);
+    imdbw_buf_init(&b);
+    memset(&dcols, 0, sizeof dcols);
+    if (r->ncols) {
+        ok = imdbw_columns_of(r, &cols, &ce) == 0;
+        if (ok) imdbw_msg_put(&cb, &cols, NULL);
+        ok = ok && !cb.err && imdbw_msg_get(IMDBW_COLUMNS, cb.p + IMDBW_HEAD, cb.len - IMDBW_HEAD, NULL, &dcols, &ce) == 0 &&
+             cli_res_cols(out, &dcols, &ce) == 0;
+        uint64_t next = 0;
+        while (ok && next < r->nrows) {
+            imdbw_buf_reset(&b);
+            ok = imdbw_rows_of(r, &cols, &next, target, &b, &ce) == 0;
+            for (size_t at = 0; ok && at < b.len;) {
+                uint32_t len;
+                uint8_t type;
+                imdbw_msg m;
+                ok = imdbw_head_get(b.p + at, true, &len, &type, &ce) == 0 &&
+                     imdbw_msg_get(type, b.p + at + IMDBW_HEAD, len - 1, &dcols, &m, &ce) == 0;
+                if (ok) ok = cli_res_rows(out, &dcols, &m, zone, &ce) == 0;
+                if (ok) imdbw_msg_free(&m);
+                at += 4 + (size_t)len;
+            }
+        }
+        imdbw_msg_free(&cols);
+    }
+    imdbw_done_of(r, &d);
+    imdbw_buf_reset(&b);
+    imdbw_msg_put(&b, &d, NULL);
+    if (ok && !b.err && imdbw_msg_get(IMDBW_DONE, b.p + IMDBW_HEAD, b.len - IMDBW_HEAD, NULL, &dd, &ce) == 0) {
+        cli_res_done(out, &dd);
+        imdbw_msg_free(&dd);
+    } else {
+        ok = false;
+    }
+    imdbw_msg_free(&dcols); /* (out's labels are its own: imdb_enumdef_make copied them) */
+    imdbw_buf_free(&b);
+    imdbw_buf_free(&cb);
+    return ok;
+}
+
+/* r rendered as the CLI renders it (csv or a table) and as the shell renders its rebuilt copy: the same bytes, but the
+ * access path, which the wire does not carry (cleared from r first) */
+static bool renders_alike(imdb_result *r, const imdb_tz *zone, const char *sql)
+{
+    r->path[0] = 0;
+    bool ok = true;
+    for (size_t target = 1; target <= 1u << 20 && ok; target <<= 10) {
+        imdb_result o;
+        if (!rebuild(r, target, zone, &o)) {
+            fprintf(stderr, "    %s: not rebuilt: %s\n", sql, ce.msg);
+            imdb_result_free(&o);
+            return false;
+        }
+        for (int csv = 0; csv < 2 && ok; csv++) {
+            imdb_buf x, y;
+            imdb_buf_init(&x);
+            imdb_buf_init(&y);
+            imdb_result_render(r, csv, &x);
+            imdb_result_render(&o, csv, &y);
+            ok = !x.err && !y.err && x.len == y.len && !memcmp(x.p, y.p, x.len);
+            if (!ok)
+                fprintf(stderr, "    %s (csv %d, target %zu): the engine's\n%.*s    the rebuilt\n%.*s", sql, csv, target,
+                        (int)x.len, (const char *)x.p, (int)y.len, (const char *)y.p);
+            imdb_buf_free(&x);
+            imdb_buf_free(&y);
+        }
+        imdb_result_free(&o);
+    }
+    return ok;
+}
+
+/* N1d-2: every corpus result rendered by the CLI and by the shell from the wire alike (cli/netres.c), in UTC and in New
+ * York across its spring change; then the builder's refusals of a hostile server's frames */
+static void t_conv_render(void)
+{
+    int64_t live = imdbw_live_blocks();
+    imdb_db *db = open_fresh();
+    CHECK(db);
+    imdb_result r;
+    bool fine = true;
+    for (size_t i = 0; i < sizeof kSetup / sizeof *kSetup; i++) {
+        if (exec(kSetup[i], NULL, 0, &r)) fprintf(stderr, "    setup %zu: %s\n", i, ce.msg), fine = false;
+        imdb_result_free(&r);
+    }
+    static const char *const zsetup[] = {
+        "CREATE TABLE zz (id INT64 PRIMARY KEY, t TIMESTAMPTZ)",
+        "INSERT INTO zz VALUES (1, TIMESTAMPTZ '2026-03-08 06:30:00+00'), (2, TIMESTAMPTZ '2026-03-08 07:30:00+00'), "
+        "(3, TIMESTAMPTZ '2026-11-01 05:30:00+00'), (4, TIMESTAMPTZ '2026-11-01 06:30:00+00'), (5, NULL)",
+    };
+    for (size_t i = 0; i < 2; i++) {
+        if (exec(zsetup[i], NULL, 0, &r)) fprintf(stderr, "    zone setup %zu: %s\n", i, ce.msg), fine = false;
+        imdb_result_free(&r);
+    }
+    SOFT(fine);
+    imdb_tz *ny = NULL;
+    imdb_err ze = {0};
+    SOFT(imdb_tz_load("/usr/share/zoneinfo", "America/New_York", 16, &ny, &ze) == 0);
+    int ran = 0;
+    for (int z = 0; z < 2 && fine; z++) {
+        if (z) {
+            SOFT(exec("SET TIME ZONE 'America/New_York'", NULL, 0, &r) == 0);
+            imdb_result_free(&r);
+        }
+        for (size_t i = 0; fine && i <= sizeof kCorpus / sizeof *kCorpus; i++) {
+            const char *sql = i < sizeof kCorpus / sizeof *kCorpus ? kCorpus[i] : "SELECT id, t FROM zz ORDER BY id";
+            if (!strcmp(sql, "BEGIN") || !strcmp(sql, "ROLLBACK") || !strncmp(sql, "CREATE TABLE z ", 15) ||
+                !strncmp(sql, "INSERT INTO a (id, t)", 21) || !strncmp(sql, "DELETE", 6) || !strncmp(sql, "INSERT INTO a (id)", 18))
+                continue; /* (writes run once: the first pass's) */
+            if (exec(sql, NULL, 0, &r)) {
+                fprintf(stderr, "    %s: %s\n", sql, ce.msg);
+                fine = false;
+            } else {
+                fine = renders_alike(&r, z ? ny : NULL, sql);
+                ran++;
+            }
+            imdb_result_free(&r);
+        }
+    }
+    SOFT(fine && ran > 100);
+    /* the builder's refusals: a second COLUMNS, a COLUMNS past a result's columns, ROWS before COLUMNS, an ENUM value no
+     * label of its column names */
+    imdb_result o;
+    imdb_result_init(&o);
+    imdbw_col cs[IMDB_MAX_COLS + 8];
+    memset(cs, 0, sizeof cs);
+    imdbw_text lab = {(const uint8_t *)"a", 1};
+    cs[0].type = IMDBW_T_ENUM, cs[0].labels = &lab, cs[0].nlabels = 1;
+    imdbw_msg cm = {.type = IMDBW_COLUMNS, .cols = cs, .ncols = IMDB_MAX_COLS + 5};
+    SOFT(cli_res_cols(&o, &cm, &ce) == IMDB_ERR_CORRUPT); /* past the result's columns */
+    imdbw_msg rm = {.type = IMDBW_ROWS, .nsets = 1};
+    SOFT(cli_res_rows(&o, NULL, &rm, NULL, &ce) == IMDB_ERR_CORRUPT); /* before COLUMNS */
+    cm.ncols = 1;
+    SOFT(cli_res_rows(&o, &cm, &rm, NULL, &ce) == IMDB_ERR_CORRUPT); /* a result that took no COLUMNS */
+    cm.ncols = 1;
+    SOFT(cli_res_cols(&o, &cm, &ce) == 0 && cli_res_cols(&o, &cm, &ce) == IMDB_ERR_CORRUPT); /* a second */
+    cm.ncols = 2;
+    SOFT(cli_res_rows(&o, &cm, &rm, NULL, &ce) == IMDB_ERR_CORRUPT); /* ROWS of another count than its COLUMNS' */
+    cm.ncols = 1;
+    imdbw_buf vb;
+    imdbw_buf_init(&vb);
+    imdbw_value bv = {.type = IMDBW_T_ENUM, .s = (const uint8_t *)"b", .len = 1};
+    imdbw_value_put(&vb, &bv);
+    rm.vals = (imdbw_span){vb.p, vb.len, 1};
+    SOFT(!vb.err && cli_res_rows(&o, &cm, &rm, NULL, &ce) == IMDB_ERR_CORRUPT); /* no label "b" */
+    imdbw_buf_free(&vb);
+    /* COLUMNS and ROWS past DONE refused (N1d's review: a ROWS past DONE kept offsets DONE never made pointers) */
+    {
+        imdb_result o2;
+        memset(&ce, 0, sizeof ce); /* (imdb_fail keeps a first error) */
+        imdb_result_init(&o2);
+        imdbw_value av = {.type = IMDBW_T_ENUM, .s = (const uint8_t *)"a", .len = 1};
+        imdbw_buf_init(&vb);
+        imdbw_value_put(&vb, &av);
+        imdbw_msg r1 = {.type = IMDBW_ROWS, .nsets = 1, .vals = {vb.p, vb.len, 1}};
+        imdbw_msg dm = {.type = IMDBW_DONE};
+        SOFT(!vb.err && cli_res_cols(&o2, &cm, &ce) == 0 && cli_res_rows(&o2, &cm, &r1, NULL, &ce) == 0 && o2.nrows == 1);
+        cli_res_done(&o2, &dm);
+        SOFT(o2.cells[0].v.s && o2.cells[0].v.len == 1 && o2.cells[0].v.s[0] == 'a');
+        SOFT(cli_res_rows(&o2, &cm, &r1, NULL, &ce) == IMDB_ERR_CORRUPT && o2.nrows == 1);
+        memset(&ce, 0, sizeof ce);
+        SOFT(cli_res_cols(&o2, &cm, &ce) == IMDB_ERR_CORRUPT);
+        imdbw_buf_free(&vb);
+        imdb_result_free(&o2);
+    }
+    /* the engine's cap on a result: NULLs a byte each on the wire, a cell each here, refused past it */
+    {
+        imdb_result o3;
+        memset(&ce, 0, sizeof ce);
+        imdb_result_init(&o3);
+        o3.byte_cap = 1u << 14;
+        imdbw_col ic = {.type = IMDBW_T_INT64};
+        imdbw_msg im = {.type = IMDBW_COLUMNS, .cols = &ic, .ncols = 1};
+        imdbw_buf_init(&vb);
+        imdbw_value nv = {.type = IMDBW_T_INT64, .null = true};
+        for (int k = 0; k < 4096; k++) imdbw_value_put(&vb, &nv);
+        imdbw_msg r2 = {.type = IMDBW_ROWS, .nsets = 4096, .vals = {vb.p, vb.len, 4096}};
+        SOFT(!vb.err && cli_res_cols(&o3, &im, &ce) == 0 && cli_res_rows(&o3, &im, &r2, NULL, &ce) == IMDB_ERR_LIMIT &&
+             o3.nrows < 4096);
+        memset(&ce, 0, sizeof ce);
+        imdb_result_free(&o3);
+        imdb_result_init(&o3);
+        SOFT(cli_res_cols(&o3, &im, &ce) == 0 && cli_res_rows(&o3, &im, &r2, NULL, &ce) == 0 && o3.nrows == 4096);
+        imdbw_buf_free(&vb);
+        imdb_result_free(&o3);
+    }
+    /* the reply's order (cli_order_next): a statement's messages, its DONE or ERROR, then READY */
+    {
+        static const struct {
+            const char *seq; /* C COLUMNS, R ROWS, I COPY_IN, O COPY_OUT, D DONE, E ERROR, W WARNING, Y READY */
+            int bad;         /* the message refused (its index), or -1 */
+        } os[] = {
+            {"CRRDY", -1}, {"DY", -1}, {"EY", -1}, {"OODY", -1}, {"IDY", -1}, {"WCRDWY", -1}, {"DWY", -1}, {"IEY", -1},
+            {"CRY", 2},    {"Y", 0},   {"CRDRY", 3}, {"DCY", 1}, {"DDY", 1},   {"EDY", 1},  {"DEY", 1}, {"DOY", 1},
+            {"EIY", 1},    {"OY", 1},  {"WY", 1},
+        };
+        for (size_t i = 0; i < sizeof os / sizeof os[0]; i++) {
+            cli_order ord = {0};
+            int bad = -1;
+            for (int k = 0; os[i].seq[k] && bad < 0; k++) {
+                const char *p = strchr("CRIODEWY", os[i].seq[k]);
+                static const uint8_t ty[] = {IMDBW_COLUMNS, IMDBW_ROWS,  IMDBW_COPY_IN, IMDBW_COPY_OUT,
+                                             IMDBW_DONE,    IMDBW_ERROR, IMDBW_WARNING, IMDBW_READY};
+                imdb_err oe = {0};
+                if (cli_order_next(&ord, ty[p - "CRIODEWY"], &oe)) bad = k;
+                if (bad >= 0 && oe.code != IMDB_ERR_CORRUPT) bad = 99;
+            }
+            SOFT(bad == os[i].bad);
+            if (bad != os[i].bad) fprintf(stderr, "    order %s: refused at %d\n", os[i].seq, bad);
+        }
+        /* an ERROR's code as the engine's */
+        SOFT(cli_res_code(15) == IMDB_ERR_CANCELLED && cli_res_code(4096) == -4096 && cli_res_code(4097) == IMDB_ERR_INVALID &&
+             cli_res_code(0xFFFFFFFFu) == IMDB_ERR_INVALID && cli_res_code(0x80000000u) == IMDB_ERR_INVALID &&
+             cli_res_code(0) == IMDB_ERR_INVALID);
+    }
+    imdb_result_free(&o);
+    if (ny) {
+        imdb_tz_free(ny);
+        imdb_free(ny);
+    }
+    close_fresh(db);
+    CHECK(imdbw_live_blocks() == live);
+}
+
 /* every wire value as a parameter: SELECT $1 gives it back, through the engine and the conversion, the same bytes */
 static void t_conv_params(void)
 {
@@ -513,5 +746,6 @@ const test_case conv_tests[] = {
     {"conv_types", t_conv_types},
     {"conv_results", t_conv_results},
     {"conv_params", t_conv_params},
+    {"conv_render", t_conv_render},
 };
 const size_t conv_ntests = sizeof conv_tests / sizeof *conv_tests;

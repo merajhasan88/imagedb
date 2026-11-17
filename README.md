@@ -167,6 +167,59 @@ Untested: other systems and architectures, other file systems (XFS, btrfs,
 network file systems), a CPU without AVX2 (its code path runs only under
 `IMDB_NO_SIMD=1`), AVX-512 and SHA-NI machines.
 
+## Server and client
+
+`imagedb-server` serves one database over imagedb's own protocol (IMDBWIR1) on a
+Unix-domain socket and, if asked, on TCP with TLS 1.3. `imagedb-client` is its
+shell, and `build/libimagedb-client.a` (header `client/imagedb_client.h`) the C
+client. They link OpenSSL 3, so `make server` builds them and `make
+install-server` installs them; `make` and `make install` stay the engine's, which
+links only libc and pthread.
+
+```sh
+make server             # build/imagedb-server, build/imagedb-client, build/libimagedb-client.a
+build/imagedb sql /data/p -c "CREATE ROLE admin LOGIN SUPERUSER PASSWORD 'secret'"
+mkdir -m 700 /srv/imagedb
+build/imagedb-server cert /srv/imagedb --name db.example.com   # a private CA and the server's certificate; prints the pin
+build/imagedb-server /data/p --socket /run/imagedb/s --server-dir /srv/imagedb --tcp 0.0.0.0:5544
+IMAGEDB_PASSWORD=secret build/imagedb-client --socket /run/imagedb/s --user admin -f script.sql
+build/imagedb-client --host db.example.com --port 5544 --ca /srv/imagedb/tls/ca.crt --user admin
+```
+
+- **Logins** are SCRAM-SHA-256 against the database's roles (`CREATE ROLE ...
+  PASSWORD`). Until privileges are enforced on every statement (a later step), only
+  SUPERUSER roles log in. The first role is made with the embedded CLI, whose access
+  is the file system's. An unknown name and a wrong password are refused alike.
+- **TCP** is TLS 1.3 alone (ALPN `imdbwir1`): no plaintext, no fallback to the
+  socket. The client names the CA's certificate (`ca.crt`, the host checked against
+  the server certificate's names) or pins the server's key (`--pin`, the 64 hex
+  digits `cert` prints). The login's proof is bound to its TLS session, so a relay
+  that terminates TLS cannot use it. `cert --renew` signs the same key again (the pin
+  and `ca.crt` keep working); the server warns at its start when under 30 days are
+  left. From one address, at most 8 connections authenticate at once and at most a
+  quarter of `--max-conns` wait or authenticate (the rest are closed unread); the
+  socket keeps 16 connections TCP cannot take.
+- **imagedb-client** runs scripts as `imagedb sql` does (`-c`, `-f`, piped stdin,
+  COPY's inline data to a line `\.`, the REPL) and prints each result as it does but
+  the access path (`[scan]` after a row count or a status), which the protocol does
+  not carry. Ctrl-C cancels the running statement. The password comes from
+  `IMAGEDB_PASSWORD` or the terminal. A TIMESTAMPTZ is shown in the session's zone
+  by the client's own zone files (`--zoneinfo`): the server sends the instant.
+- **COPY** through the server is spooled, so the engine, whose one thread runs every
+  session's statements, never waits on a client's network. COPY ... FROM STDIN's data
+  is held whole in an unnamed file under the spool directory (`--spool-dir`, by
+  default the server directory's `spool/`) before the statement runs, so an error in
+  the data is reported after the whole upload. COPY ... TO STDOUT runs into a ring of
+  `--copy-ring` bytes its client drains; a client reading slower than that past it
+  makes the engine wait at most `--copy-wait` in all, then the statement fails.
+  Every spool's bytes held at once are bounded by `--copy-spool`. A COPY whose data
+  stops arriving for `--copy-idle` (30 s) ends its connection: type COPY's data at
+  the REPL within that, or pipe it.
+- **Shutdown:** SIGTERM takes no new connection, lets running statements end, rolls
+  back open transactions and closes the database durable; a second signal cancels
+  the running statements. A failed sync stops the server with exit status 1 for its
+  supervisor to restart it (the reopen decides, as the watermark rules say).
+
 ## Durability and recovery
 
 - The writer keeps a **durable watermark** (`DURABLE`): the last commit whose
@@ -571,6 +624,24 @@ Command-line options (`imagedb` with no arguments prints the commands):
 | `--root-key FILE` | promote | the root key certifying the promotion | |
 | `--abandon` | promote | with `--anchor`: drops old-writer commits past its cut | refused |
 | `--old-writer-stopped` | promote | without an anchor: your word that the old writer is stopped | |
+| `--socket PATH` | imagedb-server, imagedb-client | the server's Unix-domain socket (made 0600; its directory is yours to keep 0700) | required (the server) |
+| `--server-dir SDIR` | imagedb-server | the server's directory: its secret (made once, 0600), `tls/` (`cert`) and `spool/` | required |
+| `--tcp ADDR:PORT` | imagedb-server | TLS 1.3 on TCP beside the socket (`[::1]:5544` for IPv6; port 0: any, printed) | none |
+| `--max-conns N` | imagedb-server | connections at once; one past it is closed unread | 256 |
+| `--spool-dir DIR` | imagedb-server | where COPY's spool files go (0700; unnamed files) | SDIR/spool |
+| `--copy-spool BYTES` | imagedb-server | every COPY's spooled bytes at once (K, M or G); a COPY FROM's data past it fails at once | 4G |
+| `--copy-ring BYTES` | imagedb-server | a COPY TO's output held before its client takes it | 256M |
+| `--copy-wait MS` | imagedb-server | the engine's waits for a slow COPY TO reader, in all for one statement | 60000 |
+| `--copy-idle MS` | imagedb-server | a COPY's data arriving at none this long ends its connection | 30000 |
+| `--name NAME` | imagedb-server cert | another name in the certificate's subjectAltName (localhost, 127.0.0.1, ::1 always); repeatable | |
+| `--renew` | imagedb-server cert | the same key signed again by the same CA (the pin kept) | |
+| `--host HOST`, `--port PORT` | imagedb-client | TCP with TLS 1.3 | |
+| `--ca FILE` | imagedb-client | the CA's certificate (`tls/ca.crt`): the server's names checked | one of the two |
+| `--pin HEX` | imagedb-client | the server key's SPKI SHA-256, as `cert` printed it | one of the two |
+| `--user NAME` | imagedb-client | the role to log in as | required |
+| `--identity` | imagedb-client | each read point's line, as `SET identity = on` prints it in `imagedb sql` | off |
+| `--zoneinfo DIR` | imagedb-client | the zone files a session's zone is shown by | `/usr/share/zoneinfo` |
+| `-c SQL`, `-f FILE`, `--csv` | imagedb-client | as in `imagedb sql` | |
 
 Session settings (`SET name = value`; each session's own, from the next
 statement):
@@ -603,6 +674,7 @@ Environment variables:
 
 | Variable | What it does |
 |---|---|
+| `IMAGEDB_PASSWORD` | imagedb-client: the role's password (else asked for on the terminal, without echo) |
 | `IMDB_THREADS=N` | the worker pool's size (default: the CPUs the process may use); 1 runs every parallel loop inline |
 | `IMDB_NO_SIMD=1` | the C reference kernels and the reference Ed25519, whatever the CPU |
 | `IMDB_EVICT=eager` | a test mode: every publish evicts what it can (reads below the floor go to the lake) |

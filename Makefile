@@ -47,14 +47,16 @@ HDR     = $(wildcard src/*.h src/vendor/monocypher/*.h)
 LIB     = $(BUILD)/libimagedb.a
 BIN     = $(BUILD)/imagedb
 SERVER  = $(BUILD)/imagedb-server
+CLIENTBIN = $(BUILD)/imagedb-client
+CLIENTLIB = $(BUILD)/libimagedb-client.a
 
 TSRC    = $(wildcard tests/unit/*.c)
 TOBJ    = $(TSRC:tests/unit/%.c=$(BUILD)/tobj/%.o) $(BUILD)/tobj/acrypto.o $(BUILD)/tobj/afsum.o $(BUILD)/tobj/abind.o \
           $(BUILD)/tobj/apq.o $(BUILD)/tobj/aice.o $(BUILD)/tobj/wire.o $(BUILD)/tobj/conv.o $(BUILD)/tobj/srv.o \
-          $(BUILD)/tobj/client.o $(BUILD)/tobj/tls.o $(BUILD)/tobj/spool.o
+          $(BUILD)/tobj/client.o $(BUILD)/tobj/tls.o $(BUILD)/tobj/spool.o $(BUILD)/tobj/netres.o
 TBIN    = $(BUILD)/test_unit
 
-.PHONY: all server lint test unit san tsan ct fuzz fuzz-run bench whole index-sum mem-split join-cost workload clean integration faults soak oracle install uninstall parquet-check iceberg-check
+.PHONY: all server install-server uninstall-server lint test unit san tsan ct fuzz fuzz-run bench whole index-sum mem-split join-cost workload clean integration faults soak oracle install uninstall parquet-check iceberg-check
 
 AUDIT   = $(BUILD)/imagedb-audit
 ASRC    = tools/audit/audit.c tools/audit/acrypto.c tools/audit/afsum.c tools/audit/abind.c tools/audit/apq.c tools/audit/aice.c
@@ -63,7 +65,7 @@ all: $(BIN) $(AUDIT)
 
 # N1b, N1c: the server (build/imagedb-server, which links OpenSSL: TLS on TCP), out of all so that `make` builds the
 # engine with libc and pthread alone; the suite builds it (its order-only prerequisite: t_server runs it)
-server: $(SERVER)
+server: $(SERVER) $(CLIENTBIN) $(CLIENTLIB) $(BUILD)/client-link
 
 # make install (P1 A1): the CLI and the auditor, the static library, the README and the licence; DESTDIR stages
 # it (a package). A sanitizer build (SAN=1) is never installed.
@@ -83,6 +85,26 @@ uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/imagedb $(DESTDIR)$(PREFIX)/bin/imagedb-audit $(DESTDIR)$(PREFIX)/lib/libimagedb.a
 	rm -f $(DESTDIR)$(PREFIX)/share/doc/imagedb/README.md $(DESTDIR)$(PREFIX)/share/doc/imagedb/LICENSE
 	-rmdir $(DESTDIR)$(PREFIX)/share/doc/imagedb
+
+# N1d-2: the server, its shell and the C client's library and headers (they link OpenSSL: out of `make install`, which
+# installs the engine alone). The headers keep their directories, so their relative includes hold:
+# #include <imagedb/client/imagedb_client.h> with -I$(PREFIX)/include, then -limagedb-client -lssl -lcrypto -pthread
+CLIENT_HDRS = client/imagedb_client.h server/wire.h src/util.h src/limits.h
+ifneq ($(SAN),)
+install-server:
+	@echo "make install-server: not a sanitizer build (SAN=1)"; exit 1
+else
+install-server: $(SERVER) $(CLIENTBIN) $(CLIENTLIB)
+	install -d $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/lib $(addprefix $(DESTDIR)$(PREFIX)/include/imagedb/,client server src)
+	install -m 0755 $(SERVER) $(CLIENTBIN) $(DESTDIR)$(PREFIX)/bin/
+	install -m 0644 $(CLIENTLIB) $(DESTDIR)$(PREFIX)/lib/
+	for h in $(CLIENT_HDRS); do install -m 0644 $$h $(DESTDIR)$(PREFIX)/include/imagedb/$$h || exit 1; done
+endif
+
+uninstall-server:
+	rm -f $(DESTDIR)$(PREFIX)/bin/imagedb-server $(DESTDIR)$(PREFIX)/bin/imagedb-client $(DESTDIR)$(PREFIX)/lib/libimagedb-client.a
+	for h in $(CLIENT_HDRS); do rm -f $(DESTDIR)$(PREFIX)/include/imagedb/$$h; done
+	-rmdir $(addprefix $(DESTDIR)$(PREFIX)/include/imagedb/,client server src) $(DESTDIR)$(PREFIX)/include/imagedb
 
 # The independent verifier shares no code with src/ (see tools/audit/acrypto.h).
 $(AUDIT): $(ASRC) tools/audit/acrypto.h tools/audit/afsum.h tools/audit/abind.h tools/audit/apq.h tools/audit/aice.h | $(BUILD)/obj
@@ -107,10 +129,14 @@ $(LIB): $(OBJ)
 	rm -f $@
 	ar rcs $@ $^
 
-$(BIN): $(BUILD)/obj/main.o $(LIB)
+$(BIN): $(BUILD)/obj/main.o $(BUILD)/obj/cli_run.o $(LIB)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-$(BUILD)/obj/main.o: src/main.c $(HDR) | $(BUILD)/obj
+$(BUILD)/obj/main.o: src/main.c cli/run.h $(HDR) | $(BUILD)/obj
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# N1d-2: the SQL shell's runner (cli/run.c), build/imagedb's and build/imagedb-client's: never in libimagedb.a
+$(BUILD)/obj/cli_run.o: cli/run.c cli/run.h $(HDR) | $(BUILD)/obj
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/tobj/%.o: tests/unit/%.c $(HDR) tests/unit/test.h | $(BUILD)/tobj
@@ -153,6 +179,27 @@ $(BUILD)/tobj/tls.o: server/tls.c server/tls.h server/wire.h $(HDR) | $(BUILD)/t
 $(SERVER): server/main.c server/srv.h $(BUILD)/tobj/srv.o $(BUILD)/tobj/conv.o $(BUILD)/tobj/wire.o $(BUILD)/tobj/tls.o $(BUILD)/tobj/spool.o $(LIB)
 	$(CC) $(CFLAGS) server/main.c $(BUILD)/tobj/srv.o $(BUILD)/tobj/conv.o $(BUILD)/tobj/wire.o $(BUILD)/tobj/tls.o $(BUILD)/tobj/spool.o $(LIB) -o $@ \
 	  $(LDFLAGS) -lssl -lcrypto
+
+# N1d-2: the C client's library (client/imagedb_client.h): the client, the codec, TLS and what they take of the engine's
+# sources (util, sha256, scram, fsio); OpenSSL at the application's link
+$(CLIENTLIB): $(BUILD)/tobj/client.o $(BUILD)/tobj/wire.o $(BUILD)/tobj/tls.o $(BUILD)/obj/util.o $(BUILD)/obj/sha256.o \
+              $(BUILD)/obj/scram.o $(BUILD)/obj/fsio.o
+	rm -f $@ && ar rcs $@ $^
+
+# N1d-2: imagedb-client, the network shell: the runner (cli/run.c), the result's conversion (conv.c), the client's
+# library, and libimagedb.a for the splitter, the renderer and the zones (it opens no database)
+# N1d-2: an application of the client's library alone (no libimagedb.a): the library holds all it needs
+$(BUILD)/client-link: tests/client_link/main.c client/imagedb_client.h $(CLIENTLIB)
+	$(CC) $(CFLAGS) tests/client_link/main.c $(CLIENTLIB) -o $@ $(LDFLAGS) -lssl -lcrypto
+
+$(CLIENTBIN): cli/shell.c cli/run.h cli/netres.h client/imagedb_client.h $(BUILD)/obj/cli_run.o $(BUILD)/tobj/netres.o \
+              $(BUILD)/tobj/conv.o $(CLIENTLIB) $(LIB)
+	$(CC) $(CFLAGS) cli/shell.c $(BUILD)/obj/cli_run.o $(BUILD)/tobj/netres.o $(BUILD)/tobj/conv.o $(CLIENTLIB) $(LIB) -o $@ \
+	  $(LDFLAGS) -lssl -lcrypto
+
+# N1d-2: a result rebuilt from the wire (cli/netres.c): the shell's, and the suite's round trip (t_conv)
+$(BUILD)/tobj/netres.o: cli/netres.c cli/netres.h server/conv.h server/wire.h $(HDR) | $(BUILD)/tobj
+	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/tobj/wire.o: server/wire.c server/wire.h $(HDR) | $(BUILD)/tobj
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -205,7 +252,7 @@ lint:
 # stage 3b): every read below the memory floor then goes to the lake, as a long-running copy's would.
 # The fourth and fifth keep no segment image between operations (IMDB_SEGCACHE=tiny, stage 3c-1), without the eager
 # mode and with it: every image is read again at its next use, under the held versions' ends and below the floor.
-test: lint $(TBIN) $(BIN) $(AUDIT) $(FORGE)
+test: lint $(TBIN) $(BIN) $(AUDIT) $(FORGE) $(SERVER) $(CLIENTBIN)
 	IMDB_AUDIT_BIN=$(AUDIT) $(TBIN)
 	IMDB_FAULT_SKIP=1 IMDB_NO_SIMD=1 IMDB_THREADS=1 $(TBIN)
 	IMDB_FAULT_SKIP=1 IMDB_EVICT=eager IMDB_AUDIT_BIN=$(AUDIT) $(TBIN)
@@ -216,10 +263,12 @@ test: lint $(TBIN) $(BIN) $(AUDIT) $(FORGE)
 	IMDB_EVICT=eager bash tests/integration/run.sh $(BIN)
 	IMDB_SEGCACHE=tiny bash tests/integration/run.sh $(BIN)
 	bash tests/integration/audit_reject.sh $(BIN)
+	bash tests/integration/client.sh $(BIN) # N1d-2: imagedb-client against imagedb sql
 
-integration: $(BIN) $(AUDIT) $(FORGE)
+integration: $(BIN) $(AUDIT) $(FORGE) $(SERVER) $(CLIENTBIN)
 	bash tests/integration/run.sh $(BIN)
 	bash tests/integration/audit_reject.sh $(BIN)
+	bash tests/integration/client.sh $(BIN)
 
 # Every fault point (not every 7th) of every scenario, on the build disk instead of tmpfs.
 faults: $(TBIN) $(AUDIT)
@@ -239,7 +288,8 @@ soak: $(BIN) $(LIB) $(AUDIT)
 SANRUN = setarch $(shell uname -m) -R
 
 san: lint
-	$(MAKE) SAN=1 build-san/test_unit build-san/imagedb build-san/imagedb-audit build-san/imdb-forge
+	$(MAKE) SAN=1 build-san/test_unit build-san/imagedb build-san/imagedb-audit build-san/imdb-forge build-san/imagedb-server \
+	  build-san/imagedb-client
 	IMDB_AUDIT_BIN=build-san/imagedb-audit $(SANRUN) build-san/test_unit
 	IMDB_FAULT_SKIP=1 IMDB_NO_SIMD=1 IMDB_THREADS=1 $(SANRUN) build-san/test_unit
 	IMDB_FAULT_SKIP=1 IMDB_EVICT=eager IMDB_AUDIT_BIN=build-san/imagedb-audit $(SANRUN) build-san/test_unit
@@ -250,6 +300,7 @@ san: lint
 	IMDB_EVICT=eager bash tests/integration/run.sh build-san/imagedb
 	IMDB_SEGCACHE=tiny bash tests/integration/run.sh build-san/imagedb
 	bash tests/integration/audit_reject.sh build-san/imagedb
+	bash tests/integration/client.sh build-san/imagedb
 
 FUZZ_TARGETS = $(patsubst fuzz/%.c,build-fuzz/%,$(wildcard fuzz/fuzz_*.c))
 FUZZ_ASM     = $(ASMSRC:asm/%.asm=build-fuzz/asm/%.o)
@@ -425,7 +476,7 @@ TSAN_FLAGS = -std=c11 -D_GNU_SOURCE -g -O1 -ffp-contract=off -fsanitize=thread -
 tsan:
 	mkdir -p build-tsan
 	clang $(TSAN_FLAGS) $(filter-out src/main.c,$(wildcard src/*.c)) $(wildcard src/vendor/monocypher/*.c) \
-	  $(TSRC) tools/audit/acrypto.c tools/audit/afsum.c tools/audit/abind.c tools/audit/apq.c tools/audit/aice.c server/wire.c server/conv.c server/srv.c server/tls.c server/spool.c client/client.c -o build-tsan/test_unit -lssl -lcrypto
+	  $(TSRC) tools/audit/acrypto.c tools/audit/afsum.c tools/audit/abind.c tools/audit/apq.c tools/audit/aice.c server/wire.c server/conv.c server/srv.c server/tls.c server/spool.c cli/netres.c client/client.c -o build-tsan/test_unit -lssl -lcrypto
 	clang $(TSAN_FLAGS) $(filter-out src/main.c,$(wildcard src/*.c)) $(wildcard src/vendor/monocypher/*.c) \
 	  server/main.c server/srv.c server/conv.c server/wire.c server/tls.c server/spool.c -o build-tsan/imagedb-server -lssl -lcrypto # N1b: t_server runs it
 	clang $(TSAN_FLAGS) tests/unit/t_pool.c tests/tsan/pool_main.c src/pool.c $(KERNEL_SRC) \

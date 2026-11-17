@@ -1,13 +1,15 @@
 #!/bin/sh
-# make lint (P1 A1): each session setting (SET name), command-line option and environment variable that src/ reads is
+# make lint (P1 A1): each session setting (SET name), command-line option and environment variable that src/ reads (N1d-2:
+# and the options imagedb-server and imagedb-client read, and IMAGEDB_ variables) is
 # named in README.md's "## Options and settings" section, as `name` followed by a backtick, a space or an =, so the
 # reference cannot fall behind the code. POSIX sh and awk.
 set -eu
 cd "$(dirname "$0")/.."
 {
     grep -oh 'strcmp(st->set_name, "[a-z_]*")' src/sql_exec.c | sed 's/.*"\(.*\)".*/\1/'
-    grep -oh '"--[a-z][a-z-]*"' src/main.c | tr -d '"'
+    grep -oh '"--[a-z][a-z-]*"' src/main.c server/main.c cli/shell.c | tr -d '"' # N1d-2: the server's and the shell's too
     grep -oh 'getenv("IMDB_[A-Z0-9_]*")' src/*.c | sed 's/.*"\(.*\)".*/\1/'
+    grep -oh 'getenv("IMAGEDB_[A-Z0-9_]*")' cli/*.c | sed 's/.*"\(.*\)".*/\1/'
 } | sort -u | awk -v readme=README.md '
 BEGIN {
     while ((getline l < readme) > 0) {
