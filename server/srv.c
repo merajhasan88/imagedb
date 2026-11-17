@@ -21,6 +21,10 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -28,6 +32,7 @@
 #include "../src/scram.h"
 #include "../src/sql.h"
 #include "conv.h"
+#include "tls.h"
 
 #define RQ_CLOSE 0u               /* a request that is no frame: the connection's end, its session closed */
 #define FLUSH_AT (64u << 10)      /* the engine hands a connection its frames once this many are encoded */
@@ -82,8 +87,13 @@ struct conn {
     bool close_queued;
     bool closed;         /* its session ended (RQ_CLOSE ran, or the stop): its thread may end */
     bool authing;
+    bool preauth;        /* N1c: not yet through authentication (waiting for a slot or authenticating) */
+    bool tcp;            /* N1c: came by TCP (its TLS session freed at its end, this stays for the counts) */
     bool done;           /* its thread ended: the acceptor joins and frees it */
     _Atomic bool ses_open; /* ses initialised (the engine thread sets it; a connection asks before a cancel) */
+    imdbt *tls;          /* N1c: a TCP connection's TLS session (its thread's alone); NULL on the Unix socket */
+    bool rd_wants_write, wr_wants_read; /* TLS: a read that needs the socket writable, a write that needs it readable */
+    char addr[48];       /* N1c: a TCP peer's address, for the per-address cap on authenticating connections */
     imdb_session ses;    /* the engine thread's alone (imdb_session_cancel: any thread) */
 };
 
@@ -91,6 +101,10 @@ struct imdbs {
     imdb_db *db;
     imdbs_opts o;
     int lfd, stop[2];
+    int tfd;             /* N1c: the TCP listener (-1: none) */
+    imdbt_ctx *tls;      /* its TLS context */
+    uint16_t tcp_port;
+    int cert_days;
     char path[sizeof(((struct sockaddr_un *)0)->sun_path)];
     pthread_t engine, acceptor;
     bool engine_started, acceptor_started;
@@ -99,7 +113,8 @@ struct imdbs {
     pthread_cond_t cv;   /* the engine waits for work; connections wait for their close; imdbs_wait_failed */
     pthread_cond_t pacv; /* the acceptor waits for a pre-auth slot */
     conn *conns;
-    uint32_t nconns, npreauth;
+    uint32_t nconns, npreauth; /* npreauth: the socket's pre-auth pool */
+    uint32_t ntcp, npre_tcp;   /* N1c: TCP's connections and its own pre-auth pool */
     uint64_t pending;    /* every connection's unsent replies */
     conn *rr, *last;     /* round robin's last served; the session run last and since when */
     uint64_t last_since;
@@ -319,6 +334,7 @@ static bool put_result(imdbs *s, conn *c, imdbw_buf *b, const imdb_result *r, ui
                 ok = false;
             } else if (b->len >= FLUSH_AT) {
                 flush(s, c, b);
+                if (c->gone) ok = false; /* its client gone: no further row is encoded, no one would read it */
             }
         }
         imdbw_msg_free(&cols);
@@ -544,24 +560,43 @@ static void *engine_main(void *arg)
 }
 
 /* ---- a connection's thread ---- */
-/* reads exactly n bytes before the deadline (blocking in poll on the socket and the connection's wake-up) */
+/* N1c: a connection's bytes over its socket or its TLS session alike: >0 bytes, 0 the peer closed, -1 a failure,
+ * IMDBT_WANT_READ or IMDBT_WANT_WRITE for the poll (TLS may want either for either) */
+static ssize_t c_read(conn *c, void *p, size_t n)
+{
+    if (c->tls) return imdbt_read(c->tls, p, n);
+    ssize_t k = recv(c->fd, p, n, 0);
+    if (k < 0) return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR ? IMDBT_WANT_READ : -1;
+    return k;
+}
+
+static ssize_t c_write(conn *c, const void *p, size_t n)
+{
+    if (c->tls) return imdbt_write(c->tls, p, n);
+    ssize_t k = send(c->fd, p, n, MSG_NOSIGNAL);
+    if (k < 0) return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR ? IMDBT_WANT_WRITE : -1;
+    return k;
+}
+
+/* until the socket can do what a want asks, the deadline, the stop or a wake-up; -1 past the deadline or at the stop */
+static int c_wait(conn *c, ssize_t want, uint64_t deadline)
+{
+    uint64_t now = imdb_mono_ns();
+    if (now >= deadline || c->s->stopping) return -1;
+    struct pollfd pf[2] = {{c->fd, (short)(want == IMDBT_WANT_WRITE ? POLLOUT : POLLIN), 0}, {c->wake[0], POLLIN, 0}};
+    if (poll(pf, 2, (int)((deadline - now) / 1000000u) + 1) < 0 && errno != EINTR) return -1;
+    if (pf[1].revents) drain(c->wake[0]);
+    return 0;
+}
+
+/* reads exactly n bytes before the deadline */
 static int read_full(conn *c, uint8_t *p, size_t n, uint64_t deadline)
 {
     size_t got = 0;
     while (got < n) {
-        ssize_t k = recv(c->fd, p + got, n - got, 0);
-        if (k > 0) {
-            got += (size_t)k;
-            continue;
-        }
-        if (k == 0) return -1;
-        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return -1;
-        uint64_t now = imdb_mono_ns();
-        if (now >= deadline || c->s->stopping) return -1;
-        struct pollfd pf[2] = {{c->fd, POLLIN, 0}, {c->wake[0], POLLIN, 0}};
-        int ms = (int)((deadline - now) / 1000000u) + 1;
-        if (poll(pf, 2, ms) < 0 && errno != EINTR) return -1;
-        if (pf[1].revents) drain(c->wake[0]);
+        ssize_t k = c_read(c, p + got, n - got);
+        if (k > 0) got += (size_t)k;
+        else if (k == 0 || k == -1 || c_wait(c, k, deadline)) return -1;
     }
     return 0;
 }
@@ -570,18 +605,23 @@ static int write_full(conn *c, const uint8_t *p, size_t n, uint64_t deadline)
 {
     size_t put = 0;
     while (put < n) {
-        ssize_t k = send(c->fd, p + put, n - put, MSG_NOSIGNAL);
-        if (k > 0) {
-            put += (size_t)k;
-            continue;
-        }
-        if (k < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return -1;
-        uint64_t now = imdb_mono_ns();
-        if (now >= deadline) return -1;
-        struct pollfd pf = {c->fd, POLLOUT, 0};
-        if (poll(&pf, 1, (int)((deadline - now) / 1000000u) + 1) < 0 && errno != EINTR) return -1;
+        ssize_t k = c_write(c, p + put, n - put);
+        if (k > 0) put += (size_t)k;
+        else if (k == 0 || k == -1 || c_wait(c, k, deadline)) return -1;
     }
     return 0;
+}
+
+/* N1c: a TCP connection's TLS handshake inside pre-auth's budget (ALPN, TLS 1.3 alone: tls.c) */
+static bool handshake(conn *c, uint64_t deadline)
+{
+    for (;;) {
+        imdb_err e = {0};
+        int r = imdbt_handshake(c->tls, &e);
+        if (r == IMDB_OK) return true;
+        if (r != IMDBT_WANT_READ && r != IMDBT_WANT_WRITE) return false;
+        if (c_wait(c, r, deadline)) return false;
+    }
 }
 
 /* §3, §4: the hello's head (a later version answered with ours, then closed), the hello, the challenge (a known role's
@@ -591,9 +631,13 @@ static bool authenticate(conn *c)
     imdbs *s = c->s;
     uint64_t deadline = imdb_mono_ns() + (uint64_t)(s->o.preauth_ms ? s->o.preauth_ms : 10000) * 1000000u;
     uint8_t hello[IMDBW_HELLO_LEN], chb[IMDBW_CHALLENGE_LEN], proof[IMDBW_PROOF_LEN], am[IMDBW_AUTHMSG_LEN];
-    uint8_t zero[IMDBW_KEY] = {0}, sig[IMDBW_KEY], vb[IMDBW_VERDICT_LEN];
+    uint8_t sig[IMDBW_KEY], vb[IMDBW_VERDICT_LEN];
     uint32_t version;
     imdb_err e = {0};
+    /* N1c: on TCP, TLS first (nothing in the clear), its exporter the AuthMessage's binding (RFC 9266): a proof made
+     * over another TLS session, a relay's, fails */
+    uint8_t binding[IMDBW_KEY] = {0};
+    if (c->tls && (!handshake(c, deadline) || imdbt_binding(c->tls, binding))) return false;
     if (read_full(c, hello, IMDBW_PREAUTH_HEAD, deadline) || imdbw_preauth_head(hello, &version, &e)) return false;
     if (version != 1) { /* a version this server does not speak: its own head, then the close */
         uint8_t mine[IMDBW_PREAUTH_HEAD];
@@ -632,7 +676,7 @@ static bool authenticate(conn *c)
     bool ok = !imdb_random(ch.nonce, sizeof ch.nonce, &e) && !imdbw_challenge_put(&ch, chb) &&
               !write_full(c, chb, sizeof chb, deadline) && !read_full(c, proof, sizeof proof, deadline);
     if (ok) {
-        imdbw_auth_message(IMDBW_EP_UNIX, hello, chb, zero, am);
+        imdbw_auth_message(c->tls ? IMDBW_EP_TCP : IMDBW_EP_UNIX, hello, chb, binding, am);
         bool proven = imdbw_scram_server(stored, server_key, am, proof, sig);
         ok = proven && lo;
         imdbw_verdict v;
@@ -811,12 +855,16 @@ static int pull(conn *c, inframe *in)
         if (!room && in->hgot == 0) return 0; /* its queue full: read again once the engine takes one */
         ssize_t k;
         if (in->hgot < IMDBW_HEAD) {
-            k = recv(c->fd, in->head + in->hgot, IMDBW_HEAD - in->hgot, 0);
+            k = c_read(c, in->head + in->hgot, IMDBW_HEAD - in->hgot);
         } else {
-            k = recv(c->fd, in->body + in->bgot, in->blen - in->bgot, 0);
+            k = c_read(c, in->body + in->bgot, in->blen - in->bgot);
         }
         if (k == 0) return -1;
-        if (k < 0) return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR ? 0 : -1;
+        if (k == IMDBT_WANT_READ || k == IMDBT_WANT_WRITE) { /* nothing more now (TLS may want the socket writable) */
+            c->rd_wants_write = k == IMDBT_WANT_WRITE;
+            return 0;
+        }
+        if (k < 0) return -1;
         if (in->hgot < IMDBW_HEAD) {
             in->hgot += (uint32_t)k;
             if (in->hgot < IMDBW_HEAD) continue;
@@ -856,8 +904,12 @@ static int push(conn *c)
         outbuf *o = c->oh; /* this thread alone takes from the head; the engine appends at the tail */
         pthread_mutex_unlock(&s->mu);
         if (!o) return sent;
-        ssize_t k = send(c->fd, o->p + o->off, o->len - o->off, MSG_NOSIGNAL);
-        if (k < 0) return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR ? sent : -1;
+        ssize_t k = c_write(c, o->p + o->off, o->len - o->off); /* TLS: retried with these arguments (partial writes on) */
+        if (k == IMDBT_WANT_READ || k == IMDBT_WANT_WRITE) {
+            c->wr_wants_read = k == IMDBT_WANT_READ;
+            return sent;
+        }
+        if (k <= 0) return -1;
         sent = 1;
         o->off += (size_t)k;
         pthread_mutex_lock(&s->mu);
@@ -891,14 +943,51 @@ static void drop_out(conn *c)
     pthread_mutex_unlock(&s->mu);
 }
 
+/* N1c: a TCP connection authenticates once its address has room (preauth_per_addr authenticating at once from one
+ * address, so one address cannot hold every slot), waiting for it within pre-auth's budget; true when it has a slot */
+static bool addr_slot(conn *c)
+{
+    imdbs *s = c->s;
+    uint32_t cap = s->o.preauth_per_addr ? s->o.preauth_per_addr : 8;
+    uint64_t until = imdb_mono_ns() + (uint64_t)(s->o.preauth_ms ? s->o.preauth_ms : 10000) * 1000000u;
+    pthread_mutex_lock(&s->mu);
+    for (;;) {
+        uint32_t same = 0;
+        for (conn *o = s->conns; o; o = o->next) same += o != c && o->authing && o->tcp && !strcmp(o->addr, c->addr);
+        uint32_t maxp = s->o.preauth_max ? s->o.preauth_max : 32;
+        bool room = same < cap && s->npre_tcp < maxp; /* its address's share and TCP's pool */
+        if (room || s->stopping || imdb_mono_ns() >= until) {
+            bool ok = room && !s->stopping;
+            if (ok) c->authing = true, s->npre_tcp++;
+            pthread_mutex_unlock(&s->mu);
+            return ok;
+        }
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 50 * 1000000L;
+        ts.tv_sec += ts.tv_nsec / 1000000000L;
+        ts.tv_nsec %= 1000000000L;
+        pthread_cond_timedwait(&s->pacv, &s->mu, &ts);
+    }
+}
+
 static void *conn_main(void *arg)
 {
     conn *c = arg;
     imdbs *s = c->s;
-    bool authed = authenticate(c);
+    bool slot = !c->tcp || addr_slot(c); /* the socket's took its slot at the accept */
+    if (slot && c->tcp) { /* its TLS session made here, by this thread, once it has a slot: a refused connection costs none */
+        imdb_err e = {0};
+        if (imdbt_new(s->tls, c->fd, NULL, &c->tls, &e)) c->tls = NULL;
+    }
+    bool authed = slot && (!c->tcp || c->tls) && authenticate(c);
     pthread_mutex_lock(&s->mu);
-    c->authing = false;
-    s->npreauth--;
+    c->preauth = false;
+    if (slot) { /* a connection that never took a slot gives none back */
+        c->authing = false;
+        if (c->tcp) s->npre_tcp--;
+        else s->npreauth--;
+    }
     pthread_cond_broadcast(&s->pacv);
     pthread_mutex_unlock(&s->mu);
     inframe in;
@@ -942,12 +1031,19 @@ static void *conn_main(void *arg)
         }
         if (stopping && !stop_at) stop_at = now + (uint64_t)STOP_FLUSH_MS * 1000000u;
         if (closed && (!out || !peer || (stop_at && now >= stop_at))) break;
-        struct pollfd pf[2] = {{peer ? c->fd : -1, (short)((reading && room ? POLLIN : 0) | (out ? POLLOUT : 0)), 0},
+        /* each side's events by its want (TLS may want the other); bytes OpenSSL already holds read without a poll, but
+         * only while there is room for a request: a reader paused for a full queue never spins on them */
+        bool want_in = peer && reading && room, want_out = peer && out;
+        short in_ev = c->rd_wants_write ? POLLOUT : POLLIN, out_ev = c->wr_wants_read ? POLLIN : POLLOUT;
+        bool pend = want_in && c->tls && imdbt_pending(c->tls) > 0;
+        struct pollfd pf[2] = {{peer ? c->fd : -1, (short)((want_in ? in_ev : 0) | (want_out ? out_ev : 0)), 0},
                                {c->wake[0], POLLIN, 0}};
         int wait_ms = stop_at ? 50 : (out && peer) || recancel ? 100 : 1000;
-        if (poll(pf, 2, wait_ms) < 0 && errno != EINTR) break;
+        if (poll(pf, 2, pend ? 0 : wait_ms) < 0 && errno != EINTR) break;
         if (pf[1].revents) drain(c->wake[0]);
-        if (pf[0].revents & POLLIN) {
+        bool can_in = pend || (want_in && (pf[0].revents & in_ev)), can_out = want_out && (pf[0].revents & out_ev);
+        if (can_in) {
+            c->rd_wants_write = false;
             int r = pull(c, &in);
             if (r < 0) { /* the client left: nothing more can reach it */
                 reading = peer = false;
@@ -962,12 +1058,13 @@ static void *conn_main(void *arg)
                 queue_close(c, false);
                 pthread_mutex_unlock(&s->mu);
             }
-        } else if (pf[0].revents & (POLLHUP | POLLERR | POLLNVAL)) { /* hung up: neither read nor written again */
+        } else if (!can_out && (pf[0].revents & (POLLHUP | POLLERR | POLLNVAL))) { /* hung up: neither read nor written again */
             if (reading) leave(c);
             reading = peer = false;
             drop_out(c);
         }
-        if (peer && (pf[0].revents & POLLOUT)) {
+        if (peer && can_out) {
+            c->wr_wants_read = false;
             int k = push(c);
             if (k < 0) {
                 if (reading) leave(c);
@@ -990,6 +1087,8 @@ static void *conn_main(void *arg)
     s->n.live--;
     pthread_cond_broadcast(&s->pacv);
     pthread_mutex_unlock(&s->mu);
+    imdbt_free(c->tls); /* a best-effort close_notify, then the session; its thread's alone until now */
+    c->tls = NULL;
     shutdown(c->fd, SHUT_RDWR);
     return NULL;
 }
@@ -998,6 +1097,7 @@ static void *conn_main(void *arg)
 static void conn_free(conn *c)
 {
     for (rq *r = c->rh, *nx; r; r = nx) nx = r->next, rq_free(r); /* a close queued after the engine's stop: every thread joined */
+    imdbt_free(c->tls); /* one its thread never took (a limit refused it) */
     if (c->fd >= 0) close(c->fd);
     if (c->wake[0] >= 0) close(c->wake[0]);
     if (c->wake[1] >= 0) close(c->wake[1]);
@@ -1017,6 +1117,7 @@ static void reap(imdbs *s)
         if (s->rr == c) s->rr = NULL;
         if (s->last == c) s->last = NULL;
         s->nconns--;
+        s->ntcp -= c->tcp;
         pthread_mutex_unlock(&s->mu);
         pthread_join(c->th, NULL);
         conn_free(c);
@@ -1024,54 +1125,98 @@ static void reap(imdbs *s)
     }
 }
 
+/* N1c: a TCP connection's options: no Nagle delay (small pipelined frames), keepalive (a peer gone without a FIN found
+ * in about two minutes: its session then ends as any leave's) */
+static void tcp_opts(int fd)
+{
+    int one = 1, idle = 60, intvl = 10, cnt = 6;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof idle);
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof intvl);
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof cnt);
+}
+
+/* one connection from a ready listener: the socket's in its own pre-auth pool; TCP's below max_conns less the socket's
+ * reserve, and from one address at most a quarter of max_conns (never under twice preauth_per_addr) before
+ * authentication (waiting or authenticating); its TLS session made by its own thread once it has a slot (addr_slot) */
+static void take(imdbs *s, bool tcp, pthread_attr_t *at)
+{
+    uint32_t maxc = s->o.max_conns ? s->o.max_conns : 256;
+    uint32_t reserve = s->o.socket_reserve ? s->o.socket_reserve : 16, per_addr = s->o.preauth_per_addr ? s->o.preauth_per_addr : 8;
+    if (reserve > maxc / 2) reserve = maxc / 2;
+    struct sockaddr_storage sa;
+    socklen_t salen = sizeof sa;
+    int fd = accept4(tcp ? s->tfd : s->lfd, tcp ? (struct sockaddr *)&sa : NULL, tcp ? &salen : NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
+    if (fd < 0) return;
+    conn *c = imdbw_alloc(1, sizeof *c);
+    if (!c) {
+        close(fd);
+        return;
+    }
+    c->fd = fd, c->s = s, c->wake[0] = c->wake[1] = -1;
+    if (tcp) {
+        tcp_opts(fd);
+        const void *a = sa.ss_family == AF_INET6 ? (const void *)&((struct sockaddr_in6 *)&sa)->sin6_addr
+                                                 : (const void *)&((struct sockaddr_in *)&sa)->sin_addr;
+        if (!inet_ntop(sa.ss_family, a, c->addr, sizeof c->addr)) snprintf(c->addr, sizeof c->addr, "?");
+    }
+    pthread_mutex_lock(&s->mu);
+    uint32_t same = 0;
+    for (conn *o = s->conns; tcp && o; o = o->next) same += o->tcp && o->preauth && !strcmp(o->addr, c->addr);
+    /* one address's connections before authentication (waiting for its slot or authenticating): a quarter of max_conns at
+     * most (never under twice its cap), so a client's own pool waits and one address cannot hold every TCP connection */
+    uint32_t wait_bound = maxc / 4 > 2 * per_addr ? maxc / 4 : 2 * per_addr;
+    bool room = tcp ? s->ntcp < maxc - reserve && same < wait_bound : s->nconns < maxc;
+    if (!room || s->stopping || pipe2(c->wake, O_CLOEXEC | O_NONBLOCK)) {
+        pthread_mutex_unlock(&s->mu);
+        conn_free(c); /* one past a limit is closed unread */
+        return;
+    }
+    c->preauth = true, c->tcp = tcp;
+    c->authing = !tcp; /* a TCP connection authenticates once its address and its pool have room (addr_slot) */
+    c->next = s->conns;
+    s->conns = c;
+    s->nconns++;
+    s->ntcp += tcp;
+    s->npreauth += !tcp;
+    s->n.accepted++;
+    s->n.live++;
+    if (pthread_create(&c->th, at, conn_main, c)) {
+        s->conns = c->next;
+        s->nconns--, s->ntcp -= tcp, s->npreauth -= !tcp, s->n.live--;
+        pthread_mutex_unlock(&s->mu);
+        conn_free(c);
+        return;
+    }
+    c->started = true;
+    pthread_mutex_unlock(&s->mu);
+}
+
 static void *accept_main(void *arg)
 {
     imdbs *s = arg;
-    uint32_t maxc = s->o.max_conns ? s->o.max_conns : 256, maxp = s->o.preauth_max ? s->o.preauth_max : 32;
+    uint32_t maxp = s->o.preauth_max ? s->o.preauth_max : 32;
     pthread_attr_t at;
     pthread_attr_init(&at);
     pthread_attr_setstacksize(&at, 256u << 10);
     for (;;) {
+        /* each listener polled while its own pre-auth pool has room: TCP's full never stops the socket's logins */
         pthread_mutex_lock(&s->mu);
         reap(s);
-        while (s->npreauth >= maxp && !s->stopping) pthread_cond_wait(&s->pacv, &s->mu);
+        bool unix_room = s->npreauth < maxp, tcp_room = s->tfd >= 0 && s->npre_tcp < maxp;
+        while (!unix_room && !tcp_room && !s->stopping) {
+            pthread_cond_wait(&s->pacv, &s->mu);
+            unix_room = s->npreauth < maxp, tcp_room = s->tfd >= 0 && s->npre_tcp < maxp;
+        }
         bool stopping = s->stopping;
         pthread_mutex_unlock(&s->mu);
         if (stopping) break;
-        struct pollfd pf[2] = {{s->lfd, POLLIN, 0}, {s->stop[0], POLLIN, 0}};
-        if (poll(pf, 2, 200) < 0 && errno != EINTR) break;
+        struct pollfd pf[3] = {{unix_room ? s->lfd : -1, POLLIN, 0}, {s->stop[0], POLLIN, 0}, {tcp_room ? s->tfd : -1, POLLIN, 0}};
+        if (poll(pf, 3, 200) < 0 && errno != EINTR) break;
         if (pf[1].revents) break;
-        if (!(pf[0].revents & POLLIN)) continue;
-        int fd = accept4(s->lfd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
-        if (fd < 0) continue;
-        conn *c = imdbw_alloc(1, sizeof *c);
-        if (!c) {
-            close(fd);
-            continue;
-        }
-        c->fd = fd, c->s = s, c->wake[0] = c->wake[1] = -1;
-        pthread_mutex_lock(&s->mu);
-        if (s->nconns >= maxc || s->stopping || pipe2(c->wake, O_CLOEXEC | O_NONBLOCK)) {
-            pthread_mutex_unlock(&s->mu);
-            conn_free(c); /* one past the limit is closed unread */
-            continue;
-        }
-        c->authing = true;
-        c->next = s->conns;
-        s->conns = c;
-        s->nconns++;
-        s->npreauth++;
-        s->n.accepted++;
-        s->n.live++;
-        if (pthread_create(&c->th, &at, conn_main, c)) {
-            s->conns = c->next;
-            s->nconns--, s->npreauth--, s->n.live--;
-            pthread_mutex_unlock(&s->mu);
-            conn_free(c);
-            continue;
-        }
-        c->started = true;
-        pthread_mutex_unlock(&s->mu);
+        if (pf[0].revents & POLLIN) take(s, false, &at); /* each ready listener served in a turn */
+        if (pf[2].revents & POLLIN) take(s, true, &at);
     }
     pthread_attr_destroy(&at);
     return NULL;
@@ -1108,19 +1253,61 @@ static int listen_unix(imdbs *s, const char *path, imdb_err *e)
     return IMDB_OK;
 }
 
+/* N1c: "ADDR:PORT" ("[ADDR]:PORT" for IPv6) as a TCP listener; the port bound (an ephemeral one's number) */
+static int listen_tcp(imdbs *s, const char *spec, imdb_err *e)
+{
+    char host[128], port[16];
+    const char *colon = strrchr(spec, ':');
+    if (!colon || colon == spec || strlen(colon + 1) >= sizeof port || !colon[1])
+        return imdb_fail(e, IMDB_ERR_INVALID, "--tcp ADDR:PORT ([ADDR]:PORT for IPv6)");
+    size_t hl = (size_t)(colon - spec);
+    const char *h = spec;
+    if (spec[0] == '[' && hl >= 2 && spec[hl - 1] == ']') h = spec + 1, hl -= 2;
+    if (hl >= sizeof host) return imdb_fail(e, IMDB_ERR_INVALID, "--tcp: an address too long");
+    memcpy(host, h, hl);
+    host[hl] = 0;
+    memcpy(port, colon + 1, strlen(colon + 1) + 1);
+    struct addrinfo hints, *ai = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV | AI_PASSIVE; /* an address, never a name to resolve */
+    if (getaddrinfo(host, port, &hints, &ai) || !ai) return imdb_fail(e, IMDB_ERR_INVALID, "--tcp: not an address and port");
+    int fd = socket(ai->ai_family, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0), one = 1;
+    int rc = IMDB_OK;
+    if (fd < 0 || setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) || bind(fd, ai->ai_addr, ai->ai_addrlen) ||
+        listen(fd, 128))
+        rc = imdb_fail(e, IMDB_ERR_IO, "--tcp %s: %s", spec, strerror(errno));
+    freeaddrinfo(ai);
+    struct sockaddr_storage sa;
+    socklen_t sl = sizeof sa;
+    if (!rc && getsockname(fd, (struct sockaddr *)&sa, &sl)) rc = imdb_fail(e, IMDB_ERR_IO, "getsockname: %s", strerror(errno));
+    if (rc) {
+        if (fd >= 0) close(fd);
+        return rc;
+    }
+    s->tfd = fd;
+    s->tcp_port = ntohs(sa.ss_family == AF_INET6 ? ((struct sockaddr_in6 *)&sa)->sin6_port : ((struct sockaddr_in *)&sa)->sin_port);
+    return IMDB_OK;
+}
+
 int imdbs_start(imdb_db *db, const imdbs_opts *o, imdbs **out, imdb_err *e)
 {
     *out = NULL;
     if (db->failed) return imdb_fail(e, IMDB_ERR_STATE, "the database handle has failed: reopen it");
     imdbs *s = imdbw_alloc(1, sizeof *s);
     if (!s) return imdb_fail(e, IMDB_ERR_NOMEM, "out of memory");
-    s->db = db, s->o = *o, s->lfd = -1, s->stop[0] = s->stop[1] = -1;
-    s->o.socket_path = NULL; /* the caller's string: copied into path */
+    s->db = db, s->o = *o, s->lfd = -1, s->tfd = -1, s->stop[0] = s->stop[1] = -1;
+    s->o.socket_path = s->o.tcp = s->o.server_dir = NULL; /* the caller's strings: used here alone */
     pthread_mutex_init(&s->mu, NULL);
     pthread_mutex_init(&s->lmu, NULL);
     pthread_cond_init(&s->cv, NULL);
     pthread_cond_init(&s->pacv, NULL);
     int rc = listen_unix(s, o->socket_path, e);
+    if (!rc && o->tcp) { /* N1c: TLS 1.3 on TCP, its key and certificate from the server directory */
+        if (!o->server_dir) rc = imdb_fail(e, IMDB_ERR_INVALID, "--tcp needs the server directory's certificate");
+        if (!rc) rc = imdbt_server_ctx(o->server_dir, &s->tls, &s->cert_days, e);
+        if (!rc) rc = listen_tcp(s, o->tcp, e);
+    }
     if (!rc && pipe2(s->stop, O_CLOEXEC | O_NONBLOCK)) rc = imdb_fail(e, IMDB_ERR_IO, "pipe: %s", strerror(errno));
     if (!rc) {
         logins_publish(s, true);
@@ -1194,6 +1381,8 @@ int imdbs_stop(imdbs *s, imdb_err *e)
     bool failed = s->failed || s->db->failed;
     pthread_mutex_unlock(&s->mu);
     if (s->lfd >= 0) close(s->lfd);
+    if (s->tfd >= 0) close(s->tfd);
+    imdbt_ctx_free(s->tls);
     if (s->path[0]) unlink(s->path);
     if (s->stop[0] >= 0) close(s->stop[0]);
     if (s->stop[1] >= 0) close(s->stop[1]);
@@ -1235,5 +1424,14 @@ void imdbs_counts_get(imdbs *s, imdbs_counts *c)
 {
     pthread_mutex_lock(&s->mu);
     *c = s->n;
+    c->tcp_authing = c->tcp_waiting = 0;
+    for (conn *o = s->conns; o; o = o->next) {
+        c->tcp_authing += o->tcp && o->preauth && o->authing;
+        c->tcp_waiting += o->tcp && o->preauth && !o->authing;
+    }
     pthread_mutex_unlock(&s->mu);
 }
+
+uint16_t imdbs_tcp_port(const imdbs *s) { return s->tcp_port; }
+
+int imdbs_cert_days(const imdbs *s) { return s->cert_days; }

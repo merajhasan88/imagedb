@@ -23,6 +23,7 @@
 #include "../../client/imagedb_client.h"
 #include "../../server/conv.h"
 #include "../../server/srv.h"
+#include "../../server/tls.h"
 #include "../../src/db.h"
 #include "../../src/fsio.h"
 #include "../../src/sql.h"
@@ -32,6 +33,9 @@ static char g_sock[200];
 static uint64_t g_ckpt; /* the next serve's size-triggered CHECKPOINT (0: the default) */
 static int g_sync;      /* the next serve's sync (0: none) */
 static int64_t g_blocks; /* the wire's live blocks before the server: the same after it and every client are gone */
+static bool g_tcp;       /* N1c: the tests run again over TCP with TLS 1.3 (login by the pin) */
+static uint16_t g_port;
+static uint8_t g_pin[32];
 
 static int sql_run(imdb_db *db, const char *sql)
 {
@@ -72,12 +76,20 @@ static imdb_db *serve(imdbs **s, const imdbs_opts *extra)
     if (extra) so = *extra;
     g_blocks = imdbw_live_blocks();
     so.socket_path = g_sock;
+    char sdir[300];
+    if (g_tcp) { /* N1c: a certificate in the test's directory, TCP on an ephemeral port beside the socket */
+        snprintf(sdir, sizeof sdir, "%s/sd", dir);
+        if (mkdir(sdir, 0700) || imdbt_cert_make(sdir, NULL, 0, g_pin, &e)) return NULL;
+        so.tcp = "127.0.0.1:0";
+        so.server_dir = sdir;
+    }
     memset(so.secret, 0x42, sizeof so.secret);
     if (imdbs_start(db, &so, s, &e)) {
         fprintf(stderr, "    imdbs_start: %s\n", e.msg);
         imdb_close(db);
         return NULL;
     }
+    g_port = imdbs_tcp_port(*s);
     return db;
 }
 
@@ -93,7 +105,14 @@ static imdbc *login(const char *user, const char *pw)
 {
     imdbc *c = NULL;
     imdb_err e = {0};
-    if (imdbc_connect(g_sock, user, pw, strlen(pw), &c, &e)) return NULL;
+    if (g_tcp) { /* N1c: TLS 1.3 on TCP, the server's key pinned */
+        char port[8];
+        snprintf(port, sizeof port, "%u", (unsigned)g_port);
+        imdbc_tls t = {NULL, g_pin};
+        if (imdbc_connect_tcp("127.0.0.1", port, &t, user, pw, strlen(pw), &c, &e)) return NULL;
+    } else if (imdbc_connect(g_sock, user, pw, strlen(pw), &c, &e)) {
+        return NULL;
+    }
     imdbc_set_timeout(c, 20000); /* a server that stops answering fails the test, never hangs it */
     return c;
 }
@@ -758,7 +777,7 @@ static void t_server_clients(void)
     imdbc *c = login("admin", "pw-admin");
     reply r;
     SOFT(c && q1(c, "CREATE TABLE t (id INT64 PRIMARY KEY, v INT64)", &r) == 0 && !r.nerr);
-    enum { NW = 16 };
+    enum { NW = 40 }; /* past twice the per-address cap (16): over TCP a pool from one address waits, never refused */
     worker w[NW];
     pthread_t th[NW];
     for (int i = 0; i < NW; i++) {
@@ -771,7 +790,9 @@ static void t_server_clients(void)
         total += w[i].ok;
     }
     SOFT(total == NW * 40);
-    SOFT(c && q1(c, "SELECT COUNT(*), SUM(v) FROM t", &r) == 0 && !strcmp(r.text, "640|12480\n"));
+    char want[64];
+    snprintf(want, sizeof want, "%d|%d\n", NW * 40, NW * (39 * 40 / 2)); /* each worker's v: 0 to 39 */
+    SOFT(c && q1(c, "SELECT COUNT(*), SUM(v) FROM t", &r) == 0 && !strcmp(r.text, want));
     imdbc_close(c);
     imdbs_counts cn;
     imdbs_counts_get(s, &cn);
@@ -1215,6 +1236,30 @@ static void t_server_stop_two(void)
     imdb_close(db);
     SOFT(imdbw_live_blocks() == g_blocks);
 }
+
+/* N1c: the same tests over TCP with TLS 1.3 (the pin's login), the answers the socket's; those that write raw frames or
+ * read the socket's raw challenge (auth, protocol) stay on the socket, and t_tls holds TLS's own */
+#define OVER_TCP(name)                                                                                                 \
+    static void name##_tcp(void)                                                                                       \
+    {                                                                                                                  \
+        g_tcp = true;                                                                                                  \
+        name();                                                                                                        \
+        g_tcp = false;                                                                                                 \
+    }
+OVER_TCP(t_server_statements)
+OVER_TCP(t_server_txn)
+OVER_TCP(t_server_commit_stamp)
+OVER_TCP(t_server_cancel)
+OVER_TCP(t_server_roles)
+OVER_TCP(t_server_stop)
+OVER_TCP(t_server_clients)
+OVER_TCP(t_server_pause)
+OVER_TCP(t_server_slow_reader)
+OVER_TCP(t_server_quiet)
+OVER_TCP(t_server_idle_timeout)
+OVER_TCP(t_server_deep)
+OVER_TCP(t_server_stop_two)
+OVER_TCP(t_server_warning)
 const test_case server_tests[] = {
     {"server_auth", t_server_auth},
     {"server_statements", t_server_statements},
@@ -1234,5 +1279,19 @@ const test_case server_tests[] = {
     {"server_warning", t_server_warning},
     {"server_deep", t_server_deep},
     {"server_stop_two", t_server_stop_two},
+    {"server_tcp_statements", t_server_statements_tcp},
+    {"server_tcp_txn", t_server_txn_tcp},
+    {"server_tcp_commit_stamp", t_server_commit_stamp_tcp},
+    {"server_tcp_cancel", t_server_cancel_tcp},
+    {"server_tcp_roles", t_server_roles_tcp},
+    {"server_tcp_stop", t_server_stop_tcp},
+    {"server_tcp_clients", t_server_clients_tcp},
+    {"server_tcp_pause", t_server_pause_tcp},
+    {"server_tcp_slow_reader", t_server_slow_reader_tcp},
+    {"server_tcp_quiet", t_server_quiet_tcp},
+    {"server_tcp_idle_timeout", t_server_idle_timeout_tcp},
+    {"server_tcp_deep", t_server_deep_tcp},
+    {"server_tcp_stop_two", t_server_stop_two_tcp},
+    {"server_tcp_warning", t_server_warning_tcp},
 };
 const size_t server_ntests = sizeof server_tests / sizeof *server_tests;

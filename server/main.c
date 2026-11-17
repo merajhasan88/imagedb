@@ -13,16 +13,19 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "../src/db.h"
 #include "../src/fsio.h"
 #include "srv.h"
+#include "tls.h"
 
 static int usage(void)
 {
     fputs("usage: imagedb-server DIR --socket PATH --server-dir SDIR [--max-conns N] [--nosync] [--durable-ack]\n"
-          "                      [--events FILE] [--stats FILE]\n", stderr);
+          "                      [--events FILE] [--stats FILE] [--tcp ADDR:PORT]\n"
+          "       imagedb-server cert SDIR [--name NAME]... [--renew]\n", stderr);
     return 2;
 }
 
@@ -34,27 +37,60 @@ static int load_secret(const char *sdir, uint8_t out[IMDBW_KEY], imdb_err *e)
     const char *base;
     int dfd = imdb_open_parent(path, &base, e);
     if (dfd < 0) return e->code;
-    uint8_t *buf = NULL;
-    size_t len = 0;
-    int rc = imdb_read_file_at(dfd, base, &buf, &len, 64, e);
-    if (!rc) {
-        if (len != IMDBW_KEY) rc = imdb_fail(e, IMDB_ERR_CORRUPT, "%s: not a server secret (%zu bytes, not 32)", path, len);
-        else memcpy(out, buf, IMDBW_KEY);
-        imdb_wipe(buf, len);
-        imdb_free(buf);
-    } else if (rc == IMDB_ERR_NOTFOUND) {
-        imdb_err_clear(e);
+    int rc = IMDB_OK;
+    int fd = imdb_io_openat(dfd, base, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd >= 0) { /* the one opened, read by its descriptor: 32 bytes, refused when its group or the world may read it */
+        struct stat st;
+        size_t got = 0;
+        if (imdb_io_fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size != IMDBW_KEY)
+            rc = imdb_fail(e, IMDB_ERR_CORRUPT, "%s: not a server secret (32 bytes)", path);
+        else if (st.st_mode & 077)
+            rc = imdb_fail(e, IMDB_ERR_STATE, "%s: readable by its group or the world (chmod 600)", path);
+        else if (!(rc = imdb_read_all(fd, out, IMDBW_KEY, &got, e)) && got != IMDBW_KEY)
+            rc = imdb_fail(e, IMDB_ERR_IO, "%s: read short", path);
+        close(fd);
+    } else if (errno == ENOENT) { /* made once: 32 random bytes, 0600, its directory synced */
         rc = imdb_random(out, IMDBW_KEY, e);
         if (!rc) rc = imdb_create_file_excl(dfd, base, out, IMDBW_KEY, 0600, e);
         if (!rc) rc = imdb_sync_dir(dfd, e);
+    } else {
+        rc = imdb_fail(e, IMDB_ERR_IO, "%s: %s", path, strerror(errno));
     }
     close(dfd);
     return rc;
 }
 
+
+/* N1c: imagedb-server cert SDIR [--name NAME]... [--renew]: the private CA and the server's certificate (tls.h), or the
+ * certificate made again under the same CA from the same key; prints the pin either way (the server key's SPKI SHA-256,
+ * unchanged by a renewal) */
+static int cert_cmd(int argc, char **argv)
+{
+    const char *sdir = NULL, *names[64];
+    size_t n = 0;
+    bool renew = false;
+    for (int i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "--name") && i + 1 < argc && n < 64) names[n++] = argv[++i];
+        else if (!strcmp(argv[i], "--renew")) renew = true;
+        else if (argv[i][0] == '-' || sdir) return usage();
+        else sdir = argv[i];
+    }
+    if (!sdir || (renew && n)) return usage();
+    uint8_t pin[32];
+    imdb_err e = {0};
+    if (renew ? imdbt_cert_renew(sdir, pin, &e) : imdbt_cert_make(sdir, names, n, pin, &e)) {
+        fprintf(stderr, "imagedb-server cert: %s\n", e.msg);
+        return 1;
+    }
+    char hex[65];
+    for (int k = 0; k < 32; k++) snprintf(hex + 2 * k, 3, "%02x", pin[k]);
+    printf("%s %s/server.crt; its pin (the key's SPKI SHA-256): %s\n", renew ? "renewed" : "made", sdir, hex);
+    return 0;
+}
 int main(int argc, char **argv)
 {
-    const char *dir = NULL, *sock = NULL, *sdir = NULL, *events = NULL, *stats = NULL;
+    if (argc >= 2 && !strcmp(argv[1], "cert")) return cert_cmd(argc, argv);
+    const char *dir = NULL, *sock = NULL, *sdir = NULL, *events = NULL, *stats = NULL, *tcp = NULL;
     imdbs_opts so;
     memset(&so, 0, sizeof so);
     int sync = 1;
@@ -62,6 +98,7 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--socket") && i + 1 < argc) sock = argv[++i];
         else if (!strcmp(argv[i], "--server-dir") && i + 1 < argc) sdir = argv[++i];
+        else if (!strcmp(argv[i], "--tcp") && i + 1 < argc) tcp = argv[++i]; /* N1c: TLS 1.3 on TCP beside the socket */
         else if (!strcmp(argv[i], "--events") && i + 1 < argc) events = argv[++i]; /* the engine's event log (P1 M2) */
         else if (!strcmp(argv[i], "--stats") && i + 1 < argc) stats = argv[++i];   /* the engine's stats export (P1 M1) */
         else if (!strcmp(argv[i], "--max-conns") && i + 1 < argc) {
@@ -99,6 +136,8 @@ int main(int argc, char **argv)
         return 1;
     }
     so.socket_path = sock;
+    so.tcp = tcp;
+    so.server_dir = sdir;
     imdbs *s = NULL;
     if (imdbs_start(db, &so, &s, &e)) {
         fprintf(stderr, "imagedb-server: %s\n", e.msg);
@@ -106,6 +145,12 @@ int main(int argc, char **argv)
         return 1;
     }
     printf("imagedb-server: listening on %s\n", sock);
+    if (tcp) {
+        printf("imagedb-server: listening on tcp port %u (TLS 1.3)\n", (unsigned)imdbs_tcp_port(s));
+        if (imdbs_cert_days(s) < 30)
+            fprintf(stderr, "imagedb-server: warning: server.crt has %d days left (imagedb-server cert SDIR --renew)\n",
+                    imdbs_cert_days(s));
+    }
     fflush(stdout);
     bool failed = false, stopping = false;
     for (;;) { /* the first signal begins the stop (the running statement ends at its own end); a second cancels it */

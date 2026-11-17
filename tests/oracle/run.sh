@@ -53,18 +53,31 @@ export ORACLE_MYSQL="$D/my/run/mysqld.sock root - oracle"
 export ORACLE_MARIADB="$D/ma/run/mysqld.sock oracle oracle oracle"
 export ORACLE_ODBC="Driver={ODBC Driver 18 for SQL Server};Server=tcp:127.0.0.1,14331;UID=sa;PWD=$SA;Encrypt=no"
 export LANG=C.UTF-8
-# every server up when the oracle connects to all four (the init servers come and go first)
+# every server up when the oracle connects to all four. PostgreSQL's, MySQL's and MariaDB's entrypoints first run a
+# temporary server on the same socket for their initialisation, then stop it and start the real one: a ping can land on
+# the temporary server and the oracle's connect in the gap (N1c's matrices, 2026-11-16: MySQL's socket missing after
+# "four servers up"). So each container's log must say its initialisation is done before the pings count, and the pings
+# must pass twice, a second apart; under load the whole may take minutes (300 s)
+inited() { docker logs "$C-$1" 2>&1 | grep -qF "$2"; }
 i=0
-until "$O" --engines pg,mysql,mariadb,mssql --ping >/dev/null 2>&1; do
+ok=0
+while [ "$ok" -lt 2 ]; do
+    if inited pg "init process complete; ready for start up." && inited mysql "init process done. Ready for start up." &&
+        inited mariadb "init process done. Ready for start up." && "$O" --engines pg,mysql,mariadb,mssql --ping >/dev/null 2>&1; then
+        ok=$((ok + 1))
+    else
+        ok=0
+    fi
     i=$((i + 1))
-    if [ "$i" -gt 240 ]; then
-        echo "run.sh: the servers did not all answer within 120 s:"
+    if [ "$i" -gt 300 ]; then
+        echo "run.sh: the servers did not all answer within 300 s:"
+        for x in pg mysql mariadb; do docker logs "$C-$x" 2>&1 | tail -3 | sed "s/^/  $x: /"; done
         "$O" --engines pg,mysql,mariadb,mssql --ping || true
         exit 1
     fi
-    sleep 0.5
+    sleep 1
 done
-echo "run.sh: four servers up after ~$((i / 2)) s; MemAvailable $(awk '/MemAvailable/ { print int($2 / 1024) }' /proc/meminfo) MB"
+echo "run.sh: four servers up after ~$i s; MemAvailable $(awk '/MemAvailable/ { print int($2 / 1024) }' /proc/meminfo) MB"
 # L: --scram's role logs in by SCRAM-SHA-256 on the socket (a first line matching it alone; trust stays for the rest),
 # pg_hba.conf rewritten in place so its owner stays the server's
 { printf 'local all ora_scram scram-sha-256\n'; cat "$D/pg/data/pg_hba.conf"; } > "$D/pg/hba.new"

@@ -122,5 +122,6 @@ TESTS(wire)  /* N1a: IMDBWIR1, the server's own protocol (server/wire.c) */
 TESTS(conv)  /* N1b: the engine's results and parameters to and from the wire (server/conv.c) */
 TESTS(pbind) /* N1b: a parameter binds as the literal of its value (numbers and NULLs) */
 TESTS(server) /* N1b: the server on its Unix socket, through the C client (server/srv.c, client/client.c) */
+TESTS(tls)    /* N1c: TLS 1.3 on TCP (server/tls.c): verification, refusals, a relay, a renewal */
 
 #endif

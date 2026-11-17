@@ -25,6 +25,13 @@ typedef struct imdbs_opts {
     uint32_t queue_max;        /* a connection's requests queued before its socket is read again (0: 64) */
     uint32_t tick_ms;          /* the engine thread's idle tick: transaction timeouts, maintenance (0: 100) */
     uint32_t send_timeout_ms;  /* a connection that takes no byte this long while replies wait is dropped (0: 30,000) */
+    /* N1c: TCP with TLS 1.3 beside the socket: tcp "ADDR:PORT" (an IPv6 address in brackets; port 0: an ephemeral one,
+     * imdbs_tcp_port says which), NULL for none; server_dir holds server.key and server.crt (imagedb-server cert) */
+    const char *tcp;
+    const char *server_dir;
+    uint32_t preauth_per_addr; /* TCP connections authenticating at once from one address (0: 8); twice it may wait */
+    uint32_t socket_reserve;   /* connections TCP leaves to the socket (0: 16, at most half max_conns); the socket's
+                                * pre-auth pool is its own (preauth_max each), so the network never starves it */
 } imdbs_opts;
 
 typedef struct imdbs imdbs;
@@ -63,7 +70,12 @@ typedef struct imdbs_counts {
     uint64_t leave_cancels; /* statements cancelled because their client left */
     uint64_t started;      /* statements and parameter sets begun, bumped just before each runs: a test reads it before it
                             * sends and waits for it to move (never a clock, never a gauge a late clear makes stale) */
+    uint64_t tcp_authing;  /* N1c gauges: TCP connections authenticating now (holding a slot of their address and pool) */
+    uint64_t tcp_waiting;  /* and those waiting for one */
 } imdbs_counts;
 void imdbs_counts_get(imdbs *s, imdbs_counts *c);
+/* N1c: the TCP port listened on (0: none), an ephemeral one's number; cert_days: server.crt's whole days left */
+uint16_t imdbs_tcp_port(const imdbs *s);
+int imdbs_cert_days(const imdbs *s);
 
 #endif

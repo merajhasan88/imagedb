@@ -25,6 +25,16 @@ typedef struct imdbc_stmt {
  * for a refusal (an unknown name and a wrong password alike), IMDB_ERR_UNSUPPORTED when the server speaks a later
  * version only */
 int imdbc_connect(const char *socket_path, const char *user, const char *password, size_t pwlen, imdbc **out, imdb_err *e);
+/* N1c: TCP with TLS 1.3 (ALPN imdbwir1): tls names the CA file (the host checked against the certificate's
+ * subjectAltName: a name, or an address literal) or a pin (the server key's SPKI SHA-256, imagedb-server cert prints
+ * it), exactly one; no unverified mode, no fallback to the socket or to plaintext. The handshake (the pin checked in it)
+ * ends before the hello, which names the role, is sent; the AuthMessage binds the session's exporter (RFC 9266) */
+typedef struct imdbc_tls {
+    const char *ca_file;
+    const uint8_t *pin; /* 32 bytes */
+} imdbc_tls;
+int imdbc_connect_tcp(const char *host, const char *port, const imdbc_tls *tls, const char *user, const char *password,
+                      size_t pwlen, imdbc **out, imdb_err *e);
 int imdbc_query(imdbc *c, const imdbc_stmt *stmts, uint32_t n, imdb_err *e);
 int imdbc_prepare(imdbc *c, const char *name, const char *sql, size_t len, imdb_err *e);
 /* nsets sets of nvals values, vals in set order */
@@ -44,6 +54,8 @@ int imdbc_fd(const imdbc *c);
 /* a bound on each wait for a reply's bytes (0: none, the default): past it imdbc_next fails with IMDB_ERR_IO, the
  * connection then unusable (a frame may be part read) */
 void imdbc_set_timeout(imdbc *c, uint32_t ms);
+/* tests: bytes sent as they are (crafted frames, several in one TLS record), over TLS when the connection has it */
+int imdbc_send_raw(imdbc *c, const void *p, size_t n, imdb_err *e);
 void imdbc_close(imdbc *c);
 
 #endif
