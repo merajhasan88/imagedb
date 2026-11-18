@@ -24,6 +24,7 @@
 #include "rewind.h"
 #include "sql.h"
 #include "../cli/run.h" /* N1d-2: the runner build/imagedb-client shares */
+#include "../cli/size.h"
 #include "writer.h"
 
 static int usage(void)
@@ -135,23 +136,6 @@ static bool parse_window(const char *s, uint64_t *out)
     return true;
 }
 
-/* BYTES: decimal digits, no leading zero, optionally K, M or G (binary); 0 is no budget, so refused */
-static bool parse_size(const char *s, uint64_t *out)
-{
-    uint64_t v = 0;
-    size_t i = 0;
-    if (s[0] < '1' || s[0] > '9') return false;
-    for (; s[i] >= '0' && s[i] <= '9'; i++) {
-        if (v > (UINT64_MAX - 9) / 10) return false;
-        v = v * 10 + (uint64_t)(s[i] - '0');
-    }
-    unsigned shift = s[i] == 'K' ? 10 : s[i] == 'M' ? 20 : s[i] == 'G' ? 30 : 0;
-    if (shift) i++;
-    if (s[i] || (shift && v > (UINT64_MAX >> shift))) return false;
-    *out = v << shift;
-    return true;
-}
-
 /* MS (R1.2's intervals): decimal digits, no leading zero but 0 itself (none), at most max */
 static bool parse_ms(const char *s, uint32_t max, uint32_t *out)
 {
@@ -164,16 +148,6 @@ static bool parse_ms(const char *s, uint32_t max, uint32_t *out)
     }
     *out = (uint32_t)v;
     return true;
-}
-
-/* BYTES as --mem-limit takes them, or all: every segment image kept in memory */
-static bool parse_seg_cache(const char *s, uint64_t *out)
-{
-    if (strcmp(s, "all") == 0) {
-        *out = UINT64_MAX;
-        return true;
-    }
-    return parse_size(s, out);
 }
 
 /* P1 M2: an open past two seconds says how far it has come, on stderr, at most once a second (the engine's rate) */
@@ -739,8 +713,22 @@ static int cmd_rewind(int argc, char **argv)
     imdb_db *db = open_or_die(dir, false, 1); /* a dropped lake rebuilt from the log; where it stands checked */
     if (!db) return 1;
     uint64_t at = db->seq;
-    bool there = at == rep.fork;
-    imdb_close(db);
+    /* the rewind itself ran (FILE written, the cut made, a demotion): either failure below says where they are */
+    char done[512];
+    snprintf(done, sizeof done, "imagedb: rewind: the %llu commits past commit %llu are in %s%s\n",
+             (unsigned long long)rep.saved, (unsigned long long)rep.fork, save,
+             rep.demoted ? "; the copy was demoted (a replica now: signing.key.demoted, replicas.demoted)" : "");
+    if (imdb_close(db) != IMDB_OK) {
+        fputs("imagedb: rewind: final database close failed; check the copy before enrolling it\n", stderr);
+        fputs(done, stderr);
+        return 1;
+    }
+    if (at != rep.fork) {
+        fprintf(stderr, "imagedb: rewind: the copy opened at commit %llu, not %llu\n", (unsigned long long)at,
+                (unsigned long long)rep.fork);
+        fputs(done, stderr);
+        return 1;
+    }
     char hex[2 * IMDB_PUBKEY_LEN + 1];
     imdb_hex(rep.replica_pk, IMDB_PUBKEY_LEN, hex);
     printf("rewound %s to commit %llu, the last both histories hold (the primary is at %llu); the %llu commits past it "
@@ -753,11 +741,6 @@ static int cmd_rewind(int argc, char **argv)
     printf("its new replica key (a new incarnation): %s\n"
            "enrol it on the primary (imagedb replica-add PRIMARY NAME KEY, --replace for a name it knew), then follow\n",
            hex);
-    if (!there) {
-        fprintf(stderr, "imagedb: rewind: the copy opened at commit %llu, not %llu\n", (unsigned long long)at,
-                (unsigned long long)rep.fork);
-        return 1;
-    }
     return 0;
 }
 
@@ -1380,14 +1363,19 @@ int main(int argc, char **argv)
         if (!db) return 1;
         uint64_t applied = 0;
         int rc = imdb_apply_stream(db, 0, &applied, &e);
+        uint64_t seeded = db->seeded, at = db->seq;
         if (rc) print_err("apply", &e);
-        else if (db->seeded)
+        if (imdb_close(db) != IMDB_OK) {
+            fputs("imagedb: apply: final database close failed; check the replica before resuming\n", stderr);
+            return 1;
+        }
+        if (rc) return 1;
+        if (seeded)
             fprintf(stderr, "seeded at commit %llu (its log begins after it): ship --after %llu to go on\n",
-                    (unsigned long long)db->seeded, (unsigned long long)db->seeded);
+                    (unsigned long long)seeded, (unsigned long long)seeded);
         else fprintf(stderr, "applied %llu commits; replica at commit %llu\n", (unsigned long long)applied,
-                     (unsigned long long)db->seq);
-        imdb_close(db);
-        return rc ? 1 : 0;
+                     (unsigned long long)at);
+        return 0;
     }
     if (strcmp(cmd, "verify") == 0 && (argc == 3 || (argc == 5 && strcmp(argv[3], "--anchor") == 0))) {
         imdb_db *db = open_anchored(argv[2], true, 0, argc == 5 ? argv[4] : NULL, false, false); /* the anchor checked, not moved */

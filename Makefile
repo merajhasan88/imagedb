@@ -132,7 +132,7 @@ $(LIB): $(OBJ)
 $(BIN): $(BUILD)/obj/main.o $(BUILD)/obj/cli_run.o $(LIB)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-$(BUILD)/obj/main.o: src/main.c cli/run.h $(HDR) | $(BUILD)/obj
+$(BUILD)/obj/main.o: src/main.c cli/run.h cli/size.h $(HDR) | $(BUILD)/obj
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # N1d-2: the SQL shell's runner (cli/run.c), build/imagedb's and build/imagedb-client's: never in libimagedb.a
@@ -176,9 +176,27 @@ $(BUILD)/tobj/spool.o: server/spool.c server/spool.h server/wire.h $(HDR) | $(BU
 $(BUILD)/tobj/tls.o: server/tls.c server/tls.h server/wire.h $(HDR) | $(BUILD)/tobj
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(SERVER): server/main.c server/srv.h $(BUILD)/tobj/srv.o $(BUILD)/tobj/conv.o $(BUILD)/tobj/wire.o $(BUILD)/tobj/tls.o $(BUILD)/tobj/spool.o $(LIB)
+$(SERVER): server/main.c server/srv.h cli/size.h $(BUILD)/tobj/srv.o $(BUILD)/tobj/conv.o $(BUILD)/tobj/wire.o $(BUILD)/tobj/tls.o $(BUILD)/tobj/spool.o $(LIB)
 	$(CC) $(CFLAGS) server/main.c $(BUILD)/tobj/srv.o $(BUILD)/tobj/conv.o $(BUILD)/tobj/wire.o $(BUILD)/tobj/tls.o $(BUILD)/tobj/spool.o $(LIB) -o $@ \
 	  $(LDFLAGS) -lssl -lcrypto
+
+# The 2026-11-18 review's close probes: build/imagedb and build/imagedb-server again with every imdb_close their main.c
+# makes renamed to tests/integration/close_eio.c's review_close, which fails the close's last DURABLE fsync; the engine's
+# own closes stay real. tests/integration/close_status.sh holds them to it (exit 1, said, no success printed). Test
+# binaries alone: never installed, never in libimagedb.a.
+PROBECLI = $(BUILD)/probe/imagedb-closefail
+PROBESRV = $(BUILD)/probe/imagedb-server-closefail
+probes: $(PROBECLI) $(PROBESRV)
+$(BUILD)/probe:
+	mkdir -p $@
+$(BUILD)/probe/close_eio.o: tests/integration/close_eio.c $(HDR) | $(BUILD)/probe
+	$(CC) $(CFLAGS) -Isrc -c $< -o $@
+$(PROBECLI): src/main.c cli/run.h cli/size.h $(HDR) $(BUILD)/probe/close_eio.o $(BUILD)/obj/cli_run.o $(LIB) | $(BUILD)/probe
+	$(CC) $(CFLAGS) -Dimdb_close=review_close src/main.c $(BUILD)/probe/close_eio.o $(BUILD)/obj/cli_run.o $(LIB) -o $@ $(LDFLAGS)
+$(PROBESRV): server/main.c server/srv.h cli/size.h $(HDR) $(BUILD)/probe/close_eio.o $(BUILD)/tobj/srv.o $(BUILD)/tobj/conv.o \
+             $(BUILD)/tobj/wire.o $(BUILD)/tobj/tls.o $(BUILD)/tobj/spool.o $(LIB) | $(BUILD)/probe
+	$(CC) $(CFLAGS) -Dimdb_close=review_close server/main.c $(BUILD)/probe/close_eio.o $(BUILD)/tobj/srv.o $(BUILD)/tobj/conv.o \
+	  $(BUILD)/tobj/wire.o $(BUILD)/tobj/tls.o $(BUILD)/tobj/spool.o $(LIB) -o $@ $(LDFLAGS) -lssl -lcrypto
 
 # N1d-2: the C client's library (client/imagedb_client.h): the client, the codec, TLS and what they take of the engine's
 # sources (util, sha256, scram, fsio); OpenSSL at the application's link
@@ -252,7 +270,7 @@ lint:
 # stage 3b): every read below the memory floor then goes to the lake, as a long-running copy's would.
 # The fourth and fifth keep no segment image between operations (IMDB_SEGCACHE=tiny, stage 3c-1), without the eager
 # mode and with it: every image is read again at its next use, under the held versions' ends and below the floor.
-test: lint $(TBIN) $(BIN) $(AUDIT) $(FORGE) $(SERVER) $(CLIENTBIN)
+test: lint $(TBIN) $(BIN) $(AUDIT) $(FORGE) $(SERVER) $(CLIENTBIN) $(PROBECLI) $(PROBESRV)
 	IMDB_AUDIT_BIN=$(AUDIT) $(TBIN)
 	IMDB_FAULT_SKIP=1 IMDB_NO_SIMD=1 IMDB_THREADS=1 $(TBIN)
 	IMDB_FAULT_SKIP=1 IMDB_EVICT=eager IMDB_AUDIT_BIN=$(AUDIT) $(TBIN)
@@ -264,11 +282,13 @@ test: lint $(TBIN) $(BIN) $(AUDIT) $(FORGE) $(SERVER) $(CLIENTBIN)
 	IMDB_SEGCACHE=tiny bash tests/integration/run.sh $(BIN)
 	bash tests/integration/audit_reject.sh $(BIN)
 	bash tests/integration/client.sh $(BIN) # N1d-2: imagedb-client against imagedb sql
+	bash tests/integration/close_status.sh $(BIN) # the 2026-11-18 review: a failed final close, the daemon's controls
 
-integration: $(BIN) $(AUDIT) $(FORGE) $(SERVER) $(CLIENTBIN)
+integration: $(BIN) $(AUDIT) $(FORGE) $(SERVER) $(CLIENTBIN) $(PROBECLI) $(PROBESRV)
 	bash tests/integration/run.sh $(BIN)
 	bash tests/integration/audit_reject.sh $(BIN)
 	bash tests/integration/client.sh $(BIN)
+	bash tests/integration/close_status.sh $(BIN)
 
 # Every fault point (not every 7th) of every scenario, on the build disk instead of tmpfs.
 faults: $(TBIN) $(AUDIT)
@@ -289,7 +309,7 @@ SANRUN = setarch $(shell uname -m) -R
 
 san: lint
 	$(MAKE) SAN=1 build-san/test_unit build-san/imagedb build-san/imagedb-audit build-san/imdb-forge build-san/imagedb-server \
-	  build-san/imagedb-client
+	  build-san/imagedb-client build-san/probe/imagedb-closefail build-san/probe/imagedb-server-closefail
 	IMDB_AUDIT_BIN=build-san/imagedb-audit $(SANRUN) build-san/test_unit
 	IMDB_FAULT_SKIP=1 IMDB_NO_SIMD=1 IMDB_THREADS=1 $(SANRUN) build-san/test_unit
 	IMDB_FAULT_SKIP=1 IMDB_EVICT=eager IMDB_AUDIT_BIN=build-san/imagedb-audit $(SANRUN) build-san/test_unit
@@ -301,6 +321,7 @@ san: lint
 	IMDB_SEGCACHE=tiny bash tests/integration/run.sh build-san/imagedb
 	bash tests/integration/audit_reject.sh build-san/imagedb
 	bash tests/integration/client.sh build-san/imagedb
+	bash tests/integration/close_status.sh build-san/imagedb
 
 FUZZ_TARGETS = $(patsubst fuzz/%.c,build-fuzz/%,$(wildcard fuzz/fuzz_*.c))
 FUZZ_ASM     = $(ASMSRC:asm/%.asm=build-fuzz/asm/%.o)

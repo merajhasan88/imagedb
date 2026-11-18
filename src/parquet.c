@@ -1272,7 +1272,7 @@ int imdb_pq_read(const uint8_t *f, size_t len, const pq_footer *ft, const pq_col
     }
     imdb_free(lv);
     if (!rc && prev != ft->meta_at) rc = imdb_fail(e, IMDB_ERR_CORRUPT, "parquet: bytes between the chunks and the footer");
-    pq_col cols[PQ_MAX_COLUMNS];
+    pq_col cols[PQ_MAX_COLUMNS] = {0};
     for (uint32_t ci = 0; ci < ncols && !rc; ci++) cols[ci] = out[ci].c;
     if (!rc) rc = values_check(cols, ncols, ft->nrows, IMDB_ERR_CORRUPT, e); /* the writer's rules, before statistics */
     if (!rc) { /* the footer the writer writes for what was read */

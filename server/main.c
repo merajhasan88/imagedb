@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include "../src/db.h"
+#include "../cli/size.h"
 #include "../src/fsio.h"
 #include "srv.h"
 #include "tls.h"
@@ -25,6 +26,7 @@ static int usage(void)
 {
     fputs("usage: imagedb-server DIR --socket PATH --server-dir SDIR [--max-conns N] [--nosync] [--durable-ack]\n"
           "                      [--events FILE] [--stats FILE] [--tcp ADDR:PORT] [--spool-dir DIR]\n"
+          "                      [--mem-limit BYTES] [--seg-cache BYTES|all] [--iceberg] [--anchor FILE]\n"
           "                      [--copy-spool BYTES] [--copy-ring BYTES] [--copy-wait MS] [--copy-idle MS]\n"
           "                      [--channel-binding exporter|any]\n"
           "       imagedb-server cert SDIR [--name NAME]... [--renew]\n", stderr);
@@ -124,6 +126,9 @@ int main(int argc, char **argv)
     memset(&so, 0, sizeof so);
     int sync = 1;
     bool durable_ack = false;
+    uint64_t mem_limit = 0, seg_cache = 0;
+    bool iceberg = false;
+    const char *anchor = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--socket") && i + 1 < argc) sock = argv[++i];
         else if (!strcmp(argv[i], "--server-dir") && i + 1 < argc) sdir = argv[++i];
@@ -148,7 +153,13 @@ int main(int argc, char **argv)
             const char *v = argv[++i];
             if (!strcmp(v, "any")) so.cb_any = true;
             else if (strcmp(v, "exporter")) return usage();
-        } else if (!strcmp(argv[i], "--nosync")) sync = 0;
+        } else if (!strcmp(argv[i], "--mem-limit") && i + 1 < argc) {
+            if (!parse_size(argv[++i], &mem_limit)) return usage();
+        } else if (!strcmp(argv[i], "--seg-cache") && i + 1 < argc) {
+            if (!parse_seg_cache(argv[++i], &seg_cache)) return usage();
+        } else if (!strcmp(argv[i], "--iceberg")) iceberg = true;
+        else if (!strcmp(argv[i], "--anchor") && i + 1 < argc) anchor = argv[++i];
+        else if (!strcmp(argv[i], "--nosync")) sync = 0;
         else if (!strcmp(argv[i], "--durable-ack")) durable_ack = true;
         else if (argv[i][0] == '-' || dir) return usage();
         else dir = argv[i];
@@ -166,12 +177,16 @@ int main(int argc, char **argv)
         fprintf(stderr, "imagedb-server: the server directory's secret: %s\n", e.msg);
         return 1;
     }
-    imdb_open_opts o = {.sync = sync, .durable_ack = durable_ack, .events_path = events, .stats_path = stats};
+    imdb_open_opts o = {.sync = sync, .durable_ack = durable_ack, .events_path = events, .stats_path = stats,
+                        .mem_limit = mem_limit, .seg_cache_bytes = seg_cache, .iceberg = iceberg, .anchor = anchor};
     imdb_db *db = NULL;
     if (imdb_open(dir, &o, &db, &e)) {
         fprintf(stderr, "imagedb-server: %s\n", e.msg);
         return 1;
     }
+    /* the open's warnings, as the CLI's open_anchored prints them (the anchor's, an oversized segment's): a daemon's
+     * operator sees them only here */
+    if (db->warning[0]) fprintf(stderr, "imagedb-server: warning: %s\n", db->warning);
     if (db->replica) {
         fprintf(stderr, "imagedb-server: %s is a replica: a read-only server of one is a later step\n", dir);
         imdb_close(db);
@@ -211,7 +226,10 @@ int main(int argc, char **argv)
     }
     imdb_err es = {0};
     if (imdbs_stop(s, &es)) failed = true;
-    imdb_close(db);
     if (failed) fprintf(stderr, "imagedb-server: %s\n", es.msg[0] ? es.msg : "the database handle failed");
+    if (imdb_close(db) != IMDB_OK) {
+        fputs("imagedb-server: final database close failed; durability at shutdown is not confirmed\n", stderr);
+        failed = true;
+    }
     return failed ? 1 : 0;
 }

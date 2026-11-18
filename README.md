@@ -88,18 +88,20 @@ grow it past the budget less a query's share (a quarter of the budget, at most
 1 GiB: a query's default limit, below) is refused before anything is written,
 so the database and one query fit in the budget together; DELETE,
 CHECKPOINT, COMPACT ... PURGE and ERASE are never refused, and an open always
-succeeds. `SHOW MEMORY` shows what it holds by kind.
+succeeds. `SHOW MEMORY` shows what it holds by kind. A replica (apply, follow) is never refused a commit its primary
+took: it checks the budget between commits and stops before the next one once past it, consistent (reopen it with a
+larger budget); the commit it takes is read whole before that check and may carry it past the budget, so the budget
+holds a replica to within one commit of it, not to a hard ceiling (the 2026-11-18 review).
 
 A query (SELECT, joins included, and SHOW) has a hard memory limit: everything
 it allocates, its result, sort keys, groups and join pairs alike, is counted
 before it is allocated, and a query that would pass the limit fails with
 "statement memory" and changes nothing (narrow it, or add LIMIT). `SET
 statement_memory = BYTES` sets it for the session (1 MiB to 16 GiB); by default
-it is a quarter of the budget, or 1 GiB without one. The lake's segments a query
-reads are not in this limit: they stay in memory until the query ends (the
-segment cache, `--seg-cache`, trims them after it), so a query's peak is its limit
-plus the segments it read; a scan that lets go of what it has passed is still to
-come. A write's reading is under the same limit: its nested SELECTs, INSERT's query,
+it is a quarter of the budget (at least one byte, at most 1 GiB), or 1 GiB without a budget.
+Segment images are outside this limit. Eligible scans release an image as they
+leave it; other plans (including nested or cross-checked reads) can retain images
+until the operation ends. The cache targets retained images, not peak process RSS. A write's reading is under the same limit: its nested SELECTs, INSERT's query,
 RETURNING's rows, and the rows an UPDATE or DELETE selects (8 bytes each, a list
 that doubles as it grows: at most about statement_memory / 16 rows, 65,536 at the
 1 MiB minimum, far past a transaction's 1,048,576 operations at the default). What
@@ -185,6 +187,11 @@ build/imagedb-server /data/p --socket /run/imagedb/s --server-dir /srv/imagedb -
 IMAGEDB_PASSWORD=secret build/imagedb-client --socket /run/imagedb/s --user admin -f script.sql
 build/imagedb-client --host db.example.com --port 5544 --ca /srv/imagedb/tls/ca.crt --user admin
 ```
+
+The server also accepts `--mem-limit BYTES`, `--seg-cache BYTES|all`, `--anchor FILE` and
+`--iceberg`. The first is a store admission budget, not a process memory limit.
+Iceberg publication is opt-in; external readers see a published table snapshot,
+which can lag SQL commits. Use `imagedb verify` to check a current layer.
 
 - **Logins** are SCRAM-SHA-256 against the database's roles (`CREATE ROLE ...
   PASSWORD`). Privileges are enforced on every statement (N1e); until the server's bounds hold against any role, only
@@ -581,14 +588,14 @@ Command-line options (`imagedb` with no arguments prints the commands):
 | `--cross-check` | sql | `SET cross_check = on` for the session | off |
 | `--nosync` | sql | commits are not fdatasynced until a clean close | synced |
 | `--lake-sync` | sql | a CHECKPOINT after every change (priced) | off |
-| `--iceberg` | sql, apply, follow | F5c: write the Iceberg v3 layer per copy (`iceberg/<table id>/metadata/`) after every publish, so Iceberg readers (DuckDB's iceberg extension is the tested one) see each table's current rows and the generation kept beside them; derived, never shipped, a failure only a warning; a publication writes only the changed tables' layers (Supported scope) | off |
+| `--iceberg` | sql, apply, follow, imagedb-server | F5c: write the Iceberg v3 layer per copy (`iceberg/<table id>/metadata/`) after every publish, so Iceberg readers (DuckDB's iceberg extension is the tested one) see each table's current rows and the generation kept beside them; derived, never shipped, a failure only a warning; a publication writes only the changed tables' layers (Supported scope) | off |
 | `--durable-ack` | sql, apply | DURABLE fsynced before each commit returns | off |
 | `--read-only` | sql | opens without writing anything (a replica's reads) | writable |
-| `--anchor FILE` | sql, verify, promote | an external anchor: a log rolled back behind it is refused | none |
+| `--anchor FILE` | sql, verify, promote, imagedb-server | an external anchor: a log rolled back behind it is refused | none |
 | `--accept-rollback` | sql | continues from a log behind the anchor, rewriting it | off |
-| `--mem-limit BYTES` | sql, apply, follow | the memory budget (K, M or G) | none |
+| `--mem-limit BYTES` | sql, apply, follow, imagedb-server | the memory budget (K, M or G) | none |
 | `--mem-window SECONDS\|none` | sql, apply, follow | versions ended within it stay in memory | 600 |
-| `--seg-cache BYTES\|all` | sql, apply, follow | the lake's segment images kept in memory (a segment whose image is larger is read whole again by every operation that reads it: CHECKPOINT and the open warn) | 256 MB |
+| `--seg-cache BYTES\|all` | sql, apply, follow, imagedb-server | the lake's segment images kept in memory (a segment whose image is larger is read whole again by every operation that reads it: CHECKPOINT and the open warn) | 256 MB |
 | `--stats FILE` | sql, apply, follow | writes the stats export (Monitoring) | none |
 | `--stats FILE` | health | reads that export too | the directory only |
 | `--events FILE` | sql, apply, follow | the event log (Monitoring) | none |

@@ -6644,8 +6644,10 @@ void imdb_mem(const imdb_db *db, imdb_mem_report *r)
 
 uint64_t imdb_query_share(uint64_t mem_limit)
 {
+    if (!mem_limit) return IMDB_MAX_RESULT_BYTES; /* no configured store budget */
     uint64_t share = mem_limit / 4;
-    return share && share < IMDB_MAX_RESULT_BYTES ? share : IMDB_MAX_RESULT_BYTES;
+    if (!share) return 1; /* B = 1..3: keep a positive ceiling, never the unconfigured 1 GiB */
+    return share < IMDB_MAX_RESULT_BYTES ? share : IMDB_MAX_RESULT_BYTES;
 }
 
 int imdb_mem_admit(imdb_db *db, uint64_t growth, imdb_err *e)

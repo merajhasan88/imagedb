@@ -190,6 +190,70 @@ static void t_mem_replica(void)
     imdb_close(rep);
 }
 
+/* P0 #1: a row arrives with the *real* reserve while held is in (B - reserve, B].
+ * Admit that entire commit, stop before the next one, then resume at the same signed history. */
+static void t_mem_replica_reserve_boundary(void)
+{
+    CHECK(imdb_query_share(0) == IMDB_MAX_RESULT_BYTES);
+    for (uint64_t b = 1; b <= 4; b++) CHECK(imdb_query_share(b) == 1);
+    CHECK(imdb_query_share((4ull << 30) - 4) == IMDB_MAX_RESULT_BYTES - 1);
+    CHECK(imdb_query_share(4ull << 30) == IMDB_MAX_RESULT_BYTES);
+    CHECK(imdb_query_share(UINT64_MAX) == IMDB_MAX_RESULT_BYTES);
+    const char *tmp = test_tmpdir();
+    char p[600], rr[600], st[600];
+    snprintf(p, sizeof p, "%s/p", tmp);
+    snprintf(rr, sizeof rr, "%s/r", tmp);
+    snprintf(st, sizeof st, "%s/f", tmp);
+    OK(imdb_init(p, false, NULL, E));
+    OK(imdb_init(rr, true, p, E));
+    imdb_open_opts o = {.sync = 1, .mem_window_us = UINT64_MAX};
+    imdb_db *pri = NULL, *rep = NULL;
+    OK(imdb_open(p, &o, &pri, E));
+    OK(imdb_open(rr, &o, &rep, E));
+    OK(make_table(pri, E));
+    uint64_t start = pri->seq, n = 0;
+    OK(ship_to_file(p, 0, st, E));
+    OK(apply_file(rep, st, &n, E));
+    CHECK(rep->seq == start);
+    OK(imdb_close(rep));
+    OK(imdb_open(rr, &o, &rep, E)); /* measure the reopened state, not the transient apply buffers */
+    o.mem_limit = held(rep) + 1024;
+    OK(imdb_close(rep));
+    OK(imdb_open(rr, &o, &rep, E));
+    uint64_t before = held(rep);
+    CHECK(rep->mem_reserve && rep->mem_reserve == imdb_query_share(o.mem_limit));
+    CHECK(before > o.mem_limit - rep->mem_reserve && before <= o.mem_limit);
+
+    char memo[24577];
+    memset(memo, 'x', sizeof memo - 1);
+    memo[sizeof memo - 1] = 0;
+    uint8_t middle[32], last[32], got[32];
+    OK(ins1(pri, 1, 1, 1, memo));
+    OK(imdb_view_token(pri, middle, E));
+    OK(ins1(pri, 2, 2, 2, "next"));
+    OK(imdb_view_token(pri, last, E));
+    OK(ship_to_file(p, start, st, E));
+    int rc = apply_file(rep, st, &n, E);
+    CHECK(rc == IMDB_ERR_LIMIT && strstr(g_e.msg, "stops before commit"));
+    CHECK(n == 1 && rep->seq == start + 1 && !rep->failed && held(rep) > o.mem_limit);
+    OK(imdb_view_token(rep, got, E));
+    CHECK(!memcmp(got, middle, sizeof got));
+    OK(verify_db(rep));
+    OK(imdb_close(rep));
+
+    o.mem_limit = 0;
+    OK(imdb_open(rr, &o, &rep, E));
+    OK(ship_to_file(p, rep->seq, st, E));
+    OK(apply_file(rep, st, &n, E));
+    CHECK(n == 1 && rep->seq == pri->seq && !rep->failed);
+    OK(imdb_view_token(rep, got, E));
+    CHECK(!memcmp(got, last, sizeof got));
+    OK(verify_db(rep));
+    OK(imdb_close(rep));
+    OK(imdb_close(pri));
+}
+
+
 
 /* P0 decision 1's follow-up (2026-11-18): a replica with the query reserve its budget keeps (D8 #2, not zeroed as
  * open_budget does) still never fails a commit its primary took: it applies commits until it holds its budget less the
@@ -764,6 +828,7 @@ const test_case mem_tests[] = {
     {"mem_reserve", t_mem_reserve},
     {"mem_result_cap", t_mem_result_cap},
     {"mem_replica", t_mem_replica},
+    {"mem_replica_reserve_boundary", t_mem_replica_reserve_boundary},
     {"mem_replica_reserve", t_mem_replica_reserve},
     {"mem_replica_growth", t_mem_replica_growth},
     {"mem_park", t_mem_park},
