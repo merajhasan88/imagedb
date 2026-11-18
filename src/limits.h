@@ -98,7 +98,8 @@
 #define IMDB_MAX_TZ_TRANSITIONS 2000u
 #define IMDB_MAX_TZ_TYPES 256u
 #define IMDB_MAX_TZ_NAME 63u /* = IMDB_MAX_IDENT: SET TIME ZONE keeps it */
-#define IMDB_MAX_TZ_ZONES 256u
+#define IMDB_MAX_TZ_ZONES 2048u /* zones a database loads in its life (each once, db->tz); N1e: past every name a tzdata
+                                 * holds (here 901 files, posix/ included, and 455 aliases: 1,356), so no role exhausts it */
 #define IMDB_MAX_JOIN_ROWS      (1u << 22)   /* a join: build entries, joined rows   */
 #define IMDB_VERIFY_BATCH       512u         /* commits VERIFY decodes and checks at once */
 #define IMDB_VERIFY_BATCH_BYTES (64ull << 20) /* ... or fewer, once their frames reach this */

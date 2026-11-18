@@ -187,7 +187,7 @@ build/imagedb-client --host db.example.com --port 5544 --ca /srv/imagedb/tls/ca.
 ```
 
 - **Logins** are SCRAM-SHA-256 against the database's roles (`CREATE ROLE ...
-  PASSWORD`). Until privileges are enforced on every statement (a later step), only
+  PASSWORD`). Privileges are enforced on every statement (N1e); until the server's bounds hold against any role, only
   SUPERUSER roles log in. The first role is made with the embedded CLI, whose access
   is the file system's. An unknown name and a wrong password are refused alike.
 - **TCP** is TLS 1.3 alone (ALPN `imdbwir1`): no plaintext, no fallback to the
@@ -664,6 +664,10 @@ statement):
 | `sync_timeout_ms` | 1 to 3,600,000 ms | 10,000 | how long a commit waits for them |
 | `timezone` | a zone's name as a string, DEFAULT or LOCAL (`SET TIME ZONE 'Europe/London'`) | UTC, never the process's TZ | the zone TIMESTAMPTZ values show in and literals without an offset are read in (Time zones) |
 
+Through the server, a role that is not a SUPERUSER sets each of these but `slow_statement_ms`, `cross_check`,
+`sync_replicas` and `sync_timeout_ms` (a superuser's: each reaches past its session), and `statement_memory` only
+up to its default.
+
 `BEGIN ISOLATION LEVEL SERIALIZABLE | SNAPSHOT | REPEATABLE READ | READ COMMITTED |
 READ UNCOMMITTED` (or `SET TRANSACTION ISOLATION LEVEL ...` before the transaction's
 first statement) chooses a transaction's isolation: SNAPSHOT by default (or
@@ -803,7 +807,8 @@ never updated. Values a rolled-back transaction took are gaps; a committed value
 never comes again, through a crash or a restart. Not yet: CYCLE, CACHE past 1,
 ALTER SEQUENCE, OWNED BY, an IDENTITY added by ALTER TABLE.
 
-Roles and grants (the catalog: no session carries a role yet, so nothing is refused by them): `CREATE ROLE
+Roles and grants (N1e: enforced for the server's sessions; the embedded API and the CLI keep a superuser's rights):
+`CREATE ROLE
 r [WITH] [LOGIN | NOLOGIN] [SUPERUSER | NOSUPERUSER] [[ENCRYPTED] PASSWORD 'pw' | PASSWORD NULL]` (`CREATE USER`
 the same, LOGIN by default), `ALTER ROLE r ...` (the same options; `RENAME TO s`), `DROP ROLE [IF EXISTS] r`
 (refused while it holds a privilege or a membership either way), `GRANT SELECT, INSERT, UPDATE, DELETE | ALL ON [TABLE]
@@ -816,6 +821,23 @@ the earlier names and verifiers of the live role r, and everything a dropped rol
 owner); DROP TABLE and DROP VIEW end their grants; AS OF reads the grants as they are now. A dump writes the roles,
 their memberships and their grants, the verifiers only with `--role-passwords`. Not yet: WITH GRANT OPTION, column
 privileges, PUBLIC, an owner, CREATEDB, CREATEROLE, VALID UNTIL, IN ROLE, ALTER DEFAULT PRIVILEGES, a login.
+
+Privileges through the server (N1e): each statement runs with its login's role, read from the catalog at the
+statement's start, so a GRANT, a REVOKE or an ALTER ROLE another session commits counts from the next statement. A
+SUPERUSER passes every check. Otherwise a statement needs SELECT on every table and view it reads, wherever it names
+it (joins, subqueries, derived tables, WITH, set operations, COPY TO, SHOW HISTORY, AS OF, a view's body with the
+reader's rights), a CTE nothing reads and a branch no row reaches included; FOR UPDATE needs UPDATE too; a write
+needs INSERT, UPDATE or DELETE on its target (COPY FROM: INSERT, checked before the data is asked for) and SELECT on
+it too when it can read a column of it (a WHERE, RETURNING, a FROM or USING, an expression in SET, ON CONFLICT). A
+role holds its groups' privileges too (memberships, transitively; SUPERUSER never). DDL, the role statements, GRANT
+and REVOKE, ERASE, CHECKPOINT, COMPACT, VERIFY, ALTER ... RETENTION, nextval and the other sequence functions (an
+IDENTITY's or a SERIAL's value in an INSERT aside), SHOW ROLES, SHOW TRANSACTIONS and the database-wide SHOWs are a
+superuser's; SHOW GRANTS shows a role its own; SHOW TABLES and SHOW RETENTION give counts and history only for the
+tables it reads. A refusal is code 16, `permission denied for table t` (or view v), naming the relation alone; the
+statement did nothing. PREPARE checks nothing, each EXECUTE at its run. Where this differs from PostgreSQL 14:
+docs/n1-design.md §8e. The roles govern the server's sessions alone: the database's files (its log, the lake's
+segments, which are Parquet any reader opens, and its Iceberg layer) are read by whoever the file system lets read them,
+so their directories' permissions are the operator's part of the same policy.
 
 CHECK constraints: a column's or a table's `[CONSTRAINT name] CHECK (condition)` in
 CREATE TABLE, `ALTER TABLE t ADD [CONSTRAINT name] CHECK (condition)` (every row

@@ -34,6 +34,7 @@ enum {
     IMDB_ERR_HISTORY = -13,    /* requested history was purged               */
     IMDB_ERR_CONFLICT = -14,   /* a concurrent commit won: retry the transaction */
     IMDB_ERR_CANCELLED = -15,  /* the statement was cancelled or ran past its timeout: nothing it did stays */
+    IMDB_ERR_PRIVILEGE = -16,  /* N1e: the session's role lacks a privilege the statement needs: nothing it did stays */
 };
 
 typedef struct imdb_err {

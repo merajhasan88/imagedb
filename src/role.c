@@ -80,6 +80,46 @@ bool imdb_role_member(const imdb_role *r, uint32_t group)
     return k < r->ngroups && r->groups[k] == group;
 }
 
+/* N1e: what a role holds on an object: its own privileges and every group's it reaches, transitively (PostgreSQL's
+ * INHERIT, its default: L's memberships carry no options, and the catalog's have no cycle). Each role held is marked
+ * seen once and expanded once (two bitsets over the catalog's indexes, IMDB_MAX_ROLES bits each: no allocation, so a
+ * check never fails for memory); a role not live holds nothing */
+uint32_t imdb_role_effective(const imdb_rcat *c, uint32_t role, uint8_t okind, uint32_t oid)
+{
+    enum { W = IMDB_MAX_ROLES / 64 };
+    _Static_assert(IMDB_MAX_ROLES % 64 == 0, "the bitsets' words");
+    uint32_t k = role_index(c, role);
+    if (k >= c->n || c->roles[k]->id != role || c->roles[k]->dropped_at || c->n > IMDB_MAX_ROLES) return 0;
+    uint64_t seen[W], done[W];
+    uint32_t nw = (c->n + 63) / 64, privs = 0;
+    memset(seen, 0, nw * sizeof seen[0]);
+    memset(done, 0, nw * sizeof done[0]);
+    seen[k / 64] |= 1ull << (k % 64);
+    for (;;) {
+        uint32_t i = 0;
+        uint64_t w = 0;
+        while (i < nw && !(w = seen[i] & ~done[i])) i++;
+        if (i == nw) break;
+        uint32_t x = i * 64 + (uint32_t)__builtin_ctzll(w);
+        done[i] |= 1ull << (x % 64);
+        const imdb_role *r = c->roles[x];
+        if (r->dropped_at) continue; /* (never: DROP ROLE is refused while a membership names it) */
+        privs |= imdb_role_privs(r, okind, oid);
+        for (uint32_t g = 0; g < r->ngroups; g++) {
+            uint32_t gk = role_index(c, r->groups[g]);
+            if (gk < c->n && c->roles[gk]->id == r->groups[g]) seen[gk / 64] |= 1ull << (gk % 64);
+        }
+    }
+    return privs;
+}
+
+/* N1e: SUPERUSER is the role's own attribute, never a group's (PostgreSQL's) */
+bool imdb_role_superuser(const imdb_rcat *c, uint32_t role)
+{
+    imdb_role *r = role_live(c, role);
+    return r && (r->attrs & IMDB_RA_SUPERUSER);
+}
+
 bool imdb_db_obj_live(const void *arg, uint8_t okind, uint32_t oid)
 {
     imdb_db *db = (imdb_db *)(uintptr_t)arg;

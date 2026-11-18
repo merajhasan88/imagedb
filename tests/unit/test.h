@@ -48,6 +48,7 @@ extern char g_errmsg[512];
 
 #define TESTS(group) extern const test_case group##_tests[]; extern const size_t group##_ntests;
 TESTS(crypto)
+TESTS(priv)
 TESTS(kernels)
 TESTS(codec)
 TESTS(tseg)

@@ -792,6 +792,58 @@ static void t_tz_load(void)
 }
 
 
+/* N1e: the handle's zone table sorted and searched by halves: every zone the host names (aliases too, not right/ or
+ * posix/), loaded in a drawn order, each later lookup the pointer its load handed out, the table in name order (names
+ * prefixing one another: Etc/GMT, Etc/GMT+1, Etc/GMT+10), all within IMDB_MAX_TZ_ZONES */
+static void t_tz_db_table(void)
+{
+    names zs = {0};
+    walk(ZROOT, "", &zs, false);
+    CHECK(zs.n > 100 && zs.n < IMDB_MAX_TZ_ZONES);
+    for (size_t i = zs.n - 1; i > 0; i--) { /* a drawn order */
+        size_t j = (size_t)(test_rand() % (i + 1));
+        char *t = zs.v[i];
+        zs.v[i] = zs.v[j];
+        zs.v[j] = t;
+    }
+    char dir[4096];
+    snprintf(dir, sizeof dir, "%s/db", test_tmpdir());
+    imdb_err e = {0};
+    CHECK_OK(imdb_init(dir, false, NULL, &e));
+    imdb_open_opts o = {.sync = 0};
+    imdb_db *db = NULL;
+    CHECK_OK(imdb_open(dir, &o, &db, &e));
+    const imdb_tz **got = calloc(zs.n, sizeof *got);
+    bool fine = got != NULL;
+    size_t loaded = 0;
+    for (size_t i = 0; fine && i < zs.n; i++) {
+        imdb_err_clear(&e);
+        if (imdb_db_zone(db, zs.v[i], strlen(zs.v[i]), &got[i], &e) == 0) loaded++;
+        else got[i] = NULL;
+    }
+    for (uint32_t i = 1; fine && i < db->ntz; i++)
+        if (strcmp(db->tz[i - 1]->name, db->tz[i]->name) >= 0) {
+            fine = false;
+            fprintf(stderr, "    the table out of order at %u: %s, %s\n", i, db->tz[i - 1]->name, db->tz[i]->name);
+        }
+    for (size_t i = 0; fine && i < zs.n; i++) {
+        const imdb_tz *again = NULL;
+        if (got[i] && (imdb_db_zone(db, zs.v[i], strlen(zs.v[i]), &again, &e) != 0 || again != got[i])) {
+            fine = false;
+            fprintf(stderr, "    %s found again as another zone\n", zs.v[i]);
+        }
+    }
+    uint32_t ntz = db->ntz;
+    imdb_close(db);
+    if (loaded < zs.n * 9 / 10) fine = false, fprintf(stderr, "    %zu of %zu zones loaded\n", loaded, zs.n);
+    size_t utc = 0; /* UTC's aliases are built in: no entry */
+    for (size_t i = 0; i < zs.n; i++) utc += got[i] == &imdb_tz_utc_zone;
+    SOFT(fine && ntz == loaded - utc);
+    if (ntz != loaded - utc) fprintf(stderr, "    %u entries, %zu loaded, %zu of them UTC's\n", ntz, loaded, utc);
+    free(got);
+    names_free(&zs);
+}
+
 /* the spans a caller caches: each holds t and only its offset (its ends and 16 points between read alike), at every
  * transition and random instants 1850-2150, in every zone */
 static void t_tz_spans(void)
@@ -838,6 +890,7 @@ static void t_tz_spans(void)
 
 const test_case tz_tests[] = {
     {"tz_glibc", t_tz_glibc},
+    {"tz_db_table", t_tz_db_table},
     {"tz_local", t_tz_local},
     {"tz_slim", t_tz_slim},
     {"tz_rules", t_tz_rules},

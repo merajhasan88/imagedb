@@ -113,8 +113,12 @@ enum {
     ST_CREATE_SEQUENCE, ST_DROP_SEQUENCE, /* F2a-2 */
     ST_CREATE_TYPE, ST_ALTER_TYPE, ST_DROP_TYPE, /* F3g: ENUM types */
     ST_CREATE_ROLE, ST_ALTER_ROLE, ST_DROP_ROLE, ST_GRANT, ST_REVOKE, ST_SHOW_ROLES, ST_SHOW_GRANTS, /* L: roles and grants */
+    ST__END, /* N1e: past the last kind (t_priv walks every kind below it: each classified by imdb_priv_kind_need) */
 };
 
+/* N1e: a statement kind's need for an enforced session (0 anyone's, 1 the objects' gates, 2 a superuser's; -1 not
+ * classified: refused) */
+int imdb_priv_kind_need(int kind);
 /* P2 S3: a join's kind as written (RIGHT keeps side 1's rows, FULL both sides'; CROSS and FROM a, b have no ON) */
 enum { SQL_JOIN_INNER = 1, SQL_JOIN_LEFT, SQL_JOIN_RIGHT, SQL_JOIN_FULL, SQL_JOIN_CROSS };
 enum { SQL_SET_UNION = 1, SQL_SET_INTERSECT, SQL_SET_EXCEPT, SQL_SET_ALL = 0x80 }; /* P2 S5: an arm's operator, | ALL */

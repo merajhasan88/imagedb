@@ -137,6 +137,7 @@ int main(int argc, char **argv)
         {"iv", iv_tests, &iv_ntests},          /* F3f: INTERVAL */
         {"enum", enum_tests, &enum_ntests},    /* F3g: ENUM types */
         {"role", role_tests, &role_ntests},    /* L: roles and grants */
+        {"priv", priv_tests, &priv_ntests},    /* N1e: privileges enforced */
         {"e3", e3_tests, &e3_ntests},          /* E3: SERIALIZABLE */
         {"pq", pq_tests, &pq_ntests},          /* F5: the canonical Parquet subset's codec */
         {"ice", ice_tests, &ice_ntests},       /* F5c: the Iceberg v3 layer per copy */

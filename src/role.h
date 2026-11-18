@@ -1,5 +1,5 @@
-/* L (N2's records): roles, their privileges and memberships (docs/roles-design.md). The catalog only: no session
- * carries a role yet (N1's will), so nothing here grants or refuses a read or a write. A catalog (imdb_rcat) is the
+/* L (N2's records): roles, their privileges and memberships (docs/roles-design.md). N1e: a session's role is checked
+ * against them where a statement reads or writes (sql_exec.c's gates, docs/n1-design.md §8e). A catalog (imdb_rcat) is the
  * engine's (db->rc) or VERIFY's model, the same rules applied to each. */
 #ifndef IMDB_ROLE_H
 #define IMDB_ROLE_H
@@ -73,6 +73,10 @@ imdb_role *imdb_role_by_name(imdb_db *db, const char *name);         /* the engi
 imdb_role *imdb_role_by_id(imdb_db *db, uint32_t id);
 uint32_t imdb_role_privs(const imdb_role *r, uint8_t okind, uint32_t oid);
 bool imdb_role_member(const imdb_role *r, uint32_t group);
+/* N1e: the privileges role holds on an object, its own and every group's it reaches (0 for a role not live); whether it
+ * is a live SUPERUSER (an attribute, never inherited) */
+uint32_t imdb_role_effective(const imdb_rcat *c, uint32_t role, uint8_t okind, uint32_t oid);
+bool imdb_role_superuser(const imdb_rcat *c, uint32_t role);
 
 /* The statements' engine (each commits on its own; the install after the commit allocates nothing). ver NULL: no
  * verifier (CREATE), or PASSWORD NULL (ALTER with IMDB_RF_VERIFIER). */

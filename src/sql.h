@@ -57,6 +57,9 @@ typedef int (*imdb_copy_write_fn)(void *arg, const char *buf, size_t len);
 
 typedef struct imdb_session {
     imdb_db *db;
+    uint32_t role;           /* N1e: the role it acts as (0: none); its privileges checked only when enforce is set */
+    bool enforce;            /* N1e: set by the server alone (an embedded caller, the CLI, a re-bind and the dump keep a
+                              * superuser's rights); an enforced session of role 0 is refused every statement */
     bool cross_check;
     bool show_identity;      /* SET identity = on: results print their read point in full */
     uint64_t min_commit;     /* SET min_commit = N: reads refuse a database that has not reached N */
@@ -173,6 +176,8 @@ int imdb_deallocate(imdb_session *s, const char *name, imdb_err *e);
 void imdb_session_copy_io(imdb_session *s, imdb_copy_read_fn rd, imdb_copy_write_fn wr, void *arg);
 /* P2 S10: sql is one COPY ... FROM STDIN statement, whose data a client sends after it (main.c: a script's inline data) */
 bool imdb_copy_in_stmt(const char *sql, size_t len);
+/* N1e: a COPY ... FROM STDIN this session may run (an enforced one's gates asked before its data is: the server's COPY_IN) */
+bool imdb_copy_in_open(imdb_session *ss, const char *sql, size_t len);
 /* P2 S17 (deferred.md D10; src/dump.c): a logical dump of db at one commit through wr: every live table by name, its
  * CREATE TABLE, its rows as COPY ... FROM STDIN (BATCH batch; 0: IMDB_DUMP_BATCH) data ended by \., its indexes; the
  * commit named first, the totals last. imagedb sql -f restores it into an empty database. A failure part way leaves

@@ -367,6 +367,10 @@ static int xenv_seqfn(void *ctx, uint8_t fn, const imdb_xval *a, uint8_t nargs, 
     xctx *x = ctx;
     memset(out, 0, sizeof *out);
     out->type = IMDB_T_INT64;
+    /* N1e: no sequence privileges yet: an enforced session's explicit nextval, currval, setval and lastval are a
+     * superuser's (an IDENTITY's or a SERIAL's value in an INSERT is the engine's: seq_fill, never this) */
+    if (x->ss->enforce && !imdb_role_superuser(&x->db->rc, x->ss->role))
+        return imdb_fail(e, IMDB_ERR_PRIVILEGE, "permission denied for sequence functions: a superuser's");
     if (fn == FN_LASTVAL) {
         if (!x->ss->has_lastval) return imdb_fail(e, IMDB_ERR_STATE, "lastval: no nextval in this session yet");
         out->i = x->ss->lastval;
@@ -4981,6 +4985,140 @@ static int expand_view(xctx *x, const sql_stmt *st, imdb_view *v, imdb_table **o
 /* The table a read names, at its read point (1f): the one it saw then, live or dropped since (AS OF before the drop, a
  * transaction older than it); else the live one, which answers with no row, as it always did. P2 S7: a view likewise, by
  * the same rule (a name is a table's or a view's at any one commit), expanded as a derived table (expand_view) */
+
+/* ---- N1e: privileges (docs/n1-design.md §8e) -------------------------------------------------------------------- */
+
+/* the session's role when it is enforced, NULL when not (a superuser's rights: the embedded API, the CLI, a re-bind, the
+ * dump); an enforced session's role 0 or a dropped role is refused by the statement's Gate A before any gate here runs */
+static const imdb_role *gate_role(const imdb_session *ss)
+{
+    static const imdb_role nobody; /* id 0: no role holds it, so it holds nothing (fail closed) */
+    if (!ss->enforce) return NULL;
+    const imdb_role *r = imdb_rcat_by_id(&ss->db->rc, ss->role);
+    if (!r || r->dropped_at) return &nobody; /* (Gate A refuses such a session first: this is the second lock) */
+    return r->attrs & IMDB_RA_SUPERUSER ? NULL : r;
+}
+
+/* Gate B: a table or view read by name (read_table, the bind-only pass too: an untaken branch's table checked as
+ * PostgreSQL's executor start checks every relation); SELECT ... FOR UPDATE needs UPDATE too. A view's body then reads
+ * through read_table again: the invoker's rights (PostgreSQL 15's security_invoker; §8e names the deviation) */
+static int gate_read(xctx *x, const sql_stmt *st, uint8_t okind, uint32_t oid, const char *name, imdb_err *e)
+{
+    const imdb_role *r = gate_role(x->ss);
+    if (!r) return IMDB_OK;
+    uint32_t need = IMDB_PRIV_SELECT | (st->for_update && okind == IMDB_OBJ_TABLE ? IMDB_PRIV_UPDATE : 0);
+    if ((imdb_role_effective(&x->db->rc, r->id, okind, oid) & need) == need) return IMDB_OK;
+    return imdb_fail(e, IMDB_ERR_PRIVILEGE, "permission denied for %s %s", okind == IMDB_OBJ_VIEW ? "view" : "table", name);
+}
+
+/* Gate C: a write's target, before the statement reads or writes anything (its subqueries included). SELECT too unless
+ * no column of the target can be read: fail closed, so a WHERE, RETURNING, a FROM or USING, an expression in SET (even
+ * one naming no column) or any ON CONFLICT asks for it (UPDATE t SET a = 0 WHERE secret = 1 would tell secret by its
+ * count). A name no table holds passes: the statement's own refusal follows (no table, or a view's) */
+static int gate_write(xctx *x, const sql_stmt *st, imdb_err *e)
+{
+    const imdb_role *r = gate_role(x->ss);
+    if (!r) return IMDB_OK;
+    imdb_table *t = imdb_table_by_name(x->db, st->table);
+    if (!t) return IMDB_OK;
+    bool reads = st->nwhere || st->returning || st->src;
+    uint32_t need = 0;
+    switch (st->kind == ST_EXPLAIN ? st->explained : st->kind) { /* EXPLAIN: the explained statement's needs */
+    case ST_INSERT:
+        need = IMDB_PRIV_INSERT | (st->upsert == SQL_UPSERT_UPDATE ? IMDB_PRIV_UPDATE : 0);
+        reads = st->returning || st->upsert; /* (src: INSERT ... SELECT's query reads through read_table) */
+        break;
+    case ST_COPY_FROM: need = IMDB_PRIV_INSERT, reads = false; break;
+    case ST_UPDATE:
+        need = IMDB_PRIV_UPDATE;
+        for (uint16_t i = 0; i < st->nset; i++) reads |= st->set_vals[i].kind == LIT_EXPR;
+        break;
+    case ST_DELETE: need = IMDB_PRIV_DELETE; break;
+    default: return imdb_fail(e, IMDB_ERR_PRIVILEGE, "permission denied for table %s", st->table); /* (never: fail closed) */
+    }
+    if (reads) need |= IMDB_PRIV_SELECT;
+    if ((imdb_role_effective(&x->db->rc, r->id, IMDB_OBJ_TABLE, t->s.id) & need) == need) return IMDB_OK;
+    return imdb_fail(e, IMDB_ERR_PRIVILEGE, "permission denied for table %s", st->table);
+}
+
+/* Gate A's classes: anyone's (the session's own or names alone), the objects' (Gates B and C decide, or its own rule),
+ * a superuser's. An allow-list: -1 for a kind it does not name, refused for an enforced session, so
+ * a statement kind added later is denied until it is classified here (t_priv walks every kind) */
+enum { NEED_ANY = 0, NEED_OBJECTS, NEED_SUPER };
+int imdb_priv_kind_need(int kind)
+{
+    switch (kind) {
+    case ST_EMPTY: case ST_BEGIN: case ST_COMMIT: case ST_ROLLBACK: case ST_SAVEPOINT: case ST_ROLLBACK_TO:
+    case ST_RELEASE: case ST_SET_TXN: case ST_SET: case ST_PREPARE: case ST_DEALLOCATE: case ST_EXECUTE:
+    case ST_SHOW_PREPARED: case ST_SHOW_TIMEZONE: case ST_SHOW_TABLES: case ST_SHOW_VIEWS: case ST_SHOW_INDEXES:
+    case ST_SHOW_RETENTION: case ST_SHOW_IDENTITY: /* (a read point: every DONE carries the same) */
+    case ST_SHOW_REPLICATION: /* (this session's last commit's replication: ss->last_repl) */
+        return NEED_ANY;
+    case ST_SELECT: case ST_INSERT: case ST_UPDATE: case ST_DELETE: case ST_COPY_FROM: case ST_COPY_TO:
+    case ST_SHOW_HISTORY: case ST_SHOW_GRANTS: case ST_EXPLAIN: /* (EXPLAIN: Gate A asks for the explained kind) */
+        return NEED_OBJECTS;
+    case ST_CREATE: case ST_CREATE_INDEX: case ST_DROP_INDEX: case ST_DROP_TABLE: case ST_ALTER_RETENTION:
+    case ST_ALTER_TABLE: case ST_CREATE_VIEW: case ST_DROP_VIEW: case ST_CREATE_SEQUENCE: case ST_DROP_SEQUENCE:
+    case ST_CREATE_TYPE: case ST_ALTER_TYPE: case ST_DROP_TYPE: case ST_CREATE_ROLE: case ST_ALTER_ROLE:
+    case ST_DROP_ROLE: case ST_GRANT: case ST_REVOKE: case ST_CHECKPOINT: case ST_COMPACT: case ST_ERASE_SUBJECT:
+    case ST_ERASE_WHERE: case ST_ERASE_ROLE: case ST_VERIFY: case ST_SHOW_DIGEST: case ST_SHOW_LOG: case ST_SHOW_LAKE:
+    case ST_SHOW_REPLICAS: case ST_SHOW_ERASURE: case ST_SHOW_MEMORY: case ST_SHOW_STATS:
+    case ST_SHOW_TRANSACTIONS: case ST_SHOW_ROLES:
+        return NEED_SUPER;
+    }
+    return -1;
+}
+
+/* SET's names open to every role: each changes this session alone (statement_memory only up to the default: its
+ * handler). A superuser's: slow_statement_ms (it writes the event log every session shares; PostgreSQL's
+ * log_min_duration_statement is a superuser's too), cross_check (every statement run twice), sync_replicas and
+ * sync_timeout_ms (the engine thread waits after each commit, up to an hour: repl.c). A name not listed is refused, so
+ * a later one is denied until classified */
+static bool set_open(const char *name)
+{
+    static const char *const open[] = {"timezone", "access_path", "join_plan", "identity",
+                                       "statement_memory", "statement_row_limit", "transaction_timeout",
+                                       "idle_in_transaction_timeout", "statement_timeout", "default_transaction_isolation",
+                                       "min_commit"};
+    for (size_t i = 0; i < sizeof open / sizeof open[0]; i++)
+        if (!strcmp(name, open[i])) return true;
+    return false;
+}
+
+/* Gate A, at a statement's start (exec_stmt_body, before its transaction's entry): the session's role read from the
+ * catalog now, so a change another session committed applies at this statement; none, or a dropped one, refused (a
+ * dropped role's open transaction may still roll back) */
+static int gate_kind(const imdb_session *ss, const sql_stmt *st, imdb_err *e)
+{
+    if (!ss->role) return imdb_fail(e, IMDB_ERR_PRIVILEGE, "permission denied: this session acts as no role");
+    const imdb_role *r = imdb_rcat_by_id(&ss->db->rc, ss->role);
+    if (!r || r->dropped_at) /* dropped, or erased since (ERASE ROLE takes a dropped role holding nothing out) */
+        return st->kind == ST_ROLLBACK ? IMDB_OK
+                                       : imdb_fail(e, IMDB_ERR_PRIVILEGE, "permission denied: this session's role was dropped");
+    if (r->attrs & IMDB_RA_SUPERUSER) return IMDB_OK;
+    int need = imdb_priv_kind_need(st->kind == ST_EXPLAIN ? st->explained : st->kind);
+    if (need == NEED_SUPER || need < 0)
+        return imdb_fail(e, IMDB_ERR_PRIVILEGE, "permission denied: this statement needs a superuser");
+    if (st->kind == ST_SET && !set_open(st->set_name))
+        return imdb_fail(e, IMDB_ERR_PRIVILEGE, "permission denied: SET %s needs a superuser", st->set_name);
+    return IMDB_OK;
+}
+
+/* N1e's review: SHOW TABLES and SHOW RETENTION are anyone's (names and columns, as PostgreSQL's catalogs), but a table's
+ * live rows, versions, segments and history only where the role may SELECT it (its exact count, polled, would say what
+ * each commit wrote): NULL otherwise */
+static bool shows_counts(xctx *x, const imdb_table *t)
+{
+    const imdb_role *r = gate_role(x->ss);
+    return !r || (imdb_role_effective(&x->db->rc, r->id, IMDB_OBJ_TABLE, t->s.id) & IMDB_PRIV_SELECT);
+}
+
+static void res_put_int_or_null(xctx *x, const imdb_table *t, imdb_result *r, imdb_cell *c, int64_t v)
+{
+    imdb_value nv = {.type = IMDB_T_INT64, .i = v, .null = !shows_counts(x, t)};
+    res_put(r, c, &nv);
+}
+
 static int read_table(xctx *x, const sql_stmt *st, const char *name, imdb_table **out, imdb_err *e)
 {
     for (int i = (int)x->nvis - 1; i >= 0; i--) /* P2 S4: a row set by its name first, the latest made (WITH shadows) */
@@ -5000,8 +5138,10 @@ static int read_table(xctx *x, const sql_stmt *st, const char *name, imdb_table 
         return imdb_fail(e, IMDB_ERR_CONFLICT, "view %s was created after this SERIALIZABLE transaction's snapshot; retry "
                          "the transaction", v->name);
     }
+    if (v && gate_read(x, st, IMDB_OBJ_VIEW, v->id, name, e)) return e->code; /* N1e: Gate B */
     if (v) return expand_view(x, st, v, out, e);
     if (!t) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no table %s", name);
+    if (gate_read(x, st, IMDB_OBJ_TABLE, t->s.id, name, e)) return e->code; /* N1e: Gate B (the object at the snapshot) */
     deps_note(x, IMDB_VIEWDEP_TABLE, t->s.id);
     *out = t;
     return IMDB_OK;
@@ -5200,7 +5340,13 @@ static int exec_show_grants(xctx *x, const sql_stmt *st, imdb_result *r, imdb_er
 {
     imdb_db *db = x->db;
     const imdb_role *only = NULL;
-    if (st->table[0] && !(only = imdb_role_by_name(db, st->table))) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no role %s", st->table);
+    /* N1e: an enforced non-superuser sees its own grants alone (role names are personal data here: a deviation from
+     * PostgreSQL, whose catalogs any role reads) */
+    const imdb_role *me = gate_role(x->ss);
+    if (me && st->table[0] && strcmp(st->table, me->name))
+        return imdb_fail(e, IMDB_ERR_PRIVILEGE, "permission denied: SHOW GRANTS FOR another role needs a superuser");
+    if (me) only = me;
+    else if (st->table[0] && !(only = imdb_role_by_name(db, st->table))) return imdb_fail(e, IMDB_ERR_NOTFOUND, "no role %s", st->table);
     res_cols(r, 4);
     const char *nm[] = {"role", "privilege", "kind", "object"};
     for (int i = 0; i < 4; i++) res_name(r, (uint16_t)i, nm[i]);
@@ -9045,6 +9191,7 @@ static bool gen_defaults(const sql_stmt *st, uint16_t width, uint16_t i)
 
 static int exec_insert(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
 {
+    if (gate_write(x, st, e)) return e->code; /* N1e: Gate C, before anything the statement runs */
     if ((st->nsub || st->src) && !x->own) wceil_set(x); /* P2 S8: what it reads */
     if (st->nsub && !x->own && rset_prepare(x, st, false, e)) return e->code; /* P2 S4: its subqueries, before any write */
     imdb_table *t = imdb_table_by_name(x->db, st->table);
@@ -9272,6 +9419,7 @@ static int copy_header(imdb_table *t, const imdb_csv *c, const int *map, uint16_
  * the SKIP that resumes after them */
 static int exec_copy_from(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
 {
+    if (gate_write(x, st, e)) return e->code; /* N1e: Gate C, before anything the statement runs */
     imdb_session *ss = x->ss;
     if (!ss->copy_rd)
         return imdb_fail(e, IMDB_ERR_STATE, "COPY ... FROM STDIN reads the client's stream, and this session has none "
@@ -9558,6 +9706,26 @@ bool imdb_copy_in_stmt(const char *sql, size_t len)
     imdb_free(st);
     return in;
 }
+
+/* N1e: whether this session may run that COPY ... FROM STDIN: Gate A's and Gate C's verdicts before its data is asked
+ * for, so a role without INSERT on the target never spools a byte (the server sends no COPY_IN: the statement then runs
+ * and is refused at once, as it would be from its spool). Any session: a COPY FROM into a table that exists */
+bool imdb_copy_in_open(imdb_session *ss, const char *sql, size_t len)
+{
+    imdb_err e = {0};
+    sql_stmt *st = imdb_alloc(sizeof *st, &e);
+    if (!st) return false;
+    memset(st, 0, sizeof *st);
+    bool in = !imdb_sql_parse(sql, len, st, &e) && st->kind == ST_COPY_FROM;
+    if (in && !imdb_table_by_name(ss->db, st->table)) in = false; /* no table (or a view): refused unrun, no data asked */
+    if (in && ss->enforce) {
+        xctx x = {.ss = ss, .db = ss->db, .sql = sql, .st = st};
+        in = !gate_kind(ss, st, &e) && !gate_write(&x, st, &e);
+    }
+    imdb_sql_stmt_free(st);
+    imdb_free(st);
+    return in;
+}
 /* P2 S8: a pair's place in t's key order (UPDATE ... FROM, DELETE ... USING) */
 typedef struct pkrow {
     imdb_xval k;
@@ -9704,6 +9872,7 @@ static int exec_join_write(xctx *x, const sql_stmt *st, bool upd, imdb_result *r
 
 static int exec_update(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, imdb_err *e)
 {
+    if (gate_write(x, st, e)) return e->code; /* N1e: Gate C, before anything the statement runs */
     wceil_set(x); /* P2 S8: what it reads */
     if (st->nsub && !x->own) { /* P2 S4: its subqueries, at its snapshot, before any write */
         if (rset_prepare(x, st, false, e)) return e->code;
@@ -9882,6 +10051,7 @@ static int fk_delete(xctx *x, imdb_table *t, uint64_t vid, imdb_err *e)
 }
 static int exec_delete(xctx *x, const sql_stmt *st, imdb_result *r, xplain *xp, imdb_err *e)
 {
+    if (gate_write(x, st, e)) return e->code; /* N1e: Gate C, before anything the statement runs */
     wceil_set(x); /* P2 S8: what it reads */
     if (st->nsub && !x->own) { /* P2 S4 */
         if (rset_prepare(x, st, false, e)) return e->code;
@@ -10021,7 +10191,7 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
             if (!row) return e->code;
             res_put_str(r, &row[0], t->s.name);
             res_put_str(r, &row[1], ret);
-            res_put_int(r, &row[2], (int64_t)t->horizon);
+            res_put_int_or_null(x, t, r, &row[2], (int64_t)t->horizon); /* N1e */
         }
         return res_finish(r, e);
     }
@@ -10079,10 +10249,10 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
             res_put_str(r, &row[0], t->s.name);
             res_put_str(r, &row[1], cols.p ? (const char *)cols.p : "");
             imdb_buf_free(&cols);
-            res_put_int(r, &row[2], (int64_t)t->live);
-            res_put_int(r, &row[3], (int64_t)t->nver);
-            res_put_int(r, &row[4], (int64_t)t->nseg);
-            res_put_int(r, &row[5], (int64_t)t->horizon);
+            res_put_int_or_null(x, t, r, &row[2], (int64_t)t->live); /* N1e: a role's readable tables alone */
+            res_put_int_or_null(x, t, r, &row[3], (int64_t)t->nver);
+            res_put_int_or_null(x, t, r, &row[4], (int64_t)t->nseg);
+            res_put_int_or_null(x, t, r, &row[5], (int64_t)t->horizon);
             imdb_value dv = {.type = IMDB_T_INT64, .i = (int64_t)t->dropped_at, .null = !t->dropped_at};
             res_put(r, &row[6], &dv);
         }
@@ -10841,6 +11011,10 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
         return imdb_fail(e, IMDB_ERR_STATE,
                          "replica has unauthorised redactions or an unverified lake; resume apply before querying");
     }
+    if (ss->enforce && (rc = gate_kind(ss, st, e))) { /* N1e: Gate A, before anything of the statement runs */
+        stmt_drop(st, owned);
+        return rc;
+    }
     /* read-your-writes across copies: a session that needs commit N refuses one not there yet */
     bool reads = st->kind == ST_SELECT || st->kind == ST_COPY_TO || st->kind == ST_SHOW_DIGEST || st->kind == ST_SHOW_HISTORY || st->kind == ST_SHOW_IDENTITY ||
                  (st->kind == ST_EXPLAIN && st->explained == ST_SELECT); /* a plan of what that read would see */
@@ -11442,6 +11616,10 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
                 (v && ((uint64_t)v < IMDB_MIN_STATEMENT_MEMORY || (uint64_t)v > IMDB_MAX_STATEMENT_MEMORY)))
                 rc = imdb_fail(e, IMDB_ERR_INVALID, "statement_memory is 0 (the default) or %llu to %llu bytes",
                                (unsigned long long)IMDB_MIN_STATEMENT_MEMORY, (unsigned long long)IMDB_MAX_STATEMENT_MEMORY);
+            else if (gate_role(ss) && (uint64_t)v > imdb_query_share(db->mem_limit)) /* N1e: a role's share, no more */
+                rc = imdb_fail(e, IMDB_ERR_PRIVILEGE, "permission denied: statement_memory past the default (%llu bytes) "
+                                                      "needs a superuser",
+                               (unsigned long long)imdb_query_share(db->mem_limit));
             else ss->stmt_memory = (uint64_t)v;
         } else if (strcmp(st->set_name, "slow_statement_ms") == 0) { /* P1 M2: the event log's slow statements */
             int64_t v;

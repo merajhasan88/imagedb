@@ -7154,6 +7154,14 @@ int imdb_hist_copy(imdb_schema_hist *dst, const imdb_schema_hist *src, imdb_err 
     return IMDB_OK;
 }
 
+/* a loaded zone's name against a name of len bytes (not terminated): byte order, a prefix first */
+static int tz_name_cmp(const char *a, const char *b, size_t blen)
+{
+    size_t al = strlen(a);
+    int c = memcmp(a, b, al < blen ? al : blen);
+    return c ? c : al < blen ? -1 : al > blen ? 1 : 0;
+}
+
 /* P2: a zone by name (db.h). The table holds what was ever named, each zone its own allocation, never moved or freed
  * before close, so a pointer handed out stays good while the handle lives; the load is exempt from a statement's memory
  * ceiling (the handle's, not the statement's: a 1 MiB statement naming its first zone is not refused for it) */
@@ -7168,13 +7176,21 @@ int imdb_db_zone(imdb_db *db, const char *name, size_t len, const struct imdb_tz
         return imdb_fail(e, IMDB_ERR_INVALID, "a time zone is named by letters, digits and / _ - + (at most %u bytes, no "
                                               "empty, . or .. part)", IMDB_MAX_TZ_NAME);
     pthread_mutex_lock(&db->tz_lock);
+    /* the table sorted by name, searched by halves: a statement converting a column's zones looks one up a row, and the
+     * table may hold every zone a tzdata names (IMDB_MAX_TZ_ZONES, N1e); a load inserts in place, moving pointers alone
+     * (each zone stays where it was allocated, so a pointer handed out stays good) */
+    uint32_t lo = 0, hi = db->ntz;
+    while (lo < hi) {
+        uint32_t m = lo + (hi - lo) / 2;
+        if (tz_name_cmp(db->tz[m]->name, name, len) < 0) lo = m + 1;
+        else hi = m;
+    }
+    if (lo < db->ntz && !tz_name_cmp(db->tz[lo]->name, name, len)) {
+        *out = db->tz[lo];
+        pthread_mutex_unlock(&db->tz_lock);
+        return IMDB_OK;
+    }
     int rc = IMDB_OK;
-    for (uint32_t i = 0; i < db->ntz; i++)
-        if (strlen(db->tz[i]->name) == len && !memcmp(db->tz[i]->name, name, len)) {
-            *out = db->tz[i];
-            pthread_mutex_unlock(&db->tz_lock);
-            return IMDB_OK;
-        }
     if (db->ntz >= IMDB_MAX_TZ_ZONES) {
         rc = imdb_fail(e, IMDB_ERR_LIMIT, "more than %u time zones named in this database's life", IMDB_MAX_TZ_ZONES);
     } else {
@@ -7182,7 +7198,11 @@ int imdb_db_zone(imdb_db *db, const char *name, size_t len, const struct imdb_tz
         imdb_heap_exempt_begin();
         rc = imdb_tz_load(db->tz_root, name, len, &z, e);
         imdb_heap_exempt_end();
-        if (!rc) *out = db->tz[db->ntz++] = z;
+        if (!rc) {
+            memmove(&db->tz[lo + 1], &db->tz[lo], (size_t)(db->ntz - lo) * sizeof db->tz[0]);
+            *out = db->tz[lo] = z;
+            db->ntz++;
+        }
     }
     pthread_mutex_unlock(&db->tz_lock);
     return rc;

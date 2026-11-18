@@ -4051,6 +4051,21 @@ static void quiet(void *arg, const char *msg)
     (void)msg;
 }
 
+/* N1e: the MySQL and MariaDB session's SETs (connect_all's, kept in step by hand), for the privileges battery's second
+ * connection as its role; NULL past the last, "" for one this run skips */
+static const char *my_set_sql(int d, int i)
+{
+    switch (i) {
+    case 0: return d == D_MY ? "SET NAMES utf8mb4 COLLATE utf8mb4_0900_bin" : "SET NAMES utf8mb4 COLLATE utf8mb4_nopad_bin";
+    case 1:
+        return "SET SESSION sql_mode = 'STRICT_ALL_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO,"
+               "ONLY_FULL_GROUP_BY,NO_ENGINE_SUBSTITUTION'";
+    case 2: return "SET SESSION div_precision_increment = 30";
+    case 3: return g_tz ? "SET time_zone = '+00:00'" : ""; /* "": none this run */
+    default: return NULL;
+    }
+}
+
 static void connect_all(void)
 {
     for (int d = 0; d < ND; d++) {
@@ -5136,6 +5151,8 @@ static unsigned long g_iv_compared, g_iv_unit_compared, g_iv_text_compared, g_iv
 static bool g_en;                  /* F3g: --enum (en_battery) */
 static bool g_scram;               /* L: --scram (scram_battery) */
 static int scram_battery(unsigned seed);
+static bool g_privs;               /* N1e: --privs (privs_battery) */
+static int privs_battery(unsigned seed);
 static int en_battery(unsigned seed);
 
 typedef struct ivv {
@@ -5625,7 +5642,8 @@ static int run_seed(unsigned seed, int steps)
     if (g_dec38 && dec38_battery(seed)) return -1; /* F3e: after it, likewise */
     if (g_iv && iv_battery(seed)) return -1;      /* F3f: likewise */
     if (g_en && en_battery(seed)) return -1;     /* F3g: likewise */
-    return g_scram ? scram_battery(seed) : 0;      /* L: likewise (PostgreSQL alone) */
+    if (g_scram && scram_battery(seed)) return -1; /* L: likewise (PostgreSQL alone) */
+    return g_privs ? privs_battery(seed) : 0;      /* N1e: last, so every battery's draws before it are unchanged */
 }
 
 
@@ -5936,6 +5954,497 @@ static int scram_battery(unsigned seed)
     return 0;
 }
 
+/* N1e, --privs: table privileges against PostgreSQL, MySQL, MariaDB and SQL Server, a battery per seed (SQLite has no
+ * privileges: not asked). Two tables pa (id, a) and pb (id, b), three rows each, drawn per seed; a role orapr1 (a
+ * PostgreSQL role; a MySQL and MariaDB user 'orapr1'@'localhost'; a SQL Server login and its user in oracle; an imagedb
+ * role); for each table a subset of {SELECT, INSERT, UPDATE, DELETE} granted to it, drawn. Ten statements, in an order
+ * drawn, each run as orapr1 after both tables are put back to their rows (so no statement's answer depends on another's):
+ * imagedb through a second session on the same handle, enforced, acting as orapr1 (the server's way: src/sql.h);
+ * PostgreSQL under SET ROLE on its connection (the same verdicts as a login: pg14-live-checks); SQL Server under
+ * EXECUTE AS USER on sa's; MySQL and MariaDB through a second connection as orapr1. Then the grants are drawn again,
+ * changed by REVOKE and GRANT while every session stays open (a change applies at the next statement), and the ten run
+ * again. Each verdict is answered or refused for a privilege (each engine's words); a refusal for any other reason is a
+ * mismatch (the battery's statements never fail otherwise). Answers compared as rows or as counts changed, and after
+ * every write, refused or not, both tables' rows read by the administrator. imagedb is also held to PostgreSQL 14's
+ * rules over the drawn grants (the model: SELECT on every table read; a write's privilege on its target; SELECT on it
+ * too once a WHERE reads it), so a run without a server still checks something. Only forms every engine spells alike
+ * and where imagedb is no stricter than PostgreSQL by design: no CTE, CASE or COALESCE over a subquery, UPDATE ... FROM,
+ * DELETE ... USING, ON CONFLICT, RETURNING, view or sequence (docs/n1-design.md §8e's deviations) */
+static unsigned long g_pv_compared, g_pv_stmts, g_pv_all_refused, g_pv_all_answered, g_pv_model, g_pv_states;
+
+enum { PV_S = 1, PV_I = 2, PV_U = 4, PV_D = 8 }; /* a privilege's bit; a table's grants a mask of them */
+enum { PV_ANSWERED, PV_DENIED, PV_OTHER };     /* a verdict's class */
+#define PV_PW_MY "orapr1-Pw-9x"                 /* orapr1's password in MySQL and MariaDB (the socket: any plugin's) */
+#define PV_PW_MS "Orapr1-pw-9x!"                /* its login's in SQL Server (CHECK_POLICY = OFF: no rule asked) */
+#define PV_NQ 10
+
+static const struct {
+    const char *sql; /* statement 4 is written by pv_phase with its drawn key (a literal format) */
+    bool rows, write;
+    int nty;
+    uint8_t need[2]; /* PostgreSQL 14's needs on pa, on pb (pg14-live-checks cases 2-5; 1e for IN) */
+} PVQ[PV_NQ] = {
+    {"SELECT * FROM pa ORDER BY id", true, false, 2, {PV_S, 0}},
+    {"SELECT COUNT(*) FROM pb", true, false, 1, {0, PV_S}},
+    {"SELECT pa.id FROM pa JOIN pb ON pa.id = pb.id ORDER BY 1", true, false, 1, {PV_S, PV_S}},
+    {"SELECT id FROM pa WHERE id IN (SELECT id FROM pb) ORDER BY 1", true, false, 1, {PV_S, PV_S}},
+    {"INSERT INTO pa VALUES (%d, %d)", false, true, 0, {PV_I, 0}},
+    {"UPDATE pa SET a = 0", false, true, 0, {PV_U, 0}},              /* no WHERE: UPDATE alone (case 2) */
+    {"UPDATE pa SET a = 5 WHERE id = 1", false, true, 0, {PV_U | PV_S, 0}},
+    {"DELETE FROM pb WHERE id = 2", false, true, 0, {0, PV_D | PV_S}},
+    {"DELETE FROM pb", false, true, 0, {0, PV_D}},                   /* no WHERE: DELETE alone (case 3) */
+    {"INSERT INTO pa SELECT id + 100, b FROM pb", false, true, 0, {PV_I, PV_S}},
+};
+
+static struct {
+    eng ie;                /* imagedb's enforced session, acting as orapr1 */
+    eng adm[ND];           /* MySQL's and MariaDB's user management: root (MySQL's: the oracle's own connection) */
+    eng ue[ND];            /* MySQL's and MariaDB's connections as orapr1 */
+    MYSQL *ma_root;        /* MariaDB's root connection, this battery's own (the oracle's user lacks GRANT OPTION) */
+    char mydb[ND][64];     /* the database ORACLE_MYSQL and ORACLE_MARIADB name ("oracle") */
+    int a[3], pbid[3], b[3];
+    int ins;               /* the INSERT's key: 4-9, never a held one */
+    char why[320];
+} g_pv;
+
+static bool pv_on(int d) { return g_eng[d].on && d != D_SQLITE; }
+
+static int pv_fail(unsigned seed, const char *what, const char *detail)
+{
+    g_mismatches++;
+    fprintf(stderr, "MISMATCH seed %u (--privs): %s%s%s\n", seed, what, detail ? ": " : "", detail ? detail : "");
+    return -1;
+}
+
+/* the battery's own setup statement on engine e (an administrator's): a refusal is a mismatch, never the run's end */
+static int pv_must(unsigned seed, eng *e, const char *sql)
+{
+    res r;
+    memset(&r, 0, sizeof r);
+    exec_eng(e, sql, false, NULL, 0, &r);
+    int rc = 0;
+    if (r.err) {
+        g_mismatches++;
+        fprintf(stderr, "MISMATCH seed %u (--privs), %s refused the battery's own statement: %s\n  %s\n", seed, DNAME[e->d],
+                r.msg, sql);
+        rc = -1;
+    }
+    res_clear(&r);
+    return rc;
+}
+
+static void pv_quiet(eng *e, const char *sql) /* cleanup: a refusal ignored (the next seed's setup drops again) */
+{
+    res r;
+    memset(&r, 0, sizeof r);
+    exec_eng(e, sql, false, NULL, 0, &r);
+    res_clear(&r);
+}
+
+/* ORACLE_MYSQL's or ORACLE_MARIADB's socket and database; a connection on it as user (pass "" for none), its database
+ * the oracle's when with_db, CLIENT_FOUND_ROWS as the oracle's (an UPDATE's count its matched rows, as the others') */
+static MYSQL *pv_my_connect(int d, const char *user, const char *pass, bool with_db, char *why, size_t n)
+{
+    const char *ci = getenv(d == D_MY ? "ORACLE_MYSQL" : "ORACLE_MARIADB");
+    char sock[400] = "", u[64] = "", p[64] = "", db[64] = "";
+    if (!ci || sscanf(ci, "%399s %63s %63s %63s", sock, u, p, db) < 4) {
+        snprintf(why, n, "%s's connection string is not set", DNAME[d]);
+        return NULL;
+    }
+    snprintf(g_pv.mydb[d], sizeof g_pv.mydb[d], "%s", db);
+    MYSQL *m = mysql_init(NULL);
+    if (!m) {
+        snprintf(why, n, "mysql_init failed");
+        return NULL;
+    }
+    mysql_options(m, MYSQL_SET_CHARSET_NAME, "utf8mb4");
+    if (!mysql_real_connect(m, NULL, user, pass, with_db ? db : NULL, 0, sock, CLIENT_FOUND_ROWS)) {
+        snprintf(why, n, "%s as %s: %s", DNAME[d], user, mysql_error(m));
+        mysql_close(m);
+        return NULL;
+    }
+    return m;
+}
+
+/* a mask's privileges as a list ("SELECT, UPDATE"); "" for none */
+static void pv_list(char *out, size_t cap, int m)
+{
+    static const char *const P[4] = {"SELECT", "INSERT", "UPDATE", "DELETE"};
+    size_t k = 0;
+    out[0] = 0;
+    for (int i = 0; i < 4; i++)
+        if (m & (1 << i)) k += (size_t)snprintf(out + k, k < cap ? cap - k : 0, "%s%s", k ? ", " : "", P[i]);
+}
+
+/* GRANT (or REVOKE) mask on table tab to (from) orapr1, in engine d's spelling */
+static int pv_grant(unsigned seed, int d, bool grant, int m, const char *tab)
+{
+    /* the battery's own check (IMDB_ORACLE_PRIVS_LIE=pg|mysql|mariadb|mssql|imagedb): that engine granted SELECT on pa
+     * too, so where the draw withheld it every statement reading pa must be a mismatch against that engine */
+    const char *lie = getenv("IMDB_ORACLE_PRIVS_LIE");
+    if (grant && lie && !strcmp(lie, DNAME[d]) && !strcmp(tab, "pa")) m |= PV_S;
+    if (!m) return 0;
+    char pl[64], sql[256];
+    pv_list(pl, sizeof pl, m);
+    if (d == D_MY || d == D_MA)
+        snprintf(sql, sizeof sql, "%s %s ON %s.%s %s 'orapr1'@'localhost'", grant ? "GRANT" : "REVOKE", pl, g_pv.mydb[d], tab,
+                 grant ? "TO" : "FROM");
+    else snprintf(sql, sizeof sql, "%s %s ON %s %s orapr1", grant ? "GRANT" : "REVOKE", pl, tab, grant ? "TO" : "FROM");
+    return pv_must(seed, d == D_MY || d == D_MA ? &g_pv.adm[d] : &g_eng[d], sql);
+}
+
+/* every asked engine's tables, user or role, and its grants of {pa, pb}: g[2] */
+static int pv_setup(unsigned seed, const int g[2])
+{
+    static const char *const CT[ND][2] = {
+        {"CREATE TABLE pa (id INT64 PRIMARY KEY, a INT64)", "CREATE TABLE pb (id INT64 PRIMARY KEY, b INT64)"},
+        {NULL, NULL},
+        {"CREATE TABLE pa (id BIGINT PRIMARY KEY, a BIGINT)", "CREATE TABLE pb (id BIGINT PRIMARY KEY, b BIGINT)"},
+        {"CREATE TABLE pa (id BIGINT PRIMARY KEY, a BIGINT)", "CREATE TABLE pb (id BIGINT PRIMARY KEY, b BIGINT)"},
+        {"CREATE TABLE pa (id BIGINT PRIMARY KEY, a BIGINT)", "CREATE TABLE pb (id BIGINT PRIMARY KEY, b BIGINT)"},
+        {"CREATE TABLE pa (id BIGINT NOT NULL PRIMARY KEY, a BIGINT)", "CREATE TABLE pb (id BIGINT NOT NULL PRIMARY KEY, b BIGINT)"}};
+    for (int d = 0; d < ND; d++) {
+        if (!pv_on(d)) continue;
+        eng *e = &g_eng[d];
+        int rc = 0;
+        switch (d) {
+        case D_IMDB: /* a fresh directory a seed (reset_all): nothing of a seed before it */
+            rc = pv_must(seed, e, CT[d][0]) || pv_must(seed, e, CT[d][1]) || pv_must(seed, e, "CREATE ROLE orapr1");
+            break;
+        case D_PG: /* the tables first: a role holding a grant on one is not dropped */
+            rc = pv_must(seed, e, "DROP TABLE IF EXISTS pa") || pv_must(seed, e, "DROP TABLE IF EXISTS pb") ||
+                 pv_must(seed, e, "DROP ROLE IF EXISTS orapr1") || pv_must(seed, e, CT[d][0]) || pv_must(seed, e, CT[d][1]) ||
+                 pv_must(seed, e, "CREATE ROLE orapr1");
+            break;
+        case D_MY:
+        case D_MA: { /* the user first: MySQL keeps a table's grants after its DROP TABLE, DROP USER takes them all. pz: a
+                      * table no statement reads, its SELECT granted so orapr1 may connect to the database whatever the
+                      * draw (a user holding nothing in it is refused at the connect: 1044) */
+            char cu[160], gz[200];
+            snprintf(cu, sizeof cu, "CREATE USER 'orapr1'@'localhost' IDENTIFIED BY '%s'", PV_PW_MY);
+            snprintf(gz, sizeof gz, "GRANT SELECT ON %s.pz TO 'orapr1'@'localhost'", g_pv.mydb[d]);
+            eng *a = &g_pv.adm[d];
+            rc = pv_must(seed, a, "DROP USER IF EXISTS 'orapr1'@'localhost'") || pv_must(seed, e, "DROP TABLE IF EXISTS pa") ||
+                 pv_must(seed, e, "DROP TABLE IF EXISTS pb") || pv_must(seed, e, "DROP TABLE IF EXISTS pz") ||
+                 pv_must(seed, e, CT[d][0]) || pv_must(seed, e, CT[d][1]) ||
+                 pv_must(seed, e, "CREATE TABLE pz (id BIGINT PRIMARY KEY)") || pv_must(seed, a, cu) || pv_must(seed, a, gz);
+            break;
+        }
+        case D_MS: { /* the tables take their permissions with them; then the user, then its login */
+            char cl[200];
+            snprintf(cl, sizeof cl, "CREATE LOGIN orapr1 WITH PASSWORD = '%s', CHECK_POLICY = OFF", PV_PW_MS);
+            rc = pv_must(seed, e, "DROP TABLE IF EXISTS pa") || pv_must(seed, e, "DROP TABLE IF EXISTS pb") ||
+                 pv_must(seed, e, "DROP USER IF EXISTS orapr1") ||
+                 pv_must(seed, e, "IF SUSER_ID('orapr1') IS NOT NULL DROP LOGIN orapr1") || pv_must(seed, e, CT[d][0]) ||
+                 pv_must(seed, e, CT[d][1]) || pv_must(seed, e, cl) || pv_must(seed, e, "CREATE USER orapr1 FOR LOGIN orapr1");
+            break;
+        }
+        }
+        if (rc || pv_grant(seed, d, true, g[0], "pa") || pv_grant(seed, d, true, g[1], "pb")) return -1;
+    }
+    return 0;
+}
+
+/* the grants moved from old[] to now[] on every engine: what is held and no longer drawn revoked (MySQL refuses a REVOKE
+ * of a privilege not held: 1147), what is drawn and not held granted */
+static int pv_regrant(unsigned seed, const int old[2], const int now[2])
+{
+    static const char *const T[2] = {"pa", "pb"};
+    for (int d = 0; d < ND; d++) {
+        if (!pv_on(d)) continue;
+        for (int t = 0; t < 2; t++)
+            if (pv_grant(seed, d, false, old[t] & ~now[t], T[t]) || pv_grant(seed, d, true, now[t] & ~old[t], T[t])) return -1;
+    }
+    return 0;
+}
+
+/* both tables put back to the seed's rows, by the administrator, on every asked engine */
+static int pv_restore(unsigned seed)
+{
+    char ia[160], ib[160];
+    snprintf(ia, sizeof ia, "INSERT INTO pa VALUES (1, %d), (2, %d), (3, %d)", g_pv.a[0], g_pv.a[1], g_pv.a[2]);
+    snprintf(ib, sizeof ib, "INSERT INTO pb VALUES (%d, %d), (%d, %d), (%d, %d)", g_pv.pbid[0], g_pv.b[0], g_pv.pbid[1],
+             g_pv.b[1], g_pv.pbid[2], g_pv.b[2]);
+    for (int d = 0; d < ND; d++) {
+        if (!pv_on(d)) continue;
+        eng *e = &g_eng[d];
+        if (pv_must(seed, e, "DELETE FROM pa") || pv_must(seed, e, "DELETE FROM pb") || pv_must(seed, e, ia) ||
+            pv_must(seed, e, ib))
+            return -1;
+    }
+    return 0;
+}
+
+/* orapr1's run of sql on engine d. PostgreSQL and SQL Server take the role on the administrator's connection and give it
+ * back whatever the statement did: -1 when giving it back fails (every later statement would run as orapr1, the next
+ * seed's reset_all's must() among them). A role not taken leaves r refused with words no class takes: a mismatch */
+static int pv_as(int d, const char *sql, bool rows, const int *ty, int nty, res *r)
+{
+    if (d == D_IMDB) {
+        exec_eng(&g_pv.ie, sql, rows, ty, nty, r);
+        return 0;
+    }
+    if (d == D_MY || d == D_MA) {
+        exec_eng(&g_pv.ue[d], sql, rows, ty, nty, r);
+        return 0;
+    }
+    eng *e = &g_eng[d];
+    res w;
+    memset(&w, 0, sizeof w);
+    exec_eng(e, d == D_PG ? "SET ROLE orapr1" : "EXECUTE AS USER = 'orapr1'", false, NULL, 0, &w);
+    if (w.err) {
+        res_clear(r);
+        res_fail(r, "(the battery could not act as orapr1: %.200s)", w.msg);
+        res_clear(&w);
+        return 0;
+    }
+    exec_eng(e, sql, rows, ty, nty, r);
+    exec_eng(e, d == D_PG ? "RESET ROLE" : "REVERT", false, NULL, 0, &w);
+    int rc = w.err ? -1 : 0;
+    if (rc) snprintf(g_pv.why, sizeof g_pv.why, "%s: %s", d == D_PG ? "RESET ROLE" : "REVERT", w.msg);
+    res_clear(&w);
+    return rc;
+}
+
+/* a verdict's class by each engine's words: a privilege's refusal (PostgreSQL 42501 "permission denied for table";
+ * MySQL's and MariaDB's 1142 "... command denied to user ... for table" and 1143 "... for column"; SQL Server's 229 "The
+ * ... permission was denied on the object"; imagedb's IMDB_ERR_PRIVILEGE of Gates B and C "permission denied for table":
+ * its Gate A's "permission denied: ..." is another, a setup fault, never agreement) */
+static int pv_class(int d, const res *r)
+{
+    if (!r->err) return PV_ANSWERED;
+    const char *m = r->msg;
+    switch (d) {
+    case D_IMDB:
+    case D_PG: return strstr(m, "permission denied for table ") ? PV_DENIED : PV_OTHER;
+    case D_MY:
+    case D_MA: return strstr(m, " command denied to user ") ? PV_DENIED : PV_OTHER;
+    case D_MS: return strstr(m, " permission was denied on the object ") ? PV_DENIED : PV_OTHER;
+    }
+    return PV_OTHER;
+}
+
+static const char *const PV_CLASS[3] = {"answered", "refused for a privilege", "refused for another reason"};
+
+static void pv_report(unsigned seed, int phase, int k, int d, const char *why, const char *sql, const int g[2], const res *base,
+                      const res *o, size_t at)
+{
+    char ga[64], gb[64];
+    pv_list(ga, sizeof ga, g[0]);
+    pv_list(gb, sizeof gb, g[1]);
+    g_mismatches++;
+    fprintf(stderr, "MISMATCH seed %u (--privs, phase %d, statement %d), imagedb against %s: %s\n  %s\n  orapr1 holds pa {%s}, "
+                    "pb {%s}\n", seed, phase, k, d < 0 ? "the model (PostgreSQL 14's rules)" : DNAME[d], why, sql, ga, gb);
+    fprintf(stderr, "  imagedb: %s (%zu rows, %lld changed)\n", base->err ? base->msg : "ok", base->n, base->affected);
+    if (!base->err) show_rows(base, at);
+    if (!o) return;
+    fprintf(stderr, "  %s: %s (%zu rows, %lld changed)\n", DNAME[d], o->err ? o->msg : "ok", o->n, o->affected);
+    if (!o->err) show_rows(o, at);
+}
+
+/* both tables' rows read by the administrator on every asked engine, against imagedb's */
+static int pv_states(unsigned seed, int phase, int k, const char *sql, const int g[2])
+{
+    static const char *const Q[2] = {"SELECT id, a FROM pa ORDER BY id", "SELECT id, b FROM pb ORDER BY id"};
+    static res st[ND];
+    const int ty[2] = {TY(CT_INT, 0), TY(CT_INT, 0)};
+    for (int t = 0; t < 2; t++) {
+        for (int d = 0; d < ND; d++)
+            if (pv_on(d)) exec_eng(&g_eng[d], Q[t], true, ty, 2, &st[d]);
+        const res *base = &st[D_IMDB];
+        for (int d = 1; d < ND; d++) {
+            if (!pv_on(d)) continue;
+            g_pv_states++;
+            const res *o = &st[d];
+            const char *why = base->err || o->err ? "a table's state not read" : base->n != o->n ? "another number of rows in a table's state" : NULL;
+            size_t at = 0;
+            for (; !why && at < base->n; at++)
+                if (strcmp(base->rows[at], o->rows[at])) why = "another row in a table's state";
+            if (!why) continue;
+            char w[160];
+            snprintf(w, sizeof w, "%s (%s, after the statement)", why, Q[t]);
+            pv_report(seed, phase, k, d, w, sql, g, base, o, at ? at - 1 : 0);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* the ten statements, in an order drawn, as orapr1 holding g[]: each against the model and every asked engine */
+static int pv_phase(unsigned seed, int phase, const int g[2])
+{
+    int ord[PV_NQ];
+    for (int i = 0; i < PV_NQ; i++) ord[i] = i;
+    for (int i = PV_NQ - 1; i > 0; i--) { /* Fisher-Yates over the seed's draws */
+        int j = (int)rr(0, i), t = ord[i];
+        ord[i] = ord[j], ord[j] = t;
+    }
+    static res out[ND];
+    const int ty[2] = {TY(CT_INT, 0), TY(CT_INT, 0)};
+    for (int i = 0; i < PV_NQ; i++) {
+        int k = ord[i];
+        char sql[160];
+        if (k == 4) snprintf(sql, sizeof sql, "INSERT INTO pa VALUES (%d, %d)", g_pv.ins, g_pv.ins); /* (a literal format: -Wformat=2) */
+        else snprintf(sql, sizeof sql, "%s", PVQ[k].sql);
+        if (pv_restore(seed)) return -1;
+        for (int d = 0; d < ND; d++) {
+            if (!pv_on(d)) continue;
+            if (pv_as(d, sql, PVQ[k].rows, ty, PVQ[k].nty, &out[d]))
+                return pv_fail(seed, "giving orapr1's role back failed: the connection still acts as it", g_pv.why);
+        }
+        g_pv_stmts++;
+        const res *base = &out[D_IMDB];
+        int cb = pv_class(D_IMDB, base);
+        bool want = (g[0] & PVQ[k].need[0]) == PVQ[k].need[0] && (g[1] & PVQ[k].need[1]) == PVQ[k].need[1];
+        g_pv_model++;
+        if (cb != (want ? PV_ANSWERED : PV_DENIED)) {
+            char w[160];
+            snprintf(w, sizeof w, "imagedb %s, the model %s", PV_CLASS[cb], PV_CLASS[want ? PV_ANSWERED : PV_DENIED]);
+            pv_report(seed, phase, k, -1, w, sql, g, base, NULL, 0);
+            return -1;
+        }
+        for (int d = 1; d < ND; d++) {
+            if (!pv_on(d)) continue;
+            g_pv_compared++;
+            const res *o = &out[d];
+            int co = pv_class(d, o);
+            const char *why = NULL;
+            char w[160];
+            size_t at = 0;
+            if (co != cb) {
+                snprintf(w, sizeof w, "imagedb %s, %s %s", PV_CLASS[cb], DNAME[d], PV_CLASS[co]);
+                why = w;
+            } else if (cb == PV_ANSWERED && !PVQ[k].rows && base->affected >= 0 && o->affected >= 0 && base->affected != o->affected)
+                why = "another count of rows changed";
+            else if (cb == PV_ANSWERED && PVQ[k].rows) {
+                if (base->n != o->n) why = "another number of rows";
+                for (; !why && at < base->n; at++)
+                    if (strcmp(base->rows[at], o->rows[at])) why = "another row";
+            }
+            if (!why) continue;
+            pv_report(seed, phase, k, d, why, sql, g, base, o, at ? at - 1 : 0);
+            return -1;
+        }
+        if (cb == PV_ANSWERED) g_pv_all_answered++;
+        else g_pv_all_refused++;
+        if (PVQ[k].write && pv_states(seed, phase, k, sql, g)) return -1;
+    }
+    return 0;
+}
+
+/* the battery's own objects dropped on the servers (imagedb's directory goes with the seed) */
+static void pv_cleanup(void)
+{
+    for (int d = 0; d < ND; d++) {
+        if (!pv_on(d) || d == D_IMDB) continue;
+        eng *e = &g_eng[d];
+        if (d == D_PG) {
+            pv_quiet(e, "DROP TABLE IF EXISTS pa");
+            pv_quiet(e, "DROP TABLE IF EXISTS pb");
+            pv_quiet(e, "DROP ROLE IF EXISTS orapr1");
+        } else if (d == D_MS) {
+            pv_quiet(e, "DROP TABLE IF EXISTS pa");
+            pv_quiet(e, "DROP TABLE IF EXISTS pb");
+            pv_quiet(e, "DROP USER IF EXISTS orapr1");
+            pv_quiet(e, "IF SUSER_ID('orapr1') IS NOT NULL DROP LOGIN orapr1");
+        } else {
+            if (g_pv.adm[d].my) pv_quiet(&g_pv.adm[d], "DROP USER IF EXISTS 'orapr1'@'localhost'");
+            pv_quiet(e, "DROP TABLE IF EXISTS pa");
+            pv_quiet(e, "DROP TABLE IF EXISTS pb");
+            pv_quiet(e, "DROP TABLE IF EXISTS pz");
+        }
+    }
+}
+
+static int privs_battery(unsigned seed)
+{
+    memset(&g_pv, 0, sizeof g_pv);
+    int g[2], g2[2]; /* each draw its own statement: an initializer list's order is unspecified (C11 6.7.9p23) */
+    g[0] = (int)rr(0, 15);
+    g[1] = (int)rr(0, 15);
+    for (int i = 0; i < 3; i++) g_pv.a[i] = (int)rr(0, 99), g_pv.b[i] = (int)rr(0, 99);
+    for (int i = 0, have = 0; i < 3; i++) { /* pb's keys: three of 1-5, ascending (some of pa's, maybe none) */
+        int v;
+        do v = (int)rr(1, 5);
+        while (have & (1 << v));
+        have |= 1 << v;
+        g_pv.pbid[i] = v;
+    }
+    for (int i = 1; i < 3; i++)
+        for (int j = i; j > 0 && g_pv.pbid[j - 1] > g_pv.pbid[j]; j--) {
+            int t = g_pv.pbid[j];
+            g_pv.pbid[j] = g_pv.pbid[j - 1], g_pv.pbid[j - 1] = t;
+        }
+    g_pv.ins = (int)rr(4, 9);
+    g2[0] = (int)rr(0, 15), g2[1] = (int)rr(0, 15); /* drawn now: the draws the same whatever fails below */
+    int rc = -1;
+    /* MySQL's administrator is the oracle's connection (root); MariaDB's a root connection of its own */
+    for (int d = D_MY; d <= D_MA; d++) {
+        if (!pv_on(d)) continue;
+        memset(&g_pv.adm[d], 0, sizeof g_pv.adm[d]);
+        g_pv.adm[d].d = d, g_pv.adm[d].on = true;
+        if (d == D_MY) { /* (connect_all checked ORACLE_MYSQL; its database's name read again for the GRANTs) */
+            g_pv.adm[d].my = g_eng[d].my;
+            const char *ci = getenv("ORACLE_MYSQL");
+            char s[400], u[64], p[64];
+            if (!ci || sscanf(ci, "%399s %63s %63s %63s", s, u, p, g_pv.mydb[d]) < 4) {
+                pv_fail(seed, "ORACLE_MYSQL is not set", NULL);
+                goto out;
+            }
+        } else {
+            g_pv.ma_root = pv_my_connect(d, "root", "", false, g_pv.why, sizeof g_pv.why);
+            if (!g_pv.ma_root) {
+                pv_fail(seed, "MariaDB's root on the socket (run.sh: MARIADB_ALLOW_EMPTY_ROOT_PASSWORD)", g_pv.why);
+                goto out;
+            }
+            g_pv.adm[d].my = g_pv.ma_root;
+        }
+    }
+    if (pv_setup(seed, g)) goto out;
+    /* imagedb: a second session on the oracle's handle, acting as orapr1, enforced (the server's way). cross_check before
+     * enforce: SET cross_check is a superuser's (set_open), so the field is set as the admin session's SET sets it */
+    {
+        imdb_role *r = imdb_role_by_name(g_eng[D_IMDB].idb, "orapr1");
+        if (!r) {
+            pv_fail(seed, "imagedb's catalog holds no role orapr1 after its CREATE ROLE", NULL);
+            goto out;
+        }
+        uint32_t rid = r->id; /* (the pointer is the catalog's: not kept past a statement) */
+        eng *ie = &g_pv.ie;
+        memset(ie, 0, sizeof *ie);
+        ie->d = D_IMDB, ie->on = true, ie->idb = g_eng[D_IMDB].idb;
+        imdb_session_init(&ie->ses, ie->idb);
+        ie->ses_open = true;
+        ie->ses.cross_check = true;
+        ie->ses.role = rid;
+        ie->ses.enforce = true;
+    }
+    /* MySQL and MariaDB: a connection as orapr1, the oracle's session SETs on it */
+    for (int d = D_MY; d <= D_MA; d++) {
+        if (!pv_on(d)) continue;
+        eng *ue = &g_pv.ue[d];
+        memset(ue, 0, sizeof *ue);
+        ue->d = d, ue->on = true;
+        ue->my = pv_my_connect(d, "orapr1", PV_PW_MY, true, g_pv.why, sizeof g_pv.why);
+        if (!ue->my) {
+            pv_fail(seed, "orapr1's connection refused", g_pv.why);
+            goto out;
+        }
+        for (int i = 0; my_set_sql(d, i); i++)
+            if (*my_set_sql(d, i) && pv_must(seed, ue, my_set_sql(d, i))) goto out;
+    }
+    if (pv_phase(seed, 1, g) || pv_regrant(seed, g, g2) || pv_phase(seed, 2, g2)) goto out;
+    pv_cleanup();
+    rc = 0;
+out:
+    if (g_pv.ie.ses_open) imdb_session_close(&g_pv.ie.ses), g_pv.ie.ses_open = false;
+    for (int d = D_MY; d <= D_MA; d++)
+        if (g_pv.ue[d].my) mysql_close(g_pv.ue[d].my), g_pv.ue[d].my = NULL;
+    if (g_pv.ma_root) mysql_close(g_pv.ma_root), g_pv.ma_root = NULL;
+    g_pv.adm[D_MY].my = g_pv.adm[D_MA].my = NULL; /* (MySQL's is the oracle's own: never closed here) */
+    return rc;
+}
+
 int main(int argc, char **argv)
 {
     setlocale(LC_ALL, "C.UTF-8"); /* the ODBC driver's client code page: UTF-8 */
@@ -5964,6 +6473,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--interval")) g_iv = true; /* F3f */
         else if (!strcmp(argv[i], "--enum")) g_en = true; /* F3g */
         else if (!strcmp(argv[i], "--scram")) g_scram = true; /* L */
+        else if (!strcmp(argv[i], "--privs")) g_privs = true; /* N1e */
         else if (!strcmp(argv[i], "--tz")) g_tz = true; /* P2: time zones */
         else if (!strcmp(argv[i], "--date")) g_dt = 1; /* F3b */
         else if (!strcmp(argv[i], "--time")) g_dt = 2;
@@ -6079,6 +6589,12 @@ int main(int argc, char **argv)
         printf("oracle: %lu checks of L's SCRAM-SHA-256 verifiers against PostgreSQL's (its text read, written back and its keys "
                "derived again by imagedb; imagedb's taken by PostgreSQL as it is), %lu SCRAM logins (one with the password, "
                "one with another refused)\n", g_scram_checks, g_scram_logins);
+    if (g_privs)
+        printf("oracle: N1e's privileges battery: %lu statements run as orapr1 (ten a phase, two phases a seed: its grants on "
+               "pa and pb drawn, then drawn again and changed under open sessions), %lu checked against PostgreSQL 14's "
+               "rules (the model), %lu comparisons against PostgreSQL, MySQL, MariaDB and SQL Server (SQLite not asked: no "
+               "privileges); %lu refused by all for a privilege, %lu answered by all; %lu tables' states compared after "
+               "writes\n", g_pv_stmts, g_pv_model, g_pv_compared, g_pv_all_refused, g_pv_all_answered, g_pv_states);
     if (g_bytes && g_ms_pad >= 0) printf("oracle: SQL Server's 0x01 = 0x0100 is %s (the battery's BYTEAs hold no 0x00 byte either way)\n",
                                      g_ms_pad == 1 ? "true: it pads the shorter VARBINARY with zeros" : g_ms_pad == 0 ? "false: no padding" : "unread");
     printf("oracle: %ld comparisons of P2 S4b's correlated subqueries\n", g_corr_compared);

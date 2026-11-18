@@ -2205,6 +2205,61 @@ static void t_server_copy_idle_late(void)
     unserve(db, s);
 }
 
+/* N1e: the server's sessions act as their login's role, enforced. Logins are still SUPERUSER ones (N1e's second stage
+ * opens the rest), so two log in as superusers and lose it from a third connection: each one's next statement then
+ * meets the gates over the wire (code 16): DDL, a table not granted, a table granted to the other alone (a wrong role
+ * id would read it), COPY FROM without INSERT answered with its ERROR and no COPY_IN, a prepared statement's EXECUTE,
+ * and a role dropped under its live session */
+static void t_server_priv(void)
+{
+    imdbs *s;
+    imdb_db *db = serve(&s, NULL);
+    CHECK(db);
+    imdbc *c = login("admin", "pw-admin");
+    CHECK(c);
+    reply r;
+    imdb_err e = {0};
+    SOFT(q1(c, "CREATE TABLE t (id INT64 PRIMARY KEY, v INT64)", &r) == 0 && !r.nerr);
+    SOFT(q1(c, "CREATE TABLE u (id INT64 PRIMARY KEY, v INT64)", &r) == 0 && !r.nerr);
+    SOFT(q1(c, "INSERT INTO t VALUES (1, 1), (2, 2)", &r) == 0 && !r.nerr);
+    SOFT(q1(c, "INSERT INTO u VALUES (1, 1)", &r) == 0 && !r.nerr);
+    SOFT(q1(c, "CREATE ROLE a1 LOGIN SUPERUSER PASSWORD 'pw-a1'", &r) == 0 && !r.nerr);
+    SOFT(q1(c, "CREATE ROLE a2 LOGIN SUPERUSER PASSWORD 'pw-a2'", &r) == 0 && !r.nerr);
+    SOFT(q1(c, "GRANT SELECT ON t TO a1", &r) == 0 && !r.nerr);
+    imdbc *a1 = login("a1", "pw-a1"), *a2 = login("a2", "pw-a2");
+    CHECK(a1 && a2);
+    SOFT(q1(a1, "CREATE TABLE z1 (id INT64 PRIMARY KEY)", &r) == 0 && !r.nerr); /* a superuser still */
+    SOFT(q1(c, "ALTER ROLE a1 NOSUPERUSER", &r) == 0 && !r.nerr);
+    SOFT(q1(c, "ALTER ROLE a2 NOSUPERUSER", &r) == 0 && !r.nerr);
+    uint32_t priv = (uint32_t)-IMDB_ERR_PRIVILEGE;
+    SOFT(q1(a1, "SELECT COUNT(*) FROM t", &r) == 0 && !r.nerr && !strcmp(r.text, "2\n"));
+    SOFT(q1(a1, "SELECT COUNT(*) FROM u", &r) == 0 && r.nerr == 1 && r.err_code == priv && strstr(r.err, "table u"));
+    SOFT(q1(a1, "CREATE TABLE z2 (id INT64 PRIMARY KEY)", &r) == 0 && r.nerr == 1 && r.err_code == priv);
+    SOFT(q1(a2, "SELECT COUNT(*) FROM t", &r) == 0 && r.nerr == 1 && r.err_code == priv && strstr(r.err, "table t"));
+    /* COPY FROM without INSERT: its ERROR at once, never a COPY_IN (nothing spooled) */
+    SOFT(q1(a1, "COPY u FROM STDIN", &r) == 0 && !r.copy_in && r.nerr == 1 && r.err_code == priv);
+    SOFT(spool_held(s) == 0);
+    /* the protocol's EXECUTE (imdb_execute) checked at its run */
+    SOFT(imdbc_prepare(a1, "p", "SELECT COUNT(*) FROM u", 22, &e) == 0 && read_reply(a1, &r) == 0 && !r.nerr);
+    SOFT(imdbc_execute(a1, "p", NULL, 1, 0, &e) == 0 && read_reply(a1, &r) == 0 && r.nerr == 1 && r.err_code == priv);
+    SOFT(q1(c, "GRANT SELECT ON u TO a1", &r) == 0 && !r.nerr);
+    SOFT(imdbc_execute(a1, "p", NULL, 1, 0, &e) == 0 && read_reply(a1, &r) == 0 && !r.nerr && !strcmp(r.text, "1\n"));
+    /* a role dropped under its live session: refused by name at its next statement */
+    SOFT(q1(c, "DROP ROLE a2", &r) == 0 && !r.nerr);
+    SOFT(q1(a2, "SELECT 1", &r) == 0 && r.nerr == 1 && r.err_code == priv && strstr(r.err, "dropped"));
+    /* COPY into a name no table holds, or into a view: its ERROR and no COPY_IN, a superuser's session too (nothing
+     * spooled for a statement that cannot run) */
+    SOFT(q1(c, "CREATE VIEW vt (id) AS SELECT id FROM t", &r) == 0 && !r.nerr);
+    SOFT(q1(c, "COPY nosuch FROM STDIN", &r) == 0 && !r.copy_in && r.nerr == 1 &&
+         r.err_code == (uint32_t)-IMDB_ERR_NOTFOUND);
+    SOFT(q1(c, "COPY vt FROM STDIN", &r) == 0 && !r.copy_in && r.nerr == 1 && r.err_code == (uint32_t)-IMDB_ERR_INVALID);
+    SOFT(spool_held(s) == 0 && q1(c, "SELECT 1", &r) == 0 && !r.nerr);
+    imdbc_close(a1);
+    imdbc_close(a2);
+    imdbc_close(c);
+    unserve(db, s);
+}
+
 const test_case server_tests[] = {
     {"server_auth", t_server_auth},
     {"server_statements", t_server_statements},
@@ -2239,6 +2294,7 @@ const test_case server_tests[] = {
     {"server_cancel_idle", t_server_cancel_idle},
     {"server_copy_cancel_upload", t_server_copy_cancel_upload},
     {"server_copy_idle_late", t_server_copy_idle_late},
+    {"server_priv", t_server_priv},
     {"server_tcp_statements", t_server_statements_tcp},
     {"server_tcp_txn", t_server_txn_tcp},
     {"server_tcp_commit_stamp", t_server_commit_stamp_tcp},

@@ -50,6 +50,7 @@
 /* ---- the logins: an immutable snapshot the engine thread makes, a connection thread reads ---- */
 typedef struct login {
     char name[IMDBW_USER];
+    uint32_t id; /* N1e: its role, the session's (imdb_session.role) */
     imdb_scram v;
 } login;
 typedef struct logins {
@@ -91,6 +92,7 @@ struct conn {
     conn *next; /* imdbs.conns */
     imdbs *s;
     int fd, wake[2];
+    uint32_t role; /* N1e: its login's role, set (under mu) when it authenticates; its session acts as it */
     pthread_t th;
     bool started;
     /* under imdbs.mu */
@@ -203,6 +205,7 @@ static logins *logins_make(const imdb_db *db)
         login *lo = &l->e[l->n];
         if (imdb_scram_decode(r->vent.bytes, r->vent.len, &lo->v, &e)) continue; /* the catalog's own bytes: never */
         memcpy(lo->name, r->name, strlen(r->name) + 1);
+        lo->id = r->id;
         l->n++;
     }
     return l;
@@ -599,6 +602,8 @@ static bool run(imdbs *s, rq *r)
     if (!c->ses_open) {
         imdb_session_init(&c->ses, s->db);
         imdb_session_copy_io(&c->ses, copy_rd, copy_wr, c); /* N1d: COPY through its spools */
+        c->ses.role = c->role; /* N1e: its privileges checked (docs/n1-design.md §8e) */
+        c->ses.enforce = true;
         c->ses_open = true;
     }
     imdbw_buf b;
@@ -621,7 +626,7 @@ static bool run(imdbs *s, rq *r)
         }
         /* N1d: a COPY ... FROM STDIN: COPY_IN, then the request waits here (not runnable) until its data's end or its
          * refusal; it runs then from its spool, so the engine thread never waits on the network */
-        bool cin = r->type == IMDBW_QUERY && imdb_copy_in_stmt((const char *)m->texts[i].p, m->texts[i].len);
+        bool cin = r->type == IMDBW_QUERY && imdb_copy_in_open(&c->ses, (const char *)m->texts[i].p, m->texts[i].len);
         int32_t cerr = 0;
         if (cin && s->spool_dfd >= 0) {
             pthread_mutex_lock(&s->mu);
@@ -950,6 +955,7 @@ static bool authenticate(conn *c)
         memset(stored, 0x5a, sizeof stored);
         memset(server_key, 0xa5, sizeof server_key);
     }
+    uint32_t rid = lo ? lo->id : 0;
     logins_put(s, l); /* the keys are copied: the snapshot may go */
     bool ok = !imdb_random(ch.nonce, sizeof ch.nonce, &e) && !imdbw_challenge_put(&ch, chb) &&
               !write_full(c, chb, sizeof chb, deadline) && !read_full(c, proof, sizeof proof, deadline);
@@ -967,8 +973,12 @@ static bool authenticate(conn *c)
     imdb_wipe(server_key, sizeof server_key);
     imdb_wipe(sig, sizeof sig);
     pthread_mutex_lock(&s->mu);
-    if (ok) s->n.logins++;
-    else s->n.refusals++;
+    if (ok) {
+        s->n.logins++;
+        c->role = rid; /* N1e: the role its session acts as */
+    } else {
+        s->n.refusals++;
+    }
     pthread_mutex_unlock(&s->mu);
     return ok;
 }

@@ -133,6 +133,7 @@ const char *imdb_err_name(int code)
     case IMDB_ERR_HISTORY: return "history";
     case IMDB_ERR_CONFLICT: return "conflict";
     case IMDB_ERR_CANCELLED: return "cancelled";
+    case IMDB_ERR_PRIVILEGE: return "privilege";
     }
     return "unknown";
 }
