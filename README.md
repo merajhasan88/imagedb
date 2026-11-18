@@ -193,8 +193,11 @@ build/imagedb-client --host db.example.com --port 5544 --ca /srv/imagedb/tls/ca.
 - **TCP** is TLS 1.3 alone (ALPN `imdbwir1`): no plaintext, no fallback to the
   socket. The client names the CA's certificate (`ca.crt`, the host checked against
   the server certificate's names) or pins the server's key (`--pin`, the 64 hex
-  digits `cert` prints). The login's proof is bound to its TLS session, so a relay
-  that terminates TLS cannot use it. `cert --renew` signs the same key again (the pin
+  digits `cert` prints). The login's proof is bound to its TLS session (RFC 9266's
+  exporter), so a relay that terminates TLS cannot use it, even one holding the server's
+  key. `--channel-binding any` also takes tls-server-end-point (RFC 5929, PostgreSQL's
+  binding: the certificate's hash), for drivers whose platform TLS lacks the exporter;
+  a relay holding the server's key passes that one. `cert --renew` signs the same key again (the pin
   and `ca.crt` keep working); the server warns at its start when under 30 days are
   left. From one address, at most 8 connections authenticate at once and at most a
   quarter of `--max-conns` wait or authenticate (the rest are closed unread); the
@@ -633,6 +636,7 @@ Command-line options (`imagedb` with no arguments prints the commands):
 | `--copy-ring BYTES` | imagedb-server | a COPY TO's output held before its client takes it | 256M |
 | `--copy-wait MS` | imagedb-server | the engine's waits for a slow COPY TO reader, in all for one statement | 60000 |
 | `--copy-idle MS` | imagedb-server | a COPY's data arriving at none this long ends its connection | 30000 |
+| `--channel-binding exporter\|any` | imagedb-server | a TCP login's channel binding: the TLS exporter alone (RFC 9266), or tls-server-end-point too (RFC 5929, PostgreSQL's: for drivers whose platform TLS lacks the exporter; a relay holding the server's key passes it; the certificate must be signed with SHA-256; such logins and refused types are said in the event log) | exporter |
 | `--name NAME` | imagedb-server cert | another name in the certificate's subjectAltName (localhost, 127.0.0.1, ::1 always); repeatable | |
 | `--renew` | imagedb-server cert | the same key signed again by the same CA (the pin kept) | |
 | `--host HOST`, `--port PORT` | imagedb-client | TCP with TLS 1.3 | |

@@ -46,6 +46,12 @@
 #define IMDBW_PW_MAX 1024u     /* a password's bytes (IMDB_SCRAM_PW_MAX) */
 
 enum { IMDBW_EP_TCP = 1, IMDBW_EP_UNIX = 2 };
+/* §8f (decided 2026-11-18): a hello's flags are its channel binding's type, the rest of the word reserved (refused): none
+ * on the Unix socket; on TCP the TLS exporter (RFC 9266, the default) or tls-server-end-point (RFC 5929: a hash of the
+ * server's certificate; taken only by a server run with --channel-binding any). The AuthMessage holds the hello's bytes,
+ * so the proof covers the type. A verdict's code 2: the binding type refused by this server (its proof never checked) */
+enum { IMDBW_CB_NONE = 0, IMDBW_CB_EXPORTER = 1, IMDBW_CB_ENDPOINT = 2 };
+enum { IMDBW_VERDICT_OK = 0, IMDBW_VERDICT_REFUSED = 1, IMDBW_VERDICT_BINDING = 2 };
 
 /* frame types: the client's below 64, the server's from 64 */
 enum {
@@ -152,7 +158,7 @@ typedef struct imdbw_challenge {
     uint8_t nonce[IMDBW_NONCE];
 } imdbw_challenge;
 typedef struct imdbw_verdict {
-    uint32_t code;          /* 0 accepted, 1 refused */
+    uint32_t code;          /* IMDBW_VERDICT_*: 0 accepted, 1 refused, 2 its binding type refused */
     uint8_t sig[IMDBW_KEY]; /* the server's signature; zeros when refused */
 } imdbw_verdict;
 /* the head every version keeps: a server reads a hello's 12 bytes first and answers a version it does not speak with its

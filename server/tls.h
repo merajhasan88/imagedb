@@ -51,6 +51,11 @@ ssize_t imdbt_write(imdbt *t, const void *p, size_t n);
 size_t imdbt_pending(const imdbt *t);
 /* RFC 9266's tls-exporter value: 32 bytes, label "EXPORTER-Channel-Binding", no context (AuthMessage's binding) */
 int imdbt_binding(imdbt *t, uint8_t out[32]);
+/* §8f: RFC 5929's tls-server-end-point: the SHA-256 of the server's certificate (its own on the server's side, the peer's on
+ * the client's); -1 for a certificate not signed with SHA-256 (or MD5 or SHA-1, which RFC 5929 takes to SHA-256) */
+int imdbt_endpoint(imdbt *t, uint8_t out[32]);
+/* whether a server context's certificate admits tls-server-end-point (its signature's hash SHA-256) */
+bool imdbt_ctx_endpoint_ok(imdbt_ctx *c);
 /* a best-effort close_notify (never waited on), then the session freed; the socket is the caller's */
 void imdbt_free(imdbt *t);
 

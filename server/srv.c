@@ -163,6 +163,9 @@ struct imdbs {
     uint64_t role_gen;   /* db->role_gen the logins were made at (the engine thread's) */
     int spool_dfd;       /* N1d: the spool directory (-1: none, COPY refused by name) */
     uint64_t spool_held; /* under mu: every spool's bytes held now (copy_spool bounds it) */
+    uint64_t ev_endpoint, ev_cbref; /* §8f: the engine thread's: the counts its last "channel_binding" event gave, and
+                                     * when (an unauthenticated peer moves cb_refused: at most one event in 5 s) */
+    uint64_t ev_cb_ns;
 };
 
 static uint64_t ms_since(uint64_t t0) { return (imdb_mono_ns() - t0) / 1000000u; }
@@ -774,6 +777,21 @@ static void tick(imdbs *s)
         imdb_err e = {0};
         imdb_maintain(s->db, &e); /* a failure is the handle's (db->failed) or a warning: the next statement says */
     }
+    /* §8f: logins by the weaker binding, and hellos naming a type this server refuses, said in the event log (the
+     * engine's: --events) when either has moved since the last tick, with both totals: an operator who allowed
+     * tls-server-end-point sees it in use, and one who did not sees drivers asking for it; at most one in 5 s (a peer
+     * that never authenticates moves cb_refused: no flood) */
+    pthread_mutex_lock(&s->mu);
+    uint64_t ep = s->n.logins_endpoint, cr = s->n.cb_refused;
+    pthread_mutex_unlock(&s->mu);
+    uint64_t now = imdb_mono_ns();
+    if ((ep != s->ev_endpoint || cr != s->ev_cbref) && (!s->ev_cb_ns || now - s->ev_cb_ns >= 5000000000ull)) {
+        imdb_event_begin(s->db, "channel_binding");
+        imdb_event_int(s->db, "end_point_logins", (int64_t)ep);
+        imdb_event_int(s->db, "refused_types", (int64_t)cr);
+        imdb_event_end(s->db);
+        s->ev_endpoint = ep, s->ev_cbref = cr, s->ev_cb_ns = now;
+    }
     after_statement(s);
 }
 
@@ -917,10 +935,8 @@ static bool authenticate(conn *c)
     uint8_t sig[IMDBW_KEY], vb[IMDBW_VERDICT_LEN];
     uint32_t version;
     imdb_err e = {0};
-    /* N1c: on TCP, TLS first (nothing in the clear), its exporter the AuthMessage's binding (RFC 9266): a proof made
-     * over another TLS session, a relay's, fails */
-    uint8_t binding[IMDBW_KEY] = {0};
-    if (c->tls && (!handshake(c, deadline) || imdbt_binding(c->tls, binding))) return false;
+    /* N1c: on TCP, TLS first (nothing in the clear) */
+    if (c->tls && !handshake(c, deadline)) return false;
     if (read_full(c, hello, IMDBW_PREAUTH_HEAD, deadline) || imdbw_preauth_head(hello, &version, &e)) return false;
     if (version != 1) { /* a version this server does not speak: its own head, then the close */
         uint8_t mine[IMDBW_PREAUTH_HEAD];
@@ -932,7 +948,17 @@ static bool authenticate(conn *c)
     if (read_full(c, hello + IMDBW_PREAUTH_HEAD, IMDBW_HELLO_LEN - IMDBW_PREAUTH_HEAD, deadline) ||
         imdbw_hello_get(hello, &h, &e))
         return false;
-    logins *l = logins_take(s);
+    /* §8f (decided 2026-11-18): the AuthMessage's binding is the one the hello names (its type covered by the proof, the
+     * hello's bytes in the AuthMessage): none on the socket; on TCP the TLS exporter (RFC 9266: a proof made over
+     * another TLS session, a relay's, fails) or, where this server allows it (--channel-binding any), the hash of its
+     * certificate (RFC 5929: a relay holding the server's key passes it). A type refused costs what a wrong password
+     * does (the same messages, no login looked up) and is answered by name, the verdict's code 2, its proof unchecked */
+    uint8_t cb = (uint8_t)h.flags, binding[IMDBW_KEY] = {0};
+    bool cb_refused = c->tls ? cb == IMDBW_CB_NONE || (cb == IMDBW_CB_ENDPOINT && !s->o.cb_any) : cb != IMDBW_CB_NONE;
+    if (c->tls && !cb_refused &&
+        (cb == IMDBW_CB_EXPORTER ? imdbt_binding(c->tls, binding) : imdbt_endpoint(c->tls, binding)))
+        return false;
+    logins *l = cb_refused ? NULL : logins_take(s);
     const login *lo = NULL;
     for (uint32_t i = 0; l && i < l->n && !lo; i++)
         if (!strcmp(l->e[i].name, h.user)) lo = &l->e[i];
@@ -962,10 +988,10 @@ static bool authenticate(conn *c)
     if (ok) {
         imdbw_auth_message(c->tls ? IMDBW_EP_TCP : IMDBW_EP_UNIX, hello, chb, binding, am);
         bool proven = imdbw_scram_server(stored, server_key, am, proof, sig);
-        ok = proven && lo;
+        ok = proven && lo && !cb_refused;
         imdbw_verdict v;
         memset(&v, 0, sizeof v);
-        v.code = ok ? 0 : 1;
+        v.code = cb_refused ? IMDBW_VERDICT_BINDING : ok ? IMDBW_VERDICT_OK : IMDBW_VERDICT_REFUSED;
         if (ok) memcpy(v.sig, sig, IMDBW_KEY);
         if (imdbw_verdict_put(&v, vb) || write_full(c, vb, sizeof vb, deadline)) ok = false;
     }
@@ -975,9 +1001,11 @@ static bool authenticate(conn *c)
     pthread_mutex_lock(&s->mu);
     if (ok) {
         s->n.logins++;
+        s->n.logins_endpoint += cb == IMDBW_CB_ENDPOINT; /* §8f: the weaker binding's logins, counted */
         c->role = rid; /* N1e: the role its session acts as */
     } else {
         s->n.refusals++;
+        s->n.cb_refused += cb_refused;
     }
     pthread_mutex_unlock(&s->mu);
     return ok;
@@ -1786,6 +1814,9 @@ int imdbs_start(imdb_db *db, const imdbs_opts *o, imdbs **out, imdb_err *e)
     if (!rc && o->tcp) { /* N1c: TLS 1.3 on TCP, its key and certificate from the server directory */
         if (!o->server_dir) rc = imdb_fail(e, IMDB_ERR_INVALID, "--tcp needs the server directory's certificate");
         if (!rc) rc = imdbt_server_ctx(o->server_dir, &s->tls, &s->cert_days, e);
+        if (!rc && o->cb_any && !imdbt_ctx_endpoint_ok(s->tls)) /* §8f: one hash, SHA-256, for every driver */
+            rc = imdb_fail(e, IMDB_ERR_INVALID, "--channel-binding any: the server's certificate is not signed with SHA-256 "
+                                                "(tls-server-end-point would need another hash)");
         if (!rc) rc = listen_tcp(s, o->tcp, e);
     }
     if (!rc && pipe2(s->stop, O_CLOEXEC | O_NONBLOCK)) rc = imdb_fail(e, IMDB_ERR_IO, "pipe: %s", strerror(errno));

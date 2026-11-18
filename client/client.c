@@ -153,12 +153,13 @@ void imdbc_close(imdbc *c)
 
 /* the pre-auth exchange (§4) over the connection's endpoint: the hello, the challenge, the proof over the AuthMessage
  * (binding: the TLS exporter's 32 bytes on TCP, zeros on the socket), the verdict and the server's signature */
-static int authenticate(imdbc *c, uint8_t endpoint, const uint8_t binding[IMDBW_KEY], const char *user, size_t ulen,
-                        const char *pw, size_t pwlen, imdb_err *e)
+static int authenticate(imdbc *c, uint8_t endpoint, uint8_t cb, const uint8_t binding[IMDBW_KEY], const char *user,
+                        size_t ulen, const char *pw, size_t pwlen, imdb_err *e)
 {
     imdbw_hello h;
     memset(&h, 0, sizeof h);
     h.version = 1;
+    h.flags = cb; /* §8f: the binding's type, covered by the proof (the hello is in the AuthMessage) */
     memcpy(h.user, user, ulen);
     uint8_t hello[IMDBW_HELLO_LEN], chb[IMDBW_CHALLENGE_LEN], am[IMDBW_AUTHMSG_LEN], proof[IMDBW_KEY], want[IMDBW_KEY];
     uint8_t vb[IMDBW_VERDICT_LEN];
@@ -184,7 +185,9 @@ static int authenticate(imdbc *c, uint8_t endpoint, const uint8_t binding[IMDBW_
     if (!rc) rc = send_all(c, proof, sizeof proof, e);
     if (!rc) rc = recv_all(c, vb, sizeof vb, e);
     if (!rc) rc = imdbw_verdict_get(vb, &v, e);
-    if (!rc && (v.code || !imdb_ct_eq(v.sig, want, IMDBW_KEY)))
+    if (!rc && v.code == IMDBW_VERDICT_BINDING) /* never retried with another type: no downgrade (§8f) */
+        rc = imdb_fail(e, IMDB_ERR_AUTH, "the server refuses this login's channel binding type");
+    else if (!rc && (v.code || !imdb_ct_eq(v.sig, want, IMDBW_KEY)))
         rc = imdb_fail(e, IMDB_ERR_AUTH, v.code ? "authentication refused" : "the server did not prove it holds the verifier");
     imdb_wipe(proof, sizeof proof);
     imdb_wipe(want, sizeof want);
@@ -235,7 +238,7 @@ int imdbc_connect(const char *path, const char *user, const char *pw, size_t pwl
     }
     uint8_t zero[IMDBW_KEY] = {0};
     int rc = nonblocking(c->fd, e);
-    if (!rc) rc = authenticate(c, IMDBW_EP_UNIX, zero, user, ulen, pw, pwlen, e);
+    if (!rc) rc = authenticate(c, IMDBW_EP_UNIX, IMDBW_CB_NONE, zero, user, ulen, pw, pwlen, e);
     if (rc) {
         imdbc_close(c);
         return rc;
@@ -286,9 +289,12 @@ int imdbc_connect_tcp(const char *host, const char *port, const imdbc_tls *tls, 
         else rc = c_wait(c, r, false, e);
     }
     if (c) c->timeout_ms = keep;
+    /* §8f: the exporter alone, the strongest binding, which OpenSSL always computes (tls-server-end-point is for drivers
+     * whose platform's TLS lacks the exporter) */
     uint8_t binding[IMDBW_KEY];
     if (!rc && imdbt_binding(c->tls, binding)) rc = imdb_fail(e, IMDB_ERR_STATE, "TLS: the exporter");
-    if (!rc) rc = authenticate(c, IMDBW_EP_TCP, binding, user, ulen, pw, pwlen, e);
+    if (!rc) rc = authenticate(c, IMDBW_EP_TCP, IMDBW_CB_EXPORTER, binding, user, ulen, pw, pwlen, e);
+    imdb_wipe(binding, sizeof binding);
     if (rc) {
         imdbc_close(c);
         return rc;

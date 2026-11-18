@@ -26,6 +26,7 @@ static int usage(void)
     fputs("usage: imagedb-server DIR --socket PATH --server-dir SDIR [--max-conns N] [--nosync] [--durable-ack]\n"
           "                      [--events FILE] [--stats FILE] [--tcp ADDR:PORT] [--spool-dir DIR]\n"
           "                      [--copy-spool BYTES] [--copy-ring BYTES] [--copy-wait MS] [--copy-idle MS]\n"
+          "                      [--channel-binding exporter|any]\n"
           "       imagedb-server cert SDIR [--name NAME]... [--renew]\n", stderr);
     return 2;
 }
@@ -143,6 +144,10 @@ int main(int argc, char **argv)
             if (!parse_ms(argv[++i], 1, 3600000, &so.copy_wait_ms)) return usage();
         } else if (!strcmp(argv[i], "--copy-idle") && i + 1 < argc) {
             if (!parse_ms(argv[++i], 100, 3600000, &so.copy_idle_ms)) return usage();
+        } else if (!strcmp(argv[i], "--channel-binding") && i + 1 < argc) { /* §8f: the exporter alone by default */
+            const char *v = argv[++i];
+            if (!strcmp(v, "any")) so.cb_any = true;
+            else if (strcmp(v, "exporter")) return usage();
         } else if (!strcmp(argv[i], "--nosync")) sync = 0;
         else if (!strcmp(argv[i], "--durable-ack")) durable_ack = true;
         else if (argv[i][0] == '-' || dir) return usage();

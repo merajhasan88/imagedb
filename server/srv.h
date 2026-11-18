@@ -43,6 +43,8 @@ typedef struct imdbs_opts {
     uint64_t copy_ring;
     uint32_t copy_wait_ms;
     uint32_t copy_idle_ms;
+    bool cb_any;               /* §8f: --channel-binding any: tls-server-end-point taken beside the exporter (the default:
+                                * the exporter alone); a certificate not signed with SHA-256 then refused at the start */
 } imdbs_opts;
 
 typedef struct imdbs imdbs;
@@ -90,6 +92,9 @@ typedef struct imdbs_counts {
     uint64_t copy_idle;    /* connections ended for a COPY's data arriving at none past copy_idle_ms */
     uint64_t spool_held;   /* gauge: every spool's bytes held now */
     uint64_t ticks;        /* the engine thread's ticks run (timeouts, maintenance): on their clock under any load */
+    uint64_t logins_endpoint; /* §8f: logins bound by tls-server-end-point (--channel-binding any), in logins too */
+    uint64_t cb_refused;   /* §8f: hellos whose binding type this server refuses (none on TCP, end-point by default, any on
+                            * the socket), in refusals too */
 } imdbs_counts;
 void imdbs_counts_get(imdbs *s, imdbs_counts *c);
 /* N1c: the TCP port listened on (0: none), an ephemeral one's number; cert_days: server.crt's whole days left */

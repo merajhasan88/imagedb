@@ -245,7 +245,16 @@ static void t_wire_preauth(void)
             } else
                 refused++;
         }
-    CHECK(took >= 32 * 3 && refused >= 16 * 3); /* the nonce's flips taken, the magic's, version's and flags' refused */
+    CHECK(took >= 32 * 3 + 1 && refused >= 16 * 3); /* the nonce's flips taken and flags 1 (§8f: a binding type), the
+                                                     * magic's, version's and the other flags' refused */
+    for (uint32_t fl = 0; fl < 5; fl++) { /* §8f: 0 none, 1 the exporter, 2 tls-server-end-point; past them refused */
+        uint8_t y[IMDBW_HELLO_LEN];
+        memcpy(y, hb, sizeof y);
+        y[12] = (uint8_t)fl;
+        imdb_err_clear(&we);
+        int r2 = imdbw_hello_get(y, &g, &we);
+        CHECK(fl <= IMDBW_CB_ENDPOINT ? r2 == 0 && g.flags == fl : r2 == IMDB_ERR_CORRUPT);
+    }
     /* a later version and a later magic refused by name; another magic, version 0 and flags as damage */
     uint8_t x[IMDBW_HELLO_LEN];
     memcpy(x, hb, sizeof x);
@@ -265,7 +274,7 @@ static void t_wire_preauth(void)
     x[8] = 0;
     CHECK(imdbw_hello_get(x, &g, &we) == IMDB_ERR_CORRUPT);
     memcpy(x, hb, sizeof x);
-    x[12] = 1;
+    x[12] = 3; /* §8f: a binding type past 2 */
     CHECK(imdbw_hello_get(x, &g, &we) == IMDB_ERR_CORRUPT);
     /* the role name: 1 to 63 bytes of UTF-8, NUL-padded */
     memcpy(x, hb, sizeof x);
@@ -306,8 +315,10 @@ static void t_wire_preauth(void)
     hh.version = 2;
     CHECK(imdbw_hello_put(&hh, x) != 0);
     hh = h;
-    hh.flags = 1;
+    hh.flags = 3;
     CHECK(imdbw_hello_put(&hh, x) != 0);
+    hh.flags = IMDBW_CB_ENDPOINT;
+    CHECK(imdbw_hello_put(&hh, x) == 0 && x[12] == 2);
     hh = h;
     memset(hh.user, 0, sizeof hh.user);
     CHECK(imdbw_hello_put(&hh, x) != 0);
@@ -374,8 +385,16 @@ static void t_wire_preauth(void)
     memset(vd.sig, 0, 32);
     CHECK(imdbw_verdict_put(&vd, vb) == 0);
     CHECK_OK(imdbw_verdict_get(vb, &ve, &we));
-    vb[0] = 2;
+    vb[0] = 2; /* §8f: the binding type refused, no signature */
+    CHECK_OK(imdbw_verdict_get(vb, &ve, &we));
+    CHECK(ve.code == IMDBW_VERDICT_BINDING);
+    vb[4] = 1;
+    CHECK(imdbw_verdict_get(vb, &ve, &we) != 0); /* with a signature: refused */
+    vb[4] = 0;
+    vb[0] = 3;
     CHECK(imdbw_verdict_get(vb, &ve, &we) != 0);
+    vd.code = 3;
+    CHECK(imdbw_verdict_put(&vd, vb) != 0);
 }
 
 /* RFC 5802's computation with OpenSSL, from the password */
@@ -396,7 +415,7 @@ static void ossl_scram(const char *pw, const uint8_t *salt, int salt_len, uint32
 static void t_wire_scram(void)
 {
     /* the AuthMessage, built here: the magic, the endpoint, the two messages' bytes, the binding */
-    imdbw_hello h = {.version = 1};
+    imdbw_hello h = {.version = 1, .flags = IMDBW_CB_EXPORTER}; /* §8f: TCP by the exporter */
     memcpy(h.user, "alice", 5);
     memset(h.nonce, 0x01, 32);
     imdbw_challenge c = {.version = 1, .salt_len = 16, .iter = 4096};
@@ -420,11 +439,47 @@ static void t_wire_scram(void)
     ossl_scram("pencil", c.salt, 16, 4096, am, oproof, ossig, ostored, oskey);
     CHECK(!memcmp(proof, oproof, 32) && !memcmp(ssig, ossig, 32));
     /* computed once by a program of OpenSSL alone, every byte of the hello, the challenge and the AuthMessage laid
-     * out there from docs/n1-design.md §4 */
-    unhex("a62879c90c154dbdde85d501663cdf21afeab39c2e597018033a09204dbd4e06", pin, 32);
+     * out there from docs/n1-design.md §4 (v3, 2026-11-18: §8f's binding type in the hello's flags; the program printed
+     * v2's numbers for flags 0, so its layout is v2's but that byte) */
+    unhex("28562c1bef99b0a917ecb28c1b32c22930f154f92c134b13fee7a64e8deb733e", pin, 32);
     CHECK(!memcmp(proof, pin, 32));
-    unhex("2ad80c7bf7fee596ed5a28e1862d67cae8a1fc1512ba9da813dd8793304ea8cc", pin, 32);
+    unhex("5d3ef834c39e6c429d1f4e27993ba451a8b8e35322af9055abc1dd40e88ad322", pin, 32);
     CHECK(!memcmp(ssig, pin, 32));
+    /* the other two exchanges a driver meets: TCP by tls-server-end-point (flags 2, binding 32 x 05) and the socket
+     * (endpoint 2, flags 0, binding zeros); and a proof over a hello whose type byte alone differs is refused */
+    static const struct {
+        uint8_t ep, flags, bind;
+        const char *proof, *ssig;
+    } more[] = {
+        {IMDBW_EP_TCP, IMDBW_CB_ENDPOINT, 0x05, "1065f5e038b75f2671d831f5bd5d29f56d22a787f260db523bb986ef7c53f486",
+         "28fef60553090aae9b5f184bfc0cfb455e58261131da359f525a59f4dfaa9904"},
+        {IMDBW_EP_UNIX, IMDBW_CB_NONE, 0x00, "5ee7e7bd402f0c91e2399a84c3d544763bace50b44ea82a780e57130bb5405a7",
+         "82c9d498cc5fa830d26b29740244ecf4f343962f302a647150e9d74ea7588027"},
+    };
+    for (size_t k = 0; k < sizeof more / sizeof more[0]; k++) {
+        imdbw_hello h2 = h;
+        h2.flags = more[k].flags;
+        uint8_t hb2[IMDBW_HELLO_LEN], bind2[32], am2[IMDBW_AUTHMSG_LEN], p2[32], s2[32];
+        CHECK(imdbw_hello_put(&h2, hb2) == 0 && hb2[12] == more[k].flags);
+        memset(bind2, more[k].bind, 32);
+        imdbw_auth_message(more[k].ep, hb2, cb, bind2, am2);
+        CHECK(imdbw_scram_client("pencil", 6, &c, am2, p2, s2) == 0);
+        unhex(more[k].proof, pin, 32);
+        CHECK(!memcmp(p2, pin, 32));
+        unhex(more[k].ssig, pin, 32);
+        CHECK(!memcmp(s2, pin, 32));
+    }
+    {
+        imdb_scram v0;
+        CHECK_OK(imdb_scram_make("pencil", 6, 4096, c.salt, 16, &v0, &we));
+        for (uint8_t fl = 0; fl <= IMDBW_CB_ENDPOINT; fl++) { /* the hello the server got says fl, the proof's says 1 */
+            uint8_t hb2[IMDBW_HELLO_LEN], am2[IMDBW_AUTHMSG_LEN];
+            memcpy(hb2, hb, sizeof hb2);
+            hb2[12] = fl;
+            imdbw_auth_message(IMDBW_EP_TCP, hb2, cb, bind, am2);
+            CHECK(imdbw_scram_server(v0.stored, v0.server, am2, proof, sig) == (fl == IMDBW_CB_EXPORTER));
+        }
+    }
 
     /* the server, from the verifier CREATE ROLE makes of the same password and salt */
     imdb_scram v;

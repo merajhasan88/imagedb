@@ -588,6 +588,32 @@ int imdbt_binding(imdbt *t, uint8_t out[32])
     return SSL_export_keying_material(t->ssl, out, 32, label, sizeof label - 1, NULL, 0, 0) == 1 ? 0 : -1;
 }
 
+/* §8f: RFC 5929's tls-server-end-point, the hash of the server's certificate by its signature's hash (MD5 and SHA-1 taken
+ * to SHA-256). imagedb's `cert` signs ECDSA with SHA-256, and a server allowing this binding refuses another certificate
+ * at its start (imdbt_ctx_endpoint_ok), so SHA-256 is the one hash any driver computes */
+static int cert_endpoint(X509 *x, uint8_t out[32])
+{
+    int md = NID_undef, pk = NID_undef;
+    if (!x || !OBJ_find_sigid_algs(X509_get_signature_nid(x), &md, &pk)) return -1;
+    if (md == NID_md5 || md == NID_sha1) md = NID_sha256;
+    unsigned n = 0;
+    if (md != NID_sha256 || X509_digest(x, EVP_sha256(), out, &n) != 1 || n != 32) return -1;
+    return 0;
+}
+
+int imdbt_endpoint(imdbt *t, uint8_t out[32])
+{
+    return cert_endpoint(SSL_is_server(t->ssl) ? SSL_get_certificate(t->ssl) : SSL_get0_peer_certificate(t->ssl), out);
+}
+
+bool imdbt_ctx_endpoint_ok(imdbt_ctx *c)
+{
+    uint8_t h[32];
+    bool ok = !cert_endpoint(SSL_CTX_get0_certificate(c->ssl), h);
+    imdb_wipe(h, sizeof h);
+    return ok;
+}
+
 void imdbt_free(imdbt *t)
 {
     if (!t) return;

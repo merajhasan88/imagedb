@@ -34,6 +34,7 @@
 #include "test.h"
 
 static imdbs_opts g_extra; /* the next tstart's pre-auth limits (0: the defaults) */
+static const char *g_events; /* §8f: the next tstart's event log (NULL: none) */
 
 typedef struct tserv {
     imdb_db *db;
@@ -69,7 +70,7 @@ static bool tstart(tserv *t, const char *addr, bool certs)
     char dbdir[300];
     snprintf(dbdir, sizeof dbdir, "%s/db", t->dir);
     snprintf(t->sock, sizeof t->sock, "%s/s", t->dir);
-    imdb_open_opts o = {.sync = 0};
+    imdb_open_opts o = {.sync = 0, .events_path = g_events};
     if (imdb_open(dbdir, &o, &t->db, &e)) return false;
     if (!certs && sql1(t->db, "CREATE ROLE admin LOGIN SUPERUSER PASSWORD 'pw-admin'")) return false;
     imdbs_opts so;
@@ -81,6 +82,7 @@ static bool tstart(tserv *t, const char *addr, bool certs)
     so.server_dir = t->sdir;
     so.preauth_max = g_extra.preauth_max, so.preauth_per_addr = g_extra.preauth_per_addr, so.preauth_ms = g_extra.preauth_ms;
     so.max_conns = g_extra.max_conns;
+    so.cb_any = g_extra.cb_any;
     memset(so.secret, 0x42, sizeof so.secret);
     if (imdbs_start(t->db, &so, &t->s, &e)) {
         fprintf(stderr, "    imdbs_start: %s\n", e.msg);
@@ -738,11 +740,274 @@ static void t_tls_admission_bound(void)
     if (fifth >= 0) close(fifth);
     tstop(&t);
 }
+
+/* ---- §8f (decided 2026-11-18): the channel binding's type ----------------------------------------------------------- */
+
+/* n bytes through a TLS session, its WANTs waited out (10 s at most) */
+static bool tls_io(imdbt *t, uint8_t *p, size_t n, bool wr)
+{
+    size_t k = 0;
+    for (int spins = 0; k < n && spins < 10000;) {
+        ssize_t r = wr ? imdbt_write(t, p + k, n - k) : imdbt_read(t, p + k, n - k);
+        if (r == IMDBT_WANT_READ || r == IMDBT_WANT_WRITE) {
+            usleep(1000);
+            spins++;
+            continue;
+        }
+        if (r <= 0) return false;
+        k += (size_t)r;
+    }
+    return k == n;
+}
+
+/* one raw pre-auth exchange, a driver's view (the C client binds by the exporter alone): over TLS (port; the AuthMessage's
+ * binding the hello's type's value from this session) or the socket (sock; zeros); a hello of binding type cb; the proof
+ * from pw (none: zeros), made over a hello whose type is the other bound one when tamper (only the type byte differs
+ * from the hello sent) */
+typedef struct rawreq {
+    const char *port, *sock;
+    const uint8_t *pin;
+    uint32_t cb;
+    const char *pw;
+    bool tamper;
+} rawreq;
+
+/* the verdict's code (9: an acceptance whose signature is not the verifier's), or -1 when the exchange did not complete;
+ * over TLS, *eprc is imdbt_endpoint's result on the session and ep its value */
+static int raw_login(const rawreq *q, uint8_t ep[32], int *eprc)
+{
+    imdbw_hello h;
+    memset(&h, 0, sizeof h);
+    h.version = 1;
+    h.flags = q->cb;
+    memcpy(h.user, "admin", 5);
+    uint8_t hb[IMDBW_HELLO_LEN], ph[IMDBW_HELLO_LEN], chb[IMDBW_CHALLENGE_LEN], am[IMDBW_AUTHMSG_LEN];
+    uint8_t proof[IMDBW_PROOF_LEN], want[IMDBW_KEY], vb[IMDBW_VERDICT_LEN], binding[IMDBW_KEY], epv[32];
+    memset(proof, 0, sizeof proof);
+    memset(binding, 0, sizeof binding);
+    imdb_err e = {0};
+    if (test_rand_bytes(h.nonce, sizeof h.nonce), imdbw_hello_put(&h, hb)) return -1;
+    memcpy(ph, hb, sizeof ph);
+    if (q->tamper) ph[12] = q->cb == IMDBW_CB_ENDPOINT ? IMDBW_CB_EXPORTER : IMDBW_CB_ENDPOINT;
+    int fd = -1;
+    imdbt_ctx *ctx = NULL;
+    imdbt *t = NULL;
+    bool ok;
+    if (q->port) {
+        fd = tcp_to(q->port);
+        ok = fd >= 0 && !fcntl(fd, F_SETFL, O_NONBLOCK) && !imdbt_client_ctx(NULL, q->pin, &ctx, &e) &&
+             !imdbt_new(ctx, fd, "127.0.0.1", &t, &e) && hs(t);
+        if (ok) {
+            int r = imdbt_endpoint(t, epv);
+            if (eprc) *eprc = r;
+            if (ep) memcpy(ep, epv, 32);
+            if (q->cb == IMDBW_CB_EXPORTER) ok = !imdbt_binding(t, binding);
+            else if (q->cb == IMDBW_CB_ENDPOINT && !r) memcpy(binding, epv, 32);
+        }
+    } else {
+        fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        struct sockaddr_un sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sun_family = AF_UNIX;
+        memcpy(sa.sun_path, q->sock, strlen(q->sock) + 1);
+        struct timeval tv = {10, 0};
+        ok = fd >= 0 && !connect(fd, (struct sockaddr *)&sa, sizeof sa) && !setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    }
+#define RAW_IO(p, n, wr) (t ? tls_io(t, p, n, wr) : (wr ? write(fd, p, n) : recv(fd, p, n, MSG_WAITALL)) == (ssize_t)(n))
+    imdbw_challenge ch;
+    ok = ok && RAW_IO(hb, sizeof hb, true) && RAW_IO(chb, sizeof chb, false) && !imdbw_challenge_get(chb, &ch, &e);
+    if (ok && q->pw) {
+        imdbw_auth_message(q->port ? IMDBW_EP_TCP : IMDBW_EP_UNIX, ph, chb, binding, am);
+        ok = !imdbw_scram_client(q->pw, strlen(q->pw), &ch, am, proof, want);
+    }
+    imdbw_verdict v;
+    ok = ok && RAW_IO(proof, sizeof proof, true) && RAW_IO(vb, sizeof vb, false) && !imdbw_verdict_get(vb, &v, &e);
+#undef RAW_IO
+    imdbt_free(t);
+    imdbt_ctx_free(ctx);
+    if (fd >= 0) close(fd);
+    if (!ok) return -1;
+    return v.code == IMDBW_VERDICT_OK && (!q->pw || memcmp(v.sig, want, IMDBW_KEY)) ? 9 : (int)v.code;
+}
+
+/* the server's counts once its connections' threads have counted (10 s at most): logins and refusals as given */
+static void counts_at(imdbs *s, uint64_t logins, uint64_t refusals, imdbs_counts *c)
+{
+    for (int w = 0; w < 1000; w++) {
+        imdbs_counts_get(s, c);
+        if (c->logins == logins && c->refusals == refusals) return;
+        usleep(10000);
+    }
+}
+
+/* a relay holding the server's key (relay_main) on a port of its own, for one connection */
+static bool relay_up(relay *r, tserv *t, pthread_t *th)
+{
+    memset(r, 0, sizeof *r);
+    r->sdir = t->sdir, r->up_port = t->port, r->pin = t->pin;
+    r->lfd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t sl = sizeof sa;
+    if (r->lfd < 0 || bind(r->lfd, (struct sockaddr *)&sa, sizeof sa) || listen(r->lfd, 4) ||
+        getsockname(r->lfd, (struct sockaddr *)&sa, &sl))
+        return false;
+    snprintf(r->port, sizeof r->port, "%u", (unsigned)ntohs(sa.sin_port));
+    return pthread_create(th, NULL, relay_main, r) == 0;
+}
+
+static void relay_down(relay *r, pthread_t th)
+{
+    atomic_store(&r->stop, true);
+    pthread_join(th, NULL);
+    close(r->lfd);
+}
+
+/* The default server binds by the exporter alone: a right proof bound by tls-server-end-point is refused by name (verdict
+ * 2, counted), as is no binding on TCP and any binding on the socket; --channel-binding any takes both on TCP, a proof
+ * over a hello whose type byte alone differs from the one sent refused (the proof covers the type), and the end-point is
+ * the SHA-256 of the certificate's DER (computed here by the engine's own SHA-256 over the file, not OpenSSL's digest);
+ * through a relay holding the server's key the exporter fails and end-point passes (the weaker binding's known limit,
+ * §8f: asserted, so a change is seen); a certificate signed with SHA-384 stops a server allowing end-point at its start,
+ * and has no end-point a driver could compute */
+static void t_tls_binding(void)
+{
+    tserv t;
+    memset(&g_extra, 0, sizeof g_extra);
+    CHECK(tstart(&t, "127.0.0.1", false));
+    imdb_err e = {0};
+    imdbc *c = NULL;
+    imdbs_counts c0, c1;
+    imdbs_counts_get(t.s, &c0);
+    SOFT(tlogin("127.0.0.1", t.port, NULL, t.pin, "admin", "pw-admin", &c, &e) == 0 && select1(c));
+    imdbc_close(c), c = NULL;
+    uint8_t ep[32];
+    int eprc = -2;
+    rawreq q = {.port = t.port, .pin = t.pin, .cb = IMDBW_CB_EXPORTER, .pw = "pw-admin"};
+    SOFT(raw_login(&q, ep, &eprc) == IMDBW_VERDICT_OK && eprc == 0); /* the raw exchange itself, by the exporter */
+    q.cb = IMDBW_CB_ENDPOINT;
+    SOFT(raw_login(&q, NULL, NULL) == IMDBW_VERDICT_BINDING); /* a right end-point proof: the type refused */
+    q.cb = IMDBW_CB_NONE;
+    SOFT(raw_login(&q, NULL, NULL) == IMDBW_VERDICT_BINDING); /* TCP, unbound (its proof right for zeros) */
+    rawreq s = {.sock = t.sock, .cb = IMDBW_CB_EXPORTER, .pw = "pw-admin"};
+    SOFT(raw_login(&s, NULL, NULL) == IMDBW_VERDICT_BINDING); /* the socket, bound */
+    s.cb = IMDBW_CB_ENDPOINT;
+    SOFT(raw_login(&s, NULL, NULL) == IMDBW_VERDICT_BINDING);
+    s.cb = IMDBW_CB_NONE;
+    SOFT(raw_login(&s, NULL, NULL) == IMDBW_VERDICT_OK);
+    q.cb = IMDBW_CB_EXPORTER, q.pw = NULL;
+    SOFT(raw_login(&q, NULL, NULL) == IMDBW_VERDICT_REFUSED); /* bound, a wrong proof */
+    counts_at(t.s, c0.logins + 3, c0.refusals + 5, &c1);
+    if (!(c1.logins == c0.logins + 3 && c1.refusals == c0.refusals + 5 && c1.cb_refused == c0.cb_refused + 4))
+        fprintf(stderr, "    counts: logins %llu (from %llu), refusals %llu (from %llu), cb_refused %llu (from %llu), ep %llu\n", (unsigned long long)c1.logins, (unsigned long long)c0.logins, (unsigned long long)c1.refusals, (unsigned long long)c0.refusals, (unsigned long long)c1.cb_refused, (unsigned long long)c0.cb_refused, (unsigned long long)c1.logins_endpoint);
+    SOFT(c1.logins == c0.logins + 3 && c1.refusals == c0.refusals + 5 && c1.cb_refused == c0.cb_refused + 4 &&
+         c1.logins_endpoint == c0.logins_endpoint);
+    /* the end-point a driver computes is the SHA-256 of the certificate's DER */
+    char path[340];
+    snprintf(path, sizeof path, "%s/tls/server.crt", t.sdir);
+    FILE *f = fopen(path, "r");
+    X509 *x = f ? PEM_read_X509(f, NULL, NULL, NULL) : NULL;
+    if (f) fclose(f);
+    unsigned char *der = NULL;
+    int dn = x ? i2d_X509(x, &der) : -1;
+    uint8_t want[32];
+    CHECK(dn > 0);
+    imdb_sha256(der, (size_t)dn, want);
+    OPENSSL_free(der);
+    X509_free(x);
+    SOFT(!memcmp(ep, want, 32));
+    tstop(&t);
+
+    g_extra.cb_any = true;
+    char evpath[340];
+    snprintf(evpath, sizeof evpath, "%s/events.jsonl", t.dir);
+    g_events = evpath;
+    CHECK(tstart(&t, "127.0.0.1", true));
+    g_events = NULL;
+    imdbs_counts_get(t.s, &c0);
+    q = (rawreq){.port = t.port, .pin = t.pin, .cb = IMDBW_CB_ENDPOINT, .pw = "pw-admin"};
+    SOFT(raw_login(&q, NULL, NULL) == IMDBW_VERDICT_OK);
+    SOFT(tlogin("127.0.0.1", t.port, NULL, t.pin, "admin", "pw-admin", &c, &e) == 0 && select1(c)); /* the exporter */
+    imdbc_close(c), c = NULL;
+    q.tamper = true; /* the proof's hello says exporter, the hello sent end-point: refused */
+    SOFT(raw_login(&q, NULL, NULL) == IMDBW_VERDICT_REFUSED);
+    q.cb = IMDBW_CB_EXPORTER; /* and the other way round */
+    SOFT(raw_login(&q, NULL, NULL) == IMDBW_VERDICT_REFUSED);
+    q.tamper = false, q.cb = IMDBW_CB_NONE;
+    SOFT(raw_login(&q, NULL, NULL) == IMDBW_VERDICT_BINDING); /* unbound: still refused */
+    s = (rawreq){.sock = t.sock, .cb = IMDBW_CB_ENDPOINT, .pw = "pw-admin"};
+    SOFT(raw_login(&s, NULL, NULL) == IMDBW_VERDICT_BINDING);
+    counts_at(t.s, c0.logins + 2, c0.refusals + 4, &c1);
+    if (!(c1.logins == c0.logins + 2 && c1.refusals == c0.refusals + 4 && c1.cb_refused == c0.cb_refused + 2))
+        fprintf(stderr, "    counts (any): logins %llu (from %llu), refusals %llu (from %llu), cb_refused %llu (from %llu), ep %llu\n", (unsigned long long)c1.logins, (unsigned long long)c0.logins, (unsigned long long)c1.refusals, (unsigned long long)c0.refusals, (unsigned long long)c1.cb_refused, (unsigned long long)c0.cb_refused, (unsigned long long)c1.logins_endpoint);
+    SOFT(c1.logins == c0.logins + 2 && c1.refusals == c0.refusals + 4 && c1.logins_endpoint == c0.logins_endpoint + 1 &&
+         c1.cb_refused == c0.cb_refused + 2);
+    /* the engine thread's tick says both in the event log, totals once they have moved, at most once in 5 s (20 s at
+     * most) */
+    bool said = false;
+    for (int w = 0; w < 2000 && !said; w++) {
+        char buf[16384];
+        FILE *ef = fopen(evpath, "r");
+        size_t got = ef ? fread(buf, 1, sizeof buf - 1, ef) : 0;
+        if (ef) fclose(ef);
+        buf[got] = 0;
+        said = strstr(buf, "\"ev\":\"channel_binding\",\"end_point_logins\":1,\"refused_types\":2}") != NULL;
+        if (!said) usleep(10000);
+    }
+    SOFT(said);
+    relay r;
+    pthread_t th;
+    imdbs_counts_get(t.s, &c0);
+    CHECK(relay_up(&r, &t, &th));
+    int rc = tlogin("127.0.0.1", r.port, NULL, t.pin, "admin", "pw-admin", &c, &e); /* the exporter: the relay's fails */
+    SOFT(rc == IMDB_ERR_AUTH && !c);
+    imdbc_close(c), c = NULL;
+    relay_down(&r, th);
+    CHECK(relay_up(&r, &t, &th));
+    q = (rawreq){.port = r.port, .pin = t.pin, .cb = IMDBW_CB_ENDPOINT, .pw = "pw-admin"};
+    rc = raw_login(&q, NULL, NULL); /* end-point: the relay holds the key, so it passes */
+    SOFT(rc == IMDBW_VERDICT_OK);
+    if (rc) fprintf(stderr, "    end-point through a relay holding the key: %d\n", rc);
+    relay_down(&r, th);
+    counts_at(t.s, c0.logins + 1, c0.refusals + 1, &c1);
+    SOFT(c1.logins == c0.logins + 1 && c1.refusals == c0.refusals + 1 && c1.logins_endpoint == c0.logins_endpoint + 1);
+    tstop(&t);
+
+    /* the certificate re-signed with SHA-384 (its own key; the pin is the key's, so the client still takes it) */
+    char kpath[340];
+    snprintf(kpath, sizeof kpath, "%s/tls/server.key", t.sdir);
+    f = fopen(kpath, "r");
+    EVP_PKEY *k = f ? PEM_read_PrivateKey(f, NULL, NULL, NULL) : NULL;
+    if (f) fclose(f);
+    f = fopen(path, "r");
+    x = f ? PEM_read_X509(f, NULL, NULL, NULL) : NULL;
+    if (f) fclose(f);
+    CHECK(k && x && X509_sign(x, k, EVP_sha384()) > 0);
+    f = fopen(path, "w");
+    CHECK(f && PEM_write_X509(f, x));
+    fclose(f);
+    X509_free(x);
+    EVP_PKEY_free(k);
+    SOFT(!tstart(&t, "127.0.0.1", true)); /* --channel-binding any: refused at the start */
+    g_extra.cb_any = false;
+    CHECK(tstart(&t, "127.0.0.1", true)); /* the exporter alone: the certificate's hash never asked */
+    SOFT(tlogin("127.0.0.1", t.port, NULL, t.pin, "admin", "pw-admin", &c, &e) == 0 && select1(c));
+    imdbc_close(c), c = NULL;
+    q = (rawreq){.port = t.port, .pin = t.pin, .cb = IMDBW_CB_EXPORTER, .pw = "pw-admin"};
+    eprc = 0;
+    SOFT(raw_login(&q, NULL, &eprc) == IMDBW_VERDICT_OK && eprc == -1); /* no end-point for a driver to compute */
+    tstop(&t);
+    memset(&g_extra, 0, sizeof g_extra);
+}
+
 const test_case tls_tests[] = {
     {"tls_verify", t_tls_verify},     {"tls_expired", t_tls_expired}, {"tls_refusals", t_tls_refusals},
     {"tls_relay", t_tls_relay},       {"tls_renew", t_tls_renew},     {"tls_timing", t_tls_timing},
     {"tls_peer_gone", t_tls_peer_gone}, {"tls_pending", t_tls_pending}, {"tls_cert_crash", t_tls_cert_crash},
     {"tls_admission", t_tls_admission},
     {"tls_admission_bound", t_tls_admission_bound},
+    {"tls_binding", t_tls_binding},
 };
 const size_t tls_ntests = sizeof tls_tests / sizeof *tls_tests;

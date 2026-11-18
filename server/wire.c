@@ -255,7 +255,7 @@ static int magic_version(imdb_rd *r, uint32_t *version, imdb_err *e)
 int imdbw_hello_put(const imdbw_hello *h, uint8_t out[IMDBW_HELLO_LEN])
 {
     size_t n = strnlen(h->user, IMDBW_USER);
-    if (h->version != IMDBW_VERSION || h->flags || !imdbw_user_ok(h->user, n)) return -1;
+    if (h->version != IMDBW_VERSION || h->flags > IMDBW_CB_ENDPOINT || !imdbw_user_ok(h->user, n)) return -1;
     memset(out, 0, IMDBW_HELLO_LEN);
     memcpy(out, IMDBW_MAGIC, 8);
     imdb_le32(out + 8, h->version);
@@ -275,7 +275,7 @@ int imdbw_hello_get(const uint8_t in[IMDBW_HELLO_LEN], imdbw_hello *h, imdb_err 
     const uint8_t *u = imdb_rd_bytes(&r, IMDBW_USER);
     imdb_rd_copy(&r, h->nonce, IMDBW_NONCE);
     if (r.err || imdb_rd_left(&r)) return bad(e, "a hello of another length");
-    if (h->flags) return bad(e, "a hello with flags no version defines");
+    if (h->flags > IMDBW_CB_ENDPOINT) return bad(e, "a hello with flags no version defines (a binding type but 0, 1, 2)");
     size_t n = strnlen((const char *)u, IMDBW_USER);
     if (n == IMDBW_USER || !imdbw_user_ok((const char *)u, n) || !zeros(u + n, IMDBW_USER - n))
         return bad(e, "a hello's role name is not 1 to 63 bytes of UTF-8, NUL-padded");
@@ -321,7 +321,11 @@ int imdbw_challenge_get(const uint8_t in[IMDBW_CHALLENGE_LEN], imdbw_challenge *
     return IMDB_OK;
 }
 
-static bool verdict_ok(const imdbw_verdict *v) { return v->code == 0 || (v->code == 1 && zeros(v->sig, IMDBW_KEY)); }
+static bool verdict_ok(const imdbw_verdict *v)
+{
+    return v->code == IMDBW_VERDICT_OK ||
+           ((v->code == IMDBW_VERDICT_REFUSED || v->code == IMDBW_VERDICT_BINDING) && zeros(v->sig, IMDBW_KEY));
+}
 
 int imdbw_verdict_put(const imdbw_verdict *v, uint8_t out[IMDBW_VERDICT_LEN])
 {
