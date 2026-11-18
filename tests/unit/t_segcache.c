@@ -1191,9 +1191,45 @@ out:
     imdb_close(db);
 }
 
+
+/* P0 decision 4 (2026-11-18): a segment whose image is larger than the whole budget is said, once a handle, at the
+ * CHECKPOINT that builds it and at the open that finds it; at a budget that holds it, and at the tiny mode's 0 (meant),
+ * nothing is said */
+static void t_segcache_oversize(void)
+{
+    const char *dir = test_tmpdir();
+    imdb_err e = {0};
+    CHECK_OK(imdb_init(dir, false, NULL, &e));
+    imdb_db *db = sopen(dir, 64u << 10, false);
+    CHECK(db);
+    imdb_session s;
+    imdb_session_init(&s, db);
+    bool fine = !ex(&s, "CREATE TABLE w (id INT64 PRIMARY KEY, s TEXT)");
+    char q[1400];
+    char pad[1001];
+    memset(pad, 'x', 1000);
+    pad[1000] = 0;
+    for (int i = 0; fine && i < 300; i++) { /* ~300 KB of rows: one segment's image past 64 KiB */
+        snprintf(q, sizeof q, "INSERT INTO w VALUES (%d, '%s')", i, pad);
+        fine = !ex(&s, q);
+    }
+    SOFT(fine && !db->warning[0]);
+    SOFT(!ex(&s, "CHECKPOINT") && strstr(db->warning, "larger than the segment cache's budget of 65536 bytes"));
+    imdb_session_close(&s);
+    imdb_close(db);
+    db = sopen(dir, 64u << 10, true); /* the open that finds it */
+    CHECK(db);
+    SOFT(strstr(db->warning, "larger than the segment cache's budget"));
+    imdb_close(db);
+    db = sopen(dir, 0, true); /* the default budget (256 MB) holds it: nothing said */
+    CHECK(db);
+    SOFT(!strstr(db->warning, "segment cache's budget"));
+    imdb_close(db);
+}
 const test_case segcache_tests[] = {
     {"segcache_release", t_segcache_release},
     {"segcache_one_load", t_segcache_one_load},
+    {"segcache_oversize", t_segcache_oversize},
     {"segcache_reload_ends", t_segcache_reload_ends},
     {"segcache_lru", t_segcache_lru},
     {"segcache_unwritten_kept", t_segcache_unwritten_kept},

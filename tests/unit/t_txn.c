@@ -152,6 +152,34 @@ static void t_txn_conflict_on_replay(void)
     imdb_close(db);
 }
 
+/* P0 decision 2 (2026-11-18): READ COMMITTED takes a snapshot a statement, yet a row this transaction wrote that another
+ * session then commits is a conflict all the same (first committer wins at every level; PostgreSQL's row lock would make
+ * the other wait): the transaction can only roll back, and its message says "could not serialize access" and "retry"
+ * once each (they were said twice); a row the other committed BEFORE this transaction's statement wrote it is no
+ * conflict */
+static void t_txn_conflict_read_committed(void)
+{
+    imdb_session a, b;
+    imdb_db *db = setup(&a, &b);
+    CHECK(db);
+    SRUN(&a, "BEGIN ISOLATION LEVEL READ COMMITTED");
+    SRUN(&a, "UPDATE t SET v = v + 10 WHERE id = 1");
+    SRUN(&b, "UPDATE t SET v = v + 1 WHERE id = 1"); /* autocommit: commits first */
+    CHECK(srun(&a, "COMMIT") == IMDB_ERR_CONFLICT && !a.txn.open);
+    const char *m = g_e.msg, *s1 = strstr(m, "could not serialize access"), *r1 = strstr(m, "retry");
+    SOFT(s1 && !strstr(s1 + 1, "could not serialize access") && r1 && !strstr(r1 + 1, "retry"));
+    if (!(s1 && !strstr(s1 + 1, "could not serialize access"))) fprintf(stderr, "    message: %s\n", m);
+    CHECK(sval(&a, "SELECT v FROM t WHERE id = 1") == 11);
+    SRUN(&a, "BEGIN ISOLATION LEVEL READ COMMITTED");
+    SRUN(&b, "UPDATE t SET v = v + 1 WHERE id = 1"); /* committed before a's statement: a's statement sees it */
+    SRUN(&a, "UPDATE t SET v = v + 10 WHERE id = 1");
+    SRUN(&a, "COMMIT");
+    CHECK(sval(&a, "SELECT v FROM t WHERE id = 1") == 22);
+    imdb_session_close(&a);
+    imdb_session_close(&b);
+    imdb_close(db);
+}
+
 /* A suspended write set built on a row that another session deletes and erases
  * is doomed at once, and its saved copy of the row's bytes is wiped. */
 static void t_txn_erase_dooms_suspended(void)
@@ -1081,6 +1109,7 @@ const test_case txn_tests[] = {
     {"txn_no_dirty_reads", t_txn_no_dirty_reads},
     {"txn_interleaved", t_txn_interleaved},
     {"txn_conflict_on_replay", t_txn_conflict_on_replay},
+    {"txn_conflict_read_committed", t_txn_conflict_read_committed},
     {"txn_erase_dooms_suspended", t_txn_erase_dooms_suspended},
 };
 const size_t txn_ntests = sizeof txn_tests / sizeof *txn_tests;

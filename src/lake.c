@@ -309,8 +309,17 @@ static void seg_charge(imdb_segcache *c, imdb_segment *g)
     if (!c || g->cache || !g->img_) return;
     g->cache = c;
     g->touched = c->clock;
-    c->resident += seg_img_bytes(g, g->img_);
+    uint64_t b = seg_img_bytes(g, g->img_);
+    c->resident += b;
     if (c->resident > c->peak) c->peak = c->resident;
+    /* P0 decision 4 (2026-11-18): an image past the whole budget never stays between operations, so every operation
+     * reading it loads it whole again (about 100x slower): said at the CHECKPOINT that builds it and at the open that
+     * finds it, once a handle (imdb_warn keeps one copy of a text). A segment is cut by its rows alone (its cut is every
+     * copy's: a byte bound is a format step); a budget of 0 (IMDB_SEGCACHE=tiny, the tests') is meant, never said */
+    if (c->budget && b > c->budget && c->db)
+        imdb_warn(c->db, "a lake segment's image is larger than the segment cache's budget of %llu bytes: every operation "
+                         "reading it loads it whole again (raise --seg-cache, or CHECKPOINT more often)",
+                  (unsigned long long)c->budget);
 }
 
 void imdb_segment_free(imdb_segment *g)

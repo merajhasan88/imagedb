@@ -192,7 +192,22 @@ static int swap_in(imdb_db *db, imdb_txn *x, imdb_err *e)
         db->active = NULL;
         if (rc == IMDB_ERR_NOMEM || rc == IMDB_ERR_LIMIT) return imdb_fail(e, rc, "%s", e2.msg);
         char why[384];
-        snprintf(why, sizeof why, "a row this transaction writes was changed by a commit after its snapshot (%s)", e2.msg);
+        /* the replay's own words without the "could not serialize access: " and "...retry the transaction" that doom()
+         * adds around them (the message once said each twice) */
+        const char *in = e2.msg;
+        static const char pre[] = "could not serialize access: ";
+        if (!strncmp(in, pre, sizeof pre - 1)) in += sizeof pre - 1;
+        size_t n = strlen(in);
+        static const char *const tails[] = {"; roll back and retry the transaction", "; retry the transaction"};
+        for (int k = 0; k < 2; k++) {
+            size_t tl = strlen(tails[k]);
+            if (n >= tl && !strcmp(in + n - tl, tails[k])) {
+                n -= tl;
+                break;
+            }
+        }
+        snprintf(why, sizeof why, "a row this transaction writes was changed by a commit after its snapshot (%.*s)", (int)n,
+                 in);
         doom(x, why);
         release_ops(x);
         return imdb_fail(e, IMDB_ERR_CONFLICT, "%s", x->doom);

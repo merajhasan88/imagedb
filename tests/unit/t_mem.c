@@ -190,6 +190,101 @@ static void t_mem_replica(void)
     imdb_close(rep);
 }
 
+
+/* P0 decision 1's follow-up (2026-11-18): a replica with the query reserve its budget keeps (D8 #2, not zeroed as
+ * open_budget does) still never fails a commit its primary took: it applies commits until it holds its budget less the
+ * reserve, then stops BETWEEN commits, consistent (never db->failed mid-commit), and a larger budget goes on. Its open's
+ * replay of a store past the budget less the reserve opens too */
+static void t_mem_replica_reserve(void)
+{
+    const char *tmp = test_tmpdir();
+    char p[600], rr[600], st[700];
+    snprintf(p, sizeof p, "%s/p", tmp);
+    snprintf(rr, sizeof rr, "%s/r", tmp);
+    snprintf(st, sizeof st, "%s/stream", tmp);
+    OK(imdb_init(p, false, NULL, E));
+    OK(imdb_init(rr, true, p, E));
+    imdb_db *db = open_budget(p, 0);
+    CHECK(db);
+    if (!db) return;
+    OK(make_table(db, E));
+    for (int64_t id = 1; id <= 3000; id++) OK(ins1(db, id, id % 7, id, "replicated row"));
+    uint64_t last = db->seq;
+    imdb_close(db);
+    OK(ship_to_file(p, 0, st, E));
+    imdb_db *rep = open_budget(rr, 0);
+    CHECK(rep);
+    if (!rep) return;
+    uint64_t base = held(rep);
+    imdb_close(rep);
+    uint64_t budget = (base + (128u << 10)) / 3 * 4; /* its reserve a quarter: room for base and 128 KiB of rows */
+    imdb_open_opts o = {.sync = 1, .mem_limit = budget, .mem_window_us = UINT64_MAX};
+    imdb_err_clear(E);
+    CHECK(imdb_open(rr, &o, &rep, E) == 0);
+    CHECK(rep->mem_reserve == imdb_query_share(budget) && rep->mem_reserve > 0);
+    uint64_t applied = 0;
+    int fd = open(st, O_RDONLY | O_CLOEXEC);
+    imdb_err_clear(E);
+    int rc = imdb_apply_stream(rep, fd, &applied, E);
+    close(fd);
+    if (!(rc == IMDB_ERR_LIMIT && strstr(g_e.msg, "stops before commit") && !rep->failed))
+        fprintf(stderr, "    apply: rc %d, failed %d: %s\n", rc, (int)rep->failed, g_e.msg);
+    CHECK(rc == IMDB_ERR_LIMIT && strstr(g_e.msg, "stops before commit") && rep->seq > 1 && rep->seq < last && !rep->failed);
+    OK(verify_db(rep));
+    uint64_t stopped = rep->seq;
+    imdb_close(rep);
+    /* reopened under the same budget: the open's replay is exempt (it opens), then a larger budget goes on */
+    imdb_err_clear(E);
+    CHECK(imdb_open(rr, &o, &rep, E) == 0 && rep->seq == stopped);
+    imdb_close(rep);
+    rep = open_budget(rr, 0);
+    CHECK(rep);
+    if (!rep) return;
+    OK(ship_to_file(p, rep->seq, st, E));
+    fd = open(st, O_RDONLY | O_CLOEXEC);
+    OK(imdb_apply_stream(rep, fd, &applied, E));
+    close(fd);
+    CHECK(rep->seq == last);
+    OK(verify_db(rep));
+    imdb_close(rep);
+}
+
+/* the same at a growth step: a reserve that leaves less room than the replica already holds (its budget not reached),
+ * so every growth step a commit's apply takes lands between the room and the budget: the apply never refuses it (a
+ * replica cannot refuse a logged commit), and the stop before a commit is the budget's alone */
+static void t_mem_replica_growth(void)
+{
+    const char *tmp = test_tmpdir();
+    char p[600], rr[600], st[700];
+    snprintf(p, sizeof p, "%s/p", tmp);
+    snprintf(rr, sizeof rr, "%s/r", tmp);
+    snprintf(st, sizeof st, "%s/stream", tmp);
+    OK(imdb_init(p, false, NULL, E));
+    OK(imdb_init(rr, true, p, E));
+    imdb_db *db = open_budget(p, 0);
+    CHECK(db);
+    if (!db) return;
+    OK(make_table(db, E));
+    for (int64_t id = 1; id <= 2000; id++) OK(ins1(db, id, id % 7, id, "replicated row"));
+    uint64_t last = db->seq;
+    imdb_close(db);
+    OK(ship_to_file(p, 0, st, E));
+    imdb_open_opts o = {.sync = 1, .mem_limit = 1ull << 30, .mem_window_us = UINT64_MAX};
+    imdb_db *rep = NULL;
+    imdb_err_clear(E);
+    CHECK(imdb_open(rr, &o, &rep, E) == 0);
+    rep->mem_reserve = (1ull << 30) - held(rep) + 1; /* room one byte under what it holds: every growth step past it */
+    uint64_t applied = 0;
+    int fd = open(st, O_RDONLY | O_CLOEXEC);
+    imdb_err_clear(E);
+    int rc = imdb_apply_stream(rep, fd, &applied, E);
+    close(fd);
+    if (rc || rep->failed) fprintf(stderr, "    apply: rc %d, failed %d, at %llu of %llu: %s\n", rc, (int)rep->failed,
+                                   (unsigned long long)rep->seq, (unsigned long long)last, g_e.msg);
+    CHECK(rc == 0 && !rep->failed && rep->seq == last);
+    OK(verify_db(rep));
+    imdb_close(rep);
+}
 #if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
 #define RSS_MEANINGFUL 0
 #elif defined(__has_feature)
@@ -669,6 +764,8 @@ const test_case mem_tests[] = {
     {"mem_reserve", t_mem_reserve},
     {"mem_result_cap", t_mem_result_cap},
     {"mem_replica", t_mem_replica},
+    {"mem_replica_reserve", t_mem_replica_reserve},
+    {"mem_replica_growth", t_mem_replica_growth},
     {"mem_park", t_mem_park},
     {"mem_churn", t_mem_churn},
 };

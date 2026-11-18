@@ -585,7 +585,7 @@ Command-line options (`imagedb` with no arguments prints the commands):
 | `--accept-rollback` | sql | continues from a log behind the anchor, rewriting it | off |
 | `--mem-limit BYTES` | sql, apply, follow | the memory budget (K, M or G) | none |
 | `--mem-window SECONDS\|none` | sql, apply, follow | versions ended within it stay in memory | 600 |
-| `--seg-cache BYTES\|all` | sql, apply, follow | the lake's segment images kept in memory | 256 MB |
+| `--seg-cache BYTES\|all` | sql, apply, follow | the lake's segment images kept in memory (a segment whose image is larger is read whole again by every operation that reads it: CHECKPOINT and the open warn) | 256 MB |
 | `--stats FILE` | sql, apply, follow | writes the stats export (Monitoring) | none |
 | `--stats FILE` | health | reads that export too | the directory only |
 | `--events FILE` | sql, apply, follow | the event log (Monitoring) | none |
@@ -690,7 +690,11 @@ One process and principal, one engine thread with worker parallelism, many
 interleaved sessions. SNAPSHOT, READ COMMITTED and SERIALIZABLE transactions, statement
 rollback, savepoints, `WITH (NOLOCK)` and optimistic `SELECT ... FOR UPDATE`
 (first committer wins, without fairness: a long transaction can lose every
-round to short ones writing the same row, so retry with backoff). Under SNAPSHOT
+round to short ones writing the same row, so retry with backoff). At every level,
+READ COMMITTED included, a transaction that wrote a row which another session then
+commits first is refused (CONFLICT) at its next statement or its COMMIT, where
+PostgreSQL's row lock would make the other session wait: every application that
+writes in transactions needs a retry loop. Under SNAPSHOT
 write skew is possible. SERIALIZABLE (stage 1, by tables): a SERIALIZABLE
 transaction that wrote commits only if no commit since its snapshot wrote a table
 it read (rows, or DDL on it) or changed the catalog (any DDL: views and types resolve
