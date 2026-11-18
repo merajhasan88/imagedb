@@ -534,15 +534,26 @@ int imdb_txn_release(imdb_db *db, imdb_txn *x, const char *name, imdb_err *e)
     return IMDB_OK;
 }
 
-bool imdb_txn_expired(const imdb_txn *x, uint64_t now_ns, char *why, size_t n)
+uint64_t imdb_cap_eff(const imdb_db *db, const imdb_caps *caps, uint32_t role, uint64_t own, uint64_t cap)
+{
+    if (!caps || !cap || imdb_role_superuser(&db->rc, role)) return own;
+    return own && own <= cap ? own : cap;
+}
+
+bool imdb_txn_expired(const imdb_db *db, const imdb_txn *x, uint64_t now_ns, char *why, size_t n)
 {
     if (!x->open) return false;
-    if (x->timeout_ms && now_ns - x->begin_ns > (uint64_t)x->timeout_ms * 1000000u) {
-        snprintf(why, n, "transaction timeout: it ran past %u ms (SET transaction_timeout)", x->timeout_ms);
+    /* N1e stage two: the role's caps read now, not at the BEGIN, so a superuser demoted mid-transaction is held at once */
+    uint64_t tm = imdb_cap_eff(db, x->caps, x->role, x->timeout_ms, x->caps ? x->caps->txn_ms : 0);
+    uint64_t im = imdb_cap_eff(db, x->caps, x->role, x->idle_ms, x->caps ? x->caps->idle_ms : 0);
+    if (tm && now_ns - x->begin_ns > tm * 1000000u) {
+        snprintf(why, n, "transaction timeout: it ran past %llu ms (%s)", (unsigned long long)tm,
+                 tm == x->timeout_ms ? "SET transaction_timeout" : "the server's cap for a role, --role-transaction-timeout");
         return true;
     }
-    if (x->idle_ms && !x->busy && now_ns - x->last_ns > (uint64_t)x->idle_ms * 1000000u) {
-        snprintf(why, n, "idle in transaction for more than %u ms (SET idle_in_transaction_timeout)", x->idle_ms);
+    if (im && !x->busy && now_ns - x->last_ns > im * 1000000u) {
+        snprintf(why, n, "idle in transaction for more than %llu ms (%s)", (unsigned long long)im,
+                 im == x->idle_ms ? "SET idle_in_transaction_timeout" : "the server's cap for a role, --role-idle-in-transaction");
         return true;
     }
     return false;
@@ -571,6 +582,6 @@ void imdb_txn_timeouts(imdb_db *db, uint64_t now_ns, const imdb_txn *self)
 {
     for (imdb_txn *x = db->txns; x; x = x->next) {
         char why[160];
-        if (x != self && imdb_txn_expired(x, now_ns, why, sizeof why)) imdb_txn_expire(db, x, why);
+        if (x != self && imdb_txn_expired(db, x, now_ns, why, sizeof why)) imdb_txn_expire(db, x, why);
     }
 }

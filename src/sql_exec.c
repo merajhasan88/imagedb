@@ -201,6 +201,8 @@ typedef struct xctx {
     uint64_t ticks, next_check;   /* rows passed, and the count at the next check (R1: xcheck) */
     uint64_t tested, row_limit;   /* rows tested and SET statement_row_limit (D8 #4: xtested) */
     uint64_t deadline_ns;         /* CLOCK_MONOTONIC: the statement's timeout; 0: none */
+    uint64_t deadline_ms;         /* N1e stage two: that timeout's milliseconds, and whether a role's cap set it (the message) */
+    bool deadline_cap, row_cap;   /* (row_cap: the row limit a role's cap) */
     bool checks;                  /* false for what runs to its end: COMMIT and the physical statements */
     imdb_xenv env;                /* P2 S1: the evaluator's view of the statement (xenv_check) */
     imdb_xarena arena;            /* P2 S1: computed TEXT, freed by xfree (the one exit) */
@@ -270,8 +272,8 @@ static int xcheck(xctx *x, imdb_err *e)
     if (atomic_load_explicit(&x->ss->cancel, memory_order_relaxed))
         return imdb_fail(e, IMDB_ERR_CANCELLED, "statement cancelled");
     if (x->deadline_ns && mono_ns() >= x->deadline_ns)
-        return imdb_fail(e, IMDB_ERR_CANCELLED, "statement timeout: it ran past %u ms (SET statement_timeout)",
-                         x->ss->stmt_timeout_ms);
+        return imdb_fail(e, IMDB_ERR_CANCELLED, "statement timeout: it ran past %llu ms (%s)", (unsigned long long)x->deadline_ms,
+                         x->deadline_cap ? "the server's cap for a role, --role-statement-timeout" : "SET statement_timeout");
     return IMDB_OK;
 }
 
@@ -411,8 +413,9 @@ static int xtested(xctx *x, uint64_t n, imdb_err *e)
     x->tested += n;
     if (!x->row_limit || x->tested <= x->row_limit || !x->checks) return IMDB_OK;
     x->own_limit = true; /* P2 S11: a second plan, the memo's runs spared, may stop short of it (xc_own) */
-    return imdb_fail(e, IMDB_ERR_LIMIT, "statement row limit: it tested more than %llu rows (SET statement_row_limit); "
-                                        "narrow it", (unsigned long long)x->row_limit);
+    return imdb_fail(e, IMDB_ERR_LIMIT, "statement row limit: it tested more than %llu rows (%s); narrow it",
+                     (unsigned long long)x->row_limit,
+                     x->row_cap ? "the server's cap for a role, --role-row-limit" : "SET statement_row_limit");
 }
 
 /* n more rows passed (examined, tested, joined or written): an error once the statement must stop */
@@ -2838,7 +2841,8 @@ static int run_nested(xctx *x, const sql_stmt *in, imdb_result *r, uint8_t mode,
     bool pres = mode & NEST_PRES; /* P2 S11 */
     mode = (uint8_t)(mode & ~NEST_PRES);
     xctx s = {.ss = x->ss, .db = x->db, .sql = x->sql, .params = x->params, .nparams = x->nparams, .st = in,
-              .row_limit = x->row_limit, .deadline_ns = x->deadline_ns, .checks = x->checks, .ticks = x->ticks,
+              .row_limit = x->row_limit, .deadline_ns = x->deadline_ns, .deadline_ms = x->deadline_ms,
+              .deadline_cap = x->deadline_cap, .row_cap = x->row_cap, .checks = x->checks, .ticks = x->ticks,
               .next_check = x->next_check, .tested = x->tested, .nested = true, .vdepth = x->vdepth, .deps = x->deps};
     s.env.check = xenv_check;
     s.env.subq = xenv_subq;
@@ -5085,9 +5089,49 @@ static bool set_open(const char *name)
     return false;
 }
 
+/* N1e stage two: SET of a setting the server caps for a role: a role under its cap may lower it, never set it to 0 (none)
+ * or past the cap (a superuser's, an embedded caller's and the CLI's unbounded); the effective value is read where it is
+ * checked (imdb_cap_eff), so a later promotion or demotion applies at once */
+static int set_within_cap(const imdb_session *ss, const char *name, uint64_t v, uint64_t cap, imdb_err *e)
+{
+    if (!cap || !gate_role(ss) || (v && v <= cap)) return IMDB_OK;
+    return imdb_fail(e, IMDB_ERR_PRIVILEGE, "permission denied: %s of 0 (none) or past the server's cap for a role (%llu) "
+                                            "needs a superuser",
+                     name, (unsigned long long)cap);
+}
+
 /* Gate A, at a statement's start (exec_stmt_body, before its transaction's entry): the session's role read from the
  * catalog now, so a change another session committed applies at this statement; none, or a dropped one, refused (a
  * dropped role's open transaction may still roll back) */
+/* N1e stage two: what only a superuser may SET is held to the role a session acts as now. A session whose role is not a
+ * superuser (demoted since it SET them) runs with cross_check off, no slow-statement events, no replica wait, and its
+ * statement_memory within its role's share; reset at each statement's Gate A, so SHOW and every use agree, as the caps
+ * are read where they are checked (an embedded caller's and the CLI's sessions are not enforced: untouched) */
+enum { SU_CROSS = 1, SU_SLOW = 2, SU_SYNC = 4, SU_MEMORY = 8 };
+
+/* a SET this enforced session made of what only a superuser may set (Gate A let it through: it was one then), noted so
+ * demoted_reset takes back exactly these: a field a harness set on the session directly (the oracle's --privs battery
+ * runs its role's session cross-checked) is not the session's SET and stays */
+static void su_note(imdb_session *ss, const char *name)
+{
+    if (!strcmp(name, "cross_check")) ss->su_set |= SU_CROSS;
+    else if (!strcmp(name, "slow_statement_ms")) ss->su_set |= SU_SLOW;
+    else if (!strcmp(name, "sync_replicas") || !strcmp(name, "sync_timeout_ms")) ss->su_set |= SU_SYNC;
+    else if (!strcmp(name, "statement_memory") && ss->stmt_memory > imdb_query_share(ss->db->mem_limit))
+        ss->su_set |= SU_MEMORY;
+}
+
+static void demoted_reset(imdb_session *ss)
+{
+    if (!ss->su_set || !gate_role(ss)) return; /* nothing noted, or a superuser now */
+    if (ss->su_set & SU_CROSS) ss->cross_check = false;
+    if (ss->su_set & SU_SLOW) ss->slow_ms = 0;
+    if (ss->su_set & SU_SYNC) ss->sync_replicas = 0, ss->sync_wait_ms = 0;
+    if ((ss->su_set & SU_MEMORY) && ss->stmt_memory > imdb_query_share(ss->db->mem_limit))
+        ss->stmt_memory = 0; /* the default: the share */
+    ss->su_set = 0;
+}
+
 static int gate_kind(const imdb_session *ss, const sql_stmt *st, imdb_err *e)
 {
     if (!ss->role) return imdb_fail(e, IMDB_ERR_PRIVILEGE, "permission denied: this session acts as no role");
@@ -10852,9 +10896,9 @@ static int prep_add(imdb_session *ss, const char *name, const char *sql, size_t 
     if (!ss->prep && !(ss->prep = imdb_alloc(sizeof *ss->prep, e))) return e->code;
     if (ss->prep->n >= IMDB_MAX_PREPARED)
         return imdb_fail(e, IMDB_ERR_LIMIT, "a session prepares at most %u statements: DEALLOCATE one", IMDB_MAX_PREPARED);
-    if (len > IMDB_MAX_PREPARED_BYTES)
-        return imdb_fail(e, IMDB_ERR_LIMIT, "a statement of more than %llu bytes to prepare",
-                         (unsigned long long)IMDB_MAX_PREPARED_BYTES);
+    /* N1e stage two: a role's session holds at most its cap (the server's --role-prepared-bytes: a role's share) */
+    uint64_t pmax = imdb_cap_eff(ss->db, ss->enforce ? &ss->caps : NULL, ss->role, IMDB_MAX_PREPARED_BYTES, ss->caps.prep_bytes);
+    if (len > pmax) return imdb_fail(e, IMDB_ERR_LIMIT, "a statement of more than %llu bytes to prepare", (unsigned long long)pmax);
     uint64_t heap0 = imdb_heap_bytes();
     prep_entry *p = &ss->prep->e[ss->prep->n];
     memset(p, 0, sizeof *p);
@@ -10875,9 +10919,9 @@ static int prep_add(imdb_session *ss, const char *name, const char *sql, size_t 
         else memcpy(p->ptypes, ptypes, nptype * sizeof *ptypes), p->nptype = nptype;
     }
     uint64_t bytes = imdb_heap_bytes() - heap0;
-    if (!rc && ss->prep->bytes + bytes > IMDB_MAX_PREPARED_BYTES)
+    if (!rc && ss->prep->bytes + bytes > pmax)
         rc = imdb_fail(e, IMDB_ERR_LIMIT, "a session's prepared statements hold at most %llu bytes: DEALLOCATE one",
-                       (unsigned long long)IMDB_MAX_PREPARED_BYTES);
+                       (unsigned long long)pmax);
     if (!rc && ss->db->mem_limit) { /* every session's prepared statements are in the total: imdb_mem's prepared */
         imdb_mem_report mr;
         imdb_mem(ss->db, &mr);
@@ -11015,6 +11059,7 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
         stmt_drop(st, owned);
         return rc;
     }
+    if (ss->enforce) demoted_reset(ss);
     /* read-your-writes across copies: a session that needs commit N refuses one not there yet */
     bool reads = st->kind == ST_SELECT || st->kind == ST_COPY_TO || st->kind == ST_SHOW_DIGEST || st->kind == ST_SHOW_HISTORY || st->kind == ST_SHOW_IDENTITY ||
                  (st->kind == ST_EXPLAIN && st->explained == ST_SELECT); /* a plan of what that read would see */
@@ -11033,7 +11078,7 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
     uint64_t now_ns = mono_ns();
     if (txn && st->kind != ST_ROLLBACK && !ss->txn.doomed) {
         char why[200];
-        if (imdb_txn_expired(&ss->txn, now_ns, why, sizeof why)) {
+        if (imdb_txn_expired(db, &ss->txn, now_ns, why, sizeof why)) {
             imdb_txn_expire(db, &ss->txn, why);
             bool ends = st->kind == ST_COMMIT; /* a COMMIT ends it either way, as a doomed COMMIT does */
             if (ends) imdb_txn_rollback(db, &ss->txn);
@@ -11064,7 +11109,13 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
                st->kind != ST_DROP_ROLE && st->kind != ST_GRANT &&
                st->kind != ST_REVOKE; /* each commits on its own (F2a-2: the sequence statements too; F3g: the types'; L: the roles') */
     x.next_check = TICK_ROWS;
-    if (x.checks && ss->stmt_timeout_ms) x.deadline_ns = mono_ns() + (uint64_t)ss->stmt_timeout_ms * 1000000u;
+    /* N1e stage two: the timeout and the row limit held to a role's caps, by its attributes now (imdb_cap_eff) */
+    const imdb_caps *cp = ss->enforce ? &ss->caps : NULL;
+    x.deadline_ms = imdb_cap_eff(db, cp, ss->role, ss->stmt_timeout_ms, ss->caps.stmt_ms);
+    x.deadline_cap = x.deadline_ms != ss->stmt_timeout_ms;
+    x.row_limit = imdb_cap_eff(db, cp, ss->role, ss->row_limit, ss->caps.row_limit);
+    x.row_cap = x.row_limit != ss->row_limit;
+    if (x.checks && x.deadline_ms) x.deadline_ns = mono_ns() + x.deadline_ms * 1000000u;
     if (txn && (st->kind == ST_CREATE || st->kind == ST_CREATE_INDEX || st->kind == ST_DROP_INDEX ||
                 st->kind == ST_ALTER_RETENTION || st->kind == ST_ALTER_TABLE || st->kind == ST_DROP_TABLE || st->kind == ST_CREATE_VIEW ||
                 st->kind == ST_DROP_VIEW || st->kind == ST_CREATE_SEQUENCE || st->kind == ST_DROP_SEQUENCE ||
@@ -11422,6 +11473,8 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
         ss->txn.begin_us = imdb_now_us(); /* F2a: the transaction's now() */
         ss->txn.timeout_ms = ss->txn_timeout_ms;
         ss->txn.idle_ms = ss->idle_timeout_ms;
+        ss->txn.caps = ss->enforce ? &ss->caps : NULL; /* N1e stage two: held to them at each check, by the role then */
+        ss->txn.role = ss->role;
         snprintf(r->status, sizeof r->status, "BEGIN");
         break;
     case ST_SET_TXN:
@@ -11632,22 +11685,24 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
             imdb_err ep = {0};
             if (imdb_parse_int64(st->set_value, strlen(st->set_value), &v, &ep) || v < 0 || (uint64_t)v > IMDB_MAX_STATEMENT_ROW_LIMIT)
                 rc = imdb_fail(e, IMDB_ERR_INVALID, "statement_row_limit is 0 (none) to %llu rows", (unsigned long long)IMDB_MAX_STATEMENT_ROW_LIMIT);
-            else ss->row_limit = (uint64_t)v;
+            else if (!(rc = set_within_cap(ss, "statement_row_limit", (uint64_t)v, ss->caps.row_limit, e))) ss->row_limit = (uint64_t)v;
         } else if (strcmp(st->set_name, "transaction_timeout") == 0 || strcmp(st->set_name, "idle_in_transaction_timeout") == 0) {
             bool idle = st->set_name[0] == 'i'; /* R4: milliseconds; 0: none; at the next BEGIN */
             int64_t v;
             imdb_err ep = {0}; /* the range is the message, whatever the literal was */
             if (imdb_parse_int64(st->set_value, strlen(st->set_value), &v, &ep) || v < 0 || v > IMDB_MAX_STATEMENT_TIMEOUT_MS)
                 rc = imdb_fail(e, IMDB_ERR_INVALID, "%s is 0 (none) to %u milliseconds", st->set_name, IMDB_MAX_STATEMENT_TIMEOUT_MS);
-            else if (idle) ss->idle_timeout_ms = (uint32_t)v;
-            else ss->txn_timeout_ms = (uint32_t)v;
+            else if (!(rc = set_within_cap(ss, st->set_name, (uint64_t)v, idle ? ss->caps.idle_ms : ss->caps.txn_ms, e))) {
+                if (idle) ss->idle_timeout_ms = (uint32_t)v;
+                else ss->txn_timeout_ms = (uint32_t)v;
+            }
         } else if (strcmp(st->set_name, "statement_timeout") == 0) { /* R1: milliseconds; 0: none */
             int64_t v;
             imdb_err ep = {0}; /* the range is the message, whatever the literal was */
             if (imdb_parse_int64(st->set_value, strlen(st->set_value), &v, &ep) || v < 0 || v > IMDB_MAX_STATEMENT_TIMEOUT_MS)
                 rc = imdb_fail(e, IMDB_ERR_INVALID, "statement_timeout is 0 (none) to %u milliseconds",
                                IMDB_MAX_STATEMENT_TIMEOUT_MS);
-            else ss->stmt_timeout_ms = (uint32_t)v;
+            else if (!(rc = set_within_cap(ss, "statement_timeout", (uint64_t)v, ss->caps.stmt_ms, e))) ss->stmt_timeout_ms = (uint32_t)v;
         } else if (strcmp(st->set_name, "default_transaction_isolation") == 0) { /* E3: a BEGIN's level naming none */
             const char *v = st->set_value;
             if (!strcmp(v, "serializable")) ss->default_iso = IMDB_ISO_SERIALIZABLE;
@@ -11664,6 +11719,7 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
             rc = imdb_fail(e, IMDB_ERR_NOTFOUND, "unknown setting %s (cross_check, access_path, join_plan, identity, min_commit, idle_in_transaction_timeout, statement_memory, statement_row_limit, statement_timeout, slow_statement_ms, sync_replicas, transaction_timeout, sync_timeout_ms, default_transaction_isolation)",
                            st->set_name);
         }
+        if (!rc && ss->enforce) su_note(ss, st->set_name); /* N1e stage two: what demoted_reset may take back */
         if (!rc) snprintf(r->status, sizeof r->status, "SET %s = %s", st->set_name, st->set_value);
         break;
     }

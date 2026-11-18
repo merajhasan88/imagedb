@@ -51,6 +51,7 @@
 typedef struct login {
     char name[IMDBW_USER];
     uint32_t id; /* N1e: its role, the session's (imdb_session.role) */
+    bool super;  /* N1e stage two: a superuser when the snapshot was made (the role caps and the reserve exempt it) */
     imdb_scram v;
 } login;
 typedef struct logins {
@@ -76,6 +77,13 @@ typedef struct outbuf { /* whole frames, sent in order */
 } outbuf;
 
 typedef struct conn conn;
+/* N1e stage two: a role's connections' queued request bytes and unsent reply bytes together (under mu), so one role's
+ * shares (--role-queue-bytes, --role-reply-bytes) bound what all its connections hold; an entry a role with an
+ * authenticated connection (imdbs.tal, max_conns of them), freed with its last */
+typedef struct rtally {
+    uint32_t role, conns;
+    uint64_t qbytes, pending;
+} rtally;
 typedef struct rq {
     struct rq *next; /* its connection's, in arrival order */
     conn *c;
@@ -93,6 +101,12 @@ struct conn {
     imdbs *s;
     int fd, wake[2];
     uint32_t role; /* N1e: its login's role, set (under mu) when it authenticates; its session acts as it */
+    const char *refuse;  /* N1e stage two: its login was answered but refused (a role's cap, the reserve): an ERROR, then the close */
+    rtally *tal;         /* N1e stage two (under mu): its role's tally, from its login to its end (NULL: none yet) */
+    bool q_held;         /* N1e stage two (under mu): its reads held by its role's queue share (counted once a hold) */
+    bool super;          /* N1e stage two (under mu): its role a superuser (at its login, then at each change of the roles)
+                          * exempt from the role's shares */
+    uint64_t served;     /* under mu: the engine thread's turn it was last served at (pick: a role's least recent first) */
     pthread_t th;
     bool started;
     /* under imdbs.mu */
@@ -153,7 +167,9 @@ struct imdbs {
     uint32_t nconns, npreauth; /* npreauth: the socket's pre-auth pool */
     uint32_t ntcp, npre_tcp;   /* N1c: TCP's connections and its own pre-auth pool */
     uint64_t pending;    /* every connection's unsent replies */
-    conn *rr, *last;     /* round robin's last served; the session run last and since when */
+    conn *last;          /* the session run last and since when */
+    uint32_t rr_role;    /* N1e stage two: the role served last (turns go by role, then by connection) */
+    uint64_t serve_clock; /* each turn's number: a connection's served is its last turn's */
     uint64_t last_since;
     _Atomic bool stopping;
     bool failed;
@@ -162,6 +178,8 @@ struct imdbs {
     logins *lg;          /* NULL: no one may log in (the logins could not be made: fail closed) */
     uint64_t role_gen;   /* db->role_gen the logins were made at (the engine thread's) */
     int spool_dfd;       /* N1d: the spool directory (-1: none, COPY refused by name) */
+    rtally *tal;         /* N1e stage two: the roles' tallies (max_conns entries; role 0: free) */
+    uint32_t ntal;
     uint64_t spool_held; /* under mu: every spool's bytes held now (copy_spool bounds it) */
     uint64_t ev_endpoint, ev_cbref; /* §8f: the engine thread's: the counts its last "channel_binding" event gave, and
                                      * when (an unauthenticated peer moves cb_refused: at most one event in 5 s) */
@@ -185,30 +203,50 @@ static void drain(int fd)
 }
 
 /* ---- logins ---- */
-static bool login_ok(const imdb_role *r)
+
+/* N1e stage two: the caps a session of a role (not a superuser) is held to, from the options and their defaults */
+static uint32_t cap_ms(uint32_t v, uint32_t dflt) { return v == IMDBS_NONE ? 0 : v ? v : dflt; }
+
+static void role_caps(const imdbs_opts *o, imdb_caps *c)
 {
-    return r && !r->dropped_at && (r->attrs & IMDB_RA_LOGIN) && (r->attrs & IMDB_RA_SUPERUSER) && r->has_ver &&
+    memset(c, 0, sizeof *c);
+    c->stmt_ms = cap_ms(o->role_stmt_ms, 60000);
+    c->txn_ms = cap_ms(o->role_txn_ms, 600000);
+    c->idle_ms = cap_ms(o->role_idle_ms, 60000);
+    c->row_limit = o->role_row_limit;
+    /* a role's sessions together at most 64 MiB of prepared statements (one session's own bound): its share over its
+     * connection cap, 2 MiB at the defaults, never under 64 KiB */
+    uint32_t conns = o->role_conns == IMDBS_NONE ? (o->max_conns ? o->max_conns : 256) : o->role_conns ? o->role_conns : 32;
+    uint64_t each = (64ull << 20) / conns;
+    c->prep_bytes = o->role_prep_bytes ? o->role_prep_bytes : each < (64u << 10) ? (64u << 10) : each;
+}
+
+/* open: imdbs_opts.test_open_logins (tests alone, before N1e stage two's last slice opens logins to every LOGIN role) */
+static bool login_ok(const imdb_role *r, bool open)
+{
+    return r && !r->dropped_at && (r->attrs & IMDB_RA_LOGIN) && (open || (r->attrs & IMDB_RA_SUPERUSER)) && r->has_ver &&
            r->vent.bytes && !r->vent.erased && !r->vent.doomed && !r->vent.pending && r->name[0];
 }
 
 static size_t logins_size(uint32_t n) { return offsetof(logins, e) + (size_t)n * sizeof(login); }
 
-static logins *logins_make(const imdb_db *db)
+static logins *logins_make(const imdb_db *db, bool open)
 {
     const imdb_rcat *c = &db->rc;
     uint32_t n = 0;
-    for (uint32_t i = 0; i < c->n; i++) n += login_ok(c->roles[i]);
+    for (uint32_t i = 0; i < c->n; i++) n += login_ok(c->roles[i], open);
     logins *l = imdbw_alloc(1, logins_size(n));
     if (!l) return NULL;
     l->refs = 1;
     for (uint32_t i = 0; i < c->n; i++) {
         const imdb_role *r = c->roles[i];
         imdb_err e = {0};
-        if (!login_ok(r) || strlen(r->name) >= IMDBW_USER) continue;
+        if (!login_ok(r, open) || strlen(r->name) >= IMDBW_USER) continue;
         login *lo = &l->e[l->n];
         if (imdb_scram_decode(r->vent.bytes, r->vent.len, &lo->v, &e)) continue; /* the catalog's own bytes: never */
         memcpy(lo->name, r->name, strlen(r->name) + 1);
         lo->id = r->id;
+        lo->super = (r->attrs & IMDB_RA_SUPERUSER) != 0;
         l->n++;
     }
     return l;
@@ -240,7 +278,7 @@ static logins *logins_take(imdbs *s)
 static void logins_publish(imdbs *s, bool force)
 {
     if (!force && s->db->role_gen == s->role_gen) return;
-    logins *l = logins_make(s->db); /* NULL: none may log in until the next change (fail closed) */
+    logins *l = logins_make(s->db, s->o.test_open_logins); /* NULL: none may log in until the next change (fail closed) */
     pthread_mutex_lock(&s->lmu);
     logins *old = s->lg;
     s->lg = l;
@@ -249,35 +287,116 @@ static void logins_publish(imdbs *s, bool force)
     logins_put(s, old);
     pthread_mutex_lock(&s->mu);
     s->n.logins_made++;
+    for (conn *c = s->conns; c; c = c->next) /* N1e stage two: the shares follow a role's attributes now (this thread
+                                               * owns the catalog) */
+        if (c->role) c->super = imdb_role_superuser(&s->db->rc, c->role);
     pthread_mutex_unlock(&s->mu);
 }
 
+/* ---- a role's tally (N1e stage two; under mu) ---- */
+/* c's bytes moved by d (queued requests, or unsent replies with the server's total), its role's tally with them */
+static void qb_move(conn *c, int64_t d)
+{
+    c->qbytes += (uint64_t)d;
+    if (!c->tal) return;
+    c->tal->qbytes += (uint64_t)d;
+    if (d < 0) /* its role's share freed: a connection of it held by the share reads again now, not at its next poll */
+        for (conn *o = c->s->conns; o; o = o->next)
+            if (o != c && o->tal == c->tal && o->q_held) wake(o->wake[1]);
+}
+
+static void pend_move(imdbs *s, conn *c, int64_t d)
+{
+    c->pending += (uint64_t)d;
+    s->pending += (uint64_t)d;
+    if (c->tal) c->tal->pending += (uint64_t)d;
+}
+
+/* c joins its role's tally at its login (an entry made for the role's first connection; there are max_conns entries, so
+ * one is free for every authenticated connection) */
+static void tal_join(imdbs *s, conn *c, uint32_t role)
+{
+    rtally *free_e = NULL;
+    for (uint32_t i = 0; i < s->ntal; i++) {
+        if (s->tal[i].conns && s->tal[i].role == role) {
+            c->tal = &s->tal[i];
+            break;
+        }
+        if (!s->tal[i].conns && !free_e) free_e = &s->tal[i];
+    }
+    if (!c->tal && free_e) {
+        memset(free_e, 0, sizeof *free_e);
+        free_e->role = role;
+        c->tal = free_e;
+    }
+    if (c->tal) c->tal->conns++;
+}
+
+/* c leaves its tally at its end, what it still holds taken off */
+static void tal_leave(conn *c)
+{
+    if (!c->tal) return;
+    c->tal->qbytes -= c->qbytes;
+    c->tal->pending -= c->pending;
+    if (!--c->tal->conns) c->tal->role = 0;
+    c->tal = NULL;
+}
+
+static uint64_t share(uint64_t v, uint64_t dflt) { return v == IMDBS_NONE ? UINT64_MAX : v ? v : dflt; }
+
+/* c's socket may be read for another request: its role's queued requests under --role-queue-bytes (a superuser's exempt);
+ * a connection held by it counted once a hold (role_queue_waits) */
+static bool q_room(imdbs *s, conn *c)
+{
+    bool ok = c->super || !c->tal || c->tal->qbytes < share(s->o.role_queue_bytes, 64ull << 20);
+    if (!ok && !c->q_held) s->n.role_queue_waits++;
+    c->q_held = !ok;
+    return ok;
+}
+
 /* ---- the engine thread ---- */
+/* N1e stage two: a role's statement starts only while its role's unsent replies are under --role-reply-bytes, and the
+ * server's under its budget unless the role has none unsent (the escape a connection with none had before, now the
+ * role's: a role that holds the server past its budget stops itself, never another role); so one statement adds at most
+ * one result's encoding past them. A superuser's: the rule before, by its connection */
+static uint64_t reply_budget(const imdbs *s) { return s->o.reply_budget ? s->o.reply_budget : BUDGET; }
+
 static bool runnable(const imdbs *s, const rq *r)
 {
     if (r->type == RQ_CLOSE || r->c->gone) return true;
     if (r->c->cin == CIN_OPEN && !r->c->cin_end && !r->c->cin_err) return false; /* N1d: its COPY's data still arriving */
     uint64_t cap = s->o.conn_cap ? s->o.conn_cap : (32ull << 20);
-    return r->c->pending < cap && (s->pending < BUDGET || !r->c->pending);
+    if (r->c->pending >= cap) return false;
+    if (r->c->super || !r->c->tal) return s->pending < reply_budget(s) || !r->c->pending;
+    const rtally *t = r->c->tal;
+    return t->pending < share(s->o.role_reply_bytes, 64ull << 20) && (s->pending < reply_budget(s) || !t->pending);
 }
 
 /* the session run last runs on while it is in a transaction and within its slice (no swap of its transaction); else
- * the connections in turn from the one after the last served */
+ * N1e stage two: turns go by role, then by connection: the next role after the last served (by id, cyclically) with a
+ * runnable request, then that role's least recently served runnable connection. A role's many connections share one
+ * turn among the roles, so a session waits one statement of each other active role, whatever their connection counts
+ * (by connection, a role's 32 connections took 32 turns to another's one). Superusers' roles take turns like any other */
 static rq *pick(imdbs *s)
 {
     uint64_t slice = (uint64_t)(s->o.slice_ms ? s->o.slice_ms : 10) * 1000000u;
     conn *l = s->last;
     if (l && l->rh && l->ses_open && l->ses.txn.open && imdb_mono_ns() - s->last_since < slice && runnable(s, l->rh))
         return l->rh;
-    conn *c = s->rr && s->rr->next ? s->rr->next : s->conns;
-    for (uint32_t k = 0; c && k <= s->nconns; k++) {
-        if (c->rh && runnable(s, c->rh)) {
-            s->rr = c;
-            return c->rh;
-        }
-        c = c->next ? c->next : s->conns;
+    bool any = false;
+    uint32_t next = 0, key = 0; /* key: the role's distance after rr_role, cyclically (rr_role itself last) */
+    for (conn *c = s->conns; c; c = c->next) {
+        if (!c->rh || !runnable(s, c->rh)) continue;
+        uint32_t k = c->role - s->rr_role - 1u;
+        if (!any || k < key) any = true, key = k, next = c->role;
     }
-    return NULL;
+    if (!any) return NULL;
+    conn *best = NULL;
+    for (conn *c = s->conns; c; c = c->next)
+        if (c->role == next && c->rh && runnable(s, c->rh) && (!best || c->served < best->served)) best = c;
+    s->rr_role = next;
+    best->served = ++s->serve_clock;
+    return best->rh;
 }
 
 static void rq_free(rq *r)
@@ -307,8 +426,7 @@ static void flush(imdbs *s, conn *c, imdbw_buf *b)
     if (c->ot) c->ot->next = o;
     else c->oh = o;
     c->ot = o;
-    c->pending += o->len;
-    s->pending += o->len;
+    pend_move(s, c, (int64_t)o->len);
     pthread_mutex_unlock(&s->mu);
     imdbw_buf_init(b); /* its bytes are the queue's now */
     wake(c->wake[1]);
@@ -607,6 +725,7 @@ static bool run(imdbs *s, rq *r)
         imdb_session_copy_io(&c->ses, copy_rd, copy_wr, c); /* N1d: COPY through its spools */
         c->ses.role = c->role; /* N1e: its privileges checked (docs/n1-design.md §8e) */
         c->ses.enforce = true;
+        role_caps(&s->o, &c->ses.caps); /* N1e stage two: held while its role is not a superuser */
         c->ses_open = true;
     }
     imdbw_buf b;
@@ -837,7 +956,7 @@ static void *engine_main(void *arg)
             c->rh = r->next;
             if (!c->rh) c->rt = NULL;
             c->nq--;
-            c->qbytes -= r->len;
+            qb_move(c, -(int64_t)r->len);
             if (r->type == RQ_CLOSE) c->closed = true;
             else s->n.requests++;
             rq_free(r);
@@ -848,7 +967,8 @@ static void *engine_main(void *arg)
     /* the stop: queued requests dropped, every session closed (an open transaction rolled back) */
     for (conn *c = s->conns; c; c = c->next) {
         for (rq *r = c->rh, *nx; r; r = nx) nx = r->next, rq_free(r);
-        c->rh = c->rt = NULL, c->nq = 0, c->qbytes = 0;
+        qb_move(c, -(int64_t)c->qbytes);
+        c->rh = c->rt = NULL, c->nq = 0;
         if (c->ses_open) imdb_session_close(&c->ses);
         c->ses_open = false;
         c->closed = true;
@@ -982,6 +1102,7 @@ static bool authenticate(conn *c)
         memset(server_key, 0xa5, sizeof server_key);
     }
     uint32_t rid = lo ? lo->id : 0;
+    bool super = lo && lo->super;
     logins_put(s, l); /* the keys are copied: the snapshot may go */
     bool ok = !imdb_random(ch.nonce, sizeof ch.nonce, &e) && !imdbw_challenge_put(&ch, chb) &&
               !write_full(c, chb, sizeof chb, deadline) && !read_full(c, proof, sizeof proof, deadline);
@@ -999,10 +1120,28 @@ static bool authenticate(conn *c)
     imdb_wipe(server_key, sizeof server_key);
     imdb_wipe(sig, sizeof sig);
     pthread_mutex_lock(&s->mu);
+    if (ok && !super) { /* N1e stage two: a role's connections, and the slots kept for superusers, once its proof is good */
+        uint32_t mine = 0, cap = s->o.role_conns == IMDBS_NONE ? UINT32_MAX : s->o.role_conns ? s->o.role_conns : 32;
+        uint32_t maxc = s->o.max_conns ? s->o.max_conns : 256;
+        uint32_t keep = s->o.su_reserve == IMDBS_NONE ? 0 : s->o.su_reserve ? s->o.su_reserve : 4;
+        for (conn *o = s->conns; o; o = o->next) mine += o != c && o->role == rid && !o->closed;
+        if (mine >= cap) c->refuse = "too many connections for this role (--role-conns)";
+        else if ((uint64_t)s->nconns + keep > maxc)
+            c->refuse = "the remaining connection slots are reserved for superusers (--superuser-reserve)";
+    }
     if (ok) {
         s->n.logins++;
         s->n.logins_endpoint += cb == IMDBW_CB_ENDPOINT; /* §8f: the weaker binding's logins, counted */
-        c->role = rid; /* N1e: the role its session acts as */
+        if (!c->refuse) {
+            tal_join(s, c, rid); /* N1e stage two: its role's shares (an entry a connection: never short; if it were, the
+                                  * login is refused, never left outside its role's shares) */
+            if (!c->tal) c->refuse = "the server could not account for this role's connection";
+        }
+        s->n.role_refused += c->refuse != NULL;
+        if (!c->refuse) { /* N1e: the role its session acts as (a refused login's acts as none) */
+            c->role = rid;
+            c->super = super;
+        }
     } else {
         s->n.refusals++;
         s->n.cb_refused += cb_refused;
@@ -1020,7 +1159,7 @@ static void queue_close(conn *c, bool drop)
         for (rq *r = keep ? keep->next : c->rh, *nx; r; r = nx) {
             nx = r->next;
             c->nq--;
-            c->qbytes -= r->len;
+            qb_move(c, -(int64_t)r->len);
             rq_free(r);
         }
         if (keep) keep->next = NULL;
@@ -1075,8 +1214,7 @@ static void conn_put(conn *c, const imdbw_msg *m)
     if (c->ot) c->ot->next = o;
     else c->oh = o;
     c->ot = o;
-    c->pending += o->len;
-    s->pending += o->len;
+    pend_move(s, c, (int64_t)o->len);
     pthread_mutex_unlock(&s->mu);
 }
 
@@ -1196,7 +1334,7 @@ static bool take_frame(conn *c, uint8_t type, uint8_t *body, uint32_t len, bool 
         else c->rh = r;
         c->rt = r;
         c->nq++;
-        c->qbytes += len;
+        qb_move(c, (int64_t)len);
         pthread_cond_broadcast(&s->cv);
         pthread_mutex_unlock(&s->mu);
         return true;
@@ -1260,7 +1398,8 @@ static int pull(conn *c, inframe *in)
     for (;;) {
         pthread_mutex_lock(&s->mu);
         /* N1d: while a COPY's frames arrive (its data, or its refusal's drop) they are never queued: always read */
-        bool room = (c->nq < qmax && c->qbytes < QBYTES_MAX) || (c->cin == CIN_OPEN && !c->cin_end) || c->cin == CIN_DISCARD;
+        bool room = (c->nq < qmax && c->qbytes < QBYTES_MAX && q_room(s, c)) || (c->cin == CIN_OPEN && !c->cin_end) ||
+                    c->cin == CIN_DISCARD;
         pthread_mutex_unlock(&s->mu);
         if (!room && in->hgot == 0) return 0; /* its queue full: read again once the engine takes one */
         ssize_t k;
@@ -1352,8 +1491,7 @@ static int ring_take(conn *c, outbuf *o)
     s->spool_held -= k;
     f->next = o; /* o is the head: this thread alone takes from it */
     c->oh = f;
-    c->pending += f->len;
-    s->pending += f->len;
+    pend_move(s, c, (int64_t)f->len);
     pthread_cond_broadcast(&s->cv); /* room for the engine's writer */
     pthread_mutex_unlock(&s->mu);
     return 1;
@@ -1384,8 +1522,7 @@ static int push(conn *c)
         sent = 1;
         o->off += (size_t)k;
         pthread_mutex_lock(&s->mu);
-        c->pending -= (uint64_t)k;
-        s->pending -= (uint64_t)k;
+        pend_move(s, c, -(int64_t)k);
         bool whole = o->off == o->len;
         if (whole) {
             c->oh = o->next;
@@ -1410,6 +1547,7 @@ static void drop_out(conn *c)
         imdbw_free(o->p);
         imdbw_free(o);
     }
+    if (c->tal) c->tal->pending -= c->pending; /* N1e stage two: its role's tally too */
     c->oh = c->ot = NULL, c->pending = 0;
     pthread_mutex_unlock(&s->mu);
 }
@@ -1464,6 +1602,12 @@ static void *conn_main(void *arg)
     inframe in;
     memset(&in, 0, sizeof in);
     bool reading = authed, peer = authed; /* peer: the socket can still be read or written (after it, poll it no more) */
+    if (authed && c->refuse) { /* N1e stage two: answered, then refused: its ERROR goes out, no request is read */
+        imdbw_text t = {(const uint8_t *)c->refuse, (uint32_t)strlen(c->refuse)};
+        imdbw_msg er = {.type = IMDBW_ERROR, .code = (uint32_t)-IMDB_ERR_LIMIT, .texts = &t, .ntexts = 1};
+        conn_put(c, &er);
+        reading = false;
+    }
     uint64_t stop_at = 0, progress = imdb_mono_ns();
     bool waiting = false; /* replies waited at the last turn too */
     uint64_t send_ns = (uint64_t)(s->o.send_timeout_ms ? s->o.send_timeout_ms : 30000) * 1000000u;
@@ -1489,7 +1633,7 @@ static void *conn_main(void *arg)
         if (copying && out) c->cin_last = imdb_mono_ns(); /* its client still has replies to read (COPY_IN among them, or a
                                                        * ring draining): its data cannot be due yet, so the idle clock waits */
         uint64_t cin_last = c->cin_last;
-        bool room = (c->nq < qmax && c->qbytes < QBYTES_MAX) || copying; /* N1d: a COPY's frames never queued */
+        bool room = (c->nq < qmax && c->qbytes < QBYTES_MAX && q_room(s, c)) || copying; /* N1d: a COPY's frames never queued */
         pthread_mutex_unlock(&s->mu);
         uint64_t now = imdb_mono_ns();
         if (copying && reading && peer && now - cin_last > copy_idle_ns) { /* N1d: its data stopped: the connection ends */
@@ -1611,9 +1755,9 @@ static void reap(imdbs *s)
             continue;
         }
         *pp = c->next;
-        if (s->rr == c) s->rr = NULL;
         if (s->last == c) s->last = NULL;
         s->nconns--;
+        tal_leave(c); /* N1e stage two */
         s->ntcp -= c->tcp;
         pthread_mutex_unlock(&s->mu);
         pthread_join(c->th, NULL);
@@ -1810,6 +1954,8 @@ int imdbs_start(imdb_db *db, const imdbs_opts *o, imdbs **out, imdb_err *e)
         }
         if (!rc) rc = imdbsp_dir(path, &s->spool_dfd, e);
     }
+    s->ntal = o->max_conns ? o->max_conns : 256; /* N1e stage two: an entry for every connection's role at worst */
+    if (!rc && !(s->tal = imdbw_alloc(s->ntal, sizeof *s->tal))) rc = imdb_fail(e, IMDB_ERR_NOMEM, "out of memory");
     if (!rc) rc = listen_unix(s, o->socket_path, e);
     if (!rc && o->tcp) { /* N1c: TLS 1.3 on TCP, its key and certificate from the server directory */
         if (!o->server_dir) rc = imdb_fail(e, IMDB_ERR_INVALID, "--tcp needs the server directory's certificate");
@@ -1899,6 +2045,7 @@ int imdbs_stop(imdbs *s, imdb_err *e)
     if (s->stop[0] >= 0) close(s->stop[0]);
     if (s->stop[1] >= 0) close(s->stop[1]);
     logins_put(s, s->lg);
+    imdbw_free(s->tal);
     pthread_mutex_destroy(&s->mu);
     pthread_mutex_destroy(&s->lmu);
     pthread_cond_destroy(&s->cv);

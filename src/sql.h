@@ -60,6 +60,8 @@ typedef struct imdb_session {
     uint32_t role;           /* N1e: the role it acts as (0: none); its privileges checked only when enforce is set */
     bool enforce;            /* N1e: set by the server alone (an embedded caller, the CLI, a re-bind and the dump keep a
                               * superuser's rights); an enforced session of role 0 is refused every statement */
+    imdb_caps caps;          /* N1e stage two: its role's caps (the server's options), while enforce is set and the role is not
+                              * a superuser (db.h imdb_cap_eff); zero: none */
     bool cross_check;
     bool show_identity;      /* SET identity = on: results print their read point in full */
     uint64_t min_commit;     /* SET min_commit = N: reads refuse a database that has not reached N */
@@ -80,6 +82,8 @@ typedef struct imdb_session {
     uint32_t txn_timeout_ms;  /* SET transaction_timeout = ms: a transaction older can only roll back (R4; 0: none) */
     uint32_t idle_timeout_ms; /* SET idle_in_transaction_timeout = ms: one idle longer, the same (R4; 0: none) */
     uint8_t default_iso;      /* E3: SET default_transaction_isolation: a BEGIN's level when it names none (IMDB_ISO_*) */
+    uint8_t su_set;           /* N1e stage two: the superuser-only settings this enforced session SET itself (SU_*):
+                               * demoted_reset takes back these alone (a harness's field, set directly, stays) */
     uint64_t stmt_memory;     /* SET statement_memory = bytes: a read statement's workspace ceiling (P0 R2; 0: the default,
                                * a quarter of the memory budget or IMDB_MAX_RESULT_BYTES) */
     struct imdb_prep_set *prep; /* P2 S9: its prepared statements (PREPARE, imdb_prepare), NULL until the first */

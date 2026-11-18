@@ -6004,6 +6004,7 @@ static struct {
     char mydb[ND][64];     /* the database ORACLE_MYSQL and ORACLE_MARIADB name ("oracle") */
     int a[3], pbid[3], b[3];
     int ins;               /* the INSERT's key: 4-9, never a held one */
+    uint32_t ie_rows_ok;   /* the role session's SELECTs imagedb answered this seed (the cross-check assert's ground) */
     char why[320];
 } g_pv;
 
@@ -6182,6 +6183,7 @@ static int pv_as(int d, const char *sql, bool rows, const int *ty, int nty, res 
 {
     if (d == D_IMDB) {
         exec_eng(&g_pv.ie, sql, rows, ty, nty, r);
+        g_pv.ie_rows_ok += rows && !r->err; /* a SELECT answered: the cross-check had a statement to check */
         return 0;
     }
     if (d == D_MY || d == D_MA) {
@@ -6412,6 +6414,7 @@ static int privs_battery(unsigned seed)
         uint32_t rid = r->id; /* (the pointer is the catalog's: not kept past a statement) */
         eng *ie = &g_pv.ie;
         memset(ie, 0, sizeof *ie);
+        g_pv.ie_rows_ok = 0;
         ie->d = D_IMDB, ie->on = true, ie->idb = g_eng[D_IMDB].idb;
         imdb_session_init(&ie->ses, ie->idb);
         ie->ses_open = true;
@@ -6434,6 +6437,12 @@ static int privs_battery(unsigned seed)
             if (*my_set_sql(d, i) && pv_must(seed, ue, my_set_sql(d, i))) goto out;
     }
     if (pv_phase(seed, 1, g) || pv_regrant(seed, g, g2) || pv_phase(seed, 2, g2)) goto out;
+    /* the role's session ran cross-checked (its field set above, never its SET): a battery whose session lost the flag
+     * would pass on one plan alone (N1e stage two's demoted_reset once cleared it; su_note keeps a harness's field) */
+    if (g_pv.ie_rows_ok && !g_pv.ie.ses.cross_checks_run) { /* (a seed whose role was granted no SELECT: nothing to check) */
+        pv_fail(seed, "imagedb's role session ran no cross-check: its statements were answered by one plan alone", NULL);
+        goto out;
+    }
     pv_cleanup();
     rc = 0;
 out:

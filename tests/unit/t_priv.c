@@ -6,6 +6,7 @@
  * inherited transitively, the principal (none, a dropped role, a superuser). A refusal is IMDB_ERR_PRIVILEGE and its
  * message names the relation, never a privilege or a value. */
 #include <stdlib.h>
+#include <unistd.h>
 
 #include "../../src/db_internal.h"
 #include "../../src/role.h"
@@ -493,9 +494,151 @@ static void t_priv_lake(void)
     TAKEN("SELECT COUNT(*) FROM t");
     teardown(db);
 }
+
+/* N1e stage two: a role's caps (the server's options; here set on the session as the server sets them). Each held while
+ * the role is not a superuser, read where it is checked: the statement timeout and the row limit at a statement's start,
+ * the transaction's two at each check (a role demoted mid-transaction held at once, one promoted released at once); SET
+ * of each to 0 (none) or past its cap refused for the role, a lower value taken; a session's prepared bytes. Each section
+ * sets the one cap it tests (another's clock never decides its message under a slow build); the capped join is 16
+ * million pairs, seconds uncapped, so a 150 ms cap always cuts it */
+static void t_priv_caps(void)
+{
+    imdb_db *db = setup();
+    CHECK(db);
+    ADMIN("CREATE TABLE big (id INT64 PRIMARY KEY, v INT64)");
+    static char ins[80000];
+    size_t o = (size_t)snprintf(ins, sizeof ins, "INSERT INTO big VALUES (0, 0)");
+    for (int i = 1; i < 4000; i++) o += (size_t)snprintf(ins + o, sizeof ins - o, ", (%d, %d)", i, i % 7);
+    ADMIN(ins);
+    ADMIN("GRANT SELECT ON big TO r");
+    ADMIN("GRANT SELECT ON t TO r");
+    static const char join[] = "SELECT COUNT(*) FROM big AS a, big AS b WHERE a.v + b.v = 99";
+    /* the statement cap: its own value none, so the cap governs */
+    g_r.caps = (imdb_caps){.stmt_ms = 150};
+    int rc = run_on(&g_r, join);
+    SOFT(rc == IMDB_ERR_CANCELLED && strstr(g_msg, "150 ms") && strstr(g_msg, "--role-statement-timeout"));
+    if (rc != IMDB_ERR_CANCELLED) fprintf(stderr, "    the capped statement: %d %s\n", rc, g_msg);
+    REFUSED("SET statement_timeout = 0", "the server's cap for a role (150)");
+    REFUSED("SET statement_timeout = 151", "the server's cap for a role (150)");
+    TAKEN("SET statement_timeout = 120");
+    rc = run_on(&g_r, join);
+    SOFT(rc == IMDB_ERR_CANCELLED && strstr(g_msg, "120 ms") && strstr(g_msg, "SET statement_timeout"));
+    /* the row limit (D8 #4: the rows past the scan's plain predicates) */
+    g_r.caps = (imdb_caps){.row_limit = 1000};
+    rc = run_on(&g_r, "SELECT COUNT(*) FROM big WHERE v >= 0");
+    SOFT(rc == IMDB_ERR_LIMIT && strstr(g_msg, "1000 rows") && strstr(g_msg, "--role-row-limit"));
+    if (rc != IMDB_ERR_LIMIT) fprintf(stderr, "    the capped rows: %d %s\n", rc, g_msg);
+    REFUSED("SET statement_row_limit = 0", "the server's cap for a role (1000)");
+    REFUSED("SET statement_row_limit = 5000", "the server's cap for a role (1000)");
+    TAKEN("SET statement_row_limit = 10");
+    TAKEN("SELECT COUNT(*) FROM t");
+    /* idle in transaction */
+    g_r.caps = (imdb_caps){.idle_ms = 200};
+    TAKEN("BEGIN");
+    TAKEN("SELECT COUNT(*) FROM t");
+    usleep(300000);
+    rc = run_on(&g_r, "SELECT COUNT(*) FROM t");
+    SOFT(rc == IMDB_ERR_CANCELLED && strstr(g_msg, "--role-idle-in-transaction"));
+    TAKEN("ROLLBACK");
+    REFUSED("SET idle_in_transaction_timeout = 0", "the server's cap for a role (200)");
+    /* the transaction's age (statements every 50 ms; no idle cap) */
+    g_r.caps = (imdb_caps){.txn_ms = 700};
+    TAKEN("BEGIN");
+    rc = 0;
+    for (int k = 0; k < 400 && !rc; k++) {
+        usleep(50000);
+        rc = run_on(&g_r, "SELECT COUNT(*) FROM t");
+    }
+    SOFT(rc == IMDB_ERR_CANCELLED && strstr(g_msg, "700 ms") && strstr(g_msg, "--role-transaction-timeout"));
+    TAKEN("ROLLBACK");
+    REFUSED("SET transaction_timeout = 701", "the server's cap for a role (700)");
+    /* a superuser: unbounded, its SET of none taken; demoted inside a transaction, held at the next check */
+    g_r.caps = (imdb_caps){.idle_ms = 200};
+    ADMIN("ALTER ROLE r SUPERUSER");
+    TAKEN("SET idle_in_transaction_timeout = 0");
+    TAKEN("BEGIN");
+    TAKEN("SELECT COUNT(*) FROM t");
+    usleep(300000);
+    TAKEN("SELECT COUNT(*) FROM t"); /* a superuser's: none */
+    ADMIN("ALTER ROLE r NOSUPERUSER");
+    usleep(300000);
+    rc = run_on(&g_r, "SELECT COUNT(*) FROM t");
+    SOFT(rc == IMDB_ERR_CANCELLED && strstr(g_msg, "--role-idle-in-transaction"));
+    TAKEN("ROLLBACK");
+    /* promoted inside one: released at once */
+    TAKEN("BEGIN");
+    TAKEN("SELECT COUNT(*) FROM t");
+    ADMIN("ALTER ROLE r SUPERUSER");
+    usleep(300000);
+    TAKEN("SELECT COUNT(*) FROM t");
+    TAKEN("COMMIT");
+    ADMIN("ALTER ROLE r NOSUPERUSER");
+    /* the prepared statements' bytes */
+    g_r.caps = (imdb_caps){.prep_bytes = 64u << 10};
+    static char big[70000];
+    o = (size_t)snprintf(big, sizeof big, "PREPARE p AS SELECT 1");
+    while (o + 8 < sizeof big - 16) o += (size_t)snprintf(big + o, sizeof big - o, " + 1");
+    rc = run_on(&g_r, big);
+    SOFT(rc == IMDB_ERR_LIMIT && strstr(g_msg, "65536"));
+    if (rc != IMDB_ERR_LIMIT) fprintf(stderr, "    a large PREPARE: %d %s\n", rc, g_msg);
+    TAKEN("PREPARE q AS SELECT COUNT(*) FROM t");
+    g_r.caps = (imdb_caps){0};
+    teardown(db);
+}
+
+/* N1e stage two: a superuser's session SETs what only a superuser may (cross_check, slow_statement_ms, sync_replicas,
+ * sync_timeout_ms, statement_memory past a role's share), is demoted by another session, and runs: from that statement
+ * on it holds none of them (Gate A resets them: demoted_reset), as the caps are read where they are checked; promoted
+ * again, it SETs them again */
+static void t_priv_demoted(void)
+{
+    imdb_db *db = setup();
+    CHECK(db);
+    ADMIN("GRANT SELECT ON t TO r");
+    ADMIN("ALTER ROLE r SUPERUSER");
+    TAKEN("SET cross_check = on");
+    TAKEN("SET slow_statement_ms = 5");
+    TAKEN("SET sync_replicas = 1");
+    TAKEN("SET sync_timeout_ms = 5000");
+    TAKEN("SET statement_memory = 2147483648"); /* 2 GiB: past the share without a budget (1 GiB) */
+    CHECK(g_r.cross_check && g_r.slow_ms == 5 && g_r.sync_replicas == 1 && g_r.sync_wait_ms == 5000 &&
+          g_r.stmt_memory == 2147483648ull);
+    TAKEN("SET sync_replicas = 0");
+    TAKEN("SET sync_replicas = 1"); /* (a primary without replicas: a commit would wait; this session commits nothing) */
+    ADMIN("ALTER ROLE r NOSUPERUSER");
+    TAKEN("SELECT COUNT(*) FROM t");
+    SOFT(!g_r.cross_check && g_r.slow_ms == 0 && g_r.sync_replicas == 0 && g_r.sync_wait_ms == 0 && g_r.stmt_memory == 0);
+    REFUSED("SET cross_check = on", "needs a superuser");
+    TAKEN("SET statement_memory = 1048576"); /* within the share: a role's own, kept */
+    TAKEN("SELECT COUNT(*) FROM t");
+    SOFT(g_r.stmt_memory == 1048576);
+    ADMIN("ALTER ROLE r SUPERUSER");
+    TAKEN("SET cross_check = on");
+    TAKEN("SELECT COUNT(*) FROM t");
+    SOFT(g_r.cross_check);
+    /* a field a harness sets on the session directly (the oracle's --privs battery cross-checks its role's session) is
+     * not the session's SET: demoted, the reset takes back the SET (above), never the harness's field */
+    ADMIN("ALTER ROLE r NOSUPERUSER");
+    TAKEN("SELECT COUNT(*) FROM t"); /* the SET above taken back */
+    SOFT(!g_r.cross_check);
+    g_r.cross_check = true;
+    TAKEN("SELECT COUNT(*) FROM t");
+    TAKEN("SELECT COUNT(*) FROM t");
+    SOFT(g_r.cross_check);
+    /* and beside a SET the reset does take back: the harness's field stays, the SET goes */
+    ADMIN("ALTER ROLE r SUPERUSER");
+    TAKEN("SET slow_statement_ms = 7");
+    ADMIN("ALTER ROLE r NOSUPERUSER");
+    TAKEN("SELECT COUNT(*) FROM t");
+    SOFT(g_r.cross_check && g_r.slow_ms == 0);
+    g_r.cross_check = false;
+    teardown(db);
+}
 const test_case priv_tests[] = {
     {"priv_kinds", t_priv_kinds},     {"priv_principal", t_priv_principal}, {"priv_super", t_priv_super},
     {"priv_reads", t_priv_reads},     {"priv_member", t_priv_member},       {"priv_writes", t_priv_writes},
     {"priv_dropped", t_priv_dropped}, {"priv_copy_open", t_priv_copy_open}, {"priv_unrun", t_priv_unrun}, {"priv_lake", t_priv_lake},
+    {"priv_caps", t_priv_caps},
+    {"priv_demoted", t_priv_demoted},
 };
 const size_t priv_ntests = sizeof priv_tests / sizeof *priv_tests;

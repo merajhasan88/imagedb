@@ -28,7 +28,10 @@ static int usage(void)
           "                      [--events FILE] [--stats FILE] [--tcp ADDR:PORT] [--spool-dir DIR]\n"
           "                      [--mem-limit BYTES] [--seg-cache BYTES|all] [--iceberg] [--anchor FILE]\n"
           "                      [--copy-spool BYTES] [--copy-ring BYTES] [--copy-wait MS] [--copy-idle MS]\n"
-          "                      [--channel-binding exporter|any]\n"
+          "                      [--channel-binding exporter|any] [--role-statement-timeout MS]\n"
+          "                      [--role-transaction-timeout MS] [--role-idle-in-transaction MS] [--role-row-limit N]\n"
+          "                      [--role-prepared-bytes BYTES] [--role-conns N] [--superuser-reserve N]\n"
+          "                      [--role-queue-bytes BYTES] [--role-reply-bytes BYTES]\n"
           "       imagedb-server cert SDIR [--name NAME]... [--renew]\n", stderr);
     return 2;
 }
@@ -153,6 +156,24 @@ int main(int argc, char **argv)
             const char *v = argv[++i];
             if (!strcmp(v, "any")) so.cb_any = true;
             else if (strcmp(v, "exporter")) return usage();
+        } else if ((!strcmp(argv[i], "--role-statement-timeout") || !strcmp(argv[i], "--role-transaction-timeout") ||
+                    !strcmp(argv[i], "--role-idle-in-transaction")) &&
+                   i + 1 < argc) { /* N1e stage two: a role's caps; 0 none */
+            uint32_t *f = argv[i][7] == 's' ? &so.role_stmt_ms : argv[i][7] == 't' ? &so.role_txn_ms : &so.role_idle_ms;
+            if (!parse_ms(argv[++i], 0, 86400000, f)) return usage();
+            if (!*f) *f = IMDBS_NONE;
+        } else if (!strcmp(argv[i], "--role-row-limit") && i + 1 < argc) {
+            if (!parse_bytes(argv[++i], 0, 1000000000000ull, &so.role_row_limit) || strpbrk(argv[i], "KMG")) return usage();
+        } else if (!strcmp(argv[i], "--role-prepared-bytes") && i + 1 < argc) {
+            if (!parse_bytes(argv[++i], 64u << 10, 64ull << 20, &so.role_prep_bytes)) return usage();
+        } else if ((!strcmp(argv[i], "--role-conns") || !strcmp(argv[i], "--superuser-reserve")) && i + 1 < argc) {
+            uint32_t *f = argv[i][2] == 'r' ? &so.role_conns : &so.su_reserve; /* N1e stage two; 0: none */
+            if (!parse_ms(argv[++i], 0, 65536, f)) return usage();
+            if (!*f) *f = IMDBS_NONE;
+        } else if ((!strcmp(argv[i], "--role-queue-bytes") || !strcmp(argv[i], "--role-reply-bytes")) && i + 1 < argc) {
+            uint64_t *f = argv[i][7] == 'q' ? &so.role_queue_bytes : &so.role_reply_bytes; /* 0: none */
+            if (!parse_bytes(argv[++i], 0, 64ull << 30, f)) return usage();
+            if (!*f) *f = IMDBS_NONE;
         } else if (!strcmp(argv[i], "--mem-limit") && i + 1 < argc) {
             if (!parse_size(argv[++i], &mem_limit)) return usage();
         } else if (!strcmp(argv[i], "--seg-cache") && i + 1 < argc) {

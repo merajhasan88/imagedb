@@ -139,7 +139,10 @@ $(BUILD)/obj/main.o: src/main.c cli/run.h cli/size.h $(HDR) | $(BUILD)/obj
 $(BUILD)/obj/cli_run.o: cli/run.c cli/run.h $(HDR) | $(BUILD)/obj
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD)/tobj/%.o: tests/unit/%.c $(HDR) tests/unit/test.h | $(BUILD)/tobj
+# the tests include the server's, the client's and the shell's headers too: a struct changed there (imdbs_counts) rebuilds them
+# (2026-11-18: t_tls.o, compiled before 2a moved imdbs_counts' fields, read cb_refused at its old offset)
+THDR    = $(wildcard server/*.h client/*.h cli/*.h tests/unit/*.h)
+$(BUILD)/tobj/%.o: tests/unit/%.c $(HDR) $(THDR) | $(BUILD)/tobj
 	$(CC) $(CFLAGS) -Wno-missing-prototypes -Wno-deprecated-declarations -Wno-format-truncation -c $< -o $@
 
 $(BUILD)/tobj/acrypto.o: tools/audit/acrypto.c tools/audit/acrypto.h | $(BUILD)/tobj
@@ -176,7 +179,7 @@ $(BUILD)/tobj/spool.o: server/spool.c server/spool.h server/wire.h $(HDR) | $(BU
 $(BUILD)/tobj/tls.o: server/tls.c server/tls.h server/wire.h $(HDR) | $(BUILD)/tobj
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(SERVER): server/main.c server/srv.h cli/size.h $(BUILD)/tobj/srv.o $(BUILD)/tobj/conv.o $(BUILD)/tobj/wire.o $(BUILD)/tobj/tls.o $(BUILD)/tobj/spool.o $(LIB)
+$(SERVER): server/main.c server/srv.h server/tls.h server/wire.h cli/size.h $(HDR) $(BUILD)/tobj/srv.o $(BUILD)/tobj/conv.o $(BUILD)/tobj/wire.o $(BUILD)/tobj/tls.o $(BUILD)/tobj/spool.o $(LIB)
 	$(CC) $(CFLAGS) server/main.c $(BUILD)/tobj/srv.o $(BUILD)/tobj/conv.o $(BUILD)/tobj/wire.o $(BUILD)/tobj/tls.o $(BUILD)/tobj/spool.o $(LIB) -o $@ \
 	  $(LDFLAGS) -lssl -lcrypto
 
@@ -193,7 +196,7 @@ $(BUILD)/probe/close_eio.o: tests/integration/close_eio.c $(HDR) | $(BUILD)/prob
 	$(CC) $(CFLAGS) -Isrc -c $< -o $@
 $(PROBECLI): src/main.c cli/run.h cli/size.h $(HDR) $(BUILD)/probe/close_eio.o $(BUILD)/obj/cli_run.o $(LIB) | $(BUILD)/probe
 	$(CC) $(CFLAGS) -Dimdb_close=review_close src/main.c $(BUILD)/probe/close_eio.o $(BUILD)/obj/cli_run.o $(LIB) -o $@ $(LDFLAGS)
-$(PROBESRV): server/main.c server/srv.h cli/size.h $(HDR) $(BUILD)/probe/close_eio.o $(BUILD)/tobj/srv.o $(BUILD)/tobj/conv.o \
+$(PROBESRV): server/main.c server/srv.h server/tls.h server/wire.h cli/size.h $(HDR) $(BUILD)/probe/close_eio.o $(BUILD)/tobj/srv.o $(BUILD)/tobj/conv.o \
              $(BUILD)/tobj/wire.o $(BUILD)/tobj/tls.o $(BUILD)/tobj/spool.o $(LIB) | $(BUILD)/probe
 	$(CC) $(CFLAGS) -Dimdb_close=review_close server/main.c $(BUILD)/probe/close_eio.o $(BUILD)/tobj/srv.o $(BUILD)/tobj/conv.o \
 	  $(BUILD)/tobj/wire.o $(BUILD)/tobj/tls.o $(BUILD)/tobj/spool.o $(LIB) -o $@ $(LDFLAGS) -lssl -lcrypto
@@ -210,7 +213,7 @@ $(CLIENTLIB): $(BUILD)/tobj/client.o $(BUILD)/tobj/wire.o $(BUILD)/tobj/tls.o $(
 $(BUILD)/client-link: tests/client_link/main.c client/imagedb_client.h $(CLIENTLIB)
 	$(CC) $(CFLAGS) tests/client_link/main.c $(CLIENTLIB) -o $@ $(LDFLAGS) -lssl -lcrypto
 
-$(CLIENTBIN): cli/shell.c cli/run.h cli/netres.h client/imagedb_client.h $(BUILD)/obj/cli_run.o $(BUILD)/tobj/netres.o \
+$(CLIENTBIN): cli/shell.c cli/run.h cli/netres.h client/imagedb_client.h server/conv.h server/wire.h $(HDR) $(BUILD)/obj/cli_run.o $(BUILD)/tobj/netres.o \
               $(BUILD)/tobj/conv.o $(CLIENTLIB) $(LIB)
 	$(CC) $(CFLAGS) cli/shell.c $(BUILD)/obj/cli_run.o $(BUILD)/tobj/netres.o $(BUILD)/tobj/conv.o $(CLIENTLIB) $(LIB) -o $@ \
 	  $(LDFLAGS) -lssl -lcrypto

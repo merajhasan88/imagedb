@@ -45,7 +45,26 @@ typedef struct imdbs_opts {
     uint32_t copy_idle_ms;
     bool cb_any;               /* §8f: --channel-binding any: tls-server-end-point taken beside the exporter (the default:
                                 * the exporter alone); a certificate not signed with SHA-256 then refused at the start */
+    /* N1e stage two: a role's caps (docs/n1-design.md §8e), applied to a session while its role is not a superuser (db.h
+     * imdb_caps): its statement and transaction timeouts and its idle-in-transaction bound (0: the default, 60 s, 10 min and
+     * 60 s; IMDBS_NONE: none), the rows a statement tests (0: none) and a session's prepared statements' bytes (0: 64 MiB over
+     * --role-conns: 2 MiB at its default, at least 64 KiB) */
+    uint32_t role_stmt_ms, role_txn_ms, role_idle_ms;
+    uint64_t role_row_limit, role_prep_bytes;
+    /* N1e stage two: a role's authenticated connections at once (0: 32; IMDBS_NONE: max_conns), and the connection
+     * slots no role but a superuser takes (0: 4, PostgreSQL's superuser_reserved_connections; IMDBS_NONE: none): a login
+     * past either is answered (its proof was right), then an ERROR and the close */
+    uint32_t role_conns, su_reserve;
+    /* N1e stage two: one role's queued requests' bytes, past which its connections' sockets are not read (0: 64 MiB), and
+     * its unsent replies' bytes, past which none of its statements starts (0: 64 MiB); IMDBS_NONE: none; a superuser's
+     * exempt. A role's statement starts only while the server's unsent replies are under its own bound too */
+    uint64_t role_queue_bytes, role_reply_bytes;
+    uint64_t reply_budget;     /* every connection's unsent replies, past which only a connection (a role) with none runs (0:
+                                * 256 MiB) */
+    bool test_open_logins;     /* tests alone: any LOGIN role logs in (N1e stage two's last slice opens them) */
 } imdbs_opts;
+
+#define IMDBS_NONE UINT32_MAX /* an imdbs_opts bound that defaults when 0: none */
 
 typedef struct imdbs imdbs;
 
@@ -93,6 +112,8 @@ typedef struct imdbs_counts {
     uint64_t spool_held;   /* gauge: every spool's bytes held now */
     uint64_t ticks;        /* the engine thread's ticks run (timeouts, maintenance): on their clock under any load */
     uint64_t logins_endpoint; /* §8f: logins bound by tls-server-end-point (--channel-binding any), in logins too */
+    uint64_t role_refused; /* N1e stage two: logins past --role-conns or into the superusers' reserve (in logins too) */
+    uint64_t role_queue_waits; /* N1e stage two: a connection's reads held by its role's queue share (once a hold) */
     uint64_t cb_refused;   /* §8f: hellos whose binding type this server refuses (none on TCP, end-point by default, any on
                             * the socket), in refusals too */
 } imdbs_counts;

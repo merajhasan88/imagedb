@@ -926,6 +926,7 @@ static void t_tls_binding(void)
     g_events = evpath;
     CHECK(tstart(&t, "127.0.0.1", true));
     g_events = NULL;
+    uint64_t ev_t0 = imdb_mono_ns(); /* the event limit allows one more in each 5 s that passes (a slow build's) */
     imdbs_counts_get(t.s, &c0);
     q = (rawreq){.port = t.port, .pin = t.pin, .cb = IMDBW_CB_ENDPOINT, .pw = "pw-admin"};
     SOFT(raw_login(&q, NULL, NULL) == IMDBW_VERDICT_OK);
@@ -948,7 +949,7 @@ static void t_tls_binding(void)
      * most) */
     bool said = false;
     for (int w = 0; w < 2000 && !said; w++) {
-        char buf[16384];
+        static char buf[1u << 20]; /* the whole log (its open and other events come first) */
         FILE *ef = fopen(evpath, "r");
         size_t got = ef ? fread(buf, 1, sizeof buf - 1, ef) : 0;
         if (ef) fclose(ef);
@@ -957,6 +958,41 @@ static void t_tls_binding(void)
         if (!said) usleep(10000);
     }
     SOFT(said);
+    /* at most one event in 5 s: the phase's logins and refusals (a burst under a second) give the first event and the
+     * one with the final totals, never one a tick */
+    int lines = 0;
+    {
+        static char buf[1u << 20]; /* the whole log (its open and other events come first) */
+        FILE *ef = fopen(evpath, "r");
+        size_t got = ef ? fread(buf, 1, sizeof buf - 1, ef) : 0;
+        if (ef) fclose(ef);
+        buf[got] = 0;
+        for (const char *p = buf; (p = strstr(p, "\"ev\":\"channel_binding\"")); p++) lines++;
+    }
+    int allow = 2 + (int)((imdb_mono_ns() - ev_t0) / 5000000000ull); /* the first, then one a 5 s */
+    SOFT(lines >= 1 && lines <= allow);
+    if (lines > allow) fprintf(stderr, "    channel_binding events: %d (at most %d: one in 5 s)\n", lines, allow);
+    /* five refused hellos 200 ms apart, each across ticks of the engine thread (100 ms): at most one event more, where a
+     * tick's event would give five (a peer that never authenticates must not flood the log) */
+    uint64_t burst_t0 = imdb_mono_ns();
+    for (int k = 0; k < 5; k++) {
+        rawreq nb = {.port = t.port, .pin = t.pin, .cb = IMDBW_CB_NONE, .pw = "pw-admin"};
+        SOFT(raw_login(&nb, NULL, NULL) == IMDBW_VERDICT_BINDING);
+        usleep(200000);
+    }
+    usleep(300000);
+    int after = 0;
+    {
+        static char buf[1u << 20]; /* the whole log (its open and other events come first) */
+        FILE *ef = fopen(evpath, "r");
+        size_t got = ef ? fread(buf, 1, sizeof buf - 1, ef) : 0;
+        if (ef) fclose(ef);
+        buf[got] = 0;
+        for (const char *p = buf; (p = strstr(p, "\"ev\":\"channel_binding\"")); p++) after++;
+    }
+    int more = 1 + (int)((imdb_mono_ns() - burst_t0) / 5000000000ull);
+    SOFT(after - lines <= more);
+    if (after - lines > more) fprintf(stderr, "    channel_binding events: %d, then %d after five spaced refusals\n", lines, after);
     relay r;
     pthread_t th;
     imdbs_counts_get(t.s, &c0);

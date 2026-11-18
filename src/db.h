@@ -878,6 +878,15 @@ typedef struct imdb_txn_sp { /* SAVEPOINT: a position in the op list */
     uint32_t pos;
 } imdb_txn_sp;
 
+/* N1e stage two: a role's caps, the server's options (0: none), applied while its session's role is not a superuser (read
+ * where each is checked, so an ALTER ROLE another session committed applies at once): the statement and transaction
+ * timeouts, the idle-in-transaction bound, the rows a statement tests, its prepared statements' bytes. An embedded caller
+ * and the CLI leave them zero */
+typedef struct imdb_caps {
+    uint32_t stmt_ms, txn_ms, idle_ms;
+    uint64_t row_limit, prep_bytes;
+} imdb_caps;
+
 typedef struct imdb_txn {
     struct imdb_txn *next;     /* in db->txns */
     bool open, started, doomed;
@@ -894,6 +903,9 @@ typedef struct imdb_txn {
     uint64_t begin_ns, last_ns; /* R4: its BEGIN and the end of its last statement (CLOCK_MONOTONIC) */
     uint64_t begin_us;          /* F2a: its BEGIN by imdb's clock (imdb_now_us): now() and the other clock values in it */
     uint32_t timeout_ms, idle_ms; /* SET transaction_timeout and idle_in_transaction_timeout at its BEGIN (0: none) */
+    const imdb_caps *caps;     /* N1e stage two: its session's caps (NULL: none) and role, at its BEGIN: imdb_txn_expired reads
+                                * the role's superuser attribute at each check */
+    uint32_t role;
     bool busy;                 /* N1d: its session's statement is under way outside the engine (a COPY's data arriving through
                                 * the server): never idle (idle_ms), its age (timeout_ms) still counted */
     uint32_t *seqs;            /* F2a-2: its sequences nextval touched, while it is not active (db->txseq when it is) */
@@ -904,8 +916,12 @@ typedef struct imdb_txn {
 } imdb_txn;
 
 void imdb_txn_begin(imdb_db *db, imdb_txn *x, uint8_t iso);
-/* R4: x is past its transaction timeout, or idle past its limit, at now_ns (why says which; doomed or not) */
-bool imdb_txn_expired(const imdb_txn *x, uint64_t now_ns, char *why, size_t n);
+/* N1e stage two: a session's own value (0: none) held to its role's cap while the role is not a superuser now (caps NULL
+ * or cap 0: the own value): the own value when set and within the cap, else the cap */
+uint64_t imdb_cap_eff(const imdb_db *db, const imdb_caps *caps, uint32_t role, uint64_t own, uint64_t cap);
+/* R4: x is past its transaction timeout, or idle past its limit, at now_ns (why says which; doomed or not); N1e stage
+ * two: each held to its role's cap (imdb_cap_eff) */
+bool imdb_txn_expired(const imdb_db *db, const imdb_txn *x, uint64_t now_ns, char *why, size_t n);
 /* R4: x can only roll back (doomed with why, unless it already was), and what it holds goes now: the active one's
  * pending versions are undone, a parked one's saved writes and its locks freed; it stays open, so its session's next
  * statement fails and only ROLLBACK ends it */

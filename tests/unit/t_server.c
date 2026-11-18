@@ -1031,7 +1031,8 @@ static pid_t spawn(const char *bin, const char *dbdir, const char *sdir)
         prctl(PR_SET_PDEATHSIG, SIGKILL); /* a test that stops early leaves no server behind */
         struct rlimit rl = {RLIM_INFINITY, RLIM_INFINITY}; /* a supervisor's: the engine thread's stack its own */
         setrlimit(RLIMIT_STACK, &rl);
-        execl(bin, bin, dbdir, "--socket", g_sock, "--server-dir", sdir, "--nosync", (char *)NULL);
+        execl(bin, bin, dbdir, "--socket", g_sock, "--server-dir", sdir, "--nosync", "--mem-limit", "768M", "--seg-cache", "96M",
+              (char *)NULL); /* N1e stage two: the budget and the images reach the handle (SHOW MEMORY below) */
         _exit(127);
     }
     return pid;
@@ -1136,6 +1137,9 @@ static void t_server_binary(void)
     SOFT(raw_challenge("ghost", &c2) && !memcmp(c1.salt, c2.salt, 16)); /* the secret kept: the same salt */
     imdbc *dc = login("admin", "pw-admin"); /* the deepest statements, the binary run with RLIMIT_STACK unlimited */
     SOFT(dc && deep_ok(dc));
+    reply mr;
+    SOFT(dc && q1(dc, "SHOW MEMORY", &mr) == 0 && strstr(mr.status, "budget 805306368") && strstr(mr.status, "budget 100663296"));
+    if (!strstr(mr.status, "budget 805306368")) fprintf(stderr, "    SHOW MEMORY: %d %s %s\n", mr.rc, mr.err, mr.status);
     imdbc_close(dc);
     /* killed in the middle of commits: every acknowledged one there */
     inserter in = {0};
@@ -2260,12 +2264,302 @@ static void t_server_priv(void)
     unserve(db, s);
 }
 
+
+/* N1e stage two: turns go by role, then by connection. A third role's statement holds the engine thread (a cross join of
+ * minutes, cut at 1.5 s by its statement_timeout) while role ra's six connections and rb's one each queue three requests,
+ * a nextval each: the values are the order they ran in. By role, ra and rb alternate, so rb's third runs by the sixth or
+ * seventh turn; by connection, rb would have one turn in seven, its third at the fifteenth at the soonest, whatever the
+ * connections' order. No clock is asserted: the order alone */
+static void t_server_turns(void)
+{
+    imdbs *s = NULL;
+    imdb_db *db = serve(&s, NULL);
+    CHECK(db);
+    imdbc *adm = login("admin", "pw-admin");
+    CHECK(adm);
+    reply r;
+    load_rows(adm, 400);
+    static const char *const setup[] = {"CREATE ROLE ra LOGIN SUPERUSER PASSWORD 'pw-a'",
+                                        "CREATE ROLE rb LOGIN SUPERUSER PASSWORD 'pw-b'",
+                                        "CREATE ROLE rc LOGIN SUPERUSER PASSWORD 'pw-c'", "CREATE SEQUENCE q"};
+    for (size_t i = 0; i < sizeof setup / sizeof *setup; i++) SOFT(q1(adm, setup[i], &r) == 0 && !r.nerr);
+    imdbc *a[6], *b = NULL, *hold = login("rc", "pw-c");
+    for (int i = 0; i < 6; i++) a[i] = login("ra", "pw-a");
+    b = login("rb", "pw-b");
+    CHECK(hold && b);
+    for (int i = 0; i < 6; i++) CHECK(a[i]);
+    SOFT(q1(hold, "SET statement_timeout = 1500", &r) == 0 && !r.nerr);
+    imdb_err e = {0};
+    static const char slow[] = "SELECT COUNT(*) FROM big2 AS x, big2 AS y WHERE x.v + y.v = 99";
+    imdbc_stmt hs = {slow, sizeof slow - 1, NULL, 0}, nv = {"SELECT nextval('q')", 19, NULL, 0};
+    uint64_t before = started_now(s);
+    SOFT(imdbc_query(hold, &hs, 1, &e) == 0);
+    wait_started(s, before);
+    for (int k = 0; k < 3; k++) {
+        for (int i = 0; i < 6; i++) SOFT(imdbc_query(a[i], &nv, 1, &e) == 0);
+        SOFT(imdbc_query(b, &nv, 1, &e) == 0);
+    }
+    SOFT(read_reply(hold, &r) == 0 && r.err_code == (uint32_t)-IMDB_ERR_CANCELLED);
+    long vb[3] = {0, 0, 0};
+    for (int k = 0; k < 3; k++) {
+        SOFT(read_reply(b, &r) == 0 && !r.nerr);
+        vb[k] = strtol(r.text, NULL, 10);
+    }
+    SOFT(vb[0] < vb[1] && vb[1] < vb[2] && vb[2] <= 7);
+    if (vb[2] > 7) fprintf(stderr, "    rb's nextvals: %ld %ld %ld (by role: the third by 7)\n", vb[0], vb[1], vb[2]);
+    for (int i = 0; i < 6; i++) {
+        for (int k = 0; k < 3; k++) SOFT(read_reply(a[i], &r) == 0 && !r.nerr);
+        imdbc_close(a[i]);
+    }
+    imdbc_close(b);
+    imdbc_close(hold);
+    imdbc_close(adm);
+    unserve(db, s);
+}
+
+/* N1e stage two: the server sets a session's caps from its options (their defaults here: 60 s for a statement, 10 min for
+ * a transaction, 60 s idle in one, 2 MiB of prepared statements). Logins are a superuser's until stage two's last slice,
+ * so the role logs in a superuser and is demoted: its session is held from its next statement, and promoted again, freed */
+static void t_server_role_caps(void)
+{
+    imdbs *s = NULL;
+    imdb_db *db = serve(&s, NULL);
+    CHECK(db);
+    imdbc *adm = login("admin", "pw-admin");
+    CHECK(adm);
+    reply r;
+    SOFT(q1(adm, "CREATE ROLE dem LOGIN SUPERUSER PASSWORD 'pw-d'", &r) == 0 && !r.nerr);
+    imdbc *d = login("dem", "pw-d");
+    CHECK(d);
+    SOFT(q1(d, "SET statement_timeout = 0", &r) == 0 && !r.nerr); /* a superuser's: none */
+    SOFT(q1(adm, "ALTER ROLE dem NOSUPERUSER", &r) == 0 && !r.nerr);
+    static const char *const held[][2] = {{"SET statement_timeout = 0", "(60000)"},
+                                          {"SET statement_timeout = 60001", "(60000)"},
+                                          {"SET transaction_timeout = 600001", "(600000)"},
+                                          {"SET idle_in_transaction_timeout = 0", "(60000)"}};
+    for (size_t i = 0; i < sizeof held / sizeof *held; i++) {
+        SOFT(q1(d, held[i][0], &r) == 0 && r.err_code == (uint32_t)-IMDB_ERR_PRIVILEGE && strstr(r.err, held[i][1]));
+        if (r.err_code != (uint32_t)-IMDB_ERR_PRIVILEGE) fprintf(stderr, "    %s: %u %s\n", held[i][0], r.err_code, r.err);
+    }
+    SOFT(q1(d, "SET statement_timeout = 59000", &r) == 0 && !r.nerr);
+    SOFT(q1(adm, "ALTER ROLE dem SUPERUSER", &r) == 0 && !r.nerr);
+    SOFT(q1(d, "SET statement_timeout = 0", &r) == 0 && !r.nerr);
+    imdbc_close(d);
+    imdbc_close(adm);
+    unserve(db, s);
+}
+
+/* a login answered and then refused (a role's cap, the superusers' reserve): its first reply is the ERROR, then the close */
+static bool refused_after_login(const char *user, const char *pw, const char *want)
+{
+    imdbc *c = login(user, pw);
+    if (!c) return false;
+    reply r;
+    q1(c, "SELECT 1", &r);
+    bool ok = r.err_code == (uint32_t)-IMDB_ERR_LIMIT && strstr(r.err, want) && r.ndone == 0;
+    if (!ok) fprintf(stderr, "    %s's login: code %u, %u done: %s\n", user, r.err_code, r.ndone, r.err);
+    imdbc_close(c);
+    return ok;
+}
+
+/* a login of user that runs a statement, within 10 s (a closed connection's place is freed when its session ends) */
+static imdbc *login_runs(const char *user, const char *pw)
+{
+    for (int k = 0; k < 200; k++) {
+        imdbc *c = login(user, pw);
+        reply r;
+        if (c && q1(c, "SELECT 1", &r) == 0 && !r.nerr) return c;
+        imdbc_close(c);
+        usleep(50000);
+    }
+    return NULL;
+}
+
+/* N1e stage two: one role's connections at most --role-conns; a superuser past it; a place freed by a close; the last
+ * --superuser-reserve slots a superuser's alone. Logins of a role that is not a superuser are opened for the test
+ * (test_open_logins: N1e stage two's last slice opens them) */
+static void t_server_role_conns(void)
+{
+    imdbs_opts o;
+    memset(&o, 0, sizeof o);
+    o.test_open_logins = true;
+    o.role_conns = 2;
+    o.max_conns = 6;
+    o.su_reserve = 2;
+    imdbs *s = NULL;
+    imdb_db *db = serve(&s, &o);
+    CHECK(db);
+    imdbc *p1 = login_runs("plain", "pw"), *p2 = login_runs("plain", "pw");
+    CHECK(p1 && p2);
+    imdbs_counts c0, c1;
+    imdbs_counts_get(s, &c0);
+    SOFT(refused_after_login("plain", "pw", "--role-conns"));
+    imdbc *a[3];
+    for (int i = 0; i < 3; i++) SOFT((a[i] = login_runs("admin", "pw-admin")) != NULL); /* a superuser: no role cap */
+    imdbc_close(a[2]);
+    imdbc_close(p2);
+    imdbc *p3 = login_runs("plain", "pw"); /* p2's place freed */
+    SOFT(p3 != NULL);
+    imdbc_close(a[1]);
+    /* now 3 connections (p1, a[0], p3): the reserve is the last 2 of 6, so a fourth role connection would leave 2 */
+    SOFT(q1(p1, "SELECT 1", &(reply){0}) == 0);
+    imdbc_close(p3);
+    SOFT(q1(a[0], "CREATE ROLE other LOGIN PASSWORD 'pw-o'", &(reply){0}) == 0);
+    imdbc *o1 = login_runs("other", "pw-o"), *o2 = login_runs("other", "pw-o"); /* p1, a[0], o1, o2: 4 of 6 */
+    SOFT(o1 && o2);
+    /* the closed connections reaped first (10 s at most): the reserve counts what is in the server's list, and exactly
+     * the four above must be, or the check below means nothing (once, under the gate's load, the fifth login was taken:
+     * not reproduced since; this says which way the count was off if it comes back) */
+    imdbs_counts lv;
+    for (int w = 0; w < 1000; w++) {
+        imdbs_counts_get(s, &lv);
+        if (lv.live == 4) break;
+        usleep(10000);
+    }
+    SOFT(lv.live == 4);
+    if (lv.live != 4) fprintf(stderr, "    connections live before the reserve's check: %llu, not 4\n", (unsigned long long)lv.live);
+    SOFT(refused_after_login("plain", "pw", "reserved for superusers"));
+    imdbc *a5 = login_runs("admin", "pw-admin"); /* the reserve: a superuser takes it */
+    SOFT(a5 != NULL);
+    imdbs_counts_get(s, &c1);
+    SOFT(c1.role_refused >= c0.role_refused + 2);
+    imdbc_close(a5);
+    imdbc_close(o1);
+    imdbc_close(o2);
+    imdbc_close(a[0]);
+    imdbc_close(p1);
+    unserve(db, s);
+}
+
+/* N1e stage two: a role's shares, one server per case (budget: every connection's unsent replies; share: one role's).
+ * Role plain's first connection leaves 3 MB of replies unread: its second connection's statement waits (past the
+ * server's budget with replies of its own, or past its role's share), while role other's runs (it has none unsent: a
+ * role holding the server stops itself, never another) and a superuser's runs; read, plain's runs. A superuser past the
+ * share runs until demoted, then waits (the refresh of the roles). Its queued requests past --role-queue-bytes: its
+ * sockets are not read (role_queue_waits) */
+static void shares_case(uint64_t budget, uint64_t share, bool queue, bool demote)
+{
+    imdbs_opts o;
+    memset(&o, 0, sizeof o);
+    o.test_open_logins = true;
+    o.reply_budget = budget;
+    o.role_reply_bytes = share;
+    o.role_queue_bytes = 1u << 20;
+    imdbs *s = NULL;
+    imdb_db *db = serve(&s, &o);
+    CHECK(db);
+    imdbc *adm = login("admin", "pw-admin");
+    CHECK(adm);
+    reply r;
+    load_rows(adm, 400);
+    static const char *const setup[] = {"GRANT SELECT ON big2 TO plain", "CREATE ROLE other LOGIN PASSWORD 'pw-o'",
+                                        "CREATE ROLE boss LOGIN SUPERUSER PASSWORD 'pw-b'"};
+    for (size_t i = 0; i < sizeof setup / sizeof *setup; i++) SOFT(q1(adm, setup[i], &r) == 0 && !r.nerr);
+    const char *who = demote ? "boss" : "plain", *pw = demote ? "pw-b" : "pw";
+    imdbc *p1 = login(who, pw), *p2 = login(who, pw), *ot = login("other", "pw-o");
+    CHECK(p1 && p2 && ot);
+    imdb_err e = {0};
+    imdbc_stmt all = {"SELECT * FROM big2", 18, NULL, 0}; /* 160,000 rows: about 3 MB of frames, past the socket's buffers */
+    uint64_t before = started_now(s);
+    SOFT(imdbc_query(p1, &all, 1, &e) == 0);
+    wait_started(s, before);
+    SOFT(q1(adm, "SELECT 1", &r) == 0 && !r.nerr); /* runs after p1's statement (one engine thread) */
+    if (demote) { /* a superuser past the share: its statement runs; demoted, the next waits */
+        SOFT(q1(p2, "SELECT 2", &r) == 0 && !r.nerr);
+        SOFT(q1(adm, "ALTER ROLE boss NOSUPERUSER", &r) == 0 && !r.nerr);
+    }
+    before = started_now(s);
+    imdbc_stmt two = {"SELECT 2", 8, NULL, 0};
+    SOFT(imdbc_query(p2, &two, 1, &e) == 0);
+    usleep(300000);
+    SOFT(started_now(s) == before); /* p2's statement waits */
+    if (started_now(s) != before) fprintf(stderr, "    budget %llu, share %llu: the held role's statement ran\n",
+                                          (unsigned long long)budget, (unsigned long long)share);
+    SOFT(q1(ot, "SELECT 3", &r) == 0 && !r.nerr); /* another role's runs */
+    SOFT(q1(adm, "SELECT 4", &r) == 0 && !r.nerr); /* a superuser's runs */
+    imdbs_counts c0, c1;
+    imdbs_counts_get(s, &c0);
+    if (queue) { /* three requests of 400 KB, each read while the role's queue was under its 1 MiB, the last past it */
+        static char pad[400000];
+        size_t n = (size_t)snprintf(pad, sizeof pad, "SELECT 5 -- ");
+        memset(pad + n, 'x', sizeof pad - n - 1);
+        pad[sizeof pad - 1] = 0;
+        imdbc_stmt big = {pad, strlen(pad), NULL, 0};
+        for (int k = 0; k < 3; k++) SOFT(imdbc_query(p2, &big, 1, &e) == 0);
+        for (int w = 0; w < 500; w++) {
+            imdbs_counts_get(s, &c1);
+            if (c1.role_queue_waits > c0.role_queue_waits) break;
+            usleep(10000);
+        }
+        SOFT(c1.role_queue_waits > c0.role_queue_waits);
+    }
+    /* p1's replies read: the role's statements run, its queue drains */
+    SOFT(read_reply(p1, &r) == 0 && !r.nerr && r.nrows == 160000);
+    SOFT(read_reply(p2, &r) == 0 && !r.nerr);
+    for (int k = 0; queue && k < 3; k++) {
+        SOFT(read_reply(p2, &r) == 0 && !r.nerr && strstr(r.text, "5"));
+        if (r.nerr || r.rc) fprintf(stderr, "    the padded request: rc %d code %u %s\n", r.rc, r.err_code, r.err);
+    }
+    imdbc_close(p1);
+    imdbc_close(p2);
+    imdbc_close(ot);
+    imdbc_close(adm);
+    unserve(db, s);
+}
+
+static void t_server_role_shares(void)
+{
+    shares_case(1u << 20, IMDBS_NONE, false, false); /* the server's budget alone */
+    shares_case(0, 1u << 20, true, false);           /* the role's share alone, and its queue */
+    shares_case(0, 1u << 20, false, true);           /* a superuser exempt, then demoted */
+}
+
+/* N1e stage two: a role's statement cut at the server's cap, through the server, and another session's statement queued
+ * behind it runs once it ends: --role-statement-timeout 400 ms, a role demoted after its login (logins are a superuser's
+ * until 2c) running a cross join of minutes; the superuser's SELECT waits for the one engine thread, then answers (a
+ * cap that never cut would hold it for minutes, past the client's 20 s) */
+static void t_server_role_cap_cancel(void)
+{
+    imdbs_opts o;
+    memset(&o, 0, sizeof o);
+    o.role_stmt_ms = 400;
+    imdbs *s = NULL;
+    imdb_db *db = serve(&s, &o);
+    CHECK(db);
+    imdbc *adm = login("admin", "pw-admin");
+    CHECK(adm);
+    reply r;
+    load_rows(adm, 400);
+    SOFT(q1(adm, "CREATE ROLE dem LOGIN SUPERUSER PASSWORD 'pw-d'", &r) == 0 && !r.nerr);
+    SOFT(q1(adm, "GRANT SELECT ON big2 TO dem", &r) == 0 && !r.nerr);
+    imdbc *d = login("dem", "pw-d");
+    CHECK(d);
+    SOFT(q1(adm, "ALTER ROLE dem NOSUPERUSER", &r) == 0 && !r.nerr);
+    imdb_err e = {0};
+    static const char slow[] = "SELECT COUNT(*) FROM big2 AS x, big2 AS y WHERE x.v + y.v = 99";
+    imdbc_stmt st = {slow, sizeof slow - 1, NULL, 0};
+    uint64_t before = started_now(s);
+    SOFT(imdbc_query(d, &st, 1, &e) == 0);
+    wait_started(s, before);
+    SOFT(q1(adm, "SELECT 7", &r) == 0 && !r.nerr && strstr(r.text, "7")); /* after the capped statement ends */
+    SOFT(read_reply(d, &r) == 0 && r.err_code == (uint32_t)-IMDB_ERR_CANCELLED && strstr(r.err, "400 ms") &&
+         strstr(r.err, "--role-statement-timeout"));
+    if (r.err_code != (uint32_t)-IMDB_ERR_CANCELLED) fprintf(stderr, "    the capped statement: %u %s\n", r.err_code, r.err);
+    imdbc_close(d);
+    imdbc_close(adm);
+    unserve(db, s);
+}
 const test_case server_tests[] = {
     {"server_auth", t_server_auth},
     {"server_statements", t_server_statements},
     {"server_txn", t_server_txn},
     {"server_commit_stamp", t_server_commit_stamp},
     {"server_cancel", t_server_cancel},
+    {"server_turns", t_server_turns},
+    {"server_role_caps", t_server_role_caps},
+    {"server_role_conns", t_server_role_conns},
+    {"server_role_shares", t_server_role_shares},
+    {"server_role_cap_cancel", t_server_role_cap_cancel},
     {"server_roles", t_server_roles},
     {"server_protocol", t_server_protocol},
     {"server_stop", t_server_stop},

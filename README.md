@@ -644,6 +644,15 @@ Command-line options (`imagedb` with no arguments prints the commands):
 | `--copy-wait MS` | imagedb-server | the engine's waits for a slow COPY TO reader, in all for one statement | 60000 |
 | `--copy-idle MS` | imagedb-server | a COPY's data arriving at none this long ends its connection | 30000 |
 | `--channel-binding exporter\|any` | imagedb-server | a TCP login's channel binding: the TLS exporter alone (RFC 9266), or tls-server-end-point too (RFC 5929, PostgreSQL's: for drivers whose platform TLS lacks the exporter; a relay holding the server's key passes it; the certificate must be signed with SHA-256; such logins and refused types are said in the event log) | exporter |
+| `--role-statement-timeout MS` | imagedb-server | a statement of a role that is not a superuser runs at most this long; the role may SET a lower `statement_timeout`, never none or a higher one (0: none) | 60000 |
+| `--role-transaction-timeout MS` | imagedb-server | a transaction of such a role at most this old (`transaction_timeout`, held as above; 0: none) | 600000 |
+| `--role-idle-in-transaction MS` | imagedb-server | such a role's transaction idle at most this long (`idle_in_transaction_timeout`, held as above; 0: none) | 60000 |
+| `--role-row-limit N` | imagedb-server | the rows a statement of such a role may test (`statement_row_limit`, held as above; 0: none) | none |
+| `--role-prepared-bytes BYTES` | imagedb-server | a session of such a role holds at most this in prepared statements | 64M / `--role-conns` (2M), at least 64K |
+| `--role-conns N` | imagedb-server | one such role's connections at once; a login past it is answered, then refused (0: none) | 32 |
+| `--superuser-reserve N` | imagedb-server | the last N connection slots are a superuser's alone (0: none) | 4 |
+| `--role-queue-bytes BYTES` | imagedb-server | one such role's queued requests, past which its connections are not read (0: none) | 64M |
+| `--role-reply-bytes BYTES` | imagedb-server | one such role's replies not yet sent, past which none of its statements starts (0: none) | 64M |
 | `--name NAME` | imagedb-server cert | another name in the certificate's subjectAltName (localhost, 127.0.0.1, ::1 always); repeatable | |
 | `--renew` | imagedb-server cert | the same key signed again by the same CA (the pin kept) | |
 | `--host HOST`, `--port PORT` | imagedb-client | TCP with TLS 1.3 | |
