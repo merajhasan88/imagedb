@@ -59,9 +59,15 @@ typedef struct imdbs_opts {
      * its unsent replies' bytes, past which none of its statements starts (0: 64 MiB); IMDBS_NONE: none; a superuser's
      * exempt. A role's statement starts only while the server's unsent replies are under its own bound too */
     uint64_t role_queue_bytes, role_reply_bytes;
+    /* N1e stage two, 2b-2a: one role's spooled bytes at once (its COPY FROM spools, COPY TO rings and results spooled past
+     * their connection's room together; 0: a quarter of copy_spool; IMDBS_NONE: none; a superuser's exempt) */
+    uint64_t role_copy_spool;
     uint64_t reply_budget;     /* every connection's unsent replies, past which only a connection (a role) with none runs (0:
                                 * 256 MiB) */
     bool test_open_logins;     /* tests alone: any LOGIN role logs in (N1e stage two's last slice opens them) */
+    bool test_no_spill;        /* tests alone (2b-2a's measure): every result's frames to memory, as before the spool */
+    uint32_t test_sndbuf;      /* tests alone: each accepted socket's SO_SNDBUF (0: the kernel's), so a reply's bytes past a few
+                                * KiB stay the server's (a client's lag made exact) */
 } imdbs_opts;
 
 #define IMDBS_NONE UINT32_MAX /* an imdbs_opts bound that defaults when 0: none */
@@ -127,6 +133,11 @@ typedef struct imdbs_counts {
     uint64_t kills_refused; /* and refused (code 1: no such session, or to a role another role's) */
     uint64_t oot_waits;    /* N1e stage two: a connection's reads paused for its out-of-turn answers unsent (once a pause) */
     uint64_t oot_peak;     /* and the most of them any connection held unsent (OOT_MAX and one frame at most) */
+    uint64_t res_spilled;  /* 2b-2a: results whose frames went to a spool past their connection's room */
+    uint64_t res_spool_bytes; /* and those frames' bytes */
+    uint64_t res_refused;  /* reads refused for want of room for their reply (the spools full, a role's share, no spool) */
+    uint64_t role_spool_limits; /* COPYs and results stopped by a role's spool share (--role-copy-spool) */
+    uint64_t pend_peak;    /* the most unsent replies in memory at once, every connection's (the budget and a chunk a connection) */
     uint64_t conns;        /* D34: gauge: connections in the server's list (nconns, the count the reserve reads) */
     uint64_t ends[IMDBS_END_N]; /* D34: connection threads ended, by cause (IMDBS_END_*): which way a connection left */
 } imdbs_counts;

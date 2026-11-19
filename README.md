@@ -232,6 +232,12 @@ which can lag SQL commits. Use `imagedb verify` to check a current layer.
   Every spool's bytes held at once are bounded by `--copy-spool`. A COPY whose data
   stops arriving for `--copy-idle` (30 s) ends its connection: type COPY's data at
   the REPL within that, or pipe it.
+- **Large results:** a result's frames past its connection's room in memory (`--conn-cap`, its role's
+  `--role-reply-bytes`, the server's `--reply-budget`) go to a file in the spool directory, so a client that reads
+  slowly never holds them in the server's memory nor makes the engine wait. A read whose reply passes that room and the
+  spools (`--copy-spool`, its role's `--role-copy-spool`, a quarter of it) fails by name: read it in parts. At the
+  defaults a role's largest result (its `statement_memory`, 1 GiB, whose frames are smaller) fits. A write's
+  RETURNING is always delivered with its commit.
 - **Shutdown:** SIGTERM takes no new connection, lets running statements end, rolls
   back open transactions and closes the database durable; a second signal cancels
   the running statements. A failed sync stops the server with exit status 1 for its
@@ -650,7 +656,7 @@ Command-line options (`imagedb` with no arguments prints the commands):
 | `--tcp ADDR:PORT` | imagedb-server | TLS 1.3 on TCP beside the socket (`[::1]:5544` for IPv6; port 0: any, printed) | none |
 | `--max-conns N` | imagedb-server | connections at once; one past it is closed unread | 256 |
 | `--spool-dir DIR` | imagedb-server | where COPY's spool files go (0700; unnamed files) | SDIR/spool |
-| `--copy-spool BYTES` | imagedb-server | every COPY's spooled bytes at once (K, M or G); a COPY FROM's data past it fails at once | 4G |
+| `--copy-spool BYTES` | imagedb-server | every spool's bytes at once (K, M or G), each file by its size until freed: COPY FROM's data, COPY TO's rings and the results spooled past their connection's room; a COPY FROM's data past it fails at once, a read's result past it fails by name, a write's never | 4G |
 | `--copy-ring BYTES` | imagedb-server | a COPY TO's output held before its client takes it | 256M |
 | `--copy-wait MS` | imagedb-server | the engine's waits for a slow COPY TO reader, in all for one statement | 60000 |
 | `--copy-idle MS` | imagedb-server | a COPY's data arriving at none this long ends its connection | 30000 |
@@ -663,7 +669,8 @@ Command-line options (`imagedb` with no arguments prints the commands):
 | `--role-conns N` | imagedb-server | one such role's connections at once; a login past it is answered, then refused (0: none) | 32 |
 | `--superuser-reserve N` | imagedb-server | the last N connection slots are a superuser's alone (0: none) | 4 |
 | `--role-queue-bytes BYTES` | imagedb-server | one such role's queued requests, past which its connections are not read (0: none) | 64M |
-| `--role-reply-bytes BYTES` | imagedb-server | one such role's replies not yet sent, past which none of its statements starts (0: none) | 64M |
+| `--role-reply-bytes BYTES` | imagedb-server | one such role's replies not yet sent (in memory, and results spooled past their room), past which none of its statements starts (0: none) | 64M |
+| `--role-copy-spool BYTES` | imagedb-server | one role's spooled bytes at once: its COPY FROM spools, COPY TO rings and the results spooled past their connection's room (0: none; a superuser's exempt) | a quarter of `--copy-spool` |
 | `--preauth-max N` | imagedb-server | connections authenticating at once on each listener; the rest wait in the listen queue | 32 |
 | `--preauth-timeout MS` | imagedb-server | a whole authentication exchange (TLS's handshake included) | 10000 |
 | `--preauth-per-addr N` | imagedb-server | TCP connections authenticating at once from one address (twice it may wait) | 8 |
@@ -671,8 +678,8 @@ Command-line options (`imagedb` with no arguments prints the commands):
 | `--slice-ms MS` | imagedb-server | a session in a transaction runs on this long while others wait | 10 |
 | `--queue-max N` | imagedb-server | a connection's requests queued before its socket is read again | 64 |
 | `--send-timeout MS` | imagedb-server | a connection that takes no byte this long while replies wait is dropped | 30000 |
-| `--conn-cap BYTES` | imagedb-server | a connection's replies waiting to be sent before its next statement waits | 32M |
-| `--reply-budget BYTES` | imagedb-server | every connection's unsent replies, past which only a connection (a role) with none starts a statement | 256M |
+| `--conn-cap BYTES` | imagedb-server | a connection's replies held in memory unsent: past it a result's frames go to the spool, and (with its spooled ones) its next statement waits | 32M |
+| `--reply-budget BYTES` | imagedb-server | every connection's unsent replies in memory: never past it (but a chunk a connection, and the frame one draining a spool reads), and past it only a connection (a role) with none in memory starts a statement | 256M |
 | `--name NAME` | imagedb-server cert | another name in the certificate's subjectAltName (localhost, 127.0.0.1, ::1 always); repeatable | |
 | `--renew` | imagedb-server cert | the same key signed again by the same CA (the pin kept) | |
 | `--host HOST`, `--port PORT` | imagedb-client | TCP with TLS 1.3 | |

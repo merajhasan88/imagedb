@@ -2612,6 +2612,8 @@ static void shares_case(uint64_t budget, uint64_t share, bool queue, bool demote
     imdbs_opts o;
     memset(&o, 0, sizeof o);
     o.test_open_logins = true;
+    o.test_no_spill = budget != 0; /* 2b-2a: the budget's gate is memory's, which spooling keeps under it: its backstop shown
+                                    * as before the spool, every result in memory */
     o.reply_budget = budget;
     o.role_reply_bytes = share;
     o.role_queue_bytes = 1u << 20;
@@ -3053,6 +3055,587 @@ static void t_server_refused_slots(void)
     imdbc_close(a);
     unserve(db, s);
 }
+
+/* ---- 2b-2a: results past their connection's room spooled (docs/n1-design.md §4, §8e) ---- */
+
+static imdbs_counts counts_of(imdbs *s)
+{
+    imdbs_counts n;
+    imdbs_counts_get(s, &n);
+    return n;
+}
+
+/* until the server ran one more request to its end than before (its replies all handed over: memory or spool), 20 s */
+static bool requests_past(imdbs *s, uint64_t before)
+{
+    for (int w = 0; w < 2000; w++) {
+        if (counts_of(s).requests > before) return true;
+        usleep(10000);
+    }
+    return false;
+}
+
+/* until the server's spools hold nothing and no spool file is open (every credit back), 10 s */
+static bool spools_empty(imdbs *s)
+{
+    for (int w = 0; w < 1000; w++) {
+        if (!counts_of(s).spool_held && !imdbsp_live()) return true;
+        usleep(10000);
+    }
+    fprintf(stderr, "    spools: %llu bytes held, %d files\n", (unsigned long long)counts_of(s).spool_held, (int)imdbsp_live());
+    return false;
+}
+
+static const imdbc_stmt k_all = {"SELECT * FROM big2", 18, NULL, 0}; /* 160,000 rows: about 3 MB of frames */
+
+/* a result past its connection's room, its client reading only after the statement ended: the frames past the room
+ * spooled, the replies in memory never past that room and a chunk, every row then delivered in order, and
+ * every credit back once read */
+static void t_server_res_spill(void)
+{
+    imdbs_opts o;
+    memset(&o, 0, sizeof o);
+    o.conn_cap = 1u << 20;
+    o.reply_budget = 64u << 20; /* the connection's room alone binds (the server's budget counts spooled replies too) */
+    imdbs *s = NULL;
+    imdb_db *db = serve(&s, &o);
+    CHECK(db);
+    imdbc *a = login("admin", "pw-admin");
+    CHECK(a);
+    load_rows(a, 400);
+    reply r = {0};
+    /* over TCP the kernel's buffers hold a few megabytes: a result of 1,280,000 rows (about 25 MB) to spill there */
+    const char *q = "SELECT * FROM big2";
+    uint32_t want = 160000;
+    if (g_tcp) {
+        SOFT(q1(a, "CREATE TABLE m (id INT64 PRIMARY KEY, v INT64)", &r) == 0 && !r.nerr);
+        for (int k = 0; k < 8; k++) {
+            char ins[100];
+            snprintf(ins, sizeof ins, "INSERT INTO m SELECT id + %d, v FROM big2", k * 1000000);
+            SOFT(q1(a, ins, &r) == 0 && !r.nerr);
+        }
+        q = "SELECT * FROM m", want = 1280000;
+    }
+    imdbc_stmt big = {q, strlen(q), NULL, 0};
+    imdbs_counts c0 = counts_of(s);
+    imdb_err e = {0};
+    SOFT(imdbc_query(a, &big, 1, &e) == 0);
+    SOFT(requests_past(s, c0.requests));
+    imdbs_counts c1 = counts_of(s);
+    SOFT(c1.res_spilled == c0.res_spilled + 1 && c1.res_spool_bytes > (1u << 20));
+    SOFT(c1.pend_peak <= (1u << 20) + (128u << 10)); /* its room and a chunk: never the 3 MB */
+    if (c1.pend_peak > (1u << 20) + (128u << 10) || c1.res_spilled != c0.res_spilled + 1)
+        fprintf(stderr, "    spilled %llu, %llu bytes, peak in memory %llu\n", (unsigned long long)(c1.res_spilled - c0.res_spilled),
+                (unsigned long long)c1.res_spool_bytes, (unsigned long long)c1.pend_peak);
+    /* its spooled replies count against its connection's room: a statement pipelined behind them waits for the drain */
+    uint64_t st0 = started_now(s);
+    imdbc_stmt two = {"SELECT 2", 8, NULL, 0};
+    SOFT(imdbc_query(a, &two, 1, &e) == 0);
+    usleep(300000);
+    SOFT(started_now(s) == st0);
+    SOFT(read_reply(a, &r) == 0 && r.nrows == want && r.ndone == 1 && !r.nerr && r.state == IMDBW_IDLE);
+    SOFT(!strncmp(r.text, "0|0\n", 4)); /* the first rows first (big2 in key order: 0, 1, ...) */
+    SOFT(read_reply(a, &r) == 0 && !strcmp(r.text, "2\n")); /* then it ran */
+    SOFT(q1(a, "SELECT COUNT(*), SUM(v) FROM big2", &r) == 0 && !strcmp(r.text, "160000|478800\n")); /* the session goes on */
+    SOFT(spools_empty(s));
+    imdbc_close(a);
+    unserve(db, s);
+}
+
+/* every credit of a spooled result back on every path: its client gone part way through it, its session ended by a
+ * KILL with it unread, and the server's stop with one unread */
+static void t_server_res_spill_paths(void)
+{
+    imdbs_opts o;
+    memset(&o, 0, sizeof o);
+    o.conn_cap = 512u << 10;
+    imdbs *s = NULL;
+    imdb_db *db = serve(&s, &o);
+    CHECK(db);
+    imdbc *a = login("admin", "pw-admin");
+    CHECK(a);
+    load_rows(a, 400);
+    imdb_err e = {0};
+    /* gone part way */
+    imdbc *g = login("admin", "pw-admin");
+    imdbs_counts c0 = counts_of(s);
+    SOFT(g && imdbc_query(g, &k_all, 1, &e) == 0);
+    SOFT(requests_past(s, c0.requests) && counts_of(s).spool_held > 0);
+    imdbw_msg m;
+    for (int k = 0; g && k < 3; k++) SOFT(imdbc_next(g, &m, &e) == 0); /* COLUMNS and two ROWS, then gone */
+    imdbc_close(g);
+    SOFT(spools_empty(s));
+    /* a KILL's terminate with it unread */
+    imdbc *t = login("admin", "pw-admin");
+    c0 = counts_of(s);
+    SOFT(t && imdbc_query(t, &k_all, 1, &e) == 0);
+    SOFT(requests_past(s, c0.requests) && counts_of(s).spool_held > 0);
+    reply l = {0};
+    uint64_t victim = 0;
+    if (list_of(a, &l))
+        for (uint32_t i = 0; i < l.nsess && i < 16; i++) victim = l.sess[i].id; /* the newest: t */
+    SOFT(victim && kill_of(a, IMDBW_KILL_TERMINATE, victim, IMDBW_KILLED));
+    SOFT(spools_empty(s));
+    imdbc_close(t);
+    /* the stop with one unread */
+    imdbc *u = login("admin", "pw-admin");
+    c0 = counts_of(s);
+    SOFT(u && imdbc_query(u, &k_all, 1, &e) == 0);
+    SOFT(requests_past(s, c0.requests) && counts_of(s).spool_held > 0);
+    imdbc_close(a);
+    imdb_err se = {0};
+    SOFT(imdbs_stop(s, &se) == 0);
+    SOFT(imdbsp_live() == 0); /* the stop freed the unread spool */
+    imdbc_close(u);
+    imdb_close(db);
+    SOFT(imdbw_live_blocks() == g_blocks);
+}
+
+/* a role's share of the spools (--role-copy-spool, 4 MiB): role plain's two connections each leave a 3 MB result unread:
+ * the first spills within the share, the second crosses it and is refused by name; role other's 3 MB result spills
+ * within its own share and is read whole while plain's are held; a superuser exempt */
+static void t_server_res_role_share(void)
+{
+    imdbs_opts o;
+    memset(&o, 0, sizeof o);
+    o.test_open_logins = true;
+    o.conn_cap = 256u << 10;
+    o.role_copy_spool = 4u << 20;
+    imdbs *s = NULL;
+    imdb_db *db = serve(&s, &o);
+    CHECK(db);
+    imdbc *a = login("admin", "pw-admin");
+    CHECK(a);
+    load_rows(a, 400);
+    reply r = {0};
+    static const char *const setup[] = {"GRANT SELECT ON big2 TO plain", "CREATE ROLE other LOGIN PASSWORD 'pw-o'",
+                                        "GRANT SELECT ON big2 TO other"};
+    for (size_t i = 0; i < sizeof setup / sizeof *setup; i++) SOFT(q1(a, setup[i], &r) == 0 && !r.nerr);
+    imdbc *p0 = login("plain", "pw"), *p = login("plain", "pw"), *ot = login("other", "pw-o");
+    CHECK(p0 && p && ot);
+    imdb_err e = {0};
+    imdbs_counts c0 = counts_of(s);
+    SOFT(imdbc_query(p0, &k_all, 1, &e) == 0); /* spilled within the share, unread */
+    SOFT(requests_past(s, c0.requests));
+    SOFT(counts_of(s).res_refused == c0.res_refused);
+    c0 = counts_of(s);
+    SOFT(imdbc_query(p, &k_all, 1, &e) == 0); /* crosses the share */
+    SOFT(requests_past(s, c0.requests));
+    imdbs_counts c1 = counts_of(s);
+    SOFT(c1.res_refused == c0.res_refused + 1 && c1.role_spool_limits == c0.role_spool_limits + 1);
+    SOFT(q1(ot, "SELECT * FROM big2", &r) == 0 && r.nrows == 160000 && !r.nerr); /* another role's: its own share */
+    if (r.nerr || r.nrows != 160000) fprintf(stderr, "    other's read: %u rows, rc %d, code %u: %s\n", r.nrows, r.rc, r.err_code, r.err);
+    SOFT(q1(a, "SELECT * FROM big2", &r) == 0 && r.nrows == 160000 && !r.nerr);  /* a superuser's: exempt */
+    SOFT(read_reply(p, &r) == 0 && r.nerr == 1 && r.err_code == (uint32_t)-IMDB_ERR_LIMIT && strstr(r.err, "--role-copy-spool") &&
+         r.nrows < 160000 && r.state == IMDBW_IDLE);
+    if (!strstr(r.err, "--role-copy-spool")) fprintf(stderr, "    plain's read: %u rows, %u errors: %s\n", r.nrows, r.nerr, r.err);
+    SOFT(q1(p, "SELECT COUNT(*) FROM big2", &r) == 0 && !strcmp(r.text, "160000\n")); /* the session goes on */
+    SOFT(read_reply(p0, &r) == 0 && !r.nerr && r.nrows == 160000); /* the first, within the share: whole */
+    SOFT(spools_empty(s));
+    imdbc_close(p);
+    imdbc_close(ot);
+    imdbc_close(p0);
+    imdbc_close(a);
+    unserve(db, s);
+}
+
+/* the server's spools full: a read past its room refused by name (ERROR 3, what was handed over before it kept), and a
+ * write's RETURNING past every bound delivered whole with its commit (its rows are in the log: never refused) */
+static void t_server_res_bounds(void)
+{
+    imdbs_opts o;
+    memset(&o, 0, sizeof o);
+    o.conn_cap = 256u << 10;
+    o.copy_spool = 512u << 10;
+    imdbs *s = NULL;
+    imdb_db *db = serve(&s, &o);
+    CHECK(db);
+    imdbc *a = login("admin", "pw-admin"), *b = login("admin", "pw-admin");
+    CHECK(a && b);
+    load_rows(a, 400);
+    reply r = {0};
+    SOFT(q1(a, "CREATE TABLE w (id INT64 PRIMARY KEY, v INT64)", &r) == 0 && !r.nerr);
+    imdb_err e = {0};
+    imdbs_counts c0 = counts_of(s);
+    SOFT(imdbc_query(b, &k_all, 1, &e) == 0);
+    SOFT(requests_past(s, c0.requests));
+    SOFT(read_reply(b, &r) == 0 && r.nerr == 1 && r.err_code == (uint32_t)-IMDB_ERR_LIMIT && strstr(r.err, "--copy-spool") &&
+         r.nrows < 160000);
+    imdbc_stmt ins = {"INSERT INTO w SELECT id, v FROM big2 RETURNING id, v", 52, NULL, 0};
+    c0 = counts_of(s);
+    SOFT(imdbc_query(a, &ins, 1, &e) == 0);
+    SOFT(requests_past(s, c0.requests));
+    imdbs_counts c1 = counts_of(s);
+    SOFT(c1.res_spool_bytes - c0.res_spool_bytes > (512u << 10)); /* spooled past the server's bound */
+    SOFT(read_reply(a, &r) == 0 && !r.nerr && r.nrows == 160000 && r.ndone == 1 && r.has_write && r.write_commit > 0);
+    SOFT(q1(b, "SELECT COUNT(*) FROM w", &r) == 0 && !strcmp(r.text, "160000\n"));
+    SOFT(spools_empty(s));
+    imdbc_close(a);
+    imdbc_close(b);
+    unserve(db, s);
+}
+
+/* no spool directory: a read past its room refused by name; a write's RETURNING held in memory and delivered whole */
+static void t_server_res_nospool(void)
+{
+    imdbs_opts o;
+    memset(&o, 0, sizeof o);
+    o.conn_cap = 256u << 10;
+    g_nospool = true;
+    imdbs *s = NULL;
+    imdb_db *db = serve(&s, &o);
+    g_nospool = false;
+    CHECK(db);
+    imdbc *a = login("admin", "pw-admin"), *b = login("admin", "pw-admin");
+    CHECK(a && b);
+    load_rows(a, 400);
+    reply r = {0};
+    SOFT(q1(a, "CREATE TABLE w (id INT64 PRIMARY KEY, v INT64)", &r) == 0 && !r.nerr);
+    imdb_err e = {0};
+    imdbs_counts c0 = counts_of(s);
+    SOFT(imdbc_query(b, &k_all, 1, &e) == 0);
+    SOFT(requests_past(s, c0.requests));
+    SOFT(read_reply(b, &r) == 0 && r.nerr == 1 && r.err_code == (uint32_t)-IMDB_ERR_STATE && strstr(r.err, "spool directory"));
+    imdbc_stmt ins = {"INSERT INTO w SELECT id, v FROM big2 RETURNING id, v", 52, NULL, 0};
+    c0 = counts_of(s);
+    SOFT(imdbc_query(a, &ins, 1, &e) == 0);
+    SOFT(requests_past(s, c0.requests));
+    SOFT(read_reply(a, &r) == 0 && !r.nerr && r.nrows == 160000 && r.has_write);
+    imdbc_close(a);
+    imdbc_close(b);
+    unserve(db, s);
+}
+
+/* 2b-2a's measure (recorded, never asserted): IMDB_SRV_RES_ROWS rows (a multiple of 160,000) read by SELECT * through
+ * the socket by a client that reads at once, three runs each: as before the spool (every frame in memory: the test
+ * option), at the default room (32 MiB a connection) and at a room of 1 MiB; the time and what spilled. Skipped unless
+ * IMDB_SRV_RES_ROWS is set */
+static void t_server_res_measure(void)
+{
+    const char *env = getenv("IMDB_SRV_RES_ROWS");
+    if (!env) return;
+    long want = atol(env), mult = want / 160000 < 1 ? 1 : want / 160000;
+    for (int mode = 0; mode < 3; mode++) {
+        imdbs_opts o;
+        memset(&o, 0, sizeof o);
+        o.test_no_spill = mode == 0;
+        o.conn_cap = mode == 2 ? 1u << 20 : 0;
+        imdbs *s = NULL;
+        imdb_db *db = serve(&s, &o);
+        CHECK(db);
+        imdbc *c = login("admin", "pw-admin");
+        CHECK(c);
+        imdbc_set_timeout(c, 0);
+        load_rows(c, 400);
+        reply r = {0};
+        char q[200];
+        snprintf(q, sizeof q, "CREATE TABLE m (id INT64 PRIMARY KEY, v INT64)");
+        SOFT(q1(c, q, &r) == 0 && !r.nerr);
+        for (long k = 0; k < mult; k++) {
+            snprintf(q, sizeof q, "INSERT INTO m SELECT id + %ld, v FROM big2", k * 1000000L);
+            SOFT(q1(c, q, &r) == 0 && !r.nerr);
+        }
+        for (int run = 0; run < 3; run++) {
+            imdbs_counts c0 = counts_of(s);
+            uint64_t t0 = imdb_mono_ns();
+            SOFT(q1(c, "SELECT * FROM m", &r) == 0 && !r.nerr && r.nrows == (uint32_t)(mult * 160000));
+            uint64_t ms = (imdb_mono_ns() - t0) / 1000000u;
+            imdbs_counts c1 = counts_of(s);
+            fprintf(stderr, "    %s, run %d: %ld rows in %llu ms; spilled %.1f MB; memory peak %.1f MB\n",
+                    mode == 0 ? "before (all in memory)" : mode == 1 ? "room 32 MiB" : "room 1 MiB", run, mult * 160000,
+                    (unsigned long long)ms, (double)(c1.res_spool_bytes - c0.res_spool_bytes) / 1048576.0,
+                    (double)c1.pend_peak / 1048576.0);
+        }
+        imdbc_close(c);
+        unserve(db, s);
+    }
+}
+
+/* 2b-2a (the advisor's 15:1x review): a spool is charged by its file until it is freed. A client that has read all but
+ * the tail of a spooled result leaves the whole file charged (the server's spools and its role's share), its unsent part
+ * alone counted as replies; the rest read, the file freed and every credit back */
+static void t_server_res_tail(void)
+{
+    imdbs_opts o;
+    memset(&o, 0, sizeof o);
+    o.conn_cap = 256u << 10;
+    imdbs *s = NULL;
+    imdb_db *db = serve(&s, &o);
+    CHECK(db);
+    imdbc *a = login("admin", "pw-admin");
+    CHECK(a);
+    load_rows(a, 400);
+    imdb_err e = {0};
+    imdbs_counts c0 = counts_of(s);
+    SOFT(imdbc_query(a, &k_all, 1, &e) == 0);
+    SOFT(requests_past(s, c0.requests));
+    imdbs_counts c1 = counts_of(s);
+    uint64_t file = c1.res_spool_bytes - c0.res_spool_bytes;
+    SOFT(file > (1u << 20) && c1.spool_held == file);
+    imdbw_msg m;
+    uint64_t rows = 0;
+    while (rows < 150000 && imdbc_next(a, &m, &e) == 0) /* all but the tail */
+        if (m.type == IMDBW_ROWS) rows += m.nsets;
+    usleep(200000);
+    imdbs_counts c2 = counts_of(s);
+    SOFT(rows >= 150000 && rows < 160000 && c2.spool_held == file); /* the whole file still charged */
+    if (c2.spool_held != file) fprintf(stderr, "    after %llu rows read: %llu of %llu charged\n", (unsigned long long)rows,
+                                       (unsigned long long)c2.spool_held, (unsigned long long)file);
+    reply r = {0};
+    SOFT(read_reply(a, &r) == 0 && rows + r.nrows == 160000 && r.ndone == 1);
+    SOFT(spools_empty(s));
+    imdbc_close(a);
+    unserve(db, s);
+}
+
+/* a KILL's terminate of a session whose client still reads (a spooled result's backlog taking it over a second): the
+ * whole result, then the ERROR (its deadline runs from the last byte its client took, never from the KILL) */
+static void t_server_res_kill_reading(void)
+{
+    imdbs_opts o;
+    memset(&o, 0, sizeof o);
+    o.conn_cap = 256u << 10;
+    imdbs *s = NULL;
+    imdb_db *db = serve(&s, &o);
+    CHECK(db);
+    imdbc *a = login("admin", "pw-admin"), *t = login("admin", "pw-admin");
+    CHECK(a && t);
+    load_rows(a, 400);
+    imdb_err e = {0};
+    imdbs_counts c0 = counts_of(s);
+    SOFT(imdbc_query(t, &k_all, 1, &e) == 0);
+    SOFT(requests_past(s, c0.requests) && counts_of(s).spool_held > 0);
+    reply l = {0};
+    uint64_t victim = 0;
+    if (list_of(a, &l))
+        for (uint32_t i = 0; i < l.nsess && i < 16; i++) victim = l.sess[i].id; /* the newest: t */
+    SOFT(victim && kill_of(a, IMDBW_KILL_TERMINATE, victim, IMDBW_KILLED));
+    imdbw_msg m;
+    uint64_t rows = 0, t0 = imdb_mono_ns();
+    bool killed = false;
+    while (imdbc_next(t, &m, &e) == 0) { /* a frame every 40 ms: the backlog takes it well over a second */
+        if (m.type == IMDBW_ROWS) rows += m.nsets;
+        if (m.type == IMDBW_ERROR && m.ntexts && memmem(m.texts[0].p, m.texts[0].len, "a KILL", 6)) killed = true;
+        usleep(40000);
+    }
+    uint64_t ms = (imdb_mono_ns() - t0) / 1000000u;
+    SOFT(rows == 160000 && killed && ms > 1000);
+    if (rows != 160000 || !killed) fprintf(stderr, "    the killed reader: %llu rows, ERROR %d, %llu ms\n", (unsigned long long)rows, killed,
+                                           (unsigned long long)ms);
+    SOFT(spools_empty(s));
+    imdbc_close(t);
+    imdbc_close(a);
+    unserve(db, s);
+}
+
+/* COPY's role share (--role-copy-spool, 1 MiB): a role's COPY FROM past it refused at once (the table unchanged); its
+ * COPY TO's ring stops growing at the share and wraps there (the export whole, the role's spools never past the share
+ * while it runs). (A ring that cannot take a byte fails at once by name: the server bound's path, server_copy_full) */
+static void t_server_copy_role_share(void)
+{
+    imdbs_opts o;
+    memset(&o, 0, sizeof o);
+    o.test_open_logins = true;
+    o.role_copy_spool = 1u << 20;
+    o.conn_cap = 128u << 10;
+    imdbs *s = NULL;
+    imdb_db *db = serve(&s, &o);
+    CHECK(db);
+    imdbc *a = login("admin", "pw-admin");
+    CHECK(a);
+    load_rows(a, 400);
+    reply r = {0};
+    static const char *const setup[] = {"CREATE TABLE cf (id INT64 PRIMARY KEY, v INT64)", "GRANT SELECT, INSERT ON cf TO plain",
+                                        "GRANT SELECT ON big2 TO plain"};
+    for (size_t i = 0; i < sizeof setup / sizeof *setup; i++) SOFT(q1(a, setup[i], &r) == 0 && !r.nerr);
+    imdbc *p = login("plain", "pw"), *p2 = login("plain", "pw");
+    CHECK(p && p2);
+    imdb_err e = {0};
+    /* COPY FROM: 2 MB of rows past the 1 MiB share */
+    imdbc_stmt cf = {"COPY cf FROM STDIN", 18, NULL, 0};
+    SOFT(imdbc_query(p, &cf, 1, &e) == 0 && read_reply(p, &r) == 0 && r.copy_in);
+    char line[64];
+    static char chunk[64u << 10];
+    size_t n = 0;
+    for (int i = 0; i < 100000; i++) {
+        int k = snprintf(line, sizeof line, "%d,%d\n", i, i);
+        if (n + (size_t)k > sizeof chunk) {
+            SOFT(imdbc_copy_data(p, chunk, n, &e) == 0);
+            n = 0;
+        }
+        memcpy(chunk + n, line, (size_t)k), n += (size_t)k;
+    }
+    SOFT(imdbc_copy_data(p, chunk, n, &e) == 0 && imdbc_copy_done(p, &e) == 0);
+    SOFT(read_reply(p, &r) == 0 && r.nerr == 1 && r.err_code == (uint32_t)-IMDB_ERR_LIMIT && strstr(r.err, "--role-copy-spool"));
+    SOFT(q1(a, "SELECT COUNT(*) FROM cf", &r) == 0 && !strcmp(r.text, "0\n"));
+    SOFT(spools_empty(s));
+    /* COPY TO: the ring wraps at the share; its client reads after the engine waited, the export whole */
+    imdbc_stmt ct = {"COPY big2 TO STDOUT", 19, NULL, 0};
+    uint64_t before = started_now(s);
+    SOFT(imdbc_query(p, &ct, 1, &e) == 0);
+    wait_started(s, before);
+    usleep(300000); /* the engine fills the ring and waits for its reader */
+    uint64_t held = counts_of(s).spool_held;
+    SOFT(held > 0 && held <= (1u << 20)); /* never past the share */
+    if (held > (1u << 20)) fprintf(stderr, "    COPY TO's ring held %llu bytes\n", (unsigned long long)held);
+    g_out = NULL, g_outlen = 0, g_outcap = 0;
+    SOFT(read_reply(p, &r) == 0 && !r.nerr && r.count == 160000);
+    SOFT(spools_empty(s));
+    /* the share all but 100 bytes held by an upload kept open: a COPY TO's ring could never reach its floor (64 KiB), so it
+     * fails at once by name, never streaming a byte at a time */
+    SOFT(imdbc_query(p, &cf, 1, &e) == 0 && read_reply(p, &r) == 0 && r.copy_in);
+    static char upl[(1u << 20) - 100];
+    memset(upl, 'x', sizeof upl);
+    SOFT(imdbc_copy_data(p, upl, sizeof upl, &e) == 0);
+    for (int w = 0; w < 500 && counts_of(s).spool_held < sizeof upl; w++) usleep(10000);
+    SOFT(counts_of(s).spool_held == sizeof upl);
+    imdbs_counts c0 = counts_of(s);
+    uint64_t t0 = imdb_mono_ns();
+    SOFT(q1(p2, "COPY big2 TO STDOUT", &r) == 0 && r.nerr == 1 && strstr(r.err, "its role's spool share is full"));
+    if (!strstr(r.err, "spool share")) fprintf(stderr, "    COPY TO under the floor: %u errors, %llu bytes: %s\n", r.nerr, (unsigned long long)r.nout, r.err);
+    SOFT((imdb_mono_ns() - t0) / 1000000u < 5000 && counts_of(s).role_spool_limits == c0.role_spool_limits + 1); /* at once */
+    SOFT(imdbc_copy_fail(p, "done", &e) == 0 && read_reply(p, &r) == 0 && r.nerr == 1);
+    SOFT(spools_empty(s));
+    imdbc_close(p);
+    imdbc_close(p2);
+    imdbc_close(a);
+    unserve(db, s);
+}
+
+/* 2b-2a (the advisor's 16:19 review): every spool call failed in turn (imdbsp_fail_at: an open, a write, a read). A read
+ * ends whole, or in one ERROR with no DONE (the frames before it whole), or with its connection closed and no DONE (its
+ * spool unreadable: never a stream cut short and then a DONE); a write's RETURNING arrives whole with its commit, or (a
+ * read of its spool failing) its connection closes, never an ERROR for what committed; the open and the first write
+ * failing, a write's reply falls back to memory, whole. Every credit back after each */
+static void t_server_res_spool_faults(void)
+{
+    imdbs_opts o;
+    memset(&o, 0, sizeof o);
+    o.conn_cap = 256u << 10;
+    imdbs *s = NULL;
+    imdb_db *db = serve(&s, &o);
+    CHECK(db);
+    imdbc *a = login("admin", "pw-admin");
+    CHECK(a);
+    load_rows(a, 400);
+    reply r = {0};
+    imdb_err e = {0};
+    for (int k = 1; k <= 8; k++) {
+        for (int wr = 0; wr < 2; wr++) {
+            char q[160];
+            if (wr) {
+                snprintf(q, sizeof q, "CREATE TABLE w%d_%d (id INT64 PRIMARY KEY, v INT64)", k, wr);
+                SOFT(q1(a, q, &r) == 0 && !r.nerr);
+                snprintf(q, sizeof q, "INSERT INTO w%d_%d SELECT id, v FROM big2 RETURNING id, v", k, wr);
+            } else {
+                snprintf(q, sizeof q, "SELECT * FROM big2");
+            }
+            imdbc *c = login("admin", "pw-admin");
+            SOFT(c != NULL);
+            if (!c) continue;
+            imdbc_stmt st = {q, strlen(q), NULL, 0};
+            imdbs_counts c0 = counts_of(s);
+            imdbsp_fail_at(k);
+            SOFT(imdbc_query(c, &st, 1, &e) == 0);
+            SOFT(requests_past(s, c0.requests));
+            reply x = {0};
+            int rc = read_reply(c, &x);
+            imdbsp_fail_at(0);
+            bool whole = !rc && x.ndone == 1 && x.nrows == 160000 && !x.nerr;
+            bool one_error = !rc && x.nerr == 1 && x.ndone == 0;
+            bool closed = rc && x.ndone == 0 && !x.nerr;
+            bool ok = wr ? (whole || (k > 2 && closed)) : (whole || one_error || closed);
+            SOFT(ok);
+            if (!ok) fprintf(stderr, "    fail at %d, %s: rc %d, %u rows, %u done, %u errors: %s\n", k, wr ? "write" : "read", rc,
+                             x.nrows, x.ndone, x.nerr, x.err);
+            if (wr) {
+                snprintf(q, sizeof q, "SELECT COUNT(*) FROM w%d_%d", k, wr);
+                SOFT(q1(a, q, &r) == 0 && !strcmp(r.text, "160000\n")); /* the write committed whatever its reply met */
+            }
+            imdbc_close(c);
+            SOFT(spools_empty(s));
+        }
+    }
+    imdbc_close(a);
+    unserve(db, s);
+}
+
+/* a batch's earlier statements kept when a later one is refused mid-result: one request of SELECT 1 then a result past
+ * the room and the spools, sent while an earlier reply is unread in the server (a small socket buffer: the first
+ * statement's frames are then still the engine's when the second is refused): the reply is statement 0's DONE, then
+ * the ERROR at index 1 */
+static void t_server_res_batch_refused(void)
+{
+    imdbs_opts o;
+    memset(&o, 0, sizeof o);
+    o.test_sndbuf = 4096; /* the kernel holds a few KiB of a reply: the rest of the first stays the server's, unsent */
+    o.conn_cap = 64u << 10;
+    o.copy_spool = 64u << 10;
+    imdbs *s = NULL;
+    imdb_db *db = serve(&s, &o);
+    CHECK(db);
+    imdbc *a = login("admin", "pw-admin");
+    CHECK(a);
+    load_rows(a, 400);
+    reply r = {0};
+    imdb_err e = {0};
+    /* about 40 KB: past the few KiB the kernel holds, under the connection's 64 KiB (the next request starts), and the next
+     * statement's first chunk beside it past the room: it spills, finds the spools full and is refused at that chunk */
+    imdbc_stmt first = {"SELECT * FROM big2 LIMIT 2000", 29, NULL, 0};
+    imdbc_stmt two[2] = {{"SELECT 1", 8, NULL, 0}, {"SELECT * FROM big2", 18, NULL, 0}};
+    imdbs_counts c0 = counts_of(s);
+    SOFT(imdbc_query(a, &first, 1, &e) == 0 && imdbc_query(a, two, 2, &e) == 0);
+    for (int w = 0; w < 2000 && counts_of(s).requests < c0.requests + 2; w++) usleep(10000);
+    SOFT(read_reply(a, &r) == 0 && r.nrows == 2000 && r.ndone == 1);
+    SOFT(read_reply(a, &r) == 0 && r.ndone == 1 && !strncmp(r.text, "1\n", 2) && r.nerr == 1 && r.err_index == 1 &&
+         r.err_code == (uint32_t)-IMDB_ERR_LIMIT);
+    if (r.ndone != 1 || r.err_index != 1) fprintf(stderr, "    the batch: %u done, %u errors at %u: %s\n", r.ndone, r.nerr, r.err_index, r.err);
+    SOFT(spools_empty(s));
+    imdbc_close(a);
+    unserve(db, s);
+}
+
+/* 2b-2a (the advisor's 17:19 review): the two other bounds of mem_room, each alone binding. The server's budget (1 MiB)
+ * with a connection's room of 64 MiB: a 3 MB result spills and the replies in memory stay within the budget and a chunk
+ * before its client reads. A role's reply share (1 MiB) with the room and the budget large: a role's result spills */
+static void t_server_res_mem_bounds(void)
+{
+    for (int k = 0; k < 2; k++) {
+        imdbs_opts o;
+        memset(&o, 0, sizeof o);
+        o.test_open_logins = true;
+        o.conn_cap = 64u << 20;
+        o.reply_budget = k ? (512u << 20) : (1u << 20);
+        o.role_reply_bytes = k ? (1u << 20) : 0;
+        imdbs *s = NULL;
+        imdb_db *db = serve(&s, &o);
+        CHECK(db);
+        imdbc *a = login("admin", "pw-admin");
+        CHECK(a);
+        load_rows(a, 400);
+        reply r = {0};
+        SOFT(q1(a, "GRANT SELECT ON big2 TO plain", &r) == 0 && !r.nerr);
+        imdbc *c = k ? login("plain", "pw") : login("admin", "pw-admin");
+        CHECK(c);
+        imdb_err e = {0};
+        imdbs_counts c0 = counts_of(s);
+        SOFT(imdbc_query(c, &k_all, 1, &e) == 0);
+        SOFT(requests_past(s, c0.requests));
+        imdbs_counts c1 = counts_of(s);
+        SOFT(c1.res_spilled == c0.res_spilled + 1);
+        SOFT(c1.pend_peak <= (1u << 20) + (192u << 10)); /* the bound and a chunk or two (the floor's): never the 3 MB */
+        if (c1.res_spilled != c0.res_spilled + 1 || c1.pend_peak > (1u << 20) + (192u << 10))
+            fprintf(stderr, "    %s: spilled %llu, peak %llu\n", k ? "the role's share" : "the budget",
+                    (unsigned long long)(c1.res_spilled - c0.res_spilled), (unsigned long long)c1.pend_peak);
+        SOFT(read_reply(c, &r) == 0 && r.nrows == 160000 && !r.nerr);
+        SOFT(spools_empty(s));
+        imdbc_close(c);
+        imdbc_close(a);
+        unserve(db, s);
+    }
+}
+OVER_TCP(t_server_res_spill)
+
 const test_case server_tests[] = {
     {"server_auth", t_server_auth},
     {"server_statements", t_server_statements},
@@ -3070,6 +3653,19 @@ const test_case server_tests[] = {
     {"server_closed_reason", t_server_closed_reason},
     {"server_tcp_closed_reason", t_server_closed_reason_tcp},
     {"server_refused_slots", t_server_refused_slots},
+    {"server_res_spill", t_server_res_spill},
+    {"server_res_spill_paths", t_server_res_spill_paths},
+    {"server_res_role_share", t_server_res_role_share},
+    {"server_res_bounds", t_server_res_bounds},
+    {"server_res_nospool", t_server_res_nospool},
+    {"server_res_measure", t_server_res_measure},
+    {"server_res_tail", t_server_res_tail},
+    {"server_res_kill_reading", t_server_res_kill_reading},
+    {"server_copy_role_share", t_server_copy_role_share},
+    {"server_res_spool_faults", t_server_res_spool_faults},
+    {"server_res_batch_refused", t_server_res_batch_refused},
+    {"server_res_mem_bounds", t_server_res_mem_bounds},
+    {"server_tcp_res_spill", t_server_res_spill_tcp},
     {"server_roles", t_server_roles},
     {"server_protocol", t_server_protocol},
     {"server_stop", t_server_stop},

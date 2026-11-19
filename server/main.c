@@ -34,6 +34,7 @@ static int usage(void)
           "                      [--role-queue-bytes BYTES] [--role-reply-bytes BYTES] [--preauth-max N]\n"
           "                      [--preauth-timeout MS] [--preauth-per-addr N] [--socket-reserve N] [--slice-ms MS]\n"
           "                      [--queue-max N] [--send-timeout MS] [--conn-cap BYTES] [--reply-budget BYTES]\n"
+          "                      [--role-copy-spool BYTES]\n"
           "       imagedb-server cert SDIR [--name NAME]... [--renew]\n", stderr);
     return 2;
 }
@@ -176,6 +177,9 @@ int main(int argc, char **argv)
             uint64_t *f = argv[i][7] == 'q' ? &so.role_queue_bytes : &so.role_reply_bytes; /* 0: none */
             if (!parse_bytes(argv[++i], 0, 64ull << 30, f)) return usage();
             if (!*f) *f = IMDBS_NONE;
+        } else if (!strcmp(argv[i], "--role-copy-spool") && i + 1 < argc) { /* 2b-2a; 0: none */
+            if (!parse_bytes(argv[++i], 0, 1ull << 40, &so.role_copy_spool)) return usage();
+            if (!so.role_copy_spool) so.role_copy_spool = IMDBS_NONE;
         } else if (!strcmp(argv[i], "--preauth-max") && i + 1 < argc) { /* N1e stage two: the server's constants */
             if (!parse_ms(argv[++i], 1, 4096, &so.preauth_max)) return usage();
         } else if (!strcmp(argv[i], "--preauth-timeout") && i + 1 < argc) {

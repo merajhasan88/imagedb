@@ -73,18 +73,18 @@ if [ "$EXPECT" = 1 ]; then
   [ "$stop_rc" -eq 0 ] || fail "a clean stop exited $stop_rc"
   # N1e stage two: the server's constants as options, every one at once, and three out of their bounds refused
   start "$SRV" --preauth-max 8 --preauth-timeout 5000 --preauth-per-addr 2 --socket-reserve 4 --slice-ms 20 --queue-max 16 \
-        --send-timeout 20000 --conn-cap 8M --reply-budget 64M
+        --send-timeout 20000 --conn-cap 8M --reply-budget 64M --role-copy-spool 256M
   net -c 'SELECT 1' >/dev/null || fail "a server with every constant set did not answer"
   stop
   [ "$stop_rc" -eq 0 ] || fail "a clean stop exited $stop_rc"
   for pair in '--mem-limit 0' '--mem-limit 18446744073709551616' '--seg-cache 01M' '--seg-cache never' '--slice-ms 0' \
-              '--queue-max 0' '--conn-cap 1K'; do
+              '--queue-max 0' '--conn-cap 1K' '--role-copy-spool 2T'; do
     rc=0
     # shellcheck disable=SC2086 # two words, an option and its value
     "$SRV" "$P" --socket "$WORK/s" --server-dir "$WORK/sd" $pair >/dev/null 2>&1 || rc=$?
     [ "$rc" -eq 2 ] || fail "$pair: exit $rc, not the usage's 2"
   done
-  echo "the daemon's controls: --mem-limit, --seg-cache (and all), --iceberg, --anchor, the nine constants taken; seven bad values refused"
+  echo "the daemon's controls: --mem-limit, --seg-cache (and all), --iceberg, --anchor, the nine constants and --role-copy-spool taken; eight bad values refused"
 fi
 
 # 1. a failed final close: the server, apply, rewind
