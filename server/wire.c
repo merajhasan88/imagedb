@@ -874,6 +874,7 @@ static void col_put(imdbw_buf *b, const imdbw_col *c)
 
 void imdbw_msg_free(imdbw_msg *m)
 {
+    imdbw_free(m->sess);
     imdbw_free(m->texts);
     imdbw_free(m->params);
     imdbw_cols_unindex(m);
@@ -892,6 +893,33 @@ static int one_text(imdb_rd *r, uint32_t lenbytes, uint32_t min, uint32_t max, i
 static bool done_ok(const imdbw_msg *m)
 {
     return text_ok(&m->status, 0, IMDBW_STATUS_MAX) && (!m->has_write || m->write_commit >= 1);
+}
+
+/* N1e stage two: a SESSIONS_LIST entry's rules, its decoder's and its encoder's: ids strictly increasing (one order, no
+ * id twice), a role, an endpoint (1 TCP, 2 the socket), a state, the role's name 0 to 63 bytes ("" once erased) */
+#define IMDBW_SESS_MIN 23u /* an entry's bytes at least: u64 id, u32 role, u8 endpoint, u8 state, u64 age, u8 length */
+static bool sess_ok(const imdbw_sess *s, uint64_t prev)
+{
+    return s->id > prev && s->role && (s->endpoint == 1 || s->endpoint == 2) && s->state <= IMDBW_SS_COPY &&
+           text_ok(&s->name, 0, IMDBW_USER - 1);
+}
+
+static int sess_get(imdb_rd *r, imdbw_sess *s, uint64_t prev, imdb_err *e)
+{
+    s->id = imdb_rd_u64(r);
+    s->role = imdb_rd_u32(r);
+    s->endpoint = imdb_rd_u8(r);
+    s->state = imdb_rd_u8(r);
+    s->age_ms = imdb_rd_u64(r);
+    if (r->err) return bad(e, "a session cut short");
+    TRY(text_get(r, 1, 0, IMDBW_USER - 1, &s->name, e));
+    if (!sess_ok(s, prev)) return bad(e, "a session's id out of order, or its role, endpoint or state");
+    return IMDB_OK;
+}
+
+static bool kill_ok(uint8_t kind, uint64_t sid)
+{
+    return (kind == IMDBW_KILL_CANCEL || kind == IMDBW_KILL_TERMINATE) && sid;
 }
 
 static int body_get(uint8_t type, imdb_rd *r, const imdbw_msg *cols, imdbw_msg *m, imdb_err *e)
@@ -924,6 +952,25 @@ static int body_get(uint8_t type, imdb_rd *r, const imdbw_msg *cols, imdbw_msg *
         return span_get(r, (uint64_t)m->nsets * m->nvals, NULL, &m->vals, e);
     }
     case IMDBW_DEALLOCATE: return name_get(r, m->name, e);
+    case IMDBW_KILL:
+        m->kill = imdb_rd_u8(r);
+        m->sid = imdb_rd_u64(r);
+        if (r->err || !kill_ok(m->kill, m->sid)) return bad(e, "a KILL's kind (1 cancel, 2 terminate) or a session id of 0");
+        return IMDB_OK;
+    case IMDBW_KILL_DONE:
+        m->code = imdb_rd_u8(r);
+        m->sid = imdb_rd_u64(r);
+        if (r->err || m->code > IMDBW_KILL_NONE || !m->sid) return bad(e, "a KILL_DONE's code or a session id of 0");
+        return IMDB_OK;
+    case IMDBW_SESSIONS_LIST: {
+        uint32_t n = imdb_rd_u32(r);
+        if (r->err || n > IMDBW_SESSIONS_MAX || n > imdb_rd_left(r) / IMDBW_SESS_MIN)
+            return bad(e, "a SESSIONS_LIST of at most 65,536 sessions it holds the bytes of");
+        if (n && !(m->sess = imdbw_alloc(n, sizeof *m->sess))) return nomem(e);
+        m->nsess = n;
+        for (uint32_t i = 0; i < n; i++) TRY(sess_get(r, &m->sess[i], i ? m->sess[i - 1].id : 0, e));
+        return IMDB_OK;
+    }
     case IMDBW_COPY_DATA:
     case IMDBW_COPY_OUT:
         m->dlen = (uint32_t)imdb_rd_left(r);
@@ -932,6 +979,7 @@ static int body_get(uint8_t type, imdb_rd *r, const imdbw_msg *cols, imdbw_msg *
         return IMDB_OK;
     case IMDBW_COPY_FAIL:
     case IMDBW_WARNING: return one_text(r, 2, 0, IMDBW_MESSAGE_MAX, m, e);
+    case IMDBW_SESSIONS:
     case IMDBW_COPY_DONE:
     case IMDBW_CANCEL:
     case IMDBW_PING:
@@ -1097,6 +1145,34 @@ void imdbw_msg_put(imdbw_buf *b, const imdbw_msg *m, const imdbw_msg *cols)
         if (m->state > IMDBW_DOOMED) b->err = true;
         imdbw_put_u8(b, m->state);
         break;
+    case IMDBW_KILL:
+        if (!kill_ok(m->kill, m->sid)) b->err = true;
+        imdbw_put_u8(b, m->kill);
+        imdbw_put_u64(b, m->sid);
+        break;
+    case IMDBW_KILL_DONE:
+        if (m->code > IMDBW_KILL_NONE || !m->sid) b->err = true;
+        imdbw_put_u8(b, (uint8_t)m->code);
+        imdbw_put_u64(b, m->sid);
+        break;
+    case IMDBW_SESSIONS_LIST:
+        if (m->nsess > IMDBW_SESSIONS_MAX || (m->nsess && !m->sess)) {
+            b->err = true;
+            break;
+        }
+        imdbw_put_u32(b, m->nsess);
+        for (uint32_t i = 0; i < m->nsess; i++) {
+            const imdbw_sess *s = &m->sess[i];
+            if (!sess_ok(s, i ? m->sess[i - 1].id : 0)) b->err = true;
+            imdbw_put_u64(b, s->id);
+            imdbw_put_u32(b, s->role);
+            imdbw_put_u8(b, s->endpoint);
+            imdbw_put_u8(b, s->state);
+            imdbw_put_u64(b, s->age_ms);
+            text_put(b, 1, 0, IMDBW_USER - 1, &s->name);
+        }
+        break;
+    case IMDBW_SESSIONS:
     case IMDBW_COPY_DONE:
     case IMDBW_CANCEL:
     case IMDBW_PING:

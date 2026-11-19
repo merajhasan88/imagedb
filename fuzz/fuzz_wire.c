@@ -246,5 +246,15 @@ int LLVMFuzzerInitialize(int *argc, char ***argv)
     seed_frames(dir, "error", 4, m, 1);
     m[0] = (imdbw_msg){.type = IMDBW_READY, .state = IMDBW_IN_TXN};
     seed_frames(dir, "ready", 4, m, 1);
+    /* N1e stage two: KILL, and SESSIONS_LIST and KILL_DONE */
+    m[0] = (imdbw_msg){.type = IMDBW_KILL, .kill = IMDBW_KILL_TERMINATE, .sid = 12};
+    seed_frames(dir, "kill", 3, m, 1);
+    imdbw_sess ss[2] = {{.id = 1, .role = 2, .endpoint = 1, .state = IMDBW_SS_RUNNING, .age_ms = 1500,
+                         .name = {(const uint8_t *)"alice", 5}},
+                        {.id = 7, .role = 3, .endpoint = 2, .state = IMDBW_SS_IN_TXN, .name = {(const uint8_t *)"", 0}}};
+    m[0] = (imdbw_msg){.type = IMDBW_SESSIONS_LIST, .sess = ss, .nsess = 2};
+    seed_frames(dir, "sessions_list", 4, m, 1);
+    m[0] = (imdbw_msg){.type = IMDBW_KILL_DONE, .code = IMDBW_KILL_NONE, .sid = 7};
+    seed_frames(dir, "kill_done", 4, m, 1);
     exit(0);
 }

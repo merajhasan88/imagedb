@@ -6755,6 +6755,10 @@ int imdb_stats_each(imdb_db *db, imdb_stat_fn fn, void *ctx, bool walk_disk)
     STAT("replication.primary_seq", s->repl_primary_seq);
     STAT("rollbacks", s->rollbacks);
     STAT("rollbacks.serializable", s->ser_conflicts); /* E3: SERIALIZABLE commits refused (docs/e3-design.md) */
+    STAT("privilege.refused.kind", s->priv_refused[0]); /* N1e stage two: the gates' refusals, and their events dropped */
+    STAT("privilege.refused.read", s->priv_refused[1]);
+    STAT("privilege.refused.write", s->priv_refused[2]);
+    STAT("privilege.events_dropped", s->priv_events_dropped);
     STAT("log.bytes_appended", s->log_bytes);
     STAT("process.syncs", syncs.n);
     STAT("process.syncs.p50_us", imdb_hist_quantile(&syncs, 500));

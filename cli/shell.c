@@ -224,6 +224,60 @@ static int shell_stmt(cli_runner *rn, const char *sql, size_t len, bool copy_in)
     return rc;
 }
 
+
+/* N1e stage two: the shell's own commands on the server's sessions: \sessions (a superuser's every session, a role's its
+ * own role's), \cancel ID and \terminate ID (KILL); 1 when the line is one of them (its outcome printed, a refusal counted
+ * a failure), 0 for any other line */
+static int shell_meta(cli_runner *rn, const char *line)
+{
+    shell *sh = rn->ctx;
+    char cmd[16] = "";
+    unsigned long long id = 0;
+    char tail = 0;
+    int got = sscanf(line, "\\%15s %llu %c", cmd, &id, &tail);
+    bool list = got == 1 && !strcmp(cmd, "sessions");
+    uint8_t kind = got == 2 && !strcmp(cmd, "cancel") ? IMDBW_KILL_CANCEL : got == 2 && !strcmp(cmd, "terminate") ? IMDBW_KILL_TERMINATE : 0;
+    if (!list && !kind) return 0;
+    imdb_err e = {0};
+    int rc = list ? imdbc_sessions(sh->c, &e) : id ? imdbc_kill(sh->c, kind, id, &e)
+                                                   : imdb_fail(&e, IMDB_ERR_STATE, "a session's id is 1 or more");
+    imdbw_msg m;
+    while (!rc && !(rc = imdbc_next(sh->c, &m, &e))) {
+        if (list && m.type == IMDBW_SESSIONS_LIST) {
+            static const char *const via[] = {"?", "tcp", "socket"};
+            static const char *const st[] = {"idle", "running", "in transaction", "copy data"};
+            if (rn->csv) puts("id,role,name,via,state,age_ms");
+            else printf("%10s  %8s  %-24s  %-6s  %-14s  %s\n", "id", "role", "name", "via", "state", "age");
+            for (uint32_t i = 0; i < m.nsess; i++) {
+                const imdbw_sess *x = &m.sess[i];
+                if (rn->csv) { /* the name quoted, a quote in it doubled (RFC 4180) */
+                    printf("%llu,%u,\"", (unsigned long long)x->id, x->role);
+                    for (uint32_t j = 0; j < x->name.len; j++) {
+                        if (x->name.p[j] == '"') putchar('"');
+                        putchar(x->name.p[j]);
+                    }
+                    printf("\",%s,%s,%llu\n", via[x->endpoint], st[x->state], (unsigned long long)x->age_ms);
+                } else
+                    printf("%10llu  %8u  %-24.*s  %-6s  %-14s  %llu.%03llu s\n", (unsigned long long)x->id, x->role,
+                           (int)x->name.len, (const char *)x->name.p, via[x->endpoint], st[x->state],
+                           (unsigned long long)(x->age_ms / 1000), (unsigned long long)(x->age_ms % 1000));
+            }
+            printf("(%u session%s)\n", m.nsess, m.nsess == 1 ? "" : "s");
+            return 1;
+        }
+        if (kind && m.type == IMDBW_KILL_DONE) {
+            if (m.code == IMDBW_KILLED) {
+                printf("%s session %llu\n", kind == IMDBW_KILL_CANCEL ? "cancelled" : "terminated", id);
+                return 1;
+            }
+            rc = imdb_fail(&e, IMDB_ERR_STATE, "no such session (a role that is not a superuser sees its own role's alone)");
+        }
+        /* (anything else: nothing else is outstanding between statements; read on to the answer) */
+    }
+    cli_print_err("error", &e);
+    rn->failures++;
+    return 1;
+}
 /* the terminal's state while the password is read without echo: a Ctrl-C there puts it back before the default action
  * ends the process (tcsetattr and raise are async-signal-safe), so the terminal never stays without echo */
 static int g_pw_fd = -1;
@@ -340,13 +394,14 @@ int main(int argc, char **argv)
         imdbc_close(sh.c);
         return 1;
     }
-    cli_runner rn = {.stmt = shell_stmt, .ctx = &sh, .csv = csv, .stop_on_error = true};
+    cli_runner rn = {.stmt = shell_stmt, .meta = shell_meta, .ctx = &sh, .csv = csv, .stop_on_error = true};
     rc = 0;
     bool ran = false;
     for (int i = 1; i < argc && !rc; i++) {
         if (!strcmp(argv[i], "-c") && i + 1 < argc) {
             const char *q = argv[++i];
-            rc = cli_run_text(&rn, q, strlen(q));
+            if (q[0] == '\\' && shell_meta(&rn, q)) rc = rn.failures ? 1 : 0; /* N1e stage two: \sessions, \cancel, \terminate */
+            else rc = cli_run_text(&rn, q, strlen(q));
             ran = true;
         } else if (!strcmp(argv[i], "-f") && i + 1 < argc) {
             FILE *f = !strcmp(argv[i + 1], "-") ? stdin : fopen(argv[i + 1], "rb");

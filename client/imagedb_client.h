@@ -1,8 +1,9 @@
 /* N1b: the C client of imagedb's protocol, IMDBWIR1 (docs/n1-design.md §4, §7), over the server's Unix-domain socket
  * (TCP with TLS: N1c). A request is sent whole (imdbc_query, _prepare, _execute, _deallocate, _ping); its replies are
- * read one message at a time (imdbc_next): COLUMNS, ROWS, DONE, ERROR, WARNING, READY, PONG, as strict as the server
- * reads the client. Requests may pipeline: send several, then read each one's replies in order. imdbc_cancel, from any
- * thread, wakes a reader blocked in imdbc_next, which sends CANCEL in band. Its blocks are the wire's (imdbw_alloc). */
+ * read one message at a time (imdbc_next): COLUMNS, ROWS, DONE, ERROR, WARNING, READY, PONG, SESSIONS_LIST, KILL_DONE, as
+ * strict as the server reads the client. Requests may pipeline: send several, then read each one's replies in order.
+ * imdbc_cancel, from any thread, wakes a reader blocked in imdbc_next, which sends CANCEL in band. Its blocks are the
+ * wire's (imdbw_alloc). */
 #ifndef IMAGEDB_CLIENT_H
 #define IMAGEDB_CLIENT_H
 
@@ -41,6 +42,12 @@ int imdbc_prepare(imdbc *c, const char *name, const char *sql, size_t len, imdb_
 int imdbc_execute(imdbc *c, const char *name, const imdbw_value *vals, uint32_t nsets, uint16_t nvals, imdb_err *e);
 int imdbc_deallocate(imdbc *c, const char *name, imdb_err *e);
 int imdbc_ping(imdbc *c, imdb_err *e);
+/* N1e stage two: SESSIONS (a SESSIONS_LIST reply: a superuser's every session, a role's its own role's) and KILL of a
+ * session by its id (IMDBW_KILL_CANCEL: the request it runs now, each of its statements; IMDBW_KILL_TERMINATE: the session
+ * ended, its transaction rolled back): a KILL_DONE reply (code IMDBW_KILLED, _NONE, _DENIED). Both answered out of turn,
+ * as PONG is: behind the replies already sent, before the rest of a request running now */
+int imdbc_sessions(imdbc *c, imdb_err *e);
+int imdbc_kill(imdbc *c, uint8_t kind, uint64_t session, imdb_err *e);
 /* N1d: after a COPY_IN reply, COPY ... FROM STDIN's data (cut into frames of at most 1 MiB), then its end, or its failure
  * (the statement refused unrun, the reason in its ERROR); a COPY TO's bytes arrive as COPY_OUT replies (imdbc_next) */
 int imdbc_copy_data(imdbc *c, const void *p, size_t n, imdb_err *e);

@@ -87,6 +87,13 @@ bool imdbs_failed(imdbs *s);
 /* blocks until the handle fails or imdbs_stop is called elsewhere, or ms pass (0: forever); true when it failed */
 bool imdbs_wait_failed(imdbs *s, uint32_t ms);
 
+/* D34: why a connection's thread ended (imdbs_counts.ends): never authenticated, its login refused, its client left
+ * (EOF or a failed read or write), hung up (POLLHUP, POLLERR), its descriptor not open (POLLNVAL: closed by another),
+ * EBADF on a read or write, a protocol error, TERMINATE, send_timeout, copy_idle, the engine gone, a KILL, the stop, a
+ * failed poll */
+enum { IMDBS_END_UNAUTH, IMDBS_END_REFUSED, IMDBS_END_LEFT, IMDBS_END_HUP, IMDBS_END_NVAL, IMDBS_END_EBADF, IMDBS_END_PROTOCOL,
+       IMDBS_END_TERMINATE, IMDBS_END_SEND, IMDBS_END_COPY_IDLE, IMDBS_END_GONE, IMDBS_END_KILL, IMDBS_END_STOP,
+       IMDBS_END_POLL, IMDBS_END_N };
 typedef struct imdbs_counts {
     uint64_t accepted;     /* connections taken */
     uint64_t logins;       /* authentications accepted */
@@ -116,6 +123,12 @@ typedef struct imdbs_counts {
     uint64_t role_queue_waits; /* N1e stage two: a connection's reads held by its role's queue share (once a hold) */
     uint64_t cb_refused;   /* §8f: hellos whose binding type this server refuses (none on TCP, end-point by default, any on
                             * the socket), in refusals too */
+    uint64_t kills;        /* N1e stage two: KILLs taken (KILL_DONE code 0) */
+    uint64_t kills_refused; /* and refused (code 1: no such session, or to a role another role's) */
+    uint64_t oot_waits;    /* N1e stage two: a connection's reads paused for its out-of-turn answers unsent (once a pause) */
+    uint64_t oot_peak;     /* and the most of them any connection held unsent (OOT_MAX and one frame at most) */
+    uint64_t conns;        /* D34: gauge: connections in the server's list (nconns, the count the reserve reads) */
+    uint64_t ends[IMDBS_END_N]; /* D34: connection threads ended, by cause (IMDBS_END_*): which way a connection left */
 } imdbs_counts;
 void imdbs_counts_get(imdbs *s, imdbs_counts *c);
 /* N1c: the TCP port listened on (0: none), an ephemeral one's number; cert_days: server.crt's whole days left */

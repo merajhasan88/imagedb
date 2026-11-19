@@ -65,7 +65,9 @@ enum {
     IMDBW_CANCEL = 8,
     IMDBW_PING = 9,
     IMDBW_TERMINATE = 10,
-    IMDBW_CLIENT_LAST = 10,
+    IMDBW_SESSIONS = 11, /* N1e stage two: the sessions (a superuser's all; a role's its own), answered out of turn */
+    IMDBW_KILL = 12,     /* N1e stage two: cancel or terminate a session by its id (a superuser's; a role's own role) */
+    IMDBW_CLIENT_LAST = 12,
     IMDBW_COLUMNS = 64,
     IMDBW_ROWS = 65,
     IMDBW_DONE = 66,
@@ -75,12 +77,21 @@ enum {
     IMDBW_COPY_OUT = 70,
     IMDBW_READY = 71,
     IMDBW_PONG = 72,
-    IMDBW_SERVER_LAST = 72,
+    IMDBW_SESSIONS_LIST = 73,
+    IMDBW_KILL_DONE = 74,
+    IMDBW_SERVER_LAST = 74,
 };
 
 /* READY's states: a failed statement is undone alone (statement-level rollback), so a transaction goes on after an
  * ERROR; a doomed one (an ALTER, an ERASE, a SERIALIZABLE conflict) takes only ROLLBACK */
 enum { IMDBW_IDLE = 0, IMDBW_IN_TXN = 1, IMDBW_DOOMED = 2 };
+/* N1e stage two: KILL's kind (1 cancel, 2 terminate) and KILL_DONE's code (0 done, 1 no such session: to a role that is
+ * not a superuser, another role's session too, as SESSIONS shows it none); a session's state in SESSIONS_LIST (0 idle, 1 running a request, 2 in a
+ * transaction between requests, 3 receiving a COPY's data) */
+enum { IMDBW_KILL_CANCEL = 1, IMDBW_KILL_TERMINATE = 2 };
+enum { IMDBW_KILLED = 0, IMDBW_KILL_NONE = 1 };
+enum { IMDBW_SS_IDLE = 0, IMDBW_SS_RUNNING = 1, IMDBW_SS_IN_TXN = 2, IMDBW_SS_COPY = 3 };
+#define IMDBW_SESSIONS_MAX 65536u
 
 /* a value's wire type: the contract (docs/n1-design.md §4), not the engine's internal forms */
 enum {
@@ -256,7 +267,21 @@ typedef struct imdbw_msg {
     bool own;                           /* the read saw its transaction's own writes, past its commit (snap_own) */
     uint32_t code, index;               /* ERROR: the engine's code (1 to 15 in this imagedb: IMDB_ERR_* negated), its index */
     uint8_t state;                      /* READY */
+    uint8_t kill;                       /* KILL: its kind (IMDBW_KILL_*); KILL_DONE: its code is code (u8 on the wire) */
+    uint64_t sid;                       /* KILL: the session's id; KILL_DONE: the one it answers */
+    struct imdbw_sess *sess;            /* SESSIONS_LIST: its sessions (pointing into the frame's body) */
+    uint32_t nsess;
 } imdbw_msg;
+
+/* N1e stage two: a session in SESSIONS_LIST: its id (a counter at accept, never reused), its role, its endpoint (1 TCP, 2
+ * the socket), its state (IMDBW_SS_*), its age in ms since its login, its role's name (1 to 63 bytes, as a hello's) */
+typedef struct imdbw_sess {
+    uint64_t id;
+    uint32_t role;
+    uint8_t endpoint, state;
+    uint64_t age_ms;
+    imdbw_text name;
+} imdbw_sess;
 
 /* a frame's body decoded: a ROWS frame against the COLUMNS message before it (cols; ignored for the other types), each
  * value its column's type or NULL (imdbw_value_fits) */

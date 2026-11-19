@@ -634,11 +634,80 @@ static void t_priv_demoted(void)
     g_r.cross_check = false;
     teardown(db);
 }
+
+/* N1e stage two: each gate's refusal counted (A: a kind or a SET past a cap, B: a read, C: a write's target) and an
+ * event "privilege" (the role's id, never its name; the gate; the relation's id; the shape, no value), at most 4 a second
+ * a role: a burst's events and its dropped count add to its refusals */
+static void t_priv_events(void)
+{
+    const char *dir = test_tmpdir();
+    char db_dir[600], ev[600];
+    snprintf(db_dir, sizeof db_dir, "%s/db", dir);
+    snprintf(ev, sizeof ev, "%s/events.jsonl", dir);
+    imdb_err e = {0};
+    CHECK_OK(imdb_init(db_dir, false, NULL, &e));
+    imdb_open_opts o = {.sync = 0, .events_path = ev};
+    imdb_db *db = NULL;
+    CHECK_OK(imdb_open(db_dir, &o, &db, &e));
+    imdb_session_init(&g_a, db);
+    imdb_session_init(&g_r, db);
+    ADMIN("CREATE TABLE secret (id INT64 PRIMARY KEY, v INT64)");
+    ADMIN("CREATE ROLE prober");
+    ADMIN("CREATE ROLE admin SUPERUSER"); /* named by the prober's refused statements */
+    g_r.enforce = true;
+    g_r.role = imdb_role_by_name(db, "prober")->id;
+    g_r.caps = (imdb_caps){.stmt_ms = 1000};
+    uint32_t rel = imdb_table_by_name(db, "secret")->s.id;
+    uint64_t r0[3] = {db->stats.priv_refused[0], db->stats.priv_refused[1], db->stats.priv_refused[2]};
+    uint64_t t0 = imdb_mono_ns() / 1000000000u, d00 = db->stats.priv_events_dropped;
+    REFUSED("CREATE TABLE x (id INT64 PRIMARY KEY)", "needs a superuser");     /* A */
+    REFUSED("SET statement_timeout = 0", "the server's cap for a role");        /* A: a SET past a cap */
+    REFUSED("SELECT v FROM secret WHERE id = 42", "permission denied for table secret"); /* B */
+    REFUSED("INSERT INTO secret VALUES (1, 2)", "permission denied for table secret");   /* C */
+    REFUSED("SHOW GRANTS FOR admin", "needs a superuser");                     /* A (no gate: kind's count) */
+    REFUSED("ALTER ROLE admin PASSWORD 'pw-x'", "needs a superuser");            /* A: a role's name and a secret */
+    SOFT(db->stats.priv_refused[0] == r0[0] + 4 && db->stats.priv_refused[1] == r0[1] + 1 &&
+         db->stats.priv_refused[2] == r0[2] + 1);
+    uint64_t d0 = db->stats.priv_events_dropped;
+    for (int k = 0; k < 12; k++) REFUSED("SELECT v FROM secret", "permission denied");
+    uint64_t secs = imdb_mono_ns() / 1000000000u - t0 + 1;
+    uint64_t dropped = db->stats.priv_events_dropped - d00;
+    (void)d0;
+    imdb_session_close(&g_r);
+    imdb_session_close(&g_a);
+    CHECK_OK(imdb_close(db));
+    /* the log: every privilege event's fields, and the burst's count */
+    static char buf[1u << 20];
+    FILE *f = fopen(ev, "r");
+    size_t got = f ? fread(buf, 1, sizeof buf - 1, f) : 0;
+    if (f) fclose(f);
+    buf[got] = 0;
+    int n = 0, gb = 0;
+    char want_b[96], want_c[96];
+    snprintf(want_b, sizeof want_b, "\"gate\":\"B\",\"relation\":%u,", rel);
+    snprintf(want_c, sizeof want_c, "\"gate\":\"C\",\"relation\":%u,", rel);
+    for (char *p = buf; (p = strstr(p, "\"ev\":\"privilege\"")); p++) {
+        char *eol = strchr(p, '\n');
+        if (eol) *eol = 0;
+        n++;
+        gb += strstr(p, want_b) != NULL;
+        /* the role's id, never a role's name (its own, or one a statement names: SHOW GRANTS FOR, ALTER ROLE keep their
+         * leading keywords alone), never a value (the shape's ?), never a password */
+        SOFT(!strstr(p, "prober") && !strstr(p, "admin") && !strstr(p, "pw-x") && !strstr(p, "42"));
+        if (eol) *eol = '\n';
+    }
+    SOFT(strstr(buf, want_c) != NULL && strstr(buf, "\"gate\":\"A\"") && gb >= 1);
+    /* 18 refusals: 6 before the burst, 12 in it; events and the dropped count add to them, at most 4 a second */
+    SOFT((uint64_t)n + dropped == 18);
+    SOFT((uint64_t)n <= 4 * (secs + 1));
+    if ((uint64_t)n + dropped != 18) fprintf(stderr, "    privilege events %d, dropped %llu, of 18\n", n, (unsigned long long)dropped);
+}
 const test_case priv_tests[] = {
     {"priv_kinds", t_priv_kinds},     {"priv_principal", t_priv_principal}, {"priv_super", t_priv_super},
     {"priv_reads", t_priv_reads},     {"priv_member", t_priv_member},       {"priv_writes", t_priv_writes},
     {"priv_dropped", t_priv_dropped}, {"priv_copy_open", t_priv_copy_open}, {"priv_unrun", t_priv_unrun}, {"priv_lake", t_priv_lake},
     {"priv_caps", t_priv_caps},
     {"priv_demoted", t_priv_demoted},
+    {"priv_events", t_priv_events},
 };
 const size_t priv_ntests = sizeof priv_tests / sizeof *priv_tests;

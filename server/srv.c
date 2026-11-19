@@ -17,6 +17,7 @@
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h> /* qsort */
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -44,6 +45,7 @@
 #define FLUSH_AT (64u << 10)      /* the engine hands a connection its frames once this many are encoded */
 #define ROWS_TARGET (64u << 10)   /* a ROWS frame cut at a row's end once past this */
 #define QBYTES_MAX (64ull << 20)  /* a connection's queued request bytes before its socket is read again */
+#define OOT_MAX (64u << 10)        /* N1e stage two: its out-of-turn answers unsent before its socket is read again */
 #define BUDGET (256ull << 20)     /* every connection's unsent replies: past it, only a connection with none runs */
 #define STOP_FLUSH_MS 1000        /* at a stop, a connection's last replies get this long */
 
@@ -74,6 +76,7 @@ typedef struct outbuf { /* whole frames, sent in order */
     uint8_t *p;
     size_t len, off;
     cring *ring;         /* N1d: no frame but a COPY TO's place: its ring's bytes go out here as COPY_OUT frames */
+    bool oot;            /* N1e stage two: a frame its connection's thread put (conn_put): counted in conn.oot */
 } outbuf;
 
 typedef struct conn conn;
@@ -94,6 +97,7 @@ typedef struct rq {
     uint32_t at;     /* the next statement or parameter set: a request pauses and resumes at a boundary */
     imdb_rd vals;    /* EXECUTE: its values from set at */
     bool begun;
+    _Atomic bool killed; /* N1e stage two: a KILL's cancel holds for this request (its statements start cancelled) */
 } rq;
 
 struct conn {
@@ -107,6 +111,15 @@ struct conn {
     bool super;          /* N1e stage two (under mu): its role a superuser (at its login, then at each change of the roles)
                           * exempt from the role's shares */
     uint64_t served;     /* under mu: the engine thread's turn it was last served at (pick: a role's least recent first) */
+    uint64_t id;         /* N1e stage two: its session's id, a counter at accept never reused (SESSIONS, KILL) */
+    uint64_t login_ns;   /* N1e stage two (under mu): when it authenticated (SESSIONS' age) */
+    uint8_t txstate;     /* N1e stage two (under mu): its READY's state at its last request's end (SESSIONS) */
+    bool kill_term;      /* N1e stage two (under mu): a KILL ended it: its thread stops reading, says so, then closes */
+    bool cin_kill;       /* N1e stage two (under mu): a KILL's cancel of the COPY whose data arrives (its thread refuses it) */
+    uint64_t oot;        /* N1e stage two (under mu): its out-of-turn frames' bytes unsent (PONG, SESSIONS_LIST, KILL_DONE,
+                          * its ERRORs): past OOT_MAX its socket is not read, so a client that asks and never reads holds
+                          * at most that much (a frame each answer: one SESSIONS_LIST may pass it alone) */
+    bool oot_held;       /* N1e stage two (under mu): reading paused for them (counted once a pause) */
     pthread_t th;
     bool started;
     /* under imdbs.mu */
@@ -170,6 +183,7 @@ struct imdbs {
     conn *last;          /* the session run last and since when */
     uint32_t rr_role;    /* N1e stage two: the role served last (turns go by role, then by connection) */
     uint64_t serve_clock; /* each turn's number: a connection's served is its last turn's */
+    uint64_t next_id;    /* N1e stage two: the last session id given (under mu) */
     uint64_t last_since;
     _Atomic bool stopping;
     bool failed;
@@ -728,6 +742,7 @@ static bool run(imdbs *s, rq *r)
         role_caps(&s->o, &c->ses.caps); /* N1e stage two: held while its role is not a superuser */
         c->ses_open = true;
     }
+    if (atomic_load(&r->killed)) imdb_session_cancel_held(&c->ses, true); /* N1e stage two: a KILL before its session was */
     imdbw_buf b;
     imdbw_buf_init(&b);
     c->run_b = &b;
@@ -953,6 +968,8 @@ static void *engine_main(void *arg)
         pthread_mutex_lock(&s->mu);
         c->running = false;
         if (ended) {
+            if (r->type != RQ_CLOSE) c->txstate = ready_state(c); /* N1e stage two: SESSIONS' state */
+            if (atomic_load(&r->killed) && c->ses_open) imdb_session_cancel_held(&c->ses, false); /* its hold ends with it */
             c->rh = r->next;
             if (!c->rh) c->rt = NULL;
             c->nq--;
@@ -1141,6 +1158,7 @@ static bool authenticate(conn *c)
         if (!c->refuse) { /* N1e: the role its session acts as (a refused login's acts as none) */
             c->role = rid;
             c->super = super;
+            c->login_ns = imdb_mono_ns(); /* N1e stage two: SESSIONS' age */
         }
     } else {
         s->n.refusals++;
@@ -1209,8 +1227,10 @@ static void conn_put(conn *c, const imdbw_msg *m)
         imdbw_buf_free(&b);
         return;
     }
-    o->p = b.p, o->len = b.len;
+    o->p = b.p, o->len = b.len, o->oot = true;
     pthread_mutex_lock(&s->mu);
+    c->oot += o->len; /* N1e stage two */
+    if (c->oot > s->n.oot_peak) s->n.oot_peak = c->oot;
     if (c->ot) c->ot->next = o;
     else c->oh = o;
     c->ot = o;
@@ -1285,6 +1305,107 @@ static bool copy_frame(conn *c, const imdbw_msg *m)
     return true;
 }
 
+/* under mu, by the connection's own thread (its spool is written outside mu): the COPY whose data arrives refused, never
+ * run, the rest of its data read and dropped */
+static void cin_cancel(imdbs *s, conn *c, const char *by)
+{
+    snprintf(c->cin_msg, sizeof c->cin_msg, "statement cancelled%s: the COPY never ran (the rest of its data is read and "
+                                            "dropped)", by);
+    c->cin_err = IMDB_ERR_CANCELLED;
+    cin_drop(s, c);
+    s->n.cancels++;
+    pthread_cond_broadcast(&s->cv);
+}
+
+/* N1e stage two: SESSIONS, answered here out of turn as PONG is (§4): a superuser's every session, a role's its own role's;
+ * each its id, role, endpoint, state (at its last request's end, or running, or receiving a COPY's data), age since its
+ * login, and its role's name as the logins give it now ("" for a role no longer among them: dropped, NOLOGIN, erased; a
+ * session keeps no copy of a name, so ERASE ROLE's wipe reaches every one). false when no memory: the ERROR, then the close */
+static int sess_by_id(const void *a, const void *b)
+{
+    uint64_t x = ((const imdbw_sess *)a)->id, y = ((const imdbw_sess *)b)->id;
+    return x < y ? -1 : x > y;
+}
+
+/* a session SESSIONS lists to a caller: a superuser's every one, a role's its own role's (under mu) */
+static bool sess_listed(const conn *o, bool su, uint32_t me) { return o->role && !o->closed && (su || o->role == me); }
+
+static bool sessions_answer(conn *c)
+{
+    imdbs *s = c->s;
+    logins *l = logins_take(s);
+    pthread_mutex_lock(&s->mu);
+    bool su = c->super;
+    uint32_t me = c->role, n = 0, k = 0;
+    for (conn *o = s->conns; o; o = o->next) n += sess_listed(o, su, me);
+    imdbw_sess *v = n ? imdbw_alloc(n, sizeof *v) : NULL;
+    uint64_t now = imdb_mono_ns();
+    for (conn *o = s->conns; v && o && k < n; o = o->next) {
+        if (!sess_listed(o, su, me)) continue;
+        imdbw_sess *x = &v[k++];
+        x->id = o->id, x->role = o->role, x->endpoint = o->tcp ? 1 : 2;
+        x->state = o->cin == CIN_OPEN && !o->cin_end                    ? IMDBW_SS_COPY
+                   : o->running || (o->rh && o->rh->type != RQ_CLOSE) ? IMDBW_SS_RUNNING
+                   : o->txstate != IMDBW_IDLE                          ? IMDBW_SS_IN_TXN
+                                                                       : IMDBW_SS_IDLE;
+        x->age_ms = now > o->login_ns ? (now - o->login_ns) / 1000000u : 0;
+        x->name = (imdbw_text){(const uint8_t *)"", 0}; /* until the logins name it */
+    }
+    pthread_mutex_unlock(&s->mu);
+    bool ok = !n || v;
+    if (ok) {
+        qsort(v, k, sizeof *v, sess_by_id); /* one order: ids increasing (the codec's rule) */
+        for (uint32_t i = 0; i < k; i++)
+            for (uint32_t j = 0; l && j < l->n; j++)
+                if (l->e[j].id == v[i].role) {
+                    v[i].name = (imdbw_text){(const uint8_t *)l->e[j].name, (uint32_t)strlen(l->e[j].name)};
+                    break;
+                }
+        imdbw_msg r = {.type = IMDBW_SESSIONS_LIST, .sess = v, .nsess = k};
+        conn_put(c, &r);
+    } else {
+        imdbw_text t = {(const uint8_t *)"out of memory listing the sessions: the connection closed", 57};
+        imdbw_msg er = {.type = IMDBW_ERROR, .code = (uint32_t)-IMDB_ERR_NOMEM, .texts = &t, .ntexts = 1};
+        conn_put(c, &er);
+    }
+    imdbw_free(v);
+    logins_put(s, l);
+    return ok;
+}
+
+/* N1e stage two: KILL, answered here (no engine turn: a superuser who logs in while the engine runs a long statement
+ * reaches it): a superuser's, or a role's on its own role's sessions. Cancel holds for the request running now (or begun
+ * and paused), so each of its statements starts cancelled, however close to its start the KILL lands; terminate also has
+ * the session's thread stop reading, send an ERROR and close, as when its client leaves (its transaction rolled back) */
+static void kill_answer(conn *c, const imdbw_msg *m)
+{
+    imdbs *s = c->s;
+    uint32_t code = IMDBW_KILL_NONE;
+    pthread_mutex_lock(&s->mu);
+    conn *t = NULL;
+    for (conn *o = s->conns; o && !t; o = o->next)
+        if (o->id == m->sid && o->role && !o->closed) t = o;
+    if (t && !c->super && t->role != c->role) t = NULL; /* another role's: none to a role, as SESSIONS shows it none */
+    if (t) {
+        code = IMDBW_KILLED;
+        rq *r = t->rh; /* the request running, begun, or next to run (queued behind another connection's): it starts cancelled */
+        if (r && r->type != RQ_CLOSE) {
+            atomic_store(&r->killed, true);
+            if (t->ses_open) imdb_session_cancel_held(&t->ses, true);
+        }
+        /* a COPY whose data arrives: refused by its own thread at its next turn (it writes the spool outside mu) */
+        if (t->cin == CIN_OPEN && !t->cin_end && !t->cin_err) t->cin_kill = true;
+        if (m->kill == IMDBW_KILL_TERMINATE) t->kill_term = true;
+        pthread_cond_broadcast(&s->cv); /* a COPY TO waiting for room sees it */
+        wake(t->wake[1]);
+    }
+    s->n.kills += code == IMDBW_KILLED;
+    s->n.kills_refused += code != IMDBW_KILLED;
+    pthread_mutex_unlock(&s->mu);
+    imdbw_msg r = {.type = IMDBW_KILL_DONE, .code = code, .sid = m->sid};
+    conn_put(c, &r);
+}
+
 /* a frame from the client: a request queued, CANCEL and PING answered here; false when the connection is to end (a
  * protocol error, after its ERROR) */
 static bool take_frame(conn *c, uint8_t type, uint8_t *body, uint32_t len, bool *terminate)
@@ -1342,12 +1463,7 @@ static bool take_frame(conn *c, uint8_t type, uint8_t *body, uint32_t len, bool 
     case IMDBW_CANCEL: /* the statement running now, never one queued behind it (§4); no reply of its own */
         pthread_mutex_lock(&s->mu);
         if (c->cin == CIN_OPEN && !c->cin_end && !c->cin_err) { /* N1d: a COPY whose data arrives: refused, never run */
-            snprintf(c->cin_msg, sizeof c->cin_msg, "statement cancelled: the COPY never ran (the rest of its data is "
-                                                    "read and dropped)");
-            c->cin_err = IMDB_ERR_CANCELLED;
-            cin_drop(s, c);
-            s->n.cancels++;
-            pthread_cond_broadcast(&s->cv);
+            cin_cancel(s, c, "");
         } else if (c->running && c->ses_open) {
             imdb_session_cancel(&c->ses);
             s->n.cancels++;
@@ -1360,6 +1476,14 @@ static bool take_frame(conn *c, uint8_t type, uint8_t *body, uint32_t len, bool 
         conn_put(c, &pong);
         break;
     }
+    case IMDBW_SESSIONS: /* N1e stage two */
+        if (sessions_answer(c)) break;
+        imdbw_msg_free(&m);
+        imdbw_free(body);
+        return false;
+    case IMDBW_KILL:
+        kill_answer(c, &m);
+        break;
     case IMDBW_TERMINATE:
         *terminate = true;
         break;
@@ -1398,7 +1522,7 @@ static int pull(conn *c, inframe *in)
     for (;;) {
         pthread_mutex_lock(&s->mu);
         /* N1d: while a COPY's frames arrive (its data, or its refusal's drop) they are never queued: always read */
-        bool room = (c->nq < qmax && c->qbytes < QBYTES_MAX && q_room(s, c)) || (c->cin == CIN_OPEN && !c->cin_end) ||
+        bool room = (c->nq < qmax && c->qbytes < QBYTES_MAX && q_room(s, c) && c->oot < OOT_MAX) || (c->cin == CIN_OPEN && !c->cin_end) ||
                     c->cin == CIN_DISCARD;
         pthread_mutex_unlock(&s->mu);
         if (!room && in->hgot == 0) return 0; /* its queue full: read again once the engine takes one */
@@ -1525,6 +1649,7 @@ static int push(conn *c)
         pend_move(s, c, -(int64_t)k);
         bool whole = o->off == o->len;
         if (whole) {
+            if (o->oot) c->oot -= o->len; /* N1e stage two */
             c->oh = o->next;
             if (!c->oh) c->ot = NULL;
         }
@@ -1548,7 +1673,7 @@ static void drop_out(conn *c)
         imdbw_free(o);
     }
     if (c->tal) c->tal->pending -= c->pending; /* N1e stage two: its role's tally too */
-    c->oh = c->ot = NULL, c->pending = 0;
+    c->oh = c->ot = NULL, c->pending = 0, c->oot = 0;
     pthread_mutex_unlock(&s->mu);
 }
 
@@ -1580,6 +1705,33 @@ static bool addr_slot(conn *c)
     }
 }
 
+/* N1e stage two: Apache's lingering close. A server that closes a TCP socket while the client's bytes sit unread makes
+ * the kernel answer with a reset, which discards what the server sent and the client has not yet received: the ERROR
+ * saying why (a refused login's, a protocol error's) would be lost on a network with any delay. So the write side is
+ * shut first (the client reads everything, then the end), and whatever the client still sends is read and dropped until
+ * its own close, at most 1 s or 256 KiB, before the socket is closed */
+static void linger_close(conn *c)
+{
+    shutdown(c->fd, SHUT_WR);
+    uint64_t until = imdb_mono_ns() + 1000000000u;
+    size_t got = 0;
+    char buf[4096];
+    for (;;) {
+        uint64_t now = imdb_mono_ns();
+        if (now >= until || got >= (256u << 10) || atomic_load(&c->s->stopping)) return; /* (a stop ends it: 100 ms) */
+        struct pollfd pf = {c->fd, POLLIN, 0};
+        uint64_t left = (until - now) / 1000000u + 1;
+        int pr = poll(&pf, 1, left < 100 ? (int)left : 100);
+        if (pr < 0 && errno == EINTR) continue;
+        if (pr < 0) return;
+        if (pr == 0) continue; /* (a slice: the stop and the second asked again) */
+        ssize_t k = recv(c->fd, buf, sizeof buf, 0);
+        if (k < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) continue;
+        if (k <= 0) return; /* its close (or an error): done */
+        got += (size_t)k;
+    }
+}
+
 static void *conn_main(void *arg)
 {
     conn *c = arg;
@@ -1602,11 +1754,23 @@ static void *conn_main(void *arg)
     inframe in;
     memset(&in, 0, sizeof in);
     bool reading = authed, peer = authed; /* peer: the socket can still be read or written (after it, poll it no more) */
+    uint8_t why = IMDBS_END_N; /* D34: the first cause this connection ends by */
+#define END_BY(w) \
+    do { \
+        if (why == IMDBS_END_N) why = (w); \
+    } while (0)
     if (authed && c->refuse) { /* N1e stage two: answered, then refused: its ERROR goes out, no request is read */
         imdbw_text t = {(const uint8_t *)c->refuse, (uint32_t)strlen(c->refuse)};
         imdbw_msg er = {.type = IMDBW_ERROR, .code = (uint32_t)-IMDB_ERR_LIMIT, .texts = &t, .ntexts = 1};
         conn_put(c, &er);
         reading = false;
+        END_BY(IMDBS_END_REFUSED);
+        /* no session was made, nor any request read: closed now, never waiting for the engine thread's turn (a role at
+         * its cap could otherwise fill --max-conns with refused logins while a long statement runs, and lock out the
+         * superuser come to KILL it) */
+        pthread_mutex_lock(&s->mu);
+        c->closed = true;
+        pthread_mutex_unlock(&s->mu);
     }
     uint64_t stop_at = 0, progress = imdb_mono_ns();
     bool waiting = false; /* replies waited at the last turn too */
@@ -1627,13 +1791,21 @@ static void *conn_main(void *arg)
         /* its client gone and its statement still running: the cancel again (one that landed just before the statement
          * began was cleared by its start), every turn until the session's end runs */
         bool recancel = c->gone && c->running && c->ses_open && !closed;
+        if (c->cin_kill) { /* N1e stage two: a KILL's cancel of the COPY whose data arrives */
+            c->cin_kill = false;
+            if (c->cin == CIN_OPEN && !c->cin_end && !c->cin_err) cin_cancel(s, c, " by a KILL");
+        }
+        bool kterm = c->kill_term;
         if (recancel) imdb_session_cancel(&c->ses);
         uint32_t qmax = s->o.queue_max ? s->o.queue_max : 64;
         bool copying = (c->cin == CIN_OPEN && !c->cin_end) || c->cin == CIN_DISCARD; /* N1d: a COPY's frames arrive */
         if (copying && out) c->cin_last = imdb_mono_ns(); /* its client still has replies to read (COPY_IN among them, or a
                                                        * ring draining): its data cannot be due yet, so the idle clock waits */
         uint64_t cin_last = c->cin_last;
-        bool room = (c->nq < qmax && c->qbytes < QBYTES_MAX && q_room(s, c)) || copying; /* N1d: a COPY's frames never queued */
+        bool oot_ok = c->oot < OOT_MAX; /* N1e stage two: its out-of-turn answers drained below the bound */
+        if (!oot_ok && !c->oot_held) s->n.oot_waits++;
+        c->oot_held = !oot_ok;
+        bool room = (c->nq < qmax && c->qbytes < QBYTES_MAX && q_room(s, c) && oot_ok) || copying; /* N1d: a COPY's frames never queued */
         pthread_mutex_unlock(&s->mu);
         uint64_t now = imdb_mono_ns();
         if (copying && reading && peer && now - cin_last > copy_idle_ns) { /* N1d: its data stopped: the connection ends */
@@ -1647,11 +1819,25 @@ static void *conn_main(void *arg)
             imdbw_msg er = {.type = IMDBW_ERROR, .code = (uint32_t)-IMDB_ERR_CANCELLED, .texts = &t, .ntexts = 1};
             conn_put(c, &er);
             reading = false;
+            END_BY(IMDBS_END_COPY_IDLE);
             leave(c);
         }
-        if (stopping && reading) reading = false;
+        if (stopping && reading) {
+            reading = false;
+            END_BY(IMDBS_END_STOP);
+        }
+        if (kterm && reading) { /* N1e stage two: a KILL's terminate: as a client that leaves, then its ERROR and the close */
+            reading = false;
+            END_BY(IMDBS_END_KILL);
+            leave(c);
+            static const char km[] = "the session was ended by a KILL: its transaction, if any, rolled back";
+            imdbw_text t = {(const uint8_t *)km, (uint32_t)(sizeof km - 1)};
+            imdbw_msg er = {.type = IMDBW_ERROR, .code = (uint32_t)-IMDB_ERR_CANCELLED, .texts = &t, .ntexts = 1};
+            conn_put(c, &er);
+        }
         if (c->gone && reading) { /* the engine could not queue a reply, or the server stops: no further request */
             reading = false;
+            END_BY(IMDBS_END_GONE);
             leave(c);
         }
         if (!out || !waiting) progress = now; /* the clock starts when replies begin to wait, never in an idle sleep */
@@ -1661,6 +1847,7 @@ static void *conn_main(void *arg)
             s->n.dropped++;
             pthread_mutex_unlock(&s->mu);
             reading = peer = false;
+            END_BY(IMDBS_END_SEND);
             leave(c);
             drop_out(c);
             out = false;
@@ -1675,34 +1862,44 @@ static void *conn_main(void *arg)
         struct pollfd pf[2] = {{peer ? c->fd : -1, (short)((want_in ? in_ev : 0) | (want_out ? out_ev : 0)), 0},
                                {c->wake[0], POLLIN, 0}};
         int wait_ms = stop_at ? 50 : (out && peer) || recancel || copying ? 100 : 1000;
-        if (poll(pf, 2, pend ? 0 : wait_ms) < 0 && errno != EINTR) break;
+        if (poll(pf, 2, pend ? 0 : wait_ms) < 0 && errno != EINTR) {
+            END_BY(IMDBS_END_POLL);
+            break;
+        }
         if (pf[1].revents) drain(c->wake[0]);
         bool can_in = pend || (want_in && (pf[0].revents & in_ev)), can_out = want_out && (pf[0].revents & out_ev);
         if (can_in) {
             c->rd_wants_write = false;
+            errno = 0;
             int r = pull(c, &in);
             if (r < 0) { /* the client left: nothing more can reach it */
+                END_BY(errno == EBADF ? IMDBS_END_EBADF : IMDBS_END_LEFT);
                 reading = peer = false;
                 leave(c);
                 drop_out(c);
             } else if (r == 1) { /* a protocol error: its ERROR goes out, then the close */
+                END_BY(IMDBS_END_PROTOCOL);
                 reading = false;
                 leave(c);
             } else if (r == 2) { /* TERMINATE: the requests before it run, then the session's end */
+                END_BY(IMDBS_END_TERMINATE);
                 reading = false;
                 pthread_mutex_lock(&s->mu);
                 queue_close(c, false);
                 pthread_mutex_unlock(&s->mu);
             }
         } else if (!can_out && (pf[0].revents & (POLLHUP | POLLERR | POLLNVAL))) { /* hung up: neither read nor written again */
+            END_BY(pf[0].revents & POLLNVAL ? IMDBS_END_NVAL : IMDBS_END_HUP);
             if (reading) leave(c);
             reading = peer = false;
             drop_out(c);
         }
         if (peer && can_out) {
             c->wr_wants_read = false;
+            errno = 0;
             int k = push(c);
             if (k < 0) {
+                END_BY(errno == EBADF ? IMDBS_END_EBADF : IMDBS_END_LEFT);
                 if (reading) leave(c);
                 reading = peer = false;
                 drop_out(c);
@@ -1718,14 +1915,21 @@ static void *conn_main(void *arg)
     }
     imdbw_free(in.body);
     drop_out(c);
+    imdbt_free(c->tls); /* a best-effort close_notify, then the session; its thread's alone (conn_free frees one never taken) */
+    c->tls = NULL;
+    /* N1e stage two: a connection this server ends while its client is still there (a login refused after its verdict,
+     * a protocol error, a KILL, the end of COPY's data waited for): its replies all handed to the kernel, then a lingering
+     * close, before the thread counts as ended (so the acceptor's reap never waits on it) */
+    if (peer && authed && !atomic_load(&s->stopping)) linger_close(c);
     pthread_mutex_lock(&s->mu);
     if (c->cin == CIN_OPEN && !c->cin_end) cin_drop(s, c); /* N1d: its spool still this thread's: freed at once */
+    if (why == IMDBS_END_N) why = !authed ? IMDBS_END_UNAUTH : stop_at ? IMDBS_END_STOP : IMDBS_END_LEFT;
+    s->n.ends[why]++; /* D34 */
+#undef END_BY
     c->done = true;
     s->n.live--;
     pthread_cond_broadcast(&s->pacv);
     pthread_mutex_unlock(&s->mu);
-    imdbt_free(c->tls); /* a best-effort close_notify, then the session; its thread's alone until now */
-    c->tls = NULL;
     shutdown(c->fd, SHUT_RDWR);
     return NULL;
 }
@@ -1815,6 +2019,7 @@ static void take(imdbs *s, bool tcp, pthread_attr_t *at)
         return;
     }
     c->preauth = true, c->tcp = tcp;
+    c->id = ++s->next_id; /* N1e stage two */
     c->authing = !tcp; /* a TCP connection authenticates once its address and its pool have room (addr_slot) */
     c->next = s->conns;
     s->conns = c;
@@ -2084,6 +2289,7 @@ void imdbs_counts_get(imdbs *s, imdbs_counts *c)
     pthread_mutex_lock(&s->mu);
     *c = s->n;
     c->tcp_authing = c->tcp_waiting = 0;
+    c->conns = s->nconns; /* D34 */
     c->spool_held = s->spool_held;
     for (conn *o = s->conns; o; o = o->next) {
         c->tcp_authing += o->tcp && o->preauth && o->authing;

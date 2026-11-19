@@ -84,6 +84,9 @@ typedef struct imdb_session {
     uint8_t default_iso;      /* E3: SET default_transaction_isolation: a BEGIN's level when it names none (IMDB_ISO_*) */
     uint8_t su_set;           /* N1e stage two: the superuser-only settings this enforced session SET itself (SU_*):
                                * demoted_reset takes back these alone (a harness's field, set directly, stays) */
+    uint8_t priv_gate;        /* N1e stage two: the gate that refused this statement (0 A: its kind, a SET; 1 B: a read; 2 C: a
+                               * write's target) and the relation (0: none), for the count and the event (priv_note) */
+    uint32_t priv_rel;
     uint64_t stmt_memory;     /* SET statement_memory = bytes: a read statement's workspace ceiling (P0 R2; 0: the default,
                                * a quarter of the memory budget or IMDB_MAX_RESULT_BYTES) */
     struct imdb_prep_set *prep; /* P2 S9: its prepared statements (PREPARE, imdb_prepare), NULL until the first */
@@ -99,6 +102,8 @@ typedef struct imdb_session {
     int64_t lastval;
     atomic_bool cancel;       /* imdb_session_cancel: the running statement stops at its next check (cleared at
                                * each statement's start, so a request between statements is dropped) */
+    atomic_bool cancel_hold;  /* N1e stage two: imdb_session_cancel_held: every statement starting while it is set starts
+                               * cancelled (the server's KILL: a request's statements, until the server clears it) */
 } imdb_session;
 
 typedef struct imdb_cell {
@@ -155,6 +160,9 @@ void imdb_session_close(imdb_session *s);
  * statement savepoint undoes what it wrote. COMMIT, CREATE TABLE, CREATE INDEX, DROP INDEX, ALTER, CHECKPOINT, COMPACT,
  * ERASE and VERIFY run to their end. */
 void imdb_session_cancel(imdb_session *s);
+/* N1e stage two: a cancel that holds (on) until released (off): any thread; sequentially consistent with the clear at a
+ * statement's start, so a cancel landing between that start and its first check is never lost */
+void imdb_session_cancel_held(imdb_session *s, bool on);
 /* P2 S12, tests: a window function's moving frames each summed afresh (the reference the sliding window is checked
  * against), process-wide; off by default */
 void imdb_sql_set_window_reference(bool on);

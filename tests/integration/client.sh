@@ -105,6 +105,38 @@ same "an open transaction at exit" sock $none -- -c "BEGIN; INSERT INTO c VALUES
 same "errors' words" sock $none -- -c "SELEC 1" -c "INSERT INTO c VALUES (1, 'dup', 1)" -c "SELECT missing FROM c"
 same "the copies agree" sock $none -- -c "SELECT COUNT(*), SUM(v) FROM c" -c "SELECT COUNT(*) FROM a"
 
+# N1e stage two: the client's own commands (imagedb sql has none). A client holds a session open, reading a FIFO; another
+# lists the sessions (\sessions, --csv), terminates the held one by its id, then finds no such session to cancel
+net() { "$CLI" --socket "$WORK/s" --user admin "$@"; }
+mkfifo "$WORK/hold"
+net -f "$WORK/hold" > "$WORK/held.out" 2>&1 &
+hpid=$!
+exec 7<>"$WORK/hold" # (read and write: never blocks, so a held client that failed cannot hang this script)
+for _ in $(seq 200); do
+  net --csv -c '\sessions' > "$WORK/ss" 2>&1 || fail "\\sessions: $(cat "$WORK/ss")"
+  [ "$(grep -c ',"admin",socket,idle,' "$WORK/ss")" = 2 ] && break
+  sleep 0.05
+done
+[ "$(grep -c ',"admin",socket,idle,' "$WORK/ss")" = 2 ] || fail "\\sessions: not the held session and its own: $(cat "$WORK/ss")"
+head -n 1 "$WORK/ss" | grep -qx 'id,role,name,via,state,age_ms' || fail "\\sessions --csv's header: $(cat "$WORK/ss")"
+held=$(awk -F, 'NR == 2 { print $1 }' "$WORK/ss") # ids increase: the held client's came first
+net -c "\\terminate $held" > "$WORK/k" 2>&1 || fail "\\terminate $held: $(cat "$WORK/k")"
+grep -qx "terminated session $held" "$WORK/k" || fail "\\terminate's line: $(cat "$WORK/k")"
+gone=0
+for _ in $(seq 200); do # its session's end runs on the engine thread
+  rc=0
+  net -c "\\cancel $held" > "$WORK/k" 2>&1 || rc=$?
+  if [ "$rc" = 1 ] && grep -q 'no such session' "$WORK/k"; then gone=1; break; fi
+  sleep 0.05
+done
+[ "$gone" = 1 ] || fail "a terminated session still found: $(cat "$WORK/k")"
+exec 7>&-
+wait "$hpid" || true
+rc=0
+net -c '\cancel 0' > "$WORK/k" 2>&1 || rc=$?
+[ "$rc" = 1 ] && grep -q "a session's id is 1 or more" "$WORK/k" || fail "\\cancel 0: exit $rc: $(cat "$WORK/k")"
+echo "client.sh: \\sessions, \\terminate and \\cancel through imagedb-client"
+
 kill -TERM "$spid"
 sc=0
 wait "$spid" || sc=$?

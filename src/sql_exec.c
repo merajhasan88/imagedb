@@ -24,11 +24,18 @@ void imdb_session_init(imdb_session *s, imdb_db *db)
     memset(s, 0, sizeof *s);
     s->db = db;
     atomic_init(&s->cancel, false);
+    atomic_init(&s->cancel_hold, false);
 }
 
 _Static_assert(ATOMIC_BOOL_LOCK_FREE == 2, "the cancel flag is set from a signal handler: it must be lock-free");
 
 void imdb_session_cancel(imdb_session *s) { atomic_store_explicit(&s->cancel, true, memory_order_relaxed); }
+
+void imdb_session_cancel_held(imdb_session *s, bool on)
+{
+    atomic_store(&s->cancel_hold, on); /* (seq_cst: the statement's start clears cancel, then reads this) */
+    if (on) atomic_store(&s->cancel, true);
+}
 
 static void prep_all_free(imdb_session *ss); /* P2 S9 */
 
@@ -5012,6 +5019,7 @@ static int gate_read(xctx *x, const sql_stmt *st, uint8_t okind, uint32_t oid, c
     if (!r) return IMDB_OK;
     uint32_t need = IMDB_PRIV_SELECT | (st->for_update && okind == IMDB_OBJ_TABLE ? IMDB_PRIV_UPDATE : 0);
     if ((imdb_role_effective(&x->db->rc, r->id, okind, oid) & need) == need) return IMDB_OK;
+    x->ss->priv_gate = 1, x->ss->priv_rel = oid; /* N1e stage two: priv_note's */
     return imdb_fail(e, IMDB_ERR_PRIVILEGE, "permission denied for %s %s", okind == IMDB_OBJ_VIEW ? "view" : "table", name);
 }
 
@@ -5042,6 +5050,7 @@ static int gate_write(xctx *x, const sql_stmt *st, imdb_err *e)
     }
     if (reads) need |= IMDB_PRIV_SELECT;
     if ((imdb_role_effective(&x->db->rc, r->id, IMDB_OBJ_TABLE, t->s.id) & need) == need) return IMDB_OK;
+    x->ss->priv_gate = 2, x->ss->priv_rel = t->s.id; /* N1e stage two: priv_note's */
     return imdb_fail(e, IMDB_ERR_PRIVILEGE, "permission denied for table %s", st->table);
 }
 
@@ -5107,6 +5116,41 @@ static int set_within_cap(const imdb_session *ss, const char *name, uint64_t v, 
  * superuser (demoted since it SET them) runs with cross_check off, no slow-statement events, no replica wait, and its
  * statement_memory within its role's share; reset at each statement's Gate A, so SHOW and every use agree, as the caps
  * are read where they are checked (an embedded caller's and the CLI's sessions are not enforced: untouched) */
+/* N1e stage two: a statement a gate refused, counted by gate (SHOW STATS privilege.refused.*) and an event "privilege":
+ * the role's id (never its name: names leave the event log by imdb_sql_shape's rule, which ERASE ROLE cannot follow),
+ * the gate, the relation's id and the statement's shape cut at 256 bytes (the shape keeps the identifiers the role typed,
+ * never a value); at most 4 a second a role (priv_ev: the least recent of 64 entries replaced), the rest counted dropped,
+ * so an operator sees a role probing without the log filling from it */
+static void priv_note(imdb_session *ss, const char *sql, size_t len)
+{
+    imdb_db *db = ss->db;
+    uint8_t g = ss->priv_gate < 3 ? ss->priv_gate : 0;
+    db->stats.priv_refused[g]++;
+    if (db->events_fd < 0) return;
+    uint64_t sec = mono_ns() / 1000000000u;
+    int at = -1, old = 0;
+    for (int i = 0; i < 64; i++) {
+        if (db->priv_ev[i].role == ss->role && db->priv_ev[i].n) at = i;
+        if (db->priv_ev[i].sec < db->priv_ev[old].sec) old = i;
+    }
+    if (at < 0) at = old, db->priv_ev[at].role = ss->role, db->priv_ev[at].sec = sec, db->priv_ev[at].n = 0;
+    if (db->priv_ev[at].sec != sec) db->priv_ev[at].sec = sec, db->priv_ev[at].n = 0;
+    if (db->priv_ev[at].n >= 4) {
+        db->stats.priv_events_dropped++;
+        return;
+    }
+    db->priv_ev[at].n++;
+    char shape[257];
+    imdb_sql_shape(sql, len, shape, sizeof shape);
+    static const char gates[3][2] = {"A", "B", "C"};
+    imdb_event_begin(db, "privilege");
+    imdb_event_int(db, "role", ss->role);
+    imdb_event_str(db, "gate", gates[g], 1);
+    imdb_event_int(db, "relation", ss->priv_rel);
+    imdb_event_str(db, "shape", shape, strlen(shape));
+    imdb_event_end(db);
+}
+
 enum { SU_CROSS = 1, SU_SLOW = 2, SU_SYNC = 4, SU_MEMORY = 8 };
 
 /* a SET this enforced session made of what only a superuser may set (Gate A let it through: it was one then), noted so
@@ -11055,7 +11099,9 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
         return imdb_fail(e, IMDB_ERR_STATE,
                          "replica has unauthorised redactions or an unverified lake; resume apply before querying");
     }
+    ss->priv_gate = 0, ss->priv_rel = 0; /* N1e stage two: a refusal's gate and relation (priv_note) */
     if (ss->enforce && (rc = gate_kind(ss, st, e))) { /* N1e: Gate A, before anything of the statement runs */
+        if (rc == IMDB_ERR_PRIVILEGE) priv_note(ss, sql, len);
         stmt_drop(st, owned);
         return rc;
     }
@@ -11100,7 +11146,8 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
     /* R1: a cancel asked for before this statement is dropped; what runs to its end (COMMIT, the statements that commit
      * on their own, the physical ones) is never checked, so neither a cancel nor the deadline cuts a logged op part
      * way */
-    atomic_store_explicit(&ss->cancel, false, memory_order_relaxed);
+    atomic_store(&ss->cancel, false);
+    if (atomic_load(&ss->cancel_hold)) atomic_store(&ss->cancel, true); /* N1e stage two: a KILL's, held for its request */
     x.checks = !physical && st->kind != ST_COMMIT && st->kind != ST_CREATE && st->kind != ST_CREATE_INDEX &&
                st->kind != ST_DROP_INDEX && st->kind != ST_ALTER_RETENTION && st->kind != ST_ALTER_TABLE && st->kind != ST_DROP_TABLE &&
                st->kind != ST_CREATE_VIEW && st->kind != ST_DROP_VIEW && st->kind != ST_CREATE_SEQUENCE &&
@@ -11777,6 +11824,7 @@ done:
         if (rc)
             db->stats.fails[rc == IMDB_ERR_CONFLICT ? IMDB_SF_CONFLICT : rc == IMDB_ERR_LIMIT ? IMDB_SF_LIMIT
                             : rc == IMDB_ERR_CANCELLED ? IMDB_SF_CANCELLED : IMDB_SF_OTHER]++;
+        if (rc == IMDB_ERR_PRIVILEGE && ss->enforce) priv_note(ss, sql, len); /* N1e stage two: Gates B and C, a SET's cap */
     }
     ss->rows_tested = x.tested; /* D8 #4: the first plan's count, for the caller and the tests */
     if (ss->txn.open) ss->txn.last_ns = mono_ns(); /* R4: idle from here */

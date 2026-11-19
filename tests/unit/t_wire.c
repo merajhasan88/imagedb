@@ -568,12 +568,13 @@ static const imdbw_text kLabels[] = {{(const uint8_t *)"", 0}, {(const uint8_t *
 
 /* the samples: one message of every type, the value-carrying ones' bytes in their own buffers */
 typedef struct smp {
-    imdbw_msg m[24];
+    imdbw_msg m[32];
     size_t n;
     size_t kcols, krows; /* the COLUMNS sample and the ROWS sample (its columns) */
     imdbw_text texts[3], labels[3];
     imdbw_span params[3];
     imdbw_col cols[4];
+    imdbw_sess sess[2]; /* N1e stage two: SESSIONS_LIST's */
     imdbw_buf bq0, bq2, be, br;
 } smp;
 
@@ -648,6 +649,9 @@ static void samples(smp *s)
     s->m[s->n++] = (imdbw_msg){.type = IMDBW_CANCEL};
     s->m[s->n++] = (imdbw_msg){.type = IMDBW_PING};
     s->m[s->n++] = (imdbw_msg){.type = IMDBW_TERMINATE};
+    s->m[s->n++] = (imdbw_msg){.type = IMDBW_SESSIONS}; /* N1e stage two */
+    s->m[s->n++] = (imdbw_msg){.type = IMDBW_KILL, .kill = IMDBW_KILL_CANCEL, .sid = 1};
+    s->m[s->n++] = (imdbw_msg){.type = IMDBW_KILL, .kill = IMDBW_KILL_TERMINATE, .sid = UINT64_MAX};
     s->kcols = s->n;
     s->m[s->n++] = (imdbw_msg){.type = IMDBW_COLUMNS, .cols = s->cols, .ncols = 4};
     s->krows = s->n;
@@ -669,6 +673,13 @@ static void samples(smp *s)
     s->m[s->n++] = (imdbw_msg){.type = IMDBW_COPY_OUT, .data = (const uint8_t *)"1,2\n", .dlen = 4};
     s->m[s->n++] = (imdbw_msg){.type = IMDBW_READY, .state = IMDBW_DOOMED};
     s->m[s->n++] = (imdbw_msg){.type = IMDBW_PONG};
+    s->sess[0] = (imdbw_sess){.id = 3, .role = 7, .endpoint = 1, .state = IMDBW_SS_COPY, .age_ms = UINT64_MAX,
+                              .name = {(const uint8_t *)"hé", 3}};
+    s->sess[1] = (imdbw_sess){.id = 4, .role = UINT32_MAX, .endpoint = 2, .state = IMDBW_SS_IDLE, .name = {(const uint8_t *)"", 0}};
+    s->m[s->n++] = (imdbw_msg){.type = IMDBW_SESSIONS_LIST, .sess = s->sess, .nsess = 2};
+    s->m[s->n++] = (imdbw_msg){.type = IMDBW_SESSIONS_LIST};
+    s->m[s->n++] = (imdbw_msg){.type = IMDBW_KILL_DONE, .code = IMDBW_KILLED, .sid = 9};
+    s->m[s->n++] = (imdbw_msg){.type = IMDBW_KILL_DONE, .code = IMDBW_KILL_NONE, .sid = UINT64_MAX};
     if (imdbw_cols_index(&s->m[s->kcols])) abort();
 }
 
@@ -921,7 +932,7 @@ static void t_wire_bounds(void)
     imdb_le32(h, IMDBW_FRAME_MAX);
     CHECK(imdbw_head_get(h, false, &len, &type, &we) == 0 && len == IMDBW_FRAME_MAX);
     CHECK(imdbw_head_get(h, true, &len, &type, &we) != 0); /* a client's type from the server */
-    static const uint8_t bad_client[] = {0, 11, 63, 64, 72, 255}, bad_server[] = {0, 1, 10, 63, 73, 255};
+    static const uint8_t bad_client[] = {0, 13, 63, 64, 74, 255}, bad_server[] = {0, 1, 12, 63, 75, 255};
     for (size_t i = 0; i < sizeof bad_client; i++) {
         h[4] = bad_client[i];
         CHECK(imdbw_head_get(h, false, &len, &type, &we) != 0);
@@ -1001,6 +1012,32 @@ static void t_wire_bounds(void)
     CHECK(body(IMDBW_READY, "03", NULL) != 0);
     CHECK(body(IMDBW_READY, "", NULL) != 0);
     CHECK(body(IMDBW_PING, "00", NULL) != 0);                                     /* a body where none is */
+    /* N1e stage two: KILL, KILL_DONE and SESSIONS_LIST at their edges */
+    CHECK(body(IMDBW_KILL, "01 0100000000000000", NULL) == 0);
+    CHECK(body(IMDBW_KILL, "00 0100000000000000", NULL) != 0);                    /* kind 0 */
+    CHECK(body(IMDBW_KILL, "03 0100000000000000", NULL) != 0);                    /* kind 3 */
+    CHECK(body(IMDBW_KILL, "02 0000000000000000", NULL) != 0);                    /* session 0 */
+    CHECK(body(IMDBW_KILL, "02 01000000000000", NULL) != 0);                      /* cut */
+    CHECK(body(IMDBW_KILL, "02 0100000000000000 00", NULL) != 0);                 /* a byte past */
+    CHECK(body(IMDBW_KILL_DONE, "01 0100000000000000", NULL) == 0);
+    CHECK(body(IMDBW_KILL_DONE, "02 0100000000000000", NULL) != 0);               /* code 2 */
+    CHECK(body(IMDBW_KILL_DONE, "03 0100000000000000", NULL) != 0);               /* code 3 */
+    CHECK(body(IMDBW_KILL_DONE, "00 0000000000000000", NULL) != 0);               /* session 0 */
+    CHECK(body(IMDBW_SESSIONS, "00", NULL) != 0);                                 /* a body where none is */
+    CHECK(body(IMDBW_SESSIONS_LIST, "00000000", NULL) == 0);
+    CHECK(body(IMDBW_SESSIONS_LIST, "01000000 0100000000000000 01000000 01 00 0000000000000000 00", NULL) == 0);
+    CHECK(body(IMDBW_SESSIONS_LIST, "01000000 0000000000000000 01000000 01 00 0000000000000000 00", NULL) != 0); /* id 0 */
+    CHECK(body(IMDBW_SESSIONS_LIST, "01000000 0100000000000000 00000000 01 00 0000000000000000 00", NULL) != 0); /* role 0 */
+    CHECK(body(IMDBW_SESSIONS_LIST, "01000000 0100000000000000 01000000 03 00 0000000000000000 00", NULL) != 0); /* endpoint 3 */
+    CHECK(body(IMDBW_SESSIONS_LIST, "01000000 0100000000000000 01000000 01 04 0000000000000000 00", NULL) != 0); /* state 4 */
+    CHECK(body(IMDBW_SESSIONS_LIST, "01000000 0100000000000000 01000000 01 00 0000000000000000 40", NULL) != 0); /* 64 bytes */
+    CHECK(body(IMDBW_SESSIONS_LIST, "01000000 0100000000000000 01000000 01 00 0000000000000000 01 ff", NULL) != 0); /* UTF-8 */
+    CHECK(body(IMDBW_SESSIONS_LIST, "02000000 0200000000000000 01000000 01 00 0000000000000000 00 "
+                                    "0200000000000000 01000000 01 00 0000000000000000 00", NULL) != 0); /* an id twice */
+    CHECK(body(IMDBW_SESSIONS_LIST, "02000000 0200000000000000 01000000 01 00 0000000000000000 00 "
+                                    "0100000000000000 01000000 01 00 0000000000000000 00", NULL) != 0); /* out of order */
+    CHECK(body(IMDBW_SESSIONS_LIST, "02000000 0100000000000000 01000000 01 00 0000000000000000 00", NULL) != 0); /* 2 claimed */
+    CHECK(body(IMDBW_SESSIONS_LIST, "01000100 0100000000000000 01000000 01 00 0000000000000000 00", NULL) != 0); /* 65,537 */
     CHECK(body(IMDBW_COPY_DATA, "", NULL) != 0);                                  /* an empty piece */
     CHECK(body(IMDBW_COPY_FAIL, "0110", NULL) == IMDB_ERR_LIMIT);                 /* 4,097 bytes claimed */
     /* an ENUM of 1,024 distinct labels taken, of 1,025 refused (each three letters: only the count can refuse it) */
@@ -1172,7 +1209,7 @@ static void t_wire_encoder_refuses(void)
     imdbw_value ev = {.type = IMDBW_T_ENUM, .s = (const uint8_t *)"x", .len = 1};
     imdbw_span enum_param = span_of(&eb, &ev, 1); /* an ENUM among a statement's values */
     three.n = 3; /* a count other than its values' */
-    imdbw_msg no[32];
+    imdbw_msg no[48];
     size_t n = 0;
     no[n++] = (imdbw_msg){.type = IMDBW_QUERY, .texts = s.texts, .params = s.params, .ntexts = 0};
     no[n++] = (imdbw_msg){.type = IMDBW_QUERY, .texts = &bad_utf8, .params = s.params + 1, .ntexts = 1};
@@ -1203,7 +1240,18 @@ static void t_wire_encoder_refuses(void)
     no[n++] = (imdbw_msg){.type = IMDBW_ERROR, .code = 5, .texts = &bad_utf8, .ntexts = 1};
     no[n++] = (imdbw_msg){.type = IMDBW_WARNING, .ntexts = 0};
     no[n++] = (imdbw_msg){.type = IMDBW_READY, .state = 3};
-    no[n++] = (imdbw_msg){.type = 11};
+    no[n++] = (imdbw_msg){.type = 13};
+    no[n++] = (imdbw_msg){.type = IMDBW_KILL, .kill = 3, .sid = 1};              /* N1e stage two */
+    no[n++] = (imdbw_msg){.type = IMDBW_KILL, .kill = IMDBW_KILL_CANCEL, .sid = 0};
+    no[n++] = (imdbw_msg){.type = IMDBW_KILL_DONE, .code = 2, .sid = 1};
+    no[n++] = (imdbw_msg){.type = IMDBW_KILL_DONE, .code = 0, .sid = 0};
+    imdbw_sess twice[2] = {{.id = 5, .role = 1, .endpoint = 1}, {.id = 5, .role = 1, .endpoint = 1}};
+    imdbw_sess badname = {.id = 1, .role = 1, .endpoint = 2, .name = bad_utf8};
+    imdbw_sess noend = {.id = 1, .role = 1, .endpoint = 0};
+    no[n++] = (imdbw_msg){.type = IMDBW_SESSIONS_LIST, .sess = twice, .nsess = 2};
+    no[n++] = (imdbw_msg){.type = IMDBW_SESSIONS_LIST, .sess = &badname, .nsess = 1};
+    no[n++] = (imdbw_msg){.type = IMDBW_SESSIONS_LIST, .sess = &noend, .nsess = 1};
+    no[n++] = (imdbw_msg){.type = IMDBW_SESSIONS_LIST, .sess = NULL, .nsess = 1};
     for (size_t k = 0; k < n; k++) {
         imdbw_buf b;
         imdbw_buf_init(&b);

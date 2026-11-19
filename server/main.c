@@ -31,7 +31,9 @@ static int usage(void)
           "                      [--channel-binding exporter|any] [--role-statement-timeout MS]\n"
           "                      [--role-transaction-timeout MS] [--role-idle-in-transaction MS] [--role-row-limit N]\n"
           "                      [--role-prepared-bytes BYTES] [--role-conns N] [--superuser-reserve N]\n"
-          "                      [--role-queue-bytes BYTES] [--role-reply-bytes BYTES]\n"
+          "                      [--role-queue-bytes BYTES] [--role-reply-bytes BYTES] [--preauth-max N]\n"
+          "                      [--preauth-timeout MS] [--preauth-per-addr N] [--socket-reserve N] [--slice-ms MS]\n"
+          "                      [--queue-max N] [--send-timeout MS] [--conn-cap BYTES] [--reply-budget BYTES]\n"
           "       imagedb-server cert SDIR [--name NAME]... [--renew]\n", stderr);
     return 2;
 }
@@ -174,6 +176,24 @@ int main(int argc, char **argv)
             uint64_t *f = argv[i][7] == 'q' ? &so.role_queue_bytes : &so.role_reply_bytes; /* 0: none */
             if (!parse_bytes(argv[++i], 0, 64ull << 30, f)) return usage();
             if (!*f) *f = IMDBS_NONE;
+        } else if (!strcmp(argv[i], "--preauth-max") && i + 1 < argc) { /* N1e stage two: the server's constants */
+            if (!parse_ms(argv[++i], 1, 4096, &so.preauth_max)) return usage();
+        } else if (!strcmp(argv[i], "--preauth-timeout") && i + 1 < argc) {
+            if (!parse_ms(argv[++i], 100, 600000, &so.preauth_ms)) return usage();
+        } else if (!strcmp(argv[i], "--preauth-per-addr") && i + 1 < argc) {
+            if (!parse_ms(argv[++i], 1, 4096, &so.preauth_per_addr)) return usage();
+        } else if (!strcmp(argv[i], "--socket-reserve") && i + 1 < argc) {
+            if (!parse_ms(argv[++i], 1, 65536, &so.socket_reserve)) return usage();
+        } else if (!strcmp(argv[i], "--slice-ms") && i + 1 < argc) {
+            if (!parse_ms(argv[++i], 1, 10000, &so.slice_ms)) return usage();
+        } else if (!strcmp(argv[i], "--queue-max") && i + 1 < argc) {
+            if (!parse_ms(argv[++i], 1, 4096, &so.queue_max)) return usage();
+        } else if (!strcmp(argv[i], "--send-timeout") && i + 1 < argc) {
+            if (!parse_ms(argv[++i], 1000, 3600000, &so.send_timeout_ms)) return usage();
+        } else if (!strcmp(argv[i], "--conn-cap") && i + 1 < argc) {
+            if (!parse_bytes(argv[++i], 64u << 10, 64ull << 30, &so.conn_cap)) return usage();
+        } else if (!strcmp(argv[i], "--reply-budget") && i + 1 < argc) {
+            if (!parse_bytes(argv[++i], 1u << 20, 64ull << 30, &so.reply_budget)) return usage();
         } else if (!strcmp(argv[i], "--mem-limit") && i + 1 < argc) {
             if (!parse_size(argv[++i], &mem_limit)) return usage();
         } else if (!strcmp(argv[i], "--seg-cache") && i + 1 < argc) {

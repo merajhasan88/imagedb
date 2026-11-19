@@ -724,11 +724,33 @@ static void t_row_limit_write(void)
     imdb_close(db);
 }
 
+
+/* N1e stage two: a held cancel (the server's KILL): every statement starting while it is held starts cancelled, however
+ * soon after a plain cancel's clear (the statement's start clears a plain one, then reads the hold); released, the next
+ * statement runs. A statement never checked (COMMIT, a DDL) runs to its end as a plain cancel's does */
+static void t_cancel_held(void)
+{
+    imdb_db *db = loaded();
+    CHECK(db);
+    RUN("SET statement_timeout = 20000"); /* a hold that failed ends anyway, by its timeout's words */
+    imdb_session_cancel_held(&g_ss, true);
+    double t0 = now_ms();
+    int rc = run("SELECT COUNT(*) FROM t JOIN t AS b ON t.g = b.g"); /* billions of pairs: minutes */
+    SOFT(rc == IMDB_ERR_CANCELLED && strstr(g_e.msg, "statement cancelled"));
+    if (rc != IMDB_ERR_CANCELLED) fprintf(stderr, "    the join: %d %s\n", rc, g_e.msg);
+    rc = run("SELECT COUNT(*) FROM t"); /* the next one too, while held */
+    SOFT(rc == IMDB_ERR_CANCELLED);
+    SOFT(now_ms() - t0 < 10000);
+    imdb_session_cancel_held(&g_ss, false);
+    SOFT(one_i64("SELECT COUNT(*) FROM t") == N); /* released: it runs (the cancel the hold set is cleared at its start) */
+    done(db);
+}
 const test_case cancel_tests[] = {
     {"cancel_timeout_paths", t_timeout_paths},
     {"cancel_timeout_writes", t_timeout_writes},
     {"cancel_timeout_write_phase", t_timeout_write_phase},
     {"cancel_thread", t_cancel_thread},
+    {"cancel_held", t_cancel_held},
     {"cancel_txn_timeout", t_txn_timeout},
     {"cancel_txn_idle_timeout", t_txn_idle_timeout},
     {"cancel_txn_idle_sweep", t_txn_idle_sweep},

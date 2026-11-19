@@ -342,6 +342,7 @@ int cli_repl(cli_runner *rn)
         fflush(stdout);
         if (!fgets(line, sizeof line, stdin)) break;
         if (!acc.len && (strncmp(line, "\\q", 2) == 0 || strncmp(line, "quit", 4) == 0)) break;
+        if (!acc.len && line[0] == '\\' && rn->meta && rn->meta(rn, line)) continue; /* N1e stage two: the client's */
         if (!acc.len && strncmp(line, "\\timing", 7) == 0) {
             rn->timing = !rn->timing;
             printf("timing is %s\n", rn->timing ? "on" : "off");

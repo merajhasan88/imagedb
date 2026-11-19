@@ -401,6 +401,8 @@ typedef struct imdb_stats {
     imdb_hist stmt_lat[IMDB_SC_N];
     uint64_t commits, rollbacks, log_bytes, applied; /* applied: a replica's commits taken from a stream (apply) */
     uint64_t ser_conflicts;   /* E3: SERIALIZABLE commits refused because a table they read was written since their snapshot */
+    uint64_t priv_refused[3]; /* N1e stage two: statements a gate refused (A its kind or SET, B a read, C a write's target) */
+    uint64_t priv_events_dropped; /* N1e stage two: their events past a role's rate (at most 4 a second a role) */
     imdb_hist commit_lat;
     uint64_t seg_hits;
     uint64_t maint_n[IMDB_MT_N], maint_ns[IMDB_MT_N], maint_max_ns[IMDB_MT_N], maint_last_ns[IMDB_MT_N];
@@ -538,6 +540,11 @@ typedef struct imdb_db {
     imdb_enum *enums; /* F3g: enums[id - 1] is type id, a dropped one a tombstone */
     uint32_t nenums, capenums;
     imdb_rcat rc;           /* L: the roles, their privileges and memberships (role.h) */
+    struct {                /* N1e stage two: privilege events by role, at most 4 a second each (sql_exec.c priv_note; the
+                             * least recent entry replaced: 64 roles at once) */
+        uint32_t role, n;
+        uint64_t sec;
+    } priv_ev[64];
     imdb_sequence *seqs; /* F2a-2: seqs[i] is sequence i, a dropped one a tombstone */
     uint32_t nseqs, capseqs;
     uint32_t *txseq;     /* F2a-2: the active transaction's sequences nextval touched, by id (SEQ_ADVANCE at its commit) */

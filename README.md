@@ -215,6 +215,13 @@ which can lag SQL commits. Use `imagedb verify` to check a current layer.
   not carry. Ctrl-C cancels the running statement. The password comes from
   `IMAGEDB_PASSWORD` or the terminal. A TIMESTAMPTZ is shown in the session's zone
   by the client's own zone files (`--zoneinfo`): the server sends the instant.
+- **Sessions:** at the REPL or with `-c`, `\sessions` lists the server's sessions (a
+  superuser's all, a role's its own role's: id, role, name, socket or tcp, state, age;
+  `--csv` too), `\cancel ID` cancels what a session runs (each statement of its
+  request, even one still queued behind another session's), and `\terminate ID` ends
+  it (its open transaction rolled back). They are answered without waiting for the
+  engine, so a superuser who logs in while a long statement runs can stop it. In a
+  script (`-f`, piped input) a backslash line goes to the server as SQL.
 - **COPY** through the server is spooled, so the engine, whose one thread runs every
   session's statements, never waits on a client's network. COPY ... FROM STDIN's data
   is held whole in an unnamed file under the spool directory (`--spool-dir`, by
@@ -526,7 +533,11 @@ always the same rows: statements by class (read, write, transaction, ddl,
 physical, show, other) with their p50, p99 and largest latency in
 microseconds; failures by kind (conflict, limit, cancelled, other); commits
 and their latency (a replica's applied commits apart: `commits.applied`),
-rollbacks (`rollbacks.serializable`: the commits the SERIALIZABLE check refused), the log's bytes; the segment cache's hits and
+rollbacks (`rollbacks.serializable`: the commits the SERIALIZABLE check refused), the statements a privilege gate
+refused (`privilege.refused.read` and `.write` by the read and write gates, `.kind` every other: a statement's kind, a
+SET past a cap, the sequence functions, SHOW GRANTS FOR another; each also an event "privilege" in the event log
+with the role's id, the gate, the relation's id and the statement's shape, at most four a second a role, the rest
+counted in `privilege.events_dropped`), the log's bytes; the segment cache's hits and
 loads; each CHECKPOINT, COMPACT, EXPIRE, RETIRE and eviction's count and time;
 the open's time and the commits it replayed; the open transactions and the
 oldest's age; the bytes on disk of the log and the lake; the running
@@ -653,6 +664,15 @@ Command-line options (`imagedb` with no arguments prints the commands):
 | `--superuser-reserve N` | imagedb-server | the last N connection slots are a superuser's alone (0: none) | 4 |
 | `--role-queue-bytes BYTES` | imagedb-server | one such role's queued requests, past which its connections are not read (0: none) | 64M |
 | `--role-reply-bytes BYTES` | imagedb-server | one such role's replies not yet sent, past which none of its statements starts (0: none) | 64M |
+| `--preauth-max N` | imagedb-server | connections authenticating at once on each listener; the rest wait in the listen queue | 32 |
+| `--preauth-timeout MS` | imagedb-server | a whole authentication exchange (TLS's handshake included) | 10000 |
+| `--preauth-per-addr N` | imagedb-server | TCP connections authenticating at once from one address (twice it may wait) | 8 |
+| `--socket-reserve N` | imagedb-server | connections TCP leaves to the Unix socket (at most half `--max-conns`) | 16 |
+| `--slice-ms MS` | imagedb-server | a session in a transaction runs on this long while others wait | 10 |
+| `--queue-max N` | imagedb-server | a connection's requests queued before its socket is read again | 64 |
+| `--send-timeout MS` | imagedb-server | a connection that takes no byte this long while replies wait is dropped | 30000 |
+| `--conn-cap BYTES` | imagedb-server | a connection's replies waiting to be sent before its next statement waits | 32M |
+| `--reply-budget BYTES` | imagedb-server | every connection's unsent replies, past which only a connection (a role) with none starts a statement | 256M |
 | `--name NAME` | imagedb-server cert | another name in the certificate's subjectAltName (localhost, 127.0.0.1, ::1 always); repeatable | |
 | `--renew` | imagedb-server cert | the same key signed again by the same CA (the pin kept) | |
 | `--host HOST`, `--port PORT` | imagedb-client | TCP with TLS 1.3 | |

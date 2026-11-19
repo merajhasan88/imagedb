@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -21,6 +22,7 @@ struct imdbc {
     imdbt_ctx *tctx;     /* N1c: TCP's TLS context and session (NULL on the Unix socket) */
     imdbt *tls;
     uint32_t timeout_ms; /* each wait for bytes (0: none) */
+    bool wr_closed;      /* a write found the connection closed by the server (closed_reason) */
     uint8_t *body;     /* the last frame's body: the last message points into it */
     imdbw_msg last;
     uint8_t *cbody;    /* the last COLUMNS' body, kept while ROWS are read against it */
@@ -77,7 +79,10 @@ static int send_all(imdbc *c, const uint8_t *p, size_t n, imdb_err *e)
             p += k, n -= (size_t)k;
             continue;
         }
-        if (k == 0 || k == -1) return imdb_fail(e, IMDB_ERR_IO, "the connection: %s", k ? "a write failed" : "closed");
+        if (k == 0 || k == -1) {
+            c->wr_closed = true;
+            return imdb_fail(e, IMDB_ERR_IO, "the connection: %s", k ? "a write failed" : "closed");
+        }
         if (c_wait(c, k, false, e)) return e->code; /* TLS keeps the same arguments for the retry */
     }
     return IMDB_OK;
@@ -110,6 +115,36 @@ static int recv_all(imdbc *c, uint8_t *p, size_t n, imdb_err *e)
     return IMDB_OK;
 }
 
+/* N1e stage two: a send that found the connection closed by the server (a login answered and then refused, a protocol
+ * error): what the server sent before its close is still to be read, and when its very last frame is an ERROR, that is
+ * why it closed: the error reported is the server's own (its code and its words), not "a write failed" (libpq reads a
+ * closed connection's last message alike). An ERROR followed by any frame answered something else (a statement of an
+ * earlier request): no reason then, nor past 64 frames. The frames read are dropped: the connection is unusable */
+static void closed_reason(imdbc *c, imdb_err *e)
+{
+    uint32_t keep = c->timeout_ms;
+    c->timeout_ms = 1000; /* a peer that closed sends nothing more: what it sent is already here */
+    imdb_err e2 = {0};
+    imdbw_msg m;
+    uint32_t code = 0;
+    char why[sizeof e->msg];
+    bool ended = false; /* the read reached the server's close */
+    for (int k = 0; k < 64 && !ended; k++) {
+        if (imdbc_next(c, &m, &e2)) {
+            ended = true;
+        } else if (m.type == IMDBW_ERROR && m.ntexts) {
+            code = m.code;
+            snprintf(why, sizeof why, "%.*s", (int)m.texts[0].len, (const char *)m.texts[0].p);
+        } else {
+            code = 0; /* an ERROR before another frame answered that frame's request, not the close */
+        }
+    }
+    c->timeout_ms = keep;
+    if (!ended || !code || code > 64) return;
+    imdb_err_clear(e);
+    imdb_fail(e, -(int)code, "the server closed the connection: %s", why);
+}
+
 static int put_msg(imdbc *c, const imdbw_msg *m, imdb_err *e)
 {
     bool req = m->type == IMDBW_QUERY || m->type == IMDBW_PREPARE || m->type == IMDBW_EXECUTE || m->type == IMDBW_DEALLOCATE;
@@ -124,6 +159,10 @@ static int put_msg(imdbc *c, const imdbw_msg *m, imdb_err *e)
     int rc = b.err ? imdb_fail(e, b.nomem ? IMDB_ERR_NOMEM : IMDB_ERR_INVALID, "a request its encoder refuses")
                    : send_all(c, b.p, b.len, e);
     imdbw_buf_free(&b);
+    if (rc && c->wr_closed) {
+        closed_reason(c, e);
+        rc = e->code;
+    }
     if (!rc && req)
         c->outstanding++; /* each answered to its READY */
     return rc;
@@ -417,6 +456,20 @@ int imdbc_copy_fail(imdbc *c, const char *reason, imdb_err *e)
 int imdbc_ping(imdbc *c, imdb_err *e)
 {
     imdbw_msg m = {.type = IMDBW_PING};
+    return put_msg(c, &m, e);
+}
+
+int imdbc_sessions(imdbc *c, imdb_err *e)
+{
+    imdbw_msg m = {.type = IMDBW_SESSIONS};
+    return put_msg(c, &m, e);
+}
+
+int imdbc_kill(imdbc *c, uint8_t kind, uint64_t session, imdb_err *e)
+{
+    if ((kind != IMDBW_KILL_CANCEL && kind != IMDBW_KILL_TERMINATE) || !session)
+        return imdb_fail(e, IMDB_ERR_STATE, "a KILL's kind is cancel or terminate, its session an id from SESSIONS");
+    imdbw_msg m = {.type = IMDBW_KILL, .kill = kind, .sid = session};
     return put_msg(c, &m, e);
 }
 

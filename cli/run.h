@@ -29,6 +29,8 @@ struct cli_runner {
     cli_src *script;    /* the stream being run (cli_run_stream): COPY's data inline, after the statement */
     cli_src *in;        /* stdin's, made at the first COPY ... FROM STDIN outside a script (-c, the REPL) */
     cli_src *active;    /* the running COPY's: cli_copy_read reads it */
+    int (*meta)(cli_runner *rn, const char *line); /* N1e stage two: a client's backslash commands (NULL: none): 1 when
+                                                   * it took the line, its outcome printed */
 };
 
 /* the running COPY's data, stopped before a \. line (the engine session's reader's signature, arg the runner): > 0
