@@ -6457,6 +6457,9 @@ out:
 int main(int argc, char **argv)
 {
     setlocale(LC_ALL, "C.UTF-8"); /* the ODBC driver's client code page: UTF-8 */
+    /* 2b-2b: every imagedb sort in runs of this many (the tables here stay under one run of 512), so the merges and the
+     * permutation answer against the five engines too */
+    if (getenv("IMDB_ORACLE_SORT_RUN")) imdb_sql_set_sort_run((size_t)atoi(getenv("IMDB_ORACLE_SORT_RUN")));
     unsigned lo = 1, hi = 20;
     int steps = 80;
     bool keep_going = false, ping = false;

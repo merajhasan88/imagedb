@@ -432,6 +432,181 @@ static inline int xtick(xctx *x, uint64_t n, imdb_err *e)
     return x->ticks < x->next_check ? IMDB_OK : xcheck(x, e);
 }
 
+/* ---- 2b-2b: the executor's one sort (docs/n1-design.md §8e: the sort's deadline) ---- */
+/* Every sort of a statement's rows, keys, groups or vids goes through xsort, so the statement's deadline and cancel are
+ * looked at as it goes (a million rows sorted in about two seconds had run past both). Runs are sorted in place by the
+ * C library (XS_RUN elements: the check cadence of every other path, whatever a comparison costs), a
+ * check after each; longer arrays are then merged in glibc's top-down order (each run at once into the run before it of
+ * its length), a check every TICK_ROWS moves, the temporary the statement's (imdb_alloc_array: charged to its memory
+ * ceiling). An array of one run allocates nothing of ours. Elements of eight bytes (order arrays, vids) are sorted as
+ * they are, larger ones through pointers to them, then put in their places by following each cycle. Every comparator
+ * given it is total (ties broken by the default order, or keys that are unique: .work/scratch/sortdl/REPORT.md), so its
+ * order is the one any correct sort gives, the C library's whole (the tests' reference). A sort that stops leaves its
+ * array a permutation of what it was given (no caller reads it after the error) */
+typedef struct xsortc {
+    int (*cr)(const void *, const void *, void *); /* a qsort_r comparator and its argument, or */
+    int (*c)(const void *, const void *);          /* a qsort one */
+    void *arg;
+    int site; /* tests: its call site (1-15), passed to the hook */
+} xsortc;
+
+_Static_assert(sizeof(uintptr_t) <= sizeof(uint64_t), "a pointer is held in a word");
+/* the runs sorted in place before the merges: XS_RUN elements, about 4,600 comparisons, the cadence of the merges' own
+ * checks (every TICK_ROWS moves) and of every other path's (rows), whatever a comparison costs. (A run of 16,384 had
+ * gone 34 ms unchecked over keys sharing a 4,000-byte prefix; one timed from its first elements could be steered by
+ * putting cheap keys first. In the merges' top-down order, 512 costs about 1.5% more than 16,384 over a million rows) */
+enum { XS_RUN = 512 };
+
+static bool g_sort_reference;          /* tests: the C library's qsort whole (the old sort), no checks */
+/* tests: called at each of a sort's checks, before it (its phase: 0 a run, 1 a merge, 2 the permutation; its site) */
+static void (*g_sort_hook)(void *arg, int phase, int site);
+static void *g_sort_hook_arg;
+static _Atomic uint64_t g_sorts_stopped; /* tests: sorts a check stopped */
+static size_t g_sort_run;              /* tests: the runs' length (0: XS_RUN), so a few thousand rows reach the merges */
+void imdb_sql_set_sort_reference(bool on) { g_sort_reference = on; }
+void imdb_sql_set_sort_hook(void (*fn)(void *arg, int phase, int site), void *arg) { g_sort_hook = fn, g_sort_hook_arg = arg; }
+uint64_t imdb_sql_sorts_stopped(void) { return atomic_load_explicit(&g_sorts_stopped, memory_order_relaxed); }
+void imdb_sql_set_sort_run(size_t n) { g_sort_run = n; }
+
+static inline int xs_cmp(const xsortc *k, const void *a, const void *b) { return k->cr ? k->cr(a, b, k->arg) : k->c(a, b); }
+static int xs_ref(const void *a, const void *b, void *arg) { return xs_cmp(arg, a, b); }
+static int xs_ref_ind(const void *a, const void *b, void *arg)
+{
+    return xs_cmp(arg, (const void *)(uintptr_t)*(const uint64_t *)a, (const void *)(uintptr_t)*(const uint64_t *)b);
+}
+
+/* a sort's check: the tests' hook, then the statement's (a stop counted) */
+static int xs_check(xctx *x, int phase, int site, imdb_err *e)
+{
+    if (g_sort_hook) g_sort_hook(g_sort_hook_arg, phase, site);
+    int rc = xcheck(x, e);
+    if (rc) atomic_fetch_add_explicit(&g_sorts_stopped, 1, memory_order_relaxed);
+    return rc;
+}
+
+/* m elements at base sorted in place by the C library (the comparator called directly where it can be; ind: words
+ * holding pointers to the elements compared), then a check once about TICK_ROWS moves have passed */
+static int xs_run(xctx *x, void *base, size_t m, size_t size, bool ind, const xsortc *k, imdb_err *e)
+{
+    if (ind) qsort_r(base, m, size, xs_ref_ind, (void *)(uintptr_t)k); /* (its argument read only) */
+    else if (k->cr) qsort_r(base, m, size, k->cr, k->arg);
+    else qsort(base, m, size, k->c);
+    x->ticks += m * (64 - (uint64_t)__builtin_clzll(m | 1)); /* (about its moves: m log2 m) */
+    return x->ticks >= x->next_check ? xs_check(x, 0, k->site, e) : IMDB_OK;
+}
+
+/* w[lo, mid) and w[mid, hi) merged in place: the left run copied to tmp, then merged back from the left (the left first
+ * among equals: stable), the comparator in registers and the moves counted locally to the next check. Stopped, the left
+ * run's rest is copied into the gap its merge left, so w stays a permutation */
+static int xs_merge2(xctx *x, uint64_t *w, uint64_t *tmp, size_t lo, size_t mid, size_t hi, bool ind, const xsortc *k,
+                     imdb_err *e)
+{
+    size_t nl = mid - lo, i = 0, j = mid, o = lo;
+    memcpy(tmp, w + lo, nl * sizeof *tmp);
+    int (*cr)(const void *, const void *, void *) = k->cr;
+    int (*cq)(const void *, const void *) = k->c;
+    void *arg = k->arg;
+    uint64_t left = x->next_check > x->ticks ? x->next_check - x->ticks : 1;
+    int rc = IMDB_OK;
+    if (!ind && cr) { /* the hot case (an order array's indices, a qsort_r comparator): its own loop, no branch a step */
+        while (i < nl && j < hi) {
+            w[o++] = cr(&tmp[i], &w[j], arg) <= 0 ? tmp[i++] : w[j++];
+            if (!--left) {
+                x->ticks = x->next_check;
+                if ((rc = xs_check(x, 1, k->site, e))) break;
+                left = x->next_check - x->ticks;
+            }
+        }
+    } else {
+        while (i < nl && j < hi) {
+            const void *a = ind ? (const void *)(uintptr_t)tmp[i] : (const void *)&tmp[i];
+            const void *b = ind ? (const void *)(uintptr_t)w[j] : (const void *)&w[j];
+            int c = cr ? cr(a, b, arg) : cq(a, b);
+            w[o++] = c <= 0 ? tmp[i++] : w[j++];
+            if (!--left) {
+                x->ticks = x->next_check;
+                if ((rc = xs_check(x, 1, k->site, e))) break;
+                left = x->next_check - x->ticks;
+            }
+        }
+    }
+    x->ticks = x->next_check - left;
+    memcpy(w + o, tmp + i, (nl - i) * sizeof *w); /* (the left run's rest: its place, o + (nl - i) == j; stopped too) */
+    x->ticks += nl - i;
+    return rc;
+}
+
+/* n words (ind: each a pointer to the element compared): runs sorted in place, each merged at once with the run before
+ * it while the two are equal in length (a binary counter: glibc's top-down order, so a merge reads keys its runs just
+ * left in the cache; merging pass by pass over the whole array had cost the comparator's misses, 7%), the rest merged
+ * last from the right; the temporary holds a left run at a time */
+static int xs_merge(xctx *x, uint64_t *w, size_t n, bool ind, size_t run, const xsortc *k, imdb_err *e)
+{
+    if (n <= run) return xs_run(x, w, n, sizeof *w, ind, k, e);
+    uint64_t *tmp = imdb_alloc_array(n, sizeof *tmp, e);
+    if (!tmp) return e->code;
+    size_t st[64], ns = 0; /* the sorted runs' starts, left to right (each run's length st[i+1] - st[i]; the last's n) */
+    int rc = IMDB_OK;
+    for (size_t lo = 0; lo < n && !rc; lo += run) {
+        size_t m = n - lo < run ? n - lo : run;
+        if ((rc = xs_run(x, w + lo, m, sizeof *w, ind, k, e))) break;
+        st[ns++] = lo;
+        /* the newest run merged into the one before it while that one is no longer than it */
+        while (!rc && ns >= 2) {
+            size_t a = st[ns - 2], b = st[ns - 1], end = lo + m;
+            if (b - a > end - b) break;
+            rc = xs_merge2(x, w, tmp, a, b, end, ind, k, e);
+            ns--;
+        }
+    }
+    while (!rc && ns >= 2) { /* the rest, from the right */
+        rc = xs_merge2(x, w, tmp, st[ns - 2], st[ns - 1], n, ind, k, e);
+        ns--;
+    }
+    imdb_free(tmp);
+    return rc;
+}
+
+static int xsort(xctx *x, void *base, size_t n, size_t size, const xsortc *k, imdb_err *e)
+{
+    if (n < 2) return IMDB_OK;
+    if (g_sort_reference) {
+        qsort_r(base, n, size, xs_ref, (void *)(uintptr_t)k); /* (its argument read only, by xs_ref) */
+        return IMDB_OK;
+    }
+    size_t run = g_sort_run ? g_sort_run : XS_RUN;
+    if (n <= run) return xs_run(x, base, n, size, false, k, e); /* nothing of ours allocated */
+    if (size == sizeof(uint64_t)) return xs_merge(x, base, n, false, run, k, e);
+    /* larger elements sorted through pointers to them (as glibc's qsort does), then put in their places by following
+     * each cycle of the permutation; stopped inside a cycle, the element it carries fills the hole: a permutation */
+    uint8_t one[256], *b = base;
+    if (size > sizeof one) return imdb_fail(e, IMDB_ERR_STATE, "a sort's element of %zu bytes", size);
+    uint64_t *p = imdb_alloc_array(n, sizeof *p, e);
+    if (!p) return e->code;
+    for (size_t i = 0; i < n; i++) p[i] = (uintptr_t)(b + i * size);
+    int rc = xs_merge(x, p, n, true, run, k, e);
+    for (size_t i = 0; i < n && !rc; i++) {
+        if (p[i] == (uintptr_t)(b + i * size)) continue;
+        memcpy(one, b + i * size, size);
+        for (size_t j = i;;) {
+            size_t from = (size_t)((uint8_t *)(uintptr_t)p[j] - b) / size;
+            p[j] = (uintptr_t)(b + j * size);
+            if (from == i) {
+                memcpy(b + j * size, one, size);
+                break;
+            }
+            memcpy(b + j * size, b + from * size, size);
+            j = from;
+            if (++x->ticks >= x->next_check && (rc = xs_check(x, 2, k->site, e))) {
+                memcpy(b + j * size, one, size); /* the hole is at j now */
+                break;
+            }
+        }
+    }
+    imdb_free(p);
+    return rc;
+}
+
 static void *xalloc(xctx *x, size_t n, imdb_err *e)
 {
     if (x->nallocs == x->capallocs) {
@@ -1192,7 +1367,18 @@ static const imdb_result *sub_result(const xctx *x, uint8_t k, imdb_err *e)
     return &x->own[k].r;
 }
 
-static int cmp_xval(const void *a, const void *b) { return imdb_x_cmp(a, b); }
+/* the IN set's order (bind_inset, corr_answer): imdb_x_cmp's, then (2b-2b) an INTERVAL's triple, so equal spans of other
+ * fields ('1 mon', '30 days') are ordered too. The set is only searched (any equal element answers), but every sort's
+ * comparator is total (xsort) */
+static int cmp_xval(const void *a, const void *b)
+{
+    int c = imdb_x_cmp(a, b);
+    const imdb_xval *p = a, *q = b;
+    if (c || p->type != IMDB_T_INTERVAL || q->type != IMDB_T_INTERVAL) return c;
+    if (p->mon != q->mon) return p->mon < q->mon ? -1 : 1;
+    if (p->day != q->day) return p->day < q->day ? -1 : 1;
+    return (p->i > q->i) - (p->i < q->i);
+}
 
 static struct xplain *xp_scratch(imdb_err *e); /* P2 S4b: the bind-only pass's collector, its rows discarded */
 static int run_nested(xctx *x, const sql_stmt *in, imdb_result *r, uint8_t mode, const xscope *sc, const imdb_value *upv,
@@ -1270,7 +1456,8 @@ static int bind_inset(xctx *x, const xscope *sc, uint16_t k, imdb_err *e)
         if (v.null) s->has_null = true;
         else s->v[s->n++] = v;
     }
-    qsort(s->v, s->n, sizeof *s->v, cmp_xval);
+    xsortc kc = {.site = 1, .c = cmp_xval};
+    if (xsort(x, s->v, s->n, sizeof *s->v, &kc, e)) return e->code;
     x->xn[n->r].set = s;
     x->xn[n->r].type = tb;
     x->xn[n->r].scale = r->cscale[0];
@@ -3001,7 +3188,8 @@ static int corr_answer(xctx *x, const sql_expr *n, const xcorr *c, const imdb_re
         *a = (uint64_t)(uintptr_t)&s->v[0];
         return IMDB_OK;
     }
-    qsort(s->v, s->n, sizeof *s->v, cmp_xval);
+    xsortc kc = {.site = 2, .c = cmp_xval};
+    if (xsort(x, s->v, s->n, sizeof *s->v, &kc, e)) return e->code;
     *a = (uint64_t)(uintptr_t)s;
     return IMDB_OK;
 }
@@ -4485,7 +4673,7 @@ static bool plain_order(const sql_stmt *st) { return !st->norder && !st->distinc
 
 /* rows built in the default order (rows[0..n)), now ordered, deduplicated and cut to OFFSET and LIMIT: the cells
  * rebuilt in that order (grouped statements, whose rows are few: IMDB_MAX_GROUPS) */
-static int reorder_rows(const sql_stmt *st, imdb_xval *keys, imdb_result *r, imdb_err *e)
+static int reorder_rows(xctx *x, const sql_stmt *st, imdb_xval *keys, imdb_result *r, imdb_err *e)
 {
     uint64_t n = r->nrows, *ord = imdb_alloc_array(n ? n : 1, sizeof *ord, e), *keep = NULL;
     if (!ord) return e->code;
@@ -4495,7 +4683,11 @@ static int reorder_rows(const sql_stmt *st, imdb_xval *keys, imdb_result *r, imd
             if (st->ord_pos[o]) cell_x(r, &r->cells[i * r->ncols + st->ord_pos[o] - 1], &keys[i * st->norder + o]);
     if (st->norder) {
         ordctx c = {st, keys, NULL};
-        qsort_r(ord, n, sizeof *ord, cmp_order, &c);
+        xsortc kc = {.site = 3, .cr = cmp_order, .arg = &c};
+        if (xsort(x, ord, n, sizeof *ord, &kc, e)) {
+            imdb_free(ord);
+            return e->code;
+        }
     }
     window w;
     int rc = window_init(&w, st, r, e);
@@ -4621,7 +4813,8 @@ static int materialize(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb
         if (!k->kwalk) return imdb_fail(e, IMDB_ERR_STATE, "a row statement materialized without its walk's keys");
         if (key_resolve(k, e)) return e->code;
         keyed *kv = k->wkv;
-        if (k->nvids) qsort(kv, k->nvids, sizeof *kv, cmp_keyed);
+        xsortc kk = {.site = 4, .c = cmp_keyed};
+        if (xsort(x, kv, k->nvids, sizeof *kv, &kk, e)) return e->code;
         imdb_value vals[IMDB_MAX_COLS];
         int rc = IMDB_OK;
         if (plain_order(st)) { /* the primary key's order, the first LIMIT rows */
@@ -4640,8 +4833,8 @@ static int materialize(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb
         for (uint64_t i = 0; !rc && i < n; i++) ord[i] = i;
         if (!rc && st->norder) {
             ordctx c = {st, k->wok, kv};
-            qsort_r(ord, n, sizeof *ord, cmp_order, &c);
-            rc = xcheck(x, e); /* a sort runs to its end (the result cap bounds it): the check after it */
+            xsortc kc = {.site = 5, .cr = cmp_order, .arg = &c};
+            rc = xsort(x, ord, n, sizeof *ord, &kc, e); /* 2b-2b: its own checks (it ran to its end before) */
         }
         if (!rc) rc = window_init(&w, st, r, e);
         for (uint64_t j = 0; !rc && j < n && w.left; j++) {
@@ -4687,8 +4880,11 @@ static int materialize(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb
     uint64_t *order = imdb_alloc_array(k->ngroups ? k->ngroups : 1, sizeof *order, e);
     if (!order) return e->code;
     for (uint64_t g = 0; g < k->ngroups; g++) order[g] = g;
-    if (k->gen) qsort_r(order, k->ngroups, sizeof *order, cmp_gkeys, k);
-    else qsort_r(order, k->ngroups, sizeof *order, cmp_group_idx, k->groups);
+    xsortc kg = k->gen ? (xsortc){.site = 6, .cr = cmp_gkeys, .arg = k} : (xsortc){.site = 6, .cr = cmp_group_idx, .arg = k->groups};
+    if (xsort(x, order, k->ngroups, sizeof *order, &kg, e)) {
+        imdb_free(order);
+        return e->code;
+    }
     bool plain = plain_order(st); /* else every group's row is built, then ordered and cut (reorder_rows) */
     uint64_t lim = plain && st->has_limit && st->limit < k->ngroups ? st->limit : k->ngroups;
     imdb_xval *keys = NULL;
@@ -4731,7 +4927,7 @@ static int materialize(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb
             else xrc = put_agg(r, &row[i], &k->gacc[g * st->nitems + i], st->items[i].agg, c >= 0 ? &t->s.cols[c] : &t->s.cols[0], e);
         }
     }
-    if (!xrc && !plain) xrc = reorder_rows(st, keys, r, e);
+    if (!xrc && !plain) xrc = reorder_rows(x, st, keys, r, e);
     imdb_free(keys);
     imdb_free(order);
     return xrc ? xrc : res_finish(r, e);
@@ -5169,7 +5365,7 @@ static void demoted_reset(imdb_session *ss)
 {
     if (!ss->su_set || !gate_role(ss)) return; /* nothing noted, or a superuser now */
     if (ss->su_set & SU_CROSS) ss->cross_check = false;
-    if (ss->su_set & SU_SLOW) ss->slow_ms = 0;
+    if (ss->su_set & SU_SLOW) ss->slow_ms = ss->caps.slow_ms; /* 2b-2b: its role's default, the server's option (0: none) */
     if (ss->su_set & SU_SYNC) ss->sync_replicas = 0, ss->sync_wait_ms = 0;
     if ((ss->su_set & SU_MEMORY) && ss->stmt_memory > imdb_query_share(ss->db->mem_limit))
         ss->stmt_memory = 0; /* the default: the share */
@@ -7153,8 +7349,12 @@ static int join_materialize(xctx *x, const sql_stmt *st, jctx *j, sink *k, imdb_
             return e->code;
         }
     }
-    qsort(kv, j->npairs, sizeof *kv, cmp_jkeyed);
-    int rc = IMDB_OK;
+    xsortc kj = {.site = 7, .c = cmp_jkeyed};
+    int rc = xsort(x, kv, j->npairs, sizeof *kv, &kj, e);
+    if (rc) {
+        imdb_free(kv);
+        return rc;
+    }
     imdb_value cv[IMDB_MAX_COLS];
     if (plain_order(st)) { /* side 0's key, then side 1's: the first LIMIT pairs */
         uint64_t lim = st->has_limit && st->limit < j->npairs ? st->limit : j->npairs;
@@ -7179,8 +7379,8 @@ static int join_materialize(xctx *x, const sql_stmt *st, jctx *j, sink *k, imdb_
     }
     if (!rc && keys) {
         ordctx c = {st, keys, NULL};
-        qsort_r(ord, n, sizeof *ord, cmp_order, &c);
-        rc = xcheck(x, e); /* a sort runs to its end: the check after it */
+        xsortc kc = {.site = 8, .cr = cmp_order, .arg = &c};
+        rc = xsort(x, ord, n, sizeof *ord, &kc, e); /* 2b-2b: its own checks (it ran to its end before) */
     }
     if (!rc) rc = window_init(&w, st, r, e);
     for (uint64_t jx = 0; !rc && jx < n && w.left; jx++) {
@@ -7979,7 +8179,8 @@ static int setop_tail(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
     if (!ord) return e->code;
     for (uint64_t i = 0; i < n; i++) ord[i] = i;
     setcmp c = {r, st, key};
-    if (st->norder) qsort_r(ord, n, sizeof *ord, cmp_setrow, &c);
+    xsortc kc = {.site = 9, .cr = cmp_setrow, .arg = &c};
+    if (st->norder && xsort(x, ord, n, sizeof *ord, &kc, e)) return e->code;
     imdb_cell *nc = cnt ? imdb_alloc_array(cnt * r->ncols, sizeof *nc, e) : NULL;
     if (cnt && !nc) return e->code;
     for (uint64_t i = 0; i < cnt; i++) memcpy(&nc[i * r->ncols], &r->cells[ord[from + i] * r->ncols], r->ncols * sizeof *nc);
@@ -8664,8 +8865,8 @@ static int exec_window(xctx *x, const sql_stmt *st, imdb_result *r, struct xplai
             }
             for (uint64_t i = 0; i < N; i++) srt[sw][i] = i;
             wsortc c = {&R, &st->win[sw], pcol[sw], ocol[sw]};
-            qsort_r(srt[sw], N, sizeof *srt[sw], cmp_wrow, &c);
-            if ((rc = xcheck(x, e))) break; /* a sort runs to its end: the check after it */
+            xsortc kc = {.site = 10, .cr = cmp_wrow, .arg = &c};
+            if ((rc = xsort(x, srt[sw], N, sizeof *srt[sw], &kc, e))) break; /* 2b-2b: its own checks */
         }
         rc = win_compute(x, st, &wi[q], &R, srt[sw], pcol[sw], ocol[sw], &W, q, e);
     }
@@ -8675,7 +8876,10 @@ static int exec_window(xctx *x, const sql_stmt *st, imdb_result *r, struct xplai
     if (!rc) {
         for (uint64_t i = 0; i < N; i++) ord[i] = i;
         wtailc c = {st, &R, &W, kcol, wfrom};
-        if (st->norder) qsort_r(ord, N, sizeof *ord, cmp_wtail, &c);
+        xsortc kc = {.site = 11, .cr = cmp_wtail, .arg = &c};
+        if (st->norder) rc = xsort(x, ord, N, sizeof *ord, &kc, e);
+    }
+    if (!rc) {
         res_cols(r, st->nitems);
         r->byte_cap = workspace_of(x->ss);
         for (uint16_t i = 0; i < st->nitems; i++) {
@@ -8904,7 +9108,11 @@ static int select_vids(xctx *x, const sql_stmt *st, imdb_table *t, bool all_vers
         sink_free(&k);
         return rc;
     }
-    if (k.nvids) qsort(k.vids, k.nvids, sizeof *k.vids, cmp_u64);
+    xsortc ku = {.site = 12, .c = cmp_u64};
+    if (!rc && xsort(x, k.vids, k.nvids, sizeof *k.vids, &ku, e)) {
+        sink_free(&k);
+        return e->code;
+    }
     if (x->ss->cross_check) {
         sink k2;
         memset(&k2, 0, sizeof k2);
@@ -8924,7 +9132,8 @@ static int select_vids(xctx *x, const sql_stmt *st, imdb_table *t, bool all_vers
         int rc2 = run_path(x, p2, &q, &k2, &e2);
         x->tested = first;
         rc = xc_verdict(rc, rc2, xc_own(x, rc2), &e2, path_name(p1, &q), path_name(p2, &q), e);
-        if (!rc && k2.nvids) qsort(k2.vids, k2.nvids, sizeof *k2.vids, cmp_u64);
+        xsortc ku2 = {.site = 13, .c = cmp_u64};
+        if (!rc) rc = xsort(x, k2.vids, k2.nvids, sizeof *k2.vids, &ku2, e);
         if (!rc && (k.nvids != k2.nvids || (k.nvids && memcmp(k.vids, k2.vids, k.nvids * sizeof *k.vids) != 0)))
             rc = imdb_fail(e, IMDB_ERR_VERIFY, "cross-check FAILED selecting rows to change: %s and %s disagree",
                            path_name(p1, &q), path_name(p2, &q));
@@ -9899,7 +10108,8 @@ static int exec_join_write(xctx *x, const sql_stmt *st, bool upd, imdb_result *r
         pr[i].i = i;
     }
     pkctx pc = {&q, &t->s};
-    if (!rc && q.nrows) qsort_r(pr, q.nrows, sizeof *pr, cmp_pkrow, &pc);
+    xsortc kp = {.site = 14, .cr = cmp_pkrow, .arg = &pc};
+    if (!rc) rc = xsort(x, pr, q.nrows, sizeof *pr, &kp, e);
     for (uint64_t i = 0; !rc && i < q.nrows; i++) { /* each t row once */
         if (n && !pkrow_keys(&pr[n - 1], &pr[i], &pc)) {
             if (upd)
@@ -10684,7 +10894,8 @@ static int exec_show(xctx *x, const sql_stmt *st, imdb_result *r, imdb_err *e)
                 nch = n;
                 continue;
             }
-            qsort(chain, nch, sizeof *chain, cmp_u64); /* oldest first: vids are handed out in order */
+            xsortc ku = {.site = 15, .c = cmp_u64};
+            if (xsort(x, chain, nch, sizeof *chain, &ku, e)) return e->code; /* oldest first: vids are handed out in order */
             imdb_value vals[IMDB_MAX_COLS];
             for (uint64_t i = 0; i < nch; i++) {
                 imdb_vloc at;

@@ -10,6 +10,8 @@
 #include "../../src/db.h"
 #include "../../src/lake.h"
 #include "../../src/sql.h"
+#include "../../server/spool.h"
+#include "../../server/srv.h"
 #include "test.h"
 
 int g_test_failed;
@@ -161,6 +163,15 @@ int main(int argc, char **argv)
             imdb_clock_offset(0);      /* a test that moves the clock (expiry) moves it for itself only */
             imdb_clock_freeze(0);      /* and one that froze it */
             imdb_backup_test_between(NULL, NULL); /* a test that cuts between a backup's parts does it for itself only */
+            imdb_sql_set_sort_hook(NULL, NULL);    /* 2b-2b: the sort's knobs and the server's, so a test that failed with */
+            imdb_sql_set_sort_run(0);              /* one set leaves it set for no later test */
+            imdb_sql_set_sort_reference(false);
+            imdbs_test_reply_hold(0);
+            imdbs_test_count_hold(0);
+            imdbs_test_copy_hold(0);
+            imdbsp_no_release(false);
+            imdbsp_no_tmpfile(false);
+            imdbsp_fail_at(0);
             g_errmsg[0] = 0;
             printf("[%s] %s\n", groups[g].name, tc->name);
             fflush(stdout);

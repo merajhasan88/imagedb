@@ -25,12 +25,17 @@ int imdbsp_open(int dfd, imdbsp **out, imdb_err *e);
 int imdbsp_write(imdbsp *sp, uint64_t off, const void *p, size_t n, imdb_err *e);
 /* up to n bytes at off: > 0 read, 0 past the end, < 0 a failure */
 ssize_t imdbsp_read(imdbsp *sp, uint64_t off, void *p, size_t n);
+/* 2b-2b: [off, off + n) never read again: its blocks given back to the file system (a hole, the file's size kept); false
+ * when the file system cannot (the caller then keeps them counted). Never an error: nothing depends on it but a bound */
+bool imdbsp_release(imdbsp *sp, uint64_t off, uint64_t n);
 void imdbsp_close(imdbsp *sp);
 
 /* tests: the nth spool call from now fails (an open, a write, a read: ENOSPC, or EIO for a read; 0: none); spools open
- * now; the O_TMPFILE path refused, so the named fallback runs */
+ * now; the O_TMPFILE path refused, so the named fallback runs; releases refused */
 void imdbsp_fail_at(int64_t n);
 int64_t imdbsp_live(void);
 void imdbsp_no_tmpfile(bool on);
+/* tests: every release refused, as on a file system without holes */
+void imdbsp_no_release(bool on);
 
 #endif

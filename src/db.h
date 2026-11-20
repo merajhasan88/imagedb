@@ -892,6 +892,8 @@ typedef struct imdb_txn_sp { /* SAVEPOINT: a position in the op list */
 typedef struct imdb_caps {
     uint32_t stmt_ms, txn_ms, idle_ms;
     uint64_t row_limit, prep_bytes;
+    uint32_t slow_ms; /* 2b-2b: a role's slow-statement default (the session's slow_ms at its start; what a demoted superuser's
+                       * SET slow_statement_ms returns to): its statements past it events in the log (0: none) */
 } imdb_caps;
 
 typedef struct imdb_txn {

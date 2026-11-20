@@ -18,10 +18,12 @@ struct imdbsp {
 static _Atomic int64_t g_live;
 static _Atomic int64_t g_fail_at;
 static _Atomic bool g_no_tmpfile;
+static _Atomic bool g_no_release;
 
 void imdbsp_fail_at(int64_t n) { atomic_store_explicit(&g_fail_at, n, memory_order_relaxed); }
 int64_t imdbsp_live(void) { return atomic_load_explicit(&g_live, memory_order_relaxed); }
 void imdbsp_no_tmpfile(bool on) { atomic_store_explicit(&g_no_tmpfile, on, memory_order_relaxed); }
+void imdbsp_no_release(bool on) { atomic_store_explicit(&g_no_release, on, memory_order_relaxed); }
 
 /* the call the hook fails (counted down to it) */
 static bool failing(void)
@@ -104,6 +106,16 @@ ssize_t imdbsp_read(imdbsp *sp, uint64_t off, void *p, size_t n)
         ssize_t k = pread(sp->fd, p, n, (off_t)off);
         if (k < 0 && errno == EINTR) continue;
         return k;
+    }
+}
+
+bool imdbsp_release(imdbsp *sp, uint64_t off, uint64_t n)
+{
+    if (!n) return true;
+    if (atomic_load_explicit(&g_no_release, memory_order_relaxed) || off > INT64_MAX || n > INT64_MAX - off) return false;
+    for (;;) {
+        if (!fallocate(sp->fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)off, (off_t)n)) return true;
+        if (errno != EINTR) return false;
     }
 }
 

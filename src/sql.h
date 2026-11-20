@@ -166,6 +166,15 @@ void imdb_session_cancel_held(imdb_session *s, bool on);
 /* P2 S12, tests: a window function's moving frames each summed afresh (the reference the sliding window is checked
  * against), process-wide; off by default */
 void imdb_sql_set_window_reference(bool on);
+/* 2b-2b, tests (the sort's deadline): every executor sort by the C library's qsort (the old sort: the order's reference),
+ * process-wide, off by default; a hook called at each of a sort's checks (every 4,096 element moves), before it; the
+ * sorts a check stopped */
+void imdb_sql_set_sort_reference(bool on);
+void imdb_sql_set_sort_hook(void (*fn)(void *arg, int phase, int site), void *arg); /* (phase: 0 a run, 1 a merge, 2 the
+                                                                                    * permutation; site: the call site, 1-15) */
+uint64_t imdb_sql_sorts_stopped(void);
+/* tests: the length of the runs a sort sorts in place before its merges (0: 16,384), so a few thousand rows reach them */
+void imdb_sql_set_sort_run(size_t n);
 /* tests: the segments the scan's grouped fast path (fast_group_seg) has taken in this process, so a test can show it ran */
 uint64_t imdb_sql_fast_group_segments(void);
 void imdb_result_init(imdb_result *r);

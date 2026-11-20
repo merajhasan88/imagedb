@@ -85,6 +85,29 @@ if [ "$EXPECT" = 1 ]; then
     [ "$rc" -eq 2 ] || fail "$pair: exit $rc, not the usage's 2"
   done
   echo "the daemon's controls: --mem-limit, --seg-cache (and all), --iceberg, --anchor, the nine constants and --role-copy-spool taken; eight bad values refused"
+  # 2b-2b: the descriptors --max-conns needs (256: 2,496): a hard limit short of them refused before anything is opened;
+  # a soft one short of them raised to the hard one
+  rc=0
+  (ulimit -n 1024 && exec "$SRV" "$P" --socket "$WORK/s" --server-dir "$WORK/sd") >"$WORK/nofile" 2>&1 || rc=$?
+  { [ "$rc" -eq 1 ] && grep -q 'needs about 2496 file descriptors, and RLIMIT_NOFILE allows 1024' "$WORK/nofile"; } ||
+    fail "a hard limit of 1,024: exit $rc: $(cat "$WORK/nofile")"
+  [ ! -S "$WORK/s" ] || fail "a refused start made its socket"
+  hard=$(ulimit -Hn)
+  if [ "$hard" = unlimited ] || [ "$hard" -ge 4096 ]; then
+    printf '#!/bin/sh\nulimit -Sn 1024 || exit 9\nexec "%s" "$@"\n' "$SRV" >"$WORK/soft1024"
+    chmod +x "$WORK/soft1024"
+    start "$WORK/soft1024"
+    soft=$(awk '/^Max open files/ {print $4}' "/proc/$spid/limits")
+    [ "$soft" = "$(awk '/^Max open files/ {print $5}' "/proc/$spid/limits")" ] || fail "a soft limit of 1,024 not raised: $soft"
+    net -c 'CREATE TABLE fd_t (id INT64 PRIMARY KEY)' -c 'INSERT INTO fd_t VALUES (1)' -c CHECKPOINT >/dev/null
+    fds=$(find "/proc/$spid/fd" -mindepth 1 -maxdepth 1 | wc -l)
+    stop
+    [ "$stop_rc" -eq 0 ] || fail "a clean stop exited $stop_rc"
+    echo "the descriptors: a hard limit of 1,024 refused at start; a soft one raised to $soft; $fds open with no client (256 allowed for them)"
+    [ "$fds" -lt 256 ] || fail "the server holds $fds descriptors with no client: past imdbs_fds_needed's 256"
+  else
+    echo "the descriptors: a hard limit of 1,024 refused at start; the soft limit's raise not tested (the hard limit is $hard)"
+  fi
 fi
 
 # 1. a failed final close: the server, apply, rewind

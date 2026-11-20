@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -34,7 +35,7 @@ static int usage(void)
           "                      [--role-queue-bytes BYTES] [--role-reply-bytes BYTES] [--preauth-max N]\n"
           "                      [--preauth-timeout MS] [--preauth-per-addr N] [--socket-reserve N] [--slice-ms MS]\n"
           "                      [--queue-max N] [--send-timeout MS] [--conn-cap BYTES] [--reply-budget BYTES]\n"
-          "                      [--role-copy-spool BYTES]\n"
+          "                      [--role-copy-spool BYTES] [--role-slow-statement-ms MS] [--role-idle-session MS]\n"
           "       imagedb-server cert SDIR [--name NAME]... [--renew]\n", stderr);
     return 2;
 }
@@ -121,7 +122,7 @@ static int cert_cmd(int argc, char **argv)
     }
     char hex[65];
     for (int k = 0; k < 32; k++) snprintf(hex + 2 * k, 3, "%02x", pin[k]);
-    printf("%s %s/server.crt; its pin (the key's SPKI SHA-256): %s\n", renew ? "renewed" : "made", sdir, hex);
+    printf("%s %s/tls/server.crt; its pin (the key's SPKI SHA-256): %s\n", renew ? "renewed" : "made", sdir, hex);
     return 0;
 }
 int main(int argc, char **argv)
@@ -165,6 +166,11 @@ int main(int argc, char **argv)
             uint32_t *f = argv[i][7] == 's' ? &so.role_stmt_ms : argv[i][7] == 't' ? &so.role_txn_ms : &so.role_idle_ms;
             if (!parse_ms(argv[++i], 0, 86400000, f)) return usage();
             if (!*f) *f = IMDBS_NONE;
+        } else if (!strcmp(argv[i], "--role-slow-statement-ms") && i + 1 < argc) { /* 2b-2b: 0 none */
+            if (!parse_ms(argv[++i], 0, 86400000, &so.role_slow_ms)) return usage();
+        } else if (!strcmp(argv[i], "--role-idle-session") && i + 1 < argc) { /* 2b-2b: 0 none, else 1 s at least */
+            if (!parse_ms(argv[++i], 0, 86400000, &so.role_sess_idle_ms) || (so.role_sess_idle_ms && so.role_sess_idle_ms < 1000))
+                return usage();
         } else if (!strcmp(argv[i], "--role-row-limit") && i + 1 < argc) {
             if (!parse_bytes(argv[++i], 0, 1000000000000ull, &so.role_row_limit) || strpbrk(argv[i], "KMG")) return usage();
         } else if (!strcmp(argv[i], "--role-prepared-bytes") && i + 1 < argc) {
@@ -210,6 +216,30 @@ int main(int argc, char **argv)
         else dir = argv[i];
     }
     if (!dir || !sock || !sdir) return usage();
+    /* 2b-2b: the descriptors its connections may hold (imdbs_fds_needed): a soft limit short of them raised to the hard
+     * one (a unit's default is often 1,024), a hard one short of them a refusal before anything is opened, so a full
+     * server never fails an accept or a spool for want of a descriptor */
+    {
+        uint64_t need = imdbs_fds_needed(&so);
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NOFILE, &rl)) {
+            fprintf(stderr, "imagedb-server: RLIMIT_NOFILE: %s\n", strerror(errno));
+            return 1;
+        }
+        if (rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < need) {
+            if (rl.rlim_max != RLIM_INFINITY && rl.rlim_max < need) {
+                fprintf(stderr, "imagedb-server: --max-conns %u needs about %llu file descriptors, and RLIMIT_NOFILE allows %llu: "
+                                "raise it (ulimit -n, a unit's LimitNOFILE=) or lower --max-conns\n",
+                        so.max_conns ? so.max_conns : 256u, (unsigned long long)need, (unsigned long long)rl.rlim_max);
+                return 1;
+            }
+            rl.rlim_cur = rl.rlim_max;
+            if (setrlimit(RLIMIT_NOFILE, &rl)) {
+                fprintf(stderr, "imagedb-server: raising RLIMIT_NOFILE to %llu: %s\n", (unsigned long long)rl.rlim_max, strerror(errno));
+                return 1;
+            }
+        }
+    }
     /* every thread the server starts inherits these blocked: the main thread alone takes them, by sigtimedwait */
     sigset_t set;
     sigemptyset(&set);

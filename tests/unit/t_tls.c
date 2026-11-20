@@ -90,6 +90,7 @@ static bool tstart(tserv *t, const char *addr, bool certs)
         return false;
     }
     snprintf(t->port, sizeof t->port, "%u", (unsigned)imdbs_tcp_port(t->s));
+    if (getenv("IMDB_SRV_HOLD_US")) imdbs_test_reply_hold((uint32_t)atoi(getenv("IMDB_SRV_HOLD_US"))); /* (a group under the hold) */
     return true;
 }
 
@@ -511,6 +512,7 @@ static void t_tls_peer_gone(void)
     so.socket_path = t.sock, so.tcp = "127.0.0.1:0", so.server_dir = t.sdir, so.queue_max = 1;
     CHECK_OK(imdbs_start(t.db, &so, &t.s, &e));
     snprintf(t.port, sizeof t.port, "%u", (unsigned)imdbs_tcp_port(t.s));
+    if (getenv("IMDB_SRV_HOLD_US")) imdbs_test_reply_hold((uint32_t)atoi(getenv("IMDB_SRV_HOLD_US"))); /* (a group under the hold) */
     for (int round = 0; round < 3; round++) {
         imdbc *c = NULL;
         SOFT(tlogin("127.0.0.1", t.port, NULL, t.pin, "admin", "pw-admin", &c, &e) == 0);
@@ -553,6 +555,7 @@ static void t_tls_pending(void)
     so.socket_path = t.sock, so.tcp = "127.0.0.1:0", so.server_dir = t.sdir, so.queue_max = 2;
     CHECK_OK(imdbs_start(t.db, &so, &t.s, &e));
     snprintf(t.port, sizeof t.port, "%u", (unsigned)imdbs_tcp_port(t.s));
+    if (getenv("IMDB_SRV_HOLD_US")) imdbs_test_reply_hold((uint32_t)atoi(getenv("IMDB_SRV_HOLD_US"))); /* (a group under the hold) */
     imdbc *c = NULL;
     CHECK(tlogin("127.0.0.1", t.port, NULL, t.pin, "admin", "pw-admin", &c, &e) == 0);
     enum { N = 20 };
