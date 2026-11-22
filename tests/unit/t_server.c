@@ -3072,7 +3072,7 @@ static imdbs_counts counts_of(imdbs *s)
 /* until the server ran one more request to its end than before (its replies all handed over: memory or spool), 20 s */
 static bool requests_past(imdbs *s, uint64_t before)
 {
-    for (int w = 0; w < 2000; w++) {
+    for (int w = 0; w < 6000; w++) { /* (60 s at most: a spilled result under TSan and a loaded machine took past 20, 11-21) */
         if (counts_of(s).requests > before) return true;
         usleep(10000);
     }
@@ -3384,8 +3384,13 @@ static void t_server_res_tail(void)
         uint64_t rows = 0;
         while (rows < 150000 && imdbc_next(a, &m, &e) == 0) /* all but the tail */
             if (m.type == IMDBW_ROWS) rows += m.nsets;
-        usleep(200000);
+        /* the server's thread sends and gives back as the client reads: waited on by its counts (a fixed 200 ms was not
+         * enough under load: sortpg's suite, 11-21), a fixed pause where nothing should move */
         imdbs_counts c2 = counts_of(s);
+        if (keep) usleep(200000), c2 = counts_of(s);
+        else
+            for (int w = 0; w < 1000 && !(c2.spool_held < file / 2 && c2.spool_held <= (3u << 19)); w++)
+                usleep(10000), c2 = counts_of(s);
         uint64_t unsent = c2.spool_held - (c2.spool_held > (1u << 20) ? (1u << 20) : 0); /* (a step at most not given back) */
         SOFT(rows >= 150000 && rows < 160000);
         if (keep) SOFT(c2.spool_held == file && c2.res_released == c1.res_released); /* the whole file still charged */

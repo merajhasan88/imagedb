@@ -175,6 +175,14 @@ void imdb_sql_set_sort_hook(void (*fn)(void *arg, int phase, int site), void *ar
 uint64_t imdb_sql_sorts_stopped(void);
 /* tests: the length of the runs a sort sorts in place before its merges (0: 16,384), so a few thousand rows reach them */
 void imdb_sql_set_sort_run(size_t n);
+/* sortpg (a prototype): ORDER BY's order arrays through abbreviated keys (0 off; 1 merged; 2 introsort); the insertion
+ * sort's cutoff; comparisons counted */
+void imdb_sql_set_sort_noab(bool on);
+void imdb_sql_sort_time(bool on);
+uint64_t imdb_sql_sort_ns(void);
+uint64_t imdb_sql_sort_ns_site(int site);
+void imdb_sql_sort_inorder(int site, uint64_t *inorder, uint64_t *n);
+void imdb_sql_set_sort_nopre(bool on);
 /* tests: the segments the scan's grouped fast path (fast_group_seg) has taken in this process, so a test can show it ran */
 uint64_t imdb_sql_fast_group_segments(void);
 void imdb_result_init(imdb_result *r);

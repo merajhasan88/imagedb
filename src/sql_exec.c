@@ -1,4 +1,5 @@
 /* SQL executor: binding, the three read paths, cross-checking, DML, admin. */
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -458,6 +459,8 @@ _Static_assert(sizeof(uintptr_t) <= sizeof(uint64_t), "a pointer is held in a wo
 enum { XS_RUN = 512 };
 
 static bool g_sort_reference;          /* tests: the C library's qsort whole (the old sort), no checks */
+static bool g_sort_nopre;              /* tests (sortpg): no in-order pass in xsort (its cost measured) */
+void imdb_sql_set_sort_nopre(bool on) { g_sort_nopre = on; }
 /* tests: called at each of a sort's checks, before it (its phase: 0 a run, 1 a merge, 2 the permutation; its site) */
 static void (*g_sort_hook)(void *arg, int phase, int site);
 static void *g_sort_hook_arg;
@@ -539,15 +542,18 @@ static int xs_merge2(xctx *x, uint64_t *w, uint64_t *tmp, size_t lo, size_t mid,
 /* n words (ind: each a pointer to the element compared): runs sorted in place, each merged at once with the run before
  * it while the two are equal in length (a binary counter: glibc's top-down order, so a merge reads keys its runs just
  * left in the cache; merging pass by pass over the whole array had cost the comparator's misses, 7%), the rest merged
- * last from the right; the temporary holds a left run at a time */
-static int xs_merge(xctx *x, uint64_t *w, size_t n, bool ind, size_t run, const xsortc *k, imdb_err *e)
+ * last from the right; the temporary holds a left run at a time. pre: the elements at the start already in order (the
+ * in-order pass's), taken as the first run when they make one */
+static int xs_merge(xctx *x, uint64_t *w, size_t n, bool ind, size_t run, size_t pre, const xsortc *k, imdb_err *e)
 {
     if (n <= run) return xs_run(x, w, n, sizeof *w, ind, k, e);
     uint64_t *tmp = imdb_alloc_array(n, sizeof *tmp, e);
     if (!tmp) return e->code;
     size_t st[64], ns = 0; /* the sorted runs' starts, left to right (each run's length st[i+1] - st[i]; the last's n) */
     int rc = IMDB_OK;
-    for (size_t lo = 0; lo < n && !rc; lo += run) {
+    if (pre < run) pre = 0;
+    else st[ns++] = 0;
+    for (size_t lo = pre; lo < n && !rc; lo += run) {
         size_t m = n - lo < run ? n - lo : run;
         if ((rc = xs_run(x, w + lo, m, sizeof *w, ind, k, e))) break;
         st[ns++] = lo;
@@ -567,16 +573,84 @@ static int xs_merge(xctx *x, uint64_t *w, size_t n, bool ind, size_t run, const 
     return rc;
 }
 
+static int xsort_body(xctx *x, void *base, size_t n, size_t size, const xsortc *k, imdb_err *e);
+static _Atomic uint64_t g_sort_ns; /* tests (sortpg): the time sorts took, while counted */
+static _Atomic uint64_t g_sort_ns_site[16]; /* (by site) */
+static _Atomic uint64_t g_sort_inorder[16], g_sort_n[16]; /* (by site: the elements in order at the start, of n) */
+void imdb_sql_sort_inorder(int site, uint64_t *inorder, uint64_t *n)
+{
+    *inorder = site > 0 && site < 16 ? atomic_load_explicit(&g_sort_inorder[site], memory_order_relaxed) : 0;
+    *n = site > 0 && site < 16 ? atomic_load_explicit(&g_sort_n[site], memory_order_relaxed) : 0;
+}
+uint64_t imdb_sql_sort_ns(void) { return atomic_load_explicit(&g_sort_ns, memory_order_relaxed); }
+uint64_t imdb_sql_sort_ns_site(int site) { return site > 0 && site < 16 ? atomic_load_explicit(&g_sort_ns_site[site], memory_order_relaxed) : 0; }
+static bool g_sort_timed;
+void imdb_sql_sort_time(bool on) { g_sort_timed = on; }
+
 static int xsort(xctx *x, void *base, size_t n, size_t size, const xsortc *k, imdb_err *e)
+{
+    if (!g_sort_timed) return xsort_body(x, base, n, size, k, e);
+    if (k->site > 0 && k->site < 16 && n > 1) { /* (tests: how far its input is in order already, looked at untimed) */
+        size_t i = 1;
+        while (i < n && xs_cmp(k, (const uint8_t *)base + (i - 1) * size, (const uint8_t *)base + i * size) <= 0) i++;
+        atomic_fetch_add_explicit(&g_sort_inorder[k->site], i, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_sort_n[k->site], n, memory_order_relaxed);
+    }
+    uint64_t t0 = imdb_mono_ns();
+    int rc = xsort_body(x, base, n, size, k, e);
+    uint64_t dt = imdb_mono_ns() - t0;
+    atomic_fetch_add_explicit(&g_sort_ns, dt, memory_order_relaxed);
+    if (k->site > 0 && k->site < 16) atomic_fetch_add_explicit(&g_sort_ns_site[k->site], dt, memory_order_relaxed);
+    return rc;
+}
+
+static int xsort_impl(xctx *x, void *base, size_t n, size_t size, const xsortc *k, imdb_err *e);
+
+/* the sort, and in the checked builds its result walked once: in order by its comparator, or a stop (a vid list
+ * mis-sorted would leave a table's state alike, but it is the log's op order) */
+static int xsort_body(xctx *x, void *base, size_t n, size_t size, const xsortc *k, imdb_err *e)
+{
+    int rc = xsort_impl(x, base, n, size, k, e);
+#ifdef IMDB_STORE_CHECKS
+    for (size_t i = 1; !rc && i < n; i++)
+        if (xs_cmp(k, (const uint8_t *)base + (i - 1) * size, (const uint8_t *)base + i * size) > 0) {
+            fprintf(stderr, "xsort: site %d left element %zu of %zu out of order\n", k->site, i, n);
+            abort();
+        }
+#endif
+    return rc;
+}
+
+static int xsort_impl(xctx *x, void *base, size_t n, size_t size, const xsortc *k, imdb_err *e)
 {
     if (n < 2) return IMDB_OK;
     if (g_sort_reference) {
         qsort_r(base, n, size, xs_ref, (void *)(uintptr_t)k); /* (its argument read only, by xs_ref) */
         return IMDB_OK;
     }
+    /* sortpg: an array already in order found in one pass (PostgreSQL's presorted check: a scan in key order, a table
+     * inserted in key order, hands the walk's keys over in order), a check every TICK_ROWS comparisons */
+    size_t pre = 0; /* the elements at the start in order: the first run when they make one */
+    if (!g_sort_nopre) {
+        const uint8_t *b = base;
+        size_t i = 1;
+        uint64_t left = x->next_check > x->ticks ? x->next_check - x->ticks : 1;
+        int rc = IMDB_OK;
+        while (i < n && xs_cmp(k, b + (i - 1) * size, b + i * size) <= 0) {
+            i++;
+            if (!--left) {
+                x->ticks = x->next_check;
+                if ((rc = xs_check(x, 5, k->site, e))) return rc;
+                left = x->next_check - x->ticks;
+            }
+        }
+        x->ticks = x->next_check - left;
+        if (i == n) return IMDB_OK;
+        pre = i;
+    }
     size_t run = g_sort_run ? g_sort_run : XS_RUN;
     if (n <= run) return xs_run(x, base, n, size, false, k, e); /* nothing of ours allocated */
-    if (size == sizeof(uint64_t)) return xs_merge(x, base, n, false, run, k, e);
+    if (size == sizeof(uint64_t)) return xs_merge(x, base, n, false, run, pre, k, e);
     /* larger elements sorted through pointers to them (as glibc's qsort does), then put in their places by following
      * each cycle of the permutation; stopped inside a cycle, the element it carries fills the hole: a permutation */
     uint8_t one[256], *b = base;
@@ -584,7 +658,7 @@ static int xsort(xctx *x, void *base, size_t n, size_t size, const xsortc *k, im
     uint64_t *p = imdb_alloc_array(n, sizeof *p, e);
     if (!p) return e->code;
     for (size_t i = 0; i < n; i++) p[i] = (uintptr_t)(b + i * size);
-    int rc = xs_merge(x, p, n, true, run, k, e);
+    int rc = xs_merge(x, p, n, true, run, pre, k, e); /* (p in the elements' order: their in-order start its) */
     for (size_t i = 0; i < n && !rc; i++) {
         if (p[i] == (uintptr_t)(b + i * size)) continue;
         memcpy(one, b + i * size, size);
@@ -4122,22 +4196,473 @@ typedef struct ordctx {
     const keyed *kv;         /* P2 S18: or, given, row i's at kv[i].at (the walk's place: walk_keys) */
 } ordctx;
 
-static int cmp_order(const void *pa, const void *pb, void *arg)
+/* rows a and b by ORDER BY's keys from key o0 on (the keys before it known equal), the default order breaking the tie */
+static inline int cmp_order_at(const ordctx *c, uint64_t a, uint64_t b, uint8_t o0)
 {
-    const ordctx *c = arg;
-    uint64_t a = *(const uint64_t *)pa, b = *(const uint64_t *)pb, nk = c->st->norder;
-    uint64_t ka = c->kv ? c->kv[a].at : a, kb = c->kv ? c->kv[b].at : b; /* the tie stays a < b: the default order's */
-    for (uint8_t o = 0; o < nk; o++) {
-        const imdb_xval *x = &c->keys[ka * nk + o], *y = &c->keys[kb * nk + o];
-        if (x->null || y->null) {
-            if (x->null == y->null) continue;
-            int r = x->null ? 1 : -1; /* NULLs last, or first: whatever the direction */
-            return c->st->ord_nulls_first[o] ? -r : r;
+    uint64_t nk = c->st->norder;
+    if (o0 < nk) {
+        uint64_t ka = c->kv ? c->kv[a].at : a, kb = c->kv ? c->kv[b].at : b; /* the tie stays a < b: the default order's */
+        for (uint8_t o = o0; o < nk; o++) {
+            const imdb_xval *x = &c->keys[ka * nk + o], *y = &c->keys[kb * nk + o];
+            if (x->null || y->null) {
+                if (x->null == y->null) continue;
+                int r = x->null ? 1 : -1; /* NULLs last, or first: whatever the direction */
+                return c->st->ord_nulls_first[o] ? -r : r;
+            }
+            int r = imdb_x_cmp(x, y); /* one type per key (bound), or two numbers */
+            if (r) return c->st->ord_desc[o] ? -r : r;
         }
-        int r = imdb_x_cmp(x, y); /* one type per key (bound), or two numbers */
-        if (r) return c->st->ord_desc[o] ? -r : r;
     }
     return a < b ? -1 : a > b;
+}
+
+static int cmp_order(const void *pa, const void *pb, void *arg)
+{
+    return cmp_order_at(arg, *(const uint64_t *)pa, *(const uint64_t *)pb, 0);
+}
+
+/* ---- ORDER BY's sort (sortpg: PostgreSQL's abbreviated keys): the order arrays of sites 3, 5 and 8 (cmp_order) ----
+ * Each element carries ab, a monotone image of its row's first key (a before b by that key gives ab(a) <= ab(b)): two
+ * elements whose images differ are ordered by them alone, two whose images are equal by the whole comparison (from the
+ * second key on when the image is one to one over the values held). A byte string's image is its eight bytes past the
+ * prefix every value shares; an image that orders almost nothing (ab_weak) is not taken: xsort's merge of words, the
+ * comparison whole. The array is then merge sorted (an in-order start the first run, runs of XAB_RUN by binary
+ * insertion, glibc's top-down merges through half the array in ord's own space), the comparison inlined, the deadline
+ * looked at every TICK_ROWS comparisons in each loop (phases: 0 a run, 1 and 4 a merge from the left and from the right,
+ * 3 the images, 5 the in-order pass, 6 the shared prefix's pass) */
+typedef struct xabk {
+    uint64_t ab, idx;
+} xabk;
+
+static bool g_sort_noab; /* tests: no image (every key compared whole: the cost of a key with none) */
+void imdb_sql_set_sort_noab(bool on) { g_sort_noab = on; }
+enum { AB_NONE, AB_INT, AB_BYTES, AB_F64, AB_IV };
+enum { XAB_RUN = 32 };    /* the runs sorted by binary insertion before the merges: about five comparisons an element */
+enum { XAB_STACK = 128 }; /* an array this short sorted on the stack: nothing allocated (2 KiB) */
+
+static inline const imdb_xval *ord_key0(const ordctx *c, uint64_t i)
+{
+    return &c->keys[(c->kv ? c->kv[i].at : i) * c->st->norder];
+}
+
+/* an integer's image: the value, saturated at int64's ends (monotone; one to one only while nothing saturates) */
+static inline uint64_t ab_i128(__int128 v, bool *sat)
+{
+    int64_t w;
+    if (v > INT64_MAX) w = INT64_MAX, *sat = true;
+    else if (v < INT64_MIN) w = INT64_MIN, *sat = true;
+    else w = (int64_t)v;
+    return (uint64_t)w ^ (UINT64_C(1) << 63);
+}
+
+/* a byte string's first eight bytes, zeros past its end, big-endian: memcmp's order, the shorter first among equal
+ * prefixes (a prefix's image never exceeds its extension's) */
+static inline uint64_t ab_bytes(const uint8_t *s, uint32_t len)
+{
+    uint8_t b[8] = {0};
+    if (len) memcpy(b, s, len < 8 ? len : 8);
+    uint64_t r;
+    memcpy(&r, b, 8);
+    return __builtin_bswap64(r);
+}
+
+/* a finite double's order as an unsigned word (-0 as 0: they compare equal) */
+static inline uint64_t ab_f64(double f)
+{
+    if (f == 0) f = 0;
+    uint64_t u;
+    memcpy(&u, &f, sizeof u);
+    return u >> 63 ? ~u : u | UINT64_C(1) << 63;
+}
+
+/* a first key's class: its type's (imdb_x_cmp's rules), or none */
+static int ab_class_of(uint8_t t)
+{
+    switch (t) {
+    case IMDB_T_INT64: case IMDB_T_DECIMAL: case IMDB_T_BOOL: case IMDB_T_TIMESTAMP: case IMDB_T_TIMESTAMPTZ:
+    case IMDB_T_DATE: case IMDB_T_TIME: case IMDB_T_ENUM: return AB_INT;
+    case IMDB_T_TEXT: case IMDB_T_UUID: case IMDB_T_BYTEA: return AB_BYTES;
+    case IMDB_T_FLOAT64: return AB_F64;
+    case IMDB_T_INTERVAL: return AB_IV;
+    default: return AB_NONE;
+    }
+}
+
+typedef struct xabs {
+    xctx *x;
+    const ordctx *c;
+    imdb_err *e;
+    int64_t left; /* comparisons to the next check */
+    int site, rc;
+    uint8_t o0; /* the key the full comparison starts at: 1 when the images are one to one */
+} xabs;
+
+static inline int xab_c(xabs *s, const xabk *a, const xabk *b)
+{
+    s->left--;
+    if (a->ab != b->ab) return a->ab < b->ab ? -1 : 1;
+    return cmp_order_at(s->c, a->idx, b->idx, s->o0);
+}
+
+static int xab_tick(xabs *s, int phase)
+{
+    s->x->ticks = s->x->next_check;
+    s->rc = xs_check(s->x, phase, s->site, s->e);
+    s->left = (int64_t)(s->x->next_check - s->x->ticks);
+    return s->rc;
+}
+
+#define XAB_CHECK(s, ph)                                                                                              \
+    do {                                                                                                              \
+        if ((s)->left <= 0 && xab_tick((s), (ph))) return (s)->rc;                                                    \
+    } while (0)
+
+/* m elements sorted by binary insertion (about log2 m comparisons an element, glibc's count), a check after them */
+static int xab_binsert(xabs *s, xabk *a, size_t m)
+{
+    for (size_t k = 1; k < m; k++) {
+        xabk t = a[k];
+        size_t lo = 0, hi = k;
+        while (lo < hi) {
+            size_t mid = (lo + hi) / 2;
+            if (xab_c(s, &t, &a[mid]) < 0) hi = mid;
+            else lo = mid + 1;
+        }
+        if (lo < k) {
+            memmove(a + lo + 1, a + lo, (k - lo) * sizeof *a);
+            a[lo] = t;
+        }
+    }
+    XAB_CHECK(s, 0);
+    return IMDB_OK;
+}
+
+/* w[lo, mid) and w[mid, hi) merged in place through tmp, which holds the shorter of the two (at most half the array):
+ * the left copied and merged from the left, or the right copied and merged from the right; two runs already in order
+ * cost one comparison. Stopped, the copied run's rest fills the gap its merge left, so w stays a permutation */
+static int xab_merge2(xabs *s, xabk *w, xabk *tmp, size_t lo, size_t mid, size_t hi)
+{
+    size_t nl = mid - lo, nr = hi - mid;
+    if (xab_c(s, &w[mid - 1], &w[mid]) < 0) return IMDB_OK;
+    int rc = IMDB_OK;
+    if (nl <= nr) {
+        size_t i = 0, j = mid, o = lo;
+        memcpy(tmp, w + lo, nl * sizeof *tmp);
+        while (i < nl && j < hi) {
+            w[o++] = xab_c(s, &tmp[i], &w[j]) <= 0 ? tmp[i++] : w[j++];
+            if (s->left <= 0 && (rc = xab_tick(s, 1))) break;
+        }
+        memcpy(w + o, tmp + i, (nl - i) * sizeof *w); /* (o + (nl - i) == j) */
+    } else {
+        size_t i = mid, j = nr, o = hi; /* w[lo, i) and tmp[0, j) unmerged, w[o, hi) merged: o - i == j */
+        memcpy(tmp, w + mid, nr * sizeof *tmp);
+        while (i > lo && j > 0) {
+            if (xab_c(s, &w[i - 1], &tmp[j - 1]) > 0) w[o - 1] = w[i - 1], i--;
+            else w[o - 1] = tmp[j - 1], j--;
+            o--;
+            if (s->left <= 0 && (rc = xab_tick(s, 4))) break;
+        }
+        memcpy(w + i, tmp, j * sizeof *w);
+    }
+    return rc;
+}
+
+/* a merge sort: the elements in order at the start (pre: found before the images were made) the first run when they
+ * make one, the rest in runs by binary insertion, each merged at once into the run before it while that one is no
+ * longer (glibc's top-down order: a merge reads what its runs just left in the cache); tmp holds half the array */
+static int xab_msort(xabs *s, xabk *a, size_t n, xabk *tmp, size_t pre)
+{
+    size_t i = pre, run = g_sort_run ? g_sort_run : XAB_RUN, st[64], ns = 0; /* (the tests' run length, xsort's too) */
+    if (i < run) i = 0; /* (the in-order start the first run when it makes one: the rest sorted, then one merge) */
+    else st[ns++] = 0;
+    for (size_t lo = i; lo < n; lo += run) {
+        size_t m = n - lo < run ? n - lo : run;
+        if (xab_binsert(s, a + lo, m)) return s->rc;
+        st[ns++] = lo;
+        while (ns >= 2 && st[ns - 1] - st[ns - 2] <= lo + m - st[ns - 1]) {
+            if (xab_merge2(s, a, tmp, st[ns - 2], st[ns - 1], lo + m)) return s->rc;
+            ns--;
+        }
+    }
+    for (; ns >= 2; ns--)
+        if (xab_merge2(s, a, tmp, st[ns - 2], st[ns - 1], n)) return s->rc;
+    return IMDB_OK;
+}
+
+/* the bytes every non-NULL first key begins with: their order is their rests' (each looked at once, checks between);
+ * a value of another type than the first (two numbers: never a byte string) leaves the key unabbreviated */
+static int ab_common(xabs *s, const ordctx *c, const uint64_t *ord, uint64_t n, uint8_t t, size_t *out, int *cls)
+{
+    const imdb_xval *v0 = NULL;
+    size_t L = 0;
+    for (uint64_t i = 0; i < n; i++) {
+        const imdb_xval *v = ord_key0(c, ord[i]);
+        if (v->null) continue;
+        if (v->type != t) {
+            *cls = AB_NONE;
+            break;
+        }
+        s->left -= 1 + (int64_t)(L / 256);
+        if (!v0) v0 = v, L = v->len;
+        else {
+            size_t m = v->len < L ? v->len : L; /* (a shorter value: the prefix its length at most) */
+            if (m && memcmp(v0->s, v->s, m)) {
+                size_t k = 0;
+                while (v0->s[k] == v->s[k]) k++;
+                L = k;
+            } else L = m;
+        }
+        if (!L) break; /* (the fill checks every type again) */
+        XAB_CHECK(s, 6);
+    }
+    *out = L;
+    return IMDB_OK;
+}
+
+/* an order array (ord: row indices) sorted by ORDER BY's keys through abbreviated elements (on the stack when short,
+ * else the merges' half array in ord's own space); stopped, ord is a permutation of what it was */
+static int xsort_ord_body(xctx *x, uint64_t *ord, uint64_t n, const ordctx *c, int site, imdb_err *e);
+static int xsort_ord(xctx *x, uint64_t *ord, uint64_t n, const ordctx *c, int site, imdb_err *e)
+{
+    if (!g_sort_timed) return xsort_ord_body(x, ord, n, c, site, e);
+    uint64_t t0 = imdb_mono_ns();
+    int rc = xsort_ord_body(x, ord, n, c, site, e);
+    uint64_t dt = imdb_mono_ns() - t0;
+    atomic_fetch_add_explicit(&g_sort_ns, dt, memory_order_relaxed);
+    if (site > 0 && site < 16) atomic_fetch_add_explicit(&g_sort_ns_site[site], dt, memory_order_relaxed);
+    return rc;
+}
+
+/* a first key's image (NULL's its place's; past a shared prefix of L bytes for a byte string) */
+static inline uint64_t ab_of(int cls, const imdb_xval *v, size_t L, bool desc, uint64_t nullab, bool *sat)
+{
+    if (v->null) return nullab;
+    uint64_t ab;
+    switch (cls) {
+    case AB_INT: ab = ab_i128(v->i, sat); break;
+    case AB_IV: ab = ab_i128(imdb_iv_span(v->mon, v->day, (int64_t)v->i), sat); break;
+    case AB_F64:
+#ifdef IMDB_STORE_CHECKS
+        if (!isfinite(v->f)) abort(); /* a FLOAT64 is finite (checked at every ingress and result) */
+#endif
+        ab = ab_f64(v->f);
+        break;
+    default: ab = ab_bytes(v->s + L, v->len - (uint32_t)L); break;
+    }
+    return desc ? ~ab : ab;
+}
+
+/* an image that orders almost nothing: 32 rows spread over the array, the images of fewer than half of them distinct,
+ * where equal images mean nothing (byte strings, or integers past int64's ends); then every comparison would be the
+ * whole one and the images only cost (a sort of one outlier and many rows sharing a prefix: 14% slower measured). A
+ * value of another type (two numbers) too: no image */
+enum { XAB_MANY = 1 << 17 }; /* rows past which ab_few looks (the tests' run length makes it 1,024) */
+
+static int cmp_word(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* fewer than half of 1,024 images spread over the array distinct */
+static bool ab_few(const xabk *a, uint64_t n)
+{
+    uint64_t smp[1024];
+    for (size_t k = 0; k < 1024; k++) smp[k] = a[(uint64_t)k * n / 1024].ab;
+    qsort(smp, 1024, sizeof *smp, cmp_word);
+    size_t d = 1;
+    for (size_t k = 1; k < 1024; k++) d += smp[k] != smp[k - 1];
+    return 2 * d < 1024;
+}
+
+/* the bytes m rows spread over the array (their non-NULL values) all begin with (ab_weak's 32, ab_few_bytes' 1,024) */
+static int ab_sample_prefix(xabs *s, const ordctx *c, const uint64_t *ord, uint64_t n, size_t m, size_t *out)
+{
+    size_t L = 0;
+    if (n < m) m = (size_t)n;
+    const imdb_xval *v0 = NULL;
+    for (size_t k = 0; k < m; k++) {
+        const imdb_xval *v = ord_key0(c, ord[(uint64_t)k * n / m]);
+        if (v->null) continue;
+        s->left -= 1 + (int64_t)(L / 256); /* (by the bytes compared: a prefix of 32,000 bytes is checked as it goes) */
+        if (!v0) v0 = v, L = v->len;
+        else {
+            size_t j = 0, lim = v->len < L ? v->len : L;
+            if (lim && !memcmp(v0->s, v->s, lim)) j = lim;
+            else
+                while (j < lim && v0->s[j] == v->s[j]) j++;
+            L = j;
+        }
+        XAB_CHECK(s, 6);
+    }
+    *out = L;
+    return IMDB_OK;
+}
+
+/* ab_few's rule for byte strings before the images are made: 1,024 rows spread over the array, their images past the
+ * prefix they share (past the prefix every row shares, which is no longer, they would be no more distinct), not one to
+ * one (one of them runs past eight bytes after it or holds a zero there, but in a UUID), fewer than half distinct; a value
+ * of another type: no image */
+static int ab_few_bytes(xabs *s, const ordctx *c, const uint64_t *ord, uint64_t n, uint8_t t, bool desc, uint64_t nullab,
+                        bool *few)
+{
+    uint64_t smp[1024];
+    size_t m = n < 1024 ? (size_t)n : 1024, Ls = 0, d = 1;
+    bool inexact = false, sat = false;
+    *few = false;
+    int rc = ab_sample_prefix(s, c, ord, n, m, &Ls);
+    if (rc) return rc;
+    for (size_t k = 0; k < m; k++) {
+        const imdb_xval *v = ord_key0(c, ord[(uint64_t)k * n / m]);
+        if (!v->null && v->type != t) {
+            *few = true;
+            return IMDB_OK;
+        }
+        if (!v->null) {
+            uint32_t r = v->len - (uint32_t)Ls;
+            if (r > 8 || (t != IMDB_T_UUID && r && memchr(v->s + Ls, 0, r))) inexact = true;
+        }
+        smp[k] = ab_of(AB_BYTES, v, Ls, desc, nullab, &sat);
+    }
+    if (!inexact || m < 2) return IMDB_OK;
+    qsort(smp, m, sizeof *smp, cmp_word);
+    for (size_t k = 1; k < m; k++) d += smp[k] != smp[k - 1];
+    *few = 2 * d < m;
+    return IMDB_OK;
+}
+
+static bool ab_weak(const ordctx *c, const uint64_t *ord, uint64_t n, int cls, uint8_t t, uint8_t sc, size_t L,
+                    bool desc, uint64_t nullab)
+{
+    uint64_t smp[32];
+    size_t m = n < 32 ? (size_t)n : 32, d = 0;
+    bool sat = false;
+    for (size_t k = 0; k < m; k++) {
+        const imdb_xval *v = ord_key0(c, ord[(uint64_t)k * n / m]);
+        if (!v->null && (v->type != t || (t == IMDB_T_DECIMAL && v->scale != sc))) return true;
+        uint64_t ab = ab_of(cls, v, L, desc, nullab, &sat);
+        size_t j = k;
+        while (j > 0 && smp[j - 1] > ab) smp[j] = smp[j - 1], j--;
+        smp[j] = ab;
+    }
+    if (cls != AB_BYTES && !sat) return false; /* one to one: an equal image skips the first key's comparison */
+    for (size_t k = 0; k < m; k++) d += !k || smp[k] != smp[k - 1];
+    return 2 * d < m;
+}
+
+/* (never inlined: its stack buffers, 3 KiB, stay out of the frames of the statements around it, which nest with their
+ * subqueries) */
+__attribute__((noinline)) static int xsort_ord_body(xctx *x, uint64_t *ord, uint64_t n, const ordctx *c, int site,
+                                                   imdb_err *e)
+{
+    if (n < 2) return IMDB_OK;
+    int64_t left = (int64_t)(x->next_check > x->ticks ? x->next_check - x->ticks : 1);
+    xabs s = {x, c, e, left, site, IMDB_OK, 0};
+    xabk stk[XAB_STACK], tstk[XAB_STACK / 2], *a = NULL, *tmp = tstk;
+    if (g_sort_reference) goto whole; /* (the tests' reference: the C library's qsort whole, by xsort) */
+    bool sorted = false, sat = false, any_null = false, at_null = false, past8 = false, zero = false;
+    bool desc = c->st->ord_desc[0];
+    uint64_t nullab = c->st->ord_nulls_first[0] ? 0 : UINT64_MAX, i0 = 0, pre = 1;
+    uint8_t t = 0, sc = 0;
+    int cls = AB_NONE, rc = IMDB_OK;
+    size_t L = 0, Ls = 0;
+    bool few = false;
+    /* already in order (the default order often is): one pass by the comparison whole, before anything is made */
+    while (pre < n && cmp_order_at(c, ord[pre - 1], ord[pre], 0) < 0) {
+        pre++;
+        if (--s.left <= 0 && (rc = xab_tick(&s, 5))) goto out;
+    }
+    if (pre == n) goto out; /* (ord as given) */
+    while (i0 < n && ord_key0(c, ord[i0])->null) { /* the first key's type: its first value's (NULLs passed, checked) */
+        i0++;
+        if (--s.left <= 0 && (rc = xab_tick(&s, 3))) goto out;
+    }
+    if (i0 < n) {
+        t = ord_key0(c, ord[i0])->type, sc = ord_key0(c, ord[i0])->scale;
+        if (!g_sort_noab) cls = ab_class_of(t);
+    }
+    if (cls == AB_BYTES) {
+        /* the sampled rows' shared prefix first: weak past it, weak past every row's (a shorter one leaves the samples'
+         * images fewer distinct), so a weak key never pays the pass over every row */
+        if ((rc = ab_sample_prefix(&s, c, ord, n, 32, &Ls))) goto out;
+        if (ab_weak(c, ord, n, cls, t, sc, Ls, desc, nullab)) goto whole;
+        if (c->st->norder >= 2 && n >= (g_sort_run ? 1024u : XAB_MANY)) {
+            if ((rc = ab_few_bytes(&s, c, ord, n, t, desc, nullab, &few))) goto out;
+            if (few) goto whole; /* (before anything is made: ab_few's rule, decided from 1,024 rows) */
+        }
+        if ((rc = ab_common(&s, c, ord, n, t, &L, &cls))) goto out;
+    }
+    if (cls != AB_NONE && ab_weak(c, ord, n, cls, t, sc, L, desc, nullab)) cls = AB_NONE;
+    if (cls == AB_NONE) goto whole;
+    a = stk;
+    if (n > XAB_STACK) {
+        /* 16 bytes a row beside the order array: where the statement's memory ceiling has no room for them, the old merge,
+         * 8 bytes a row (its temporary), so no statement the old sort answered is refused for this one's. The room is
+         * looked at before asking, by the reservation's own sum: a refused request would be counted (cross_check's
+         * xc_own reads the count) and is never asked; a request's own failure is the statement's error */
+        uint64_t cap = imdb_heap_ceiling(), need;
+        if (cap && (imdb_mul_ovf(n, (uint64_t)sizeof *a, &need) || need > cap || imdb_heap_bytes() > cap - need)) goto whole;
+        if (!(a = imdb_alloc_array(n, sizeof *a, e))) {
+            rc = e->code;
+            goto out;
+        }
+        tmp = (xabk *)(void *)ord; /* (n words: n / 2 elements, the most a merge copies) */
+    }
+    for (uint64_t i = 0; i < n; i++) {
+        const imdb_xval *v = ord_key0(c, ord[i]);
+        if (!v->null && (v->type != t || (t == IMDB_T_DECIMAL && v->scale != sc))) {
+            cls = AB_NONE; /* two numbers (INT64 and DECIMAL, or two scales): no image */
+            break;
+        }
+#ifdef IMDB_STORE_CHECKS
+        if (cls == AB_BYTES && !v->null && v->len < L) abort(); /* the shared prefix is every value's */
+#endif
+        uint64_t ab = ab_of(cls, v, L, desc, nullab, &sat);
+        if (v->null) any_null = true;
+        else if (ab == nullab) at_null = true;
+        if (cls == AB_BYTES && !v->null) { /* (a rest past eight bytes, or holding a zero: its image is not it alone) */
+            uint32_t r = v->len - (uint32_t)L;
+            if (r > 8) past8 = true;
+            else if (r && memchr(v->s + L, 0, r)) zero = true;
+        }
+        a[i] = (xabk){ab, ord[i]};
+        if (--s.left <= 0 && (rc = xab_tick(&s, 3))) goto out;
+    }
+    if (cls == AB_NONE) goto whole;
+    /* one to one: equal images are equal first keys (integers and spans none saturated, doubles; byte strings none of
+     * whose values runs past eight bytes after the shared prefix and, but for a UUID's one length, none holding a zero
+     * there: the zeros past a value's end are then no byte of it, whatever the type promises; a NULL's image shared by
+     * no value) */
+    s.o0 = (((cls == AB_INT || cls == AB_IV) && !sat) || cls == AB_F64 ||
+            (cls == AB_BYTES && !past8 && (t == IMDB_T_UUID || !zero))) &&
+           !(any_null && at_null);
+    /* images that are not one to one, before a second key, over many rows: when their values are few, most of a sort's
+     * comparisons meet equal first keys (late, their keys far apart in memory), the images settle none of those and
+     * only cost (measured: 200 values over 1,000,000 rows, +8%; 2,000, +1%; 20,000, 19% faster): 1,024 rows spread
+     * over the array, fewer than half their images distinct, the old merge (32 rows cannot tell 200 values from a
+     * million) */
+    if (!s.o0 && c->st->norder >= 2 && n >= (g_sort_run ? 1024u : XAB_MANY) && ab_few(a, n)) goto whole;
+    sorted = true;
+    rc = xab_msort(&s, a, n, tmp, (size_t)pre);
+out:
+    x->ticks = s.left > 0 ? x->next_check - (uint64_t)s.left : x->next_check;
+    if (sorted)
+        for (uint64_t i = 0; i < n; i++) ord[i] = a[i].idx;
+    if (a && a != stk) imdb_free(a);
+#ifdef IMDB_STORE_CHECKS
+    for (uint64_t i = 1; sorted && !rc && i < n; i++) /* (in order by the comparison whole, or a stop) */
+        if (cmp_order_at(c, ord[i - 1], ord[i], 0) > 0) {
+            fprintf(stderr, "xsort_ord: site %d left element %llu of %llu out of order\n", site, (unsigned long long)i,
+                    (unsigned long long)n);
+            abort();
+        }
+#endif
+    return rc;
+whole: /* no image worth its cost: xsort's merge of the words, the comparison whole (ord as given) */
+    x->ticks = s.left > 0 ? x->next_check - (uint64_t)s.left : x->next_check;
+    if (a && a != stk) imdb_free(a);
+    xsortc kc = {.site = site, .cr = cmp_order, .arg = (void *)(uintptr_t)c};
+    return xsort_body(x, ord, n, sizeof *ord, &kc, e);
 }
 
 /* a built cell as a value (TEXT points into r's text: read only once every row is built) */
@@ -4683,8 +5208,7 @@ static int reorder_rows(xctx *x, const sql_stmt *st, imdb_xval *keys, imdb_resul
             if (st->ord_pos[o]) cell_x(r, &r->cells[i * r->ncols + st->ord_pos[o] - 1], &keys[i * st->norder + o]);
     if (st->norder) {
         ordctx c = {st, keys, NULL};
-        xsortc kc = {.site = 3, .cr = cmp_order, .arg = &c};
-        if (xsort(x, ord, n, sizeof *ord, &kc, e)) {
+        if (xsort_ord(x, ord, n, &c, 3, e)) {
             imdb_free(ord);
             return e->code;
         }
@@ -4833,8 +5357,7 @@ static int materialize(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb
         for (uint64_t i = 0; !rc && i < n; i++) ord[i] = i;
         if (!rc && st->norder) {
             ordctx c = {st, k->wok, kv};
-            xsortc kc = {.site = 5, .cr = cmp_order, .arg = &c};
-            rc = xsort(x, ord, n, sizeof *ord, &kc, e); /* 2b-2b: its own checks (it ran to its end before) */
+            rc = xsort_ord(x, ord, n, &c, 5, e); /* 2b-2b: its own checks (it ran to its end before) */
         }
         if (!rc) rc = window_init(&w, st, r, e);
         for (uint64_t j = 0; !rc && j < n && w.left; j++) {
@@ -7379,8 +7902,7 @@ static int join_materialize(xctx *x, const sql_stmt *st, jctx *j, sink *k, imdb_
     }
     if (!rc && keys) {
         ordctx c = {st, keys, NULL};
-        xsortc kc = {.site = 8, .cr = cmp_order, .arg = &c};
-        rc = xsort(x, ord, n, sizeof *ord, &kc, e); /* 2b-2b: its own checks (it ran to its end before) */
+        rc = xsort_ord(x, ord, n, &c, 8, e); /* 2b-2b: its own checks (it ran to its end before) */
     }
     if (!rc) rc = window_init(&w, st, r, e);
     for (uint64_t jx = 0; !rc && jx < n && w.left; jx++) {

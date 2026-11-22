@@ -775,6 +775,14 @@ static imdb_db *sort_db(void)
     }
     imdb_buf_free(&b);
     for (int i = 1; i <= 3000 && !g_e.code; i++) run("UPDATE h SET v = v + 1 WHERE id = 1");
+    /* sortpg: a table inserted out of key order, so a write's vids (in the walk's key order) are not in order */
+    if (!g_e.code && !run("CREATE TABLE s3 (id INT64 PRIMARY KEY, g INT64, v INT64)")) {
+        imdb_buf_init(&b);
+        imdb_buf_put_str(&b, "INSERT INTO s3 VALUES ");
+        for (int i = 1; i <= 5000; i++) imdb_buf_printf(&b, "%s(%d, %d, %d)", i > 1 ? ", " : "", i * 7919 % 5003 + 1, i % 7, i % 13);
+        if (!imdb_buf_check(&b, &g_e) && !run_buf(&b)) run("CREATE INDEX s3g ON s3 (g)"); /* (a walk by g: vids out of order) */
+        imdb_buf_free(&b);
+    }
     return db;
 }
 
@@ -783,32 +791,45 @@ typedef struct sort_stmt {
     bool write, perm; /* perm: a sort of large elements it reaches moves thousands of them (the permutation's checks) */
     uint32_t sites;   /* the sort sites it must reach (xsortc.site: 1u << site), each seen checking */
     bool xc;          /* run with cross_check on (select_vids' second plan) */
+    uint32_t phases;  /* sortpg: the phases it must show checking (1u << phase; 0: a run and a merge, and the permutation
+                       * where perm), at psite alone when given */
+    int psite;
 } sort_stmt;
 
 #define S_(n) (1u << (n))
 
 static const sort_stmt k_sort_stmts[] = {
-    {"SELECT id, v FROM s ORDER BY v DESC, g", false, false, S_(4) | S_(5), false},                           /* the walk's keys, ORDER BY */
-    {"SELECT id, COUNT(*) FROM s GROUP BY id", false, false, S_(6), false},                           /* 5,000 groups by a column */
-    {"SELECT id / 2 + v, COUNT(*) FROM s GROUP BY id / 2 + v", false, false, S_(6), false},           /* groups by a tree's keys */
-    {"SELECT id / 2 AS k, COUNT(*) AS c FROM s GROUP BY id / 2 ORDER BY c, k DESC", false, false, S_(6) | S_(3), false}, /* reorder_rows */
-    {"SELECT a.id, b.v FROM s AS a JOIN s2 AS b ON a.id = b.p", false, true, S_(7), false},           /* a join's pairs */
-    {"SELECT a.id, b.v FROM s AS a JOIN s2 AS b ON a.id = b.id ORDER BY b.v, a.g", false, false, S_(7) | S_(8), false}, /* a join's ORDER BY */
-    {"SELECT v FROM s UNION ALL SELECT v FROM s2 ORDER BY 1", false, false, S_(9), false},            /* a set operation's tail */
-    {"SELECT id, ROW_NUMBER() OVER (ORDER BY v, g) FROM s", false, false, S_(10), false},              /* a window's sort */
-    {"SELECT id, SUM(v) OVER (PARTITION BY g ORDER BY v) AS w FROM s ORDER BY w, v", false, false, S_(10) | S_(11), false}, /* window and tail */
-    {"SELECT COUNT(*) FROM s WHERE v IN (SELECT p FROM s2)", false, true, S_(2), false},              /* an IN set run on demand */
-    {"SHOW HISTORY h (1)", false, false, S_(15), false},                                               /* a key's versions */
-    {"UPDATE s SET v = v + 1 WHERE v >= 0", true, false, S_(12), false},                  /* the vids to change (cross_check: twice) */
-    {"UPDATE s SET v = s2.v FROM s2 WHERE s.id = s2.p", true, true, S_(14), false},       /* UPDATE ... FROM's pairs by the key */
-    {"DELETE FROM s WHERE v IN (SELECT p FROM s2 WHERE v > 3)", true, true, S_(1), false}, /* a write's IN set, before its first write */
-    {"UPDATE s SET v = v + 2 WHERE v >= 0", true, false, S_(12) | S_(13), true}, /* cross_check: the second plan's vids */
+    {"SELECT id, v FROM s ORDER BY v DESC, g", false, false, S_(4) | S_(5), false, 0, 0}, /* the walk's keys, ORDER BY */
+    {"SELECT id, COUNT(*) FROM s GROUP BY id", false, false, S_(6), false, S_(5), 6}, /* 5,000 groups by a column, in order */
+    {"SELECT p, COUNT(*) FROM s2 GROUP BY p", false, false, S_(6), false, S_(0) | S_(1), 6}, /* 5,000 groups, out of order */
+    {"SELECT id / 2 + v, COUNT(*) FROM s GROUP BY id / 2 + v", false, false, S_(6), false, 0, 0}, /* groups by a tree's keys */
+    {"SELECT p / 2 AS k, COUNT(*) AS c FROM s2 GROUP BY p / 2 ORDER BY c, k DESC", false, false, S_(6) | S_(3), false, 0, 0}, /* reorder_rows */
+    {"SELECT a.id, b.v FROM s AS a JOIN s2 AS b ON a.id = b.p", false, true, S_(7), false, 0, 0}, /* a join's pairs */
+    {"SELECT a.id, b.v FROM s AS a JOIN s2 AS b ON a.id = b.id ORDER BY b.v, a.g", false, false, S_(7) | S_(8), false, 0, 0}, /* a join's ORDER BY */
+    {"SELECT v FROM s UNION ALL SELECT v FROM s2 ORDER BY 1", false, false, S_(9), false, 0, 0}, /* a set operation's tail */
+    {"SELECT id, ROW_NUMBER() OVER (ORDER BY v, g) FROM s", false, false, S_(10), false, 0, 0}, /* a window's sort */
+    {"SELECT id, SUM(v) OVER (PARTITION BY g ORDER BY v) AS w FROM s ORDER BY w, v", false, false, S_(10) | S_(11), false, 0, 0}, /* window and tail */
+    {"SELECT COUNT(*) FROM s WHERE v IN (SELECT p FROM s2)", false, true, S_(2), false, 0, 0}, /* an IN set run on demand */
+    {"SHOW HISTORY h (1)", false, false, S_(15), false, 0, 0}, /* a key's versions */
+    {"UPDATE s SET v = v + 1 WHERE v >= 0", true, false, S_(12), false, S_(5), 12}, /* the vids to change, in order */
+    {"UPDATE s3 SET v = v + 1 WHERE g >= 0", true, false, S_(12), false, S_(0) | S_(1), 12}, /* the vids by an index: out of order */
+    {"UPDATE s SET v = s2.v FROM s2 WHERE s.id = s2.p", true, true, S_(14), false, 0, 0}, /* UPDATE ... FROM's pairs by the key */
+    {"DELETE FROM s WHERE v IN (SELECT p FROM s2 WHERE v > 3)", true, true, S_(1), false, 0, 0}, /* a write's IN set, before its first write */
+    {"UPDATE s3 SET v = v + 2 WHERE g >= 0", true, false, S_(12) | S_(13), true, 0, 0}, /* cross_check: the second plan's vids */
+    /* sortpg: an ORDER BY's abbreviated merge sort, each phase (0 a run, 1 a merge from the left, 3 the images and the
+     * shared prefix's pass, 4 a merge from the right, 5 the in-order pass) */
+    {"SELECT id, v FROM s ORDER BY v, g", false, false, S_(5), false, S_(0) | S_(1) | S_(3) | S_(4), 5},
+    {"SELECT id, v FROM s ORDER BY id", false, false, S_(5), false, S_(5), 5}, /* the default order: in order, nothing made */
+    {"SELECT id FROM s ORDER BY 'prefix-' || CAST(id * 7919 % 5003 AS TEXT)", false, false, S_(5), false, S_(0) | S_(1) | S_(3) | S_(4) | S_(6), 5},
+    {"SELECT id, v FROM s ORDER BY CASE WHEN v < 0 THEN v END, v DESC, id", false, false, S_(5), false, S_(3), 5}, /* a first key NULL in every row: the scan past its NULLs */
 };
 
 typedef struct sort_hook_ctx {
     int mode;      /* 0: count, 1: another thread's cancel, 2: a sleep past the statement's deadline */
-    int at_phase;  /* the stop at the first check of this phase (0 a run, 1 a merge, 2 the permutation) */
-    int seen[3];   /* checks seen by phase */
+    int at_phase;  /* the stop at the first check of this phase (0 a run, 1 a merge, 2 the permutation; sortpg: 3 the
+                    * images, 4 a merge from the right, 5 the in-order pass) */
+    int seen[7];   /* checks seen by phase (6: the shared prefix's pass) */
+    uint8_t sp[32]; /* the phases seen checking at each site */
     uint32_t sites; /* the sites seen checking */
     bool fired;
 } sort_hook_ctx;
@@ -822,8 +843,9 @@ static void *cancel_from(void *arg)
 static void sort_hook(void *arg, int phase, int site)
 {
     sort_hook_ctx *h = arg;
-    if (phase >= 0 && phase < 3) h->seen[phase]++;
+    if (phase >= 0 && phase < 7) h->seen[phase]++;
     if (site > 0 && site < 32) h->sites |= 1u << site;
+    if (site > 0 && site < 32 && phase >= 0 && phase < 7) h->sp[site] |= (uint8_t)(1u << phase);
     if (!h->mode || h->fired || phase != h->at_phase) return;
     h->fired = true;
     if (h->mode == 1) {
@@ -857,13 +879,16 @@ static void t_sort_stops(void)
         if (ss->write) RUN("BEGIN");
         int rc = run(ss->sql);
         if (ss->write) RUN("ROLLBACK");
-        int seen[3] = {h.seen[0], h.seen[1], h.seen[2]};
-        bool counted = rc == 0 && seen[0] >= 1 && seen[1] >= 1 && (!ss->perm || seen[2] >= 1) && (h.sites & ss->sites) == ss->sites;
+        int seen[7];
+        uint32_t shown = 0, need = ss->phases ? ss->phases : S_(0) | S_(1) | (ss->perm ? S_(2) : 0);
+        for (int p = 0; p < 7; p++) seen[p] = h.seen[p], shown |= seen[p] ? 1u << p : 0;
+        if (ss->psite) shown = h.sp[ss->psite];
+        bool counted = rc == 0 && (shown & need) == need && (h.sites & ss->sites) == ss->sites;
         SOFT(counted);
-        if (!counted) fprintf(stderr, "    %s: rc %d (%s), checks %d / %d / %d, sites %#x of %#x\n", ss->sql, rc, g_e.msg, seen[0],
-                              seen[1], seen[2], h.sites, ss->sites);
+        if (!counted) fprintf(stderr, "    %s: rc %d (%s), checks %d / %d / %d / %d / %d / %d / %d (at its site %#x), sites %#x of %#x\n", ss->sql, rc,
+                              g_e.msg, seen[0], seen[1], seen[2], seen[3], seen[4], seen[5], seen[6], (unsigned)shown, h.sites, ss->sites);
         for (int mode = 1; mode <= 2; mode++)
-            for (int ph = 0; ph < 3; ph++) {
+            for (int ph = 0; ph < 7; ph++) {
                 if (!seen[ph] || (mode == 2 && ph)) continue; /* (the deadline: its first check alone) */
                 if (mode == 2) RUN("SET statement_timeout = 1000");
                 memset(&h, 0, sizeof h);
@@ -992,12 +1017,16 @@ static void gap_hook(void *arg, int phase, int site)
 }
 
 /* printed only (IMDB_SORT_MEASURE=1): a sort's longest unchecked stretch over TEXT keys sharing a long prefix (each
- * comparison scans it), inserted in scrambled order: 20,000 keys of 4,000 bytes and 4,000 of 32,000 */
+ * comparison scans it), inserted in scrambled order: 20,000 keys of 4,000 bytes and 4,000 of 32,000; then (sortpg) with
+ * one outlier (no prefix shared: no image, xsort's merge) and with the 32 rows the images are sampled at distinct in
+ * their first eight bytes and every other row sharing them (the images taken, every comparison whole) */
 static void t_sort_gap(void)
 {
     if (!getenv("IMDB_SORT_MEASURE")) return;
     static const int rows[2] = {20000, 4000}, plen[2] = {4000, 32000};
-    for (int c = 0; c < 2; c++) {
+    static const char *const how[4] = {"", ", one outlier", ", the sampled rows distinct", ", a second key (runs of 64: the 1,024 rows' pass)"};
+    for (int cc = 0; cc < 8; cc++) {
+        int c = cc % 2, mode = cc / 2;
         const char *dir = test_tmpdir();
         imdb_err e = {0};
         CHECK(!imdb_init(dir, false, NULL, &e));
@@ -1012,6 +1041,11 @@ static void t_sort_gap(void)
             imdb_buf_put_str(&b, "INSERT INTO g VALUES ");
             for (int i = base; i < base + 100 && i < rows[c]; i++) {
                 imdb_buf_printf(&b, "%s(%d, '", i > base ? ", " : "", i);
+                if (mode == 1 && i == rows[c] / 2) {
+                    imdb_buf_put_str(&b, "outlier')");
+                    continue;
+                }
+                if (mode == 2 && i % (rows[c] / 32) == 0) imdb_buf_printf(&b, "A%07d", i);
                 for (int x = 0; x < plen[c]; x++) imdb_buf_put_str(&b, "x");
                 imdb_buf_printf(&b, "%010d')", (int)((int64_t)i * 7919 % 1000003));
             }
@@ -1021,11 +1055,13 @@ static void t_sort_gap(void)
         gap_ctx g = {0, 0, 0};
         imdb_sql_set_sort_hook(gap_hook, &g);
         double t0 = now_ms();
-        CHECK(run("SELECT id FROM g ORDER BY k LIMIT 1") == 0);
+        if (mode == 3) imdb_sql_set_sort_run(64);
+        CHECK(run(mode == 3 ? "SELECT id FROM g ORDER BY k, id DESC LIMIT 1" : "SELECT id FROM g ORDER BY k LIMIT 1") == 0);
+        imdb_sql_set_sort_run(0);
         double total = now_ms() - t0;
         imdb_sql_set_sort_hook(NULL, NULL);
-        fprintf(stderr, "    %d keys of %d bytes: the statement %.0f ms, %d sort checks, the longest stretch between two %.1f ms\n",
-                rows[c], plen[c], total, g.calls, g.worst);
+        fprintf(stderr, "    %d keys of %d bytes%s: the statement %.0f ms, %d sort checks, the longest stretch between two %.1f ms\n",
+                rows[c], plen[c], how[mode], total, g.calls, g.worst);
         done(db);
     }
 }
@@ -1067,6 +1103,340 @@ static void t_sort_measure_mid(void)
         done(db);
     }
 }
+
+/* ---- sortpg (a prototype): ORDER BY's order arrays through abbreviated keys, merged (1) or by introsort (2) ---- */
+static void proto_db(int n, imdb_db **out)
+{
+    const char *dir = test_tmpdir();
+    imdb_err e = {0};
+    CHECK(!imdb_init(dir, false, NULL, &e));
+    imdb_db *db = open_db(dir);
+    *out = NULL;
+    CHECK(db);
+    imdb_session_init(&g_ss, db);
+    RUN("CREATE TABLE pt (id INT64 PRIMARY KEY, v INT64, s TEXT, p TEXT, vn INT64, g INT64, f FLOAT64, d DECIMAL(12,2), "
+        "iv INTERVAL, q TEXT, c2 TEXT, w DECIMAL(38,0))");
+    imdb_buf b;
+    imdb_buf_init(&b);
+    for (int base = 0; base < n; base += 2000) {
+        b.len = 0;
+        imdb_buf_put_str(&b, "INSERT INTO pt VALUES ");
+        for (int i = base + 1; i <= base + 2000 && i <= n; i++) {
+            int v = (int)((int64_t)i * 7919 % 1000003);
+            imdb_buf_printf(&b, "%s(%d, %d, 'k%07d', 'commonprefix-%07d', ", i > base + 1 ? ", " : "", i, v, v, v);
+            if (i % 10 == 0) imdb_buf_put_str(&b, "NULL, ");
+            else imdb_buf_printf(&b, "%d, ", v % 5000);
+            imdb_buf_printf(&b, "%d, %d.25, ", v % 100, v - 500000);
+            if (i % 7 == 0) imdb_buf_put_str(&b, "NULL, ");
+            else imdb_buf_printf(&b, "%d.%02d, ", v / 100, v % 100);
+            if (v % 3 == 0) imdb_buf_printf(&b, "INTERVAL '%d months', ", v % 50);
+            else imdb_buf_printf(&b, "INTERVAL '%d days', ", v % 50 * 30);
+            if (i == n / 2 + 1) imdb_buf_put_str(&b, "'outlier', ");
+            else imdb_buf_printf(&b, "'commonprefix-%07d', ", v);
+            imdb_buf_printf(&b, "'%s-%07d', ", v % 2 ? "aaaaaaaaaaaa" : "bbbbbbbbbbbb", v);
+            if (i == n / 2 + 1) imdb_buf_put_str(&b, "100000000000000000000)");
+            else imdb_buf_printf(&b, "%d)", v - 500000);
+        }
+        CHECK(!imdb_buf_check(&b, &g_e) && !run_buf(&b));
+    }
+    imdb_buf_free(&b);
+    *out = db;
+}
+
+/* a statement's first column, every row */
+static int64_t *proto_ids(const char *sql, uint64_t *n)
+{
+    imdb_result r;
+    *n = 0;
+    if (q(sql, &r)) {
+        fprintf(stderr, "    %s: %s\n", sql, g_e.msg);
+        return NULL;
+    }
+    int64_t *ids = calloc(r.nrows ? r.nrows : 1, sizeof *ids);
+    for (uint64_t i = 0; i < r.nrows; i++) ids[i] = r.cells[i * r.ncols].null ? INT64_MIN : (int64_t)r.cells[i * r.ncols].v.i;
+    *n = r.nrows;
+    imdb_result_free(&r);
+    return ids;
+}
+
+static const char *const k_proto_stmts[] = {
+    "SELECT id FROM pt ORDER BY v", "SELECT id FROM pt ORDER BY s", "SELECT id FROM pt ORDER BY p",
+    "SELECT id FROM pt ORDER BY vn DESC", "SELECT id FROM pt ORDER BY vn NULLS FIRST", "SELECT id FROM pt ORDER BY g, s",
+    "SELECT id FROM pt ORDER BY f DESC", "SELECT id FROM pt ORDER BY d NULLS FIRST", "SELECT id FROM pt ORDER BY d DESC",
+    "SELECT id FROM pt ORDER BY iv", "SELECT id FROM pt ORDER BY iv DESC, v", "SELECT id FROM pt ORDER BY id",
+    "SELECT id FROM pt ORDER BY id DESC", "SELECT id FROM pt ORDER BY -v", "SELECT id FROM pt ORDER BY s || 'x' DESC",
+    "SELECT id FROM pt ORDER BY v % 7, p", "SELECT id FROM pt ORDER BY CASE WHEN v % 2 = 0 THEN v ELSE NULL END",
+    "SELECT id FROM pt ORDER BY CASE WHEN v % 2 = 0 THEN 1 ELSE 1.5 END, id DESC",
+    "SELECT g FROM pt GROUP BY g ORDER BY COUNT(*) DESC, g", "SELECT g FROM pt GROUP BY g ORDER BY MAX(p) DESC",
+    "SELECT a.id FROM pt AS a JOIN pt AS b ON a.g = b.id ORDER BY b.p, a.id",
+    "SELECT a.id FROM pt AS a JOIN pt AS b ON a.g = b.id ORDER BY b.vn DESC, a.s",
+    "SELECT id FROM pt ORDER BY q", "SELECT id FROM pt ORDER BY q DESC, v", "SELECT id FROM pt ORDER BY c2", "SELECT id FROM pt ORDER BY w",
+    "SELECT id FROM pt ORDER BY w DESC", "SELECT id FROM pt ORDER BY CASE WHEN v % 2 = 0 THEN v ELSE v + 0.5 END",
+    /* in order for a while, then not: the in-order start the first run */
+    "SELECT id FROM pt ORDER BY CASE WHEN id > 2900 THEN -id ELSE id END",
+    "SELECT id FROM pt ORDER BY CASE WHEN id % 700 = 0 THEN -id ELSE id END, v",
+    /* a first key equal in every row (one to one: the second decides; alone, the default order), a constant TEXT */
+    "SELECT id FROM pt ORDER BY v * 0, s DESC", "SELECT id FROM pt ORDER BY v * 0", "SELECT id FROM pt ORDER BY 'k', v",
+    /* TEXT whose values end within eight bytes past the shared prefix: one to one (equal images, the second key decides);
+     * and values running past them that differ only there (never one to one) */
+    "SELECT id FROM pt ORDER BY CAST(v / 5000 AS TEXT), v DESC",
+    "SELECT id FROM pt ORDER BY CAST(v / 5000 AS TEXT) || CASE WHEN v % 2 = 0 THEN 'abcdefghij' ELSE 'abcdefghik' END, id DESC"};
+
+/* every statement's order through each mode, cutoff and run length the same as the C library's whole */
+static void t_sort_proto_equal(void)
+{
+    imdb_db *db;
+    proto_db(3000, &db);
+    CHECK(db);
+    static const struct { int mode; size_t run; } cfg[] = {{0, 0}, {0, 1}, {0, 2}, {0, 3}, {0, 7}, {0, 64}, {1, 0}, {1, 64}}; /* (mode 1: no image, xsort) */
+    bool updated = false;
+    for (size_t s = 0; s < sizeof k_proto_stmts / sizeof *k_proto_stmts; s++) {
+        imdb_sql_set_sort_reference(true);
+        uint64_t nr, n;
+        int64_t *ref = proto_ids(k_proto_stmts[s], &nr);
+        imdb_sql_set_sort_reference(false);
+        CHECK(ref);
+        for (size_t c = 0; c < sizeof cfg / sizeof *cfg; c++) {
+            imdb_sql_set_sort_noab(cfg[c].mode == 1);
+            imdb_sql_set_sort_run(cfg[c].run);
+            int64_t *got = proto_ids(k_proto_stmts[s], &n);
+            if (n != nr || (n && memcmp(got, ref, n * sizeof *got))) {
+                fprintf(stderr, "    %s: mode %d runs of %zu differs from the reference\n", k_proto_stmts[s], cfg[c].mode, cfg[c].run);
+                CHECK(0);
+            }
+            free(got);
+        }
+        imdb_sql_set_sort_noab(false);
+        imdb_sql_set_sort_run(0);
+        free(ref);
+        /* then again after a tenth of the rows were updated (their versions last: the walk's keys in key order for nine
+         * tenths, then not), once each statement has run */
+        if (s + 1 == sizeof k_proto_stmts / sizeof *k_proto_stmts && !updated) {
+            RUN("UPDATE pt SET g = g + 1 WHERE id % 10 = 3");
+            updated = true;
+            s = (size_t)-1;
+        }
+    }
+    done(db);
+}
+
+
+/* sortpg: the images at their edges, each statement's order against the C library's whole: INT64's ends beside NULLs in
+ * both places and directions (a NULL's image a value's), -0 beside 0, DECIMALs past int64 (saturated: equal images, the
+ * values in the opposite order to their ids) spread and only late, a value shorter than the others' shared prefix and one
+ * exactly it, BYTEA with NULs and the empty string */
+static void t_sort_proto_edges(void)
+{
+    const char *dir = test_tmpdir();
+    imdb_err e = {0};
+    CHECK(!imdb_init(dir, false, NULL, &e));
+    imdb_db *db = open_db(dir);
+    CHECK(db);
+    imdb_session_init(&g_ss, db);
+    RUN("CREATE TABLE pe (id INT64 PRIMARY KEY, i INT64, f FLOAT64, d DECIMAL(38,0), d2 DECIMAL(38,0), t TEXT, b BYTEA, u UUID)");
+    imdb_buf b;
+    imdb_buf_init(&b);
+    imdb_buf_put_str(&b, "INSERT INTO pe VALUES ");
+    for (int k = 0; k < 300; k++) {
+        imdb_buf_printf(&b, "%s(%d, ", k ? ", " : "", k + 1);
+        if (k % 10 == 0) imdb_buf_put_str(&b, "NULL, ");
+        else if (k % 10 == 1) imdb_buf_put_str(&b, "9223372036854775807, ");
+        else if (k % 10 == 2) imdb_buf_put_str(&b, "-9223372036854775808, ");
+        else imdb_buf_printf(&b, "%d, ", (k * 7919) % 1000 - 500);
+        if (k % 10 == 0) imdb_buf_put_str(&b, "NULL, ");
+        else if (k % 3 == 0) imdb_buf_put_str(&b, "0.0, ");
+        else imdb_buf_printf(&b, "%d.5, ", k % 50 - 25);
+        if (k % 10 == 0) imdb_buf_put_str(&b, "NULL, ");
+        else if (k % 25 == 1) imdb_buf_printf(&b, "%d00000000000000000000, ", 300 - k);
+        else if (k % 25 == 2) imdb_buf_printf(&b, "-%d00000000000000000000, ", 300 - k);
+        else imdb_buf_printf(&b, "%d, ", k * 1000 - 150000);
+        if (k >= 290) imdb_buf_printf(&b, "%d00000000000000000000, ", 300 - k);
+        else imdb_buf_printf(&b, "%d, ", (k * 37) % 300 - 150);
+        if (k % 10 == 0) imdb_buf_put_str(&b, "NULL, ");
+        else if (k == 5) imdb_buf_put_str(&b, "'ab', ");
+        else if (k == 6) imdb_buf_put_str(&b, "'abc', ");
+        else if (k == 7) imdb_buf_put_str(&b, "'abcd', ");
+        else imdb_buf_printf(&b, "'abcd%03d', ", (k * 37) % 300);
+        if (k % 10 == 0) imdb_buf_put_str(&b, "NULL, ");
+        else if (k % 7 == 0) imdb_buf_printf(&b, "'\\x%04x00', ", (k * 37) % 300 / 2); /* X and X 00: one image, two values */
+        else if (k == 1) imdb_buf_put_str(&b, "'\\x00', ");
+        else if (k == 2) imdb_buf_put_str(&b, "'\\x0000', ");
+        else if (k == 3) imdb_buf_put_str(&b, "'\\x', ");
+        else if (k == 4) imdb_buf_put_str(&b, "'\\x00ff', ");
+        else imdb_buf_printf(&b, "'\\x%04x', ", (k * 37) % 300 / 2);
+        /* a UUID: its first ten bytes shared, fifty values (one to one past the prefix: one length) */
+        if (k % 10 == 0) imdb_buf_put_str(&b, "NULL)");
+        else imdb_buf_printf(&b, "'00000000-0000-0000-0000-0000%08x')", (unsigned)((k * 37) % 50) * 0x01010101u);
+    }
+    CHECK(!imdb_buf_check(&b, &g_e) && !run_buf(&b));
+    imdb_buf_free(&b);
+    static const char *const ks[] = {
+        "i", "i DESC", "i NULLS FIRST", "i DESC NULLS LAST", "f * CASE WHEN id % 2 = 0 THEN -1.0 ELSE 1.0 END", "-f",
+        "f DESC", "d", "d DESC", "d NULLS FIRST", "d2", "d2 DESC", "t", "t DESC", "t NULLS FIRST", "b", "b DESC",
+        "b NULLS FIRST", "i, t", "d, i DESC", "t, b", "u, i DESC", "u DESC NULLS LAST, id DESC"};
+    for (size_t k = 0; k < sizeof ks / sizeof *ks; k++) {
+        char sql[160];
+        snprintf(sql, sizeof sql, "SELECT id FROM pe ORDER BY %s", ks[k]);
+        imdb_sql_set_sort_reference(true);
+        uint64_t nr, n;
+        int64_t *ref = proto_ids(sql, &nr);
+        imdb_sql_set_sort_reference(false);
+        CHECK(ref && nr == 300);
+        static const size_t cut[] = {0, 1, 3};
+        for (size_t c = 0; c < 3; c++) {
+            imdb_sql_set_sort_run(cut[c]);
+            int64_t *got = proto_ids(sql, &n);
+            if (n != nr || memcmp(got, ref, n * sizeof *got)) {
+                fprintf(stderr, "    %s (runs of %zu): differs from the reference\n", sql, cut[c]);
+                CHECK(0);
+            }
+            free(got);
+        }
+        imdb_sql_set_sort_run(0);
+        free(ref);
+    }
+    done(db);
+}
+
+/* printed only (IMDB_SORT_MEASURE=1): an ORDER BY's sorts by site (4: the walk's keys by the primary key; 5: ORDER BY's),
+ * and how far site 4's input is in order already, on a table inserted in key order, then in segments (CHECKPOINTs), then
+ * with a tenth of its rows updated, then inserted in another order */
+static void t_sort_site4(void)
+{
+    if (!getenv("IMDB_SORT_MEASURE")) return;
+    int n = getenv("IMDB_SORT_ROWS") ? atoi(getenv("IMDB_SORT_ROWS")) : 200000;
+    imdb_db *db;
+    proto_db(n, &db);
+    CHECK(db);
+    for (int stage = 0; stage < 4; stage++) {
+        if (stage == 1)
+            for (int k = 0; k < 4; k++) {
+                char sql[96];
+                snprintf(sql, sizeof sql, "UPDATE pt SET g = g + 1 WHERE id %% 4 = %d AND id %% 10 = 0", k);
+                RUN(sql);
+                RUN("CHECKPOINT");
+            }
+        if (stage == 2) RUN("UPDATE pt SET v = v + 1 WHERE id % 10 = 3");
+        if (stage == 3) {
+            RUN("CREATE TABLE pr (id INT64 PRIMARY KEY, v INT64)");
+            RUN("INSERT INTO pr SELECT v, id FROM pt");
+        }
+        const char *sql = stage == 3 ? "SELECT id FROM pr ORDER BY v LIMIT 1" : "SELECT id FROM pt ORDER BY v LIMIT 1";
+        uint64_t n4 = imdb_sql_sort_ns_site(4), n5 = imdb_sql_sort_ns_site(5), io0, nn0, io1, nn1, pre[2] = {0, 0};
+        imdb_sql_sort_inorder(4, &io0, &nn0);
+        imdb_sql_sort_time(true);
+        for (int r = 0; r < 3; r++) CHECK(run(sql) == 0);
+        imdb_sql_sort_time(false);
+        imdb_sql_sort_inorder(4, &io1, &nn1);
+        for (int r = 0; r < 10; r++) /* the in-order pass's cost: site 4 with it and without, alternating */
+            for (int np = 0; np < 2; np++) {
+                imdb_sql_set_sort_nopre(np == 1);
+                uint64_t a = imdb_sql_sort_ns_site(4);
+                imdb_sql_sort_time(true);
+                CHECK(run(sql) == 0);
+                imdb_sql_sort_time(false);
+                pre[np] += imdb_sql_sort_ns_site(4) - a;
+            }
+        imdb_sql_set_sort_nopre(false);
+        fprintf(stderr, "      site 4 alternating, ten each: with the in-order pass %.1f ms, without %.1f ms\n", (double)pre[0] / 1e7,
+                (double)pre[1] / 1e7);
+        static const char *const what[4] = {"inserted in key order", "after updates and CHECKPOINTs (segments)",
+                                            "a tenth updated since", "another table inserted out of key order"};
+        fprintf(stderr, "    %d rows, %s: site 4 %.1f ms (in order %.1f%% of %llu), site 5 %.1f ms\n", n, what[stage],
+                (double)(imdb_sql_sort_ns_site(4) - n4) / 3e6, nn1 > nn0 ? 100.0 * (double)(io1 - io0) / (double)(nn1 - nn0) : 0,
+                (unsigned long long)((nn1 - nn0) / 3), (double)(imdb_sql_sort_ns_site(5) - n5) / 3e6);
+    }
+    done(db);
+}
+
+/* sortpg: every size from 2 to 300 rows (the stack's 128 and 129, odd sizes, merges whose shorter side is half), each
+ * key and site against the C library's whole, in runs of the default, 1 and 3 */
+static void t_sort_proto_sizes(void)
+{
+    imdb_db *db;
+    proto_db(300, &db);
+    CHECK(db);
+    static const char *const ks[][2] = {{"SELECT id FROM pt WHERE id <=", "ORDER BY v"}, {"SELECT id FROM pt WHERE id <=", "ORDER BY s DESC"},
+                                        {"SELECT id FROM pt WHERE id <=", "ORDER BY p"}, {"SELECT id FROM pt WHERE id <=", "ORDER BY vn DESC, s"},
+                                        {"SELECT id FROM pt WHERE id <=", "ORDER BY q"}, /* (the outlier past 150: no image) */
+                                        {"SELECT id FROM pt WHERE id <=", "GROUP BY id ORDER BY MAX(s)"}, /* site 3 */
+                                        {"SELECT a.id FROM pt AS a JOIN pt AS b ON a.id = b.id WHERE a.id <=", "ORDER BY b.f DESC"}}; /* 8 */
+    static const size_t runs[] = {0, 1, 3};
+    int bad = 0;
+    for (int nr = 2; nr <= 300 && bad < 5; nr++)
+        for (size_t k = 0; k < sizeof ks / sizeof *ks; k++) {
+            char sql[200];
+            snprintf(sql, sizeof sql, "%s %d %s", ks[k][0], nr, ks[k][1]);
+            imdb_sql_set_sort_reference(true);
+            uint64_t n0, n;
+            int64_t *ref = proto_ids(sql, &n0);
+            imdb_sql_set_sort_reference(false);
+            CHECK(ref && n0 == (uint64_t)nr);
+            for (size_t r = 0; r < 3; r++) {
+                imdb_sql_set_sort_run(runs[r]);
+                int64_t *got = proto_ids(sql, &n);
+                if (n != n0 || memcmp(got, ref, n * sizeof *got)) {
+                    fprintf(stderr, "    %s (runs of %zu): differs from the reference\n", sql, runs[r]);
+                    bad++;
+                }
+                free(got);
+            }
+            imdb_sql_set_sort_run(0);
+            free(ref);
+        }
+    CHECK(bad == 0);
+    done(db);
+}
+/* printed only (IMDB_SORT_MEASURE=1): the sort's own time (and the statement's) by method, keys and size */
+static void t_sort_proto_measure(void)
+{
+    if (!getenv("IMDB_SORT_MEASURE")) return;
+    static const int rows[6] = {10, 100, 500, 5000, 50000, 1000000}, reps[6] = {20000, 4000, 1000, 200, 20, 3};
+    static const char *const ms[] = {"v", "s", "p", "q", "c2", "vn DESC", "g, s", "f", "d", "w", "CASE WHEN v % 2 = 0 THEN v ELSE v + 0.5 END", "id",
+                                     /* low-cardinality TEXT (the advisor, 11-21) */
+                                     "CAST(v % 20 AS TEXT)", "CAST(v % 200 AS TEXT)", "CAST(v % 2000 AS TEXT)", "CAST(v % 200 AS TEXT), v",
+                                     "'category-' || CAST(v % 200 AS TEXT) || '-suffix'", "CAST(v / 50000 AS TEXT)", "CAST(v / 5000 AS TEXT)",
+                                     "CAST(v / 5000 AS TEXT), v", "'category-' || CAST(v / 5000 AS TEXT) || '-suffix'",
+                                     "'category-' || CAST(v / 5000 AS TEXT) || '-suffix', v",
+                                     "'category-' || CAST(v / 500 AS TEXT) || '-suffix', v", "'category-' || CAST(v / 50 AS TEXT) || '-suffix', v",
+                                     "'category-' || CAST(v / 5 AS TEXT) || '-suffix', v"};
+    static const char *const mname[3] = {"qsort", "xsort", "msort"}; /* (xsort: the merge of words, no image) */
+    const char *sz = getenv("IMDB_SORT_SIZES"); /* (a subset: "012") */
+    const char *only_s = getenv("IMDB_SORT_STMT"), *only_m = getenv("IMDB_SORT_MODE"); /* (a profile's: one of each) */
+    for (int c = 0; c < 6; c++) {
+        if (sz && !strchr(sz, '0' + c)) continue;
+        imdb_db *db;
+        proto_db(rows[c], &db);
+        CHECK(db);
+        fprintf(stderr, "    %d rows (%d repetitions, alternating): the sort's ms a statement [the statement's]\n", rows[c], reps[c]);
+        for (size_t s = 0; s < sizeof ms / sizeof *ms; s++) {
+            if (only_s && strcmp(only_s, ms[s])) continue;
+            char sql[128];
+            snprintf(sql, sizeof sql, "SELECT id FROM pt ORDER BY %s LIMIT 1", ms[s]);
+            double sort_ms[3] = {0}, st_ms[3] = {0};
+            for (int rep = 0; rep < reps[c]; rep++)
+                for (int m = 0; m < 3; m++) {
+                    if (only_m && atoi(only_m) != m) continue;
+                    imdb_sql_set_sort_reference(m == 0);
+                    imdb_sql_set_sort_noab(m == 1);
+                    uint64_t n0 = imdb_sql_sort_ns();
+                    imdb_sql_sort_time(true);
+                    double t0 = now_ms();
+                    CHECK(run(sql) == 0);
+                    st_ms[m] += now_ms() - t0;
+                    imdb_sql_sort_time(false);
+                    sort_ms[m] += (double)(imdb_sql_sort_ns() - n0) / 1e6;
+                }
+            imdb_sql_set_sort_reference(false);
+            imdb_sql_set_sort_noab(false);
+            fprintf(stderr, "      %-24.24s", ms[s]);
+            for (int m = 0; m < 3; m++)
+                fprintf(stderr, " %s %.3f [%.3f] |", mname[m], sort_ms[m] / reps[c], st_ms[m] / reps[c]);
+            fprintf(stderr, "\n");
+        }
+        done(db);
+    }
+}
 const test_case cancel_tests[] = {
     {"cancel_timeout_paths", t_timeout_paths},
     {"cancel_timeout_writes", t_timeout_writes},
@@ -1078,6 +1448,11 @@ const test_case cancel_tests[] = {
     {"cancel_sort_measure", t_sort_measure},
     {"cancel_sort_gap", t_sort_gap},
     {"cancel_sort_measure_mid", t_sort_measure_mid},
+    {"cancel_sort_proto_equal", t_sort_proto_equal},
+    {"cancel_sort_proto_edges", t_sort_proto_edges},
+    {"cancel_sort_proto_sizes", t_sort_proto_sizes},
+    {"cancel_sort_proto_measure", t_sort_proto_measure},
+    {"cancel_sort_site4", t_sort_site4},
     {"cancel_txn_timeout", t_txn_timeout},
     {"cancel_txn_idle_timeout", t_txn_idle_timeout},
     {"cancel_txn_idle_sweep", t_txn_idle_sweep},

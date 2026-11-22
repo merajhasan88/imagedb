@@ -143,6 +143,7 @@ static void shapes(imdb_session *s, imdb_db *db)
         CHECK(!memcmp(tok0, tok1, 32));
         OK(set_mem(s, 256ull << 20));
         OK(ex(s, "SET cross_check = on"));
+        uint64_t refused = imdb_heap_ceiling_refusals(); /* sortpg: an answered statement asked for nothing it was refused */
         if (kShapes[i].answer != INT64_MIN) {
             int64_t v = one(s, kShapes[i].sql);
             if (v != kShapes[i].answer) {
@@ -152,6 +153,12 @@ static void shapes(imdb_session *s, imdb_db *db)
             }
         } else {
             OK(ex(s, kShapes[i].sql));
+        }
+        if (imdb_heap_ceiling_refusals() != refused) {
+            char m[300];
+            snprintf(m, sizeof m, "%s at 256 MB: answered after %llu refused requests", kShapes[i].sql,
+                     (unsigned long long)(imdb_heap_ceiling_refusals() - refused));
+            test_fail(__FILE__, __LINE__, m);
         }
         OK(ex(s, "SET cross_check = off"));
         CHECK(imdb_heap_ceiling() == 0);
