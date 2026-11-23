@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 #include "wire.h"
@@ -24,6 +25,36 @@ void imdbsp_fail_at(int64_t n) { atomic_store_explicit(&g_fail_at, n, memory_ord
 int64_t imdbsp_live(void) { return atomic_load_explicit(&g_live, memory_order_relaxed); }
 void imdbsp_no_tmpfile(bool on) { atomic_store_explicit(&g_no_tmpfile, on, memory_order_relaxed); }
 void imdbsp_no_release(bool on) { atomic_store_explicit(&g_no_release, on, memory_order_relaxed); }
+
+static _Atomic int64_t g_free[2] = {-1, -1};
+
+void imdbsp_test_free(int kind, int64_t bytes)
+{
+    if (kind == IMDBSP_FREE_DATA || kind == IMDBSP_FREE_SPOOL) atomic_store_explicit(&g_free[kind], bytes, memory_order_relaxed);
+}
+
+int imdbsp_subdir(int dfd, const char *name) { return openat(dfd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW); }
+
+bool imdbsp_free_hooked(int kind)
+{
+    return (kind == IMDBSP_FREE_DATA || kind == IMDBSP_FREE_SPOOL) && atomic_load_explicit(&g_free[kind], memory_order_relaxed) >= 0;
+}
+
+bool imdbsp_free(int dfd, int kind, uint64_t *bytes)
+{
+    *bytes = 0;
+    int64_t t = kind == IMDBSP_FREE_DATA || kind == IMDBSP_FREE_SPOOL ? atomic_load_explicit(&g_free[kind], memory_order_relaxed)
+                                                                      : -1;
+    if (t >= 0) {
+        *bytes = (uint64_t)t;
+        return true;
+    }
+    struct statvfs v;
+    if (dfd < 0 || fstatvfs(dfd, &v)) return false;
+    unsigned __int128 b = (unsigned __int128)v.f_bavail * v.f_frsize;
+    *bytes = b > UINT64_MAX ? UINT64_MAX : (uint64_t)b;
+    return true;
+}
 
 /* the call the hook fails (counted down to it) */
 static bool failing(void)

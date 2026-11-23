@@ -30,7 +30,8 @@ N=$WORK/net
 cp -a "$E" "$N"
 mkdir -m 700 "$WORK/sd"
 pin=$("$SRV" cert "$WORK/sd" | awk '{ print $NF }')
-"$SRV" "$N" --socket "$WORK/s" --server-dir "$WORK/sd" --tcp 127.0.0.1:0 --nosync > "$WORK/srv.out" 2>&1 &
+# (--disk-headroom 0: the test machine's file systems may be near full; the headroom has its own tests, t_server's)
+"$SRV" "$N" --socket "$WORK/s" --server-dir "$WORK/sd" --tcp 127.0.0.1:0 --nosync --disk-headroom 0 > "$WORK/srv.out" 2>&1 &
 spid=$!
 port=""
 for _ in $(seq 100); do

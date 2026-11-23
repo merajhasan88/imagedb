@@ -36,6 +36,7 @@ static int usage(void)
           "                      [--preauth-timeout MS] [--preauth-per-addr N] [--socket-reserve N] [--slice-ms MS]\n"
           "                      [--queue-max N] [--send-timeout MS] [--conn-cap BYTES] [--reply-budget BYTES]\n"
           "                      [--role-copy-spool BYTES] [--role-slow-statement-ms MS] [--role-idle-session MS]\n"
+          "                      [--disk-headroom BYTES]\n"
           "       imagedb-server cert SDIR [--name NAME]... [--renew]\n", stderr);
     return 2;
 }
@@ -131,6 +132,8 @@ int main(int argc, char **argv)
     const char *dir = NULL, *sock = NULL, *sdir = NULL, *events = NULL, *stats = NULL, *tcp = NULL;
     imdbs_opts so;
     memset(&so, 0, sizeof so);
+    so.disk_headroom = 1ull << 30; /* 2b-3: imagedb-server's default (the API's none) */
+    so.say_disk = true;
     int sync = 1;
     bool durable_ack = false;
     uint64_t mem_limit = 0, seg_cache = 0;
@@ -183,6 +186,8 @@ int main(int argc, char **argv)
             uint64_t *f = argv[i][7] == 'q' ? &so.role_queue_bytes : &so.role_reply_bytes; /* 0: none */
             if (!parse_bytes(argv[++i], 0, 64ull << 30, f)) return usage();
             if (!*f) *f = IMDBS_NONE;
+        } else if (!strcmp(argv[i], "--disk-headroom") && i + 1 < argc) { /* 2b-3; 0: none */
+            if (!parse_bytes(argv[++i], 0, 1ull << 50, &so.disk_headroom)) return usage();
         } else if (!strcmp(argv[i], "--role-copy-spool") && i + 1 < argc) { /* 2b-2a; 0: none */
             if (!parse_bytes(argv[++i], 0, 1ull << 40, &so.role_copy_spool)) return usage();
             if (!so.role_copy_spool) so.role_copy_spool = IMDBS_NONE;
@@ -262,6 +267,13 @@ int main(int argc, char **argv)
     /* the open's warnings, as the CLI's open_anchored prints them (the anchor's, an oversized segment's): a daemon's
      * operator sees them only here */
     if (db->warning[0]) fprintf(stderr, "imagedb-server: warning: %s\n", db->warning);
+    /* 2b-3: a reserve below what one automatic CHECKPOINT writes (about the log's checkpoint size and a fill of the log)
+     * may not hold the publish an operator's recovery needs */
+    uint64_t pub = db->checkpoint_bytes == UINT64_MAX ? 0 : db->checkpoint_bytes + IMDB_LOG_FILL_CHUNK;
+    if (so.disk_headroom && so.disk_headroom < pub)
+        fprintf(stderr, "imagedb-server: warning: --disk-headroom %llu is below what one automatic CHECKPOINT may write "
+                        "(about %llu bytes): the reserve may not hold an operator's recovery\n",
+                (unsigned long long)so.disk_headroom, (unsigned long long)pub);
     if (db->replica) {
         fprintf(stderr, "imagedb-server: %s is a replica: a read-only server of one is a later step\n", dir);
         imdb_close(db);

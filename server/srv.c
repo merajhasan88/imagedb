@@ -168,6 +168,13 @@ struct conn {
     struct cring *rings; /* N1d: its COPY TO rings (under mu): each freed once drained, or by its thread at its end */
     /* the engine thread's alone: */
     bool cin_run;        /* the running statement is a COPY FROM reading its spool */
+    /* 2b-3, under mu: the request and statement whose COPY_IN opened the COPY (its resume is that COPY's, whatever a second
+     * look at its gates would say: a disk below the headroom, a REVOKE or a DROP TABLE while its data arrived refused by
+     * its run, its spool freed) */
+    const void *cin_rq;
+    uint32_t cin_i;
+    bool dkept;          /* 2b-3, the engine thread's: the running statement's write reply kept in memory for the spool disk's
+                          * headroom (disk_kept counted at its first chunk so kept: once a statement) */
     struct cring *ring;  /* the running statement's COPY TO ring (made at its first write) */
     struct cring *rsp;   /* 2b-2a: the running statement's result spool (its frames past the room: made at its first spill) */
     int32_t out_err;     /* a COPY TO's write refused (the wait's bound: LIMIT; the spool: IO; a spool directory: STATE) */
@@ -210,9 +217,13 @@ struct imdbs {
     logins *lg;          /* NULL: no one may log in (the logins could not be made: fail closed) */
     uint64_t role_gen;   /* db->role_gen the logins were made at (the engine thread's) */
     int spool_dfd;       /* N1d: the spool directory (-1: none, COPY refused by name) */
+    int obj_dfd;         /* 2b-3: the database's objects/ (the lake), its free space read with the data directory's and log/'s */
     rtally *tal;         /* N1e stage two: the roles' tallies (max_conns entries; role 0: free) */
     uint32_t ntal;
     uint64_t spool_held; /* under mu: every spool's bytes held now (copy_spool bounds it) */
+    bool ev_disk[2];                /* 2b-3: the engine thread's: below the headroom at its last "disk_headroom" event, */
+    uint64_t ev_disk_ns[2];         /* and that event's time (at most one in 5 s a directory: a disk at the line flaps) */
+    uint64_t disk_ns[2];            /* 2b-3, under mu: when each directory's free bytes were last read (disk_low) */
     uint64_t ev_endpoint, ev_cbref; /* §8f: the engine thread's: the counts its last "channel_binding" event gave, and
                                      * when (an unauthenticated peer moves cb_refused: at most one event in 5 s) */
     uint64_t ev_cb_ns;
@@ -403,6 +414,44 @@ static bool role_spool_room(const imdbs *s, const conn *c, uint64_t n)
     if (c->super || !c->tal) return true;
     uint64_t cs = s->o.copy_spool ? s->o.copy_spool : (4ull << 30);
     return c->tal->spool + n <= share(s->o.role_copy_spool, cs / 4);
+}
+
+/* 2b-3: kind's directory below --disk-headroom with n more bytes written there (none set: never): its free bytes read now
+ * (fstatvfs, a failure 0: fail closed), the gauges set; outside mu (it takes mu). Either thread: the engine's per
+ * statement and result chunk, a connection's per COPY frame */
+#define DISK_EVERY_NS 2000000u /* 2b-3: a directory's free bytes read at most every 2 ms (about a microsecond each, on the one
+                                * engine thread: a statement's check takes the last reading; the headroom is a margin) */
+static bool disk_low(imdbs *s, int kind, uint64_t n)
+{
+    uint64_t h = s->o.disk_headroom, fr = 0;
+    if (!h) return false;
+    uint64_t now = imdb_mono_ns();
+    pthread_mutex_lock(&s->mu);
+    bool fresh = s->disk_ns[kind] && now - s->disk_ns[kind] < DISK_EVERY_NS && !imdbsp_free_hooked(kind);
+    fr = kind == IMDBSP_FREE_DATA ? s->n.disk_free_data : s->n.disk_free_spool;
+    pthread_mutex_unlock(&s->mu);
+    if (!fresh) {
+        if (kind == IMDBSP_FREE_DATA) { /* every file system the engine writes (log/ or objects/ may be a mount of its own):
+                                         * the least */
+            const int fds[3] = {s->db->dirfd, s->db->logdirfd, s->obj_dfd};
+            fr = UINT64_MAX;
+            for (int k = 0; k < 3; k++) {
+                uint64_t f = 0;
+                if (fds[k] < 0) continue;
+                (void)imdbsp_free(fds[k], kind, &f);
+                if (f < fr) fr = f;
+            }
+            if (fr == UINT64_MAX) fr = 0;
+        } else {
+            (void)imdbsp_free(s->spool_dfd, kind, &fr);
+        }
+        pthread_mutex_lock(&s->mu);
+        if (kind == IMDBSP_FREE_DATA) s->n.disk_low_data = fr < h, s->n.disk_free_data = fr; /* (the gauges: below it now) */
+        else s->n.disk_low_spool = fr < h, s->n.disk_free_spool = fr;
+        s->disk_ns[kind] = now;
+        pthread_mutex_unlock(&s->mu);
+    }
+    return fr < h || fr - h < n;
 }
 
 /* c's socket may be read for another request: its role's queued requests under --role-queue-bytes (a superuser's exempt);
@@ -617,27 +666,39 @@ static bool mem_room(const imdbs *s, const conn *c, uint64_t n)
 static bool rows_flush(imdbs *s, conn *c, imdbw_buf *b, size_t at, bool wrote, bool copy, imdb_err *e)
 {
     uint64_t n = b->len;
+    /* 2b-3: the spool disk below --disk-headroom: a read refused (as a full spool), a write's reply kept in memory (its
+     * commit stands; bounded by the result the engine already holds); read at every chunk, so a result spilling as the
+     * disk fills stops at the chunk that finds it. Everyone's, a superuser's too: a spool never takes the disk's last
+     * space (PostgreSQL's temp_file_limit binds a superuser too; --copy-spool's 4 GiB is past the default reserve) */
+    bool dlow = s->o.disk_headroom && s->spool_dfd >= 0 && disk_low(s, IMDBSP_FREE_SPOOL, n);
+    if (wrote && c->dkept) dlow = true; /* a write's reply once kept in memory stays there to its end: free space hovering at
+                                         * the line never alternates it between memory and new spool files (a descriptor each) */
     pthread_mutex_lock(&s->mu);
     bool gone = c->gone, mem = !c->rsp && (mem_room(s, c, n) || s->o.test_no_spill);
     uint64_t bound = s->o.copy_spool ? s->o.copy_spool : (4ull << 30);
     bool sfull = s->spool_held + n > bound, rfull = !role_spool_room(s, c, n);
-    bool spill = !gone && !mem && s->spool_dfd >= 0 && (wrote || (!sfull && !rfull));
+    bool spill = !gone && !mem && s->spool_dfd >= 0 && !dlow && (wrote || (!sfull && !rfull));
     if (spill) spool_move(s, c, (int64_t)n, (int64_t)n); /* reserved under the lock it was decided in */
     pthread_mutex_unlock(&s->mu);
     if (gone || mem) {
         flush(s, c, b);
         return true;
     }
-    if (!wrote && (sfull || rfull || s->spool_dfd < 0)) {
+    if (!wrote && (dlow || sfull || rfull || s->spool_dfd < 0)) {
         pthread_mutex_lock(&s->mu);
         s->n.res_refused++;
-        s->n.role_spool_limits += !sfull && rfull;
+        s->n.disk_refused += dlow;
+        s->n.role_spool_limits += !dlow && !sfull && rfull;
         pthread_mutex_unlock(&s->mu);
         rsp_end(s, c);
         b->len = at; /* this statement's unsent frames dropped: its ERROR follows what was handed over */
         imdb_fail(e, s->spool_dfd < 0 ? IMDB_ERR_STATE : IMDB_ERR_LIMIT, "%s",
                   s->spool_dfd < 0 ? "a result past its connection's room needs a spool directory (--spool-dir, or "
                                      "--server-dir's spool/)"
+                  : dlow && copy ? "COPY TO: a role's export unread past its connection's room, the server's spool disk "
+                                   "below its headroom (--disk-headroom), fails; read as it comes, or export in parts"
+                  : dlow ? "a result unread past its connection's room, the server's spool disk below its headroom "
+                           "(--disk-headroom), fails; read as it comes, or read it in parts (LIMIT, OFFSET or key ranges)"
                   : copy && sfull ? "COPY TO: a role's export unread past its connection's room and the server's spools "
                                     "(--copy-spool) fails (the server never waits for a reader); read as it comes, or export "
                                     "in parts (COPY (SELECT ... WHERE a key range) TO STDOUT)"
@@ -658,6 +719,12 @@ static bool rows_flush(imdbs *s, conn *c, imdbw_buf *b, size_t at, bool wrote, b
         return true;
     }
     if (wrote) { /* no spool takes it: a write's reply in memory (its commit reaches the client) */
+        if (dlow && !c->dkept) { /* (once a statement) */
+            pthread_mutex_lock(&s->mu);
+            s->n.disk_kept++;
+            pthread_mutex_unlock(&s->mu);
+            c->dkept = true;
+        }
         rsp_end(s, c);
         flush(s, c, b);
         return true;
@@ -963,6 +1030,9 @@ static int copy_wr(void *arg, const char *p, size_t n)
     if (hold && !first) usleep(hold * 1000u); /* (tests: a statement whose output comes slowly) */
     cring *g = c->ring;
     uint64_t *waited = &c->out_waited; /* the statement's, across its writes: copy_wait_ms bounds the sum */
+    /* 2b-3: the spool disk below --disk-headroom: the ring grows to its floor and no further, then streams at its
+     * reader's pace (a superuser's export runs on a filling disk: it is how data leaves one) */
+    bool dlow = s->o.disk_headroom && disk_low(s, IMDBSP_FREE_SPOOL, n);
     while (n) {
         pthread_mutex_lock(&s->mu);
         uint64_t room = 0;
@@ -975,16 +1045,13 @@ static int copy_wr(void *arg, const char *p, size_t n)
             }
             uint64_t mine = g->w - g->r;
             room = g->size - mine;
-            bool role_full = false;
-            if (g->w < g->size) { /* 2b-2a: its file still grows, charged as it grows: the spools' bounds (the server's, its
-                                   * role's share) stop the growth, and it wraps at the size it has: its reader's pace, never
-                                   * another's spools freed */
+            if (g->w < g->size) { /* 2b-2a: its file still grows, charged as it grows: the server's spool bound stops the
+                                   * growth, and it wraps at the size it has: its reader's pace, never another's spools
+                                   * freed (2b-3: a ring is a superuser's or a tally-less connection's alone, out_mode 1,
+                                   * so no role's share binds here: a role's COPY TO is a result's, copy_res) */
                 uint64_t sroom = bound > s->spool_held ? bound - s->spool_held : 0, grow = sroom;
-                if (!c->super && c->tal) {
-                    uint64_t rs = share(s->o.role_copy_spool, bound / 4), rroom = rs > c->tal->spool ? rs - c->tal->spool : 0;
-                    if (grow > rroom) grow = rroom, role_full = true; /* (the share binds: the message names it) */
-                }
                 uint64_t floor = g->size < RING_FLOOR ? g->size : RING_FLOOR;
+                if (dlow && grow > (g->w < floor ? floor - g->w : 0)) grow = g->w < floor ? floor - g->w : 0;
                 if (g->w + grow < floor && grow < n) { /* a ring too small to stream through (an export that fits
                                                     * whole passes): a byte at a time, the engine waiting */
                     room = 0, mine = 0;
@@ -999,12 +1066,9 @@ static int copy_wr(void *arg, const char *p, size_t n)
             if (!mine) { /* its ring empty, or kept under its floor, by the spools' bounds: others' bytes, no pace of its
                           * reader's, so no wait */
                 s->n.copy_limits++;
-                s->n.role_spool_limits += role_full;
                 pthread_mutex_unlock(&s->mu);
-                out_fail(c, IMDB_ERR_LIMIT, role_full ? "COPY TO: its role's spool share is full (every spool of the role's "
-                                                        "connections at once: --role-copy-spool)"
-                                                      : "COPY TO: the server's spools are full (every spool's bytes held at "
-                                                        "once: --copy-spool)");
+                out_fail(c, IMDB_ERR_LIMIT, "COPY TO: the server's spools are full (every spool's bytes held at once: "
+                                            "--copy-spool)");
                 return -1;
             }
             if (*waited >= wait_ns) {
@@ -1101,7 +1165,15 @@ static bool run(imdbs *s, rq *r)
         }
         /* N1d: a COPY ... FROM STDIN: COPY_IN, then the request waits here (not runnable) until its data's end or its
          * refusal; it runs then from its spool, so the engine thread never waits on the network */
-        bool cin = r->type == IMDBW_QUERY && imdb_copy_in_open(&c->ses, (const char *)m->texts[i].p, m->texts[i].len);
+        /* 2b-3: the data disk read before each statement (a role's row writes refused below the headroom, by the engine's
+         * gate: the catalog says who is a superuser now), so a COPY FROM is refused before its upload */
+        c->ses.disk_low = disk_low(s, IMDBSP_FREE_DATA, 0);
+        c->dkept = false;
+        pthread_mutex_lock(&s->mu);
+        bool resumed = c->cin == CIN_OPEN && c->cin_rq == (const void *)r && c->cin_i == i; /* 2b-3: its COPY's data ended */
+        pthread_mutex_unlock(&s->mu);
+        bool cin = resumed ||
+                   (r->type == IMDBW_QUERY && imdb_copy_in_open(&c->ses, (const char *)m->texts[i].p, m->texts[i].len));
         int32_t cerr = 0;
         if (cin && s->spool_dfd >= 0) {
             pthread_mutex_lock(&s->mu);
@@ -1109,6 +1181,7 @@ static bool run(imdbs *s, rq *r)
             if (fresh) {
                 c->cin = CIN_OPEN, c->cin_end = false, c->cin_err = 0, c->cin_msg[0] = 0;
                 c->in_len = c->in_rd = 0, c->cin_last = imdb_mono_ns();
+                c->cin_rq = r, c->cin_i = i;
             } else if (c->cin != CIN_OPEN) {
                 c->cin_err = IMDB_ERR_STATE; /* (never: a new COPY reaches the engine only after the last one's end) */
                 snprintf(c->cin_msg, sizeof c->cin_msg, "a COPY while another's data is still read");
@@ -1164,6 +1237,7 @@ static bool run(imdbs *s, rq *r)
             if (cin && s->spool_dfd >= 0) { /* its spool freed; a client still sending: the rest dropped to its end */
                 c->cin_run = false;
                 pthread_mutex_lock(&s->mu);
+                c->cin_rq = NULL;
                 if (c->cin_end) {
                     cin_drop(s, c);
                     c->cin = CIN_NONE;
@@ -1198,7 +1272,9 @@ static bool run(imdbs *s, rq *r)
         }
         pthread_mutex_lock(&s->mu);
         s->n.statements++;
+        s->n.disk_refused += c->ses.disk_refused;
         pthread_mutex_unlock(&s->mu);
+        c->ses.disk_refused = false;
         bool ok = !rc;
         const char *warn = s->db->warning[0] && strcmp(wb, s->db->warning) ? s->db->warning : NULL; /* as the CLI shows one */
         if (rc) {
@@ -1278,6 +1354,36 @@ static void tick(imdbs *s)
         imdb_event_int(s->db, "refused_types", (int64_t)cr);
         imdb_event_end(s->db);
         s->ev_endpoint = ep, s->ev_cbref = cr, s->ev_cb_ns = now;
+    }
+    /* 2b-3: each directory's crossing of --disk-headroom, either way, said in the event log (read here too, so a crossing
+     * is seen with no statement running): its state when it differs from the last event's, at most one in 5 s a
+     * directory (a disk flapping at the line logs no more; the state it settles in is said) */
+    for (int k = 0; k < 2 && s->o.disk_headroom; k++) {
+        if (k == IMDBSP_FREE_SPOOL && s->spool_dfd < 0) continue;
+        uint64_t fr = 0;
+        bool low = disk_low(s, k, 0);
+        pthread_mutex_lock(&s->mu);
+        fr = k == IMDBSP_FREE_DATA ? s->n.disk_free_data : s->n.disk_free_spool;
+        pthread_mutex_unlock(&s->mu);
+        if (low == s->ev_disk[k] || (s->ev_disk_ns[k] && now - s->ev_disk_ns[k] < 5000000000ull)) continue;
+        s->ev_disk_ns[k] = now;
+        imdb_event_begin(s->db, "disk_headroom");
+        imdb_event_str(s->db, "directory", k == IMDBSP_FREE_DATA ? "data" : "spool", k == IMDBSP_FREE_DATA ? 4 : 5);
+        imdb_event_int(s->db, "below", low);
+        imdb_event_int(s->db, "free_bytes", (int64_t)(fr > INT64_MAX ? INT64_MAX : fr));
+        imdb_event_int(s->db, "headroom", (int64_t)(s->o.disk_headroom > INT64_MAX ? INT64_MAX : s->o.disk_headroom));
+        imdb_event_end(s->db);
+        if (s->o.say_disk) /* (an operator without --events sees it too) */
+            fprintf(stderr, low ? "imagedb-server: warning: the %s directory's file system has %llu bytes free, below "
+                                  "--disk-headroom (%llu): %s\n"
+                                : "imagedb-server: the %s directory's file system has %llu bytes free, above --disk-headroom "
+                                  "(%llu) again%s\n",
+                    k == IMDBSP_FREE_DATA ? "data" : "spool", (unsigned long long)fr, (unsigned long long)s->o.disk_headroom,
+                    !low ? ""
+                    : k == IMDBSP_FREE_DATA ? "roles' row writes are refused (a superuser's statements run)"
+                                            : "uploads and results past their connection's room are refused (a write's reply "
+                                              "kept in memory), everyone's");
+        s->ev_disk[k] = low;
     }
     after_statement(s);
 }
@@ -1615,6 +1721,8 @@ static bool copy_frame(conn *c, const imdbw_msg *m)
 {
     imdbs *s = c->s;
     uint64_t bound = s->o.copy_spool ? s->o.copy_spool : (4ull << 30);
+    /* 2b-3: the spool disk read at every frame of data (everyone's: a spool never takes the disk's last space) */
+    bool dlow = m->type == IMDBW_COPY_DATA && s->o.disk_headroom && s->spool_dfd >= 0 && disk_low(s, IMDBSP_FREE_SPOOL, m->dlen);
     pthread_mutex_lock(&s->mu);
     if (c->cin == CIN_NONE || (c->cin == CIN_OPEN && c->cin_end)) { /* (after its end: data no COPY expects) */
         pthread_mutex_unlock(&s->mu);
@@ -1641,6 +1749,17 @@ static bool copy_frame(conn *c, const imdbw_msg *m)
         return true;
     }
     if (c->cin_err) { /* refused, its answer not yet sent: dropped */
+        pthread_mutex_unlock(&s->mu);
+        return true;
+    }
+    if (dlow) { /* 2b-3: an upload past the spool disk's headroom, a superuser's too (its spool's): refused, never run */
+        snprintf(c->cin_msg, sizeof c->cin_msg, "COPY ... FROM STDIN: the server's spool disk is below its headroom "
+                 "(--disk-headroom): the upload is refused; the rest is read and dropped");
+        c->cin_err = IMDB_ERR_LIMIT;
+        s->n.copy_limits++;
+        s->n.disk_refused++;
+        cin_drop(s, c);
+        pthread_cond_broadcast(&s->cv);
         pthread_mutex_unlock(&s->mu);
         return true;
     }
@@ -2183,6 +2302,7 @@ static void *conn_main(void *arg)
     uint64_t stop_at = 0, progress = imdb_mono_ns();
     uint64_t mark = 0; /* 2b-2b: sent_total when progress last moved: it moves again once TRICKLE_FLOOR more are taken */
     uint64_t idle_from = imdb_mono_ns(); /* 2b-2b: when its session last had something to do */
+    uint32_t pmark = 0; /* 2b-3: the frame arriving's bytes when it last moved the idle clock */
     uint64_t idle_ns = (uint64_t)s->o.role_sess_idle_ms * 1000000u;
     uint64_t kill_at = 0; /* 2b-2a: when a KILL ended it */
     bool waiting = false; /* replies waited at the last turn too */
@@ -2217,10 +2337,14 @@ static void *conn_main(void *arg)
         bool oot_ok = c->oot < OOT_MAX; /* N1e stage two: its out-of-turn answers drained below the bound */
         if (!oot_ok && !c->oot_held) s->n.oot_waits++;
         c->oot_held = !oot_ok;
-        bool room = (c->nq < qmax && c->qbytes < QBYTES_MAX && q_room(s, c) && oot_ok) || copying; /* N1d: a COPY's frames never queued */
+        bool qok = c->nq < qmax && c->qbytes < QBYTES_MAX && q_room(s, c);
+        bool room = (qok && oot_ok) || copying; /* N1d: a COPY's frames never queued */
         /* 2b-2b: its session has something to do: a request queued or running, a reply waiting (a PING's or another
          * out-of-turn answer not counted, so a pool's pings never keep a session), a COPY's data due */
         bool busy = c->rh || c->running || c->cin != CIN_NONE || hg || c->pending + c->spout > c->oot;
+        /* 2b-3: or its reads held by its queue's bounds (its own, or its role's share: the client's request waits in the
+         * socket, on the server; an unread flood of out-of-turn answers is the send timeout's, so that bound is not here) */
+        if (!copying && !qok) busy = true;
         bool role_sess = !c->super && c->role;
         pthread_mutex_unlock(&s->mu);
         uint64_t now = imdb_mono_ns();
@@ -2238,6 +2362,12 @@ static void *conn_main(void *arg)
             END_BY(IMDBS_END_COPY_IDLE);
             leave(c);
         }
+        /* 2b-3: a frame still arriving counts while it gains a KiB a window (or comes whole, then it is a request): one
+         * header and then silence, or a byte now and then, is idle. (Its body's buffer, allocated at its header, is not
+         * charged to the role's queue share: at most a frame a connection, --role-conns the role's) */
+        uint32_t pgot = in.hgot + in.bgot;
+        if (!in.hgot || pgot < pmark) pmark = 0; /* (a new frame) */
+        else if (pgot - pmark >= 1024) idle_from = now, pmark = pgot;
         if (busy || !reading) idle_from = now;
         if (idle_ns && role_sess && reading && peer && now - idle_from > idle_ns) { /* 2b-2b: a role's session idle past
                                                                                       * --role-idle-session: as a KILL's */
@@ -2604,6 +2734,7 @@ int imdbs_start(imdb_db *db, const imdbs_opts *o, imdbs **out, imdb_err *e)
     imdbs *s = imdbw_alloc(1, sizeof *s);
     if (!s) return imdb_fail(e, IMDB_ERR_NOMEM, "out of memory");
     s->db = db, s->o = *o, s->lfd = -1, s->tfd = -1, s->stop[0] = s->stop[1] = -1, s->spool_dfd = -1;
+    s->obj_dfd = imdbsp_subdir(db->dirfd, "objects"); /* (-1: none yet, or none to read: the others are read) */
     s->o.socket_path = s->o.tcp = s->o.server_dir = s->o.spool_dir = NULL; /* the caller's strings: used here alone */
     pthread_mutex_init(&s->mu, NULL);
     pthread_mutex_init(&s->lmu, NULL);
@@ -2706,6 +2837,7 @@ int imdbs_stop(imdbs *s, imdb_err *e)
     if (s->lfd >= 0) close(s->lfd);
     if (s->tfd >= 0) close(s->tfd);
     if (s->spool_dfd >= 0) close(s->spool_dfd);
+    if (s->obj_dfd >= 0) close(s->obj_dfd);
     imdbt_ctx_free(s->tls);
     if (s->path[0]) unlink(s->path);
     if (s->stop[0] >= 0) close(s->stop[0]);

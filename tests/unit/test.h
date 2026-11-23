@@ -12,6 +12,7 @@ typedef struct test_case {
 } test_case;
 
 extern int g_test_failed;
+extern const char *g_test_current;
 void test_fail(const char *file, int line, const char *what);
 uint64_t test_rand(void);           /* deterministic xorshift, seeded per test */
 void test_seed(uint64_t s);         /* reseed (a test that runs several random rounds) */

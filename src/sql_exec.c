@@ -5750,6 +5750,14 @@ static int gate_write(xctx *x, const sql_stmt *st, imdb_err *e)
 {
     const imdb_role *r = gate_role(x->ss);
     if (!r) return IMDB_OK;
+    /* 2b-3: the disk headroom, before the privileges (a role's every row write is refused alike, whatever it holds: the
+     * statement kinds a role may run that write the log are these four, imdb_priv_kind_need's NEED_OBJECTS writes; every
+     * other a superuser's). EXPLAIN writes nothing: it runs. Not a privilege refusal (no priv_note: a LIMIT) */
+    if (x->ss->disk_low && st->kind != ST_EXPLAIN) {
+        x->ss->disk_refused = true;
+        return imdb_fail(e, IMDB_ERR_LIMIT, "the server's disk is below its headroom (--disk-headroom): a role's writes are "
+                                            "refused until space is freed (reads run; a superuser's statements run)");
+    }
     imdb_table *t = imdb_table_by_name(x->db, st->table);
     if (!t) return IMDB_OK;
     bool reads = st->nwhere || st->returning || st->src;

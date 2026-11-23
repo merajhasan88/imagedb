@@ -783,6 +783,23 @@ static imdb_db *sort_db(void)
         if (!imdb_buf_check(&b, &g_e) && !run_buf(&b)) run("CREATE INDEX s3g ON s3 (g)"); /* (a walk by g: vids out of order) */
         imdb_buf_free(&b);
     }
+    /* 2b-3: keys sharing a 2,000-byte prefix, 50 values, each running past eight bytes after it: before a second key over
+     * 1,024 rows (the run knob's threshold) the 1,024 rows' sample finds them few, so the sort goes to the old merge before
+     * ab_common runs: the sampled prefix pass is the one source of phase 6 there */
+    if (!g_e.code && !run("CREATE TABLE s4 (id INT64 PRIMARY KEY, k TEXT)")) {
+        imdb_buf_init(&b);
+        for (int base = 0; base < 5000 && !g_e.code; base += 250) {
+            b.len = 0;
+            imdb_buf_put_str(&b, "INSERT INTO s4 VALUES ");
+            for (int i = base + 1; i <= base + 250; i++) {
+                imdb_buf_printf(&b, "%s(%d, '", i > base + 1 ? ", " : "", i);
+                for (int x = 0; x < 2000; x++) imdb_buf_put_str(&b, "P");
+                imdb_buf_printf(&b, "%02d-suffixxxx')", i * 7919 % 5003 % 50);
+            }
+            if (!imdb_buf_check(&b, &g_e)) run_buf(&b);
+        }
+        imdb_buf_free(&b);
+    }
     return db;
 }
 
@@ -822,6 +839,7 @@ static const sort_stmt k_sort_stmts[] = {
     {"SELECT id, v FROM s ORDER BY id", false, false, S_(5), false, S_(5), 5}, /* the default order: in order, nothing made */
     {"SELECT id FROM s ORDER BY 'prefix-' || CAST(id * 7919 % 5003 AS TEXT)", false, false, S_(5), false, S_(0) | S_(1) | S_(3) | S_(4) | S_(6), 5},
     {"SELECT id, v FROM s ORDER BY CASE WHEN v < 0 THEN v END, v DESC, id", false, false, S_(5), false, S_(3), 5}, /* a first key NULL in every row: the scan past its NULLs */
+    {"SELECT id FROM s4 ORDER BY k, id", false, false, S_(5), false, S_(6), 5}, /* 2b-3: the sampled prefix pass alone */
 };
 
 typedef struct sort_hook_ctx {
@@ -832,6 +850,7 @@ typedef struct sort_hook_ctx {
     uint8_t sp[32]; /* the phases seen checking at each site */
     uint32_t sites; /* the sites seen checking */
     bool fired;
+    int sleep_ms; /* mode 2: how long the hook waits (past the statement's timeout; 0: 1,100 ms) */
 } sort_hook_ctx;
 
 static void *cancel_from(void *arg)
@@ -852,7 +871,7 @@ static void sort_hook(void *arg, int phase, int site)
         pthread_t t;
         if (!pthread_create(&t, NULL, cancel_from, &g_ss)) pthread_join(t, NULL);
     } else {
-        sleep_ms(1100); /* past statement_timeout's 1,000 ms */
+        sleep_ms(h->sleep_ms ? h->sleep_ms : 1100); /* past statement_timeout (1,000 ms, or the retry's longer one) */
     }
 }
 
@@ -890,15 +909,28 @@ static void t_sort_stops(void)
         for (int mode = 1; mode <= 2; mode++)
             for (int ph = 0; ph < 7; ph++) {
                 if (!seen[ph] || (mode == 2 && ph)) continue; /* (the deadline: its first check alone) */
-                if (mode == 2) RUN("SET statement_timeout = 1000");
-                memset(&h, 0, sizeof h);
-                h.mode = mode, h.at_phase = ph;
-                uint64_t stopped = imdb_sql_sorts_stopped();
-                rc = run(ss->sql);
+                uint64_t stopped = 0;
                 char msg[sizeof g_e.msg];
-                snprintf(msg, sizeof msg, "%s", g_e.msg);
-                h.mode = 0;
-                if (mode == 2) RUN("SET statement_timeout = 0");
+                /* mode 2: the deadline must pass inside the sort. A deadline that passed before the sort was reached (the
+                 * hook never fired: SAN on a loaded machine, 11-22) tests nothing: again with a longer one, the hook
+                 * waiting past it. A sort that fails to stop still fails: its hook fired */
+                for (int tmo = 1000; tmo <= 16000; tmo *= 4) {
+                    char set[64];
+                    if (mode == 2) {
+                        snprintf(set, sizeof set, "SET statement_timeout = %d", tmo);
+                        RUN(set);
+                    }
+                    memset(&h, 0, sizeof h);
+                    h.mode = mode, h.at_phase = ph, h.sleep_ms = tmo + 100;
+                    stopped = imdb_sql_sorts_stopped();
+                    rc = run(ss->sql);
+                    snprintf(msg, sizeof msg, "%s", g_e.msg);
+                    h.mode = 0;
+                    if (mode == 2) RUN("SET statement_timeout = 0");
+                    if (mode != 2 || h.fired || rc != IMDB_ERR_CANCELLED) break;
+                    fprintf(stderr, "    mode 2, phase %d, %s: the deadline of %d ms passed before the sort; again\n", ph,
+                            ss->sql, tmo);
+                }
                 bool ok = rc == IMDB_ERR_CANCELLED && strstr(msg, mode == 1 ? "statement cancelled" : "statement timeout") &&
                           h.fired && imdb_sql_sorts_stopped() == stopped + 1;
                 SOFT(ok);

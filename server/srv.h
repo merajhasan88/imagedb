@@ -66,6 +66,13 @@ typedef struct imdbs_opts {
     /* N1e stage two, 2b-2a: one role's spooled bytes at once (its COPY FROM spools, COPY TO rings and results spooled past
      * their connection's room together; 0: a quarter of copy_spool; IMDBS_NONE: none; a superuser's exempt) */
     uint64_t role_copy_spool;
+    /* 2b-3: the free bytes kept on the data directory's and the spool directory's file systems: below it on the data's, a
+     * role's row writes are refused at their start; on the spool's, a role's COPY FROM upload is refused and a role's
+     * result past its connection's room is refused (a write's reply kept in memory: its commit stands); a superuser's
+     * exempt (0: none; imagedb-server's default 1 GiB, the API's none) */
+    uint64_t disk_headroom;
+    bool say_disk;             /* 2b-3: each crossing of the headroom (and at start, below it) a line on stderr too
+                                * (imagedb-server's; the tests' none) */
     uint64_t reply_budget;     /* every connection's unsent replies, past which only a connection (a role) with none runs (0:
                                 * 256 MiB) */
     bool test_open_logins;     /* tests alone: any LOGIN role logs in (N1e stage two's last slice opens them) */
@@ -145,6 +152,11 @@ typedef struct imdbs_counts {
     uint64_t res_spool_bytes; /* and those frames' bytes */
     uint64_t res_refused;  /* reads refused for want of room for their reply (the spools full, a role's share, no spool) */
     uint64_t role_spool_limits; /* COPYs and results stopped by a role's spool share (--role-copy-spool) */
+    uint64_t disk_refused; /* 2b-3: a role's statements, uploads and results refused by --disk-headroom */
+    uint64_t disk_kept;    /* 2b-3: a role's write replies kept in memory past their room, the spool disk below it */
+    uint64_t disk_low_data, disk_low_spool; /* 2b-3: gauges: 1 while that directory's file system is below the headroom
+                                             * (as the engine thread last read it), the free bytes it read last */
+    uint64_t disk_free_data, disk_free_spool;
     uint64_t pend_peak;    /* the most unsent replies in memory at once, every connection's (the budget and a chunk a connection) */
     uint64_t files_peak;   /* 2b-2b: the most reply spools one connection held at once (SPOOL_FILES: 4) */
     uint64_t res_released; /* 2b-2b: result spools' sent bytes given back to the file system (holes), uncharged */

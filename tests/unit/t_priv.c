@@ -635,6 +635,82 @@ static void t_priv_demoted(void)
     teardown(db);
 }
 
+
+/* refused by the disk headroom: a LIMIT naming --disk-headroom, never a privilege refusal */
+#define DISKLOW(sql)                                                                                                   \
+    do {                                                                                                               \
+        int rc_ = run_on(&g_r, (sql));                                                                                 \
+        if (rc_ != IMDB_ERR_LIMIT || !strstr(g_msg, "--disk-headroom")) {                                              \
+            char m_[900];                                                                                              \
+            snprintf(m_, sizeof m_, "want refused by the headroom: %s: %d %s", (sql), rc_, g_msg);                     \
+            test_fail(__FILE__, __LINE__, m_);                                                                         \
+        }                                                                                                              \
+    } while (0)
+
+/* 2b-3: --disk-headroom at the engine (the server sets disk_low before each statement): a role holding every privilege
+ * on t and u refused every form of row write by name, COPY FROM's data never asked, nothing logged (the commit sequence
+ * unmoved but by its COMMIT), no privilege refusal counted; reads, EXPLAIN, SET, PREPARE, BEGIN and ROLLBACK taken, a
+ * refusal inside a transaction leaving it as a privilege refusal does, and a COMMIT of what it wrote before taken; a
+ * superuser's enforced session and an embedded caller's write */
+static void t_priv_disk(void)
+{
+    imdb_db *db = setup();
+    CHECK(db);
+    ADMIN("GRANT SELECT, INSERT, UPDATE, DELETE ON t TO r");
+    ADMIN("GRANT SELECT, INSERT, UPDATE, DELETE ON u TO r");
+    ADMIN("CREATE ROLE boss SUPERUSER");
+    TAKEN("PREPARE ins AS INSERT INTO t VALUES (50, 1, 'p')");
+    TAKEN("BEGIN");
+    TAKEN("INSERT INTO t VALUES (40, 1, 'b')");
+    g_r.disk_low = true;
+    uint64_t seq = db->seq, pr = db->stats.priv_refused[0] + db->stats.priv_refused[1] + db->stats.priv_refused[2];
+    DISKLOW("INSERT INTO t VALUES (41, 1, 'x')");
+    SOFT(g_r.disk_refused);
+    TAKEN("SELECT COUNT(*) FROM t WHERE id = 40"); /* its transaction goes on */
+    TAKEN("COMMIT");                                /* what it wrote before: a margin, not a quota */
+    SOFT(db->seq == seq + 1);
+    seq = db->seq;
+    static const char *const w[] = {"INSERT INTO t VALUES (41, 1, 'x')",
+                                    "INSERT INTO t VALUES (42, 1, 'x') RETURNING id",
+                                    "INSERT INTO t VALUES (1, 1, 'x') ON CONFLICT (id) DO UPDATE SET a = 5",
+                                    "INSERT INTO t VALUES (1, 1, 'x') ON CONFLICT DO NOTHING",
+                                    "INSERT INTO t SELECT id + 100, x, 'u' FROM u",
+                                    "UPDATE t SET a = 0",
+                                    "UPDATE u SET x = x + 1 WHERE id = 1 RETURNING x",
+                                    "UPDATE t SET a = u.x FROM u WHERE u.id = t.id",
+                                    "DELETE FROM t WHERE id = 1",
+                                    "DELETE FROM t USING u WHERE u.id = t.id",
+                                    "EXECUTE ins",
+                                    "COPY t FROM STDIN"};
+    for (size_t i = 0; i < sizeof w / sizeof w[0]; i++) DISKLOW(w[i]);
+    SOFT(g_cpk == 0); /* COPY's data never asked for */
+    SOFT(!imdb_copy_in_open(&g_r, "COPY t FROM STDIN", 17));
+    static const char *const ok[] = {"SELECT COUNT(*) FROM t", "EXPLAIN UPDATE t SET a = 0 WHERE id = 1",
+                                     "SET statement_timeout = 1000", "SELECT id FROM t WHERE id = 1 FOR UPDATE",
+                                     "BEGIN", "SELECT x FROM u WHERE id = 2", "ROLLBACK"};
+    for (size_t i = 0; i < sizeof ok / sizeof ok[0]; i++) TAKEN(ok[i]);
+    SOFT(db->seq == seq); /* nothing logged */
+    SOFT(db->stats.priv_refused[0] + db->stats.priv_refused[1] + db->stats.priv_refused[2] == pr);
+    uint32_t rid = g_r.role;
+    g_r.role = imdb_role_by_name(db, "boss")->id; /* a superuser's enforced session writes */
+    TAKEN("INSERT INTO t VALUES (60, 1, 's')");
+    g_r.role = rid;
+    g_a.disk_low = true; /* an embedded caller's too (never enforced) */
+    ADMIN("INSERT INTO t VALUES (61, 1, 's')");
+    g_r.disk_low = g_a.disk_low = false;
+    TAKEN("INSERT INTO t VALUES (62, 1, 's')");
+    SOFT(run_on(&g_a, "SELECT COUNT(*) FROM t WHERE id IN (40, 60, 61, 62)") == 0);
+    imdb_result res;
+    imdb_err e = {0};
+    static const char cnt[] = "SELECT COUNT(*) FROM t WHERE id IN (40, 41, 42, 50, 60, 61, 62)";
+    if (!imdb_exec_one(&g_a, cnt, sizeof cnt - 1, NULL, 0, &res, &e)) {
+        SOFT(res.nrows == 1 && res.cells[0].v.i == 4);
+        imdb_result_free(&res);
+    } else {
+        SOFT(false);
+    }
+    teardown(db);
+}
 /* N1e stage two: each gate's refusal counted (A: a kind or a SET past a cap, B: a read, C: a write's target) and an
  * event "privilege" (the role's id, never its name; the gate; the relation's id; the shape, no value), at most 4 a second
  * a role: a burst's events and its dropped count add to its refusals */
@@ -709,5 +785,6 @@ const test_case priv_tests[] = {
     {"priv_caps", t_priv_caps},
     {"priv_demoted", t_priv_demoted},
     {"priv_events", t_priv_events},
+    {"priv_disk", t_priv_disk},
 };
 const size_t priv_ntests = sizeof priv_tests / sizeof *priv_tests;

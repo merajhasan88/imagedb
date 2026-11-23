@@ -38,4 +38,16 @@ void imdbsp_no_tmpfile(bool on);
 /* tests: every release refused, as on a file system without holes */
 void imdbsp_no_release(bool on);
 
+/* 2b-3: the bytes an unprivileged writer may still use on dfd's file system (f_bavail * f_frsize), kind naming which
+ * directory it is (the data's or the spool's) for the tests' hook; a failed fstatvfs reports 0 (the headroom fails
+ * closed: a role's writes refused, said by name) and returns false */
+enum { IMDBSP_FREE_DATA, IMDBSP_FREE_SPOOL };
+bool imdbsp_free(int dfd, int kind, uint64_t *bytes);
+/* 2b-3: dfd/name as a directory to read the free space of (O_NOFOLLOW: a mount there is read, a symlink refused); -1
+ * when it cannot be opened */
+int imdbsp_subdir(int dfd, const char *name);
+/* tests: kind's free bytes reported as bytes (-1: the file system's own again); whether kind's are so reported now */
+void imdbsp_test_free(int kind, int64_t bytes);
+bool imdbsp_free_hooked(int kind);
+
 #endif

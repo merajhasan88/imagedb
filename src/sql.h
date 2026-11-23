@@ -62,6 +62,10 @@ typedef struct imdb_session {
                               * superuser's rights); an enforced session of role 0 is refused every statement */
     imdb_caps caps;          /* N1e stage two: its role's caps (the server's options), while enforce is set and the role is not
                               * a superuser (db.h imdb_cap_eff); zero: none */
+    bool disk_low;           /* 2b-3: set by the server before each statement: its data directory's free space is below
+                              * --disk-headroom, so an enforced role's row writes are refused at their start (gate_write; a
+                              * superuser's run: the operator acting on a full disk) */
+    bool disk_refused;       /* 2b-3: set by gate_write when it refused for disk_low (the server counts it, then clears it) */
     bool cross_check;
     bool show_identity;      /* SET identity = on: results print their read point in full */
     uint64_t min_commit;     /* SET min_commit = N: reads refuse a database that has not reached N */

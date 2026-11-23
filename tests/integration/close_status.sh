@@ -34,7 +34,8 @@ start() { # program, then the server's options
   local program=$1
   shift
   rm -f "$WORK/s"
-  "$program" "$P" --socket "$WORK/s" --server-dir "$WORK/sd" "$@" >"$WORK/server.out" 2>"$WORK/server.err" &
+  # (--disk-headroom 0: the test machine's file systems may be near full; the headroom has its own tests, t_server's)
+  "$program" "$P" --socket "$WORK/s" --server-dir "$WORK/sd" --disk-headroom 0 "$@" >"$WORK/server.out" 2>"$WORK/server.err" &
   spid=$!
   for _ in $(seq 200); do
     grep -q 'listening on' "$WORK/server.out" && [ -S "$WORK/s" ] && return 0
@@ -78,13 +79,13 @@ if [ "$EXPECT" = 1 ]; then
   stop
   [ "$stop_rc" -eq 0 ] || fail "a clean stop exited $stop_rc"
   for pair in '--mem-limit 0' '--mem-limit 18446744073709551616' '--seg-cache 01M' '--seg-cache never' '--slice-ms 0' \
-              '--queue-max 0' '--conn-cap 1K' '--role-copy-spool 2T'; do
+              '--queue-max 0' '--conn-cap 1K' '--role-copy-spool 2T' '--disk-headroom 1X'; do
     rc=0
     # shellcheck disable=SC2086 # two words, an option and its value
     "$SRV" "$P" --socket "$WORK/s" --server-dir "$WORK/sd" $pair >/dev/null 2>&1 || rc=$?
     [ "$rc" -eq 2 ] || fail "$pair: exit $rc, not the usage's 2"
   done
-  echo "the daemon's controls: --mem-limit, --seg-cache (and all), --iceberg, --anchor, the nine constants and --role-copy-spool taken; eight bad values refused"
+  echo "the daemon's controls: --mem-limit, --seg-cache (and all), --iceberg, --anchor, the nine constants and --role-copy-spool taken; nine bad values refused"
   # 2b-2b: the descriptors --max-conns needs (256: 2,496): a hard limit short of them refused before anything is opened;
   # a soft one short of them raised to the hard one
   rc=0

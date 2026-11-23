@@ -240,6 +240,17 @@ which can lag SQL commits. Use `imagedb verify` to check a current layer.
   part passes that room and the spools (`--copy-spool`, its role's `--role-copy-spool`, a quarter of it) fails by name:
   read as it comes, or in parts (a role's export: `COPY (SELECT ... WHERE a key range) TO STDOUT`). On a file system
   that cannot punch holes the whole file counts until it is sent. A write's RETURNING is always delivered with its commit.
+- **A filling disk** (`--disk-headroom`, 1 GiB by default): the server reads the free space of every file system the
+  database writes (its directory, `log/`, `objects/`: the least counts) and of the spool directory's. Below the line on
+  the database's, a role's INSERT, UPDATE, DELETE and COPY FROM are refused at their start by name (a DELETE frees
+  nothing here: it adds history); reads, SET, BEGIN, ROLLBACK and a COMMIT of writes made above it run. Below it on the
+  spool's, nothing spools, a superuser's included: an upload and a result past its connection's room are refused (a
+  write's reply is kept in memory with its commit), and a superuser's COPY TO streams through its ring, grown no further
+  (64 KiB when it starts below the line), at its client's pace. A superuser's statements run, so the operator gives
+  space back: `ALTER TABLE t SET RETENTION` shorter,
+  `DROP TABLE t RETENTION ...` of what is not needed, `COMPACT t PURGE BEFORE n`, then `CHECKPOINT` (RETIRE then cuts
+  the log once every table's history has expired past a segment); or grows the file system. Each crossing is a line on
+  stderr and a `disk_headroom` event. A commit that still meets a full disk fails alone and the server goes on.
 - **Shutdown:** SIGTERM takes no new connection, lets running statements end, rolls
   back open transactions and closes the database durable; a second signal cancels
   the running statements. A failed sync stops the server with exit status 1 for its
@@ -675,6 +686,7 @@ Command-line options (`imagedb` with no arguments prints the commands):
 | `--role-queue-bytes BYTES` | imagedb-server | one such role's queued requests, past which its connections are not read (0: none) | 64M |
 | `--role-reply-bytes BYTES` | imagedb-server | one such role's replies not yet sent (in memory, and results spooled past their room), past which none of its statements starts (0: none) | 64M |
 | `--role-copy-spool BYTES` | imagedb-server | one role's spooled bytes at once: its COPY FROM spools, COPY TO rings and the results spooled past their connection's room (0: none; a superuser's exempt) | a quarter of `--copy-spool` |
+| `--disk-headroom BYTES` | imagedb-server | the free bytes kept on the database's file systems (its directory, `log/`, `objects/`: the least) and the spool directory's: below it on the database's a role's row writes (INSERT, UPDATE, DELETE, COPY FROM) are refused at their start, a superuser's statements run; on the spool's every upload and result past its connection's room is refused (a write's reply kept in memory), a superuser's COPY TO streaming through its ring, grown no further; reads run; each crossing a line on stderr and a `disk_headroom` event (0: none); see "A filling disk" | 1 GiB (the API: none) |
 | `--preauth-max N` | imagedb-server | connections authenticating at once on each listener; the rest wait in the listen queue | 32 |
 | `--preauth-timeout MS` | imagedb-server | a whole authentication exchange (TLS's handshake included) | 10000 |
 | `--preauth-per-addr N` | imagedb-server | TCP connections authenticating at once from one address (twice it may wait) | 8 |

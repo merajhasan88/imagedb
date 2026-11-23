@@ -1069,7 +1069,8 @@ static pid_t spawn(const char *bin, const char *dbdir, const char *sdir)
         struct rlimit rl = {RLIM_INFINITY, RLIM_INFINITY}; /* a supervisor's: the engine thread's stack its own */
         setrlimit(RLIMIT_STACK, &rl);
         execl(bin, bin, dbdir, "--socket", g_sock, "--server-dir", sdir, "--nosync", "--mem-limit", "768M", "--seg-cache", "96M",
-              (char *)NULL); /* N1e stage two: the budget and the images reach the handle (SHOW MEMORY below) */
+              "--disk-headroom", "0", (char *)NULL); /* N1e stage two: the budget and the images reach the handle (SHOW MEMORY
+                                                       * below); 2b-3: no headroom (the tests' file system may be near full) */
         _exit(127);
     }
     return pid;
@@ -3072,11 +3073,26 @@ static imdbs_counts counts_of(imdbs *s)
 /* until the server ran one more request to its end than before (its replies all handed over: memory or spool), 20 s */
 static bool requests_past(imdbs *s, uint64_t before)
 {
-    for (int w = 0; w < 6000; w++) { /* (60 s at most: a spilled result under TSan and a loaded machine took past 20, 11-21) */
-        if (counts_of(s).requests > before) return true;
-        usleep(10000);
+    /* 60 s at most: a spilled result under TSan and a loaded machine took past 20, 11-21 (the cause not established). A
+     * wait past 5 s is printed, with the server's counts at its start and end: counts that moved are a slow machine,
+     * counts frozen for seconds a stall (2b-3: the matrix's runs give the data at no extra load) */
+    imdbs_counts c0 = counts_of(s);
+    uint64_t t0 = imdb_mono_ns();
+    bool ok = false;
+    for (int w = 0; w < 6000 && !ok; w++) {
+        if (counts_of(s).requests > before) ok = true;
+        else usleep(10000);
     }
-    return false;
+    uint64_t ms = (imdb_mono_ns() - t0) / 1000000u;
+    if (ms > 5000) {
+        imdbs_counts c1 = counts_of(s);
+        fprintf(stderr, "    requests_past in %s: %llu ms (%s); requests %llu -> %llu, wakeups %llu -> %llu, ticks %llu -> %llu, "
+                        "res_spool_bytes %llu -> %llu\n", g_test_current, (unsigned long long)ms, ok ? "done" : "TIMED OUT",
+                (unsigned long long)c0.requests, (unsigned long long)c1.requests, (unsigned long long)c0.wakeups,
+                (unsigned long long)c1.wakeups, (unsigned long long)c0.ticks, (unsigned long long)c1.ticks,
+                (unsigned long long)c0.res_spool_bytes, (unsigned long long)c1.res_spool_bytes);
+    }
+    return ok;
 }
 
 /* until the server's spools hold nothing and no spool file is open (every credit back), 10 s */
@@ -3652,6 +3668,10 @@ static void t_server_trickle(void)
         SOFT(imdbc_query(c, &k_all, 1, &e) == 0);
         int fd = imdbc_fd(c);
         size_t want = fast ? 512 : 64, total = 0;
+        /* the window from its first bytes: a statement slow to begin its rows (160,000 under TSan on a loaded machine took
+         * seconds, 11-22) holds no reply waiting, so no clock of the server's runs before them either */
+        struct pollfd pf0 = {fd, POLLIN, 0};
+        (void)poll(&pf0, 1, 30000);
         uint64_t t0 = imdb_mono_ns(), dropped_ms = 0;
         while (imdb_mono_ns() - t0 < 8000000000u) {
             if (counts_of(s).dropped != c0.dropped) {
@@ -3782,6 +3802,396 @@ static void t_server_role_defaults(void)
     unserve(db, s);
 }
 
+
+/* 2b-3: --role-idle-session's busy by progress (D35: a frame only partly received; reads the server holds). A QUERY half
+ * sent and then silent is idle: closed past the bound. The same frame arriving a KiB every 400 ms, past the bound three
+ * times over, is not: answered once whole. A role's second connection whose request its role's queue share holds unread
+ * (the first's result unread past its reply share, its three padded requests past the 1 MiB queue share) is not idle
+ * either: answered once the first reads */
+static void t_server_idle_busy(void)
+{
+    imdbs_opts o;
+    memset(&o, 0, sizeof o);
+    o.test_open_logins = true;
+    o.role_sess_idle_ms = 1000;
+    o.role_reply_bytes = 1u << 20;
+    o.role_queue_bytes = 1u << 20;
+    imdbs *s = NULL;
+    imdb_db *db = serve(&s, &o);
+    CHECK(db);
+    imdbc *a = login("admin", "pw-admin");
+    CHECK(a);
+    reply r = {0};
+    imdb_err e = {0};
+    static char text[16000]; /* (16 KiB: 16 pieces 200 ms apart, past the bound three times; five pieces a bound) */
+    size_t n = (size_t)snprintf(text, sizeof text, "SELECT 7 -- ");
+    memset(text + n, 'x', sizeof text - n - 1);
+    text[sizeof text - 1] = 0;
+    imdbw_text txt = {(const uint8_t *)text, (uint32_t)strlen(text)};
+    imdbw_span none = {(const uint8_t *)"", 0, 0};
+    imdbw_msg q;
+    memset(&q, 0, sizeof q);
+    q.type = IMDBW_QUERY, q.texts = &txt, q.ntexts = 1, q.params = &none;
+    imdbw_buf b;
+    imdbw_buf_init(&b);
+    imdbw_msg_put(&b, &q, NULL);
+    CHECK(!b.err);
+    /* half, then silence: idle */
+    imdbc *p = login("plain", "pw");
+    CHECK(p);
+    imdbs_counts c0 = counts_of(s);
+    SOFT(imdbc_send_raw(p, b.p, b.len / 2, &e) == 0);
+    uint64_t t0 = imdb_mono_ns();
+    SOFT(read_reply(p, &r) != 0 && r.nerr == 1 && strstr(r.err, "--role-idle-session"));
+    uint64_t ms = (imdb_mono_ns() - t0) / 1000000u;
+    SOFT(ms >= 800 && ms < 4000 && counts_of(s).idle_closed == c0.idle_closed + 1);
+    if (!strstr(r.err, "--role-idle-session")) fprintf(stderr, "    half a frame: after %llu ms: %s\n", (unsigned long long)ms, r.err);
+    imdbc_close(p);
+    /* a KiB every 200 ms: busy while it arrives */
+    p = login("plain", "pw");
+    CHECK(p);
+    c0 = counts_of(s);
+    for (size_t off = 0; off < b.len; off += 1024) {
+        size_t k = b.len - off < 1024 ? b.len - off : 1024;
+        SOFT(imdbc_send_raw(p, b.p + off, k, &e) == 0);
+        if (off + k < b.len) usleep(200000);
+    }
+    SOFT(read_reply(p, &r) == 0 && !r.nerr && strstr(r.text, "7"));
+    SOFT(counts_of(s).idle_closed == c0.idle_closed);
+    if (r.nerr) fprintf(stderr, "    a frame arriving: %s\n", r.err);
+    imdbc_close(p);
+    imdbw_buf_free(&b);
+    /* reads held by the role's queue share */
+    load_rows(a, 400);
+    SOFT(q1(a, "GRANT SELECT ON big2 TO plain", &r) == 0 && !r.nerr);
+    imdbc *p1 = login("plain", "pw"), *p2 = NULL;
+    CHECK(p1);
+    imdbc_stmt all = {"SELECT * FROM big2", 18, NULL, 0}; /* about 3 MB unread: past the role's reply share */
+    uint64_t before = started_now(s);
+    SOFT(imdbc_query(p1, &all, 1, &e) == 0);
+    wait_started(s, before);
+    static char pad[400000];
+    n = (size_t)snprintf(pad, sizeof pad, "SELECT 5 -- ");
+    memset(pad + n, 'x', sizeof pad - n - 1);
+    pad[sizeof pad - 1] = 0;
+    imdbc_stmt big = {pad, strlen(pad), NULL, 0};
+    for (int k = 0; k < 3; k++) SOFT(imdbc_query(p1, &big, 1, &e) == 0);
+    imdbs_counts c1;
+    for (int w = 0; w < 500; w++) {
+        c1 = counts_of(s);
+        if (c1.role_queue_waits > c0.role_queue_waits) break;
+        usleep(10000);
+    }
+    SOFT(c1.role_queue_waits > c0.role_queue_waits);
+    p2 = login("plain", "pw"); /* (logged in once the queue is held: its idle clock from here) */
+    CHECK(p2);
+    c0 = counts_of(s);
+    imdbc_stmt eight = {"SELECT 8", 8, NULL, 0};
+    SOFT(imdbc_query(p2, &eight, 1, &e) == 0); /* held unread: the role's queue is past its share */
+    usleep(2500000); /* past the idle bound twice */
+    SOFT(counts_of(s).idle_closed == c0.idle_closed);
+    SOFT(read_reply(p1, &r) == 0 && !r.nerr && r.nrows == 160000);
+    for (int k = 0; k < 3; k++) SOFT(read_reply(p1, &r) == 0 && !r.nerr);
+    SOFT(read_reply(p2, &r) == 0 && !r.nerr && strstr(r.text, "8"));
+    if (r.nerr) fprintf(stderr, "    held reads: %s\n", r.err);
+    imdbc_close(p1);
+    imdbc_close(p2);
+    imdbc_close(a);
+    unserve(db, s);
+}
+
+/* 2b-3: --disk-headroom, each cell of its table (the free bytes by the tests' hook alone: no file system filled). The
+ * data disk below it: a role's INSERT, INSERT ... SELECT, UPDATE, DELETE and COPY FROM refused at their start by name
+ * (COPY's data never asked), its SELECT and EXPLAIN run, a COMMIT of writes made above it commits, a superuser's writes
+ * run, a superuser's statements that give space back run (the README's runbook), a superuser demoted refused at once (the
+ * catalog decides, not the server's copy). The spool disk below it, everyone's (a superuser's too): a COPY FROM upload
+ * refused and never run, a read past its connection's room refused by name, a write's RETURNING past its room kept in
+ * memory with its commit, a superuser's COPY TO streaming through a ring held at its floor. Each crossing an event, either
+ * way; the counts and the gauges */
+static void t_server_disk_headroom(void)
+{
+    char ev[300];
+    snprintf(ev, sizeof ev, "%s/events", test_tmpdir());
+    g_events = ev;
+    imdbs_opts o;
+    memset(&o, 0, sizeof o);
+    o.test_open_logins = true;
+    o.conn_cap = 256u << 10;
+    o.disk_headroom = 1ull << 30;
+    imdbsp_test_free(IMDBSP_FREE_DATA, 2ll << 30);
+    imdbsp_test_free(IMDBSP_FREE_SPOOL, 2ll << 30);
+    imdbs *s = NULL;
+    imdb_db *db = serve(&s, &o);
+    CHECK(db);
+    imdbc *a = login("admin", "pw-admin");
+    CHECK(a);
+    reply r = {0};
+    imdb_err e = {0};
+    load_rows(a, 400);
+    static const char *const setup[] = {"CREATE TABLE w (id INT64 PRIMARY KEY, v INT64)", "INSERT INTO w VALUES (1, 1), (2, 2)",
+                                        "GRANT SELECT, INSERT, UPDATE, DELETE ON w TO plain", "GRANT SELECT ON big2 TO plain",
+                                        "CREATE ROLE boss LOGIN SUPERUSER PASSWORD 'pw-b'",
+                                        "CREATE TABLE zz (id INT64 PRIMARY KEY)", "INSERT INTO zz VALUES (1)"};
+    for (size_t i = 0; i < sizeof setup / sizeof *setup; i++) SOFT(q1(a, setup[i], &r) == 0 && !r.nerr);
+    imdbc *p = login("plain", "pw"), *u = login("boss", "pw-b");
+    CHECK(p && u);
+    SOFT(q1(p, "INSERT INTO w VALUES (3, 3)", &r) == 0 && !r.nerr); /* above it: runs */
+    SOFT(q1(p, "BEGIN", &r) == 0 && !r.nerr && q1(p, "INSERT INTO w VALUES (4, 4)", &r) == 0 && !r.nerr);
+    int ev0 = ev_count(ev, "\"disk_headroom\"");
+    /* the data disk below it */
+    imdbsp_test_free(IMDBSP_FREE_DATA, 100ll << 20);
+    SOFT(q1(p, "COMMIT", &r) == 0 && !r.nerr); /* admitted above it: a margin, not a quota */
+    imdbs_counts c0 = counts_of(s);
+    static const char *const refused[] = {"INSERT INTO w VALUES (5, 5)", "INSERT INTO w SELECT id + 10, v FROM w",
+                                          "UPDATE w SET v = 9 WHERE id = 1", "DELETE FROM w WHERE id = 2"};
+    for (size_t i = 0; i < sizeof refused / sizeof *refused; i++) {
+        SOFT(q1(p, refused[i], &r) == 0 && r.nerr == 1 && r.err_code == (uint32_t)-IMDB_ERR_LIMIT &&
+             strstr(r.err, "--disk-headroom"));
+        if (!strstr(r.err, "--disk-headroom")) fprintf(stderr, "    %s: %s\n", refused[i], r.err);
+    }
+    static const char d[] = "6,6\n7,7\n";
+    SOFT(copy_in(p, "COPY w FROM STDIN", d, sizeof d - 1, 0, &r) == 0 && r.nerr == 1 && strstr(r.err, "--disk-headroom") &&
+         !r.copy_in); /* refused before its data is asked for */
+    imdbs_counts c1 = counts_of(s);
+    SOFT(c1.disk_refused == c0.disk_refused + 5 && c1.disk_low_data == 1 && c1.disk_free_data == (100ull << 20));
+    SOFT(c1.copy_in == c0.copy_in);
+    SOFT(q1(p, "SELECT id, v FROM w ORDER BY id", &r) == 0 && !r.nerr && !strcmp(r.text, "1|1\n2|2\n3|3\n4|4\n"));
+    if (strcmp(r.text, "1|1\n2|2\n3|3\n4|4\n")) fprintf(stderr, "    w: %s\n", r.text);
+    SOFT(q1(p, "EXPLAIN UPDATE w SET v = 9 WHERE id = 1", &r) == 0 && !r.nerr); /* (it writes nothing) */
+    if (r.nerr) fprintf(stderr, "    EXPLAIN: %s\n", r.err);
+    SOFT(q1(u, "INSERT INTO w VALUES (5, 5)", &r) == 0 && !r.nerr); /* a superuser's runs */
+    /* and the statements that give space back, a superuser's (the runbook: README) */
+    static const char *const freeing[] = {"ALTER TABLE zz SET RETENTION 1 HOURS", "CHECKPOINT", "COMPACT zz",
+                                          "DROP TABLE zz RETENTION 1 HOURS"};
+    for (size_t i = 0; i < sizeof freeing / sizeof *freeing; i++) {
+        SOFT(q1(u, freeing[i], &r) == 0 && !r.nerr);
+        if (r.nerr) fprintf(stderr, "    below the line, %s: %s\n", freeing[i], r.err);
+    }
+    SOFT(copy_in(u, "COPY w FROM STDIN", d, sizeof d - 1, 0, &r) == 0 && !r.nerr && r.count == 2);
+    SOFT(q1(a, "ALTER ROLE boss NOSUPERUSER", &r) == 0 && !r.nerr);
+    SOFT(q1(u, "INSERT INTO w VALUES (8, 8)", &r) == 0 && r.nerr == 1 && strstr(r.err, "--disk-headroom")); /* at once */
+    SOFT(q1(a, "ALTER ROLE boss SUPERUSER", &r) == 0 && !r.nerr);
+    /* the crossing, said once, then the way back */
+    for (int w = 0; w < 500 && ev_count(ev, "\"disk_headroom\"") == ev0; w++) usleep(10000);
+    SOFT(ev_count(ev, "\"disk_headroom\"") == ev0 + 1 && ev_count(ev, "\"below\":1") >= 1);
+    imdbsp_test_free(IMDBSP_FREE_DATA, 2ll << 30);
+    for (int w = 0; w < 1000 && ev_count(ev, "\"disk_headroom\"") == ev0 + 1; w++) usleep(10000); /* (5 s after the first) */
+    SOFT(ev_count(ev, "\"disk_headroom\"") == ev0 + 2);
+    SOFT(q1(p, "INSERT INTO w VALUES (9, 9)", &r) == 0 && !r.nerr && counts_of(s).disk_low_data == 0);
+    /* a COPY whose gates change while its data arrives (the disk below the headroom, then a REVOKE): refused by its run,
+     * its spool freed, and the next COPY on the connection its own (its data asked for, its rows alone) */
+    for (int round = 0; round < 2; round++) {
+        imdbc_stmt cp = {"COPY w FROM STDIN", 17, NULL, 0};
+        char row[16];
+        int rl = snprintf(row, sizeof row, "%d,1\n", 20 + round);
+        SOFT(imdbc_query(p, &cp, 1, &e) == 0 && read_reply(p, &r) == 0 && r.copy_in);
+        SOFT(imdbc_copy_data(p, row, (size_t)rl, &e) == 0);
+        for (int w = 0; w < 1000 && spool_held(s) == 0; w++) usleep(10000);
+        SOFT(spool_held(s) > 0);
+        if (round == 0) imdbsp_test_free(IMDBSP_FREE_DATA, 100ll << 20);
+        else SOFT(q1(a, "REVOKE INSERT ON w FROM plain", &r) == 0 && !r.nerr);
+        SOFT(imdbc_copy_done(p, &e) == 0 && read_reply(p, &r) == 0 && r.nerr == 1 &&
+             strstr(r.err, round ? "permission denied" : "--disk-headroom"));
+        if (r.nerr != 1) fprintf(stderr, "    a COPY's gates changed, round %d: nerr %d %s\n", round, r.nerr, r.err);
+        SOFT(spools_empty(s));
+        if (round == 0) imdbsp_test_free(IMDBSP_FREE_DATA, 2ll << 30);
+        else SOFT(q1(a, "GRANT INSERT ON w TO plain", &r) == 0 && !r.nerr);
+        rl = snprintf(row, sizeof row, "%d,1\n", 30 + round);
+        SOFT(copy_in(p, "COPY w FROM STDIN", row, (size_t)rl, 0, &r) == 0 && !r.nerr && r.count == 1);
+    }
+    SOFT(q1(p, "SELECT id FROM w WHERE id IN (20, 21, 30, 31) ORDER BY id", &r) == 0 && !strcmp(r.text, "30\n31\n"));
+    if (strcmp(r.text, "30\n31\n")) fprintf(stderr, "    the COPYs' rows: %s\n", r.text);
+    /* the spool disk below it */
+    imdbsp_test_free(IMDBSP_FREE_SPOOL, 100ll << 20);
+    c0 = counts_of(s);
+    SOFT(copy_in(p, "COPY w FROM STDIN", d, sizeof d - 1, 0, &r) == 0 && r.nerr == 1 && strstr(r.err, "--disk-headroom"));
+    if (!strstr(r.err, "--disk-headroom")) fprintf(stderr, "    a role's upload: %s\n", r.err);
+    SOFT(q1(p, "SELECT COUNT(*) FROM w WHERE id IN (6, 7)", &r) == 0 && !strcmp(r.text, "2\n")); /* (the superuser's rows) */
+    SOFT(copy_in(u, "COPY w FROM STDIN", "10,10\n", 6, 0, &r) == 0 && r.nerr == 1 && strstr(r.err, "--disk-headroom"));
+    if (!strstr(r.err, "--disk-headroom")) fprintf(stderr, "    a superuser's upload: %s\n", r.err); /* (its spool's too) */
+    c1 = counts_of(s);
+    SOFT(imdbc_query(p, &k_all, 1, &e) == 0); /* a role's read past its room: refused by name */
+    SOFT(requests_past(s, c1.requests));
+    SOFT(read_reply(p, &r) == 0 && r.nerr == 1 && r.err_code == (uint32_t)-IMDB_ERR_LIMIT && strstr(r.err, "--disk-headroom") &&
+         r.nrows < 160000);
+    if (!strstr(r.err, "--disk-headroom")) fprintf(stderr, "    a role's read: %s\n", r.err);
+    imdbs_counts c2 = counts_of(s);
+    SOFT(c2.res_spool_bytes == c1.res_spool_bytes && c2.res_refused == c1.res_refused + 1);
+    SOFT(q1(a, "CREATE TABLE w2 (id INT64 PRIMARY KEY, v INT64)", &r) == 0 && !r.nerr);
+    SOFT(q1(a, "GRANT SELECT, INSERT ON w2 TO plain", &r) == 0 && !r.nerr);
+    imdbc_stmt ins = {"INSERT INTO w2 SELECT id, v FROM big2 RETURNING id, v", 53, NULL, 0};
+    c1 = counts_of(s);
+    SOFT(imdbc_query(p, &ins, 1, &e) == 0); /* a role's write past its room: its reply in memory, its commit stands */
+    SOFT(requests_past(s, c1.requests));
+    c2 = counts_of(s);
+    SOFT(read_reply(p, &r) == 0 && !r.nerr && r.nrows == 160000 && r.has_write && r.write_commit > 0);
+    SOFT(c2.disk_kept == c1.disk_kept + 1 && c2.res_spool_bytes == c1.res_spool_bytes);
+    if (c2.disk_kept != c1.disk_kept + 1 || c2.res_spool_bytes != c1.res_spool_bytes)
+        fprintf(stderr, "    a write's reply: kept %llu -> %llu, spooled %llu -> %llu\n", (unsigned long long)c1.disk_kept,
+                (unsigned long long)c2.disk_kept, (unsigned long long)c1.res_spool_bytes, (unsigned long long)c2.res_spool_bytes);
+    c1 = counts_of(s);
+    SOFT(imdbc_query(u, &k_all, 1, &e) == 0); /* a superuser's read past its room: refused too */
+    SOFT(requests_past(s, c1.requests));
+    c2 = counts_of(s);
+    SOFT(read_reply(u, &r) == 0 && r.nerr == 1 && strstr(r.err, "--disk-headroom") && c2.res_spilled == c1.res_spilled);
+    SOFT(c2.disk_refused == c0.disk_refused + 4 && c2.disk_low_spool == 1);
+    /* a superuser's COPY TO streams through a ring held at its floor (a dump leaves a filling disk): unread for a while,
+     * its spool no larger than the floor; read, whole */
+    imdbs_test_copy_hold(20);
+    imdbc_stmt dump = {"COPY big2 TO STDOUT", 19, NULL, 0};
+    SOFT(imdbc_query(u, &dump, 1, &e) == 0);
+    usleep(1500000);
+    uint64_t held = spool_held(s);
+    SOFT(held > 0 && held <= (64u << 10));
+    if (held > (64u << 10)) fprintf(stderr, "    a superuser's ring below the line: %llu bytes\n", (unsigned long long)held);
+    imdbs_test_copy_hold(0);
+    SOFT(read_reply(u, &r) == 0 && !r.nerr && r.count == 160000);
+    if (r.nerr) fprintf(stderr, "    a superuser's export below the line: %s\n", r.err);
+    /* the bytes about to be written count: 32 KiB past the headroom takes a role's upload of 6 bytes, not a read's chunk
+     * of 64 KiB */
+    imdbsp_test_free(IMDBSP_FREE_SPOOL, (1ll << 30) + (32 << 10));
+    SOFT(copy_in(p, "COPY w FROM STDIN", "11,11\n", 6, 0, &r) == 0 && !r.nerr && r.count == 1);
+    c1 = counts_of(s);
+    SOFT(imdbc_query(p, &k_all, 1, &e) == 0);
+    SOFT(requests_past(s, c1.requests));
+    SOFT(read_reply(p, &r) == 0 && r.nerr == 1 && strstr(r.err, "--disk-headroom"));
+    SOFT(spools_empty(s));
+    /* checked at every chunk: a role's COPY TO (a result's) already spilling when the spool disk falls below it stops at
+     * the next chunk, by name, after the frames handed over, every credit back */
+    imdbsp_test_free(IMDBSP_FREE_SPOOL, 2ll << 30);
+    imdbs_test_copy_hold(50);
+    c1 = counts_of(s);
+    imdbc_stmt cto = {"COPY big2 TO STDOUT", 19, NULL, 0};
+    SOFT(imdbc_query(p, &cto, 1, &e) == 0);
+    for (int w = 0; w < 2000 && counts_of(s).res_spool_bytes == c1.res_spool_bytes; w++) usleep(10000);
+    SOFT(counts_of(s).res_spool_bytes > c1.res_spool_bytes);
+    imdbsp_test_free(IMDBSP_FREE_SPOOL, 100ll << 20);
+    imdbs_test_copy_hold(0);
+    SOFT(requests_past(s, c1.requests));
+    SOFT(read_reply(p, &r) == 0 && r.nerr == 1 && strstr(r.err, "COPY TO") && strstr(r.err, "--disk-headroom"));
+    if (!strstr(r.err, "--disk-headroom")) fprintf(stderr, "    a role's COPY TO: %s\n", r.err);
+    SOFT(spools_empty(s));
+    imdbc_close(p);
+    imdbc_close(u);
+    imdbc_close(a);
+    unserve(db, s);
+}
+
+/* 2b-3's measure (recorded, never asserted; IMDB_SRV_DISK_MEASURE set, else skipped): the free-space read the headroom
+ * adds before each statement (fstatvfs of the test directory and the server's lock, alone, 200,000 times), and pipelined
+ * SELECT 1 through the socket in windows of 50 with the headroom off and at imagedb-server's 1 GiB, three interleaved
+ * runs each of 20,000 statements */
+static void t_server_disk_measure(void)
+{
+    if (!getenv("IMDB_SRV_DISK_MEASURE")) return;
+    int dfd = open(test_tmpdir(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(dfd >= 0);
+    pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    uint64_t sink = 0, t0 = imdb_mono_ns();
+    for (int k = 0; k < 200000; k++) {
+        uint64_t fr = 0;
+        (void)imdbsp_free(dfd, IMDBSP_FREE_DATA, &fr);
+        pthread_mutex_lock(&mu);
+        sink += fr & 1;
+        pthread_mutex_unlock(&mu);
+    }
+    fprintf(stderr, "    the read alone: %.0f ns a call (%llu)\n", (double)(imdb_mono_ns() - t0) / 200000.0,
+            (unsigned long long)(sink & 1));
+    close(dfd);
+    double us[2][3];
+    for (int run = 0; run < 3; run++) {
+        for (int mode = 0; mode < 2; mode++) {
+            imdbs_opts o;
+            memset(&o, 0, sizeof o);
+            o.disk_headroom = mode ? 1ull << 30 : 0;
+            imdbs *s = NULL;
+            imdb_db *db = serve(&s, &o);
+            CHECK(db);
+            imdbc *a = login("admin", "pw-admin");
+            CHECK(a);
+            imdbc_stmt one = {"SELECT 1", 8, NULL, 0};
+            imdb_err e = {0};
+            reply r = {0};
+            uint64_t t1 = imdb_mono_ns();
+            bool good = true;
+            for (int w = 0; w < 400 && good; w++) {
+                for (int k = 0; k < 50; k++) good = good && imdbc_query(a, &one, 1, &e) == 0;
+                for (int k = 0; k < 50 && good; k++) good = read_reply(a, &r) == 0 && !r.nerr;
+            }
+            us[mode][run] = (double)(imdb_mono_ns() - t1) / 20000.0 / 1000.0;
+            SOFT(good);
+            imdbc_close(a);
+            unserve(db, s);
+        }
+    }
+    for (int mode = 0; mode < 2; mode++)
+        fprintf(stderr, "    headroom %s: %.2f %.2f %.2f us a statement\n", mode ? "1 GiB" : "off", us[mode][0], us[mode][1],
+                us[mode][2]);
+}
+
+/* 2b-3, the COMMIT margin's premise (a commit admitted above the headroom may still meet a full disk): such a commit
+ * fails alone through the server and the handle goes on (log_put_tagged: its sectors put back and synced; only a failed
+ * put-back or its sync stops the handle). The log's next write refused once with ENOSPC by the fault hook (no file system
+ * filled; installed before the server's threads, as fsio.h asks), synced as a production server: a role's autocommit
+ * INSERT and then its COMMIT answer an error, and its next statements, a superuser's and the reads run, the failed
+ * commits' rows nowhere */
+static _Atomic int g_enospc_fd = -1;
+static long enospc_write(imdb_io_call *c, void *ctx)
+{
+    (void)ctx;
+    int fd = atomic_load(&g_enospc_fd);
+    if (c->op == IMDB_IO_WRITE && fd >= 0 && c->fd == fd && atomic_compare_exchange_strong(&g_enospc_fd, &fd, -1)) {
+        errno = ENOSPC;
+        return -1;
+    }
+    return 0;
+}
+static const imdb_io_hooks g_enospc_hooks = {.before = enospc_write};
+
+static void t_server_disk_enospc(void)
+{
+    imdb_io_set_hooks(&g_enospc_hooks);
+    imdbs_opts o;
+    memset(&o, 0, sizeof o);
+    o.test_open_logins = true;
+    g_sync = 1;
+    imdbs *s = NULL;
+    imdb_db *db = serve(&s, &o);
+    imdbc *a = db ? login("admin", "pw-admin") : NULL;
+    SOFT(db && a);
+    reply r = {0};
+    imdbc *p = NULL;
+    if (a) {
+        SOFT(q1(a, "CREATE TABLE w (id INT64 PRIMARY KEY, v INT64)", &r) == 0 && !r.nerr);
+        SOFT(q1(a, "GRANT SELECT, INSERT ON w TO plain", &r) == 0 && !r.nerr);
+        p = login("plain", "pw");
+        SOFT(p);
+    }
+    if (p) {
+        (void)counts_of(s); /* (the engine thread's last write of logfd seen through the server's lock) */
+        int lfd = db->logfd;
+        SOFT(lfd >= 0);
+        atomic_store(&g_enospc_fd, lfd);
+        SOFT(q1(p, "INSERT INTO w VALUES (1, 1)", &r) == 0 && r.nerr == 1);
+        if (r.nerr != 1) fprintf(stderr, "    the commit meeting ENOSPC: nerr %d\n", r.nerr);
+        SOFT(atomic_load(&g_enospc_fd) == -1); /* (the hook was reached) */
+        SOFT(q1(p, "INSERT INTO w VALUES (2, 2)", &r) == 0 && !r.nerr);
+        SOFT(q1(a, "INSERT INTO w VALUES (3, 3)", &r) == 0 && !r.nerr);
+        SOFT(q1(p, "BEGIN", &r) == 0 && !r.nerr && q1(p, "INSERT INTO w VALUES (4, 4)", &r) == 0 && !r.nerr);
+        atomic_store(&g_enospc_fd, lfd);
+        SOFT(q1(p, "COMMIT", &r) == 0 && r.nerr == 1);
+        SOFT(atomic_load(&g_enospc_fd) == -1);
+        SOFT(q1(p, "INSERT INTO w VALUES (5, 5)", &r) == 0 && !r.nerr);
+        SOFT(q1(p, "SELECT id FROM w ORDER BY id", &r) == 0 && !strcmp(r.text, "2\n3\n5\n"));
+        if (strcmp(r.text, "2\n3\n5\n")) fprintf(stderr, "    after ENOSPC: %s\n", r.text);
+        SOFT(!db->failed);
+        imdbc_close(p);
+    }
+    atomic_store(&g_enospc_fd, -1);
+    if (a) imdbc_close(a);
+    if (db) unserve(db, s);
+    imdb_io_set_hooks(NULL);
+}
 /* 2b-2b: state recorded before the reply that announces it, held to it by a pause at every point where a client may
  * already know (imdbs_test_reply_hold, 20 ms: after a verdict's write, around a READY's flush, after a push): a login
  * listed as soon as its verdict is read, a BEGIN's session IN_TXN and a query's request counted as soon as its READY is.
@@ -4190,6 +4600,10 @@ const test_case server_tests[] = {
     {"server_trickle", t_server_trickle},
     {"server_state_order", t_server_state_order},
     {"server_role_defaults", t_server_role_defaults},
+    {"server_idle_busy", t_server_idle_busy},
+    {"server_disk_headroom", t_server_disk_headroom},
+    {"server_disk_measure", t_server_disk_measure},
+    {"server_disk_enospc", t_server_disk_enospc},
     {"server_refused_churn", t_server_refused_churn},
     {"server_res_spool_faults", t_server_res_spool_faults},
     {"server_res_batch_refused", t_server_res_batch_refused},

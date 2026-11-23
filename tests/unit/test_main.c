@@ -15,6 +15,7 @@
 #include "test.h"
 
 int g_test_failed;
+const char *g_test_current = ""; /* 2b-3: the running test's name (a slow wait names it) */
 char g_errmsg[512];
 static uint64_t g_rng;
 static char g_tmp[512];
@@ -158,6 +159,7 @@ int main(int argc, char **argv)
             if (argc > 1 && !strstr(tc->name, argv[1]) && strcmp(argv[1], groups[g].name) != 0) continue;
             g_rng = 0x9E3779B97F4A7C15ull ^ (uint64_t)(i + 1) * 0xBF58476D1CE4E5B9ull;
             g_test_failed = 0;
+            g_test_current = tc->name;
             imdb_sql_set_window_reference(false); /* P2 S12: the sliding frames, but where a test asks for the reference */
             imdb_seg_load_hook(NULL, NULL);        /* P2 S14: no load held, but where a test holds them */
             imdb_clock_offset(0);      /* a test that moves the clock (expiry) moves it for itself only */
@@ -175,6 +177,8 @@ int main(int argc, char **argv)
             imdbsp_no_release(false);
             imdbsp_no_tmpfile(false);
             imdbsp_fail_at(0);
+            imdbsp_test_free(IMDBSP_FREE_DATA, -1);
+            imdbsp_test_free(IMDBSP_FREE_SPOOL, -1);
             g_errmsg[0] = 0;
             printf("[%s] %s\n", groups[g].name, tc->name);
             fflush(stdout);
