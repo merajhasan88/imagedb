@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- an acceptance probe: imagedb-probe SOCKET PASSWORD SQL (one statement, its rows or its error) -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Imagedb.Probe</RootNamespace>
+    <AssemblyName>Imagedb.Probe</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../src/Imagedb.Client/Imagedb.Client.csproj" />
+  </ItemGroup>
+</Project>

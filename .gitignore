@@ -22,3 +22,13 @@ build-ct/
 # user's word.
 /progress_for_owner.md
 *.md
+
+# The drivers' build outputs and test data (drivers/LANG/tmp, Rust's target/, .NET's bin/ and obj/, JS's dist/ and
+# node_modules/, Python's caches; Java's build/ is the build/ above)
+/drivers/*/tmp/
+/drivers/rust/target/
+/drivers/csharp/**/bin/
+/drivers/csharp/**/obj/
+/drivers/js/dist/
+/drivers/js/node_modules/
+__pycache__/

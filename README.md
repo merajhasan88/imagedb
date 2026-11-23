@@ -257,6 +257,25 @@ which can lag SQL commits. Use `imagedb verify` to check a current layer.
   the running statements. A failed sync stops the server with exit status 1 for its
   supervisor to restart it (the reopen decides, as the watermark rules say).
 
+### Drivers
+
+Drivers for imagedb-server's own protocol (IMDBWIR1) live under `drivers/`, each in its language with its standard
+library alone (the one exception optional: on a JDK before 25, Java's driver takes the TLS exporter from BouncyCastle
+through a bridge built apart), each held to the C client's byte rules and `tests/unit/t_wire.c`'s vectors:
+
+| Driver | API | TCP binding | Tests |
+|---|---|---|---|
+| `drivers/python` | PEP 249 (DB-API 2.0) and the protocol level, Python 3.10+ | tls-server-end-point (its ssl has no exporter) | `sh run_tests.sh` |
+| `drivers/js` | TypeScript: an async client and the protocol level | the TLS exporter | `sh run_tests.sh` (tsc, node) |
+| `drivers/java` | a native API and the protocol level (not JDBC), JDK 17+ | the exporter on JDK 25 (or BouncyCastle's on 17), else tls-server-end-point | `sh run_tests.sh` |
+| `drivers/go` | `database/sql` and the protocol level | the exporter | `sh run_tests.sh` (plain and `-race`) |
+| `drivers/csharp` | ADO.NET and the protocol level, .NET 10 | tls-server-end-point (no exporter in .NET 10) | `sh run_tests.sh` |
+| `drivers/rust` | a client over the socket (stage 1: TCP with TLS later) | none yet | `sh run_tests.sh` |
+
+A driver that binds by tls-server-end-point logs in over TCP only to a server run with `--channel-binding any`; on the
+Unix-domain socket every driver logs in to any server. Each `run_tests.sh` takes the repository's `build/` (after `make`
+and `make server`; `IMDB_DRV_BIN` overrides), starts its own servers on databases under its `tmp/`, and stops them.
+
 ## Durability and recovery
 
 - The writer keeps a **durable watermark** (`DURABLE`): the last commit whose

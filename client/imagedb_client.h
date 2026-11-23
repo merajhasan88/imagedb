@@ -44,8 +44,9 @@ int imdbc_deallocate(imdbc *c, const char *name, imdb_err *e);
 int imdbc_ping(imdbc *c, imdb_err *e);
 /* N1e stage two: SESSIONS (a SESSIONS_LIST reply: a superuser's every session, a role's its own role's) and KILL of a
  * session by its id (IMDBW_KILL_CANCEL: the request it runs now, each of its statements; IMDBW_KILL_TERMINATE: the session
- * ended, its transaction rolled back): a KILL_DONE reply (code IMDBW_KILLED, _NONE, _DENIED). Both answered out of turn,
- * as PONG is: behind the replies already sent, before the rest of a request running now */
+ * ended, its transaction rolled back): a KILL_DONE reply (code IMDBW_KILLED, 0; or IMDBW_KILL_NONE, 1: no such session,
+ * or to a role another role's). Both answered out of turn, as PONG is: behind the replies already sent, before the rest of
+ * a request running now */
 int imdbc_sessions(imdbc *c, imdb_err *e);
 int imdbc_kill(imdbc *c, uint8_t kind, uint64_t session, imdb_err *e);
 /* N1d: after a COPY_IN reply, COPY ... FROM STDIN's data (cut into frames of at most 1 MiB), then its end, or its failure

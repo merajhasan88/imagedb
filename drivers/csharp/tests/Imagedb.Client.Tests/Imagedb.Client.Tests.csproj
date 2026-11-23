@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- the tests: a console program of its own (no test framework package) -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Imagedb.Client.Tests</RootNamespace>
+    <AssemblyName>Imagedb.Client.Tests</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/Imagedb.Client/Imagedb.Client.csproj" />
+  </ItemGroup>
+</Project>

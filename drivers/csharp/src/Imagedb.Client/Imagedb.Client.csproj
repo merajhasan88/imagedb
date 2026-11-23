@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Imagedb.Client</RootNamespace>
+    <AssemblyName>Imagedb.Client</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Imagedb.Client.Tests" />
+  </ItemGroup>
+</Project>

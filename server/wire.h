@@ -265,7 +265,7 @@ typedef struct imdbw_msg {
     uint8_t read_hash[32], digest[32], lake_manifest[32], write_hash[32];
     uint8_t db_id[16];                  /* the database the read point is of (imdb_result.db_id) */
     bool own;                           /* the read saw its transaction's own writes, past its commit (snap_own) */
-    uint32_t code, index;               /* ERROR: the engine's code (1 to 15 in this imagedb: IMDB_ERR_* negated), its index */
+    uint32_t code, index;               /* ERROR: the engine's code (1 to 16 in this imagedb: IMDB_ERR_* negated), its index */
     uint8_t state;                      /* READY */
     uint8_t kill;                       /* KILL: its kind (IMDBW_KILL_*); KILL_DONE: its code is code (u8 on the wire) */
     uint64_t sid;                       /* KILL: the session's id; KILL_DONE: the one it answers */
@@ -274,7 +274,7 @@ typedef struct imdbw_msg {
 } imdbw_msg;
 
 /* N1e stage two: a session in SESSIONS_LIST: its id (a counter at accept, never reused), its role, its endpoint (1 TCP, 2
- * the socket), its state (IMDBW_SS_*), its age in ms since its login, its role's name (1 to 63 bytes, as a hello's) */
+ * the socket), its state (IMDBW_SS_*), its age in ms since its login, its role's name (0 to 63 bytes: 0 a role gone) */
 typedef struct imdbw_sess {
     uint64_t id;
     uint32_t role;
