@@ -698,7 +698,8 @@ static void layer_rec(const char *dir)
 
 enum {
     VIOL_FAILSTOP = 3, VIOL_OPEN = 4, VIOL_PINNED = 5, VIOL_INDEX = 7, VIOL_ORDERED = 8, VIOL_JOIN = 9,
-    VIOL_LEAK = 10, VIOL_FILL = 11, VIOL_PUTBACK = 12, VIOL_EXPIRE = 13, VIOL_RETIRE = 14, VIOL_VIEW = 15, VIOL_ALTER = 16
+    VIOL_LEAK = 10, VIOL_FILL = 11, VIOL_PUTBACK = 12, VIOL_EXPIRE = 13, VIOL_RETIRE = 14, VIOL_VIEW = 15, VIOL_ALTER = 16,
+    VIOL_GROUP = 17
 };
 
 typedef struct fscen {
@@ -1805,6 +1806,81 @@ static int run_strict(const char *run)
     return v;
 }
 
+/* Group commit (the server's deferral, through the engine's API, docs/txn-design.md §6): the switch (its strict
+ * record, fsynced), then four rounds, each a write group of deferred commits:
+ * 1. sixteen commits of a 60 KB row, past the fill's low mark, acknowledged once imdb_group_sync returned (its fill
+ *    extension: a clean run must have moved the fill's end);
+ * 2. four commits, then a SET RETENTION (the engine's API) whose synced append makes them durable with it,
+ *    acknowledged once it returned (the synced append behind an open group, the advisor's 13:16 review);
+ * 3. a CHECKPOINT (a publishing commit: its segment ends), then four commits deferred into a group that opens the
+ *    next segment, acknowledged once its sync returned;
+ * 4. four left pending at the close, acknowledged only if the close (its syncs) succeeded.
+ * An acknowledgement is of the round's last commit (the log a prefix). At every fault point and crash state the reopen
+ * must open with no operator (a torn or damaged frame past the strict watermark was never acknowledged) and hold every
+ * acknowledged commit; strict: DURABLE names every acknowledgement. */
+static int run_group(const char *run)
+{
+    imdb_db *db = child_open(dir_in(run, "p"), 1);
+    if (!db) return 0;
+    imdb_err e = {0};
+    if (imdb_set_group_commit(db, true, &e)) { /* its watermark could not be published: the handle stopped */
+        int v = db->failed ? 0 : VIOL_FAILSTOP;
+        imdb_close(db);
+        return v;
+    }
+    static char big[60001];
+    memset(big, 'x', 60000);
+    int v = 0;
+    bool ok = true;
+
+    for (int64_t id = 10; id < 26 && ok; id++)
+        if (ins1(db, id, id % 2 ? 42 : 7, 100 * id, big)) v = after_error(db), ok = false;
+    if (ok && imdb_group_pending(db) == 0) v = VIOL_GROUP, ok = false; /* sixteen deferred commits, nothing pending */
+    if (ok) {
+        if (imdb_group_sync(db, &e)) {
+            v = after_error(db), ok = false;
+        } else {
+            ack(db);
+            /* a clean run: its sync extended the fill, so at least the low mark of zeros lies past the group's end (frames
+             * past the fill move log_fill by themselves: that alone proves nothing) */
+            if (!g_hit_op && db->log_fill < db->log_phys * IMDB_TSEG_SECTOR + IMDB_LOG_FILL_LOW) v = VIOL_GROUP;
+        }
+    }
+    for (int64_t id = 30; id < 34 && ok; id++)
+        if (ins1(db, id, 7, 100 * id, "row")) v = after_error(db), ok = false;
+    if (ok) { /* a commit that may not defer, through the engine's API (SQL's DDL syncs a pending group at its start:
+               * that would never meet this path): SET RETENTION, its synced append behind the open group */
+        if (imdb_begin(db, &e) || imdb_set_retention(db, db->t[0], 3600ull * 1000000u, &e) || imdb_commit(db, &e)) {
+            if (db->in_txn) imdb_rollback(db);
+            v = after_error(db), ok = false;
+        } else if (imdb_group_pending(db)) {
+            v = VIOL_GROUP, ok = false; /* the synced append left the group open */
+        } else {
+            ack(db);
+        }
+    }
+    /* a group that opens a segment: a CHECKPOINT (a publishing commit, synced, ends its segment), then four deferred
+     * commits, the first of them the new segment's first frame; acknowledged once their group's sync returned */
+    if (ok && imdb_checkpoint(db, &e)) v = after_error(db), ok = false;
+    else if (ok) ack(db);
+    for (int64_t id = 50; id < 54 && ok; id++)
+        if (ins1(db, id, 7, 100 * id, "row")) v = after_error(db), ok = false;
+    if (ok && imdb_group_pending(db) == 0) v = VIOL_GROUP, ok = false;
+    if (ok) {
+        if (imdb_group_sync(db, &e)) v = after_error(db), ok = false;
+        else ack(db);
+    }
+    for (int64_t id = 40; id < 44 && ok; id++)
+        if (ins1(db, id, 7, 100 * id, "row")) v = after_error(db), ok = false;
+    frec r; /* the pending round: acknowledged only by a close that succeeded (its last syncs) */
+    memset(&r, 0, sizeof r);
+    r.kind = R_ACK;
+    r.seq = db->seq;
+    memcpy(r.head, db->head, 32);
+    if (imdb_close(db) == IMDB_OK && ok) rec_send(&r);
+    return v;
+}
+
 /* An operator's `imagedb recover --discard-tail` after a --nosync writer died with commits in
  * two segments and garbage at the end: recover keeps those commits and writes DURABLE as
  * synced, so it must have synced both segments first (an OS crash afterwards must not lose
@@ -2430,6 +2506,7 @@ static const char *check_run(const fscen *s, const char *run, const frun *r)
                  : code == VIOL_RETIRE ? "a clean run that did not retire below its boundary"
                  : code == VIOL_VIEW   ? "a view whose answer is not its inlined query's, or a clean run that did not end with its views"
                  : code == VIOL_ALTER  ? "a read of an altered table not its twin's, or a clean run that did not make every version"
+                 : code == VIOL_GROUP  ? "group commit: a deferred commit left nothing pending, or a clean run whose group sync did not extend the fill"
                                        : "a violation",
                  code);
         return g_why;
@@ -3121,6 +3198,8 @@ static const fscen kScen[] = {
     {"seq", setup_txns, run_seq, false, NULL, NULL, false, false, false},     /* F2a-2 */
     {"erase_role", setup_erase_role, run_erase_role, false, NULL, erase_role_base_ok, false, false, false}, /* L stage 2 */
     {"iceberg", setup_txns, run_iceberg, false, NULL, NULL, false, false, false}, /* F5c */
+    {"group", setup_txns, run_group, false, NULL, NULL, false, false, true}, /* group commit: deferred, strict */
+    {"group_anchored", setup_txns, run_group, false, NULL, NULL, true, false, true}, /* and its anchor: never past a sync */
 };
 
 static void t_fault_commits(void) { fault_scenario(&kScen[0]); }
@@ -3160,6 +3239,8 @@ static void t_fault_alter(void) { fault_scenario(&kScen[33]); }
 static void t_fault_seq(void) { fault_scenario(&kScen[34]); }
 static void t_fault_erase_role(void) { fault_scenario(&kScen[35]); }
 static void t_fault_iceberg(void) { fault_scenario(&kScen[36]); }
+static void t_fault_group(void) { fault_scenario(&kScen[37]); }
+static void t_fault_group_anchored(void) { fault_scenario(&kScen[38]); }
 
 const test_case fault_tests[] = {
     {"fault_commits", t_fault_commits},     {"fault_nosync", t_fault_nosync}, {"fault_checkpoint", t_fault_checkpoint},
@@ -3194,5 +3275,7 @@ const test_case fault_tests[] = {
     {"fault_seq", t_fault_seq},
     {"fault_erase_role", t_fault_erase_role}, /* L stage 2 */
     {"fault_iceberg", t_fault_iceberg},       /* F5c */
+    {"fault_group", t_fault_group},           /* group commit */
+    {"fault_group_anchored", t_fault_group_anchored}, /* group commit with the external anchor */
 };
 const size_t fault_ntests = sizeof fault_tests / sizeof *fault_tests;

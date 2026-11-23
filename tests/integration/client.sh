@@ -173,4 +173,41 @@ counts() { "$BIN" sql "$1" -c "SHOW DIGEST" | awk -F'|' 'NR > 2 && NF >= 3 { pri
 $(counts "$E")
 $(counts "$N")"
 echo "client.sh: $n runs alike through imagedb sql and imagedb-client (socket and TCP); the copies' rows equal"
+
+# group commit (docs/txn-design.md §6): refused with --nosync (exit 2, its words); a server with it takes four clients'
+# commits at once (each answered once its group is durable), its counters show the groups' syncs, it stops cleanly, and
+# the copy verifies
+G=$WORK/gdb
+"$BIN" init "$G" > /dev/null
+"$BIN" sql "$G" --nosync -c "CREATE ROLE admin LOGIN SUPERUSER PASSWORD 'pw-client'" \
+  -c "CREATE TABLE g (id INT64 PRIMARY KEY, v INT64)" > /dev/null || fail "the group commit copy's setup"
+gsc=0
+"$SRV" "$G" --socket "$WORK/gs" --server-dir "$WORK/sd" --nosync --group-commit --disk-headroom 0 > "$WORK/gsrv.out" 2>&1 || gsc=$?
+[ "$gsc" = 2 ] && grep -q "needs synchronous commits" "$WORK/gsrv.out" ||
+  fail "--nosync --group-commit: exit $gsc: $(cat "$WORK/gsrv.out")"
+"$SRV" "$G" --socket "$WORK/gs" --server-dir "$WORK/sd" --group-commit --disk-headroom 0 > "$WORK/gsrv.out" 2>&1 &
+gpid=$!
+spid=$gpid # (the trap's cleanup stops it on a failure)
+for _ in $(seq 100); do [ -S "$WORK/gs" ] && break; sleep 0.1; done
+[ -S "$WORK/gs" ] || fail "the group commit server did not start: $(cat "$WORK/gsrv.out")"
+gpids=""
+for c in 1 2 3 4; do
+  awk -v c="$c" 'BEGIN { for (i = 0; i < 25; i++) printf "INSERT INTO g VALUES (%d, %d);\n", c * 1000 + i, i }' > "$WORK/g$c.sql"
+  "$CLI" --socket "$WORK/gs" --user admin -f "$WORK/g$c.sql" > "$WORK/g$c.out" 2>&1 &
+  gpids="$gpids $!"
+done
+for p in $gpids; do wait "$p" || fail "a group commit client failed: $(cat "$WORK"/g*.out)"; done
+[ "$("$CLI" --socket "$WORK/gs" --user admin --csv -c "SELECT COUNT(*) FROM g" | tail -1)" = 100 ] ||
+  fail "the group commit server's rows"
+gs=$("$CLI" --socket "$WORK/gs" --user admin --csv -c "SHOW STATS" | awk -F, '{ gsub(/"/, "", $1) } $1 == "server.group.syncs" { print $2 }')
+[ "${gs:-0}" -ge 1 ] || fail "server.group.syncs: ${gs:-none}"
+kill -TERM "$gpid"
+gsc=0
+wait "$gpid" || gsc=$?
+spid=""
+[ "$gsc" = 0 ] || fail "the group commit server exited $gsc at its stop: $(cat "$WORK/gsrv.out")"
+! grep -qE "runtime error|AddressSanitizer|LeakSanitizer|ThreadSanitizer" "$WORK/gsrv.out" ||
+  fail "the group commit server's sanitizer: $(cat "$WORK/gsrv.out")"
+"$BIN" verify "$G" > "$WORK/gverify" 2>&1 || fail "the group commit copy's verify: $(cat "$WORK/gverify")"
+echo "client.sh: --group-commit refused with --nosync; with it, 100 commits from four clients, $gs group syncs, verified"
 echo "ALL CLIENT CHECKS PASSED"

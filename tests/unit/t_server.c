@@ -72,6 +72,10 @@ static imdb_db *serve(imdbs **s, const imdbs_opts *extra)
     if (strlen(g_sock) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return NULL; /* 107 bytes at most */
     imdb_err e = {0};
     if (imdb_init(dbdir, false, NULL, &e)) return NULL;
+    bool group = getenv("IMDB_SRV_GROUP") != NULL; /* (group commit under every test: synchronous, deferred, held) */
+    if (group) g_sync = 1;
+    if (getenv("IMDB_SRV_GROUP_HOLD_US")) /* (every group's sync slower: held replies meet KILL, COPY, cancel, the stop) */
+        imdb_test_group_delay((uint32_t)atoi(getenv("IMDB_SRV_GROUP_HOLD_US")));
     imdb_open_opts o = {.sync = g_sync, .checkpoint_bytes = g_ckpt, .events_path = g_events, .stats_path = g_stats,
                         .mem_limit = g_nomem ? 0 : (2ull << 30)}; /* 2c: a budget opens a role's logins */
     g_events = NULL;
@@ -90,6 +94,7 @@ static imdb_db *serve(imdbs **s, const imdbs_opts *extra)
     imdbs_opts so;
     memset(&so, 0, sizeof so);
     if (extra) so = *extra;
+    if (group) so.group_commit = true;
     g_blocks = imdbw_live_blocks();
     so.socket_path = g_sock;
     char sdir[300];
@@ -1025,9 +1030,20 @@ static void t_server_failed(void)
     reply r = {0};
     SOFT(c && q1(c, "CREATE TABLE t (id INT64 PRIMARY KEY)", &r) == 0 && !r.nerr);
     atomic_store(&g_fail_sync, true);
-    SOFT(c && q1(c, "INSERT INTO t VALUES (1)", &r) == 0 && r.nerr == 1);
+    /* (group commit, IMDB_SRV_GROUP: the INSERT's DONE and READY were held behind its group; the failed sync drops them
+     * unsent and sends the ERROR, then the session ends: every later request's ERROR is a fresh session's) */
+    bool group = getenv("IMDB_SRV_GROUP") != NULL;
+    SOFT(c && (q1(c, "INSERT INTO t VALUES (1)", &r) == 0 || group) && r.nerr == 1);
+    SOFT(!group || r.err_code == (uint32_t)-IMDB_ERR_IO);
     SOFT(imdbs_wait_failed(s, 5000));
-    SOFT(c && q1(c, "SELECT 1", &r) == 0 && r.nerr == 1 && r.err_code == (uint32_t)-IMDB_ERR_IO);
+    if (group) {
+        imdbc_close(c);
+        c = login("admin", "pw-admin");
+    }
+    int src = c ? q1(c, "SELECT 1", &r) : -1;
+    SOFT(c && src == 0 && r.nerr == 1 && r.err_code == (uint32_t)-IMDB_ERR_IO);
+    if (!c || src || r.nerr != 1 || r.err_code != (uint32_t)-IMDB_ERR_IO)
+        fprintf(stderr, "    after the failure: login %s, rc %d, nerr %u, code %u: %s\n", c ? "ok" : "refused", src, r.nerr, r.err_code, r.err);
     imdbc_close(c);
     imdb_err e = {0};
     SOFT(imdbs_stop(s, &e) == IMDB_ERR_IO);
@@ -4375,8 +4391,8 @@ static void t_server_stats(void)
         SOFT(srv_row(r.text, "server.connections.ended.refused", &v) == 0);
         SOFT(srv_row(r.text, "server.disk.data_free_bytes", &v) == (headroom ? 0 : -1));
         int nr = srv_rows(r.text);
-        SOFT(nr == 42 + (headroom ? 4 : 0) + IMDBS_END_N); /* (46 rows less the four free-space ones, then the ends) */
-        if (nr != 42 + (headroom ? 4 : 0) + IMDBS_END_N) fprintf(stderr, "    headroom %d: %d server rows\n", headroom, nr);
+        SOFT(nr == 45 + (headroom ? 4 : 0) + IMDBS_END_N); /* (49 rows less the four free-space ones, then the ends) */
+        if (nr != 45 + (headroom ? 4 : 0) + IMDBS_END_N) fprintf(stderr, "    headroom %d: %d server rows\n", headroom, nr);
         SOFT(srv_row(r.text, "wakeups", &v) < 0 && !strstr(r.text, "server.ticks"));
         /* the export: the same rows, written at most once a second while statements run */
         bool found = false;
@@ -4772,7 +4788,293 @@ static void t_server_res_mem_bounds(void)
 }
 OVER_TCP(t_server_res_spill)
 
+/* group commit (docs/txn-design.md §6), the server's half: four clients' deferred commits and a read pipelined behind
+ * one of them answer nothing while their group's sync is held (imdb_test_group_hold), then all at once, each commit
+ * durable (the watermark, read after the stop, names the last), the read seeing them, the replies counted as held and
+ * the group's sync reported; a failed group sync: the held DONE never sent, the ERROR in its place, then the session's
+ * end, the handle stopped (the fault hook installed before the server's threads start, armed by its flag). The engine's
+ * fields are read only after the stop (the engine thread writes them) */
+static void t_server_group_commit(void)
+{
+    static const imdb_io_hooks h = {fail_sync, NULL, NULL};
+    atomic_store(&g_fail_sync, false);
+    imdb_io_set_hooks(&h);
+    imdbs_opts o;
+    memset(&o, 0, sizeof o);
+    o.group_commit = true;
+    g_sync = 1;
+    imdbs *s = NULL;
+    imdb_db *db = serve(&s, &o);
+    if (!db) imdb_io_set_hooks(NULL);
+    CHECK(db);
+    imdbc *a = login("admin", "pw-admin");
+    CHECK(a);
+    reply r = {0};
+    SOFT(q1(a, "CREATE TABLE gt (id INT64 PRIMARY KEY, v INT64)", &r) == 0 && !r.nerr);
+    imdbc *c[4];
+    for (int i = 0; i < 4; i++) {
+        c[i] = login("admin", "pw-admin");
+        CHECK(c[i]);
+    }
+    imdbs_counts c0, c1;
+    imdbs_counts_get(s, &c0);
+    imdb_test_group_hold(600);
+    uint64_t t0 = imdb_mono_ns();
+    imdb_err e = {0};
+    for (int i = 0; i < 4; i++) {
+        char sql[80];
+        snprintf(sql, sizeof sql, "INSERT INTO gt VALUES (%d, %d)", i + 1, i);
+        imdbc_stmt st = {sql, strlen(sql), NULL, 0};
+        SOFT(imdbc_query(c[i], &st, 1, &e) == 0);
+    }
+    imdbc_stmt sel = {"SELECT COUNT(*) FROM gt", 23, NULL, 0};
+    SOFT(imdbc_query(c[0], &sel, 1, &e) == 0); /* pipelined behind its commit: a read after a deferred commit */
+    uint64_t last = 0;
+    for (int i = 0; i < 4; i++) {
+        SOFT(read_reply(c[i], &r) == 0 && r.ndone == 1 && !r.nerr && r.has_write);
+        if (r.write_commit > last) last = r.write_commit;
+    }
+    SOFT(imdb_mono_ns() - t0 >= 500000000u); /* (they waited for the held sync) */
+    SOFT(read_reply(c[0], &r) == 0 && !r.nerr && r.nrows == 1 && atoi(r.text) >= 1);
+    imdbs_counts_get(s, &c1);
+    SOFT(c1.group_held >= c0.group_held + 4 && c1.group_syncs > c0.group_syncs && c1.group_failed == c0.group_failed);
+    if (c1.group_held < c0.group_held + 4)
+        fprintf(stderr, "    held %llu replies (want 4 or more)\n", (unsigned long long)(c1.group_held - c0.group_held));
+    /* a failed group sync: c[1]'s DONE is held, then dropped: the ERROR alone reaches it, then the session's end */
+    atomic_store(&g_fail_sync, true);
+    SOFT(q1(c[1], "INSERT INTO gt VALUES (100, 1)", &r) != 0 || r.nerr);
+    SOFT(r.ndone == 0 && strstr(r.err, "could not be made durable"));
+    if (!strstr(r.err, "could not be made durable")) fprintf(stderr, "    failed group: ndone %u, %s\n", r.ndone, r.err);
+    atomic_store(&g_fail_sync, false);
+    imdbs_counts_get(s, &c1);
+    SOFT(c1.group_failed == c0.group_failed + 1);
+    for (int i = 0; i < 4; i++) imdbc_close(c[i]);
+    imdbc_close(a);
+    SOFT(imdbs_stop(s, &e) != 0); /* (the stop reports the stopped handle) */
+    SOFT(db->failed && db->dur.strict && db->dur.seq >= last); /* (the engine thread gone: its fields read now) */
+    imdb_close(db);
+    SOFT(imdbw_live_blocks() == g_blocks);
+    imdb_io_set_hooks(NULL);
+}
+
+/* group commit: a write whose RETURNING spills (its reply past the connection's room) holds every frame of it, the
+ * spooled rows and its DONE, until its group is durable: put_result encodes a reply only after the statement's commit,
+ * so the spool's marker takes a hold covering it (the advisor's 14:18 review); the group kept pending until another
+ * session's synced commit (imdbs_test_no_idle_sync) */
+static void t_server_group_spill(void)
+{
+    imdbs_opts o;
+    memset(&o, 0, sizeof o);
+    o.conn_cap = 256u << 10;
+    o.group_commit = true;
+    g_sync = 1;
+    imdbs *s = NULL;
+    imdb_db *db = serve(&s, &o);
+    CHECK(db);
+    imdbc *a = login("admin", "pw-admin"), *b = login("admin", "pw-admin");
+    CHECK(a && b);
+    load_rows(a, 400);
+    reply r = {0};
+    SOFT(q1(a, "CREATE TABLE w (id INT64 PRIMARY KEY, v INT64)", &r) == 0 && !r.nerr);
+    imdbs_counts c0 = counts_of(s);
+    imdbs_test_no_idle_sync(true);
+    imdb_err e = {0};
+    /* 24,000 rows: past the connection's room (it spills), under the group's 4 MiB (a larger commit syncs at once) */
+    const char *iq = "INSERT INTO w SELECT id, v FROM big2 WHERE id < 60000 RETURNING id, v";
+    imdbc_stmt ins = {iq, strlen(iq), NULL, 0};
+    SOFT(imdbc_query(a, &ins, 1, &e) == 0);
+    SOFT(requests_past(s, c0.requests)); /* the statement ran and its reply was made */
+    imdbs_counts c1 = counts_of(s);
+    SOFT(c1.res_spilled > c0.res_spilled && c1.group_held > c0.group_held); /* spilled, and held */
+    struct pollfd pf = {imdbc_fd(a), POLLIN, 0};
+    SOFT(poll(&pf, 1, 300) == 0); /* not a byte of it while its group is pending */
+    SOFT(q1(b, "CREATE TABLE w2 (id INT64 PRIMARY KEY)", &r) == 0 && !r.nerr); /* a synced commit: the group durable */
+    imdbs_test_no_idle_sync(false);
+    SOFT(read_reply(a, &r) == 0 && !r.nerr && r.nrows == 24000 && r.ndone == 1 && r.has_write);
+    imdbc_close(a);
+    imdbc_close(b);
+    unserve(db, s);
+}
+
+/* each sync point the server half relies on, with the idle sync off (imdbs_test_no_idle_sync) and the age bound past
+ * reach (imdb_test_group_age), so the point alone can release a held reply (the advisor's 15:1x review): a statement
+ * of a non-neutral kind that commits nothing (SHOW TABLES) syncs at its start; a superuser's COPY TO past its ring syncs
+ * before it waits for room (else its held ring never drains and --copy-wait refuses it); the stop syncs before it ends
+ * the sessions (a held DONE read after imdbs_stop_begin) */
+static void t_server_group_points(void)
+{
+    imdbs_opts o;
+    memset(&o, 0, sizeof o);
+    o.group_commit = true;
+    o.copy_ring = 64u << 10;
+    o.copy_wait_ms = 3000;
+    g_sync = 1;
+    imdbs *s = NULL;
+    imdb_db *db = serve(&s, &o);
+    CHECK(db);
+    imdbc *a = login("admin", "pw-admin"), *b = login("admin", "pw-admin");
+    CHECK(a && b);
+    load_rows(a, 400);
+    reply r = {0};
+    SOFT(q1(a, "CREATE TABLE gp (id INT64 PRIMARY KEY)", &r) == 0 && !r.nerr);
+    imdbs_test_no_idle_sync(true);
+    imdb_test_group_age(60ull * 1000000u);
+    imdb_err e = {0};
+    imdbs_counts c0, c1;
+    /* 1. a statement's start: SHOW TABLES, no commit of its own, releases a held DONE */
+    imdbs_counts_get(s, &c0);
+    imdbc_stmt i1 = {"INSERT INTO gp VALUES (1)", 25, NULL, 0};
+    SOFT(imdbc_query(a, &i1, 1, &e) == 0);
+    for (int i = 0; i < 5000; i++) {
+        imdbs_counts_get(s, &c1);
+        if (c1.group_held > c0.group_held) break;
+        usleep(1000);
+    }
+    struct pollfd pf = {imdbc_fd(a), POLLIN, 0};
+    SOFT(poll(&pf, 1, 300) == 0); /* held */
+    SOFT(q1(b, "SHOW TABLES", &r) == 0 && !r.nerr);
+    SOFT(poll(&pf, 1, 5000) == 1); /* released by SHOW TABLES' start */
+    SOFT(read_reply(a, &r) == 0 && r.ndone == 1 && !r.nerr && r.has_write);
+    /* 2. COPY TO past its ring, pipelined behind a deferred commit: the group synced before the wait for room */
+    imdbc_stmt b2[2] = {{"INSERT INTO gp VALUES (2)", 25, NULL, 0}, {"COPY big2 TO STDOUT", 19, NULL, 0}};
+    SOFT(imdbc_query(a, b2, 2, &e) == 0);
+    SOFT(read_reply(a, &r) == 0 && r.ndone == 2 && !r.nerr && r.count == 160000);
+    if (r.nerr || r.count != 160000) fprintf(stderr, "    group points, COPY TO: %llu rows, %s\n", (unsigned long long)r.count, r.err);
+    /* 4. a PING behind a held DONE: its PONG goes ahead (it depends on no data: an operator's PING answered during a
+     * disk's stall, the advisor's 16:46 review), the DONE once the group is durable */
+    imdbs_counts_get(s, &c0);
+    imdbc_stmt i4 = {"INSERT INTO gp VALUES (4)", 25, NULL, 0};
+    SOFT(imdbc_query(a, &i4, 1, &e) == 0);
+    for (int i = 0; i < 5000; i++) {
+        imdbs_counts_get(s, &c1);
+        if (c1.group_held > c0.group_held) break;
+        usleep(1000);
+    }
+    SOFT(imdbc_ping(a, &e) == 0);
+    SOFT(read_reply(a, &r) == 0 && r.pong && r.ndone == 0); /* the PONG first, the DONE still held */
+    SOFT(q1(b, "SHOW TABLES", &r) == 0 && !r.nerr); /* its start syncs the group */
+    SOFT(read_reply(a, &r) == 0 && r.ndone == 1 && !r.nerr && r.has_write);
+    /* 3. the stop: a held DONE sent before the session ends */
+    imdbs_counts_get(s, &c0);
+    imdbc_stmt i3 = {"INSERT INTO gp VALUES (3)", 25, NULL, 0};
+    SOFT(imdbc_query(a, &i3, 1, &e) == 0);
+    for (int i = 0; i < 5000; i++) {
+        imdbs_counts_get(s, &c1);
+        if (c1.group_held > c0.group_held) break;
+        usleep(1000);
+    }
+    imdbs_stop_begin(s);
+    SOFT(read_reply(a, &r) == 0 && r.ndone == 1 && !r.nerr && r.has_write);
+    imdbs_test_no_idle_sync(false);
+    imdb_test_group_age(0);
+    imdbc_close(a);
+    imdbc_close(b);
+    unserve(db, s);
+}
+
+/* a session KILLed (terminate) while its DONE is held behind its group: it still receives the DONE and its READY once
+ * the group is durable, then the KILL's ERROR, never a close on held replies (the advisor's 13:46 review); the group
+ * kept pending through the close (imdbs_test_no_idle_sync), the hold waited for as a fact (the held count) */
+static void t_server_group_kill(void)
+{
+    imdbs_opts o;
+    memset(&o, 0, sizeof o);
+    o.group_commit = true;
+    g_sync = 1;
+    imdbs *s = NULL;
+    imdb_db *db = serve(&s, &o);
+    CHECK(db);
+    imdbc *a = login("admin", "pw-admin");
+    CHECK(a);
+    reply r = {0};
+    SOFT(q1(a, "CREATE TABLE gk (id INT64 PRIMARY KEY)", &r) == 0 && !r.nerr);
+    imdbc *v = login("admin", "pw-admin");
+    CHECK(v);
+    uint64_t vid = 0;
+    SOFT(list_of(a, &r));
+    for (uint32_t i = 0; i < r.nsess && i < 16; i++)
+        if (r.sess[i].id > vid) vid = r.sess[i].id;
+    imdbs_counts c0, c1;
+    imdbs_counts_get(s, &c0);
+    imdbs_test_no_idle_sync(true); /* the group stays pending through the session's close: the window the rule guards */
+    imdb_err e = {0};
+    imdbc_stmt st = {"INSERT INTO gk VALUES (1)", 25, NULL, 0};
+    SOFT(imdbc_query(v, &st, 1, &e) == 0);
+    for (int i = 0; i < 5000; i++) { /* its DONE and READY held (the engine inside the held sync) */
+        imdbs_counts_get(s, &c1);
+        if (c1.group_held >= c0.group_held + 1) break;
+        usleep(1000);
+    }
+    SOFT(c1.group_held >= c0.group_held + 1); /* (its DONE and READY: one outbuf) */
+    SOFT(kill_of(a, IMDBW_KILL_TERMINATE, vid, IMDBW_KILLED));
+    usleep(1500000); /* (the engine ran its close: a thread that closed on held replies would have closed by now; past a
+                      * KILL's 1 KiB-a-second clock, 1 s, which must not close it either: nothing may be sent) */
+    SOFT(q1(a, "CREATE TABLE gk2 (id INT64 PRIMARY KEY)", &r) == 0 && !r.nerr); /* a synced commit: the group durable */
+    imdbs_test_no_idle_sync(false);
+    SOFT(read_reply(v, &r) == 0 && r.ndone == 1 && !r.nerr && r.has_write); /* the held DONE, delivered */
+    r.err[0] = 0;
+    SOFT(read_reply(v, &r) != 0 && strstr(r.err, "by a KILL")); /* then the KILL's ERROR and the end */
+    if (!strstr(r.err, "by a KILL")) fprintf(stderr, "    group kill: %s\n", r.err);
+    imdbc_close(v);
+    imdbc_close(a);
+    unserve(db, s);
+}
+
+/* the latency hole (the advisor's 12:46 review): a commit whose request goes on into a long scan answers within the
+ * age bound, not at the scan's end: the engine syncs a group older than IMDB_GROUP_AGE_US at xcheck (every TICK_ROWS
+ * rows), and the hook wakes the connection mid-statement. One request, [INSERT, the scan]: no idle point between them */
+static void t_server_group_scan(void)
+{
+    imdbs_opts o;
+    memset(&o, 0, sizeof o);
+    o.group_commit = true;
+    g_sync = 1;
+    imdbs *s = NULL;
+    imdb_db *db = serve(&s, &o);
+    CHECK(db);
+    imdbc *a = login("admin", "pw-admin");
+    CHECK(a);
+    load_rows(a, 400);
+    reply r = {0};
+    SOFT(q1(a, "CREATE TABLE gs (id INT64 PRIMARY KEY)", &r) == 0 && !r.nerr);
+    imdbc_set_timeout(a, 120000); /* (the scan runs ~1.5 s, ten times that under TSan: past login's 20 s) */
+    const char *ins = "INSERT INTO gs VALUES (1)";
+    const char *scan = "SELECT COUNT(*) FROM big2 AS a, big AS b WHERE b.id < 100 AND a.v + b.v = -1"; /* 16 million, none */
+    imdbc_stmt st[2] = {{ins, strlen(ins), NULL, 0}, {scan, strlen(scan), NULL, 0}};
+    imdb_err e = {0};
+    uint64_t t0 = imdb_mono_ns(), t_ins = 0, t_end = 0;
+    SOFT(imdbc_query(a, st, 2, &e) == 0);
+    for (;;) {
+        imdbw_msg m;
+        if (imdbc_next(a, &m, &e)) break;
+        if (m.type == IMDBW_ERROR) {
+            fprintf(stderr, "    group scan: an ERROR\n");
+            SOFT(0);
+        }
+        if (m.type == IMDBW_DONE && !t_ins) t_ins = imdb_mono_ns();
+        else if (m.type == IMDBW_DONE) t_end = imdb_mono_ns();
+        if (m.type == IMDBW_READY) break;
+    }
+    SOFT(t_ins && t_end && t_ins <= t_end);
+    uint64_t ins_ms = (t_ins - t0) / 1000000u, scan_ms = (t_end - t0) / 1000000u;
+    if (scan_ms < 200) {
+        fprintf(stderr, "    group scan: the scan ran %llu ms, too short to show the bound\n", (unsigned long long)scan_ms);
+    } else {
+        SOFT(ins_ms * 4 < scan_ms); /* the commit's DONE long before the scan's end */
+        if (ins_ms * 4 >= scan_ms)
+            fprintf(stderr, "    group scan: the commit answered at %llu ms, the scan at %llu ms\n",
+                    (unsigned long long)ins_ms, (unsigned long long)scan_ms);
+    }
+    imdbc_close(a);
+    unserve(db, s);
+}
+
 const test_case server_tests[] = {
+    {"server_group_commit", t_server_group_commit},
+    {"server_group_scan", t_server_group_scan},
+    {"server_group_kill", t_server_group_kill},
+    {"server_group_spill", t_server_group_spill},
+    {"server_group_points", t_server_group_points},
     {"server_auth", t_server_auth},
     {"server_statements", t_server_statements},
     {"server_txn", t_server_txn},

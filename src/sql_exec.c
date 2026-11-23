@@ -276,6 +276,9 @@ static int xcheck(xctx *x, imdb_err *e)
 {
     x->next_check = x->ticks + TICK_ROWS;
     imdb_stats_tick(x->db, false); /* P1 M1: a long statement still reports (at most once a second) */
+    /* group commit: a pending group older than its bound made durable mid-statement (the statement's own reads are
+     * at their snapshot: the sync changes no state); its failure stops the handle and this statement */
+    if (x->db->group_last && imdb_group_tick(x->db, imdb_group_age_us(), e)) return e->code;
     if (!x->checks) return IMDB_OK;
     if (atomic_load_explicit(&x->ss->cancel, memory_order_relaxed))
         return imdb_fail(e, IMDB_ERR_CANCELLED, "statement cancelled");
@@ -11966,6 +11969,22 @@ static void stmt_drop(sql_stmt *st, bool owned)
 }
 
 /* one statement, parsed, run: sql its text (x->sql and its literals point into it); pname its prepared name (P2 S9) */
+/* group commit: the kinds that may run with a group pending without syncing it first (reads and row writes, whose
+ * checks tick the age bound; transaction control; SET, PREPARE, DEALLOCATE, EXPLAIN; the cheap SHOWs); every other
+ * kind syncs it at its start */
+static bool group_neutral(int kind)
+{
+    switch (kind) {
+    case ST_INSERT: case ST_UPDATE: case ST_DELETE: case ST_SELECT: case ST_COPY_FROM: case ST_COPY_TO:
+    case ST_BEGIN: case ST_COMMIT: case ST_ROLLBACK: case ST_SAVEPOINT: case ST_ROLLBACK_TO: case ST_RELEASE:
+    case ST_SET: case ST_SET_TXN: case ST_EMPTY: case ST_PREPARE: case ST_EXECUTE: case ST_DEALLOCATE: case ST_EXPLAIN:
+    case ST_SHOW_STATS: case ST_SHOW_TRANSACTIONS: case ST_SHOW_PREPARED: case ST_SHOW_TIMEZONE:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char *sql, size_t len, const imdb_value *params,
                           uint32_t nparams, const char *pname, imdb_result *r, imdb_err *e)
 {
@@ -11973,6 +11992,15 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
     if (nparams > IMDB_MAX_PARAMS) {
         stmt_drop(st, owned);
         return imdb_fail(e, IMDB_ERR_LIMIT, "too many parameters");
+    }
+    /* group commit: a group older than its bound made durable before this statement runs, so no commit's answer waits
+     * for another session's statement (the advisor's 12:46 review; xcheck does the same every TICK_ROWS rows); before
+     * a kind that works long before any row or synced append (DDL, an index's build, CHECKPOINT, COMPACT, ERASE,
+     * VERIFY, the heavier SHOWs) whatever its age (the advisor's 14:18 review) */
+    if (ss->db->group_last && (rc = group_neutral(st->kind) ? imdb_group_tick(ss->db, imdb_group_age_us(), e)
+                                                            : imdb_group_sync(ss->db, e))) {
+        stmt_drop(st, owned);
+        return rc;
     }
     xctx x = {.ss = ss, .db = ss->db, .sql = sql, .params = params, .nparams = nparams, .st = st, .row_limit = ss->row_limit};
     ss->corr_runs = ss->corr_hits = 0; /* P2 S4b */
@@ -12687,6 +12715,9 @@ static int exec_stmt_body(imdb_session *ss, sql_stmt *st, bool owned, const char
     }
     if (ss->txn.open && ss->txn.doomed) imdb_txn_discard(db, &ss->txn); /* it can only roll back now */
     if (!db->in_txn && !db->active) imdb_maintain(db, e); /* between transactions only */
+    /* group commit: a commit that waits for its replicas is made durable first (ship sends only what DURABLE names: a
+     * deferred commit's acknowledgement could not come before its group's sync) */
+    if (!rc && ss->sync_replicas && db->group_last) rc = imdb_group_sync(db, e);
     if (!rc && db->seq > seq_before && !db->failed) {
         /* the commit is durable here whatever the replicas say: they change only what the caller is told */
         imdb_repl_outcome *o = &ss->last_repl;

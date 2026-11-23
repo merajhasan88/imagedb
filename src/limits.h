@@ -106,6 +106,9 @@
 #define IMDB_VERIFY_LAKE_BYTES  (256ull << 20) /* segment bytes VERIFY holds at once (at least one segment) */
 #define IMDB_MAX_REPLICAS       256u         /* allowlisted replicas per primary (replicas/) */
 #define IMDB_MAX_SYNC_REPLICAS  64u          /* SET sync_replicas                     */
+#define IMDB_GROUP_MAX          256u         /* group commit: deferred commits a group holds at most  */
+#define IMDB_GROUP_BYTES        (4u << 20)   /* group commit: and their frames' bytes                */
+#define IMDB_GROUP_AGE_US       2000u        /* group commit: a group older synced at a statement's start and checks */
 #define IMDB_MAX_SYNC_TIMEOUT_MS 3600000u    /* SET sync_timeout_ms (an hour)         */
 #define IMDB_MAX_STATEMENT_TIMEOUT_MS 86400000u /* SET statement_timeout (a day; 0: none) */
 #define IMDB_MAX_UNACKED        (1u << 20)   /* commits ship --acks sends past the last acknowledgement */

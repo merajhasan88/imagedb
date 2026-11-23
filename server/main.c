@@ -26,6 +26,7 @@
 static int usage(void)
 {
     fputs("usage: imagedb-server DIR --socket PATH --server-dir SDIR [--max-conns N] [--nosync] [--durable-ack]\n"
+          "                      [--group-commit]\n"
           "                      [--events FILE] [--stats FILE] [--tcp ADDR:PORT] [--spool-dir DIR]\n"
           "                      [--mem-limit BYTES] [--seg-cache BYTES|all] [--iceberg] [--anchor FILE]\n"
           "                      [--copy-spool BYTES] [--copy-ring BYTES] [--copy-wait MS] [--copy-idle MS]\n"
@@ -217,6 +218,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--anchor") && i + 1 < argc) anchor = argv[++i];
         else if (!strcmp(argv[i], "--nosync")) sync = 0;
         else if (!strcmp(argv[i], "--durable-ack")) durable_ack = true;
+        else if (!strcmp(argv[i], "--group-commit")) so.group_commit = true; /* (refused with --nosync: nothing to group) */
         else if (argv[i][0] == '-' || dir) return usage();
         else dir = argv[i];
     }
@@ -256,6 +258,10 @@ int main(int argc, char **argv)
     if (load_secret(sdir, so.secret, &e)) {
         fprintf(stderr, "imagedb-server: the server directory's secret: %s\n", e.msg);
         return 1;
+    }
+    if (so.group_commit && !sync) { /* group commit defers syncs: under --nosync there are none */
+        fputs("imagedb-server: --group-commit needs synchronous commits (not with --nosync)\n", stderr);
+        return 2;
     }
     imdb_open_opts o = {.sync = sync, .durable_ack = durable_ack, .events_path = events, .stats_path = stats,
                         .mem_limit = mem_limit, .seg_cache_bytes = seg_cache, .iceberg = iceberg, .anchor = anchor};

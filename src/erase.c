@@ -20,6 +20,10 @@ int imdb_erase_versions(imdb_db *db, imdb_erase_ent *ents, uint32_t n, imdb_eras
         imdb_free(ents);
         return imdb_fail(e, IMDB_ERR_STATE, "ERASE must run outside an explicit transaction");
     }
+    if (db->group_last && imdb_group_sync(db, e)) { /* group commit: durable before the ERASE plans */
+        imdb_free(ents);
+        return e->code;
+    }
     if (n == 0) {
         imdb_free(ents);
         return IMDB_OK;
@@ -196,6 +200,7 @@ static int erase_subject_body(imdb_db *db, const imdb_value *subject, imdb_erase
 /* one operation (stage 3c-1): the segment cache trims when the outermost ends */
 int imdb_erase_subject(imdb_db *db, const imdb_value *subject, imdb_erase_report *rep, imdb_err *e)
 {
+    if (db->group_last && imdb_group_sync(db, e)) return e->code; /* group commit: durable before the ERASE plans */
     imdb_op_enter(db);
     int rc = erase_subject_body(db, subject, rep, e);
     imdb_op_leave(db);
@@ -208,6 +213,7 @@ int imdb_erase_role(imdb_db *db, const char *name, imdb_erase_report *rep, imdb_
 {
     memset(rep, 0, sizeof *rep);
     if (db->in_txn) return imdb_fail(e, IMDB_ERR_STATE, "ERASE must run outside an explicit transaction");
+    if (db->group_last && imdb_group_sync(db, e)) return e->code; /* group commit: durable before the ERASE plans */
     imdb_rerase *x = NULL;
     uint32_t n = 0;
     if (imdb_role_erase_collect(&db->rc, name, &x, &n, e)) return e->code;

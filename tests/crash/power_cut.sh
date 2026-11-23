@@ -124,8 +124,8 @@ step sql "$D" -c "CREATE VIEW vv AS SELECT v.id, g.w FROM vt AS v LEFT JOIN gone
 # A persistent writer (persist_writer.c): one open, many commits, each acknowledgement recorded
 # and marked before the next commit starts. Then the same with --durable-ack, after a mark: from
 # its first acknowledgement on, DURABLE must be strict and name every acknowledged commit.
-persistent() { # FIRST N [--durable-ack]
-    coproc PW { "$WORK/persist_writer" "$D" "$@"; }
+persistent() { # FIRST N [--durable-ack | --group]
+    coproc PW { "$WORK/persist_writer" "$D" "$@" 2> "$WORK/pw-$1.err"; }
     local pid=$PW_PID seq head rd wr
     exec {rd}<&"${PW[0]}" {wr}>&"${PW[1]}" # bash unsets PW[] and closes its fds once it reaps the writer
     while read -r seq head <&"$rd"; do
@@ -139,6 +139,14 @@ persistent() { # FIRST N [--durable-ack]
 persistent 100 40
 mark strict
 persistent 200 40 --durable-ack
+# group commit (docs/txn-design.md §6): each group acknowledged once its sync returned; DURABLE strict as under
+# --durable-ack; its writer's open publishes a plain record first (its own flag), the switch then a strict one, so the
+# strict check keys each entry past this mark to this writer's acknowledgements alone
+mark group
+persistent 300 40 --group
+largest=$(awk '/largest group/ { print $NF }' "$WORK/pw-300.err")
+[ "${largest:-0}" -gt 1 ] || { echo "FAIL: the group writer's largest group was ${largest:-none}: no group was ever formed"; exit 1; }
+echo "group writer: largest group $largest"
 umount "$WORK/mnt"
 mark umounted
 dmsetup remove "$DM"
@@ -158,9 +166,10 @@ echo "replayer: all $N entries rebuild the device byte for byte"
 # 2. the states: every flush, every FUA write, and every SAMPLEth other entry after mkfs
 start=$(awk '$5 == "mkfs" {print $1}' "$WORK/entries")
 points=$(awk -v s="$start" -v k="$SAMPLE" '$1 > s && ($2 ~ /F/ || $2 ~ /U/ || ($1 % k) == 0) {print $1}' "$WORK/entries")
-checked=0 strict_checked=0 views_read=0
+checked=0 strict_checked=0 views_read=0 group_checked=0
 strict_at=$(awk '$5 == "strict" {print $1}' "$WORK/entries")
 [ -n "$strict_at" ] || { echo "FAIL: the log has no strict mark"; exit 1; }
+group_at=$(awk '$5 == "group" {print $1}' "$WORK/entries")
 for p in $points; do
     fresh
     "$WORK/lw_replay" "$LOG_LOOP" "$WORK/chk.img" --upto "$p"
@@ -174,7 +183,9 @@ for p in $points; do
     C=$WORK/chk/db
     # --durable-ack: once its writer has acknowledged a commit, the DURABLE on disk (read before any
     # writable open rewrites it) is strict and names the last acknowledged commit or a later one
-    strict_acked=$(awk -v p="$p" -v s="$strict_at" '$1 < p && $1 > s && $2 ~ /M/ && $5 ~ /^a[0-9]+$/ {print substr($5, 2)}' \
+    sa=$strict_at # (past the group mark: that writer's acknowledgements alone; its open published a plain record first)
+    [ -n "$group_at" ] && [ "$p" -gt "$group_at" ] && sa=$group_at
+    strict_acked=$(awk -v p="$p" -v s="$sa" '$1 < p && $1 > s && $2 ~ /M/ && $5 ~ /^a[0-9]+$/ {print substr($5, 2)}' \
                    "$WORK/entries" | tail -n 1)
     if [ -n "$strict_acked" ]; then
         last=$(echo "$acked" | tail -n 1)
@@ -186,6 +197,7 @@ for p in $points; do
             echo "FAIL: entry $p: commit $last was acknowledged under --durable-ack, DURABLE names ${dur:-nothing}"; exit 1
         fi
         strict_checked=$((strict_checked + 1))
+        if [ -n "$group_at" ] && [ "$p" -gt "$group_at" ]; then group_checked=$((group_checked + 1)); fi
     fi
     if [ -z "$acked" ]; then
         :   # before init returned nothing is acknowledged (an interrupted init leaves a partial directory)
@@ -223,6 +235,8 @@ for p in $points; do
 done
 echo "power cut: $checked replayed states (of $N log entries) recover, keep every acknowledged commit, VERIFY and audit"
 echo "durable-ack: in $strict_checked of them DURABLE was strict and named every commit acknowledged under it"
+[ -z "$group_at" ] || [ "$group_checked" -gt 0 ] || { echo "FAIL: no state past the group mark had its strict check"; exit 1; }
+echo "group commit: in $group_checked of them DURABLE was strict and named every commit the group writer acknowledged"
 echo "views: $views_read reads of the views the recovered states held (P2 S7)"
 [ "$views_read" -gt 0 ] || { echo "FAIL: no recovered state held a view"; exit 1; }
 echo "ALL POWER-CUT CHECKS PASSED"

@@ -85,6 +85,9 @@ typedef struct outbuf { /* whole frames, sent in order */
     size_t len, off;
     cring *ring;         /* N1d: no frame but a COPY TO's place: its ring's bytes go out here as COPY_OUT frames */
     bool oot;            /* N1e stage two: a frame its connection's thread put (conn_put): counted in conn.oot */
+    uint64_t hold;       /* group commit: the group's last commit when it was made (0: none); not sent before durable */
+    bool pass;           /* group commit: an out-of-turn answer that depends on no data (PONG, SESSIONS_LIST, KILL_DONE): it
+                          * may go ahead of held replies (an operator's PING or KILL answered during a disk's stall) */
 } outbuf;
 
 typedef struct conn conn;
@@ -114,6 +117,8 @@ struct conn {
     conn *next; /* imdbs.conns */
     imdbs *s;
     int fd, wake[2];
+    bool held_reg;       /* group commit: in imdbs.held (under imdbs.hmu): woken when the engine reports a durable seq */
+    conn *held_next;
     uint32_t role; /* N1e: its login's role, set (under mu) when it authenticates; its session acts as it */
     const char *refuse;  /* N1e stage two: its login was answered but refused (a role's cap, the reserve): an ERROR, then the close */
     rtally *tal;         /* N1e stage two (under mu): its role's tally, from its login to its end (NULL: none yet) */
@@ -214,6 +219,14 @@ struct imdbs {
     bool failed;
     imdbs_counts n;
     pthread_mutex_t lmu;
+    /* group commit: the durable seq the engine last reported (its hook, srv_durable), and the connections holding
+     * output to wake then; hmu is a leaf lock (taken after mu, or alone by the hook on the engine thread, which may run
+     * inside a statement: never mu there) */
+    _Atomic uint64_t durable;
+    _Atomic bool group_failed; /* a group's sync failed (the handle stopped): held replies become an ERROR, never sent */
+    _Atomic uint64_t gsyncs;   /* the durable reports the hook took (server.group.syncs) */
+    pthread_mutex_t hmu;
+    conn *held;
     logins *lg;          /* NULL: no one may log in (the logins could not be made: fail closed) */
     uint64_t role_gen;   /* db->role_gen the logins were made at (the engine thread's) */
     int spool_dfd;       /* N1d: the spool directory (-1: none, COPY refused by name) */
@@ -552,6 +565,73 @@ static void rsp_end(imdbs *s, conn *c)
 
 static int rsp_append(imdbs *s, conn *c, const imdbw_buf *b, imdb_err *e, bool reserved);
 
+static _Atomic bool g_no_idle_sync; /* tests: engine_main never syncs a group at idle (it stays pending until a sync of the
+                                     * engine's own: a synced commit, an age tick, the cap, the stop) */
+void imdbs_test_no_idle_sync(bool on) { atomic_store(&g_no_idle_sync, on); }
+
+/* group commit (the engine thread, under s->mu): an outbuf made while a group is pending is held until that group is
+ * durable, and its connection registered for the wake (s->hmu, the leaf lock the durable hook takes alone) */
+static void hold_mark(imdbs *s, conn *c, outbuf *o)
+{
+    uint64_t p = imdb_group_pending(s->db);
+    if (!p || p <= atomic_load_explicit(&s->durable, memory_order_acquire)) return;
+    if (atomic_load_explicit(&s->group_failed, memory_order_acquire)) return; /* made after the failure: it reports the
+                                                                               * stopped handle, and depends on nothing unsynced */
+    o->hold = p;
+    s->n.group_held++;
+    pthread_mutex_lock(&s->hmu);
+    if (!c->held_reg) c->held_reg = true, c->held_next = s->held, s->held = c;
+    pthread_mutex_unlock(&s->hmu);
+}
+
+/* group commit: the engine's hook, on the engine thread (inside commit_body, imdb_group_sync, perhaps mid-statement):
+ * the durable seq published, every connection holding output woken (their wake pipes); s->hmu alone, never s->mu */
+static void srv_durable(void *ctx, uint64_t seq)
+{
+    imdbs *s = ctx;
+    atomic_store_explicit(&s->durable, seq, memory_order_release);
+    atomic_fetch_add(&s->gsyncs, 1);
+    pthread_mutex_lock(&s->hmu);
+    for (conn *c = s->held; c;) {
+        conn *n = c->held_next;
+        c->held_reg = false, c->held_next = NULL;
+        wake(c->wake[1]);
+        c = n;
+    }
+    s->held = NULL;
+    pthread_mutex_unlock(&s->hmu);
+}
+
+/* group commit: a group's sync failed (the handle stopped): every connection holding output woken, each to replace its
+ * held replies by an ERROR (push, held_drop); the engine thread, under s->mu */
+static void group_fail(imdbs *s)
+{
+    atomic_store_explicit(&s->group_failed, true, memory_order_release);
+    s->n.group_failed++;
+    pthread_mutex_lock(&s->hmu);
+    for (conn *c = s->held; c;) {
+        conn *n = c->held_next;
+        c->held_reg = false, c->held_next = NULL;
+        wake(c->wake[1]);
+        c = n;
+    }
+    s->held = NULL;
+    pthread_mutex_unlock(&s->hmu);
+}
+
+/* group commit: a connection leaving the registry before it is freed (under s->mu, then s->hmu) */
+static void held_unlink(imdbs *s, conn *c)
+{
+    pthread_mutex_lock(&s->hmu);
+    for (conn **p = &s->held; *p; p = &(*p)->held_next)
+        if (*p == c) {
+            *p = c->held_next;
+            break;
+        }
+    c->held_reg = false, c->held_next = NULL;
+    pthread_mutex_unlock(&s->hmu);
+}
+
 /* the engine thread: b's frames handed to c (dropped when its client is gone), b empty again */
 static void flush(imdbs *s, conn *c, imdbw_buf *b)
 {
@@ -573,6 +653,7 @@ static void flush(imdbs *s, conn *c, imdbw_buf *b)
         return;
     }
     o->p = b->p, o->len = b->len;
+    hold_mark(s, c, o); /* group commit: made after a deferred commit, held until its group is durable */
     if (c->ot) c->ot->next = o;
     else c->oh = o;
     c->ot = o;
@@ -620,6 +701,7 @@ static int rsp_append(imdbs *s, conn *c, const imdbw_buf *b, imdb_err *e, bool r
         if (c->gone) {
             imdbw_free(mk); /* no reply reaches it: the spool is freed with the connection */
         } else {
+            hold_mark(s, c, mk); /* group commit */
             if (c->ot) c->ot->next = mk;
             else c->oh = mk;
             c->ot = mk;
@@ -1034,6 +1116,7 @@ static int copy_wr(void *arg, const char *p, size_t n)
         if (c->gone) {
             imdbw_free(mk); /* no reply reaches it: the ring is freed at its thread's end */
         } else {
+            hold_mark(s, c, mk); /* group commit */
             if (c->ot) c->ot->next = mk;
             else c->oh = mk;
             c->ot = mk;
@@ -1095,6 +1178,21 @@ static int copy_wr(void *arg, const char *p, size_t n)
                                           "room: --copy-ring, --copy-wait)", (unsigned)(wait_ns / 1000000u));
                 out_fail(c, IMDB_ERR_LIMIT, msg);
                 return -1;
+            }
+            if (imdb_group_pending(s->db) && !s->db->failed) { /* group commit: a ring held behind a pending group is one
+                                                                * its client cannot drain: the group durable before any
+                                                                * wait for room (the advisor's 12:46 review) */
+                pthread_mutex_unlock(&s->mu);
+                imdb_err eg = {0};
+                bool bad = imdb_group_sync(s->db, &eg) != IMDB_OK;
+                pthread_mutex_lock(&s->mu);
+                if (bad) {
+                    group_fail(s);
+                    pthread_mutex_unlock(&s->mu);
+                    out_fail(c, eg.code, eg.msg);
+                    return -1;
+                }
+                continue;
             }
             s->n.copy_waits++;
             uint64_t t0 = imdb_mono_ns(), step = wait_ns - *waited < 100000000u ? wait_ns - *waited : 100000000u;
@@ -1423,6 +1521,16 @@ static void *engine_main(void *arg)
             continue;
         }
         rq *r = pick(s);
+        /* group commit: nothing runnable: the group made durable before the wait (s->mu dropped: the sync is I/O) */
+        if (!r && imdb_group_pending(s->db) && !s->db->failed && !atomic_load(&g_no_idle_sync)) {
+            pthread_mutex_unlock(&s->mu);
+            imdb_err eg = {0};
+            bool bad = imdb_group_sync(s->db, &eg) != IMDB_OK;
+            pthread_mutex_lock(&s->mu);
+            if (bad) group_fail(s);
+            continue;
+        }
+        if (s->db->failed && imdb_group_pending(s->db) && !atomic_load(&s->group_failed)) group_fail(s); /* an engine sync's */
         if (!r) { /* nothing runnable: wait for work, at most until the next tick is due */
             uint64_t due = last_tick + (uint64_t)tick_ms * 1000000u, now = imdb_mono_ns();
             uint64_t left = due > now ? due - now : 0;
@@ -1454,6 +1562,16 @@ static void *engine_main(void *arg)
             pthread_cond_broadcast(&s->cv); /* a connection waits for its close, or for room in its queue */
             wake(c->wake[1]);
         }
+    }
+    /* group commit: a pending group made durable before the stop (its held replies then go out with the rest) */
+    if (imdb_group_pending(s->db) && !s->db->failed) {
+        pthread_mutex_unlock(&s->mu);
+        imdb_err eg = {0};
+        bool bad = imdb_group_sync(s->db, &eg) != IMDB_OK;
+        pthread_mutex_lock(&s->mu);
+        if (bad) group_fail(s);
+    } else if (s->db->failed && imdb_group_pending(s->db) && !atomic_load(&s->group_failed)) {
+        group_fail(s);
     }
     /* the stop: queued requests dropped, every session closed (an open transaction rolled back) */
     for (conn *c = s->conns; c; c = c->next) {
@@ -1721,6 +1839,7 @@ static void conn_put(conn *c, const imdbw_msg *m)
         return;
     }
     o->p = b.p, o->len = b.len, o->oot = true;
+    o->pass = m->type == IMDBW_PONG || m->type == IMDBW_SESSIONS_LIST || m->type == IMDBW_KILL_DONE; /* (an ERROR never) */
     pthread_mutex_lock(&s->mu);
     c->oot += o->len; /* N1e stage two */
     if (c->oot > s->n.oot_peak) s->n.oot_peak = c->oot;
@@ -2180,6 +2299,64 @@ static int ring_take(conn *c, outbuf *o)
 }
 
 /* sends what is queued: 1 when bytes left, 0 when none could, -1 when the client is gone */
+/* group commit (under s->mu): the first out-of-turn answer that may pass (outbuf.pass) with only held replies before it,
+ * or NULL; prev its predecessor */
+static outbuf *pass_find(imdbs *s, conn *c, outbuf **prev)
+{
+    uint64_t d = atomic_load_explicit(&s->durable, memory_order_acquire);
+    *prev = NULL;
+    for (outbuf *o = c->oh; o; *prev = o, o = o->next) {
+        if (o->pass) return *prev ? o : NULL; /* (the head itself: nothing to move) */
+        if (o->hold <= d) return NULL;      /* a reply that may go: nothing passes it */
+    }
+    return NULL;
+}
+
+/* group commit, a held head: an out-of-turn answer that depends on no data moved ahead of the held replies (never begun:
+ * push stops at a held head before writing it), true if one was */
+static bool pass_ahead(conn *c)
+{
+    imdbs *s = c->s;
+    pthread_mutex_lock(&s->mu);
+    outbuf *prev, *o = pass_find(s, c, &prev);
+    if (o) {
+        prev->next = o->next;
+        if (c->ot == o) c->ot = prev;
+        o->next = c->oh, c->oh = o;
+    }
+    pthread_mutex_unlock(&s->mu);
+    return o != NULL;
+}
+
+/* group commit, the group's sync failed: every held outbuf (a DONE among them that would claim a commit durable) freed
+ * and credited, unsent; one ERROR queued in their place (its connection's thread) */
+static void held_drop(conn *c)
+{
+    imdbs *s = c->s;
+    uint64_t d = atomic_load_explicit(&s->durable, memory_order_acquire);
+    pthread_mutex_lock(&s->mu);
+    outbuf **pp = &c->oh, *last = NULL;
+    while (*pp) {
+        outbuf *o = *pp;
+        if (o->hold > d) { /* (never begun: push stops at a held head; a marker's ring is freed with the connection) */
+            *pp = o->next;
+            pend_move(s, c, -(int64_t)(o->len - o->off));
+            imdbw_free(o->p);
+            imdbw_free(o);
+        } else {
+            last = o, pp = &o->next;
+        }
+    }
+    c->ot = last;
+    c->gone = true; /* the handle stopped: this ERROR, then the session's end (its READY was held too: none comes) */
+    pthread_mutex_unlock(&s->mu);
+    static const char km[] = "a commit's group could not be made durable: the commit may or may not be there; the server's "
+                             "handle is stopped: reopen";
+    imdbw_text t = {(const uint8_t *)km, (uint32_t)(sizeof km - 1)};
+    imdbw_msg er = {.type = IMDBW_ERROR, .code = (uint32_t)-IMDB_ERR_IO, .texts = &t, .ntexts = 1};
+    conn_put(c, &er);
+}
+
 static int push(conn *c)
 {
     imdbs *s = c->s;
@@ -2189,6 +2366,16 @@ static int push(conn *c)
         outbuf *o = c->oh; /* this thread alone takes from the head; the engine appends at the tail */
         pthread_mutex_unlock(&s->mu);
         if (!o) return sent;
+        /* group commit: made after a commit whose group is not durable yet: nothing from here on goes out (order kept;
+         * the engine's hook wakes this thread when it is) */
+        if (o->hold > atomic_load_explicit(&s->durable, memory_order_acquire)) {
+            if (atomic_load_explicit(&s->group_failed, memory_order_acquire)) {
+                held_drop(c); /* its group can never be durable now: the held replies become an ERROR */
+                continue;
+            }
+            if (pass_ahead(c)) continue; /* a PONG, SESSIONS_LIST or KILL_DONE goes first; the KILL's ERROR stays behind */
+            return sent;
+        }
         if (o->ring) { /* N1d: a COPY TO's bytes go out here, as frames */
             int k = ring_take(c, o);
             if (k < 0) return -1;
@@ -2353,6 +2540,15 @@ static void *conn_main(void *arg)
          * statement's empty ring is no reply waiting, so send_timeout never drops a client for the engine's pace) */
         const cring *hg = c->oh ? c->oh->ring : NULL;
         bool closed = c->closed, out = c->oh != NULL && (!hg || hg->w > hg->r || hg->done), stopping = s->stopping;
+        /* group commit: a held head is nothing to send yet (the progress clocks, send timeout, trickle floor, a KILL's
+         * hold and the idle bound never count it against the client) */
+        bool held = out && c->oh->hold > atomic_load_explicit(&s->durable, memory_order_acquire) &&
+                    !atomic_load_explicit(&s->group_failed, memory_order_acquire); /* (failed: push replaces it by the ERROR) */
+        if (held) { /* an answer that may pass waiting behind it (a PONG, SESSIONS_LIST, KILL_DONE): push moves it ahead */
+            outbuf *pv;
+            if (pass_find(s, c, &pv)) held = false;
+            else out = false;
+        }
         /* its client gone and its statement still running: the cancel again (one that landed just before the statement
          * began was cleared by its start), every turn until the session's end runs */
         bool recancel = c->gone && c->running && c->ses_open && !closed;
@@ -2460,7 +2656,9 @@ static void *conn_main(void *arg)
             out = false;
         }
         if (stopping && !stop_at) stop_at = now + (uint64_t)STOP_FLUSH_MS * 1000000u;
-        if (closed && (!out || !peer || (stop_at && now >= stop_at))) break;
+        /* group commit: a session that ends (a KILL, a protocol error, the stop, TERMINATE) with replies held waits for
+         * their group (milliseconds) and sends them with its own ERROR after them, never closing on them unsent */
+        if (closed && ((!out && !held) || !peer || (stop_at && now >= stop_at))) break;
         /* each side's events by its want (TLS may want the other); bytes OpenSSL already holds read without a poll, but
          * only while there is room for a request: a reader paused for a full queue never spins on them */
         bool want_in = peer && reading && room, want_out = peer && out;
@@ -2574,6 +2772,7 @@ static void *conn_main(void *arg)
 static void conn_free(conn *c)
 {
     pthread_mutex_lock(&c->s->mu); /* N1d: its spools (the engine is done with it: no request, none running) */
+    held_unlink(c->s, c); /* group commit: out of the wake registry before it is freed */
     cin_drop(c->s, c);
     while (c->rings) ring_free(c->s, c, c->rings);
     pthread_mutex_unlock(&c->s->mu);
@@ -2792,6 +2991,20 @@ int imdbs_start(imdb_db *db, const imdbs_opts *o, imdbs **out, imdb_err *e)
     pthread_mutexattr_destroy(&ma);
     imdb_stats_source(db, srv_stats, s); /* the server's counters in SHOW STATS and the export (removed at the stop) */
     pthread_mutex_init(&s->lmu, NULL);
+    pthread_mutex_init(&s->hmu, NULL); /* group commit's leaf lock */
+    atomic_store(&s->durable, db->seq); /* every commit so far durable (a synchronous handle, or none deferred) */
+    if (o->group_commit) { /* the engine's switch: its strict watermark published first; then the hook */
+        imdb_err eg = {0};
+        if (imdb_set_group_commit(db, true, &eg)) {
+            imdb_stats_source(db, NULL, NULL);
+            pthread_mutex_destroy(&s->mu);
+            pthread_mutex_destroy(&s->lmu);
+            pthread_mutex_destroy(&s->hmu);
+            imdbw_free(s);
+            return imdb_fail(e, eg.code, "group commit: %s", eg.msg);
+        }
+        imdb_set_durable_hook(db, srv_durable, s);
+    }
     pthread_cond_init(&s->cv, NULL);
     pthread_cond_init(&s->pacv, NULL);
     int rc = IMDB_OK;
@@ -2877,6 +3090,7 @@ int imdbs_stop(imdbs *s, imdb_err *e)
     imdbs_stop_begin(s);
     if (s->engine_started) pthread_join(s->engine, NULL);
     imdb_stats_source(s->db, NULL, NULL); /* (the engine thread gone: no row of a server being freed is read) */
+    imdb_set_durable_hook(s->db, NULL, NULL); /* group commit: the close's sync tells no server being freed */
     if (s->acceptor_started) pthread_join(s->acceptor, NULL);
     pthread_mutex_lock(&s->mu);
     while (s->conns) {
@@ -2901,6 +3115,7 @@ int imdbs_stop(imdbs *s, imdb_err *e)
     imdbw_free(s->tal);
     pthread_mutex_destroy(&s->mu);
     pthread_mutex_destroy(&s->lmu);
+    pthread_mutex_destroy(&s->hmu);
     pthread_cond_destroy(&s->cv);
     pthread_cond_destroy(&s->pacv);
     imdbw_free(s);
@@ -2940,6 +3155,7 @@ static void counts_take(const imdbs *s, imdbs_counts *c)
     c->conns = s->nconns; /* D34 */
     c->lingering = s->nlinger; /* 2b-2b */
     c->spool_held = s->spool_held;
+    c->group_syncs = atomic_load(&s->gsyncs); /* (the hook's, which takes no s->mu) */
     for (conn *o = s->conns; o; o = o->next) {
         c->tcp_authing += o->tcp && o->preauth && o->authing;
         c->tcp_waiting += o->tcp && o->preauth && !o->authing;
@@ -2985,7 +3201,8 @@ static const struct srv_row {
     R_("server.spool.held_bytes", spool_held), R_("server.disk.refused", disk_refused),
     R_("server.disk.kept_in_memory", disk_kept), RH("server.disk.data_low", disk_low_data),
     RH("server.disk.spool_low", disk_low_spool), RH("server.disk.data_free_bytes", disk_free_data),
-    RH("server.disk.spool_free_bytes", disk_free_spool),
+    RH("server.disk.spool_free_bytes", disk_free_spool), R_("server.group.syncs", group_syncs),
+    R_("server.group.held_replies", group_held), R_("server.group.failed", group_failed),
 #undef R_
 #undef RH
 };

@@ -71,6 +71,9 @@ typedef struct imdbs_opts {
      * result past its connection's room is refused (a write's reply kept in memory: its commit stands); a superuser's
      * exempt (0: none; imagedb-server's default 1 GiB, the API's none) */
     uint64_t disk_headroom;
+    bool group_commit;         /* group commit (docs/txn-design.md §6): a commit of row ops alone defers its sync into
+                                * a group, every reply made after it held until the group is durable (the engine's
+                                * imdb_set_group_commit: DURABLE strict from the start) */
     bool say_disk;             /* 2b-3: each crossing of the headroom (and at start, below it) a line on stderr too
                                 * (imagedb-server's; the tests' none) */
     uint64_t reply_budget;     /* every connection's unsent replies, past which only a connection (a role) with none runs (0:
@@ -162,6 +165,9 @@ typedef struct imdbs_counts {
     uint64_t linger_skipped; /* 2b-2b: refused logins closed at once, LINGER_REFUSED lingering already */
     uint64_t conns;        /* D34: gauge: connections in the server's list (nconns, the count the reserve reads) */
     uint64_t lingering;    /* 2b-2b: gauge: refused logins lingering out of conns, until reaped (at most 64) */
+    uint64_t group_syncs;  /* group commit: durable seqs the engine reported (its hook: every group made durable) */
+    uint64_t group_held;   /* group commit: replies held behind a pending group (sent once it was durable) */
+    uint64_t group_failed; /* group commit: groups whose sync failed (their held replies an ERROR, the handle stopped) */
     uint64_t ends[IMDBS_END_N]; /* D34: connection threads ended, by cause (IMDBS_END_*): which way a connection left */
 } imdbs_counts;
 void imdbs_counts_get(imdbs *s, imdbs_counts *c);
@@ -181,6 +187,8 @@ void imdbs_test_wake_hold(uint32_t ms);
 void imdbs_test_frame_hold(uint64_t conn);
 uint64_t imdbs_test_frame_held(void);
 void imdbs_test_frame_release(void);
+/* tests: group commit, the engine thread never syncs a group at idle (pending until the engine's own sync) */
+void imdbs_test_no_idle_sync(bool on);
 /* 2b-2b, tests: a pause (us, 0 none) where a client may already know what the server then records: state ordering */
 void imdbs_test_reply_hold(uint32_t us);
 /* tests: a pause (us) between a request's count and its READY's flush alone (what a wait on the count reads before)

@@ -1,12 +1,14 @@
 /* Engine tests (C API, no SQL): commit/replay, MVCC, torn tails, replication,
  * tamper detection, erasure completeness, and a randomized model check. */
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "thelp.h"
+#include "../../src/sql.h"
 
 /* ---- tests ------------------------------------------------------------------------ */
 
@@ -1072,7 +1074,199 @@ static void t_unknown_tables_bounded(void)
     free(ops);
 }
 
+/* ---- group commit (the server's; docs/txn-design.md §6): the engine half ---------------------------------- */
+static int g_gc_datasyncs, g_gc_fail;
+static uint64_t g_gc_hook;
+static long gc_before(imdb_io_call *c, void *ctx)
+{
+    (void)ctx;
+    if (c->op != IMDB_IO_FDATASYNC) return 0;
+    g_gc_datasyncs++;
+    if (!g_gc_fail) return 0;
+    errno = EIO; /* (as the fault harness: the callers read errno) */
+    return -1;
+}
+static const imdb_io_hooks g_gc_hooks = {gc_before, NULL, NULL};
+static void gc_hook(void *ctx, uint64_t seq)
+{
+    (void)ctx;
+    g_gc_hook = seq;
+}
+
+static imdb_db *gc_open(const char *dir, int sync)
+{
+    imdb_open_opts o = {.sync = sync};
+    imdb_db *db = NULL;
+    imdb_err_clear(&g_e);
+    if (imdb_open(dir, &o, &db, &g_e)) {
+        fprintf(stderr, "    open %s: %s\n", dir, g_e.msg);
+        return NULL;
+    }
+    return db;
+}
+
+static int gc_sql(imdb_db *db, const char *sql)
+{
+    imdb_session s;
+    imdb_session_init(&s, db);
+    imdb_result r;
+    imdb_err_clear(&g_e);
+    int rc = imdb_exec_one(&s, sql, strlen(sql), NULL, 0, &r, &g_e);
+    if (!rc) imdb_result_free(&r);
+    imdb_session_close(&s);
+    return rc;
+}
+
+/* deferred commits make no fdatasync; one group sync makes them durable with one, DURABLE strict at the last, the hook
+ * told; a commit that may not defer (DDL) behind a pending group makes it durable by its own synced append; the cap;
+ * the age bound; the switch refused under --nosync; a failed group sync stops the handle, and a reopen holds a prefix
+ * of the group, every commit synced before it */
+static void t_group_commit(void)
+{
+    const char *dir = test_tmpdir();
+    OK(imdb_init(dir, false, NULL, E));
+    imdb_db *db = gc_open(dir, 0);
+    CHECK(db);
+    OK(imdb_set_group_commit(db, true, E)); /* --nosync: nothing to defer */
+    CHECK(!db->group_ok && !db->strict);
+    imdb_close(db);
+    db = gc_open(dir, 1);
+    CHECK(db);
+    OK(make_table(db, E));
+    OK(imdb_set_group_commit(db, true, E));
+    CHECK(db->dur.strict && db->dur.seq == db->seq); /* the switch publishes its strict record */
+    CHECK(db->group_ok && db->strict);
+    imdb_set_durable_hook(db, gc_hook, NULL);
+    g_gc_datasyncs = 0, g_gc_fail = 0, g_gc_hook = 0;
+    imdb_io_set_hooks(&g_gc_hooks);
+    for (int64_t i = 1; i <= 10; i++) OK(ins1(db, i, 7, i, "g"));
+    imdb_io_set_hooks(NULL);
+    CHECK(g_gc_datasyncs == 0);
+    CHECK(imdb_group_pending(db) == db->seq && db->group_n == 10 && db->dur.seq < db->seq);
+    imdb_io_set_hooks(&g_gc_hooks);
+    OK(imdb_group_sync(db, E));
+    imdb_io_set_hooks(NULL);
+    CHECK(g_gc_datasyncs == 1); /* one fdatasync for ten commits (DURABLE's own is an fsync) */
+    CHECK(imdb_group_pending(db) == 0 && db->dur.seq == db->seq && db->dur.synced && db->dur.strict);
+    CHECK(g_gc_hook == db->seq);
+    /* a DDL commit behind three deferred ones: its synced append makes them durable, the hook told */
+    for (int64_t i = 11; i <= 13; i++) OK(ins1(db, i, 7, i, "g"));
+    uint64_t pend = imdb_group_pending(db);
+    CHECK(pend == db->seq);
+    g_gc_hook = 0;
+    OK(gc_sql(db, "CREATE TABLE u (id INT64 PRIMARY KEY)"));
+    CHECK(imdb_group_pending(db) == 0 && g_gc_hook >= pend && db->dur.seq == db->seq && db->dur.strict);
+    /* the cap: the 256th deferred commit syncs its group inside imdb_commit */
+    uint64_t s0 = db->seq;
+    for (int64_t i = 100; i < 100 + (int64_t)IMDB_GROUP_MAX; i++) OK(ins1(db, i, 7, i, "g"));
+    CHECK(db->seq == s0 + IMDB_GROUP_MAX && imdb_group_pending(db) == 0 && db->dur.seq == db->seq);
+    /* the bytes' cap: commits of a 60 KB row, the one that brings the group to IMDB_GROUP_BYTES (4 MiB) syncs it inside
+     * imdb_commit (about 70 of them: the bytes, not the count, decide) */
+    static char gbig[60001];
+    memset(gbig, 'x', 60000);
+    int kb = 0;
+    do {
+        OK(ins1(db, 3000 + kb, 7, 1, gbig));
+    } while (++kb < 200 && imdb_group_pending(db) != 0);
+    CHECK(imdb_group_pending(db) == 0 && kb > 60 && kb < 80 && db->dur.seq == db->seq);
+    if (kb <= 60 || kb >= 80) fprintf(stderr, "    the bytes' cap after %d commits\n", kb);
+    /* the age bound: a group older than the bound synced by the tick, a younger one not */
+    OK(ins1(db, 500, 7, 1, "g"));
+    OK(imdb_group_tick(db, 3600u * 1000000u, E));
+    CHECK(imdb_group_pending(db) == db->seq);
+    db->group_t0 -= 10ull * 1000000000u; /* (ten seconds older) */
+    OK(imdb_group_tick(db, 1000, E));
+    CHECK(imdb_group_pending(db) == 0 && db->dur.seq == db->seq);
+    /* sync_replicas: a commit that waits for its replicas is made durable before its wait (ship sends only what DURABLE
+     * names; none here: the wait times out at 1 ms) */
+    {
+        imdb_session ss;
+        imdb_session_init(&ss, db);
+        static const char *const qs[] = {"SET sync_replicas = 1", "SET sync_timeout_ms = 1",
+                                         "INSERT INTO txns VALUES (800, 7, 1.00, 'g')"};
+        for (size_t i = 0; i < 3; i++) {
+            imdb_result rr;
+            imdb_err_clear(&g_e);
+            int rq = imdb_exec_one(&ss, qs[i], strlen(qs[i]), NULL, 0, &rr, &g_e);
+            if (!rq) imdb_result_free(&rr);
+            SOFT(rq == 0);
+            if (rq) fprintf(stderr, "    %s: %s\n", qs[i], g_e.msg);
+        }
+        imdb_session_close(&ss);
+        CHECK(imdb_group_pending(db) == 0 && db->dur.seq == db->seq);
+    }
+    /* a failed group sync: the handle stops; the reopen holds everything synced before and a prefix of the group */
+    uint64_t synced = db->seq;
+    for (int64_t i = 600; i < 604; i++) OK(ins1(db, i, 7, i, "g"));
+    g_gc_fail = 1;
+    imdb_io_set_hooks(&g_gc_hooks);
+    imdb_err e2 = {0};
+    CHECK(imdb_group_sync(db, &e2) != IMDB_OK);
+    imdb_io_set_hooks(NULL);
+    g_gc_fail = 0;
+    CHECK(db->failed);
+    imdb_close(db);
+    db = gc_open(dir, 1);
+    CHECK(db);
+    CHECK(db->seq >= synced && db->seq <= synced + 4);
+    CHECK(pk_lookup(db, 101, db->seq) != 0);
+    /* a close with a group pending makes it durable: the reopen holds it whole */
+    OK(imdb_set_group_commit(db, true, E));
+    uint64_t at = db->seq;
+    for (int64_t i = 700; i < 705; i++) OK(ins1(db, i, 7, i, "g"));
+    CHECK(imdb_group_pending(db) == at + 5);
+    CHECK(imdb_close(db) == IMDB_OK);
+    db = gc_open(dir, 1);
+    CHECK(db);
+    CHECK(db->seq == at + 5 && pk_lookup(db, 704, db->seq) != 0);
+    imdb_verify_report rep;
+    OK(imdb_verify(db, &rep, E));
+    imdb_close(db);
+}
+
+/* the newest commit the external anchor names (its two slots), 0 when neither reads */
+static uint64_t gc_anchor_seq(const char *path)
+{
+    size_t n = 0;
+    uint8_t *b = slurp(path, &n);
+    uint64_t best = 0;
+    for (size_t off = 0; b && off + IMDB_ANCHOR_LEN <= n && off < IMDB_ANCHOR_FILE; off += IMDB_ANCHOR_SLOT) {
+        imdb_anchor a;
+        imdb_err ea = {0};
+        if (!imdb_anchor_decode(b + off, IMDB_ANCHOR_LEN, &a, &ea) && a.seq > best) best = a.seq;
+    }
+    free(b);
+    return best;
+}
+
+/* group commit and the external anchor (the advisor's 16:16 review: a crash scenario cannot tell an anchor written at
+ * the group's sync from one never written, since an anchor behind the log opens cleanly): while a group is pending the
+ * anchor names nothing past the last durable commit; after the group's sync it names the group's last commit */
+static void t_group_anchor(void)
+{
+    const char *dir = test_tmpdir();
+    OK(imdb_init(dir, false, NULL, E));
+    char anchor[600];
+    snprintf(anchor, sizeof anchor, "%s.anchor", dir);
+    imdb_open_opts o = {.sync = 1, .anchor = anchor};
+    imdb_db *db = NULL;
+    imdb_err_clear(&g_e);
+    OK(imdb_open(dir, &o, &db, &g_e));
+    OK(make_table(db, E));
+    OK(imdb_set_group_commit(db, true, E));
+    uint64_t durable = db->seq;
+    CHECK(gc_anchor_seq(anchor) == durable); /* (the switch's commit-free record; the table's commit synced) */
+    for (int64_t i = 1; i <= 5; i++) OK(ins1(db, i, 7, i, "a"));
+    CHECK(imdb_group_pending(db) == db->seq && db->seq == durable + 5);
+    CHECK(gc_anchor_seq(anchor) == durable); /* a deferred commit never in the anchor before its group's sync */
+    OK(imdb_group_sync(db, E));
+    CHECK(gc_anchor_seq(anchor) == db->seq); /* the group's sync names its last commit */
+    imdb_close(db);
+}
+
 const test_case engine_tests[] = {
+    {"group_commit", t_group_commit},
+    {"group_anchor", t_group_anchor},
     {"unknown_tables_bounded", t_unknown_tables_bounded},
     {"commit_replay", t_commit_replay},
     {"mvcc_time_travel", t_mvcc_time_travel},

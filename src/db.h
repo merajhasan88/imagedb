@@ -436,6 +436,17 @@ typedef struct imdb_db {
     bool log_group;           /* tagged: a write group is open (frames appended since the last fdatasync) */
     uint64_t log_phys;        /* tagged, no group open: the sector the next group begins at */
     uint64_t log_fill;        /* tagged: the end of its zero fill (the file's size, as far as known) */
+    /* group commit (the server's, imdb_set_group_commit; docs/txn-design.md §6): a commit of row ops alone
+     * appends its frame unsynced (no fdatasync, DURABLE or anchor) into the open write group; the group's sync, or any
+     * synced append after it, makes the group durable at once */
+    bool group_ok;            /* on: deferrable commits defer (needs db->sync; keeps DURABLE strict throughout) */
+    bool deferring;           /* this frame's append is deferred (commit_body sets it around the append alone) */
+    uint32_t group_n;         /* deferred commits since the group's start */
+    uint64_t group_bytes;     /* their frames' bytes */
+    uint64_t group_last;      /* the last deferred commit's seq; 0: no group pending */
+    uint64_t group_t0;        /* imdb_mono_ns() at the group's first commit (its age bound) */
+    void (*durable_hook)(void *ctx, uint64_t seq); /* told the durable seq after each group's sync, whoever syncs */
+    void *durable_ctx;
     imdb_tgroup log_tg;       /* tagged: the open group's layout */
     uint64_t *redact_seqs;    /* commits whose payloads await redaction    */
     size_t nredact, capredact;
@@ -847,6 +858,30 @@ bool imdb_col_generated(const imdb_table *t, uint16_t c);
 /* ---- transactions --------------------------------------------------------- */
 int imdb_begin(imdb_db *db, imdb_err *e);
 int imdb_commit(imdb_db *db, imdb_err *e);
+/* Group commit (the server's; docs/txn-design.md §6). On a synchronous handle, imdb_set_group_commit(db, true)
+ * makes a commit of row ops alone (with its sequence marks) append its frame without its fdatasync, DURABLE or anchor,
+ * into the log's open write group: imdb_group_sync then makes the whole group durable at once (one fdatasync of the log,
+ * then DURABLE for the last commit, strict and fsynced, then the anchor). The commit is installed at once, so the next
+ * one validates against it; whoever calls the engine must hold every answer made after a deferred commit until the
+ * group is durable (imdb_group_pending 0 again, or the durable hook's seq at or past it). The switch keeps DURABLE
+ * strict from then on (a strict record must never be followed by a plain one: an acknowledged commit past an older
+ * strict record could be dropped as never acknowledged), so a commit that does not defer publishes its watermark
+ * fsynced, as under --durable-ack. The engine syncs the group itself at its cap (IMDB_GROUP_MAX commits or
+ * IMDB_GROUP_BYTES of frames), at any synced append (a commit that may not defer, a physical commit), at imdb_log_sync's
+ * points, at the close and when imdb_group_tick finds it older than its bound. */
+int imdb_set_group_commit(imdb_db *db, bool on, imdb_err *e);
+uint64_t imdb_group_pending(const imdb_db *db); /* the group's last commit; 0: nothing pending */
+int imdb_group_sync(imdb_db *db, imdb_err *e);
+/* a group older than us microseconds made durable (0: none older; the statement's start and its checks call it) */
+int imdb_group_tick(imdb_db *db, uint64_t us, imdb_err *e);
+void imdb_set_durable_hook(imdb_db *db, void (*fn)(void *ctx, uint64_t seq), void *ctx);
+/* tests: once, the next group's sync waits ms before its fdatasync (its answers held meanwhile) */
+void imdb_test_group_hold(uint32_t ms);
+/* tests: every group's sync waits us before its fdatasync (0: none): held replies met by every path */
+void imdb_test_group_delay(uint32_t us);
+/* the age bound a statement's start and its checks sync a group past (IMDB_GROUP_AGE_US; tests: imdb_test_group_age) */
+uint64_t imdb_group_age_us(void);
+void imdb_test_group_age(uint64_t us);
 /* Due work between transactions (the size-triggered CHECKPOINT). The SQL layer calls
  * it after each statement; engine-API callers call it between their transactions. */
 int imdb_maintain(imdb_db *db, imdb_err *e);

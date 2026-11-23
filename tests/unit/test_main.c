@@ -177,6 +177,10 @@ int main(int argc, char **argv)
             imdbs_test_copy_hold(0);
             imdbs_test_wake_hold(0);
             imdbs_test_frame_hold(0);
+            imdb_test_group_hold(0);
+            imdb_test_group_delay(0);
+            imdb_test_group_age(0);
+            imdbs_test_no_idle_sync(false);
             imdbsp_no_release(false);
             imdbsp_no_tmpfile(false);
             imdbsp_fail_at(0);

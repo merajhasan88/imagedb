@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/file.h>
@@ -5218,6 +5219,7 @@ static int anchor_start(imdb_db *db, const imdb_open_opts *o, bool rewrite, imdb
 
 int imdb_log_sync(imdb_db *db, imdb_err *e)
 {
+    if (db->group_last) return imdb_group_sync(db, e); /* group commit: its frames, DURABLE for db->seq, strict */
     if (!db->unsynced_from) return IMDB_OK;
     if (db->failed) return imdb_fail(e, IMDB_ERR_STATE, "database handle failed earlier; reopen to recover");
     if (sync_segments_from(db, db->unsynced_from, e)) {
@@ -5269,9 +5271,12 @@ static int log_put_tagged(imdb_db *db, const uint8_t *frame, size_t len, imdb_er
     }
     uint64_t fill = end > db->log_fill ? end : db->log_fill; /* a frame past the fill grew the file */
     bool big = (uint64_t)ns * IMDB_TSEG_SECTOR > IMDB_LOG_FILL_LOW;
-    bool extend = !rc && db->sync && !big && fill - end < IMDB_LOG_FILL_LOW, synced = false, sync_failed = false;
+    /* group commit: a deferred frame takes --nosync's path for its own append (no fill extension, no fdatasync: the
+     * group's sync does both, imdb_group_sync); db->sync itself is never flipped */
+    bool now = db->sync && !db->deferring;
+    bool extend = !rc && now && !big && fill - end < IMDB_LOG_FILL_LOW, synced = false, sync_failed = false;
     if (extend) rc = log_write_zeros(db->logfd, fill, IMDB_LOG_FILL_CHUNK, e);
-    if (!rc && db->sync) {
+    if (!rc && now) {
         if (imdb_io_fdatasync(db->logfd) != 0) {
             rc = imdb_fail(e, IMDB_ERR_IO, "fdatasync(log) failed: %s; reopen (the commit may or may not be there)",
                            strerror(errno));
@@ -5290,7 +5295,13 @@ static int log_put_tagged(imdb_db *db, const uint8_t *frame, size_t len, imdb_er
             imdb_err eb = {0};
             back = imdb_pwrite_all(db->logfd, buf, k * IMDB_TSEG_SECTOR, (int64_t)((at + i) * IMDB_TSEG_SECTOR), &eb) == 0;
         }
-        if (!back || (db->sync && imdb_io_fdatasync(db->logfd) != 0) || sync_failed) db->failed = true;
+        /* (a deferred frame's put-back is not synced: an fdatasync mid-group would make durable the sectors the
+         * group's next frame rewrites; the group's own sync makes the put-back durable with the rest) */
+        if (!back || (now && imdb_io_fdatasync(db->logfd) != 0) || sync_failed) db->failed = true;
+        else if (now && was_open) log_group_end(db); /* group commit: that fdatasync flushed the open group's sectors
+                                                     * (the put-back restored its last): the group ends there, so no
+                                                     * later frame rewrites a flushed sector; it stays pending (its
+                                                     * watermark at the next sync), as none of it was acknowledged */
         if (buf != small) imdb_free(buf);
         return rc;
     }
@@ -5302,6 +5313,8 @@ static int log_put_tagged(imdb_db *db, const uint8_t *frame, size_t len, imdb_er
     if (synced) log_group_end(db);
     return IMDB_OK;
 }
+
+static void group_durable(imdb_db *db, uint64_t seq); /* (group commit: below)*/
 
 int imdb_log_append(imdb_db *db, const uint8_t *frame, size_t len, imdb_err *e)
 {
@@ -5315,7 +5328,9 @@ int imdb_log_append(imdb_db *db, const uint8_t *frame, size_t len, imdb_err *e)
     if (rc) return rc;
     db->log_size += len;
     db->stats.log_bytes += len; /* P1 M1 */
-    if (!db->sync && !db->unsynced_from) db->unsynced_from = imdb_frame_seq(frame);
+    if ((!db->sync || db->deferring) && !db->unsynced_from) db->unsynced_from = imdb_frame_seq(frame);
+    if (db->deferring) return IMDB_OK; /* group commit: DURABLE and the anchor at the group's sync (imdb_group_sync) */
+    bool grouped = db->sync && db->group_last; /* a synced append: the open group's frames are durable with it */
     /* the watermark moves only now: a shipper never sees a frame that could still be truncated */
     imdb_err e2 = {0};
     if (durable_publish(db, imdb_frame_seq(frame), imdb_frame_hash(frame), db->sync != 0, false, &e2)) {
@@ -5325,7 +5340,7 @@ int imdb_log_append(imdb_db *db, const uint8_t *frame, size_t len, imdb_err *e)
          * The frame stays (cutting it would need the syncs that just failed); after a crash, damage
          * to it is dropped as an append never acknowledged, which this error makes true. */
         if (db->strict)
-            return imdb_fail(e, IMDB_ERR_IO, "commit %llu reached the log but is not acknowledged: %s (--durable-ack); the "
+            return imdb_fail(e, IMDB_ERR_IO, "commit %llu reached the log but is not acknowledged: %s (a strict watermark: --durable-ack or group commit); the "
                              "handle is stopped: reopen, and the commit is there unless its frame is damaged first",
                              (unsigned long long)imdb_frame_seq(frame), e2.msg);
         snprintf(db->warning, sizeof db->warning, "commit %llu is durable, but %s; reopen to recover",
@@ -5338,7 +5353,104 @@ int imdb_log_append(imdb_db *db, const uint8_t *frame, size_t len, imdb_err *e)
         snprintf(db->warning, sizeof db->warning, "commit %llu is durable, but %s; reopen to recover",
                  (unsigned long long)imdb_frame_seq(frame), e2.msg);
     }
+    if (grouped) group_durable(db, db->seq); /* (this frame's commit is installed after: its own answer comes later) */
     return IMDB_OK;
+}
+
+/* group commit: the open group is durable (its sync, or a synced append after it): nothing pending, the host told
+ * the seq the durability now reaches (everything installed by then) */
+static void group_durable(imdb_db *db, uint64_t seq)
+{
+    db->group_n = 0, db->group_bytes = 0, db->group_last = 0, db->group_t0 = 0;
+    db->unsynced_from = 0;
+    if (db->durable_hook) db->durable_hook(db->durable_ctx, seq);
+}
+
+int imdb_set_group_commit(imdb_db *db, bool on, imdb_err *e)
+{
+    if (!on) { /* the group made durable, deferral off; the watermark stays strict (never a plain record after it) */
+        if (db->group_last && imdb_group_sync(db, e)) return e->code;
+        db->group_ok = false;
+        return IMDB_OK;
+    }
+    if (!db->sync || db->read_only || db->replica) return IMDB_OK; /* nothing to defer: --nosync, a reader, a replica */
+    if (db->failed) return imdb_fail(e, IMDB_ERR_STATE, "database handle failed earlier; reopen to recover");
+    if (db->group_ok) return IMDB_OK;
+    /* DURABLE strict from here on, the deferred commits' and every other's: a strict record followed by a plain one
+     * (rewritten in place unsynced) could survive a crash alone, and a damaged frame of a commit acknowledged after it
+     * would then be dropped as never acknowledged. The strict record is published now, fsynced, before any commit
+     * defers (every commit to db->seq is durable: a synchronous handle with no group open), so the first group too
+     * lies past a strict watermark (the advisor's 13:16 review: else a torn sector in it was DAMAGED past the open's
+     * plain record, an operator's recover) */
+    db->strict = true;
+    if (durable_publish(db, db->seq, db->head, true, true, e)) {
+        db->failed = true; /* a watermark it cannot vouch for: fail-stop, as a failed sync */
+        return e->code;
+    }
+    db->group_ok = true;
+    return IMDB_OK;
+}
+
+uint64_t imdb_group_pending(const imdb_db *db) { return db->group_last; }
+
+void imdb_set_durable_hook(imdb_db *db, void (*fn)(void *ctx, uint64_t seq), void *ctx)
+{
+    db->durable_hook = fn, db->durable_ctx = ctx;
+}
+
+static _Atomic uint32_t g_group_hold_ms; /* tests: once, the next group's sync waits this long before its fdatasync */
+void imdb_test_group_hold(uint32_t ms) { atomic_store(&g_group_hold_ms, ms); }
+static _Atomic uint32_t g_group_delay_us; /* tests: every group's sync waits this long (0: none) */
+void imdb_test_group_delay(uint32_t us) { atomic_store(&g_group_delay_us, us); }
+static _Atomic uint64_t g_group_age_us; /* tests: the age bound in place of IMDB_GROUP_AGE_US (0: the constant) */
+void imdb_test_group_age(uint64_t us) { atomic_store(&g_group_age_us, us); }
+uint64_t imdb_group_age_us(void)
+{
+    uint64_t v = atomic_load(&g_group_age_us);
+    return v ? v : IMDB_GROUP_AGE_US;
+}
+
+int imdb_group_sync(imdb_db *db, imdb_err *e)
+{
+    if (!db->group_last) return IMDB_OK;
+    uint32_t hold = atomic_exchange(&g_group_hold_ms, 0);
+    if (hold) usleep(hold * 1000u); /* (tests: a group pending, its answers held, for this long) */
+    uint32_t delay = atomic_load(&g_group_delay_us);
+    if (delay) usleep(delay); /* (tests: every group's sync this much slower, IMDB_SRV_GROUP_HOLD_US: held replies met) */
+    if (db->failed) return imdb_fail(e, IMDB_ERR_STATE, "database handle failed earlier; reopen to recover");
+    /* the fill: extended before the group's fdatasync when low (one flush for both), past the group's last sector and
+     * the fill's end, so the next groups keep landing in durable zeros (an overwrite, not an append: 0.75 ms against
+     * 1.73 ms a sync on the work disk's probe); a failed extension is no error (zeros past the end, unsynced) */
+    if (db->log_tagged && db->logfd >= 0 && db->log_group) {
+        uint64_t end = (db->log_tg.sector + (db->log_tg.len + IMDB_TSEG_PAYLOAD - 1) / IMDB_TSEG_PAYLOAD) * IMDB_TSEG_SECTOR;
+        uint64_t fill = end > db->log_fill ? end : db->log_fill;
+        imdb_err ez = {0};
+        if (fill - end < IMDB_LOG_FILL_LOW && !log_write_zeros(db->logfd, fill, IMDB_LOG_FILL_CHUNK, &ez))
+            db->log_fill = fill + IMDB_LOG_FILL_CHUNK;
+    }
+    if (sync_segments_from(db, db->unsynced_from ? db->unsynced_from : db->group_last, e)) {
+        db->failed = true; /* an uncertain sync: fail-stop (none of the group was acknowledged) */
+        return e->code;
+    }
+    log_group_end(db);
+    uint64_t first = db->group_last - db->group_n + 1;
+    imdb_err e2 = {0};
+    if (durable_publish(db, db->seq, db->head, true, false, &e2)) { /* the acknowledgement is the strict watermark */
+        db->failed = true;
+        return imdb_fail(e, IMDB_ERR_IO, "commits %llu to %llu reached the log but are not acknowledged: %s; the handle is "
+                         "stopped: reopen, and they are there unless a frame of theirs is damaged first",
+                         (unsigned long long)first, (unsigned long long)db->group_last, e2.msg);
+    }
+    if (anchor_publish(db, false, &e2)) snprintf(db->warning, sizeof db->warning, "commit %llu is durable, but %s; reopen to "
+                                                  "recover", (unsigned long long)db->seq, e2.msg);
+    group_durable(db, db->seq);
+    return IMDB_OK;
+}
+
+int imdb_group_tick(imdb_db *db, uint64_t us, imdb_err *e)
+{
+    if (!db->group_last || !us || imdb_mono_ns() - db->group_t0 < us * 1000u) return IMDB_OK;
+    return imdb_group_sync(db, e);
 }
 
 /* Segment i's first commit time: recorded when this process began the segment, else read once from
@@ -5403,7 +5515,9 @@ void imdb_evict_policy(imdb_db *db)
     }
     uint64_t f = imdb_window_floor(db, db->lake_seq);
     imdb_err e2 = {0};
-    if (f > db->mem_floor && imdb_evict(db, f, &e2)) imdb_warn(db, "a table kept versions past the memory window (%s)", e2.msg);
+    if (f <= db->mem_floor) return;
+    if (db->group_last && imdb_group_sync(db, &e2)) return; /* group commit: durable before the physical work (its answers wait on nothing long) */
+    if (imdb_evict(db, f, &e2)) imdb_warn(db, "a table kept versions past the memory window (%s)", e2.msg);
 }
 
 /* Expiry by retention (primary only, between transactions): a table kept for R moves its horizon
@@ -5424,6 +5538,8 @@ static void expire(imdb_db *db)
         due = t->retention_us != IMDB_RETAIN_FOREVER && expiry_point(db, now, t->retention_us, db->seq) > t->horizon;
     }
     if (!due) return;
+    imdb_err eg = {0};
+    if (db->group_last && imdb_group_sync(db, &eg)) return; /* group commit: durable before the pass */
     uint64_t t0 = imdb_mono_ns(); /* P1 M1: a pass that expires something, its commit included */
     imdb_err e2 = {0};
     int rc = imdb_begin(db, &e2);
@@ -5543,6 +5659,7 @@ static void retire_policy(imdb_db *db)
         return;
     }
     imdb_err e2 = {0};
+    if (db->group_last && imdb_group_sync(db, &e2)) return; /* group commit: durable before the physical work */
     if (imdb_retire(db, B, &e2)) snprintf(db->warning, sizeof db->warning, "automatic RETIRE failed (%s)", e2.msg);
 }
 
@@ -5563,6 +5680,8 @@ static int maintain_body(imdb_db *db, imdb_err *e)
     bool due = db->checkpoint_bytes && db->log_size >= db->checkpoint_bytes && !db->log_rotate && db->nt;
     if (due || (db->lake_sync && db->lake_dirty && db->nt)) {
         imdb_err e2 = {0};
+        /* group commit: the group durable before the CHECKPOINT builds (seconds, for a large one): no answer waits on it */
+        if (db->group_last && imdb_group_sync(db, &e2)) return IMDB_OK;
         if (imdb_checkpoint(db, &e2))
             snprintf(db->warning, sizeof db->warning, "automatic CHECKPOINT failed (%s)", e2.msg);
     }
@@ -5633,6 +5752,18 @@ static int erase_role_note(void *arg, const imdb_rerase *x, bool pending, imdb_e
     if (!pending && imdb_redact_note(db, x->seq, &e2)) db->failed = true;
     (void)e;
     return IMDB_OK;
+}
+
+/* group commit: a commit of row ops alone (and its sequence marks) defers its sync; every other kind (DDL, roles, an
+ * ERASE, a writer key, a view) syncs as before, and its synced append makes the open group durable with it */
+static bool group_deferrable(const imdb_db *db)
+{
+    if (!db->group_ok || !db->sync || db->failed || !db->ntx) return false;
+    for (uint32_t i = 0; i < db->ntx; i++) {
+        uint8_t k = db->tx[i].code;
+        if (k != IMDB_OP_INSERT && k != IMDB_OP_DELETE && k != IMDB_OP_UPDATE && k != IMDB_OP_SEQ_ADVANCE) return false;
+    }
+    return true;
 }
 
 static int commit_body(imdb_db *db, imdb_err *e)
@@ -5746,7 +5877,11 @@ static int commit_body(imdb_db *db, imdb_err *e)
     imdb_sign(&db->signer, msg, sizeof msg, c.sig);
     imdb_frame_build(hdr.p, hdr.len, c.seq, c.hash, c.sig, pay.p, pay.len, &frame);
     if ((rc = imdb_buf_check(&frame, e))) goto fail;
-    if ((rc = imdb_log_append(db, frame.p, frame.len, e))) goto fail;
+    db->deferring = group_deferrable(db); /* group commit: its append alone deferred (log_put_tagged, imdb_log_append) */
+    rc = imdb_log_append(db, frame.p, frame.len, e);
+    bool deferred = db->deferring;
+    db->deferring = false;
+    if (rc) goto fail;
     for (uint32_t i = 0; i < db->ntx; i++)
         if (imdb_op_publishes_manifest(db->tx[i].code)) db->log_rotate = true; /* the commit ends its segment */
 
@@ -5811,6 +5946,11 @@ static int commit_body(imdb_db *db, imdb_err *e)
         }
     }
     db->seq = c.seq;
+    if (deferred) { /* in the group until its sync: whoever answers for it holds the answer (imdb_group_pending) */
+        if (!db->group_n++) db->group_t0 = imdb_mono_ns();
+        db->group_bytes += frame.len;
+        db->group_last = c.seq;
+    }
     memcpy(db->head, c.hash, 32);
     if (!db->maintaining) { /* N1b: a statement's own (the server's DONE reads it) */
         db->stmt_seq = c.seq;
@@ -5913,6 +6053,10 @@ int imdb_commit(imdb_db *db, imdb_err *e)
     }
 #endif
     int rc = commit_body(db, e);
+    /* group commit's cap: a group of IMDB_GROUP_MAX commits or IMDB_GROUP_BYTES of frames synced here (COPY ... BATCH's
+     * commits in one statement); a failure: this commit is not durable either, the handle stopped (imdb_group_sync) */
+    if (!rc && db->group_last && (db->group_n >= IMDB_GROUP_MAX || db->group_bytes >= IMDB_GROUP_BYTES))
+        rc = imdb_group_sync(db, e);
     if (!rc) { /* P1 M1 */
         db->stats.commits++;
         imdb_hist_add(&db->stats.commit_lat, (imdb_mono_ns() - t0) / 1000u);
