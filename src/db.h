@@ -484,6 +484,9 @@ typedef struct imdb_db {
     bool stats_said_failed;   /* an export has said the handle failed: until then a failed handle exports at once */
     uint64_t stmt_start_ns;   /* the running statement's start (0: none): long-running work in the export */
     char stats_buf[IMDB_STATS_EXPORT_MAX];
+    /* N1e: a row source beside the engine's (imdb_stats_source: the server's counters), called after its rows */
+    int (*stat_src)(void *src_ctx, int (*fn)(void *ctx, const char *name, int64_t value), void *ctx);
+    void *stat_src_ctx;
     int events_fd, events_dirfd; /* P1 M2: the event log and its directory (rotation: FILE.1); -1: none */
     char events_base[256];    /* FILE's name in that directory */
     uint64_t events_bytes, events_lines, events_errors, events_cap; /* events_cap: tests lower it */
@@ -1239,6 +1242,11 @@ int imdb_disk_bytes(imdb_db *db, uint64_t *log, uint64_t *lake, imdb_err *e);
  * walk and is returned. walk_disk: list log/ and objects/ now (SHOW STATS), else the export's last walk */
 typedef int (*imdb_stat_fn)(void *ctx, const char *name, int64_t value);
 int imdb_stats_each(imdb_db *db, imdb_stat_fn fn, void *ctx, bool walk_disk);
+/* N1e: rows of another's beside the engine's, in SHOW STATS and the export (the server's counters, server.*): src is
+ * called by imdb_stats_each after the engine's rows, with its fn, on the thread that called it (a server's engine
+ * thread); NULL removes it (before src_ctx is freed). Nothing is registered at the API: an embedded caller's rows stand */
+typedef int (*imdb_stat_source)(void *src_ctx, imdb_stat_fn fn, void *ctx);
+void imdb_stats_source(imdb_db *db, imdb_stat_source src, void *src_ctx);
 /* P1 M1: the export (imdb_open_opts.stats_path): every row as `name value` lines with the writer's pid and time and a
  * CRC32C last, rewritten in place, never fsynced, advisory (a reader takes a torn copy by its CRC and reads again); at
  * most once a second unless force; from a fixed buffer; never an error: a failed write is counted and tried again */

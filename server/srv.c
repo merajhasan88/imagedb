@@ -2744,6 +2744,8 @@ static int listen_tcp(imdbs *s, const char *spec, imdb_err *e)
     return IMDB_OK;
 }
 
+static int srv_stats(void *arg, imdb_stat_fn fn, void *ctx); /* the server's rows (below, beside imdbs_counts_get) */
+
 int imdbs_start(imdb_db *db, const imdbs_opts *o, imdbs **out, imdb_err *e)
 {
     *out = NULL;
@@ -2753,7 +2755,13 @@ int imdbs_start(imdb_db *db, const imdbs_opts *o, imdbs **out, imdb_err *e)
     s->db = db, s->o = *o, s->lfd = -1, s->tfd = -1, s->stop[0] = s->stop[1] = -1, s->spool_dfd = -1;
     s->obj_dfd = imdbsp_subdir(db->dirfd, "objects"); /* (-1: none yet, or none to read: the others are read) */
     s->o.socket_path = s->o.tcp = s->o.server_dir = s->o.spool_dir = NULL; /* the caller's strings: used here alone */
-    pthread_mutex_init(&s->mu, NULL);
+    pthread_mutexattr_t ma; /* error-checking: a relock by its holder answers EDEADLK (srv_stats leaves its rows out), never
+                             * a hang of the one engine thread */
+    pthread_mutexattr_init(&ma);
+    pthread_mutexattr_settype(&ma, PTHREAD_MUTEX_ERRORCHECK);
+    pthread_mutex_init(&s->mu, &ma);
+    pthread_mutexattr_destroy(&ma);
+    imdb_stats_source(db, srv_stats, s); /* the server's counters in SHOW STATS and the export (removed at the stop) */
     pthread_mutex_init(&s->lmu, NULL);
     pthread_cond_init(&s->cv, NULL);
     pthread_cond_init(&s->pacv, NULL);
@@ -2839,6 +2847,7 @@ int imdbs_stop(imdbs *s, imdb_err *e)
     if (!s) return IMDB_OK;
     imdbs_stop_begin(s);
     if (s->engine_started) pthread_join(s->engine, NULL);
+    imdb_stats_source(s->db, NULL, NULL); /* (the engine thread gone: no row of a server being freed is read) */
     if (s->acceptor_started) pthread_join(s->acceptor, NULL);
     pthread_mutex_lock(&s->mu);
     while (s->conns) {
@@ -2894,9 +2903,9 @@ bool imdbs_wait_failed(imdbs *s, uint32_t ms)
     return f;
 }
 
-void imdbs_counts_get(imdbs *s, imdbs_counts *c)
+/* under mu: the counts and the gauges read from the server's state */
+static void counts_take(const imdbs *s, imdbs_counts *c)
 {
-    pthread_mutex_lock(&s->mu);
     *c = s->n;
     c->tcp_authing = c->tcp_waiting = 0;
     c->conns = s->nconns; /* D34 */
@@ -2906,7 +2915,80 @@ void imdbs_counts_get(imdbs *s, imdbs_counts *c)
         c->tcp_authing += o->tcp && o->preauth && o->authing;
         c->tcp_waiting += o->tcp && o->preauth && !o->authing;
     }
+}
+
+void imdbs_counts_get(imdbs *s, imdbs_counts *c)
+{
+    pthread_mutex_lock(&s->mu);
+    counts_take(s, c);
     pthread_mutex_unlock(&s->mu);
+}
+
+/* the server's counters for an operator (counters-export, after 2c): SHOW STATS's rows and the --stats export beside the
+ * engine's, as server.* (dotted names, units as suffixes, as the engine's), by imdb_stats_source: called on the engine
+ * thread, a statement's check too (imdb_stats_tick), so the counts stay live through a long statement. Every field of
+ * imdbs_counts is a row here or named left out (the static assert below: a field added fails the build until it is
+ * placed); the free-space rows only with a headroom (with none they would read 0: a full disk) */
+static const struct srv_row {
+    const char *name;
+    size_t off;
+    bool headroom; /* shown only with --disk-headroom */
+} k_srv_rows[] = {
+#define R_(n, f) {n, offsetof(imdbs_counts, f), false}
+#define RH(n, f) {n, offsetof(imdbs_counts, f), true}
+    R_("server.connections.accepted", accepted), R_("server.connections.live", live),
+    R_("server.connections.listed", conns), R_("server.connections.lingering", lingering),
+    R_("server.logins.ok", logins), R_("server.logins.refused", refusals), R_("server.logins.role_refused", role_refused),
+    R_("server.logins.endpoint_binding", logins_endpoint), R_("server.logins.binding_refused", cb_refused),
+    R_("server.logins.rebuilt", logins_made), R_("server.logins.lingered", linger_refused),
+    R_("server.logins.closed_unlingered", linger_skipped), R_("server.tcp.authenticating", tcp_authing),
+    R_("server.tcp.waiting", tcp_waiting), R_("server.requests", requests), R_("server.requests.paused", pauses),
+    R_("server.statements", statements), R_("server.cancels", cancels), R_("server.cancels.client_left", leave_cancels),
+    R_("server.kills.done", kills), R_("server.kills.refused", kills_refused),
+    R_("server.replies.dropped_slow", dropped), R_("server.replies.pending_peak_bytes", pend_peak),
+    R_("server.queue.out_of_turn_waits", oot_waits), R_("server.queue.out_of_turn_peak_bytes", oot_peak),
+    R_("server.queue.role_waits", role_queue_waits), R_("server.results.spilled", res_spilled),
+    R_("server.results.spill_bytes", res_spool_bytes), R_("server.results.refused", res_refused),
+    R_("server.results.released_bytes", res_released), R_("server.results.files_peak", files_peak),
+    R_("server.roles.spool_limits", role_spool_limits), R_("server.roles.idle_closed", idle_closed),
+    R_("server.copy.in", copy_in), R_("server.copy.out", copy_out), R_("server.copy.out_result", copy_out_res),
+    R_("server.copy.limits", copy_limits), R_("server.copy.waits", copy_waits), R_("server.copy.idle_closed", copy_idle),
+    R_("server.spool.held_bytes", spool_held), R_("server.disk.refused", disk_refused),
+    R_("server.disk.kept_in_memory", disk_kept), RH("server.disk.data_low", disk_low_data),
+    RH("server.disk.spool_low", disk_low_spool), RH("server.disk.data_free_bytes", disk_free_data),
+    RH("server.disk.spool_free_bytes", disk_free_spool),
+#undef R_
+#undef RH
+};
+/* left out: wakeups, started, ticks (the tests' instruments: a loop's turns, a statement's start, the tick's count) */
+enum { SRV_ROWS_LEFT_OUT = 3 };
+static const char *const k_srv_ends[] = {"unauth", "refused", "left", "hup", "nval", "ebadf", "protocol", "terminate",
+                                         "send", "copy_idle", "gone", "kill", "stop", "poll", "idle"};
+_Static_assert(sizeof k_srv_ends / sizeof *k_srv_ends == IMDBS_END_N, "a connection's end cause without its row's name");
+_Static_assert(sizeof k_srv_rows / sizeof *k_srv_rows + SRV_ROWS_LEFT_OUT + IMDBS_END_N ==
+                   sizeof(imdbs_counts) / sizeof(uint64_t),
+               "a field of imdbs_counts neither a row of k_srv_rows nor named left out");
+
+static int srv_stats(void *arg, imdb_stat_fn fn, void *ctx)
+{
+    imdbs *s = arg;
+    imdbs_counts c;
+    if (pthread_mutex_lock(&s->mu)) return IMDB_OK; /* (EDEADLK: its holder re-entered: these rows left out, never a hang) */
+    counts_take(s, &c);
+    pthread_mutex_unlock(&s->mu);
+    int rc = IMDB_OK;
+    for (size_t i = 0; !rc && i < sizeof k_srv_rows / sizeof *k_srv_rows; i++) {
+        if (k_srv_rows[i].headroom && !s->o.disk_headroom) continue;
+        uint64_t v;
+        memcpy(&v, (const char *)&c + k_srv_rows[i].off, sizeof v);
+        rc = fn(ctx, k_srv_rows[i].name, v > INT64_MAX ? INT64_MAX : (int64_t)v);
+    }
+    char nm[64];
+    for (int k = 0; !rc && k < IMDBS_END_N; k++) {
+        snprintf(nm, sizeof nm, "server.connections.ended.%s", k_srv_ends[k]);
+        rc = fn(ctx, nm, c.ends[k] > INT64_MAX ? INT64_MAX : (int64_t)c.ends[k]);
+    }
+    return rc;
 }
 
 uint16_t imdbs_tcp_port(const imdbs *s) { return s->tcp_port; }

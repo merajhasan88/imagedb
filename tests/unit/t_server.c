@@ -37,6 +37,7 @@ static uint64_t g_ckpt; /* the next serve's size-triggered CHECKPOINT (0: the de
 static int g_sync;      /* the next serve's sync (0: none) */
 static bool g_nomem;    /* 2c: the next serve's database without a memory budget (superusers alone log in); else 2 GiB */
 static const char *g_events; /* 2b-2b: the next serve's event log (NULL: none) */
+static const char *g_stats;  /* the counters' export: the next serve's --stats file (NULL: none) */
 static int64_t g_blocks; /* the wire's live blocks before the server: the same after it and every client are gone */
 static bool g_tcp;       /* N1c: the tests run again over TCP with TLS 1.3 (login by the pin) */
 static uint16_t g_port;
@@ -71,9 +72,10 @@ static imdb_db *serve(imdbs **s, const imdbs_opts *extra)
     if (strlen(g_sock) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return NULL; /* 107 bytes at most */
     imdb_err e = {0};
     if (imdb_init(dbdir, false, NULL, &e)) return NULL;
-    imdb_open_opts o = {.sync = g_sync, .checkpoint_bytes = g_ckpt, .events_path = g_events,
+    imdb_open_opts o = {.sync = g_sync, .checkpoint_bytes = g_ckpt, .events_path = g_events, .stats_path = g_stats,
                         .mem_limit = g_nomem ? 0 : (2ull << 30)}; /* 2c: a budget opens a role's logins */
     g_events = NULL;
+    g_stats = NULL;
     g_sync = 0;
     g_ckpt = 0;
     g_nomem = false;
@@ -4255,6 +4257,82 @@ static void t_server_logins_budget(void)
         unserve(db, s);
     }
 }
+
+/* the server's counters for an operator: SHOW STATS through the server carries server.* after the engine's rows, the
+ * counts a known workload fixes exactly (one login, one refused, no KILL, no COPY), every row once (without a headroom the
+ * four free-space rows left out, with one shown), each connection end's cause; the --stats export the same rows; a role
+ * that is not a superuser refused SHOW STATS (a superuser's statement) */
+static int srv_row(const char *text, const char *name, long long *v)
+{
+    char key[96];
+    snprintf(key, sizeof key, "\n%s|", name);
+    const char *p = strstr(text, key);
+    if (!p) return -1;
+    *v = atoll(p + strlen(key));
+    return 0;
+}
+
+static int srv_rows(const char *text)
+{
+    int n = 0;
+    for (const char *p = text; (p = strstr(p, "\nserver.")); p++) n++;
+    return n;
+}
+
+static void t_server_stats(void)
+{
+    for (int headroom = 0; headroom < 2; headroom++) {
+        char sp[300];
+        snprintf(sp, sizeof sp, "%s/stats", test_tmpdir());
+        g_stats = sp;
+        imdbs_opts o;
+        memset(&o, 0, sizeof o);
+        o.disk_headroom = headroom ? 1ull << 20 : 0;
+        if (headroom) imdbsp_test_free(IMDBSP_FREE_DATA, 1ll << 40), imdbsp_test_free(IMDBSP_FREE_SPOOL, 1ll << 40);
+        imdbs *s = NULL;
+        imdb_db *db = serve(&s, &o);
+        CHECK(db);
+        imdbc *a = login("admin", "pw-admin");
+        CHECK(a);
+        imdbc *x = NULL;
+        imdb_err e = {0};
+        SOFT(imdbc_connect(g_sock, "admin", "wrong", 5, &x, &e) == IMDB_ERR_AUTH); /* one refused */
+        reply r = {0};
+        SOFT(q1(a, "SELECT 1", &r) == 0 && !r.nerr);
+        SOFT(q1(a, "SHOW STATS", &r) == 0 && !r.nerr);
+        long long v = -1;
+        SOFT(srv_row(r.text, "server.logins.ok", &v) == 0 && v == 1);
+        SOFT(srv_row(r.text, "server.logins.refused", &v) == 0 && v == 1);
+        SOFT(srv_row(r.text, "server.kills.done", &v) == 0 && v == 0);
+        SOFT(srv_row(r.text, "server.copy.in", &v) == 0 && v == 0);
+        SOFT(srv_row(r.text, "server.connections.ended.refused", &v) == 0);
+        SOFT(srv_row(r.text, "server.disk.data_free_bytes", &v) == (headroom ? 0 : -1));
+        int nr = srv_rows(r.text);
+        SOFT(nr == 42 + (headroom ? 4 : 0) + IMDBS_END_N); /* (46 rows less the four free-space ones, then the ends) */
+        if (nr != 42 + (headroom ? 4 : 0) + IMDBS_END_N) fprintf(stderr, "    headroom %d: %d server rows\n", headroom, nr);
+        SOFT(srv_row(r.text, "wakeups", &v) < 0 && !strstr(r.text, "server.ticks"));
+        /* the export: the same rows, written at most once a second while statements run */
+        bool found = false;
+        for (int w = 0; w < 300 && !found; w++) {
+            SOFT(q1(a, "SELECT 1", &r) == 0);
+            FILE *f = fopen(sp, "r");
+            char buf[16384];
+            size_t n = f ? fread(buf, 1, sizeof buf - 1, f) : 0;
+            if (f) fclose(f);
+            buf[n] = 0;
+            found = strstr(buf, "\nserver.logins.ok 1\n") && strstr(buf, "\nserver.connections.ended.unauth ");
+            if (!found) usleep(20000);
+        }
+        SOFT(found);
+        /* a role's SHOW STATS: a superuser's statement */
+        imdbc *p = login("plain", "pw");
+        SOFT(p && q1(p, "SHOW STATS", &r) == 0 && r.nerr == 1 && strstr(r.err, "permission denied"));
+        imdbc_close(p);
+        imdbc_close(a);
+        unserve(db, s);
+        imdbsp_test_free(IMDBSP_FREE_DATA, -1), imdbsp_test_free(IMDBSP_FREE_SPOOL, -1);
+    }
+}
 /* 2b-2b: state recorded before the reply that announces it, held to it by a pause at every point where a client may
  * already know (imdbs_test_reply_hold, 20 ms: after a verdict's write, around a READY's flush, after a push): a login
  * listed as soon as its verdict is read, a BEGIN's session IN_TXN and a query's request counted as soon as its READY is.
@@ -4665,6 +4743,7 @@ const test_case server_tests[] = {
     {"server_disk_enospc", t_server_disk_enospc},
     {"server_kill_wake", t_server_kill_wake},
     {"server_logins_budget", t_server_logins_budget},
+    {"server_stats", t_server_stats},
     {"server_refused_churn", t_server_refused_churn},
     {"server_res_spool_faults", t_server_res_spool_faults},
     {"server_res_batch_refused", t_server_res_batch_refused},

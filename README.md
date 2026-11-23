@@ -565,7 +565,13 @@ statement and how long it has run. Syncs (`process.syncs.*`) are the process's,
 every database it opened. A statement's latency runs from the end of its parse to
 its own end: the parse is not in it, swapping its session's transaction in is.
 Latencies are read from buckets four to an octave:
-a quantile is at most a quarter above the true one. `SHOW TRANSACTIONS` lists
+a quantile is at most a quarter above the true one. Under imagedb-server, `SHOW STATS` and the `--stats` export also
+carry the server's own rows after the engine's, `server.*`: connections (accepted, live, and ended by cause:
+`server.connections.ended.left`, `.send`, `.kill`, `.idle` and the rest), logins (ok, refused, a role's refused by its
+caps, by binding type), requests, statements, cancels and KILLs, the queues' and replies' bounds (`server.replies.*`,
+`server.queue.*`), spilled results (`server.results.*`), COPY (`server.copy.*`), the spools' bytes, and the disk
+headroom's refusals (with `--disk-headroom`, the free bytes and whether each directory is below it).
+`SHOW TRANSACTIONS` lists
 every open transaction: its state (active, parked, doomed, begun), isolation,
 age, time since its last statement, writes and locks.
 

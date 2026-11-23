@@ -6786,7 +6786,13 @@ int imdb_stats_each(imdb_db *db, imdb_stat_fn fn, void *ctx, bool walk_disk)
     STAT("events.lines", db->events_lines); /* P1 M2 */
     STAT("events.errors", db->events_errors);
 #undef STAT
-    return 0;
+    return db->stat_src ? db->stat_src(db->stat_src_ctx, fn, ctx) : 0; /* N1e: the server's rows after the engine's */
+}
+
+void imdb_stats_source(imdb_db *db, imdb_stat_source src, void *src_ctx)
+{
+    db->stat_src = src;
+    db->stat_src_ctx = src ? src_ctx : NULL;
 }
 
 typedef struct stats_out {
