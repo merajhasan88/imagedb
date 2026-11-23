@@ -6460,6 +6460,9 @@ int main(int argc, char **argv)
     /* 2b-2b: every imagedb sort in runs of this many (the tables here stay under one run of 512), so the merges and the
      * permutation answer against the five engines too */
     if (getenv("IMDB_ORACLE_SORT_RUN")) imdb_sql_set_sort_run((size_t)atoi(getenv("IMDB_ORACLE_SORT_RUN")));
+    /* topk: ORDER BY ... LIMIT through the selection (0 its rule, a quarter of the rows or fewer; 2 whenever a LIMIT cuts
+     * the rows; 1 never), so the five engines check the rows it keeps: cross_check runs both plans through one sort */
+    if (getenv("IMDB_ORACLE_TOPK")) imdb_sql_set_sort_topk(atoi(getenv("IMDB_ORACLE_TOPK")));
     unsigned lo = 1, hi = 20;
     int steps = 80;
     bool keep_going = false, ping = false;
@@ -6551,6 +6554,8 @@ int main(int argc, char **argv)
            "SQLite; an INT64 overflow: REAL in SQLite; INT64 past 2^53 in FLOAT64: rounded by all; MySQL's INT64_MIN DIV n; SQL Server's INT64_MIN %% -1); %ld both refused "
            "for another reason\n", g_excused, g_eng[D_PG].on ? "" : " (UNGUARDED: PostgreSQL was not run)", g_class_diff);
     printf("oracle: DROP TABLE u made again %ld times on every engine\n", g_drops);
+    printf("oracle: %llu ORDER BY sorts took the top-k (IMDB_ORACLE_TOPK: %s)\n", (unsigned long long)imdb_sql_sorts_topk(),
+           getenv("IMDB_ORACLE_TOPK") ? getenv("IMDB_ORACLE_TOPK") : "unset, its rule");
     printf("oracle: %ld refusals of a subquery imagedb runs on demand excused (P2 S11: SQL Server, MySQL and MariaDB "
            "evaluate it before the rows; PostgreSQL never excused)\n", g_lazy_early);
     printf("oracle: %ld refusals under HAVING, LIMIT or OFFSET excused: the reference refused the same statement without them\n",

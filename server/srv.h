@@ -175,6 +175,12 @@ int imdbs_cert_days(const imdbs *s);
 void imdbs_test_copy_hold(uint32_t ms);
 /* tests: a connection's thread sleeps ms after a wake, then polls again (0: none): the KILL race made deterministic */
 void imdbs_test_wake_hold(uint32_t ms);
+/* tests: once, the thread of connection conn (a SESSIONS id; 0: none, and any hold released) holds as it takes its next
+ * frame until imdbs_test_frame_release (at most 10 s), imdbs_test_frame_held giving conn meanwhile: the KILL race
+ * mid-read made deterministic, by the victim's own thread */
+void imdbs_test_frame_hold(uint64_t conn);
+uint64_t imdbs_test_frame_held(void);
+void imdbs_test_frame_release(void);
 /* 2b-2b, tests: a pause (us, 0 none) where a client may already know what the server then records: state ordering */
 void imdbs_test_reply_hold(uint32_t us);
 /* tests: a pause (us) between a request's count and its READY's flush alone (what a wait on the count reads before)

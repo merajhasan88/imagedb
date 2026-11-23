@@ -4665,6 +4665,167 @@ whole: /* no image worth its cost: xsort's merge of the words, the comparison wh
     return xsort_body(x, ord, n, sizeof *ord, &kc, e);
 }
 
+/* ---- ORDER BY ... LIMIT as a bounded top-k (topk, 2026-11-22; deferred.md D35) ------------------------------------
+ * Where the window after a sort of sites 3, 5 and 8 reads only the order array's first K = OFFSET + LIMIT elements (no
+ * DISTINCT, whose window passes over the rows it drops: its count is not bounded by them), only those K are found and
+ * sorted. The comparison is total (cmp_order_at: the default order breaking every tie, so no two elements compare
+ * equal), so the K least are one set whatever finds them, and sorted they are the full sort's first K, byte for byte.
+ * Found in place in ord (nothing allocated: a permutation always, so a stop leaves one): the first B = K + max(K, 64)
+ * elements selected (ord[K - 1] the K-th least, those before it less, those after it greater), ord[K - 1] then the
+ * threshold each later element is compared with once; one less is swapped in after the K, and when B are held they are
+ * selected again (a buffer, ClickHouse's and DuckDB's way: an element in descending arrival costs a few comparisons, where
+ * a heap of K would sift each one through log2 K levels). The selection is quickselect with medians of three, a heap's
+ * selection past 2 log2 B rounds (so no input costs more than B log2 K). The K are then sorted by xsort_ord_body (its
+ * images, its checks, its memory rule: its requests are no larger than the full sort's at the same heap, and an array
+ * already in order is found by the full sort's own in-order pass first, so a request the full sort never makes is never
+ * made). Phases at the hook: 7 the threshold's pass, 8 the selections. Past n / TOPK_FRAC the full sort is taken
+ * (measured: topk's REPORT) */
+static int g_sort_topk; /* tests: 0 the top-k where taken; 1 never (the full sort); 2 whenever K < n; 3 as 2, the
+                         * selections by heaps alone */
+static _Atomic uint64_t g_sorts_topk; /* tests: the top-k's runs */
+void imdb_sql_set_sort_topk(int mode) { g_sort_topk = mode; }
+uint64_t imdb_sql_sorts_topk(void) { return atomic_load_explicit(&g_sorts_topk, memory_order_relaxed); }
+enum { TOPK_FRAC = 4, TOPK_BUF = 64 };
+
+static inline int tk_c(xabs *s, uint64_t a, uint64_t b)
+{
+    s->left--;
+    return cmp_order_at(s->c, a, b, 0);
+}
+
+static inline void tk_swap(uint64_t *w, size_t i, size_t j)
+{
+    uint64_t t = w[i];
+    w[i] = w[j];
+    w[j] = t;
+}
+
+/* h[0, m) a heap with its greatest first: h[i] sifted down */
+static int tk_sift(xabs *s, uint64_t *h, size_t m, size_t i)
+{
+    for (;;) {
+        size_t l = 2 * i + 1, big = i;
+        if (l >= m) break;
+        if (tk_c(s, h[l], h[big]) > 0) big = l;
+        if (l + 1 < m && tk_c(s, h[l + 1], h[big]) > 0) big = l + 1;
+        if (big == i) break;
+        tk_swap(h, i, big);
+        i = big;
+    }
+    XAB_CHECK(s, 8);
+    return IMDB_OK;
+}
+
+/* w[lo, hi) arranged so that w[k] is the element a sort would put there, those before it less and those after it greater,
+ * by a heap of w[lo, k]: each later element less than its greatest swapped in for it */
+static int tk_heapsel(xabs *s, uint64_t *w, size_t lo, size_t hi, size_t k)
+{
+    uint64_t *h = w + lo;
+    size_t m = k - lo + 1;
+    for (size_t i = m / 2; i-- > 0;)
+        if (tk_sift(s, h, m, i)) return s->rc;
+    for (size_t j = k + 1; j < hi; j++) {
+        if (tk_c(s, w[j], h[0]) < 0) {
+            tk_swap(w, lo, j); /* (the greatest out: greater than every element the heap keeps from now on) */
+            if (tk_sift(s, h, m, 0)) return s->rc;
+        } else {
+            XAB_CHECK(s, 8);
+        }
+    }
+    tk_swap(w, lo, k);
+    return IMDB_OK;
+}
+
+/* the same by quickselect: a median of three the pivot, w[lo, hi) partitioned about it, the side holding k kept; the
+ * heap's selection past 2 log2 (hi - lo) rounds */
+static int tk_select(xabs *s, uint64_t *w, size_t lo, size_t hi, size_t k)
+{
+    unsigned rounds = 0, lim = g_sort_topk == 3 ? 0 : 2u * (unsigned)(64 - __builtin_clzll((uint64_t)(hi - lo) | 1));
+    while (hi - lo > 1) {
+        if (rounds++ >= lim) return tk_heapsel(s, w, lo, hi, k);
+        size_t mid = lo + (hi - lo) / 2, p;
+        uint64_t a = w[lo], b = w[mid], cc = w[hi - 1];
+        if (tk_c(s, a, b) < 0) p = tk_c(s, b, cc) < 0 ? mid : tk_c(s, a, cc) < 0 ? hi - 1 : lo;
+        else p = tk_c(s, a, cc) < 0 ? lo : tk_c(s, b, cc) < 0 ? hi - 1 : mid;
+        tk_swap(w, p, hi - 1);
+        uint64_t pv = w[hi - 1];
+        size_t st = lo;
+        for (size_t i = lo; i < hi - 1; i++) {
+            if (tk_c(s, w[i], pv) < 0) tk_swap(w, i, st++);
+            XAB_CHECK(s, 8);
+        }
+        tk_swap(w, st, hi - 1);
+        if (k == st) return IMDB_OK;
+        if (k < st) hi = st;
+        else lo = st + 1;
+    }
+    return IMDB_OK;
+}
+
+/* ord's K least elements (1 <= K < n) found and sorted into ord[0, K) (the rest after them, in no order) */
+static int xtopk_ord(xctx *x, uint64_t *ord, uint64_t n, uint64_t K, const ordctx *c, int site, imdb_err *e)
+{
+    atomic_fetch_add_explicit(&g_sorts_topk, 1, memory_order_relaxed);
+    if (!K) return IMDB_OK; /* LIMIT 0: the window reads none */
+    int64_t left = (int64_t)(x->next_check > x->ticks ? x->next_check - x->ticks : 1);
+    xabs s = {x, c, e, left, site, IMDB_OK, 0};
+    int rc = IMDB_OK;
+    uint64_t pre = 1;
+    /* already in order: the full sort's own pass (its first K the answer, nothing made or asked) */
+    while (pre < n && cmp_order_at(c, ord[pre - 1], ord[pre], 0) < 0) {
+        pre++;
+        if (--s.left <= 0 && (rc = xab_tick(&s, 5))) goto out;
+    }
+    if (pre == n) goto out;
+    size_t B = (size_t)K + (K > TOPK_BUF ? (size_t)K : TOPK_BUF), b = (size_t)K;
+    if (B > n) B = (size_t)n;
+    if ((rc = tk_select(&s, ord, 0, B, (size_t)K - 1))) goto out;
+    for (size_t j = B; j < n; j++) {
+        if (tk_c(&s, ord[j], ord[K - 1]) < 0) { /* (ord[K - 1]: the K-th least of those held since the last selection) */
+            tk_swap(ord, b++, j);
+            if (b == B) {
+                if ((rc = tk_select(&s, ord, 0, b, (size_t)K - 1))) goto out;
+                b = (size_t)K;
+            }
+        }
+        if (s.left <= 0 && (rc = xab_tick(&s, 7))) goto out;
+    }
+    if (b > K) rc = tk_select(&s, ord, 0, b, (size_t)K - 1);
+out:
+    x->ticks = s.left > 0 ? x->next_check - (uint64_t)s.left : x->next_check;
+    if (rc || pre == n) return rc;
+    rc = xsort_ord_body(x, ord, K, c, site, e);
+#ifdef IMDB_STORE_CHECKS
+    for (uint64_t i = K; !rc && i < n; i++) /* (every element past the K after the K-th) */
+        if (cmp_order_at(c, ord[K - 1], ord[i], 0) >= 0) {
+            fprintf(stderr, "xtopk_ord: site %d left element %llu of %llu before the %llu kept\n", site,
+                    (unsigned long long)i, (unsigned long long)n, (unsigned long long)K);
+            abort();
+        }
+#endif
+    return rc;
+}
+
+/* ORDER BY's sort where the window then reads ord: the top-k when it reads only OFFSET + LIMIT of n elements, a small
+ * part of them, else the full sort */
+static int xsort_ord_cut(xctx *x, uint64_t *ord, uint64_t n, const ordctx *c, int site, imdb_err *e)
+{
+    const sql_stmt *st = c->st;
+    uint64_t K = 0;
+    bool topk = g_sort_topk != 1 && !g_sort_reference && st->has_limit && !st->distinct &&
+                !__builtin_add_overflow(st->limit, st->has_offset ? st->offset : 0, &K) &&
+                (!st->limit || (K < n && (g_sort_topk >= 2 || K <= n / TOPK_FRAC)));
+    if (!topk) return xsort_ord(x, ord, n, c, site, e);
+    if (!st->limit) K = 0; /* (LIMIT 0: no row read, OFFSET's none passed) */
+    if (!g_sort_timed) return xtopk_ord(x, ord, n, K, c, site, e);
+    uint64_t t0 = imdb_mono_ns();
+    int rc = xtopk_ord(x, ord, n, K, c, site, e);
+    uint64_t dt = imdb_mono_ns() - t0;
+    atomic_fetch_add_explicit(&g_sort_ns, dt, memory_order_relaxed);
+    if (site > 0 && site < 16) atomic_fetch_add_explicit(&g_sort_ns_site[site], dt, memory_order_relaxed);
+    return rc;
+}
+
 /* a built cell as a value (TEXT points into r's text: read only once every row is built) */
 static void cell_x(const imdb_result *r, const imdb_cell *c, imdb_xval *v)
 {
@@ -5208,7 +5369,7 @@ static int reorder_rows(xctx *x, const sql_stmt *st, imdb_xval *keys, imdb_resul
             if (st->ord_pos[o]) cell_x(r, &r->cells[i * r->ncols + st->ord_pos[o] - 1], &keys[i * st->norder + o]);
     if (st->norder) {
         ordctx c = {st, keys, NULL};
-        if (xsort_ord(x, ord, n, &c, 3, e)) {
+        if (xsort_ord_cut(x, ord, n, &c, 3, e)) { /* topk: OFFSET + LIMIT of them read: the top-k, else the full sort */
             imdb_free(ord);
             return e->code;
         }
@@ -5357,7 +5518,7 @@ static int materialize(xctx *x, const sql_stmt *st, imdb_table *t, sink *k, imdb
         for (uint64_t i = 0; !rc && i < n; i++) ord[i] = i;
         if (!rc && st->norder) {
             ordctx c = {st, k->wok, kv};
-            rc = xsort_ord(x, ord, n, &c, 5, e); /* 2b-2b: its own checks (it ran to its end before) */
+            rc = xsort_ord_cut(x, ord, n, &c, 5, e); /* 2b-2b: its own checks; topk: the top-k where it reads few */
         }
         if (!rc) rc = window_init(&w, st, r, e);
         for (uint64_t j = 0; !rc && j < n && w.left; j++) {
@@ -7910,7 +8071,7 @@ static int join_materialize(xctx *x, const sql_stmt *st, jctx *j, sink *k, imdb_
     }
     if (!rc && keys) {
         ordctx c = {st, keys, NULL};
-        rc = xsort_ord(x, ord, n, &c, 8, e); /* 2b-2b: its own checks (it ran to its end before) */
+        rc = xsort_ord_cut(x, ord, n, &c, 8, e); /* 2b-2b: its own checks; topk: the top-k where it reads few */
     }
     if (!rc) rc = window_init(&w, st, r, e);
     for (uint64_t jx = 0; !rc && jx < n && w.left; jx++) {

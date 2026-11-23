@@ -840,14 +840,19 @@ static const sort_stmt k_sort_stmts[] = {
     {"SELECT id FROM s ORDER BY 'prefix-' || CAST(id * 7919 % 5003 AS TEXT)", false, false, S_(5), false, S_(0) | S_(1) | S_(3) | S_(4) | S_(6), 5},
     {"SELECT id, v FROM s ORDER BY CASE WHEN v < 0 THEN v END, v DESC, id", false, false, S_(5), false, S_(3), 5}, /* a first key NULL in every row: the scan past its NULLs */
     {"SELECT id FROM s4 ORDER BY k, id", false, false, S_(5), false, S_(6), 5}, /* 2b-3: the sampled prefix pass alone */
+    /* topk: ORDER BY ... LIMIT's top-k: its threshold's pass over 5,000 rows out of order (phase 7), its selections over
+     * 2,000 (phase 8); a join's pairs (site 8) and grouped rows (site 3) cut the same way */
+    {"SELECT id FROM s2 ORDER BY p LIMIT 3", false, false, S_(5), false, S_(7), 5},
+    {"SELECT id FROM s2 ORDER BY p LIMIT 1000", false, false, S_(5), false, S_(8), 5},
+    {"SELECT a.id FROM s AS a JOIN s2 AS b ON a.id = b.p ORDER BY b.v, a.id DESC LIMIT 2", false, false, S_(8), false, S_(7), 8},
 };
 
 typedef struct sort_hook_ctx {
     int mode;      /* 0: count, 1: another thread's cancel, 2: a sleep past the statement's deadline */
     int at_phase;  /* the stop at the first check of this phase (0 a run, 1 a merge, 2 the permutation; sortpg: 3 the
                     * images, 4 a merge from the right, 5 the in-order pass) */
-    int seen[7];   /* checks seen by phase (6: the shared prefix's pass) */
-    uint8_t sp[32]; /* the phases seen checking at each site */
+    int seen[9];   /* checks seen by phase (6: the shared prefix's pass; topk: 7 the threshold's pass, 8 the selections) */
+    uint16_t sp[32]; /* the phases seen checking at each site */
     uint32_t sites; /* the sites seen checking */
     bool fired;
     int sleep_ms; /* mode 2: how long the hook waits (past the statement's timeout; 0: 1,100 ms) */
@@ -862,9 +867,9 @@ static void *cancel_from(void *arg)
 static void sort_hook(void *arg, int phase, int site)
 {
     sort_hook_ctx *h = arg;
-    if (phase >= 0 && phase < 7) h->seen[phase]++;
+    if (phase >= 0 && phase < 9) h->seen[phase]++;
     if (site > 0 && site < 32) h->sites |= 1u << site;
-    if (site > 0 && site < 32 && phase >= 0 && phase < 7) h->sp[site] |= (uint8_t)(1u << phase);
+    if (site > 0 && site < 32 && phase >= 0 && phase < 9) h->sp[site] |= (uint16_t)(1u << phase);
     if (!h->mode || h->fired || phase != h->at_phase) return;
     h->fired = true;
     if (h->mode == 1) {
@@ -898,16 +903,18 @@ static void t_sort_stops(void)
         if (ss->write) RUN("BEGIN");
         int rc = run(ss->sql);
         if (ss->write) RUN("ROLLBACK");
-        int seen[7];
+        int seen[9];
         uint32_t shown = 0, need = ss->phases ? ss->phases : S_(0) | S_(1) | (ss->perm ? S_(2) : 0);
-        for (int p = 0; p < 7; p++) seen[p] = h.seen[p], shown |= seen[p] ? 1u << p : 0;
+        for (int p = 0; p < 9; p++) seen[p] = h.seen[p], shown |= seen[p] ? 1u << p : 0;
         if (ss->psite) shown = h.sp[ss->psite];
         bool counted = rc == 0 && (shown & need) == need && (h.sites & ss->sites) == ss->sites;
         SOFT(counted);
-        if (!counted) fprintf(stderr, "    %s: rc %d (%s), checks %d / %d / %d / %d / %d / %d / %d (at its site %#x), sites %#x of %#x\n", ss->sql, rc,
-                              g_e.msg, seen[0], seen[1], seen[2], seen[3], seen[4], seen[5], seen[6], (unsigned)shown, h.sites, ss->sites);
+        if (!counted)
+            fprintf(stderr, "    %s: rc %d (%s), checks %d / %d / %d / %d / %d / %d / %d / %d / %d (at its site %#x), sites %#x of %#x\n",
+                    ss->sql, rc, g_e.msg, seen[0], seen[1], seen[2], seen[3], seen[4], seen[5], seen[6], seen[7], seen[8],
+                    (unsigned)shown, h.sites, ss->sites);
         for (int mode = 1; mode <= 2; mode++)
-            for (int ph = 0; ph < 7; ph++) {
+            for (int ph = 0; ph < 9; ph++) {
                 if (!seen[ph] || (mode == 2 && ph)) continue; /* (the deadline: its first check alone) */
                 uint64_t stopped = 0;
                 char msg[sizeof g_e.msg];
@@ -996,6 +1003,7 @@ static void t_sort_order(void)
  * reference, each statement's time (the memory: its ceiling's tests, qmem) */
 static void t_sort_measure(void)
 {
+    imdb_sql_set_sort_topk(1); /* topk: this measures the full sort (LIMIT 1 is only its output's cut) */
     if (!getenv("IMDB_SORT_MEASURE")) return;
     const char *dir = test_tmpdir();
     imdb_err e = {0};
@@ -1054,6 +1062,7 @@ static void gap_hook(void *arg, int phase, int site)
  * their first eight bytes and every other row sharing them (the images taken, every comparison whole) */
 static void t_sort_gap(void)
 {
+    imdb_sql_set_sort_topk(1); /* topk: this measures the full sort (LIMIT 1 is only its output's cut) */
     if (!getenv("IMDB_SORT_MEASURE")) return;
     static const int rows[2] = {20000, 4000}, plen[2] = {4000, 32000};
     static const char *const how[4] = {"", ", one outlier", ", the sampled rows distinct", ", a second key (runs of 64: the 1,024 rows' pass)"};
@@ -1102,6 +1111,7 @@ static void t_sort_gap(void)
  * 50,000 rows, xsort against the C library's, alternating in blocks of ten, many repetitions */
 static void t_sort_measure_mid(void)
 {
+    imdb_sql_set_sort_topk(1); /* topk: this measures the full sort (LIMIT 1 is only its output's cut) */
     if (!getenv("IMDB_SORT_MEASURE")) return;
     static const int rows[2] = {5000, 50000}, reps[2] = {400, 40};
     for (int c = 0; c < 2; c++) {
@@ -1253,6 +1263,140 @@ static void t_sort_proto_equal(void)
 }
 
 
+/* topk: ORDER BY ... LIMIT's top-k against the full sort, id for id: every proto statement (single tables of every key
+ * type, grouped rows: site 3, a join's pairs: site 8) under eight cuts (LIMIT 0, 1, 7, 100, 100 OFFSET 50, 1 OFFSET 2999,
+ * 749 and 5000 of 3,000 rows), by quickselect, by heaps alone and where the default takes it; again after a tenth of the
+ * rows were updated; and the top-k ran (its runs counted) */
+static void t_sort_topk_equal(void)
+{
+    imdb_db *db;
+    proto_db(3000, &db);
+    CHECK(db);
+    static const char *const cut[] = {" LIMIT 0", " LIMIT 1", " LIMIT 7", " LIMIT 100", " LIMIT 100 OFFSET 50",
+                                      " LIMIT 1 OFFSET 2999", " LIMIT 749", " LIMIT 5000"};
+    static const int modes[] = {0, 2, 3};
+    /* and DISTINCT, whose window reads past the rows it drops (never the top-k): repeated values under every cut */
+    static const char *const dist[] = {"SELECT DISTINCT g FROM pt ORDER BY g DESC", "SELECT DISTINCT v % 13 FROM pt ORDER BY 1",
+                                       "SELECT DISTINCT id % 17 FROM pt ORDER BY 1 DESC"};
+    const size_t np = sizeof k_proto_stmts / sizeof *k_proto_stmts, nd = sizeof dist / sizeof *dist;
+    uint64_t runs0 = imdb_sql_sorts_topk();
+    bool updated = false;
+    char sql[512];
+    for (size_t s = 0; s < np + nd; s++) {
+        for (size_t c = 0; c < sizeof cut / sizeof *cut; c++) {
+            snprintf(sql, sizeof sql, "%s%s", s < np ? k_proto_stmts[s] : dist[s - np], cut[c]);
+            imdb_sql_set_sort_topk(1);
+            uint64_t nr, n;
+            int64_t *ref = proto_ids(sql, &nr);
+            CHECK(ref);
+            for (size_t m = 0; m < sizeof modes / sizeof *modes; m++) {
+                imdb_sql_set_sort_topk(modes[m]);
+                int64_t *got = proto_ids(sql, &n);
+                if (!got || n != nr || (n && memcmp(got, ref, n * sizeof *got))) {
+                    fprintf(stderr, "    %s: the top-k (mode %d) differs from the full sort (%llu rows, %llu)\n", sql, modes[m],
+                            (unsigned long long)n, (unsigned long long)nr);
+                    free(got);
+                    free(ref);
+                    imdb_sql_set_sort_topk(0);
+                    CHECK(0);
+                }
+                free(got);
+            }
+            free(ref);
+        }
+        if (s + 1 == np + nd && !updated) {
+            imdb_sql_set_sort_topk(0);
+            RUN("UPDATE pt SET g = g + 1 WHERE id % 10 = 3");
+            updated = true;
+            s = (size_t)-1;
+        }
+    }
+    /* again after a CHECKPOINT (the rows' segments written: the matrix's eager and tiny modes then read them from the
+     * lake), then with cross_check on (each statement's two plans, each through the top-k, compared by the engine) */
+    for (int pass = 0; pass < 2; pass++) {
+        imdb_sql_set_sort_topk(0);
+        RUN(pass == 0 ? "CHECKPOINT" : "SET cross_check = on");
+        uint64_t pr = imdb_sql_sorts_topk();
+        for (size_t s = 0; s < np + nd; s++)
+            for (size_t c = 0; c < sizeof cut / sizeof *cut; c++) {
+                snprintf(sql, sizeof sql, "%s%s", s < np ? k_proto_stmts[s] : dist[s - np], cut[c]);
+                imdb_sql_set_sort_topk(1);
+                uint64_t nr, n;
+                int64_t *ref = proto_ids(sql, &nr);
+                CHECK(ref);
+                imdb_sql_set_sort_topk(2);
+                int64_t *got = proto_ids(sql, &n);
+                bool same = got && n == nr && (!n || !memcmp(got, ref, n * sizeof *got));
+                free(got);
+                free(ref);
+                if (!same) {
+                    fprintf(stderr, "    %s: the top-k differs from the full sort (%s)\n", sql, pass ? "cross_check" : "after a CHECKPOINT");
+                    imdb_sql_set_sort_topk(0);
+                    CHECK(0);
+                }
+            }
+        SOFT(imdb_sql_sorts_topk() > pr); /* (this pass's own statements took the top-k, not the full sort twice) */
+    }
+    RUN("SET cross_check = off");
+    imdb_sql_set_sort_topk(0);
+    SOFT(imdb_sql_sorts_topk() > runs0);
+    done(db);
+}
+
+/* topk's measure (printed, never asserted; IMDB_TOPK_MEASURE=rows, else skipped): ORDER BY v and ORDER BY s (TEXT) with
+ * LIMIT 1, 10 and 1000, the full sort against the top-k, the statement's time, the least of three */
+static void t_sort_topk_measure(void)
+{
+    const char *env = getenv("IMDB_TOPK_MEASURE");
+    if (!env) return;
+    int nrows = atoi(env);
+    imdb_db *db;
+    proto_db(nrows, &db);
+    CHECK(db);
+    static const char *const keys[] = {"v", "s"};
+    static const int lims[] = {1, 10, 1000};
+    for (size_t k = 0; k < 2; k++)
+        for (size_t l = 0; l < 3; l++) {
+            char sql[128];
+            snprintf(sql, sizeof sql, "SELECT id FROM pt ORDER BY %s LIMIT %d", keys[k], lims[l]);
+            double best[2] = {1e30, 1e30}, s4[2] = {0, 0}, s5[2] = {0, 0}; /* the best run's, and its sites 4 and 5's sorts */
+            imdb_sql_sort_time(true);
+            for (int run = 0; run < 3; run++)
+                for (int full = 0; full < 2; full++) {
+                    imdb_sql_set_sort_topk(full ? 1 : 0);
+                    imdb_result r;
+                    uint64_t a4 = imdb_sql_sort_ns_site(4), a5 = imdb_sql_sort_ns_site(5), t0 = imdb_mono_ns();
+                    CHECK(q(sql, &r) == 0);
+                    double ms = (double)(imdb_mono_ns() - t0) / 1e6;
+                    imdb_result_free(&r);
+                    if (ms < best[full])
+                        best[full] = ms, s4[full] = (double)(imdb_sql_sort_ns_site(4) - a4) / 1e6,
+                        s5[full] = (double)(imdb_sql_sort_ns_site(5) - a5) / 1e6;
+                }
+            imdb_sql_sort_time(false);
+            fprintf(stderr, "    %d rows, %s: full sort %.1f ms (site 4 %.1f, site 5 %.1f), top-k %.1f ms (site 4 %.1f, site 5 %.1f)\n",
+                    nrows, sql, best[1], s4[1], s5[1], best[0], s4[0], s5[0]);
+        }
+    /* the floors: the same rows walked with no key kept (a count over a predicate every row meets, then the ids of
+     * every row unsorted, LIMIT cutting the output alone), so a top-k in the walk can be priced before it is built */
+    static const char *const floors[] = {"SELECT COUNT(*) FROM pt WHERE v + 0 >= -9223372036854775807",
+                                         "SELECT id FROM pt WHERE v + 0 >= -9223372036854775807 LIMIT 1"};
+    for (size_t f = 0; f < 2; f++) {
+        double best = 1e30;
+        for (int run = 0; run < 3; run++) {
+            imdb_result r;
+            uint64_t t0 = imdb_mono_ns();
+            CHECK(q(floors[f], &r) == 0);
+            double ms = (double)(imdb_mono_ns() - t0) / 1e6;
+            imdb_result_free(&r);
+            if (ms < best) best = ms;
+        }
+        fprintf(stderr, "    %d rows, the floor %s: %.1f ms\n", nrows, floors[f], best);
+    }
+    imdb_sql_set_sort_topk(0);
+    done(db);
+}
+
 /* sortpg: the images at their edges, each statement's order against the C library's whole: INT64's ends beside NULLs in
  * both places and directions (a NULL's image a value's), -0 beside 0, DECIMALs past int64 (saturated: equal images, the
  * values in the opposite order to their ids) spread and only late, a value shorter than the others' shared prefix and one
@@ -1335,6 +1479,7 @@ static void t_sort_proto_edges(void)
  * with a tenth of its rows updated, then inserted in another order */
 static void t_sort_site4(void)
 {
+    imdb_sql_set_sort_topk(1); /* topk: this measures the full sort (LIMIT 1 is only its output's cut) */
     if (!getenv("IMDB_SORT_MEASURE")) return;
     int n = getenv("IMDB_SORT_ROWS") ? atoi(getenv("IMDB_SORT_ROWS")) : 200000;
     imdb_db *db;
@@ -1422,6 +1567,7 @@ static void t_sort_proto_sizes(void)
 /* printed only (IMDB_SORT_MEASURE=1): the sort's own time (and the statement's) by method, keys and size */
 static void t_sort_proto_measure(void)
 {
+    imdb_sql_set_sort_topk(1); /* topk: this measures the full sort (LIMIT 1 is only its output's cut) */
     if (!getenv("IMDB_SORT_MEASURE")) return;
     static const int rows[6] = {10, 100, 500, 5000, 50000, 1000000}, reps[6] = {20000, 4000, 1000, 200, 20, 3};
     static const char *const ms[] = {"v", "s", "p", "q", "c2", "vn DESC", "g, s", "f", "d", "w", "CASE WHEN v % 2 = 0 THEN v ELSE v + 0.5 END", "id",
@@ -1481,6 +1627,8 @@ const test_case cancel_tests[] = {
     {"cancel_sort_gap", t_sort_gap},
     {"cancel_sort_measure_mid", t_sort_measure_mid},
     {"cancel_sort_proto_equal", t_sort_proto_equal},
+    {"cancel_sort_topk_equal", t_sort_topk_equal},
+    {"cancel_sort_topk_measure", t_sort_topk_measure},
     {"cancel_sort_proto_edges", t_sort_proto_edges},
     {"cancel_sort_proto_sizes", t_sort_proto_sizes},
     {"cancel_sort_proto_measure", t_sort_proto_measure},

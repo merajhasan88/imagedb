@@ -169,12 +169,14 @@ int main(int argc, char **argv)
             imdb_sql_set_sort_run(0);              /* one set leaves it set for no later test */
             imdb_sql_set_sort_reference(false);
             imdb_sql_set_sort_noab(false);         /* sortpg: no image (the old path), no in-order pass, the timers */
+            imdb_sql_set_sort_topk(0);             /* topk: the top-k where taken */
             imdb_sql_set_sort_nopre(false);
             imdb_sql_sort_time(false);
             imdbs_test_reply_hold(0);
             imdbs_test_count_hold(0);
             imdbs_test_copy_hold(0);
             imdbs_test_wake_hold(0);
+            imdbs_test_frame_hold(0);
             imdbsp_no_release(false);
             imdbsp_no_tmpfile(false);
             imdbsp_fail_at(0);

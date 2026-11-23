@@ -911,6 +911,18 @@ static void out_fail(conn *c, int32_t code, const char *msg)
 static _Atomic uint32_t g_copy_hold_ms; /* tests: copy_wr sleeps this long before each write of a statement but its first */
 static _Atomic uint32_t g_wake_hold_ms; /* tests: a connection's thread sleeps this long after a wake, then polls again */
 void imdbs_test_wake_hold(uint32_t ms) { atomic_store_explicit(&g_wake_hold_ms, ms, memory_order_relaxed); }
+/* tests: once, the thread of the connection whose id is g_frame_hold_conn holds as it takes a frame, until released (at
+ * most 10 s), its id in g_frame_held meanwhile: the KILL race mid-read made deterministic, by the victim's thread alone */
+static _Atomic uint64_t g_frame_hold_conn, g_frame_held;
+static _Atomic bool g_frame_release;
+void imdbs_test_frame_hold(uint64_t id)
+{
+    atomic_store(&g_frame_held, 0);
+    atomic_store(&g_frame_release, id == 0);
+    atomic_store(&g_frame_hold_conn, id);
+}
+uint64_t imdbs_test_frame_held(void) { return atomic_load(&g_frame_held); }
+void imdbs_test_frame_release(void) { atomic_store(&g_frame_release, true); }
 void imdbs_test_copy_hold(uint32_t ms) { atomic_store_explicit(&g_copy_hold_ms, ms, memory_order_relaxed); }
 
 /* 2b-2b, tests: a pause at each point where a client may already know what the server is about to record (after a
@@ -1915,12 +1927,30 @@ static void kill_answer(conn *c, const imdbw_msg *m)
 
 /* a frame from the client: a request queued, CANCEL and PING answered here; false when the connection is to end (a
  * protocol error, after its ERROR) */
-static bool take_frame(conn *c, uint8_t type, uint8_t *body, uint32_t len, bool *terminate)
+static bool take_frame(conn *c, uint8_t type, uint8_t *body, uint32_t len, bool *terminate, bool *killed_out)
 {
     imdbs *s = c->s;
     imdb_err e = {0};
     imdbw_msg m;
     memset(&m, 0, sizeof m);
+    pthread_mutex_lock(&s->mu);
+    bool copying = (c->cin == CIN_OPEN && !c->cin_end) || c->cin == CIN_DISCARD;
+    bool killed = c->kill_term; /* (under mu, as kill_answer sets it before its KILL_DONE) */
+    pthread_mutex_unlock(&s->mu);
+    uint64_t hc = atomic_load(&g_frame_hold_conn);
+    if (hc && hc == c->id && atomic_compare_exchange_strong(&g_frame_hold_conn, &hc, 0)) {
+        atomic_store(&g_frame_held, c->id); /* (tests: this frame taken, the rest of the read after it: the KILL mid-read) */
+        for (int i = 0; i < 10000 && !atomic_load(&g_frame_release); i++) usleep(1000);
+    }
+    if (killed) { /* a KILL's terminate set: no frame is decoded, answered or queued after it, wherever the read stands
+                   * (pull reads every frame its socket holds, so a check at the wake alone left a frame read later in the
+                   * same pull answered after the KILL_DONE: the advisor's 11-22 review; a malformed one would have been
+                   * refused as a protocol error); pull returns to the loop's top, which ends the session, its ERROR the
+                   * KILL's */
+        *killed_out = true;
+        imdbw_free(body);
+        return true;
+    }
     if (imdbw_msg_get(type, body, len, NULL, &m, &e)) {
         imdbw_free(body);
         char msg[300];
@@ -1930,9 +1960,6 @@ static bool take_frame(conn *c, uint8_t type, uint8_t *body, uint32_t len, bool 
         conn_put(c, &er);
         return false;
     }
-    pthread_mutex_lock(&s->mu);
-    bool copying = (c->cin == CIN_OPEN && !c->cin_end) || c->cin == CIN_DISCARD;
-    pthread_mutex_unlock(&s->mu);
     if (copying && type != IMDBW_COPY_DATA && type != IMDBW_COPY_DONE && type != IMDBW_COPY_FAIL && type != IMDBW_CANCEL &&
         type != IMDBW_PING) { /* N1d: §4: after COPY_IN, COPY's frames to its end (CANCEL and PING answered here) */
         imdbw_msg_free(&m);
@@ -2068,9 +2095,11 @@ static int pull(conn *c, inframe *in)
         uint8_t *body = in->body;
         uint32_t blen = in->blen;
         in->body = NULL, in->hgot = in->bgot = in->blen = 0;
-        bool terminate = false;
-        if (!take_frame(c, in->type, body, blen, &terminate)) return 1;
+        bool terminate = false, killed = false;
+        if (!take_frame(c, in->type, body, blen, &terminate, &killed)) return 1;
         if (terminate) return 2;
+        if (killed) return 0; /* (a KILL's terminate: back to the loop's top, which ends the session, however fast its
+                               * client still sends: never a read past it) */
     }
 }
 

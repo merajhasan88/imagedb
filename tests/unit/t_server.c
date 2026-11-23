@@ -3129,7 +3129,10 @@ static void t_server_res_spill(void)
         for (int k = 0; k < 8; k++) {
             char ins[100];
             snprintf(ins, sizeof ins, "INSERT INTO m SELECT id + %d, v FROM big2", k * 1000000);
-            SOFT(q1(a, ins, &r) == 0 && !r.nerr);
+            int irc = q1(a, ins, &r);
+            SOFT(irc == 0 && !r.nerr);
+            if (irc || r.nerr) /* (11-22: failing in the group run, not alone: the cause printed) */
+                fprintf(stderr, "    %s: rc %d, nerr %u, code %u: %s\n", ins, irc, (unsigned)r.nerr, r.err_code, r.err);
         }
         q = "SELECT * FROM m", want = 1280000;
     }
@@ -4216,6 +4219,70 @@ static void t_server_kill_wake(void)
             fprintf(stderr, "    case %d: %s, %s\n", k, answered ? "answered" : "not answered", r.err[0] ? r.err : e.msg);
         imdbc_close(v);
     }
+    /* mid-read (the advisor's 11-22 reviews: pull reads every frame its socket holds, so a wake's check alone missed a
+     * frame read later in the same pull): a PING then a malformed frame (a PING with a body byte) in one write, the PING
+     * taken and held by the victim's own thread (imdbs_test_frame_hold: waited for as a fact, never a sleep), the KILL
+     * meanwhile, then the release: the PING answered (taken before the KILL); the malformed frame, read after it in the
+     * same pull, neither answered nor decoded (decoded, it would be refused as a protocol error); then the KILL's ERROR */
+    imdbc *v = login("admin", "pw-admin");
+    CHECK(v);
+    uint64_t vid = 0;
+    SOFT(list_of(a, &r));
+    for (uint32_t i = 0; i < r.nsess && i < 16; i++)
+        if (r.sess[i].id > vid) vid = r.sess[i].id;
+    imdbw_buf pb;
+    imdbw_buf_init(&pb);
+    imdbw_msg pm = {.type = IMDBW_PING};
+    imdbw_msg_put(&pb, &pm, NULL);
+    CHECK(!pb.err && pb.len == IMDBW_HEAD);
+    uint8_t two[2 * IMDBW_HEAD + 1];
+    memcpy(two, pb.p, IMDBW_HEAD);
+    memcpy(two + IMDBW_HEAD, pb.p, IMDBW_HEAD);
+    two[IMDBW_HEAD] = 2;     /* the second: its length (little-endian) the type and one byte, */
+    two[2 * IMDBW_HEAD] = 0; /* which a PING's body refuses */
+    imdbw_buf_free(&pb);
+    imdbs_test_frame_hold(vid);
+    SOFT(imdbc_send_raw(v, two, sizeof two, &e) == 0);
+    for (int i = 0; i < 10000 && imdbs_test_frame_held() != vid; i++) usleep(1000);
+    SOFT(vid && imdbs_test_frame_held() == vid); /* the victim's thread holds its PING, the malformed frame unread */
+    SOFT(kill_of(a, IMDBW_KILL_TERMINATE, vid, IMDBW_KILLED));
+    imdbs_test_frame_release();
+    SOFT(read_reply(v, &r) == 0 && r.pong); /* the PING: before the KILL */
+    r.err[0] = 0;
+    bool second = read_reply(v, &r) == 0 && r.pong;
+    SOFT(!second && strstr(r.err, "by a KILL"));
+    if (second || !strstr(r.err, "by a KILL")) fprintf(stderr, "    mid-read: %s, %s\n", second ? "answered" : "not answered", r.err);
+    imdbs_test_frame_hold(0);
+    imdbc_close(v);
+    /* pull's return at the dropped frame (the advisor's 22:2x review): the same frames, the victim's client closed while
+     * its thread holds the PING, so its close is behind them in the socket: back at the loop's top at once, the session
+     * ends as the KILL's (END_KILL, the first cause kept); read on, the thread would reach the close first and end it as
+     * a client that left (END_LEFT) */
+    imdbc *w = login("admin", "pw-admin");
+    CHECK(w);
+    uint64_t wid = 0;
+    SOFT(list_of(a, &r));
+    for (uint32_t i = 0; i < r.nsess && i < 16; i++)
+        if (r.sess[i].id > wid) wid = r.sess[i].id;
+    /* every earlier session's end counted first (ends[] moves at a connection thread's end, after its lingering close,
+     * just before live: so live at 2, a and w, means v's END_KILL is in k0, never a late count this case would take) */
+    for (int i = 0; i < 1000 && counts_of(s).live != 2; i++) usleep(10000);
+    SOFT(counts_of(s).live == 2);
+    uint64_t k0 = ends_of(s, IMDBS_END_KILL), l0 = ends_of(s, IMDBS_END_LEFT);
+    imdbs_test_frame_hold(wid);
+    SOFT(imdbc_send_raw(w, two, sizeof two, &e) == 0);
+    for (int i = 0; i < 10000 && imdbs_test_frame_held() != wid; i++) usleep(1000);
+    SOFT(wid && imdbs_test_frame_held() == wid);
+    SOFT(kill_of(a, IMDBW_KILL_TERMINATE, wid, IMDBW_KILLED));
+    imdbc_close(w); /* its client gone: the close behind the frames */
+    imdbs_test_frame_release();
+    for (int i = 0; i < 1000 && ends_of(s, IMDBS_END_KILL) + ends_of(s, IMDBS_END_LEFT) == k0 + l0; i++) usleep(10000);
+    uint64_t k1 = ends_of(s, IMDBS_END_KILL), l1 = ends_of(s, IMDBS_END_LEFT);
+    SOFT(k1 == k0 + 1 && l1 == l0);
+    if (k1 != k0 + 1 || l1 != l0)
+        fprintf(stderr, "    gone mid-read: ended by KILL %llu, LEFT %llu (want 1, 0)\n", (unsigned long long)(k1 - k0),
+                (unsigned long long)(l1 - l0));
+    imdbs_test_frame_hold(0);
     imdbc_close(a);
     unserve(db, s);
 }

@@ -182,6 +182,10 @@ void imdb_sql_set_sort_run(size_t n);
 /* sortpg (a prototype): ORDER BY's order arrays through abbreviated keys (0 off; 1 merged; 2 introsort); the insertion
  * sort's cutoff; comparisons counted */
 void imdb_sql_set_sort_noab(bool on);
+/* topk (ORDER BY ... LIMIT): 0 the top-k where taken (OFFSET + LIMIT at most a quarter of the rows); 1 never (the full
+ * sort); 2 whenever OFFSET + LIMIT is under the rows; 3 as 2, the selections by heaps alone. The top-k's runs */
+void imdb_sql_set_sort_topk(int mode);
+uint64_t imdb_sql_sorts_topk(void);
 void imdb_sql_sort_time(bool on);
 uint64_t imdb_sql_sort_ns(void);
 uint64_t imdb_sql_sort_ns_site(int site);
