@@ -4926,7 +4926,10 @@ static int log_new_segment(imdb_db *db, uint64_t seq, imdb_err *e)
 static int durable_publish(imdb_db *db, uint64_t seq, const uint8_t head[32], bool synced, bool sync_file,
                            imdb_err *e)
 {
-    /* a strict handle fsyncs every record before the commits it names are acknowledged, and says so */
+    /* a strict handle syncs every record before the commits it names are acknowledged, and says so. The first record
+     * a handle syncs is fsynced (a DURABLE the open made: its size and inode); every later one rewrites the same bytes
+     * in place, so fdatasync is enough, and it spares the journal commit an fsync makes for the mtime: a strict commit
+     * asks the disk for two flushes, the log's and this one, not three (flushcount.sh, /proc/diskstats: 3.00 -> 2.00) */
     imdb_durable w = {.seq = seq, .synced = synced, .strict = synced && db->strict};
     if (db->strict) sync_file = true;
     memcpy(w.head, head, 32);
@@ -4934,7 +4937,12 @@ static int durable_publish(imdb_db *db, uint64_t seq, const uint8_t head[32], bo
     imdb_durable_encode(&w, b);
     imdb_err ew = {0};
     if (imdb_pwrite_all(db->durfd, b, sizeof b, 0, &ew)) return imdb_fail(e, IMDB_ERR_IO, "DURABLE: %s", ew.msg);
-    if (sync_file && imdb_io_fsync(db->durfd) != 0) return imdb_fail(e, IMDB_ERR_IO, "DURABLE: fsync failed: %s", strerror(errno));
+    if (sync_file && db->dur_fsynced && imdb_io_fdatasync(db->durfd) != 0)
+        return imdb_fail(e, IMDB_ERR_IO, "DURABLE: fdatasync failed: %s", strerror(errno));
+    if (sync_file && !db->dur_fsynced) {
+        if (imdb_io_fsync(db->durfd) != 0) return imdb_fail(e, IMDB_ERR_IO, "DURABLE: fsync failed: %s", strerror(errno));
+        db->dur_fsynced = true;
+    }
     db->dur = w;
     db->have_dur = true;
     return IMDB_OK;

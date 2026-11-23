@@ -420,6 +420,7 @@ typedef struct imdb_db {
     uint64_t ice_reads;       /* F5c: the vectors, images and segments its layers read (the tests' measure: imdb_iceberg_reads) */
     int dirfd, logfd, lockfd;
     int durfd;                /* DURABLE (writable opens): the watermark, rewritten per append */
+    bool dur_fsynced;         /* DURABLE fsynced once by this handle (its size and inode durable): later records fdatasync */
     int anchorfd;             /* the external anchor (writable opens with an anchor), else -1 */
     char *anchor_path;        /* and its path: fencing reads whatever file is there now */
     int anchor_lockfd;        /* the anchor's writer lock (FILE.lock, flock), held for the handle's life: one writer */

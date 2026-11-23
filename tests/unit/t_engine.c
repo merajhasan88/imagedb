@@ -1075,13 +1075,16 @@ static void t_unknown_tables_bounded(void)
 }
 
 /* ---- group commit (the server's; docs/txn-design.md §6): the engine half ---------------------------------- */
-static int g_gc_datasyncs, g_gc_fail;
+static int g_gc_datasyncs, g_gc_fail, g_gc_durfd = -1, g_gc_dur_datasyncs, g_gc_dur_fsyncs;
 static uint64_t g_gc_hook;
 static long gc_before(imdb_io_call *c, void *ctx)
 {
     (void)ctx;
+    bool dur = g_gc_durfd >= 0 && c->fd == g_gc_durfd; /* DURABLE's syncs counted apart from the log's */
+    if (c->op == IMDB_IO_FSYNC && dur) g_gc_dur_fsyncs++;
     if (c->op != IMDB_IO_FDATASYNC) return 0;
-    g_gc_datasyncs++;
+    if (dur) g_gc_dur_datasyncs++;
+    else g_gc_datasyncs++;
     if (!g_gc_fail) return 0;
     errno = EIO; /* (as the fault harness: the callers read errno) */
     return -1;
@@ -1117,7 +1120,8 @@ static int gc_sql(imdb_db *db, const char *sql)
     return rc;
 }
 
-/* deferred commits make no fdatasync; one group sync makes them durable with one, DURABLE strict at the last, the hook
+/* deferred commits make no fdatasync; one group sync makes them durable with one of the log's and one of DURABLE's (an
+ * fdatasync: the handle fsynced it at its open), DURABLE strict at the last, the hook
  * told; a commit that may not defer (DDL) behind a pending group makes it durable by its own synced append; the cap;
  * the age bound; the switch refused under --nosync; a failed group sync stops the handle, and a reopen holds a prefix
  * of the group, every commit synced before it */
@@ -1137,16 +1141,19 @@ static void t_group_commit(void)
     CHECK(db->dur.strict && db->dur.seq == db->seq); /* the switch publishes its strict record */
     CHECK(db->group_ok && db->strict);
     imdb_set_durable_hook(db, gc_hook, NULL);
-    g_gc_datasyncs = 0, g_gc_fail = 0, g_gc_hook = 0;
+    g_gc_datasyncs = 0, g_gc_fail = 0, g_gc_hook = 0, g_gc_durfd = db->durfd, g_gc_dur_datasyncs = 0, g_gc_dur_fsyncs = 0;
     imdb_io_set_hooks(&g_gc_hooks);
     for (int64_t i = 1; i <= 10; i++) OK(ins1(db, i, 7, i, "g"));
     imdb_io_set_hooks(NULL);
-    CHECK(g_gc_datasyncs == 0);
+    CHECK(g_gc_datasyncs == 0 && g_gc_dur_datasyncs == 0 && g_gc_dur_fsyncs == 0);
     CHECK(imdb_group_pending(db) == db->seq && db->group_n == 10 && db->dur.seq < db->seq);
     imdb_io_set_hooks(&g_gc_hooks);
     OK(imdb_group_sync(db, E));
     imdb_io_set_hooks(NULL);
-    CHECK(g_gc_datasyncs == 1); /* one fdatasync for ten commits (DURABLE's own is an fsync) */
+    /* one fdatasync of the log for ten commits, then DURABLE's: an fdatasync, never an fsync (the handle fsynced it at
+     * its open: a strict commit's two device flushes, not three) */
+    CHECK(g_gc_datasyncs == 1 && g_gc_dur_datasyncs == 1 && g_gc_dur_fsyncs == 0);
+    g_gc_durfd = -1;
     CHECK(imdb_group_pending(db) == 0 && db->dur.seq == db->seq && db->dur.synced && db->dur.strict);
     CHECK(g_gc_hook == db->seq);
     /* a DDL commit behind three deferred ones: its synced append makes them durable, the hook told */
