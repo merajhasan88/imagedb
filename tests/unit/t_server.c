@@ -35,6 +35,7 @@
 static char g_sock[200];
 static uint64_t g_ckpt; /* the next serve's size-triggered CHECKPOINT (0: the default) */
 static int g_sync;      /* the next serve's sync (0: none) */
+static bool g_nomem;    /* 2c: the next serve's database without a memory budget (superusers alone log in); else 2 GiB */
 static const char *g_events; /* 2b-2b: the next serve's event log (NULL: none) */
 static int64_t g_blocks; /* the wire's live blocks before the server: the same after it and every client are gone */
 static bool g_tcp;       /* N1c: the tests run again over TCP with TLS 1.3 (login by the pin) */
@@ -70,10 +71,12 @@ static imdb_db *serve(imdbs **s, const imdbs_opts *extra)
     if (strlen(g_sock) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return NULL; /* 107 bytes at most */
     imdb_err e = {0};
     if (imdb_init(dbdir, false, NULL, &e)) return NULL;
-    imdb_open_opts o = {.sync = g_sync, .checkpoint_bytes = g_ckpt, .events_path = g_events};
+    imdb_open_opts o = {.sync = g_sync, .checkpoint_bytes = g_ckpt, .events_path = g_events,
+                        .mem_limit = g_nomem ? 0 : (2ull << 30)}; /* 2c: a budget opens a role's logins */
     g_events = NULL;
     g_sync = 0;
     g_ckpt = 0;
+    g_nomem = false;
     imdb_db *db = NULL;
     if (imdb_open(dbdir, &o, &db, &e)) return NULL;
     static const char *const roles[] = {"CREATE ROLE admin LOGIN SUPERUSER PASSWORD 'pw-admin'",
@@ -327,9 +330,9 @@ static void t_server_auth(void)
     imdbc *c = login("admin", "pw-admin");
     SOFT(c);
     imdbc_close(c);
-    /* every refusal one path: a wrong password, an unknown name, a role without LOGIN, without SUPERUSER (until N1e),
-     * without a verifier */
-    static const char *const bad[][2] = {{"admin", "wrong"}, {"ghost", "pw"}, {"nologin", "pw"}, {"plain", "pw"}, {"nopass", "x"}};
+    /* every refusal one path: a wrong password, an unknown name, a role without LOGIN, without a verifier (2c: a role
+     * that is not a superuser logs in where the database has a memory budget: server_logins_budget) */
+    static const char *const bad[][2] = {{"admin", "wrong"}, {"ghost", "pw"}, {"nologin", "pw"}, {"nopass", "x"}};
     for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
         imdbc *x = NULL;
         imdb_err e = {0};
@@ -368,10 +371,10 @@ static void t_server_auth(void)
      * finishing when the client has moved on (a heavy load showed it), so waited for, never read at once */
     for (int w = 0; w < 1000; w++) {
         imdbs_counts_get(s, &cn);
-        if (cn.logins == 1 && cn.refusals == 5 + 4) break;
+        if (cn.logins == 1 && cn.refusals == 4 + 4) break;
         usleep(10000);
     }
-    SOFT(cn.logins == 1 && cn.refusals == 5 + 4);
+    SOFT(cn.logins == 1 && cn.refusals == 4 + 4);
     unserve(db, s);
 }
 
@@ -2101,7 +2104,6 @@ static void t_server_closed_reason(void)
 {
     imdbs_opts o;
     memset(&o, 0, sizeof o);
-    o.test_open_logins = true;
     o.role_conns = 1;
     imdbs *s = NULL;
     imdb_db *db = serve(&s, &o);
@@ -2516,13 +2518,11 @@ static imdbc *login_runs(const char *user, const char *pw)
 }
 
 /* N1e stage two: one role's connections at most --role-conns; a superuser past it; a place freed by a close; the last
- * --superuser-reserve slots a superuser's alone. Logins of a role that is not a superuser are opened for the test
- * (test_open_logins: N1e stage two's last slice opens them) */
+ * --superuser-reserve slots a superuser's alone (2c: a role logs in where the database has a memory budget, serve's 2 GiB) */
 static void t_server_role_conns(void)
 {
     imdbs_opts o;
     memset(&o, 0, sizeof o);
-    o.test_open_logins = true;
     o.role_conns = 2;
     o.max_conns = 6;
     o.su_reserve = 2;
@@ -2616,10 +2616,8 @@ static void shares_case(uint64_t budget, uint64_t share, bool queue, bool demote
 {
     imdbs_opts o;
     memset(&o, 0, sizeof o);
-    o.test_open_logins = true;
-    o.test_no_spill = budget != 0; /* 2b-2a: the budget's gate is memory's, which spooling keeps under it: its backstop shown
-                                    * as before the spool, every result in memory */
-    o.reply_budget = budget;
+    o.reply_budget = budget; /* (2c: test_no_spill gone: a budget below one chunk, 64 KiB, which a connection holding none
+                              * always takes into memory, so p1's first chunk passes it however the rest spools) */
     o.role_reply_bytes = share;
     o.role_queue_bytes = 1u << 20;
     imdbs *s = NULL;
@@ -2686,7 +2684,7 @@ static void shares_case(uint64_t budget, uint64_t share, bool queue, bool demote
 
 static void t_server_role_shares(void)
 {
-    shares_case(1u << 20, IMDBS_NONE, false, false); /* the server's budget alone */
+    shares_case(32u << 10, IMDBS_NONE, false, false); /* the server's budget alone (below one chunk: see shares_case) */
     shares_case(0, 1u << 20, true, false);           /* the role's share alone, and its queue */
     shares_case(0, 1u << 20, false, true);           /* a superuser exempt, then demoted */
 }
@@ -2735,7 +2733,6 @@ static void t_server_conns_churn(void)
 {
     imdbs_opts o;
     memset(&o, 0, sizeof o);
-    o.test_open_logins = true;
     o.role_conns = 2;
     o.max_conns = 8;
     o.su_reserve = 2;
@@ -2812,7 +2809,6 @@ static void t_server_kill(void)
     imdbs *s;
     imdbs_opts so;
     memset(&so, 0, sizeof so);
-    so.test_open_logins = true; /* (a role's logins: N1e stage two's last slice opens them) */
     imdb_db *db = serve(&s, &so);
     CHECK(db);
     imdbc *a = login("admin", "pw-admin");
@@ -3018,7 +3014,6 @@ static void t_server_refused_slots(void)
 {
     imdbs_opts o;
     memset(&o, 0, sizeof o);
-    o.test_open_logins = true;
     o.role_conns = 1;
     o.max_conns = 6;
     o.su_reserve = 1;
@@ -3218,7 +3213,6 @@ static void t_server_res_role_share(void)
 {
     imdbs_opts o;
     memset(&o, 0, sizeof o);
-    o.test_open_logins = true;
     o.conn_cap = 256u << 10;
     o.role_copy_spool = 4u << 20;
     imdbs *s = NULL;
@@ -3335,10 +3329,9 @@ static void t_server_res_measure(void)
     const char *env = getenv("IMDB_SRV_RES_ROWS");
     if (!env) return;
     long want = atol(env), mult = want / 160000 < 1 ? 1 : want / 160000;
-    for (int mode = 0; mode < 3; mode++) {
+    for (int mode = 1; mode < 3; mode++) { /* (2c: mode 0, every result in memory as before the spool, gone with its knob) */
         imdbs_opts o;
         memset(&o, 0, sizeof o);
-        o.test_no_spill = mode == 0;
         o.conn_cap = mode == 2 ? 1u << 20 : 0;
         imdbs *s = NULL;
         imdb_db *db = serve(&s, &o);
@@ -3472,7 +3465,6 @@ static void t_server_copy_role_share(void)
 {
     imdbs_opts o;
     memset(&o, 0, sizeof o);
-    o.test_open_logins = true;
     o.role_copy_spool = 1u << 20;
     o.conn_cap = 128u << 10;
     o.test_sndbuf = 4096;
@@ -3585,7 +3577,6 @@ static void t_server_copy_role_stream(void)
 {
     imdbs_opts o;
     memset(&o, 0, sizeof o);
-    o.test_open_logins = true;
     o.role_copy_spool = 3u << 20;
     o.conn_cap = 128u << 10;
     o.test_sndbuf = 4096;
@@ -3727,7 +3718,6 @@ static void t_server_role_defaults(void)
     g_events = ev;
     imdbs_opts o;
     memset(&o, 0, sizeof o);
-    o.test_open_logins = true;
     o.role_slow_ms = 1;
     o.role_sess_idle_ms = 1000;
     imdbs *s = NULL;
@@ -3812,7 +3802,6 @@ static void t_server_idle_busy(void)
 {
     imdbs_opts o;
     memset(&o, 0, sizeof o);
-    o.test_open_logins = true;
     o.role_sess_idle_ms = 1000;
     o.role_reply_bytes = 1u << 20;
     o.role_queue_bytes = 1u << 20;
@@ -3915,7 +3904,6 @@ static void t_server_disk_headroom(void)
     g_events = ev;
     imdbs_opts o;
     memset(&o, 0, sizeof o);
-    o.test_open_logins = true;
     o.conn_cap = 256u << 10;
     o.disk_headroom = 1ull << 30;
     imdbsp_test_free(IMDBSP_FREE_DATA, 2ll << 30);
@@ -4153,7 +4141,6 @@ static void t_server_disk_enospc(void)
     imdb_io_set_hooks(&g_enospc_hooks);
     imdbs_opts o;
     memset(&o, 0, sizeof o);
-    o.test_open_logins = true;
     g_sync = 1;
     imdbs *s = NULL;
     imdb_db *db = serve(&s, &o);
@@ -4192,6 +4179,82 @@ static void t_server_disk_enospc(void)
     if (db) unserve(db, s);
     imdb_io_set_hooks(NULL);
 }
+
+/* the KILL race (found 11-22 by the Java driver's rerun against 2b-3's binaries): a victim's next frame sent after its
+ * KILL_DONE and in its socket before its thread reads (imdbs_test_wake_hold: 300 ms between the wake and the read) is
+ * never answered: the victim is told why (by a KILL). A PING and a QUERY, held and not (before the fix, the held PING
+ * was answered PONG: a session reported ended still answering) */
+static void t_server_kill_wake(void)
+{
+    imdbs_opts o;
+    memset(&o, 0, sizeof o);
+    imdbs *s = NULL;
+    imdb_db *db = serve(&s, &o);
+    CHECK(db);
+    imdbc *a = login("admin", "pw-admin");
+    CHECK(a);
+    reply r = {0};
+    imdb_err e = {0};
+    for (int k = 0; k < 4; k++) { /* 0 a PING held, 1 a QUERY held, 2 a PING, 3 a QUERY */
+        imdbc *v = login("admin", "pw-admin");
+        CHECK(v);
+        uint64_t vid = 0;
+        SOFT(list_of(a, &r));
+        for (uint32_t i = 0; i < r.nsess && i < 16; i++)
+            if (r.sess[i].id > vid) vid = r.sess[i].id; /* (the newest: the victim logged in last) */
+        imdbs_test_wake_hold(k < 2 ? 300 : 0);
+        SOFT(kill_of(a, IMDBW_KILL_TERMINATE, vid, IMDBW_KILLED));
+        r.err[0] = 0;
+        bool answered;
+        if (k % 2 == 0) answered = imdbc_ping(v, &e) == 0 && read_reply(v, &r) == 0 && r.pong;
+        else answered = q1(v, "SELECT 1", &r) == 0 && !r.nerr;
+        imdbs_test_wake_hold(0);
+        SOFT(!answered && strstr(r.err, "by a KILL"));
+        if (answered || !strstr(r.err, "by a KILL"))
+            fprintf(stderr, "    case %d: %s, %s\n", k, answered ? "answered" : "not answered", r.err[0] ? r.err : e.msg);
+        imdbc_close(v);
+    }
+    imdbc_close(a);
+    unserve(db, s);
+}
+
+/* 2c, logins open: a role that is not a superuser logs in where the database has a memory budget (its bounds are charged
+ * against it), and is refused without one on the one path a wrong password takes (an unknown name's, the same verdict),
+ * a superuser logging in either way; with a budget, a role's privileges and caps hold it (a write it holds no privilege
+ * for refused, its read of what it may read answered) */
+static void t_server_logins_budget(void)
+{
+    for (int budget = 0; budget < 2; budget++) {
+        g_nomem = !budget;
+        imdbs *s = NULL;
+        imdb_db *db = serve(&s, NULL);
+        CHECK(db);
+        imdbc *a = login("admin", "pw-admin");
+        SOFT(a);
+        imdbc *p = NULL;
+        imdb_err e = {0};
+        int rc = imdbc_connect(g_sock, "plain", "pw", 2, &p, &e);
+        if (!budget) {
+            SOFT(rc == IMDB_ERR_AUTH && !p);
+            if (rc != IMDB_ERR_AUTH) fprintf(stderr, "    no budget: plain's login: %d %s\n", rc, e.msg);
+        } else {
+            SOFT(rc == 0 && p);
+            if (rc) fprintf(stderr, "    a budget: plain's login: %d %s\n", rc, e.msg);
+            reply r = {0};
+            if (a && p) {
+                SOFT(q1(a, "CREATE TABLE lb (id INT64 PRIMARY KEY)", &r) == 0 && !r.nerr);
+                SOFT(q1(a, "INSERT INTO lb VALUES (1)", &r) == 0 && !r.nerr);
+                SOFT(q1(p, "SELECT id FROM lb", &r) == 0 && r.nerr == 1 && strstr(r.err, "permission denied"));
+                SOFT(q1(a, "GRANT SELECT ON lb TO plain", &r) == 0 && !r.nerr);
+                SOFT(q1(p, "SELECT id FROM lb", &r) == 0 && !r.nerr && !strcmp(r.text, "1\n"));
+                SOFT(q1(p, "INSERT INTO lb VALUES (2)", &r) == 0 && r.nerr == 1 && strstr(r.err, "permission denied"));
+            }
+        }
+        imdbc_close(p);
+        imdbc_close(a);
+        unserve(db, s);
+    }
+}
 /* 2b-2b: state recorded before the reply that announces it, held to it by a pause at every point where a client may
  * already know (imdbs_test_reply_hold, 20 ms: after a verdict's write, around a READY's flush, after a push): a login
  * listed as soon as its verdict is read, a BEGIN's session IN_TXN and a query's request counted as soon as its READY is.
@@ -4201,7 +4264,6 @@ static void t_server_state_order(void)
 {
     imdbs_opts o;
     memset(&o, 0, sizeof o);
-    o.test_open_logins = true;
     imdbs *s = NULL;
     imdb_db *db = serve(&s, &o);
     CHECK(db);
@@ -4312,7 +4374,6 @@ static void t_server_refused_churn(void)
 {
     imdbs_opts o;
     memset(&o, 0, sizeof o);
-    o.test_open_logins = true;
     o.role_conns = 1;
     o.max_conns = 8;
     o.su_reserve = 1;
@@ -4360,7 +4421,6 @@ static void t_server_copy_role_paths(void)
 {
     imdbs_opts o;
     memset(&o, 0, sizeof o);
-    o.test_open_logins = true;
     o.conn_cap = 128u << 10;
     o.test_sndbuf = 4096;
     imdbs *s = NULL;
@@ -4535,7 +4595,6 @@ static void t_server_res_mem_bounds(void)
     for (int k = 0; k < 2; k++) {
         imdbs_opts o;
         memset(&o, 0, sizeof o);
-        o.test_open_logins = true;
         o.conn_cap = 64u << 20;
         o.reply_budget = k ? (512u << 20) : (1u << 20);
         o.role_reply_bytes = k ? (1u << 20) : 0;
@@ -4604,6 +4663,8 @@ const test_case server_tests[] = {
     {"server_disk_headroom", t_server_disk_headroom},
     {"server_disk_measure", t_server_disk_measure},
     {"server_disk_enospc", t_server_disk_enospc},
+    {"server_kill_wake", t_server_kill_wake},
+    {"server_logins_budget", t_server_logins_budget},
     {"server_refused_churn", t_server_refused_churn},
     {"server_res_spool_faults", t_server_res_spool_faults},
     {"server_res_batch_refused", t_server_res_batch_refused},

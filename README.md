@@ -194,9 +194,10 @@ Iceberg publication is opt-in; external readers see a published table snapshot,
 which can lag SQL commits. Use `imagedb verify` to check a current layer.
 
 - **Logins** are SCRAM-SHA-256 against the database's roles (`CREATE ROLE ...
-  PASSWORD`). Privileges are enforced on every statement (N1e); until the server's bounds hold against any role, only
-  SUPERUSER roles log in. The first role is made with the embedded CLI, whose access
-  is the file system's. An unknown name and a wrong password are refused alike.
+  PASSWORD`). Privileges are enforced on every statement (N1e). A role that is not a SUPERUSER logs in only when the
+  server has a memory budget (`--mem-limit`): its bounds (a query's share, the replies' room, the statement memory) are
+  charged against it; without one, SUPERUSER roles alone log in (the start says so). The first role is made with the
+  embedded CLI, whose access is the file system's. An unknown name and a wrong password are refused alike.
 - **TCP** is TLS 1.3 alone (ALPN `imdbwir1`): no plaintext, no fallback to the
   socket. The client names the CA's certificate (`ca.crt`, the host checked against
   the server certificate's names) or pins the server's key (`--pin`, the 64 hex
@@ -623,7 +624,7 @@ Command-line options (`imagedb` with no arguments prints the commands):
 | `--read-only` | sql | opens without writing anything (a replica's reads) | writable |
 | `--anchor FILE` | sql, verify, promote, imagedb-server | an external anchor: a log rolled back behind it is refused | none |
 | `--accept-rollback` | sql | continues from a log behind the anchor, rewriting it | off |
-| `--mem-limit BYTES` | sql, apply, follow, imagedb-server | the memory budget (K, M or G) | none |
+| `--mem-limit BYTES` | sql, apply, follow, imagedb-server | the memory budget (K, M or G); imagedb-server: a role that is not a superuser logs in only with one | none |
 | `--mem-window SECONDS\|none` | sql, apply, follow | versions ended within it stay in memory | 600 |
 | `--seg-cache BYTES\|all` | sql, apply, follow, imagedb-server | the lake's segment images kept in memory (a segment whose image is larger is read whole again by every operation that reads it: CHECKPOINT and the open warn) | 256 MB |
 | `--stats FILE` | sql, apply, follow | writes the stats export (Monitoring) | none |

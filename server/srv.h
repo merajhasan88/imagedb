@@ -75,8 +75,6 @@ typedef struct imdbs_opts {
                                 * (imagedb-server's; the tests' none) */
     uint64_t reply_budget;     /* every connection's unsent replies, past which only a connection (a role) with none runs (0:
                                 * 256 MiB) */
-    bool test_open_logins;     /* tests alone: any LOGIN role logs in (N1e stage two's last slice opens them) */
-    bool test_no_spill;        /* tests alone (2b-2a's measure): every result's frames to memory, as before the spool */
     uint32_t test_sndbuf;      /* tests alone: each accepted socket's SO_SNDBUF (0: the kernel's), so a reply's bytes past a few
                                 * KiB stay the server's (a client's lag made exact) */
     uint32_t test_write_max;   /* tests alone: each plain socket write at most this many bytes (0: none), so a reader's pace
@@ -175,6 +173,8 @@ uint64_t imdbs_fds_needed(const imdbs_opts *o);
 int imdbs_cert_days(const imdbs *s);
 /* N1d, tests: each COPY TO write of a statement but its first waits ms first (0: none): output that comes slowly */
 void imdbs_test_copy_hold(uint32_t ms);
+/* tests: a connection's thread sleeps ms after a wake, then polls again (0: none): the KILL race made deterministic */
+void imdbs_test_wake_hold(uint32_t ms);
 /* 2b-2b, tests: a pause (us, 0 none) where a client may already know what the server then records: state ordering */
 void imdbs_test_reply_hold(uint32_t us);
 /* tests: a pause (us) between a request's count and its READY's flush alone (what a wait on the count reads before)

@@ -265,7 +265,9 @@ static void role_caps(const imdbs_opts *o, imdb_caps *c)
     c->slow_ms = o->role_slow_ms; /* 2b-2b */
 }
 
-/* open: imdbs_opts.test_open_logins (tests alone, before N1e stage two's last slice opens logins to every LOGIN role) */
+/* open (2c, logins open): the database has a memory budget (--mem-limit): a role that is not a superuser logs in only
+ * where the server's bounds hold it, and they are charged against the budget (a query's share, the replies' room, the
+ * statement memory capped at the default); without one, superusers alone (the start says so) */
 static bool login_ok(const imdb_role *r, bool open)
 {
     return r && !r->dropped_at && (r->attrs & IMDB_RA_LOGIN) && (open || (r->attrs & IMDB_RA_SUPERUSER)) && r->has_ver &&
@@ -322,7 +324,7 @@ static logins *logins_take(imdbs *s)
 static void logins_publish(imdbs *s, bool force)
 {
     if (!force && s->db->role_gen == s->role_gen) return;
-    logins *l = logins_make(s->db, s->o.test_open_logins); /* NULL: none may log in until the next change (fail closed) */
+    logins *l = logins_make(s->db, s->db->mem_limit != 0); /* NULL: none may log in until the next change (fail closed) */
     pthread_mutex_lock(&s->lmu);
     logins *old = s->lg;
     s->lg = l;
@@ -674,7 +676,7 @@ static bool rows_flush(imdbs *s, conn *c, imdbw_buf *b, size_t at, bool wrote, b
     if (wrote && c->dkept) dlow = true; /* a write's reply once kept in memory stays there to its end: free space hovering at
                                          * the line never alternates it between memory and new spool files (a descriptor each) */
     pthread_mutex_lock(&s->mu);
-    bool gone = c->gone, mem = !c->rsp && (mem_room(s, c, n) || s->o.test_no_spill);
+    bool gone = c->gone, mem = !c->rsp && mem_room(s, c, n);
     uint64_t bound = s->o.copy_spool ? s->o.copy_spool : (4ull << 30);
     bool sfull = s->spool_held + n > bound, rfull = !role_spool_room(s, c, n);
     bool spill = !gone && !mem && s->spool_dfd >= 0 && !dlow && (wrote || (!sfull && !rfull));
@@ -907,6 +909,8 @@ static void out_fail(conn *c, int32_t code, const char *msg)
 }
 
 static _Atomic uint32_t g_copy_hold_ms; /* tests: copy_wr sleeps this long before each write of a statement but its first */
+static _Atomic uint32_t g_wake_hold_ms; /* tests: a connection's thread sleeps this long after a wake, then polls again */
+void imdbs_test_wake_hold(uint32_t ms) { atomic_store_explicit(&g_wake_hold_ms, ms, memory_order_relaxed); }
 void imdbs_test_copy_hold(uint32_t ms) { atomic_store_explicit(&g_copy_hold_ms, ms, memory_order_relaxed); }
 
 /* 2b-2b, tests: a pause at each point where a client may already know what the server is about to record (after a
@@ -2440,8 +2444,21 @@ static void *conn_main(void *arg)
             END_BY(IMDBS_END_POLL);
             break;
         }
+        uint32_t hold = atomic_load_explicit(&g_wake_hold_ms, memory_order_relaxed);
+        if (hold && pf[1].revents) { /* tests: this thread scheduled late after a wake, so what its client sent meanwhile is
+                                       * read in the same turn (the KILL race's shape, made certain) */
+            usleep(hold * 1000u);
+            (void)poll(pf, 2, 0);
+        }
         if (pf[1].revents) drain(c->wake[0]);
         bool can_in = pend || (want_in && (pf[0].revents & in_ev)), can_out = want_out && (pf[0].revents & out_ev);
+        if (pf[1].revents && can_in) { /* a KILL's wake: its terminate goes before any frame that came with it (a PING read
+                                         * in this turn was answered after the KILL_DONE: a session reported ended answering;
+                                         * found 11-22 by the Java driver's rerun). The read waits for the loop's top */
+            pthread_mutex_lock(&s->mu);
+            if (c->kill_term) can_in = false;
+            pthread_mutex_unlock(&s->mu);
+        }
         if (can_in) {
             c->rd_wants_write = false;
             errno = 0;

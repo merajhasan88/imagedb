@@ -31,7 +31,7 @@ cp -a "$E" "$N"
 mkdir -m 700 "$WORK/sd"
 pin=$("$SRV" cert "$WORK/sd" | awk '{ print $NF }')
 # (--disk-headroom 0: the test machine's file systems may be near full; the headroom has its own tests, t_server's)
-"$SRV" "$N" --socket "$WORK/s" --server-dir "$WORK/sd" --tcp 127.0.0.1:0 --nosync --disk-headroom 0 > "$WORK/srv.out" 2>&1 &
+"$SRV" "$N" --socket "$WORK/s" --server-dir "$WORK/sd" --tcp 127.0.0.1:0 --nosync --disk-headroom 0 --mem-limit 512M > "$WORK/srv.out" 2>&1 &
 spid=$!
 port=""
 for _ in $(seq 100); do
@@ -137,6 +137,20 @@ rc=0
 net -c '\cancel 0' > "$WORK/k" 2>&1 || rc=$?
 [ "$rc" = 1 ] && grep -q "a session's id is 1 or more" "$WORK/k" || fail "\\cancel 0: exit $rc: $(cat "$WORK/k")"
 echo "client.sh: \\sessions, \\terminate and \\cancel through imagedb-client"
+
+# 2c, logins open: a role that is not a superuser logs in to a server with a memory budget (--mem-limit 512M above), its
+# privileges holding it: a read of what it was granted answered, a write it holds no privilege for refused. The same two
+# statements on the embedded copy, so the copies end at the same commit
+for st in "CREATE ROLE reader LOGIN PASSWORD 'pw-reader'" "GRANT SELECT ON c TO reader"; do
+  net -c "$st" > "$WORK/k" 2>&1 || fail "$st (server): $(cat "$WORK/k")"
+  "$BIN" sql "$E" --nosync -c "$st" > "$WORK/k" 2>&1 || fail "$st (embedded): $(cat "$WORK/k")"
+done
+rd() { IMAGEDB_PASSWORD=pw-reader "$CLI" --socket "$WORK/s" --user reader "$@"; }
+rd -c "SELECT COUNT(*) FROM c" > "$WORK/k" 2>&1 || fail "the role's read: $(cat "$WORK/k")"
+rc=0
+rd -c "INSERT INTO c VALUES (100, 'x', 1)" > "$WORK/k" 2>&1 || rc=$?
+[ "$rc" != 0 ] && grep -q "permission denied" "$WORK/k" || fail "the role's write: exit $rc: $(cat "$WORK/k")"
+echo "client.sh: a role logs in to a server with --mem-limit, its privileges holding it"
 
 kill -TERM "$spid"
 sc=0

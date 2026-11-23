@@ -174,6 +174,7 @@ int main(int argc, char **argv)
             imdbs_test_reply_hold(0);
             imdbs_test_count_hold(0);
             imdbs_test_copy_hold(0);
+            imdbs_test_wake_hold(0);
             imdbsp_no_release(false);
             imdbsp_no_tmpfile(false);
             imdbsp_fail_at(0);

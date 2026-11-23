@@ -267,6 +267,9 @@ int main(int argc, char **argv)
     /* the open's warnings, as the CLI's open_anchored prints them (the anchor's, an oversized segment's): a daemon's
      * operator sees them only here */
     if (db->warning[0]) fprintf(stderr, "imagedb-server: warning: %s\n", db->warning);
+    if (!db->mem_limit) /* 2c: a role's bounds are charged against the budget: without one, superusers alone log in */
+        fprintf(stderr, "imagedb-server: no --mem-limit: only superusers log in (a role that is not a superuser needs the "
+                        "memory budget its bounds are charged against)\n");
     /* 2b-3: a reserve below what one automatic CHECKPOINT writes (about the log's checkpoint size and a fill of the log)
      * may not hold the publish an operator's recovery needs */
     uint64_t pub = db->checkpoint_bytes == UINT64_MAX ? 0 : db->checkpoint_bytes + IMDB_LOG_FILL_CHUNK;
