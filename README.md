@@ -276,6 +276,10 @@ A driver that binds by tls-server-end-point logs in over TCP only to a server ru
 Unix-domain socket every driver logs in to any server. Each `run_tests.sh` takes the repository's `build/` (after `make`
 and `make server`; `IMDB_DRV_BIN` overrides), starts its own servers on databases under its `tmp/`, and stops them.
 
+IMDBWIR1 is not yet frozen: until the first release of a driver, a change to the protocol lands in one commit with
+the server, the C client and all six drivers (the head's version stays 1), so a driver from an older commit may refuse
+a newer server; after that release, any change is a version step.
+
 ## Durability and recovery
 
 - The writer keeps a **durable watermark** (`DURABLE`): the last commit whose
@@ -290,13 +294,25 @@ and `make server`; `IMDB_DRV_BIN` overrides), starts its own servers on database
   is therefore either an append that never finished or an acknowledged commit
   damaged later, and nothing can tell which: every open refuses it (read-only
   too) and `imagedb recover` decides. Nothing is dropped automatically.
-- `--durable-ack` (`sql`, `apply`; `imdb_open_opts.durable_ack`) fsyncs DURABLE
-  before each commit returns and marks it strict. A damaged final frame past a
-  strict watermark was never acknowledged, and the next writable open truncates
-  it. It costs one more device flush per commit (measured here: 6.7 ms instead
-  of 3.4 ms for a one-row commit, 9.2 ms instead of 5.9 ms for 100 rows). If the
-  DURABLE write fails, the commit returns an error (it reached the log but is
-  not acknowledged) and the handle stops.
+- `--durable-ack` (`sql`, `apply`; `imdb_open_opts.durable_ack`) syncs DURABLE
+  before each commit returns (by fdatasync, once the handle has fsynced it at
+  its open) and marks it strict. A damaged final frame past a strict watermark
+  was never acknowledged, and the next writable open truncates it. It costs one
+  more device flush per commit: two, the log's and DURABLE's, against a plain
+  synced commit's one (counted in /proc/diskstats). If the DURABLE write fails,
+  the commit returns an error (it reached the log but is not acknowledged) and
+  the handle stops.
+- `--group-commit` (imagedb-server): a commit of row ops alone defers its sync
+  into a group, made durable by one fdatasync of the log and one of DURABLE with
+  the commits beside it; every reply made after such a commit is held until its
+  group is durable, so no client of the server sees a commit before it is. A
+  read-only open of the directory (`dump`, `sql --read-only`) replays to the
+  log's end and may read one between its write and its group's sync, as it may
+  between any commit's write and its sync; `ship` and `backup` stop at DURABLE.
+  DURABLE is strict from the start, as under `--durable-ack`. A group costs two device flushes,
+  so it pays once more than two commits share a sync (measured here: 3.8 at
+  four clients, 15.7 at sixteen) and costs a lone writer one flush more than a
+  plain synced commit. Off by default; refused with `--nosync`.
 - `imagedb recover <dir>` shows such damage. Restore the segment from a
   replica to keep the commits, or run
   `imagedb recover <dir> --discard-tail --save FILE` to drop them explicitly
@@ -588,7 +604,8 @@ a quantile is at most a quarter above the true one. Under imagedb-server, `SHOW 
 carry the server's own rows after the engine's, `server.*`: connections (accepted, live, and ended by cause:
 `server.connections.ended.left`, `.send`, `.kill`, `.idle` and the rest), logins (ok, refused, a role's refused by its
 caps, by binding type), requests, statements, cancels and KILLs, the queues' and replies' bounds (`server.replies.*`,
-`server.queue.*`), spilled results (`server.results.*`), COPY (`server.copy.*`), the spools' bytes, and the disk
+`server.queue.*`), spilled results (`server.results.*`), COPY (`server.copy.*`), group commit (`server.group.syncs`,
+`.held_replies`, `.failed`), the spools' bytes, and the disk
 headroom's refusals (with `--disk-headroom`, the free bytes and whether each directory is below it).
 `SHOW TRANSACTIONS` lists
 every open transaction: its state (active, parked, doomed, begun), isolation,
@@ -645,7 +662,7 @@ Command-line options (`imagedb` with no arguments prints the commands):
 | `--nosync` | sql | commits are not fdatasynced until a clean close | synced |
 | `--lake-sync` | sql | a CHECKPOINT after every change (priced) | off |
 | `--iceberg` | sql, apply, follow, imagedb-server | F5c: write the Iceberg v3 layer per copy (`iceberg/<table id>/metadata/`) after every publish, so Iceberg readers (DuckDB's iceberg extension is the tested one) see each table's current rows and the generation kept beside them; derived, never shipped, a failure only a warning; a publication writes only the changed tables' layers (Supported scope) | off |
-| `--durable-ack` | sql, apply | DURABLE fsynced before each commit returns | off |
+| `--durable-ack` | sql, apply | DURABLE synced before each commit returns (fdatasync after the open's fsync) | off |
 | `--read-only` | sql | opens without writing anything (a replica's reads) | writable |
 | `--anchor FILE` | sql, verify, promote, imagedb-server | an external anchor: a log rolled back behind it is refused | none |
 | `--accept-rollback` | sql | continues from a log behind the anchor, rewriting it | off |
@@ -713,7 +730,7 @@ Command-line options (`imagedb` with no arguments prints the commands):
 | `--role-reply-bytes BYTES` | imagedb-server | one such role's replies not yet sent (in memory, and results spooled past their room), past which none of its statements starts (0: none) | 64M |
 | `--role-copy-spool BYTES` | imagedb-server | one role's spooled bytes at once: its COPY FROM spools, COPY TO rings and the results spooled past their connection's room (0: none; a superuser's exempt) | a quarter of `--copy-spool` |
 | `--disk-headroom BYTES` | imagedb-server | the free bytes kept on the database's file systems (its directory, `log/`, `objects/`: the least) and the spool directory's: below it on the database's a role's row writes (INSERT, UPDATE, DELETE, COPY FROM) are refused at their start, a superuser's statements run; on the spool's every upload and result past its connection's room is refused (a write's reply kept in memory), a superuser's COPY TO streaming through its ring, grown no further; reads run; each crossing a line on stderr and a `disk_headroom` event (0: none); see "A filling disk" | 1 GiB (the API: none) |
-| `--group-commit` | imagedb-server | a commit of row ops alone defers its sync into a group, made durable by one fdatasync with the commits beside it (at idle, a 2 ms age, 256 commits or 4 MiB, or the next synced commit); every reply made after such a commit held until its group is durable, so no client sees a commit before it is; DURABLE strict and fsynced from the start (as `--durable-ack`'s); refused with `--nosync` | off |
+| `--group-commit` | imagedb-server | a commit of row ops alone defers its sync into a group, made durable by one fdatasync with the commits beside it (at idle, a 2 ms age, 256 commits or 4 MiB, or the next synced commit); every reply made after such a commit held until its group is durable, so no client of the server sees a commit before it is (a read-only open of the directory may: it replays to the log's end); DURABLE strict from the start and synced with each group (as `--durable-ack`'s); refused with `--nosync` | off |
 | `--preauth-max N` | imagedb-server | connections authenticating at once on each listener; the rest wait in the listen queue | 32 |
 | `--preauth-timeout MS` | imagedb-server | a whole authentication exchange (TLS's handshake included) | 10000 |
 | `--preauth-per-addr N` | imagedb-server | TCP connections authenticating at once from one address (twice it may wait) | 8 |

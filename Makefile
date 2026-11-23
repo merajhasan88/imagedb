@@ -279,6 +279,7 @@ test: lint $(TBIN) $(BIN) $(AUDIT) $(FORGE) $(SERVER) $(CLIENTBIN) $(PROBECLI) $
 	IMDB_FAULT_SKIP=1 IMDB_EVICT=eager IMDB_AUDIT_BIN=$(AUDIT) $(TBIN)
 	IMDB_FAULT_SKIP=1 IMDB_SEGCACHE=tiny IMDB_AUDIT_BIN=$(AUDIT) $(TBIN)
 	IMDB_FAULT_SKIP=1 IMDB_SEGCACHE=tiny IMDB_EVICT=eager IMDB_AUDIT_BIN=$(AUDIT) $(TBIN)
+	IMDB_FAULT_SKIP=1 IMDB_SRV_GROUP=1 $(TBIN) server # group commit (txn-design §6): every test's server deferring
 	bash tests/integration/run.sh $(BIN)
 	IMDB_NO_SIMD=1 IMDB_THREADS=1 bash tests/integration/run.sh $(BIN)
 	IMDB_EVICT=eager bash tests/integration/run.sh $(BIN)
@@ -318,6 +319,7 @@ san: lint
 	IMDB_FAULT_SKIP=1 IMDB_EVICT=eager IMDB_AUDIT_BIN=build-san/imagedb-audit $(SANRUN) build-san/test_unit
 	IMDB_FAULT_SKIP=1 IMDB_SEGCACHE=tiny IMDB_AUDIT_BIN=build-san/imagedb-audit $(SANRUN) build-san/test_unit
 	IMDB_FAULT_SKIP=1 IMDB_SEGCACHE=tiny IMDB_EVICT=eager IMDB_AUDIT_BIN=build-san/imagedb-audit $(SANRUN) build-san/test_unit
+	IMDB_FAULT_SKIP=1 IMDB_SRV_GROUP=1 $(SANRUN) build-san/test_unit server # group commit: every test's server deferring
 	bash tests/integration/run.sh build-san/imagedb
 	IMDB_NO_SIMD=1 IMDB_THREADS=1 bash tests/integration/run.sh build-san/imagedb
 	IMDB_EVICT=eager bash tests/integration/run.sh build-san/imagedb
